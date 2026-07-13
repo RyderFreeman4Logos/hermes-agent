@@ -137,6 +137,64 @@ class TestDelegateRequirements(unittest.TestCase):
         self.assertIn(f"up to {_get_max_concurrent_children()}", fn["description"])
         self.assertIn(f"max_spawn_depth={_get_max_spawn_depth()}", fn["description"])
 
+    def test_dynamic_schema_exposes_only_operator_configured_route_aliases(self):
+        """The model may choose an operator-owned route alias, never raw
+        credentials or arbitrary provider/model values.
+        """
+        from tools.delegate_tool import _build_dynamic_schema_overrides
+
+        cfg = {
+            "routing": {
+                "enabled": True,
+                "routes": {
+                    "frontier": {
+                        "description": "Hardest quality-first work",
+                        "provider": "openai-codex",
+                        "model": "gpt-5.6-sol",
+                        "reasoning_effort": "max",
+                    },
+                    "efficient": {
+                        "description": "Bounded high-volume work",
+                        "provider": "openai-codex",
+                        "model": "gpt-5.6-luna",
+                        "reasoning_effort": "medium",
+                    },
+                },
+            }
+        }
+
+        with patch("tools.delegate_tool._load_config", return_value=cfg):
+            overrides = _build_dynamic_schema_overrides()
+
+        props = overrides["parameters"]["properties"]
+        task_props = props["tasks"]["items"]["properties"]
+        self.assertEqual(props["route"]["enum"], ["efficient", "frontier"])
+        self.assertEqual(task_props["route"]["enum"], ["efficient", "frontier"])
+        self.assertIn("Hardest quality-first work", props["route"]["description"])
+        for forbidden in ("provider", "model", "reasoning_effort", "base_url", "api_key"):
+            self.assertNotIn(forbidden, props)
+            self.assertNotIn(forbidden, task_props)
+
+    def test_dynamic_schema_has_zero_route_footprint_when_disabled(self):
+        from tools.delegate_tool import _build_dynamic_schema_overrides
+
+        cfg = {
+            "routing": {
+                "enabled": False,
+                "routes": {
+                    "frontier": {
+                        "provider": "openai-codex",
+                        "model": "gpt-5.6-sol",
+                    }
+                },
+            }
+        }
+        with patch("tools.delegate_tool._load_config", return_value=cfg):
+            props = _build_dynamic_schema_overrides()["parameters"]["properties"]
+
+        self.assertNotIn("route", props)
+        self.assertNotIn("route", props["tasks"]["items"]["properties"])
+
 
 class TestChildSystemPrompt(unittest.TestCase):
     def test_goal_only(self):
@@ -259,6 +317,67 @@ class TestDelegateTask(unittest.TestCase):
         self.assertEqual(result["results"][0]["summary"], "Result A")
         self.assertEqual(result["results"][1]["summary"], "Result B")
         self.assertIn("total_duration_seconds", result)
+
+    @patch("tools.delegate_tool._run_single_child")
+    @patch("tools.delegate_tool._build_child_agent")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._load_config")
+    def test_batch_per_task_route_overrides_top_level_route(
+        self, mock_config, mock_resolve, mock_build, mock_run
+    ):
+        mock_config.return_value = {"max_iterations": 7}
+
+        def resolve(_cfg, _parent, route=None):
+            model, effort = {
+                "frontier": ("gpt-5.6-sol", "max"),
+                "efficient": ("gpt-5.6-luna", "medium"),
+            }[route]
+            return {
+                "provider": "openai-codex",
+                "model": model,
+                "base_url": "https://chatgpt.com/backend-api/codex",
+                "api_key": "codex-token",
+                "api_mode": "codex_responses",
+                "reasoning_effort": effort,
+                "route": route,
+            }
+
+        mock_resolve.side_effect = resolve
+        frontier_child = MagicMock()
+        efficient_child = MagicMock()
+        mock_build.side_effect = [frontier_child, efficient_child]
+        mock_run.side_effect = [
+            {"task_index": 0, "status": "completed", "summary": "A"},
+            {"task_index": 1, "status": "completed", "summary": "B"},
+        ]
+
+        result = json.loads(
+            delegate_task(
+                tasks=[
+                    {"goal": "Hard analysis"},
+                    {"goal": "Bounded extraction", "route": "efficient"},
+                ],
+                route="frontier",
+                parent_agent=_make_mock_parent(),
+            )
+        )
+
+        self.assertIn("results", result)
+        self.assertEqual(
+            [call.kwargs.get("route") for call in mock_resolve.call_args_list],
+            ["frontier", "efficient"],
+        )
+        first, second = mock_build.call_args_list
+        self.assertEqual(first.kwargs["model"], "gpt-5.6-sol")
+        self.assertEqual(first.kwargs["override_reasoning_effort"], "max")
+        self.assertEqual(second.kwargs["model"], "gpt-5.6-luna")
+        self.assertEqual(second.kwargs["override_reasoning_effort"], "medium")
+        self.assertEqual(
+            getattr(frontier_child, "_delegate_route"), "frontier"
+        )
+        self.assertEqual(
+            getattr(efficient_child, "_delegate_route"), "efficient"
+        )
 
     @patch("tools.delegate_tool._run_single_child")
     def test_batch_mode_accepts_json_string_tasks(self, mock_run):
@@ -1097,6 +1216,57 @@ class TestDelegationCredentialResolution(unittest.TestCase):
         self.assertIsNone(creds["base_url"])
         self.assertIsNone(creds["api_key"])
 
+    @patch("hermes_cli.runtime_provider.resolve_runtime_provider")
+    def test_route_resolves_provider_model_and_reasoning_from_allowlist(self, mock_resolve):
+        mock_resolve.return_value = {
+            "provider": "openai-codex",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": "codex-token",
+            "api_mode": "codex_responses",
+        }
+        cfg = {
+            "provider": "",
+            "model": "",
+            "reasoning_effort": "",
+            "routing": {
+                "enabled": True,
+                "routes": {
+                    "frontier": {
+                        "provider": "openai-codex",
+                        "model": "gpt-5.6-sol",
+                        "reasoning_effort": "max",
+                    }
+                },
+            },
+        }
+
+        creds = _resolve_delegation_credentials(
+            cfg, _make_mock_parent(depth=0), route="frontier"
+        )
+
+        self.assertEqual(creds["provider"], "openai-codex")
+        self.assertEqual(creds["model"], "gpt-5.6-sol")
+        self.assertEqual(creds["reasoning_effort"], "max")
+        mock_resolve.assert_called_once_with(
+            requested="openai-codex", target_model="gpt-5.6-sol"
+        )
+
+    def test_unknown_route_fails_closed_without_inheriting(self):
+        cfg = {
+            "routing": {
+                "enabled": True,
+                "routes": {
+                    "frontier": {
+                        "provider": "openai-codex",
+                        "model": "gpt-5.6-sol",
+                    }
+                },
+            }
+        }
+        with self.assertRaisesRegex(ValueError, "Unknown delegation route"):
+            _resolve_delegation_credentials(
+                cfg, _make_mock_parent(depth=0), route="typo-route"
+            )
 
 
     def test_direct_endpoint_uses_configured_base_url_and_api_key(self):

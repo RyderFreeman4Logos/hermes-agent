@@ -167,6 +167,119 @@ class TestFallbackCredentialIsolation:
         assert agent._credential_pool.provider == "openai-codex"
         assert agent._transport_cache == {}
 
+    def test_quota_only_same_model_fallback_changes_provider_not_model(self):
+        """A Codex quota fallback to a mirror provider must preserve the
+        selected GPT-5.6 route model while changing only provider/runtime.
+        """
+        from agent.chat_completion_helpers import try_activate_fallback
+        from agent.error_classifier import FailoverReason
+
+        agent = _make_agent(
+            provider="openai-codex",
+            model="gpt-5.6-sol",
+            base_url="https://chatgpt.com/backend-api/codex",
+            api_mode="codex_responses",
+        )
+        agent._fallback_chain = [
+            {
+                "provider": "custom:pm",
+                "model": "$current",
+                "source_providers": ["openai-codex"],
+                "failover_reasons": ["rate_limit", "billing", "upstream_rate_limit"],
+            }
+        ]
+        agent._buffer_status = MagicMock()
+        agent._is_azure_openai_url.return_value = False
+        agent._is_direct_openai_url.return_value = False
+        agent._provider_model_requires_responses_api.return_value = True
+        agent._anthropic_prompt_cache_policy.return_value = (False, False)
+        agent._ensure_lmstudio_runtime_loaded = MagicMock()
+        agent.context_compressor = None
+
+        fallback_client = SimpleNamespace(
+            api_key="pm-key",
+            base_url="https://pm.example/v1",
+            _custom_headers={},
+        )
+
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(fallback_client, "gpt-5.6-sol"),
+        ) as resolve_provider_client, patch(
+            "agent.credential_pool.load_pool", return_value=None
+        ):
+            assert try_activate_fallback(agent, FailoverReason.rate_limit) is True
+
+        resolve_provider_client.assert_called_once_with(
+            "custom:pm",
+            model="gpt-5.6-sol",
+            raw_codex=True,
+            explicit_base_url=None,
+            explicit_api_key=None,
+        )
+        assert agent.provider == "custom:pm"
+        assert agent.model == "gpt-5.6-sol"
+
+    def test_quota_only_fallback_rejects_auth_without_consuming_entry(self):
+        from agent.chat_completion_helpers import try_activate_fallback
+        from agent.error_classifier import FailoverReason
+
+        agent = _make_agent(provider="openai-codex", model="gpt-5.6-sol")
+        agent._fallback_chain = [
+            {
+                "provider": "custom:pm",
+                "model": "$current",
+                "source_providers": ["openai-codex"],
+                "failover_reasons": ["rate_limit", "billing", "upstream_rate_limit"],
+            }
+        ]
+
+        with patch("agent.auxiliary_client.resolve_provider_client") as resolver:
+            assert try_activate_fallback(agent, FailoverReason.auth) is False
+
+        resolver.assert_not_called()
+        assert agent._fallback_index == 0
+
+    def test_same_model_fallback_rejects_nonmatching_source_provider(self):
+        from agent.chat_completion_helpers import try_activate_fallback
+        from agent.error_classifier import FailoverReason
+
+        agent = _make_agent(provider="zai", model="glm-5.2")
+        agent._fallback_chain = [
+            {
+                "provider": "custom:pm",
+                "model": "$current",
+                "source_providers": ["openai-codex"],
+                "failover_reasons": ["rate_limit"],
+            }
+        ]
+
+        with patch("agent.auxiliary_client.resolve_provider_client") as resolver:
+            assert try_activate_fallback(agent, FailoverReason.rate_limit) is False
+
+        resolver.assert_not_called()
+        assert agent._fallback_index == 0
+
+    def test_pending_fallback_is_reason_and_source_aware(self):
+        from agent.chat_completion_helpers import has_pending_fallback
+        from agent.error_classifier import FailoverReason
+
+        entry = {
+            "provider": "custom:pm",
+            "model": "$current",
+            "source_providers": ["openai-codex"],
+            "failover_reasons": ["rate_limit", "billing", "upstream_rate_limit"],
+        }
+        codex = _make_agent(provider="openai-codex", model="gpt-5.6-sol")
+        codex._fallback_chain = [entry]
+        zai = _make_agent(provider="zai", model="glm-5.2")
+        zai._fallback_chain = [entry]
+
+        assert has_pending_fallback(codex, FailoverReason.rate_limit) is True
+        assert has_pending_fallback(codex, FailoverReason.auth) is False
+        assert has_pending_fallback(codex, None) is False
+        assert has_pending_fallback(zai, FailoverReason.rate_limit) is False
+
 
 # ── Test: _recover_with_credential_pool rejects mismatched pool ──────
 

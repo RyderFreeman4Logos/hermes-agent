@@ -1299,12 +1299,66 @@ def rewrite_prompt_model_identity(agent, model: str, provider: str) -> None:
     agent._cached_system_prompt = sp
 
 
-def _fallback_entry_key(fb: dict) -> tuple[str, str, str]:
+def _fallback_entry_key(
+    fb: dict, *, current_model: str = ""
+) -> tuple[str, str, str]:
+    model = str(fb.get("model") or "").strip()
+    if model == "$current":
+        model = current_model
     return (
         str(fb.get("provider") or "").strip().lower(),
-        str(fb.get("model") or "").strip(),
+        model,
         str(fb.get("base_url") or "").strip().rstrip("/"),
     )
+
+
+def _fallback_policy_values(raw: Any) -> Optional[set[str]]:
+    """Normalize a policy scalar/list; None means unrestricted."""
+    if raw is None:
+        return None
+    values = raw if isinstance(raw, (list, tuple, set)) else [raw]
+    return {
+        str(value or "").strip().lower()
+        for value in values
+        if str(value or "").strip()
+    }
+
+
+def _fallback_entry_allowed(agent, fb: dict, reason: "FailoverReason | None") -> bool:
+    source_providers = _fallback_policy_values(fb.get("source_providers"))
+    if source_providers is not None:
+        current_provider = (
+            getattr(agent, "provider", "") or ""
+        ).strip().lower()
+        if current_provider not in source_providers:
+            return False
+
+    allowed_reasons = _fallback_policy_values(fb.get("failover_reasons"))
+    if allowed_reasons is not None:
+        reason_value = getattr(reason, "value", reason)
+        normalized_reason = str(reason_value or "").strip().lower()
+        if normalized_reason not in allowed_reasons:
+            return False
+    return True
+
+
+def _next_eligible_fallback_index(
+    agent, reason: "FailoverReason | None"
+) -> Optional[int]:
+    start = int(getattr(agent, "_fallback_index", 0) or 0)
+    chain = getattr(agent, "_fallback_chain", []) or []
+    for index in range(start, len(chain)):
+        entry = chain[index]
+        if isinstance(entry, dict) and _fallback_entry_allowed(agent, entry, reason):
+            return index
+    return None
+
+
+def has_pending_fallback(
+    agent, reason: "FailoverReason | None" = None
+) -> bool:
+    """Return whether an entry is eligible for this provider/failure reason."""
+    return _next_eligible_fallback_index(agent, reason) is not None
 
 
 def _fallback_entry_unavailable_without_network(agent, fb: dict) -> Optional[str]:
@@ -1340,7 +1394,12 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     auth resolution and client construction — no duplicated provider→key
     mappings.
     """
-    if reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
+    quota_reasons = {
+        FailoverReason.rate_limit,
+        FailoverReason.billing,
+        FailoverReason.upstream_rate_limit,
+    }
+    if reason in quota_reasons:
         # Only start cooldown when leaving the primary provider.  If we're
         # already on a fallback and chain-switching, the primary wasn't the
         # source of the 429 so the cooldown should not be reset/extended.
@@ -1356,19 +1415,29 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # turn's restore_primary_runtime stays gated instead of resetting
         # _fallback_index=0 and re-marshaling the whole context across every
         # provider again.  Guards the cross-turn replay storm in #24996.
-        if (
-            len(agent._fallback_chain) > 0
-            and reason not in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}
-        ):
+        if len(agent._fallback_chain) > 0 and reason not in quota_reasons:
             _existing_cooldown = getattr(agent, "_rate_limited_until", 0) or 0
             agent._rate_limited_until = max(
                 _existing_cooldown,
                 time.monotonic() + _FALLBACK_EXHAUSTED_COOLDOWN_S,
             )
         return False
-    fb = agent._fallback_chain[agent._fallback_index]
-    agent._fallback_index += 1
-    fb_key = _fallback_entry_key(fb)
+
+    eligible_index = _next_eligible_fallback_index(agent, reason)
+    if eligible_index is None:
+        # Policy-ineligible entries remain available for a later failure/model
+        # switch; do not consume them or arm the exhausted-chain cooldown.
+        logger.debug(
+            "Fallback policy rejected remaining entries for provider=%s reason=%s",
+            getattr(agent, "provider", None),
+            getattr(reason, "value", reason),
+        )
+        return False
+
+    fb = agent._fallback_chain[eligible_index]
+    agent._fallback_index = eligible_index + 1
+    current_model = (getattr(agent, "model", "") or "").strip()
+    fb_key = _fallback_entry_key(fb, current_model=current_model)
     unavailable = getattr(agent, "_unavailable_fallback_keys", None)
     if unavailable is None:
         unavailable = set()
@@ -1377,7 +1446,8 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         logger.debug("Fallback skip: %s previously marked unavailable", fb_key)
         return agent._try_activate_fallback(reason)
     fb_provider = (fb.get("provider") or "").strip().lower()
-    fb_model = (fb.get("model") or "").strip()
+    raw_fb_model = (fb.get("model") or "").strip()
+    fb_model = current_model if raw_fb_model == "$current" else raw_fb_model
     if not fb_provider or not fb_model:
         return agent._try_activate_fallback(reason)  # skip invalid, try next
 

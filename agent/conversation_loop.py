@@ -1120,18 +1120,25 @@ def run_conversation(
                             f"Nous Portal rate limit active — "
                             f"resets in {_fmt_nous_remaining(_nous_remaining)}."
                         )
-                        agent._buffer_vprint(
-                            f"⏳ {_nous_msg} Trying fallback..."
-                        )
-                        agent._buffer_status(f"⏳ {_nous_msg}")
-                        if agent._try_activate_fallback():
-                            active_system_prompt = _sync_failover_system_message(
-                                agent, api_messages, active_system_prompt)
-                            retry_count = 0
-                            compression_attempts = 0
-                            _retry.primary_recovery_attempted = False
-                            continue
-                        # No fallback available — surface buffered context
+                        if agent._has_pending_fallback(
+                            reason=FailoverReason.rate_limit
+                        ):
+                            agent._buffer_vprint(
+                                f"⏳ {_nous_msg} Trying fallback..."
+                            )
+                            agent._buffer_status(f"⏳ {_nous_msg}")
+                            if agent._try_activate_fallback(
+                                reason=FailoverReason.rate_limit
+                            ):
+                                active_system_prompt = _sync_failover_system_message(
+                                    agent, api_messages, active_system_prompt)
+                                retry_count = 0
+                                compression_attempts = 0
+                                _retry.primary_recovery_attempted = False
+                                continue
+                        else:
+                            agent._buffer_status(f"⏳ {_nous_msg}")
+                        # No eligible fallback — surface buffered context
                         # so user sees the rate-limit message that led here.
                         agent._flush_status_buffer()
                         agent._persist_session(messages, conversation_history)
@@ -1478,7 +1485,7 @@ def run_conversation(
                     # Eager fallback: empty/malformed responses are a common
                     # rate-limit symptom.  Switch to fallback immediately
                     # rather than retrying with extended backoff.
-                    if agent._fallback_index < len(agent._fallback_chain):
+                    if agent._has_pending_fallback():
                         agent._buffer_status("⚠️ Empty/malformed response — switching to fallback...")
                     if agent._try_activate_fallback():
                         active_system_prompt = _sync_failover_system_message(
@@ -1868,7 +1875,7 @@ def run_conversation(
                         )
                         if (
                             _cf_terminated
-                            and agent._fallback_index < len(agent._fallback_chain)
+                            and agent._has_pending_fallback()
                         ):
                             agent._vprint(
                                 f"{agent.log_prefix}🛡️  Content filter terminated "
@@ -3190,7 +3197,9 @@ def run_conversation(
                     is_rate_limited
                     or (_is_transport_failure and retry_count >= 2)
                 )
-                if _should_fallback and agent._fallback_index < len(agent._fallback_chain):
+                if _should_fallback and agent._has_pending_fallback(
+                    reason=classified.reason
+                ):
                     # Don't eagerly fallback if credential pool rotation may
                     # still recover.  See _pool_may_recover_from_rate_limit
                     # for the single-credential-pool exception.  Fixes #11314.
@@ -3251,7 +3260,7 @@ def run_conversation(
                 if (
                     classified.is_auth
                     and not _retry.auth_failover_attempted
-                    and agent._fallback_index < len(agent._fallback_chain)
+                    and agent._has_pending_fallback(reason=classified.reason)
                 ):
                     _retry.auth_failover_attempted = True
                     agent._buffer_status(
@@ -3738,14 +3747,14 @@ def run_conversation(
                     # exists; otherwise "trying fallback..." is a lie and the
                     # session looks like it's recovering when it's about to
                     # abort silently (#35314, #17446).
-                    if agent._has_pending_fallback():
+                    if agent._has_pending_fallback(reason=classified.reason):
                         if classified.reason == FailoverReason.content_policy_blocked:
                             agent._buffer_status("⚠️ Provider safety filter blocked this request — trying fallback...")
                         elif classified.reason == FailoverReason.ssl_cert_verification:
                             agent._buffer_status("⚠️ TLS certificate verification failed — trying fallback...")
                         else:
                             agent._buffer_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
-                    if agent._try_activate_fallback():
+                    if agent._try_activate_fallback(reason=classified.reason):
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -3941,9 +3950,9 @@ def run_conversation(
                         agent._fallback_activated = False
                         continue
                     # Try fallback before giving up entirely
-                    if agent._has_pending_fallback():
+                    if agent._has_pending_fallback(reason=classified.reason):
                         agent._buffer_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
-                    if agent._try_activate_fallback():
+                    if agent._try_activate_fallback(reason=classified.reason):
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -5013,7 +5022,7 @@ def run_conversation(
                     # chain.  This covers the case where a model
                     # (e.g. GLM-4.5-Air) consistently returns empty
                     # due to context degradation or provider issues.
-                    if _truly_empty and agent._fallback_chain:
+                    if _truly_empty and agent._has_pending_fallback():
                         logger.warning(
                             "Empty response after %d retries — "
                             "attempting fallback (model=%s, provider=%s)",

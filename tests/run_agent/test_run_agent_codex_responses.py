@@ -1006,6 +1006,23 @@ def test_preflight_codex_api_kwargs_rejects_function_call_output_without_call_id
         )
 
 
+def test_preflight_codex_api_kwargs_strips_foreign_provider_extra_body(monkeypatch):
+    _build_agent(monkeypatch)
+    kwargs = _codex_request_kwargs()
+    kwargs["extra_body"] = {
+        "thinking": {"type": "enabled"},
+        "enable_thinking": True,
+        "chat_template_kwargs": {"enable_thinking": True},
+        "prompt_cache_key": "conversation-1",
+    }
+
+    from agent.codex_responses_adapter import _preflight_codex_api_kwargs
+    result = _preflight_codex_api_kwargs(kwargs)
+
+    assert result["extra_body"] == {"prompt_cache_key": "conversation-1"}
+    assert kwargs["extra_body"]["thinking"] == {"type": "enabled"}
+
+
 
 
 
@@ -1729,7 +1746,6 @@ def test_duplicate_detection_uses_commentary_when_hidden_reasoning_changes(monke
     reasoning_items = interim_msgs[0].get("codex_reasoning_items")
     if reasoning_items:
         assert reasoning_items[0].get("id") == "rs_second"
-
 
 
 

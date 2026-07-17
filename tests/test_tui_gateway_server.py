@@ -13442,6 +13442,50 @@ def test_reap_idle_sessions_closes_only_evictable(monkeypatch):
         server._sessions.clear()
 
 
+def test_reap_idle_sessions_calls_periodic_trim(monkeypatch):
+    """The idle reaper must call trim_memory every scan, even with no victims."""
+    trim_calls = []
+    monkeypatch.setattr(server, "_session_pending_kind", lambda sid: "")
+    monkeypatch.setattr(server, "_close_session_by_id", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_enforce_session_cap", lambda: None)
+
+    # Mock trim_memory at the import site inside _reap_idle_sessions.
+    import hermes_cli.mem_trim as mem_trim
+    monkeypatch.setattr(
+        mem_trim,
+        "trim_memory",
+        lambda **kw: trim_calls.append(kw.get("reason", "")) or True,
+    )
+
+    server._sessions.clear()
+    try:
+        server._reap_idle_sessions()
+        assert len(trim_calls) == 1
+        assert trim_calls[0] == "idle reaper periodic trim"
+    finally:
+        server._sessions.clear()
+
+
+def test_reap_idle_sessions_logs_trim_failure(monkeypatch, caplog):
+    monkeypatch.setattr(server, "_session_pending_kind", lambda sid: "")
+    monkeypatch.setattr(server, "_close_session_by_id", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_enforce_session_cap", lambda: None)
+    import hermes_cli.mem_trim as mem_trim
+
+    monkeypatch.setattr(
+        mem_trim,
+        "trim_memory",
+        lambda **_kw: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    server._sessions.clear()
+    try:
+        with caplog.at_level("WARNING", logger="tui_gateway.server"):
+            server._reap_idle_sessions()
+        assert "idle reaper memory trim failed: RuntimeError: boom" in caplog.text
+    finally:
+        server._sessions.clear()
+
+
 def test_session_create_records_ui_model_as_session_override(monkeypatch):
     """The desktop composer owns its model as plain UI state and ships it on
     session.create. The gateway must record it as a PER-SESSION override (built

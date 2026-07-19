@@ -348,6 +348,31 @@ You do **not** need to configure `fallback_chain` to get fallback — the main-a
 
 Each `fallback_chain` entry may also declare its own `timeout` (seconds). Without it, a fallback candidate inherits the task-level timeout — which may be tuned for the primary provider. Declaring a per-entry `timeout` lets a slower-but-reliable fallback (e.g. a large-context summarizer) get the budget it actually needs instead of dying on the primary's clock.
 
+### Opt in to quota-only fallback
+
+Set `fallback_on: [quota_exhausted]` on an auxiliary task when crossing to another provider should be allowed **only** after an explicit, structured usage-quota exhaustion signal:
+
+```yaml
+custom_providers:
+  - name: compression-backup
+    base_url: https://backup.example/v1
+    key_env: BACKUP_API_KEY
+
+auxiliary:
+  compression:
+    provider: openrouter
+    model: anthropic/claude-sonnet-4
+    fallback_on: [quota_exhausted]
+    fallback_chain:
+      - provider: custom:compression-backup
+        model: backup-summary-model
+        timeout: 240
+```
+
+This opt-in is a closed policy. Hermes snapshots the task config, named custom provider, active main route (for an explicit `provider: main` entry), credentials, request body controls, and timeout before the primary request. A qualifying quota error walks only that frozen `fallback_chain`, in order. Ordinary rate limits, transport failures, authentication errors, invalid models, server errors, and malformed responses do not authorize a cross-provider request. Invalid `fallback_on` or `fallback_chain` values fail closed, and incomplete/ambient entries such as model-less `custom`, `custom:auto`, or `auto` are not discovered from environment variables.
+
+If `fallback_on` is **absent**, Hermes keeps the legacy broad auxiliary fallback behavior described above, including configured, main-model, and discovery fallbacks. This makes the stricter behavior explicitly opt-in and backward compatible.
+
 ### Provider quota errors that trigger fallback
 
 Hermes recognizes these as capacity-equivalent to 402 credit exhaustion (not transient rate limits):

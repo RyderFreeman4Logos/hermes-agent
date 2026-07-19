@@ -50,6 +50,7 @@ import os
 import re
 import threading
 import time
+from collections.abc import Mapping
 from pathlib import Path  # noqa: F401 — used by test mocks
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
@@ -104,7 +105,14 @@ class _OpenAIProxy:
 
 OpenAI = _OpenAIProxy()  # module-level name, resolves lazily on call/isinstance
 
+from agent.auxiliary_quota_policy import (
+    ClosedFallbackPlan,
+    FrozenRoute,
+    capture_closed_plan,
+    parse_fallback_policy,
+)
 from agent.credential_pool import load_pool
+from agent.error_classifier import is_explicit_usage_quota_exhaustion
 from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, get_model_context_length
 from hermes_cli.config import get_hermes_home
 from hermes_constants import OPENROUTER_BASE_URL
@@ -6411,6 +6419,12 @@ def _get_auxiliary_task_config(task: str) -> Dict[str, Any]:
     return task_config
 
 
+def _get_task_fallback_policy(task: Optional[str]) -> Optional[frozenset[str]]:
+    """Return the explicit closed policy, or ``None`` for legacy behavior."""
+
+    return parse_fallback_policy(_get_auxiliary_task_config(task or ""))
+
+
 def _get_task_timeout(task: str, default: float = _DEFAULT_AUX_TIMEOUT) -> float:
     """Read timeout from auxiliary.{task}.timeout in config, falling back to *default*."""
     if not task:
@@ -6442,7 +6456,29 @@ def _effective_aux_timeout(task: str, timeout: Optional[float]) -> float:
     return effective
 
 
-def _get_task_extra_body(task: str) -> Dict[str, Any]:
+def _effective_snapshot_timeout(
+    task: Optional[str],
+    timeout: Optional[float],
+    task_config: Mapping[str, Any],
+) -> float:
+    """Resolve timeout from a frozen task config without another config read."""
+
+    if timeout is not None:
+        return timeout
+    try:
+        effective = float(task_config.get("timeout", _DEFAULT_AUX_TIMEOUT))
+    except (TypeError, ValueError):
+        effective = _DEFAULT_AUX_TIMEOUT
+    if task == "compression":
+        effective = max(effective, _COMPRESSION_TIMEOUT_FLOOR_SECONDS)
+    return effective
+
+
+def _get_task_extra_body(
+    task: str,
+    *,
+    task_config: Optional[Mapping[str, Any]] = None,
+) -> Dict[str, Any]:
     """Read auxiliary.<task>.extra_body and return a shallow copy when valid.
 
     Also folds in ``auxiliary.<task>.reasoning_effort`` as an
@@ -6460,9 +6496,13 @@ def _get_task_extra_body(task: str) -> Dict[str, Any]:
     auxiliary-task knob — an ensemble-wide value would override the
     per-slot ones.
     """
-    task_config = _get_auxiliary_task_config(task)
+    task_config = (
+        task_config
+        if task_config is not None
+        else _get_auxiliary_task_config(task)
+    )
     raw = task_config.get("extra_body")
-    result = dict(raw) if isinstance(raw, dict) else {}
+    result = dict(raw) if isinstance(raw, Mapping) else {}
     if "reasoning" not in result:
         effort = task_config.get("reasoning_effort")
         if effort is not None and effort != "":
@@ -6799,6 +6839,10 @@ def _build_call_kwargs(
     return kwargs
 
 
+class AuxiliaryResponseValidationError(RuntimeError):
+    """A local malformed-response failure that never authorizes fallback."""
+
+
 def _validate_llm_response(
     response: Any,
     task: Optional[str] = None,
@@ -6822,7 +6866,7 @@ def _validate_llm_response(
     keeps the model (read from the response itself) with an empty route.
     """
     if response is None:
-        raise RuntimeError(
+        raise AuxiliaryResponseValidationError(
             f"Auxiliary {task or 'call'}: LLM returned None response"
         )
     from agent.aux_accounting import record_aux_usage
@@ -6833,16 +6877,22 @@ def _validate_llm_response(
         choices = response.choices
         if not choices or not hasattr(choices[0], "message"):
             raise AttributeError("missing choices[0].message")
-    except (AttributeError, TypeError, IndexError) as exc:
-        recovered = _recover_aux_response_message(response)
+    except Exception as exc:
+        try:
+            recovered = _recover_aux_response_message(response)
+        except Exception as recovery_exc:
+            raise AuxiliaryResponseValidationError(
+                f"Auxiliary {task or 'call'}: LLM returned invalid response "
+                f"(type={type(response).__name__}). Expected object with "
+                ".choices[0].message."
+            ) from recovery_exc
         if recovered is not None:
             return recovered
         response_type = type(response).__name__
-        response_preview = str(response)[:120]
-        raise RuntimeError(
+        raise AuxiliaryResponseValidationError(
             f"Auxiliary {task or 'call'}: LLM returned invalid response "
-            f"(type={response_type}): {response_preview!r}. "
-            f"Expected object with .choices[0].message — check provider "
+            f"(type={response_type}). Expected object with "
+            f".choices[0].message — check provider "
             f"adapter or custom endpoint compatibility."
         ) from exc
     return response
@@ -6906,6 +6956,162 @@ def _obj_get(obj: Any, key: str, default: Any = None) -> Any:
     return value
 
 
+def _resolve_closed_route(
+    route: FrozenRoute,
+    *,
+    task: Optional[str],
+    async_mode: bool,
+) -> Tuple[Optional[Any], Optional[str]]:
+    """Resolve one already-admitted route without ambient fallback authority."""
+
+    return _get_cached_client(
+        route.provider,
+        route.model,
+        async_mode=async_mode,
+        base_url=route.base_url,
+        api_key=route.api_key,
+        api_mode=route.api_mode,
+        main_runtime={},
+        is_vision=task == "vision",
+        task=None,
+    )
+
+
+def _closed_candidate_kwargs(
+    route: FrozenRoute,
+    model: Optional[str],
+    *,
+    messages: list,
+    temperature: Optional[float],
+    max_tokens: Optional[int],
+    tools: Optional[list],
+    effective_timeout: float,
+    effective_extra_body: dict,
+    reasoning_config: Optional[dict],
+) -> dict:
+    timeout = route.timeout or effective_timeout
+    kwargs = _build_call_kwargs(
+        route.provider,
+        model or route.model,
+        messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        tools=tools,
+        timeout=timeout,
+        extra_body=effective_extra_body,
+        reasoning_config=reasoning_config,
+        base_url=route.base_url,
+    )
+    if _is_anthropic_compat_endpoint(route.provider, route.base_url):
+        kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
+    return kwargs
+
+
+def _closed_allows_next(
+    plan: ClosedFallbackPlan,
+    error: BaseException,
+    *,
+    stop_exceptions: tuple[BaseException, ...] = (),
+) -> bool:
+    return bool(
+        plan.quota_enabled
+        and is_explicit_usage_quota_exhaustion(
+            error,
+            stop_exceptions=stop_exceptions,
+        )
+    )
+
+
+def _execute_closed_fallback_sync(
+    plan: ClosedFallbackPlan,
+    original_error: Exception,
+    *,
+    task: Optional[str],
+    messages: list,
+    temperature: Optional[float],
+    max_tokens: Optional[int],
+    tools: Optional[list],
+    effective_timeout: float,
+    effective_extra_body: dict,
+    reasoning_config: Optional[dict],
+) -> Optional[Any]:
+    for route in plan.candidates:
+        try:
+            client, model = _resolve_closed_route(
+                route, task=task, async_mode=False
+            )
+            if client is None:
+                continue
+            kwargs = _closed_candidate_kwargs(
+                route,
+                model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tools=tools,
+                effective_timeout=effective_timeout,
+                effective_extra_body=effective_extra_body,
+                reasoning_config=reasoning_config,
+            )
+            return _validate_llm_response(
+                client.chat.completions.create(**kwargs), task
+            )
+        except Exception as candidate_error:
+            if _closed_allows_next(
+                plan,
+                candidate_error,
+                stop_exceptions=(original_error,),
+            ):
+                continue
+            raise original_error from candidate_error
+    return None
+
+
+async def _execute_closed_fallback_async(
+    plan: ClosedFallbackPlan,
+    original_error: Exception,
+    *,
+    task: Optional[str],
+    messages: list,
+    temperature: Optional[float],
+    max_tokens: Optional[int],
+    tools: Optional[list],
+    effective_timeout: float,
+    effective_extra_body: dict,
+    reasoning_config: Optional[dict],
+) -> Optional[Any]:
+    for route in plan.candidates:
+        try:
+            client, model = _resolve_closed_route(
+                route, task=task, async_mode=True
+            )
+            if client is None:
+                continue
+            kwargs = _closed_candidate_kwargs(
+                route,
+                model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tools=tools,
+                effective_timeout=effective_timeout,
+                effective_extra_body=effective_extra_body,
+                reasoning_config=reasoning_config,
+            )
+            return _validate_llm_response(
+                await client.chat.completions.create(**kwargs), task
+            )
+        except Exception as candidate_error:
+            if _closed_allows_next(
+                plan,
+                candidate_error,
+                stop_exceptions=(original_error,),
+            ):
+                continue
+            raise original_error from candidate_error
+    return None
+
+
 def call_llm(
     task: str = None,
     *,
@@ -6965,11 +7171,39 @@ def call_llm(
     # concurrent /model switch produce a key for one runtime and a client for
     # another.
     main_runtime = _normalize_main_runtime(main_runtime)
-    resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
-        task, provider, model, base_url, api_key)
-    if api_mode:
-        resolved_api_mode = api_mode
-    effective_extra_body = _get_task_extra_body(task)
+    task_config = _get_auxiliary_task_config(task) if task else {}
+    closed_plan = capture_closed_plan(
+        task,
+        task_config,
+        main_runtime=main_runtime,
+        provider=provider,
+        model=model,
+        base_url=base_url,
+        api_key=api_key,
+        api_mode=api_mode,
+    )
+    if closed_plan is not None:
+        if closed_plan.primary is None:
+            raise RuntimeError(
+                f"Closed auxiliary fallback policy has no concrete primary "
+                f"route for task={task}"
+            )
+        primary = closed_plan.primary
+        main_runtime = dict(closed_plan.main_runtime)
+        resolved_provider = primary.provider
+        resolved_model = primary.model
+        resolved_base_url = primary.base_url
+        resolved_api_key = primary.api_key
+        resolved_api_mode = primary.api_mode
+        effective_extra_body = _get_task_extra_body(
+            task, task_config=closed_plan.config
+        )
+    else:
+        resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
+            task, provider, model, base_url, api_key)
+        if api_mode:
+            resolved_api_mode = api_mode
+        effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
 
     if task == "vision":
@@ -6981,7 +7215,12 @@ def call_llm(
             async_mode=False,
             main_runtime=main_runtime,
         )
-        if client is None and resolved_provider != "auto" and not resolved_base_url:
+        if (
+            client is None
+            and closed_plan is None
+            and resolved_provider != "auto"
+            and not resolved_base_url
+        ):
             logger.warning(
                 "Vision provider %s unavailable, falling back to auto vision backends",
                 resolved_provider,
@@ -7008,6 +7247,11 @@ def call_llm(
             main_runtime=main_runtime,
         )
         if client is None:
+            if closed_plan is not None:
+                raise RuntimeError(
+                    f"Closed auxiliary fallback policy primary route is unavailable "
+                    f"for task={task} provider={resolved_provider}"
+                )
             # When the user explicitly chose a non-OpenRouter provider but no
             # credentials were found, honor the task fallback_chain before
             # raising.  Missing raw env keys are recoverable for auxiliary
@@ -7041,7 +7285,11 @@ def call_llm(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
                 f"Run: hermes setup")
 
-    effective_timeout = _effective_aux_timeout(task, timeout)
+    effective_timeout = (
+        _effective_snapshot_timeout(task, timeout, closed_plan.config)
+        if closed_plan is not None
+        else _effective_aux_timeout(task, timeout)
+    )
 
     # Log what we're about to do — makes auxiliary operations visible
     _base_info = str(getattr(client, "base_url", resolved_base_url) or "")
@@ -7141,6 +7389,25 @@ def call_llm(
             # Retries exhausted — fall through to first_err fallback handling.
             raise _last_transient
     except Exception as first_err:
+        if closed_plan is not None:
+            if not _closed_allows_next(closed_plan, first_err):
+                raise
+            closed_response = _execute_closed_fallback_sync(
+                closed_plan,
+                first_err,
+                task=task,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tools=tools,
+                effective_timeout=effective_timeout,
+                effective_extra_body=effective_extra_body,
+                reasoning_config=reasoning_config,
+            )
+            if closed_response is not None:
+                return closed_response
+            raise
+
         if "temperature" in kwargs and _is_unsupported_temperature_error(first_err):
             retry_kwargs = dict(kwargs)
             retry_kwargs.pop("temperature", None)
@@ -7596,9 +7863,36 @@ async def async_call_llm(
     # Keep every async phase on the same runtime identity, even if another
     # session switches models while this task is awaiting network I/O.
     main_runtime = _normalize_main_runtime(main_runtime)
-    resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
-        task, provider, model, base_url, api_key)
-    effective_extra_body = _get_task_extra_body(task)
+    task_config = _get_auxiliary_task_config(task) if task else {}
+    closed_plan = capture_closed_plan(
+        task,
+        task_config,
+        main_runtime=main_runtime,
+        provider=provider,
+        model=model,
+        base_url=base_url,
+        api_key=api_key,
+    )
+    if closed_plan is not None:
+        if closed_plan.primary is None:
+            raise RuntimeError(
+                f"Closed auxiliary fallback policy has no concrete primary "
+                f"route for task={task}"
+            )
+        primary = closed_plan.primary
+        main_runtime = dict(closed_plan.main_runtime)
+        resolved_provider = primary.provider
+        resolved_model = primary.model
+        resolved_base_url = primary.base_url
+        resolved_api_key = primary.api_key
+        resolved_api_mode = primary.api_mode
+        effective_extra_body = _get_task_extra_body(
+            task, task_config=closed_plan.config
+        )
+    else:
+        resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
+            task, provider, model, base_url, api_key)
+        effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
 
     if task == "vision":
@@ -7610,7 +7904,12 @@ async def async_call_llm(
             async_mode=True,
             main_runtime=main_runtime,
         )
-        if client is None and resolved_provider != "auto" and not resolved_base_url:
+        if (
+            client is None
+            and closed_plan is None
+            and resolved_provider != "auto"
+            and not resolved_base_url
+        ):
             logger.warning(
                 "Vision provider %s unavailable, falling back to auto vision backends",
                 resolved_provider,
@@ -7638,6 +7937,11 @@ async def async_call_llm(
             main_runtime=main_runtime,
         )
         if client is None:
+            if closed_plan is not None:
+                raise RuntimeError(
+                    f"Closed auxiliary fallback policy primary route is unavailable "
+                    f"for task={task} provider={resolved_provider}"
+                )
             _explicit = (resolved_provider or "").strip().lower()
             if _explicit and _explicit not in {"auto", "openrouter", "custom"}:
                 fb_client, fb_model, fb_label = _try_configured_fallback_for_unavailable_client(
@@ -7663,7 +7967,11 @@ async def async_call_llm(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
                 f"Run: hermes setup")
 
-    effective_timeout = _effective_aux_timeout(task, timeout)
+    effective_timeout = (
+        _effective_snapshot_timeout(task, timeout, closed_plan.config)
+        if closed_plan is not None
+        else _effective_aux_timeout(task, timeout)
+    )
 
     # Pass the client's actual base_url (not just resolved_base_url) so
     # endpoint-specific temperature overrides can distinguish
@@ -7701,14 +8009,46 @@ async def async_call_llm(
                     transient_err,
                 )
                 raise
-            logger.info(
-                "Auxiliary %s (async): transient transport error; retrying "
-                "once on the same provider before fallback: %s",
-                task or "call", transient_err,
-            )
-            return _validate_llm_response(
-                await client.chat.completions.create(**kwargs), task)
+            _max_transient_retries = _transient_retry_count()
+            _last_transient = transient_err
+            for _attempt in range(1, _max_transient_retries + 1):
+                logger.info(
+                    "Auxiliary %s (async): transient transport error "
+                    "(attempt %d/%d); retrying same provider before fallback: %s",
+                    task or "call",
+                    _attempt,
+                    _max_transient_retries,
+                    _last_transient,
+                )
+                try:
+                    return _validate_llm_response(
+                        await client.chat.completions.create(**kwargs), task
+                    )
+                except Exception as retry_transient:
+                    if not _is_transient_transport_error(retry_transient):
+                        raise
+                    _last_transient = retry_transient
+            raise _last_transient
     except Exception as first_err:
+        if closed_plan is not None:
+            if not _closed_allows_next(closed_plan, first_err):
+                raise
+            closed_response = await _execute_closed_fallback_async(
+                closed_plan,
+                first_err,
+                task=task,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                tools=tools,
+                effective_timeout=effective_timeout,
+                effective_extra_body=effective_extra_body,
+                reasoning_config=reasoning_config,
+            )
+            if closed_response is not None:
+                return closed_response
+            raise
+
         if "temperature" in kwargs and _is_unsupported_temperature_error(first_err):
             retry_kwargs = dict(kwargs)
             retry_kwargs.pop("temperature", None)

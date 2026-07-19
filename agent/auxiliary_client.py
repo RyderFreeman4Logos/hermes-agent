@@ -7032,6 +7032,7 @@ def _closed_route_is_capable(
         route.provider,
         route.model,
         base_url=route.base_url,
+        api_key=route.api_key,
     )
     minimum = _task_minimum_context_length(plan.task)
     return minimum is None or known_window is None or known_window >= minimum

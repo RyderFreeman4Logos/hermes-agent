@@ -1092,17 +1092,20 @@ def test_compression_closed_chain_skips_known_small_context_candidate(
         }[kwargs.get("base_url")]
 
     monkeypatch.setattr(aux, "_get_cached_client", get_cached)
-    monkeypatch.setattr(
-        aux,
-        "_candidate_context_window",
-        lambda _provider, model, **_kwargs: 32_000 if model == "known-small" else None,
-    )
+    context_probe_api_keys = []
+
+    def candidate_context_window(_provider, model, **kwargs):
+        context_probe_api_keys.append(kwargs.get("api_key"))
+        return 32_000 if model == "known-small" else None
+
+    monkeypatch.setattr(aux, "_candidate_context_window", candidate_context_window)
     result = call_public(
         async_mode,
         task="compression",
         messages=[{"role": "user", "content": "compress"}],
     )
     assert result.choices[0].message.content == "unknown"
+    assert context_probe_api_keys == ["backup-key-0", "backup-key-1"]
     assert small_calls.calls == []
     assert len(unknown_calls.calls) == 1
 

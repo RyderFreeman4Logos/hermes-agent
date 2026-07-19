@@ -13,7 +13,7 @@ The client entrypoint is `src/entry.tsx`. It exits early if `stdin` is not a TTY
 `GatewayClient` spawns:
 
 ```text
-python -m tui_gateway.entry
+python -P -m tui_gateway.entry
 ```
 
 Interpreter resolution order is: `HERMES_PYTHON` → `PYTHON` → `$VIRTUAL_ENV/bin/python` → `./.venv/bin/python` → `./venv/bin/python` → `python3` (or `python` on Windows).

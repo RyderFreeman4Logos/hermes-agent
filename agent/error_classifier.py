@@ -16,6 +16,7 @@ import logging
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from numbers import Integral
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
@@ -99,17 +100,6 @@ class ClassifiedError:
         return self.reason in {FailoverReason.auth, FailoverReason.auth_permanent}
 
 
-@dataclass(frozen=True)
-class ExplicitUsageQuotaExhaustion:
-    """A narrow, non-sensitive proof that a usage bucket is exhausted.
-
-    ``marker`` is a classifier-owned label rather than provider payload text.
-    Callers can therefore inspect or log the result without accidentally
-    exposing a prompt, response body, endpoint credential, or reset metadata.
-    """
-
-    marker: str
-
 
 _QUOTA_MAX_CHAIN_DEPTH = 6
 _QUOTA_MAX_ENVELOPE_DEPTH = 4
@@ -130,7 +120,7 @@ _EXACT_QUOTA_AUTHORITIES = (
     "quotaexceeded",
     "personalteamblockedspendinglimit",
 )
-_DEVICE_QUOTA_AUTHORITY = "devicecodeexhausted"
+_DEVICE_QUOTA_AUTHORITY = "devicecodeexhaustederror"
 _GO_USAGE_LIMIT_AUTHORITY = "gousagelimiterror"
 
 # These exact structured authorities are conclusive evidence *against* a
@@ -190,20 +180,6 @@ _NON_QUOTA_MESSAGE_PATTERNS = (
     "malformed response",
 )
 
-_NON_QUOTA_EXCEPTION_TYPE_FRAGMENTS = (
-    "ratelimit",
-    "toomanyrequests",
-    "timeout",
-    "connection",
-    "connecterror",
-    "transport",
-    "network",
-    "protocolerror",
-    "authentication",
-    "permissiondenied",
-    "modelnotfound",
-    "invalidmodel",
-)
 
 # These exception types describe failures that must never authorize a
 # cross-provider request, even when an attached provider payload happens to
@@ -325,7 +301,7 @@ def _extract_explicit_quota_marker(
         if exception_type:
             node_markers.add(exception_type)
         if any(
-            _DEVICE_QUOTA_AUTHORITY in marker for marker in node_markers
+            marker == _DEVICE_QUOTA_AUTHORITY for marker in node_markers
         ) and any(
             "weekly credits" in message and "exhausted" in message
             for message in lowered
@@ -339,8 +315,8 @@ def _extract_explicit_quota_marker(
             paired_markers.add(_GO_USAGE_LIMIT_AUTHORITY)
 
     def record_status(value: Any) -> None:
-        if type(value) is int:
-            statuses.append(value)
+        if isinstance(value, Integral) and not isinstance(value, bool):
+            statuses.append(int(value))
             return
         text = bounded_text(value, message=False)
         if text is not None:
@@ -399,7 +375,7 @@ def _extract_explicit_quota_marker(
     while pending and not unsafe:
         kind, value, depth, ancestors = pending.pop()
         node_id = id(value)
-        if kind == "exception" and node_id in stop_exception_ids:
+        if node_id in stop_exception_ids:
             continue
         if node_id in ancestors:
             return None
@@ -419,8 +395,10 @@ def _extract_explicit_quota_marker(
                 tuple(mapping_value(value, name) for name in _QUOTA_AUTHORITY_FIELDS),
                 tuple(mapping_value(value, name) for name in _QUOTA_MESSAGE_FIELDS),
             )
-            nested_error = mapping_value(value, "error")
-            append_error_envelope(nested_error, depth + 1, descendants)
+            for name in ("error", "details"):
+                append_error_envelope(
+                    mapping_value(value, name), depth + 1, descendants
+                )
             continue
 
         if kind == "object":
@@ -432,9 +410,10 @@ def _extract_explicit_quota_marker(
                 tuple(safe_attr(value, name) for name in _QUOTA_AUTHORITY_FIELDS),
                 tuple(safe_attr(value, name) for name in _QUOTA_MESSAGE_FIELDS),
             )
-            append_error_envelope(
-                safe_attr(value, "error"), depth + 1, descendants
-            )
+            for name in ("error", "details"):
+                append_error_envelope(
+                    safe_attr(value, name), depth + 1, descendants
+                )
             continue
 
         for name in _QUOTA_STATUS_FIELDS:
@@ -449,15 +428,7 @@ def _extract_explicit_quota_marker(
             if response_raw_surface_is_oversized(value) or unsafe:
                 unsafe = True
                 continue
-            json_surface = safe_attr(value, "json")
-            if callable(json_surface):
-                try:
-                    json_payload = json_surface()
-                except Exception:
-                    unsafe = True
-                    continue
-            else:
-                json_payload = json_surface
+            json_payload = safe_attr(value, "json")
             if isinstance(json_payload, Mapping):
                 pending.append(("mapping", json_payload, 0, descendants))
             continue
@@ -520,7 +491,7 @@ def _extract_explicit_quota_marker(
         return None
     xai_spending_limit = "personalteamblockedspendinglimit" in structured_authorities
     if any(
-        status in {401, 404, 408}
+        status in {400, 401, 404, 408, 409, 422}
         or (status == 403 and not xai_spending_limit)
         or 500 <= status <= 599
         for status in statuses
@@ -551,40 +522,7 @@ def _extract_explicit_quota_marker(
     for marker in (_DEVICE_QUOTA_AUTHORITY, _GO_USAGE_LIMIT_AUTHORITY):
         if marker in paired_markers:
             return marker
-    if any(
-        fragment in exception_type
-        for exception_type in exception_types
-        for fragment in _NON_QUOTA_EXCEPTION_TYPE_FRAGMENTS
-    ):
-        return None
     return None
-
-
-def extract_explicit_usage_quota_exhaustion(
-    error: BaseException,
-    *,
-    stop_exceptions: tuple[BaseException, ...] = (),
-) -> Optional[ExplicitUsageQuotaExhaustion]:
-    """Extract an unequivocal usage/quota-exhaustion signal, or fail closed.
-
-    This intentionally does *not* share the broad ``FailoverReason`` billing
-    taxonomy.  Auxiliary cross-provider routing is a higher-risk action and is
-    limited to exact structured authorities or provider-contract exception
-    types paired with their expected message.  The
-    exception graph and provider payload surfaces are bounded, cycle-safe, and
-    restricted to semantic error envelopes; arbitrary metadata, debug data,
-    requests, and prompts are never traversed or concatenated.
-    """
-
-    if not isinstance(error, BaseException):
-        return None
-    marker = _extract_explicit_quota_marker(
-        error,
-        stop_exception_ids=frozenset(id(item) for item in stop_exceptions),
-    )
-    if marker is None:
-        return None
-    return ExplicitUsageQuotaExhaustion(marker=marker)
 
 
 def is_explicit_usage_quota_exhaustion(
@@ -594,9 +532,11 @@ def is_explicit_usage_quota_exhaustion(
 ) -> bool:
     """Return whether ``error`` proves usage exhaustion under the narrow policy."""
 
-    return extract_explicit_usage_quota_exhaustion(
+    if not isinstance(error, BaseException):
+        return False
+    return _extract_explicit_quota_marker(
         error,
-        stop_exceptions=stop_exceptions,
+        stop_exception_ids=frozenset(id(item) for item in stop_exceptions),
     ) is not None
 
 

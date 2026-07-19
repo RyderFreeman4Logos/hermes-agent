@@ -369,19 +369,32 @@ auxiliary:
         timeout: 240
 ```
 
-This opt-in is a closed policy. Hermes snapshots the task config, named custom provider, active main route (for an explicit `provider: main` entry), credentials, request body controls, and timeout before the primary request. A qualifying quota error walks only that frozen `fallback_chain`, in order. Ordinary rate limits, transport failures, authentication errors, invalid models, server errors, and malformed responses do not authorize a cross-provider request. Invalid `fallback_on` or `fallback_chain` values fail closed, and incomplete/ambient entries such as model-less `custom`, `custom:auto`, or `auto` are not discovered from environment variables.
+This opt-in is a closed policy. Hermes snapshots the task config, named custom provider, active main route (for an explicit `provider: main` entry), credentials, API mode, request body controls, and timeout before the primary request. A qualifying quota error walks only that frozen `fallback_chain`, in order. Ordinary rate limits, transport failures, authentication errors, invalid models, server errors, and malformed responses do not authorize a cross-provider request.
+
+Closed-policy candidates must be fully materialized without ambient provider discovery. The primary route must also be concrete at capture; `provider: auto` is unavailable in closed mode. Supported candidate forms are an explicit `provider: custom` entry with `model` and `base_url`, a named custom endpoint (`provider: custom:<name>`) with a concrete model, or `provider: main` when the active main route can be frozen as an explicit endpoint. Built-in and `auto` provider labels are rejected in the closed chain even if process-global credentials happen to exist. Inline keys and `key_env` / `api_key_env` values are resolved once from the active profile's secret scope; they never borrow another profile's process environment.
+
+Invalid `fallback_on` values fail closed. A malformed, incomplete, or unsupported entry (including model-less `custom`, `custom:auto`, and `auto`) invalidates the entire frozen chain for that request rather than being skipped. The primary request still runs, and if no admissible fallback succeeds Hermes preserves the original primary exception. Known text-only vision candidates and known compression models below the minimum context window are skipped; unknown custom capabilities remain permissive for compatibility.
+
+Sync and async calls capture the same route fields and apply the same capability and exception-precedence rules. Closed mode allows at most one configured same-provider transient retry; async uses non-blocking backoff. Legacy async calls retain their historical single immediate retry. Same-provider OAuth refresh (including an `openai-codex` primary) also remains available before the closed policy considers a cross-provider route.
 
 If `fallback_on` is **absent**, Hermes keeps the legacy broad auxiliary fallback behavior described above, including configured, main-model, and discovery fallbacks. This makes the stricter behavior explicitly opt-in and backward compatible.
 
-### Provider quota errors that trigger fallback
+### Provider quota errors and policy scope
 
-Hermes recognizes these as capacity-equivalent to 402 credit exhaustion (not transient rate limits):
+Quota-only fallback recognizes bounded structured fields (`code`, `type`,
+`reason`, `message`, or `detail`) with explicit usage-exhaustion markers such
+as `insufficient_quota`, `quota_exhausted`, `usage_limit_reached`, or the
+xAI spending-limit code. Hermes also recognizes the provider-specific
+`DeviceCodeExhaustedError` and `GoUsageLimitError` exception types. HTTP 429,
+HTTP 402, `RESOURCE_EXHAUSTED`, ordinary exception text, RPM/TPM throttling,
+and transport/auth/server failures are not sufficient authority in closed
+mode. Conflicting non-quota signals win and fail closed.
 
-- Bedrock / LiteLLM: `Too many tokens per day`, `daily limit`, `tokens per day`
-- Vertex AI / GCP: `quota exceeded`, `resource exhausted`, `RESOURCE_EXHAUSTED`
-- Generic: `daily quota`, `quota_exceeded`
-
-If your provider returns a different phrase for daily-quota exhaustion and Hermes doesn't trigger fallback, that's a bug — open an issue with the exact error string.
+Without `fallback_on`, the legacy broad fallback classifier remains unchanged
+and can recognize capacity-equivalent phrases such as daily limits or
+`RESOURCE_EXHAUSTED`. If a provider returns an authoritative structured
+usage-quota marker that closed mode does not recognize, open an issue with a
+redacted payload shape.
 
 ---
 

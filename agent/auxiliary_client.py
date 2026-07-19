@@ -40,6 +40,7 @@ Payment / credit exhaustion fallback:
   their OpenRouter balance but has Codex OAuth or another provider available.
 """
 
+import asyncio
 import contextlib
 import contextvars
 import hashlib
@@ -109,7 +110,6 @@ from agent.auxiliary_quota_policy import (
     ClosedFallbackPlan,
     FrozenRoute,
     capture_closed_plan,
-    parse_fallback_policy,
 )
 from agent.credential_pool import load_pool
 from agent.error_classifier import is_explicit_usage_quota_exhaustion
@@ -3596,8 +3596,9 @@ def _retry_same_provider_sync(
     effective_timeout: float,
     effective_extra_body: dict,
     reasoning_config: Optional[dict],
+    frozen_route: bool = False,
 ) -> Any:
-    if task == "vision":
+    if task == "vision" and not frozen_route:
         _, retry_client, retry_model = resolve_vision_provider_client(
             provider=resolved_provider,
             model=final_model,
@@ -3613,6 +3614,7 @@ def _retry_same_provider_sync(
             api_key=resolved_api_key,
             api_mode=resolved_api_mode,
             main_runtime=main_runtime,
+            is_vision=task == "vision",
         )
     if retry_client is None:
         raise RuntimeError(
@@ -3655,8 +3657,9 @@ async def _retry_same_provider_async(
     effective_timeout: float,
     effective_extra_body: dict,
     reasoning_config: Optional[dict],
+    frozen_route: bool = False,
 ) -> Any:
-    if task == "vision":
+    if task == "vision" and not frozen_route:
         _, retry_client, retry_model = resolve_vision_provider_client(
             provider=resolved_provider,
             model=final_model,
@@ -3672,6 +3675,7 @@ async def _retry_same_provider_async(
             base_url=resolved_base_url,
             api_key=resolved_api_key,
             api_mode=resolved_api_mode,
+            is_vision=task == "vision",
         )
     if retry_client is None:
         raise RuntimeError(
@@ -6419,12 +6423,6 @@ def _get_auxiliary_task_config(task: str) -> Dict[str, Any]:
     return task_config
 
 
-def _get_task_fallback_policy(task: Optional[str]) -> Optional[frozenset[str]]:
-    """Return the explicit closed policy, or ``None`` for legacy behavior."""
-
-    return parse_fallback_policy(_get_auxiliary_task_config(task or ""))
-
-
 def _get_task_timeout(task: str, default: float = _DEFAULT_AUX_TIMEOUT) -> float:
     """Read timeout from auxiliary.{task}.timeout in config, falling back to *default*."""
     if not task:
@@ -7022,6 +7020,23 @@ def _closed_allows_next(
     )
 
 
+def _closed_route_is_capable(
+    plan: ClosedFallbackPlan,
+    route: FrozenRoute,
+) -> bool:
+    if plan.task == "vision":
+        return _main_model_supports_vision(route.provider, route.model)
+    if plan.task != "compression":
+        return True
+    known_window = _candidate_context_window(
+        route.provider,
+        route.model,
+        base_url=route.base_url,
+    )
+    minimum = _task_minimum_context_length(plan.task)
+    return minimum is None or known_window is None or known_window >= minimum
+
+
 def _execute_closed_fallback_sync(
     plan: ClosedFallbackPlan,
     original_error: Exception,
@@ -7036,6 +7051,8 @@ def _execute_closed_fallback_sync(
     reasoning_config: Optional[dict],
 ) -> Optional[Any]:
     for route in plan.candidates:
+        if not _closed_route_is_capable(plan, route):
+            continue
         try:
             client, model = _resolve_closed_route(
                 route, task=task, async_mode=False
@@ -7081,6 +7098,8 @@ async def _execute_closed_fallback_async(
     reasoning_config: Optional[dict],
 ) -> Optional[Any]:
     for route in plan.candidates:
+        if not _closed_route_is_capable(plan, route):
+            continue
         try:
             client, model = _resolve_closed_route(
                 route, task=task, async_mode=True
@@ -7189,6 +7208,12 @@ def call_llm(
                 f"route for task={task}"
             )
         primary = closed_plan.primary
+        if task == "vision" and not _main_model_supports_vision(
+            primary.provider, primary.model
+        ):
+            raise RuntimeError(
+                "Closed auxiliary fallback policy primary route does not support vision"
+            )
         main_runtime = dict(closed_plan.main_runtime)
         resolved_provider = primary.provider
         resolved_model = primary.model
@@ -7206,7 +7231,7 @@ def call_llm(
         effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
 
-    if task == "vision":
+    if task == "vision" and closed_plan is None:
         effective_provider, client, final_model = resolve_vision_provider_client(
             provider=resolved_provider if resolved_provider != "auto" else provider,
             model=resolved_model or model,
@@ -7245,6 +7270,7 @@ def call_llm(
             api_key=resolved_api_key,
             api_mode=resolved_api_mode,
             main_runtime=main_runtime,
+            is_vision=task == "vision",
         )
         if client is None:
             if closed_plan is not None:
@@ -7368,7 +7394,12 @@ def call_llm(
                     transient_err,
                 )
                 raise
-            _max_transient_retries = _transient_retry_count()
+            _configured_retries = _transient_retry_count()
+            _max_transient_retries = (
+                min(_configured_retries, 1)
+                if closed_plan is not None
+                else _configured_retries
+            )
             _last_transient = transient_err
             for _attempt in range(1, _max_transient_retries + 1):
                 _backoff = min(_TRANSIENT_RETRY_BACKOFF_BASE * (2.0 ** (_attempt - 1)), 8.0)
@@ -7390,8 +7421,41 @@ def call_llm(
             raise _last_transient
     except Exception as first_err:
         if closed_plan is not None:
+            auth_refresh_provider = _auth_refresh_provider_for_route(
+                resolved_provider, _base_info
+            )
+            if (
+                _is_auth_error(first_err)
+                and auth_refresh_provider not in {"auto", "", None, "nous"}
+                and _refresh_provider_credentials(auth_refresh_provider)
+            ):
+                if auth_refresh_provider != _normalize_aux_provider(
+                    resolved_provider
+                ):
+                    _evict_cached_clients(resolved_provider)
+                try:
+                    return _retry_same_provider_sync(
+                        task=task,
+                        resolved_provider=auth_refresh_provider,
+                        resolved_model=resolved_model or final_model,
+                        resolved_base_url=resolved_base_url,
+                        resolved_api_key=resolved_api_key,
+                        resolved_api_mode=resolved_api_mode,
+                        main_runtime=main_runtime,
+                        final_model=final_model,
+                        messages=messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        tools=tools,
+                        effective_timeout=effective_timeout,
+                        effective_extra_body=effective_extra_body,
+                        reasoning_config=reasoning_config,
+                        frozen_route=True,
+                    )
+                except Exception as retry_err:
+                    first_err = retry_err
             if not _closed_allows_next(closed_plan, first_err):
-                raise
+                raise first_err
             closed_response = _execute_closed_fallback_sync(
                 closed_plan,
                 first_err,
@@ -7855,6 +7919,7 @@ async def async_call_llm(
     timeout: float = None,
     extra_body: dict = None,
     reasoning_config: Optional[dict] = None,
+    api_mode: str = None,
 ) -> Any:
     """Centralized asynchronous LLM call.
 
@@ -7872,6 +7937,7 @@ async def async_call_llm(
         model=model,
         base_url=base_url,
         api_key=api_key,
+        api_mode=api_mode,
     )
     if closed_plan is not None:
         if closed_plan.primary is None:
@@ -7880,6 +7946,12 @@ async def async_call_llm(
                 f"route for task={task}"
             )
         primary = closed_plan.primary
+        if task == "vision" and not _main_model_supports_vision(
+            primary.provider, primary.model
+        ):
+            raise RuntimeError(
+                "Closed auxiliary fallback policy primary route does not support vision"
+            )
         main_runtime = dict(closed_plan.main_runtime)
         resolved_provider = primary.provider
         resolved_model = primary.model
@@ -7892,10 +7964,12 @@ async def async_call_llm(
     else:
         resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
             task, provider, model, base_url, api_key)
+        if api_mode:
+            resolved_api_mode = api_mode
         effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
 
-    if task == "vision":
+    if task == "vision" and closed_plan is None:
         effective_provider, client, final_model = resolve_vision_provider_client(
             provider=resolved_provider if resolved_provider != "auto" else provider,
             model=resolved_model or model,
@@ -7935,6 +8009,7 @@ async def async_call_llm(
             api_key=resolved_api_key,
             api_mode=resolved_api_mode,
             main_runtime=main_runtime,
+            is_vision=task == "vision",
         )
         if client is None:
             if closed_plan is not None:
@@ -8009,9 +8084,18 @@ async def async_call_llm(
                     transient_err,
                 )
                 raise
-            _max_transient_retries = _transient_retry_count()
+            _configured_retries = _transient_retry_count()
+            _max_transient_retries = (
+                min(_configured_retries, 1) if closed_plan is not None else 1
+            )
             _last_transient = transient_err
             for _attempt in range(1, _max_transient_retries + 1):
+                if closed_plan is not None:
+                    _backoff = min(
+                        _TRANSIENT_RETRY_BACKOFF_BASE * (2.0 ** (_attempt - 1)),
+                        8.0,
+                    )
+                    await asyncio.sleep(_backoff)
                 logger.info(
                     "Auxiliary %s (async): transient transport error "
                     "(attempt %d/%d); retrying same provider before fallback: %s",
@@ -8031,8 +8115,40 @@ async def async_call_llm(
             raise _last_transient
     except Exception as first_err:
         if closed_plan is not None:
+            auth_refresh_provider = _auth_refresh_provider_for_route(
+                resolved_provider, _client_base
+            )
+            if (
+                _is_auth_error(first_err)
+                and auth_refresh_provider not in {"auto", "", None, "nous"}
+                and _refresh_provider_credentials(auth_refresh_provider)
+            ):
+                if auth_refresh_provider != _normalize_aux_provider(
+                    resolved_provider
+                ):
+                    _evict_cached_clients(resolved_provider)
+                try:
+                    return await _retry_same_provider_async(
+                        task=task,
+                        resolved_provider=auth_refresh_provider,
+                        resolved_model=resolved_model or final_model,
+                        resolved_base_url=resolved_base_url,
+                        resolved_api_key=resolved_api_key,
+                        resolved_api_mode=resolved_api_mode,
+                        final_model=final_model,
+                        messages=messages,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        tools=tools,
+                        effective_timeout=effective_timeout,
+                        effective_extra_body=effective_extra_body,
+                        reasoning_config=reasoning_config,
+                        frozen_route=True,
+                    )
+                except Exception as retry_err:
+                    first_err = retry_err
             if not _closed_allows_next(closed_plan, first_err):
-                raise
+                raise first_err
             closed_response = await _execute_closed_fallback_async(
                 closed_plan,
                 first_err,

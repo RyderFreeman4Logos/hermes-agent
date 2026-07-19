@@ -8,11 +8,12 @@ providers later in the request.
 
 from __future__ import annotations
 
-import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Optional
+
+from agent.secret_scope import get_secret
 
 _SUPPORTED_TRIGGERS = frozenset({"quota_exhausted"})
 _MISSING = object()
@@ -47,7 +48,7 @@ def _route_key(route: Mapping[str, Any]) -> Any:
     if callable(direct) or str(direct or "").strip():
         return direct
     key_env = str(route.get("key_env") or route.get("api_key_env") or "").strip()
-    return os.environ.get(key_env) if key_env else None
+    return get_secret(key_env) if key_env else None
 
 
 def _materialize_named_custom(route: Mapping[str, Any]) -> dict[str, Any]:
@@ -96,10 +97,6 @@ class FrozenRoute:
     api_mode: Optional[str] = None
     timeout: Optional[float] = None
 
-    @property
-    def label(self) -> str:
-        return f"fallback_chain[{self.index}]({self.declared_provider})"
-
 
 @dataclass(frozen=True)
 class ClosedFallbackPlan:
@@ -131,6 +128,7 @@ def _route_from_mapping(
     index: int,
     main_runtime: Mapping[str, Any],
     require_base_url: bool = True,
+    closed_candidate: bool = False,
 ) -> Optional[FrozenRoute]:
     entry = dict(entry)
     declared = str(entry.get("provider") or "").strip()
@@ -143,7 +141,8 @@ def _route_from_mapping(
     )
     route_timeout = entry.get("timeout")
 
-    if normalized == "main":
+    requested_main = normalized == "main"
+    if requested_main:
         declared = "main"
         configured_model = model
         configured_api_mode = api_mode
@@ -164,12 +163,21 @@ def _route_from_mapping(
         return None
     if (normalized == "custom" or named_custom) and not base_url:
         return None
+    if closed_candidate and callable(api_key):
+        return None
+    if closed_candidate and requested_main and not api_key:
+        return None
     if base_url and not api_key:
         # Explicitly freeze the intentional no-auth case instead of allowing
         # the generic resolver to borrow an ambient pool/env credential.
         api_key = "no-key-required"
 
-    if normalized == "custom" or named_custom:
+    if closed_candidate and not (
+        normalized == "custom" or named_custom or requested_main
+    ):
+        return None
+
+    if normalized == "custom" or named_custom or (requested_main and closed_candidate):
         resolver_provider = "custom"
     else:
         # A base URL makes this route concrete.  Keeping the declared provider
@@ -217,7 +225,28 @@ def capture_closed_plan(
         ]
     task_config["fallback_chain"] = materialized_chain
 
-    primary_config = dict(task_config)
+    configured_provider = str(task_config.get("provider") or "").strip().lower()
+    configured_base_url = str(task_config.get("base_url") or "").strip()
+    provider_changed = (
+        provider is not None and str(provider).strip().lower() != configured_provider
+    )
+    base_url_changed = (
+        base_url is not None and str(base_url).strip() != configured_base_url
+    )
+    if provider_changed or base_url_changed:
+        primary_config = {
+            "provider": (
+                provider
+                if provider is not None
+                else ("custom" if base_url_changed else task_config.get("provider"))
+            ),
+            "model": model if model is not None else task_config.get("model"),
+            "base_url": base_url,
+            "api_key": api_key,
+            "api_mode": api_mode,
+        }
+    else:
+        primary_config = dict(task_config)
     for field, value in (
         ("provider", provider),
         ("model", model),
@@ -234,13 +263,21 @@ def capture_closed_plan(
         require_base_url=False,
     )
 
-    candidates = tuple(
-        route
-        for index, entry in enumerate(materialized_chain)
-        if isinstance(entry, Mapping)
-        for route in (_route_from_mapping(entry, index=index, main_runtime=runtime),)
-        if route is not None
-    )
+    candidates: tuple[FrozenRoute, ...] = ()
+    if materialized_chain and all(
+        isinstance(entry, Mapping) for entry in materialized_chain
+    ):
+        admitted = tuple(
+            _route_from_mapping(
+                entry,
+                index=index,
+                main_runtime=runtime,
+                closed_candidate=True,
+            )
+            for index, entry in enumerate(materialized_chain)
+        )
+        if all(route is not None for route in admitted):
+            candidates = tuple(route for route in admitted if route is not None)
     return ClosedFallbackPlan(
         task=task,
         policy=policy,

@@ -449,6 +449,42 @@ class TestClosedRouting:
         assert len(primary_calls.calls) == 1
         assert backup_calls.calls == []
 
+    @pytest.mark.parametrize("async_mode", [False, True])
+    @pytest.mark.parametrize("surface", ["direct", "nested", "causal_sibling"])
+    def test_bare_generic_quota_exceeded_never_authorizes_fallback(
+        self, monkeypatch, async_mode, surface
+    ):
+        marker = {"code": "quota_exceeded"}
+        body = {"error": marker if surface == "direct" else {"details": marker}}
+        original = ProviderError("provider error", status_code=429, body=body)
+        if surface == "causal_sibling":
+            setattr(original, "body", {})
+            original.__cause__ = ProviderError(body={"error": marker})
+        primary_calls = (
+            AsyncCompletions(original) if async_mode else SyncCompletions(original)
+        )
+        backup_calls = (
+            AsyncCompletions(response("must not run"))
+            if async_mode
+            else SyncCompletions(response("must not run"))
+        )
+        install_sync_chain(
+            monkeypatch,
+            Client(primary_calls),
+            [Client(backup_calls)],
+        )
+
+        with pytest.raises(ProviderError) as caught:
+            call_public(
+                async_mode,
+                task="compression",
+                messages=[{"role": "user", "content": "compress"}],
+            )
+
+        assert caught.value is original
+        assert len(primary_calls.calls) == 1
+        assert backup_calls.calls == []
+
     def test_nonquota_candidate_reraises_original_with_candidate_as_cause(
         self, monkeypatch
     ):
@@ -622,6 +658,181 @@ class TestClosedRouting:
 
 
 class TestFrozenSnapshot:
+    def test_closed_plan_normalizes_all_three_route_sources(self, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider._get_named_custom_provider",
+            lambda _provider: {
+                "base_url": "https://named.example/v1",
+                "api_key": "named-key",
+                "model": "named-default",
+            },
+        )
+        config = quota_config(0)
+        config["model"] = "auto"
+        config["fallback_chain"] = [
+            {"provider": "custom:backup", "model": "auto"},
+            {"provider": "main"},
+        ]
+
+        snapshot = policy.capture_closed_plan(
+            "compression",
+            config,
+            main_runtime={
+                "provider": "openai",
+                "model": "gpt-main",
+                "api_key": "main-key",
+            },
+        )
+
+        assert snapshot is not None
+        assert snapshot.primary is not None
+        assert snapshot.primary.model is None
+        assert snapshot.candidates[0].model == "named-default"
+        assert (
+            snapshot.candidates[1].provider,
+            snapshot.candidates[1].base_url,
+        ) == ("custom", "https://api.openai.com/v1")
+
+    @pytest.mark.parametrize("async_mode", [False, True])
+    def test_public_primary_normalizes_auto_model_and_openai_alias(
+        self, monkeypatch, async_mode
+    ):
+        config = quota_config(0)
+        config.update(provider="openai", model="auto", api_key="openai-key")
+        config.pop("base_url")
+        calls = (
+            AsyncCompletions(response("ok"))
+            if async_mode
+            else SyncCompletions(response("ok"))
+        )
+        resolutions = []
+        monkeypatch.setattr(aux, "_get_auxiliary_task_config", lambda _task: config)
+
+        def get_cached(provider, model, **kwargs):
+            resolutions.append((provider, model, dict(kwargs)))
+            return Client(calls, str(kwargs.get("base_url") or "")), "gpt-runtime-default"
+
+        monkeypatch.setattr(aux, "_get_cached_client", get_cached)
+        call_public(
+            async_mode,
+            task="web_extract",
+            messages=[{"role": "user", "content": "extract"}],
+        )
+
+        provider, model, client_kwargs = resolutions[0]
+        assert (provider, model) == ("custom", None)
+        assert client_kwargs["base_url"] == "https://api.openai.com/v1"
+        assert client_kwargs["api_key"] == "openai-key"
+        assert calls.calls[0]["model"] == "gpt-runtime-default"
+
+    @pytest.mark.parametrize("async_mode", [False, True])
+    def test_public_candidate_auto_model_uses_frozen_named_default(
+        self, monkeypatch, async_mode
+    ):
+        config = quota_config(0)
+        config["fallback_chain"] = [
+            {"provider": "custom:backup", "model": "auto"}
+        ]
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider._get_named_custom_provider",
+            lambda _provider: {
+                "base_url": "https://named.example/v1",
+                "api_key": "named-key",
+                "model": "named-default",
+            },
+        )
+        original = quota_error()
+        primary_calls = (
+            AsyncCompletions(original) if async_mode else SyncCompletions(original)
+        )
+        backup_calls = (
+            AsyncCompletions(response("fallback"))
+            if async_mode
+            else SyncCompletions(response("fallback"))
+        )
+        resolutions = []
+        monkeypatch.setattr(aux, "_get_auxiliary_task_config", lambda _task: config)
+
+        def get_cached(provider, model, **kwargs):
+            resolutions.append((provider, model, dict(kwargs)))
+            if kwargs.get("base_url") == "https://primary.example/v1":
+                return Client(primary_calls), "primary-model"
+            return Client(backup_calls, str(kwargs.get("base_url") or "")), model
+
+        monkeypatch.setattr(aux, "_get_cached_client", get_cached)
+        result = call_public(
+            async_mode,
+            task="web_extract",
+            messages=[{"role": "user", "content": "extract"}],
+        )
+
+        assert result.choices[0].message.content == "fallback"
+        assert resolutions[1][1] == "named-default"
+        assert backup_calls.calls[0]["model"] == "named-default"
+
+    @pytest.mark.parametrize("sink", ["task_config", "main_runtime"])
+    def test_closed_plan_rejects_cycles_with_policy_error(self, sink):
+        config = quota_config(0)
+        runtime = {}
+        cyclic = {}
+        cyclic["self"] = cyclic
+        if sink == "task_config":
+            config["extra_body"] = cyclic
+        else:
+            runtime["nested"] = cyclic
+
+        with pytest.raises(ValueError, match="cycle"):
+            policy.capture_closed_plan(
+                "compression",
+                config,
+                main_runtime=runtime,
+            )
+
+    def test_closed_plan_rejects_excessive_snapshot_depth(self):
+        nested = []
+        for _ in range(34):
+            nested = [nested]
+        config = quota_config(0)
+        config["extra_body"] = nested
+
+        with pytest.raises(ValueError, match="depth limit"):
+            policy.capture_closed_plan("compression", config)
+
+    def test_closed_plan_rejects_excessive_snapshot_nodes(self):
+        config = quota_config(0)
+        config["extra_body"] = {"items": [None] * 10_000}
+
+        with pytest.raises(ValueError, match="node limit"):
+            policy.capture_closed_plan("compression", config)
+
+    @pytest.mark.parametrize("async_mode", [False, True])
+    @pytest.mark.parametrize(
+        "invalid_payload",
+        [
+            {"value": b"not-json"},
+            {"value": float("nan")},
+            {"nested": {1: "non-string-key"}},
+        ],
+    )
+    def test_public_payload_rejects_non_json_values_before_client_resolution(
+        self, monkeypatch, async_mode, invalid_payload
+    ):
+        config = quota_config(0)
+        config["extra_body"] = invalid_payload
+        monkeypatch.setattr(aux, "_get_auxiliary_task_config", lambda _task: config)
+        monkeypatch.setattr(
+            aux,
+            "_get_cached_client",
+            lambda *_args, **_kwargs: pytest.fail("invalid payload reached client"),
+        )
+
+        with pytest.raises(ValueError):
+            call_public(
+                async_mode,
+                task="web_extract",
+                messages=[{"role": "user", "content": "extract"}],
+            )
+
     @pytest.mark.parametrize("async_mode", [False, True])
     def test_nested_extra_body_is_json_payload_and_detached_from_config(
         self, monkeypatch, async_mode
@@ -1395,6 +1606,105 @@ def test_closed_openai_codex_primary_preserves_auth_refresh(monkeypatch, async_m
     )
     assert result.choices[0].message.content == "refreshed"
     assert len(resolutions) == 2
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_closed_main_anthropic_refresh_reloads_scoped_credential(
+    monkeypatch, async_mode
+):
+    config = {**quota_config(0), "provider": "main"}
+    auth_error = type("AuthenticationError", (ProviderError,), {})("expired token")
+    expired_calls = (
+        AsyncCompletions(auth_error) if async_mode else SyncCompletions(auth_error)
+    )
+    refreshed_calls = (
+        AsyncCompletions(response("refreshed"))
+        if async_mode
+        else SyncCompletions(response("refreshed"))
+    )
+    credential = {"value": "expired-anthropic-token"}
+    resolutions = []
+    monkeypatch.setattr(aux, "_get_auxiliary_task_config", lambda _task: config)
+
+    def get_cached(*_args, **kwargs):
+        explicit_key = kwargs.get("api_key")
+        effective_key = explicit_key or credential["value"]
+        resolutions.append((explicit_key, effective_key))
+        calls = (
+            expired_calls
+            if effective_key == "expired-anthropic-token"
+            else refreshed_calls
+        )
+        return Client(calls, "https://api.anthropic.com"), "claude-refresh"
+
+    def refresh(provider):
+        assert provider == "anthropic"
+        credential["value"] = "refreshed-anthropic-token"
+        return True
+
+    monkeypatch.setattr(aux, "_get_cached_client", get_cached)
+    monkeypatch.setattr(aux, "_refresh_provider_credentials", refresh)
+    result = call_public(
+        async_mode,
+        task="web_extract",
+        main_runtime={
+            "provider": "anthropic",
+            "model": "claude-refresh",
+            "base_url": "https://api.anthropic.com",
+            "api_key": "expired-anthropic-token",
+        },
+        messages=[{"role": "user", "content": "extract"}],
+    )
+
+    assert result.choices[0].message.content == "refreshed"
+    assert resolutions == [
+        ("expired-anthropic-token", "expired-anthropic-token"),
+        (None, "refreshed-anthropic-token"),
+    ]
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_closed_explicit_anthropic_route_keeps_frozen_credential_on_refresh(
+    monkeypatch, async_mode
+):
+    config = {
+        **quota_config(0),
+        "provider": "anthropic",
+        "model": "claude-frozen",
+        "base_url": "https://api.anthropic.com",
+        "api_key": "frozen-anthropic-token",
+    }
+    auth_error = type("AuthenticationError", (ProviderError,), {})("refreshable")
+    first_calls = (
+        AsyncCompletions(auth_error) if async_mode else SyncCompletions(auth_error)
+    )
+    retry_calls = (
+        AsyncCompletions(response("frozen retry"))
+        if async_mode
+        else SyncCompletions(response("frozen retry"))
+    )
+    resolutions = []
+    monkeypatch.setattr(aux, "_get_auxiliary_task_config", lambda _task: config)
+
+    def get_cached(*_args, **kwargs):
+        resolutions.append(kwargs.get("api_key"))
+        calls = first_calls if len(resolutions) == 1 else retry_calls
+        return Client(calls, "https://api.anthropic.com"), "claude-frozen"
+
+    monkeypatch.setattr(aux, "_get_cached_client", get_cached)
+    monkeypatch.setattr(
+        aux,
+        "_refresh_provider_credentials",
+        lambda provider: provider == "anthropic",
+    )
+    result = call_public(
+        async_mode,
+        task="web_extract",
+        messages=[{"role": "user", "content": "extract"}],
+    )
+
+    assert result.choices[0].message.content == "frozen retry"
+    assert resolutions == ["frozen-anthropic-token", "frozen-anthropic-token"]
 
 
 @pytest.mark.parametrize("async_mode", [False, True])

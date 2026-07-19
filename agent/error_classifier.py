@@ -117,7 +117,6 @@ _EXACT_QUOTA_AUTHORITIES = (
     "insufficientquota",
     "usagelimitreached",
     "quotaexhausted",
-    "quotaexceeded",
     "personalteamblockedspendinglimit",
 )
 _DEVICE_QUOTA_AUTHORITY = "devicecodeexhaustederror"

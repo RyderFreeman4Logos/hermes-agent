@@ -110,6 +110,7 @@ from agent.auxiliary_quota_policy import (
     ClosedFallbackPlan,
     FrozenRoute,
     capture_closed_plan,
+    normalize_route_runtime,
     thaw_json_payload,
 )
 from agent.credential_pool import load_pool
@@ -3703,6 +3704,18 @@ async def _retry_same_provider_async(
     )
 
 
+def _closed_refresh_retry_api_key(
+    plan: ClosedFallbackPlan,
+    frozen_api_key: Optional[str],
+) -> Optional[str]:
+    """Reload scoped credentials only for an explicitly frozen main route."""
+
+    primary = plan.primary
+    if primary is not None and primary.declared_provider == "main":
+        return None
+    return frozen_api_key
+
+
 def _refresh_provider_credentials(provider: str) -> bool:
     """Refresh short-lived credentials for OAuth-backed auxiliary providers."""
     normalized = _normalize_aux_provider(provider)
@@ -6225,29 +6238,12 @@ def _get_cached_client(
     return client, model or default_model
 
 
-# Aliases that target direct REST APIs not modeled as first-class providers
-# in PROVIDER_REGISTRY. Used for ``auxiliary.<task>.provider`` so users can
-# write the obvious name and have it resolve to a working ``custom`` endpoint
-# without needing to know our internal provider IDs.
-#
-# Why these specifically: PROVIDER_REGISTRY has ``openai-codex`` (OAuth) and
-# ``custom`` (manual base_url + OPENAI_API_KEY) but no plain ``openai`` for
-# direct API-key access. Users predictably type ``provider: openai`` and
-# expect it to use OPENAI_API_KEY against api.openai.com. Previously this
-# silently fell back to the user's main provider, sending OpenAI model names
-# to e.g. DeepSeek and producing cryptic ``unknown variant 'image_url'``
-# errors (issue #31179).
-_AUX_DIRECT_API_BASE_URLS: Dict[str, str] = {
-    "openai": "https://api.openai.com/v1",
-}
-
-
 def _resolve_task_provider_model(
-    task: str = None,
-    provider: str = None,
-    model: str = None,
-    base_url: str = None,
-    api_key: str = None,
+    task: Optional[str] = None,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
 ) -> Tuple[str, Optional[str], Optional[str], Optional[str], Optional[str]]:
     """Determine provider + model for a call.
 
@@ -6283,32 +6279,21 @@ def _resolve_task_provider_model(
                 cfg_api_key = os.getenv(cfg_key_env, "").strip() or None
         cfg_api_mode = str(task_config.get("api_mode", "")).strip() or None
 
-    # 'auto' is a sentinel meaning "inherit from main runtime / auto-detect", not
-    # a literal model id. Without this, a config of `auxiliary.<task>.model: auto`
-    # propagates the literal string "auto" to the wire, where the provider returns
-    # a 200 OK with an error-text body (e.g. "the model 'auto' does not exist"),
-    # which downstream consumers like ContextCompressor accept as the task output.
-    # The provider-side 'auto' is handled in _resolve_auto() via main_runtime
-    # fallback, so dropping cfg_model to None here lets that path do its job.
-    if cfg_model and cfg_model.lower() == "auto":
-        cfg_model = None
+    explicit_runtime = normalize_route_runtime(
+        {"provider": provider, "model": model, "base_url": base_url}
+    )
+    provider = str(explicit_runtime.get("provider") or "").strip() or None
+    model = str(explicit_runtime.get("model") or "").strip() or None
+    base_url = str(explicit_runtime.get("base_url") or "").strip() or None
+    configured_runtime = normalize_route_runtime(
+        {"provider": cfg_provider, "model": cfg_model, "base_url": cfg_base_url}
+    )
+    cfg_provider = str(configured_runtime.get("provider") or "").strip() or None
+    cfg_model = str(configured_runtime.get("model") or "").strip() or None
+    cfg_base_url = str(configured_runtime.get("base_url") or "").strip() or None
 
     resolved_model = model or cfg_model
     resolved_api_mode = cfg_api_mode
-
-    # Convenience aliases for direct API-key endpoints that aren't first-class
-    # providers (e.g. ``provider: openai`` → custom + api.openai.com/v1).
-    # Applied to both explicit args and config-derived values. When the user
-    # has already supplied a base_url we keep their endpoint but still rewrite
-    # the provider to ``custom`` so resolution doesn't hit the
-    # PROVIDER_REGISTRY-only path (which has no ``openai`` entry).
-    def _expand_direct_api_alias(prov: Optional[str], existing_base: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
-        if not prov:
-            return prov, existing_base
-        target_base = _AUX_DIRECT_API_BASE_URLS.get(prov.strip().lower())
-        if target_base is None:
-            return prov, existing_base
-        return "custom", existing_base or target_base
 
     def _preserve_provider_with_base_url(prov: Optional[str]) -> bool:
         normalized = str(prov or "").strip().lower()
@@ -6332,10 +6317,6 @@ def _resolve_task_provider_model(
                 "xai-oauth",
             }
 
-    if provider:
-        provider, base_url = _expand_direct_api_alias(provider, base_url)
-    if cfg_provider:
-        cfg_provider, cfg_base_url = _expand_direct_api_alias(cfg_provider, cfg_base_url)
 
     # An explicit provider arg without an explicit base_url must not bypass
     # the task's configured endpoint: adopt auxiliary.<task>.base_url/api_key
@@ -6349,7 +6330,7 @@ def _resolve_task_provider_model(
         if not api_key:
             api_key = cfg_api_key
 
-    if base_url and _preserve_provider_with_base_url(provider):
+    if provider and base_url and _preserve_provider_with_base_url(provider):
         return provider, resolved_model, base_url, api_key, resolved_api_mode
     if base_url:
         return "custom", resolved_model, base_url, api_key, resolved_api_mode
@@ -7473,7 +7454,9 @@ def call_llm(
                         resolved_provider=auth_refresh_provider,
                         resolved_model=resolved_model or final_model,
                         resolved_base_url=resolved_base_url,
-                        resolved_api_key=resolved_api_key,
+                        resolved_api_key=_closed_refresh_retry_api_key(
+                            closed_plan, resolved_api_key
+                        ),
                         resolved_api_mode=resolved_api_mode,
                         main_runtime=main_runtime,
                         final_model=final_model,
@@ -8168,7 +8151,9 @@ async def async_call_llm(
                         resolved_provider=auth_refresh_provider,
                         resolved_model=resolved_model or final_model,
                         resolved_base_url=resolved_base_url,
-                        resolved_api_key=resolved_api_key,
+                        resolved_api_key=_closed_refresh_retry_api_key(
+                            closed_plan, resolved_api_key
+                        ),
                         resolved_api_mode=resolved_api_mode,
                         final_model=final_model,
                         messages=messages,

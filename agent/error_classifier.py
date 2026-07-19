@@ -151,7 +151,9 @@ _EXACT_NON_QUOTA_AUTHORITIES = frozenset({
 
 _TRANSIENT_QUOTA_TEXT_PATTERN = re.compile(
     r"\b(?:quota\s+metric|requests?\s+per\s+(?:minute|second)|"
-    r"tokens?\s+per\s+(?:minute|second)|rpm|tpm)\b",
+    r"tokens?\s+per\s+(?:minute|second)|rpm|tpm|"
+    r"rate[\s_-]+limit(?:ed|ing)?|too\s+many\s+requests?|"
+    r"(?:ordinary\s+)?throttl(?:e|ed|ing))\b",
     re.IGNORECASE,
 )
 

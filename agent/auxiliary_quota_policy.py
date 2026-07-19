@@ -17,6 +17,8 @@ from agent.secret_scope import get_secret
 
 _SUPPORTED_TRIGGERS = frozenset({"quota_exhausted"})
 _MISSING = object()
+_JSON_THAW_MAX_DEPTH = 32
+_JSON_THAW_MAX_NODES = 10_000
 
 
 def parse_fallback_policy(config: Mapping[str, Any]) -> Optional[frozenset[str]]:
@@ -41,6 +43,39 @@ def _freeze(value: Any) -> Any:
     if isinstance(value, (set, frozenset)):
         return frozenset(_freeze(item) for item in value)
     return value
+
+
+def thaw_json_payload(value: Any) -> Any:
+    """Return a bounded plain-container copy for a provider request body."""
+
+    node_count = 0
+    active_containers: set[int] = set()
+
+    def thaw(item: Any, depth: int) -> Any:
+        nonlocal node_count
+        node_count += 1
+        if node_count > _JSON_THAW_MAX_NODES:
+            raise ValueError("Auxiliary request payload exceeds the node limit")
+        if depth > _JSON_THAW_MAX_DEPTH:
+            raise ValueError("Auxiliary request payload exceeds the depth limit")
+
+        is_mapping = isinstance(item, Mapping)
+        is_sequence = isinstance(item, (list, tuple, set, frozenset))
+        if not (is_mapping or is_sequence):
+            return item
+
+        container_id = id(item)
+        if container_id in active_containers:
+            raise ValueError("Auxiliary request payload contains a cycle")
+        active_containers.add(container_id)
+        try:
+            if is_mapping:
+                return {key: thaw(child, depth + 1) for key, child in item.items()}
+            return [thaw(child, depth + 1) for child in item]
+        finally:
+            active_containers.remove(container_id)
+
+    return thaw(value, 0)
 
 
 def _route_key(route: Mapping[str, Any]) -> Any:

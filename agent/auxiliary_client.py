@@ -110,6 +110,7 @@ from agent.auxiliary_quota_policy import (
     ClosedFallbackPlan,
     FrozenRoute,
     capture_closed_plan,
+    thaw_json_payload,
 )
 from agent.credential_pool import load_pool
 from agent.error_classifier import is_explicit_usage_quota_exhaustion
@@ -5470,7 +5471,12 @@ _VISION_AUTO_PROVIDER_ORDER = (
 )
 
 
-def _main_model_supports_vision(provider: str, model: Optional[str]) -> bool:
+def _main_model_supports_vision(
+    provider: str,
+    model: Optional[str],
+    *,
+    config: Optional[Dict[str, Any]] = None,
+) -> bool:
     """Return True when ``provider``/``model`` is known to accept image input.
 
     Used by the vision auto-detect chain to skip the user's main provider
@@ -5486,11 +5492,14 @@ def _main_model_supports_vision(provider: str, model: Optional[str]) -> bool:
     """
     try:
         from agent.image_routing import _lookup_supports_vision
-        from hermes_cli.config import load_config
     except ImportError:
         return True
     try:
-        supports = _lookup_supports_vision(provider, model, load_config())
+        if config is None:
+            from hermes_cli.config import load_config
+
+            config = load_config()
+        supports = _lookup_supports_vision(provider, model or "", config)
     except Exception:  # pragma: no cover - defensive
         return True
     if supports is None:
@@ -7020,16 +7029,39 @@ def _closed_allows_next(
     )
 
 
+def _closed_vision_capability_config(
+    plan: ClosedFallbackPlan,
+    route: FrozenRoute,
+) -> Dict[str, Any]:
+    """Adapt frozen task-route metadata for the shared vision lookup."""
+    route_config: Mapping[str, Any] = plan.config
+    if route.index >= 0:
+        chain = plan.config.get("fallback_chain")
+        if isinstance(chain, tuple) and route.index < len(chain):
+            candidate_config = chain[route.index]
+            if isinstance(candidate_config, Mapping):
+                route_config = candidate_config
+
+    model_config: Dict[str, Any] = {"provider": route.declared_provider}
+    if "supports_vision" in route_config:
+        model_config["supports_vision"] = route_config["supports_vision"]
+    return {"model": model_config}
+
+
 def _closed_route_is_capable(
     plan: ClosedFallbackPlan,
     route: FrozenRoute,
 ) -> bool:
     if plan.task == "vision":
-        return _main_model_supports_vision(route.provider, route.model)
+        return _main_model_supports_vision(
+            route.declared_provider,
+            route.model,
+            config=_closed_vision_capability_config(plan, route),
+        )
     if plan.task != "compression":
         return True
     known_window = _candidate_context_window(
-        route.provider,
+        route.declared_provider,
         route.model,
         base_url=route.base_url,
         api_key=route.api_key,
@@ -7209,8 +7241,8 @@ def call_llm(
                 f"route for task={task}"
             )
         primary = closed_plan.primary
-        if task == "vision" and not _main_model_supports_vision(
-            primary.provider, primary.model
+        if task == "vision" and not _closed_route_is_capable(
+            closed_plan, primary
         ):
             raise RuntimeError(
                 "Closed auxiliary fallback policy primary route does not support vision"
@@ -7231,6 +7263,7 @@ def call_llm(
             resolved_api_mode = api_mode
         effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
+    effective_extra_body = thaw_json_payload(effective_extra_body)
 
     if task == "vision" and closed_plan is None:
         effective_provider, client, final_model = resolve_vision_provider_client(
@@ -7947,8 +7980,8 @@ async def async_call_llm(
                 f"route for task={task}"
             )
         primary = closed_plan.primary
-        if task == "vision" and not _main_model_supports_vision(
-            primary.provider, primary.model
+        if task == "vision" and not _closed_route_is_capable(
+            closed_plan, primary
         ):
             raise RuntimeError(
                 "Closed auxiliary fallback policy primary route does not support vision"
@@ -7969,6 +8002,7 @@ async def async_call_llm(
             resolved_api_mode = api_mode
         effective_extra_body = _get_task_extra_body(task)
     effective_extra_body.update(extra_body or {})
+    effective_extra_body = thaw_json_payload(effective_extra_body)
 
     if task == "vision" and closed_plan is None:
         effective_provider, client, final_model = resolve_vision_provider_client(

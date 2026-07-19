@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Mapping
 from http import HTTPStatus
 from types import SimpleNamespace
@@ -402,6 +403,52 @@ class TestClosedRouting:
         assert len(primary_calls.calls) == 1
         assert backup_calls.calls == []
 
+    @pytest.mark.parametrize("async_mode", [False, True])
+    @pytest.mark.parametrize(
+        ("message", "surface"),
+        [
+            ("Rate limit exceeded", "same_envelope"),
+            ("Too many requests", "nested_details"),
+            ("ordinary throttling", "causal_sibling"),
+        ],
+    )
+    def test_conflicting_throttling_message_vetoes_structured_quota_fallback(
+        self, monkeypatch, async_mode, message, surface
+    ):
+        error_body: dict[str, object] = {"code": "quota_exceeded"}
+        body = {"error": error_body}
+        if surface == "same_envelope":
+            error_body["message"] = message
+        elif surface == "nested_details":
+            error_body["details"] = {"message": message}
+        original = ProviderError("provider error", status_code=429, body=body)
+        if surface == "causal_sibling":
+            original.__cause__ = ProviderError(message)
+        primary_calls = (
+            AsyncCompletions(original) if async_mode else SyncCompletions(original)
+        )
+        backup_calls = (
+            AsyncCompletions(response("must not run"))
+            if async_mode
+            else SyncCompletions(response("must not run"))
+        )
+        install_sync_chain(
+            monkeypatch,
+            Client(primary_calls),
+            [Client(backup_calls)],
+        )
+
+        with pytest.raises(ProviderError) as caught:
+            call_public(
+                async_mode,
+                task="compression",
+                messages=[{"role": "user", "content": "compress"}],
+            )
+
+        assert caught.value is original
+        assert len(primary_calls.calls) == 1
+        assert backup_calls.calls == []
+
     def test_nonquota_candidate_reraises_original_with_candidate_as_cause(
         self, monkeypatch
     ):
@@ -575,6 +622,50 @@ class TestClosedRouting:
 
 
 class TestFrozenSnapshot:
+    @pytest.mark.parametrize("async_mode", [False, True])
+    def test_nested_extra_body_is_json_payload_and_detached_from_config(
+        self, monkeypatch, async_mode
+    ):
+        configured_extra_body = {
+            "reasoning": {
+                "enabled": True,
+                "effort": "high",
+                "metadata": {
+                    "steps": [1, {"label": "preserved"}],
+                    "alternatives": ["first"],
+                },
+            }
+        }
+        config = quota_config(0)
+        config["extra_body"] = configured_extra_body
+        calls = (
+            AsyncCompletions(response("ok"))
+            if async_mode
+            else SyncCompletions(response("ok"))
+        )
+        monkeypatch.setattr(aux, "_get_auxiliary_task_config", lambda _task: config)
+        monkeypatch.setattr(
+            aux,
+            "_get_cached_client",
+            lambda *_args, **_kwargs: (Client(calls), "primary-model"),
+        )
+
+        call_public(
+            async_mode,
+            task="web_extract",
+            messages=[{"role": "user", "content": "extract"}],
+        )
+
+        payload = calls.calls[0]["extra_body"]
+        assert payload == configured_extra_body
+        json.dumps(payload)
+        payload["reasoning"]["metadata"]["steps"][1]["label"] = "provider-mutated"
+        payload["reasoning"]["metadata"]["alternatives"].append("provider-added")
+        assert configured_extra_body["reasoning"]["metadata"] == {
+            "steps": [1, {"label": "preserved"}],
+            "alternatives": ["first"],
+        }
+
     @pytest.mark.parametrize("async_mode", [False, True])
     @pytest.mark.parametrize(
         "override",
@@ -1066,6 +1157,7 @@ def test_compression_closed_chain_skips_known_small_context_candidate(
     monkeypatch, async_mode
 ):
     config = quota_config(2)
+    config["fallback_chain"][0]["provider"] = "custom:small"
     config["fallback_chain"][0]["model"] = "known-small"
     config["fallback_chain"][1]["model"] = "unknown-custom"
     original = quota_error()
@@ -1092,10 +1184,10 @@ def test_compression_closed_chain_skips_known_small_context_candidate(
         }[kwargs.get("base_url")]
 
     monkeypatch.setattr(aux, "_get_cached_client", get_cached)
-    context_probe_api_keys = []
+    context_probes = []
 
-    def candidate_context_window(_provider, model, **kwargs):
-        context_probe_api_keys.append(kwargs.get("api_key"))
+    def candidate_context_window(provider, model, **kwargs):
+        context_probes.append((provider, kwargs.get("api_key")))
         return 32_000 if model == "known-small" else None
 
     monkeypatch.setattr(aux, "_candidate_context_window", candidate_context_window)
@@ -1105,7 +1197,10 @@ def test_compression_closed_chain_skips_known_small_context_candidate(
         messages=[{"role": "user", "content": "compress"}],
     )
     assert result.choices[0].message.content == "unknown"
-    assert context_probe_api_keys == ["backup-key-0", "backup-key-1"]
+    assert context_probes == [
+        ("custom:small", "backup-key-0"),
+        ("custom", "backup-key-1"),
+    ]
     assert small_calls.calls == []
     assert len(unknown_calls.calls) == 1
 
@@ -1145,6 +1240,81 @@ def test_compression_all_known_small_routes_raise_the_original(monkeypatch, asyn
 
 
 @pytest.mark.parametrize("async_mode", [False, True])
+@pytest.mark.parametrize(
+    ("candidate_supports_vision", "ambient_supports_vision"),
+    [(True, False), (False, True)],
+)
+def test_named_custom_vision_candidate_uses_frozen_capability(
+    monkeypatch,
+    async_mode,
+    candidate_supports_vision,
+    ambient_supports_vision,
+):
+    config = quota_config(0)
+    config["supports_vision"] = True
+    config["fallback_chain"] = [
+        {
+            "provider": "custom:backup",
+            "model": "backup-vision-model",
+            "supports_vision": candidate_supports_vision,
+        }
+    ]
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider._get_named_custom_provider",
+        lambda _provider: {
+            "base_url": "https://named-backup.example/v1",
+            "api_key": "named-backup-key",
+        },
+    )
+    monkeypatch.setattr(aux, "_get_auxiliary_task_config", lambda _task: config)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "model": {
+                "provider": "custom:active",
+                "default": "active-model",
+                "supports_vision": ambient_supports_vision,
+            }
+        },
+    )
+    original = quota_error("primary quota")
+    primary_calls = (
+        AsyncCompletions(original) if async_mode else SyncCompletions(original)
+    )
+    backup_calls = (
+        AsyncCompletions(response("vision backup"))
+        if async_mode
+        else SyncCompletions(response("vision backup"))
+    )
+
+    def get_cached(*_args, **kwargs):
+        if kwargs.get("base_url") == "https://primary.example/v1":
+            return Client(primary_calls), "primary-model"
+        return Client(backup_calls), "backup-vision-model"
+
+    monkeypatch.setattr(aux, "_get_cached_client", get_cached)
+
+    if candidate_supports_vision:
+        result = call_public(
+            async_mode,
+            task="vision",
+            messages=[{"role": "user", "content": "inspect"}],
+        )
+        assert result.choices[0].message.content == "vision backup"
+    else:
+        with pytest.raises(ProviderError) as caught:
+            call_public(
+                async_mode,
+                task="vision",
+                messages=[{"role": "user", "content": "inspect"}],
+            )
+        assert caught.value is original
+
+    assert len(primary_calls.calls) == 1
+    assert len(backup_calls.calls) == int(candidate_supports_vision)
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
 def test_closed_vision_skips_known_text_only_candidate(monkeypatch, async_mode):
     config = quota_config(2)
     config["fallback_chain"][0]["model"] = "text-only"
@@ -1167,7 +1337,7 @@ def test_closed_vision_skips_known_text_only_candidate(monkeypatch, async_mode):
     monkeypatch.setattr(
         aux,
         "_main_model_supports_vision",
-        lambda _provider, model: model != "text-only",
+        lambda _provider, model, **_kwargs: model != "text-only",
     )
 
     def get_cached(*_args, **kwargs):

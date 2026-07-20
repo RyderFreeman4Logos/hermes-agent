@@ -362,6 +362,7 @@ auxiliary:
   compression:
     provider: openrouter
     model: anthropic/claude-sonnet-4
+    key_env: OPENROUTER_API_KEY
     fallback_on: [quota_exhausted]
     fallback_chain:
       - provider: custom:compression-backup
@@ -369,26 +370,23 @@ auxiliary:
         timeout: 240
 ```
 
-This opt-in is a closed policy. Hermes snapshots the task config, named custom provider, active main route (for an explicit `provider: main` entry), credentials, API mode, request body controls, and timeout before the primary request. A qualifying quota error walks only that frozen `fallback_chain`, in order. Ordinary rate limits, transport failures, authentication errors, invalid models, server errors, and malformed responses do not authorize a cross-provider request.
+This opt-in is a closed policy. Before the primary request, Hermes materializes each route's declared and resolved provider identity, endpoint, model, API mode, credential binding, timeout, request overrides, extra body and headers, maximum output tokens, and configured vision/context capabilities. A qualifying quota error walks only that frozen `fallback_chain`, in order. Ordinary rate limits, transport failures, authentication errors, invalid models, server errors, and malformed responses do not authorize a cross-provider request.
 
-Closed-policy candidates must be fully materialized without ambient provider discovery. The primary route must also be concrete at capture; `provider: auto` is unavailable in closed mode. Supported candidate forms are an explicit `provider: custom` entry with `model` and `base_url`, a named custom endpoint (`provider: custom:<name>`) with a concrete model, or `provider: main` when the active main route can be frozen as an explicit endpoint. Built-in and `auto` provider labels are rejected in the closed chain even if process-global credentials happen to exist. Inline keys and `key_env` / `api_key_env` values are resolved once from the active profile's secret scope; they never borrow another profile's process environment.
+Every closed-policy route, including the primary, must be concrete at capture. `provider: auto`, model-less routes, remote routes without a captured credential, external-process transports, and SDK-backed routes that cannot be represented by the strict frozen executor fail admission. Accepted routes include explicit or named custom endpoints, a fully captured `provider: main` runtime, and supported built-in HTTP providers when their model, endpoint (explicit or a known built-in default), and credential are all available. A deliberately local/loopback route may use a no-auth binding; a missing `key_env` / `api_key_env` value never becomes no-auth. Those environment-backed values are resolved once from the active profile's secret scope and never borrowed from another profile's process environment.
 
-Invalid `fallback_on` values fail closed. A malformed, incomplete, or unsupported entry (including model-less `custom`, `custom:auto`, and `auto`) invalidates the entire frozen chain for that request rather than being skipped. The primary request still runs, and if no admissible fallback succeeds Hermes preserves the original primary exception. Known text-only vision candidates and known compression models below the minimum context window are skipped; unknown custom capabilities remain permissive for compatibility.
+Route-local bodies and headers remain attached to their route; they are not rediscovered after the primary fails and are not copied from one provider to another. Shared task/caller request-body fields are applied with their documented precedence to each attempt. Client-cache identities include secret-safe credential and header digests, not raw keys or header values. Changing config, named-provider definitions, environment variables, or credential pools after capture cannot change an admitted route. Closed execution does not rotate a credential pool or perform ambient OAuth reacquisition; a captured callable token provider may refresh through that same bound object without selecting a different account or route.
 
-Sync and async calls capture the same route fields and apply the same capability and exception-precedence rules. Closed mode allows at most one configured same-provider transient retry; async uses non-blocking backoff. Legacy async calls retain their historical single immediate retry. Same-provider OAuth refresh (including an `openai-codex` primary) also remains available before the closed policy considers a cross-provider route.
+Invalid `fallback_on` values fail closed. A malformed, incomplete, or unsupported candidate invalidates the entire frozen chain for that request rather than being skipped. If the primary itself cannot be materialized, no request is sent. Otherwise the primary request still runs, and if no admissible fallback succeeds Hermes preserves the original primary exception; a non-quota candidate failure is attached only as a cycle-free diagnostic cause. Configured vision and context-length capabilities are frozen with the route. Known text-only vision routes and compression routes below the minimum context window are skipped; when context length is not configured, any compatibility probe uses only the frozen provider, model, endpoint, and credential.
+
+Sync and async calls capture and execute the same route fields, controls, capabilities, and exception-precedence rules. Closed mode allows at most one configured same-provider transient retry with the same frozen route; async uses non-blocking backoff. Legacy async calls retain their historical single immediate retry.
 
 If `fallback_on` is **absent**, Hermes keeps the legacy broad auxiliary fallback behavior described above, including configured, main-model, and discovery fallbacks. This makes the stricter behavior explicitly opt-in and backward compatible.
 
 ### Provider quota errors and policy scope
 
-Quota-only fallback recognizes bounded structured fields (`code`, `type`,
-`reason`, `message`, or `detail`) with explicit usage-exhaustion markers such
-as `insufficient_quota`, `quota_exhausted`, `usage_limit_reached`, or the
-xAI spending-limit code. Hermes also recognizes the provider-specific
-`DeviceCodeExhaustedError` and `GoUsageLimitError` exception types. HTTP 429,
-HTTP 402, `RESOURCE_EXHAUSTED`, ordinary exception text, RPM/TPM throttling,
-and transport/auth/server failures are not sufficient authority in closed
-mode. Conflicting non-quota signals win and fail closed.
+Quota-only fallback grants positive authority only to exact, full-string values in structured `code`, `type`, or `reason` fields. The generic authorities are `insufficient_quota`, `quota_exhausted`, and `usage_limit_reached`, with only ASCII case changes and a single space, underscore, hyphen, or no separator between their words. The xAI literal `personal-team-blocked:spending-limit` is also recognized. Generic authorities may have no HTTP status or a compatible 402/429 in the same exception component; the xAI literal may instead pair with a same-component 403. Any malformed, incompatible, or differently sourced status fails closed.
+
+`message`, `detail`, exception arguments, and other prose never grant quota authority by themselves. They are used only to veto conflicting non-quota evidence or to complete one of two same-node provider pairs: an actual `DeviceCodeExhaustedError` with `weekly credits exhausted`, or an actual `GoUsageLimitError` with `weekly usage reached`. HTTP 429, HTTP 402, `RESOURCE_EXHAUSTED`, `quota_exceeded`, ordinary exception text, RPM/TPM throttling, and transport/auth/model/server/validation failures are not sufficient authority in closed mode. A conflict anywhere in the bounded designated exception graph wins and fails closed.
 
 Without `fallback_on`, the legacy broad fallback classifier remains unchanged
 and can recognize capacity-equivalent phrases such as daily limits or

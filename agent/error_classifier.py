@@ -113,72 +113,82 @@ _QUOTA_AUTHORITY_FIELDS = ("code", "type", "reason")
 _QUOTA_MESSAGE_FIELDS = ("message", "detail")
 _QUOTA_STATUS_FIELDS = ("status_code", "status")
 
-_EXACT_QUOTA_AUTHORITIES = (
-    "insufficientquota",
-    "usagelimitreached",
-    "quotaexhausted",
-    "personalteamblockedspendinglimit",
-)
+_XAI_SPENDING_LIMIT_AUTHORITY = "personal-team-blocked:spending-limit"
 _DEVICE_QUOTA_AUTHORITY = "devicecodeexhaustederror"
 _GO_USAGE_LIMIT_AUTHORITY = "gousagelimiterror"
-
-# These exact structured authorities are conclusive evidence *against* a
-# usage-bucket exhaustion route.  In particular, normal RPM/TPM throttling
-# often carries a generic message containing the word "quota".
-_EXACT_NON_QUOTA_AUTHORITIES = frozenset({
-    "ratelimitexceeded",
-    "ratelimiterror",
-    "toomanyrequests",
-    "resourceexhausted",
-    "authenticationerror",
-    "authorizationerror",
-    "permissiondenied",
-    "invalidapikey",
-    "modelnotfound",
-    "invalidmodel",
-    "unsupportedmodel",
-    "servererror",
-    "internalservererror",
-    "serviceunavailable",
-    "timeouterror",
-    "connectionerror",
-    "transporterror",
-    "invalidrequesterror",
-    "malformedresponse",
-    "responsevalidationerror",
-})
-
-_TRANSIENT_QUOTA_TEXT_PATTERN = re.compile(
-    r"\b(?:quota\s+metric|requests?\s+per\s+(?:minute|second)|"
-    r"tokens?\s+per\s+(?:minute|second)|rpm|tpm|"
-    r"rate[\s_-]+limit(?:ed|ing)?|too\s+many\s+requests?|"
-    r"(?:ordinary\s+)?throttl(?:e|ed|ing))\b",
-    re.IGNORECASE,
+_GENERIC_QUOTA_MARKERS = (
+    ("insufficient", "quota"),
+    ("usage", "limit", "reached"),
+    ("quota", "exhausted"),
+)
+_NON_QUOTA_MARKERS = (
+    ("rate", "limit", "exceeded"),
+    ("rate", "limit", "error"),
+    ("too", "many", "requests"),
+    ("resource", "exhausted"),
+    ("authentication", "error"),
+    ("authentication", "failed"),
+    ("authentication", "failure"),
+    ("authorization", "error"),
+    ("permission", "denied"),
+    ("unauthorized",),
+    ("forbidden",),
+    ("invalid", "api", "key"),
+    ("invalid", "token"),
+    ("model", "not", "found"),
+    ("unknown", "model"),
+    ("invalid", "model"),
+    ("unsupported", "model"),
+    ("server", "error"),
+    ("internal", "server", "error"),
+    ("service", "unavailable"),
+    ("network", "error"),
+    ("network", "failure"),
+    ("connection", "error"),
+    ("connection", "failed"),
+    ("connection", "refused"),
+    ("transport", "error"),
+    ("transport", "failure"),
+    ("protocol", "error"),
+    ("timeout",),
+    ("timed", "out"),
+    ("invalid", "request"),
+    ("bad", "request"),
+    ("malformed", "request"),
+    ("validation", "error"),
+    ("response", "validation", "error"),
+    ("malformed", "response"),
+    ("context", "length", "exceeded"),
+    ("context", "overflow"),
+    ("payload", "too", "large"),
+    ("request", "entity", "too", "large"),
+    ("quota", "metric"),
+    ("requests", "per", "minute"),
+    ("requests", "per", "second"),
+    ("tokens", "per", "minute"),
+    ("tokens", "per", "second"),
+    ("rpm",),
+    ("tpm",),
+    ("throttled",),
+    ("throttling",),
 )
 
-_NON_QUOTA_MESSAGE_PATTERNS = (
-    "network error",
-    "network failure",
-    "connection error",
-    "connection failed",
-    "connection refused",
-    "transport error",
-    "transport failure",
-    "timed out",
-    "timeout",
-    "request timeout",
-    "authentication failed",
-    "authentication error",
-    "unauthorized",
-    "forbidden",
-    "invalid api key",
-    "permission denied",
-    "model not found",
-    "invalid model",
-    "unknown model",
-    "unsupported model",
-    "returned invalid response",
-    "malformed response",
+
+def _marker_pattern(words: tuple[str, ...], *, bounded: bool) -> re.Pattern[str]:
+    body = r"[ _-]?".join(re.escape(word) for word in words)
+    if bounded:
+        body = rf"(?<![A-Za-z0-9])(?:{body})(?![A-Za-z0-9])"
+    return re.compile(body, re.IGNORECASE | re.ASCII)
+
+
+_GENERIC_QUOTA_PATTERNS = tuple(
+    _marker_pattern(words, bounded=False) for words in _GENERIC_QUOTA_MARKERS
+)
+_NON_QUOTA_FULL_PATTERNS = tuple(
+    _marker_pattern(words, bounded=False) for words in _NON_QUOTA_MARKERS
+)
+_NON_QUOTA_TEXT_PATTERNS = tuple(
+    _marker_pattern(words, bounded=True) for words in _NON_QUOTA_MARKERS
 )
 
 
@@ -210,7 +220,28 @@ _HARD_NON_QUOTA_EXCEPTION_TYPE_FRAGMENTS = (
 )
 
 
-def _compact_quota_authority(value: str) -> str:
+def _normalize_structured_authority(value: str) -> str:
+    """Normalize only documented ASCII full-string structured markers."""
+
+    if not value.isascii():
+        return ""
+    value = value.strip(" \t\r\n\f\v")
+    if not value:
+        return ""
+    if value.casefold() == _XAI_SPENDING_LIMIT_AUTHORITY:
+        return _XAI_SPENDING_LIMIT_AUTHORITY
+    for words, pattern in zip(_GENERIC_QUOTA_MARKERS, _GENERIC_QUOTA_PATTERNS):
+        if pattern.fullmatch(value):
+            return "".join(words)
+    for index, pattern in enumerate(_NON_QUOTA_FULL_PATTERNS):
+        if pattern.fullmatch(value):
+            return f"!{index}"
+    return ""
+
+
+def _normalize_exception_type(value: str) -> str:
+    if not value.isascii():
+        return ""
     return "".join(character for character in value.lower() if character.isalnum())
 
 
@@ -226,11 +257,11 @@ def _extract_explicit_quota_marker(
     message_count = 0
     total_characters = 0
     seen_nodes: set[int] = set()
-    structured_authorities: set[str] = set()
+    structured_authorities: dict[str, set[int]] = {}
     exception_types: set[str] = set()
     messages: list[str] = []
-    statuses: list[int] = []
-    paired_markers: set[str] = set()
+    statuses: list[tuple[int, int]] = []
+    paired_markers: dict[str, set[int]] = {}
 
     def safe_attr(value: Any, name: str) -> Any:
         nonlocal unsafe
@@ -281,13 +312,16 @@ def _extract_explicit_quota_marker(
     def record(
         authority_values: tuple[Any, ...],
         message_values: tuple[Any, ...],
+        component: int,
         exception_type: str = "",
     ) -> None:
         node_authorities: set[str] = set()
         for value in authority_values:
             text = bounded_text(value, message=False)
-            if text is not None and (compact := _compact_quota_authority(text)):
-                node_authorities.add(compact)
+            if text is not None and (
+                marker := _normalize_structured_authority(text)
+            ):
+                node_authorities.add(marker)
         node_messages: list[str] = []
         for value in message_values:
             text = bounded_text(value, message=True)
@@ -295,48 +329,55 @@ def _extract_explicit_quota_marker(
                 node_messages.append(text)
         if exception_type:
             exception_types.add(exception_type)
-        structured_authorities.update(node_authorities)
+        for marker in node_authorities:
+            structured_authorities.setdefault(marker, set()).add(component)
         messages.extend(node_messages)
-        lowered = [message.lower() for message in node_messages]
         node_markers = set(node_authorities)
         if exception_type:
             node_markers.add(exception_type)
-        if any(
-            marker == _DEVICE_QUOTA_AUTHORITY for marker in node_markers
-        ) and any(
-            "weekly credits" in message and "exhausted" in message
-            for message in lowered
+        if _DEVICE_QUOTA_AUTHORITY in node_markers and any(
+            _marker_pattern(("weekly", "credits", "exhausted"), bounded=True).search(
+                message
+            )
+            for message in node_messages
         ):
-            paired_markers.add(_DEVICE_QUOTA_AUTHORITY)
+            paired_markers.setdefault(_DEVICE_QUOTA_AUTHORITY, set()).add(component)
         if _GO_USAGE_LIMIT_AUTHORITY in node_markers and any(
-            "weekly usage" in message
-            and any(verb in message for verb in ("reached", "exhausted", "exceeded"))
-            for message in lowered
+            _marker_pattern(("weekly", "usage", "reached"), bounded=True).search(
+                message
+            )
+            for message in node_messages
         ):
-            paired_markers.add(_GO_USAGE_LIMIT_AUTHORITY)
+            paired_markers.setdefault(_GO_USAGE_LIMIT_AUTHORITY, set()).add(component)
 
-    def record_status(value: Any) -> None:
+    def record_status(value: Any, component: int) -> None:
+        nonlocal unsafe
+        if value is _QUOTA_MISSING or value is None:
+            return
         if isinstance(value, Integral) and not isinstance(value, bool):
-            statuses.append(int(value))
+            statuses.append((component, int(value)))
             return
         text = bounded_text(value, message=False)
         if text is not None:
-            stripped = text.strip()
+            stripped = text.strip(" \t\r\n\f\v")
             if len(stripped) == 3 and stripped.isascii() and stripped.isdigit():
-                statuses.append(int(stripped))
+                statuses.append((component, int(stripped)))
+                return
+        unsafe = True
 
     def append_error_envelope(
         value: Any,
         depth: int,
         ancestors: frozenset[int],
+        component: int,
     ) -> None:
         if isinstance(value, Mapping):
-            pending.append(("mapping", value, depth, ancestors))
+            pending.append(("mapping", value, depth, ancestors, component))
         elif value is not _QUOTA_MISSING and value is not None and not isinstance(
             value,
             (str, bytes, bytearray, memoryview, int, float, bool),
         ):
-            pending.append(("object", value, depth, ancestors))
+            pending.append(("object", value, depth, ancestors, component))
 
     def response_raw_surface_is_oversized(response: Any) -> bool:
         """Use already-available size signals before calling ``response.json``."""
@@ -368,13 +409,12 @@ def _extract_explicit_quota_marker(
                     return True
         return False
 
-    # Work items are (kind, value, depth, ancestor ids). Only these explicit
-    # edges are followed; arbitrary mapping values are never flattened.
-    pending: list[tuple[str, Any, int, frozenset[int]]] = [
-        ("exception", error, 0, frozenset())
+    # Work items carry the causal component that owns their status/authority.
+    pending: list[tuple[str, Any, int, frozenset[int], int]] = [
+        ("exception", error, 0, frozenset(), id(error))
     ]
     while pending and not unsafe:
-        kind, value, depth, ancestors = pending.pop()
+        kind, value, depth, ancestors, component = pending.pop()
         node_id = id(value)
         if node_id in stop_exception_ids:
             continue
@@ -391,14 +431,15 @@ def _extract_explicit_quota_marker(
             if depth > _QUOTA_MAX_ENVELOPE_DEPTH:
                 return None
             for name in _QUOTA_STATUS_FIELDS:
-                record_status(mapping_value(value, name))
+                record_status(mapping_value(value, name), component)
             record(
                 tuple(mapping_value(value, name) for name in _QUOTA_AUTHORITY_FIELDS),
                 tuple(mapping_value(value, name) for name in _QUOTA_MESSAGE_FIELDS),
+                component,
             )
             for name in ("error", "details"):
                 append_error_envelope(
-                    mapping_value(value, name), depth + 1, descendants
+                    mapping_value(value, name), depth + 1, descendants, component
                 )
             continue
 
@@ -406,42 +447,41 @@ def _extract_explicit_quota_marker(
             if depth > _QUOTA_MAX_ENVELOPE_DEPTH:
                 return None
             for name in _QUOTA_STATUS_FIELDS:
-                record_status(safe_attr(value, name))
+                record_status(safe_attr(value, name), component)
             record(
                 tuple(safe_attr(value, name) for name in _QUOTA_AUTHORITY_FIELDS),
                 tuple(safe_attr(value, name) for name in _QUOTA_MESSAGE_FIELDS),
+                component,
             )
             for name in ("error", "details"):
                 append_error_envelope(
-                    safe_attr(value, name), depth + 1, descendants
+                    safe_attr(value, name), depth + 1, descendants, component
                 )
             continue
 
         for name in _QUOTA_STATUS_FIELDS:
-            record_status(safe_attr(value, name))
+            record_status(safe_attr(value, name), component)
         if unsafe:
             continue
 
         if kind == "response":
             response_body = safe_attr(value, "body")
             if isinstance(response_body, Mapping):
-                pending.append(("mapping", response_body, 0, descendants))
+                pending.append(("mapping", response_body, 0, descendants, component))
             if response_raw_surface_is_oversized(value) or unsafe:
                 unsafe = True
                 continue
             json_payload = safe_attr(value, "json")
             if isinstance(json_payload, Mapping):
-                pending.append(("mapping", json_payload, 0, descendants))
+                pending.append(("mapping", json_payload, 0, descendants, component))
             continue
 
         if depth > _QUOTA_MAX_CHAIN_DEPTH:
             return None
         try:
-            exception_type_text = bounded_text(
-                type(value).__name__, message=False
-            )
+            exception_type_text = bounded_text(type(value).__name__, message=False)
             exception_type = (
-                _compact_quota_authority(exception_type_text)
+                _normalize_exception_type(exception_type_text)
                 if exception_type_text is not None
                 else ""
             )
@@ -463,53 +503,45 @@ def _extract_explicit_quota_marker(
             tuple(safe_attr(value, name) for name in _QUOTA_AUTHORITY_FIELDS),
             tuple(safe_attr(value, name) for name in _QUOTA_MESSAGE_FIELDS)
             + exception_messages,
+            component,
             exception_type,
         )
-        body = safe_attr(value, "body")
-        if isinstance(body, Mapping):
-            pending.append(("mapping", body, 0, descendants))
+        for name in ("body", "details"):
+            envelope = safe_attr(value, name)
+            if isinstance(envelope, Mapping):
+                pending.append(("mapping", envelope, 0, descendants, component))
         error_envelope = safe_attr(value, "error")
         if isinstance(error_envelope, Mapping):
-            pending.append(("mapping", error_envelope, 0, descendants))
+            pending.append(("mapping", error_envelope, 0, descendants, component))
         elif error_envelope is not _QUOTA_MISSING and error_envelope is not None:
-            pending.append(("object", error_envelope, 0, descendants))
+            pending.append(("object", error_envelope, 0, descendants, component))
         response = safe_attr(value, "response")
         if response is not _QUOTA_MISSING and response is not None:
-            pending.append(("response", response, 0, descendants))
+            pending.append(("response", response, 0, descendants, component))
 
         children: list[BaseException] = []
         for child in (safe_attr(value, "__cause__"), safe_attr(value, "__context__")):
-            if isinstance(child, BaseException) and all(child is not item for item in children):
+            if isinstance(child, BaseException) and all(
+                child is not item for item in children
+            ):
                 children.append(child)
         if depth == _QUOTA_MAX_CHAIN_DEPTH and children:
             return None
         pending.extend(
-            ("exception", child, depth + 1, descendants)
+            ("exception", child, depth + 1, descendants, id(child))
             for child in children
         )
 
     if unsafe:
         return None
-    xai_spending_limit = "personalteamblockedspendinglimit" in structured_authorities
+    if any(marker.startswith("!") for marker in structured_authorities):
+        return None
     if any(
-        status in {400, 401, 404, 408, 409, 422}
-        or (status == 403 and not xai_spending_limit)
-        or 500 <= status <= 599
-        for status in statuses
+        pattern.search(message)
+        for message in messages
+        for pattern in _NON_QUOTA_TEXT_PATTERNS
     ):
         return None
-    if structured_authorities & _EXACT_NON_QUOTA_AUTHORITIES:
-        return None
-    lowered_messages = [message.lower() for message in messages]
-    if any(
-        marker in message
-        for message in lowered_messages
-        for marker in _NON_QUOTA_MESSAGE_PATTERNS
-    ):
-        return None
-    if any(_TRANSIENT_QUOTA_TEXT_PATTERN.search(message) for message in messages):
-        return None
-
     if any(
         fragment in exception_type
         for exception_type in exception_types
@@ -517,11 +549,26 @@ def _extract_explicit_quota_marker(
     ):
         return None
 
-    for marker in _EXACT_QUOTA_AUTHORITIES:
-        if marker in structured_authorities:
+    def statuses_match(components: set[int], allowed: frozenset[int]) -> bool:
+        if not statuses:
+            return True
+        return all(
+            component in components and status in allowed
+            for component, status in statuses
+        )
+
+    for marker in ("insufficientquota", "usagelimitreached", "quotaexhausted"):
+        components = structured_authorities.get(marker, set())
+        if components and statuses_match(components, frozenset({402, 429})):
             return marker
+    xai_components = structured_authorities.get(
+        _XAI_SPENDING_LIMIT_AUTHORITY, set()
+    )
+    if xai_components and statuses_match(xai_components, frozenset({403})):
+        return _XAI_SPENDING_LIMIT_AUTHORITY
     for marker in (_DEVICE_QUOTA_AUTHORITY, _GO_USAGE_LIMIT_AUTHORITY):
-        if marker in paired_markers:
+        components = paired_markers.get(marker, set())
+        if components and statuses_match(components, frozenset({402, 429})):
             return marker
     return None
 

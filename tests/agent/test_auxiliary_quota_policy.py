@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 from collections.abc import Mapping
 from http import HTTPStatus
 from types import SimpleNamespace
@@ -241,12 +242,12 @@ class TestNarrowClassifier:
         )
         assert error_classifier.is_explicit_usage_quota_exhaustion(error)
 
-    def test_bool_status_is_not_treated_as_an_integral_http_status(self):
+    def test_bool_status_is_invalid_and_fails_closed(self):
         error = ProviderError(
             status_code=True,
             body={"error": {"code": "quota_exhausted"}},
         )
-        assert error_classifier.is_explicit_usage_quota_exhaustion(error)
+        assert not error_classifier.is_explicit_usage_quota_exhaustion(error)
 
     def test_nested_hard_status_vetoes_outer_quota_authority(self):
         outer = ProviderError(body={"error": {"code": "quota_exhausted"}})
@@ -415,7 +416,7 @@ class TestClosedRouting:
     def test_conflicting_throttling_message_vetoes_structured_quota_fallback(
         self, monkeypatch, async_mode, message, surface
     ):
-        error_body: dict[str, object] = {"code": "quota_exceeded"}
+        error_body: dict[str, object] = {"code": "quota_exhausted"}
         body = {"error": error_body}
         if surface == "same_envelope":
             error_body["message"] = message
@@ -686,7 +687,7 @@ class TestFrozenSnapshot:
 
         assert snapshot is not None
         assert snapshot.primary is not None
-        assert snapshot.primary.model is None
+        assert snapshot.primary.model == "gpt-main"
         assert snapshot.candidates[0].model == "named-default"
         assert (
             snapshot.candidates[1].provider,
@@ -720,7 +721,7 @@ class TestFrozenSnapshot:
         )
 
         provider, model, client_kwargs = resolutions[0]
-        assert (provider, model) == ("custom", None)
+        assert (provider, model) == ("custom", "gpt-4o-mini")
         assert client_kwargs["base_url"] == "https://api.openai.com/v1"
         assert client_kwargs["api_key"] == "openai-key"
         assert calls.calls[0]["model"] == "gpt-runtime-default"
@@ -901,13 +902,14 @@ class TestFrozenSnapshot:
             return Client(calls), "primary-model"
 
         monkeypatch.setattr(aux, "_get_cached_client", get_cached)
-        call_public(
-            async_mode,
-            task="web_extract",
-            messages=[{"role": "user", "content": "extract"}],
-            **override,
-        )
-        assert observed[0][1].get("api_key") != "SECRET"
+        with pytest.raises(RuntimeError, match="no concrete primary"):
+            call_public(
+                async_mode,
+                task="web_extract",
+                messages=[{"role": "user", "content": "extract"}],
+                **override,
+            )
+        assert observed == []
         assert "SECRET" not in str(observed)
 
     def test_key_env_uses_profile_secret_scope_and_never_borrows_ambient(
@@ -967,7 +969,8 @@ class TestFrozenSnapshot:
                     ],
                 },
             )
-            assert snapshot.candidates[0].api_key == "no-key-required"
+            assert snapshot is not None
+            assert snapshot.candidates == ()
         finally:
             secret_scope.reset_secret_scope(token)
             secret_scope.set_multiplex_active(False)
@@ -1116,7 +1119,10 @@ class TestFrozenSnapshot:
         )
         assert snapshot.candidates == ()
 
-    def test_candidate_rejects_deferred_callable_credentials(self):
+    def test_candidate_freezes_callable_credential_identity_without_repr_leak(self):
+        def credential():
+            return "late-secret"
+
         snapshot = policy.capture_closed_plan(
             "compression",
             {
@@ -1126,12 +1132,14 @@ class TestFrozenSnapshot:
                         "provider": "custom",
                         "model": "backup",
                         "base_url": "https://backup.example/v1",
-                        "api_key": lambda: "late-secret",
+                        "api_key": credential,
                     }
                 ],
             },
         )
-        assert snapshot.candidates == ()
+        assert snapshot is not None
+        assert snapshot.candidates[0].api_key is credential
+        assert "late-secret" not in repr(snapshot)
 
     def test_real_config_loader_and_public_call_freeze_named_key_env_route(
         self, tmp_path, monkeypatch
@@ -1409,7 +1417,7 @@ def test_compression_closed_chain_skips_known_small_context_candidate(
     )
     assert result.choices[0].message.content == "unknown"
     assert context_probes == [
-        ("custom:small", "backup-key-0"),
+        ("custom", "backup-key-0"),
         ("custom", "backup-key-1"),
     ]
     assert small_calls.calls == []
@@ -1570,46 +1578,32 @@ def test_closed_vision_skips_known_text_only_candidate(monkeypatch, async_mode):
 
 
 @pytest.mark.parametrize("async_mode", [False, True])
-def test_closed_openai_codex_primary_preserves_auth_refresh(monkeypatch, async_mode):
+def test_closed_openai_codex_primary_without_binding_fails_capture(monkeypatch, async_mode):
     config = {
         **quota_config(0),
         "provider": "main",
     }
-    auth_error = type("AuthenticationError", (ProviderError,), {})("expired token")
-    first_calls = (
-        AsyncCompletions(auth_error) if async_mode else SyncCompletions(auth_error)
-    )
-    refreshed_calls = (
-        AsyncCompletions(response("refreshed"))
-        if async_mode
-        else SyncCompletions(response("refreshed"))
-    )
     resolutions = []
     monkeypatch.setattr(aux, "_get_auxiliary_task_config", lambda _task: config)
 
     def get_cached(*_args, **_kwargs):
         resolutions.append(True)
-        calls = first_calls if len(resolutions) == 1 else refreshed_calls
-        return Client(calls), "gpt-refresh"
+        raise AssertionError("closed capture must reject before client resolution")
 
     monkeypatch.setattr(aux, "_get_cached_client", get_cached)
-    monkeypatch.setattr(
-        aux,
-        "_refresh_provider_credentials",
-        lambda provider: provider == "openai-codex",
-    )
-    result = call_public(
-        async_mode,
-        task="web_extract",
-        main_runtime={"provider": "openai-codex", "model": "gpt-refresh"},
-        messages=[{"role": "user", "content": "extract"}],
-    )
-    assert result.choices[0].message.content == "refreshed"
-    assert len(resolutions) == 2
+    monkeypatch.setattr(aux, "_refresh_provider_credentials", lambda _provider: False)
+    with pytest.raises(RuntimeError, match="no concrete primary"):
+        call_public(
+            async_mode,
+            task="web_extract",
+            main_runtime={"provider": "openai-codex", "model": "gpt-refresh"},
+            messages=[{"role": "user", "content": "extract"}],
+        )
+    assert resolutions == []
 
 
 @pytest.mark.parametrize("async_mode", [False, True])
-def test_closed_main_anthropic_refresh_reloads_scoped_credential(
+def test_closed_main_anthropic_does_not_ambient_refresh(
     monkeypatch, async_mode
 ):
     config = {**quota_config(0), "provider": "main"}
@@ -1617,54 +1611,36 @@ def test_closed_main_anthropic_refresh_reloads_scoped_credential(
     expired_calls = (
         AsyncCompletions(auth_error) if async_mode else SyncCompletions(auth_error)
     )
-    refreshed_calls = (
-        AsyncCompletions(response("refreshed"))
-        if async_mode
-        else SyncCompletions(response("refreshed"))
-    )
-    credential = {"value": "expired-anthropic-token"}
     resolutions = []
     monkeypatch.setattr(aux, "_get_auxiliary_task_config", lambda _task: config)
 
     def get_cached(*_args, **kwargs):
-        explicit_key = kwargs.get("api_key")
-        effective_key = explicit_key or credential["value"]
-        resolutions.append((explicit_key, effective_key))
-        calls = (
-            expired_calls
-            if effective_key == "expired-anthropic-token"
-            else refreshed_calls
-        )
-        return Client(calls, "https://api.anthropic.com"), "claude-refresh"
+        resolutions.append(kwargs.get("api_key"))
+        return Client(expired_calls, "https://api.anthropic.com"), "claude-refresh"
 
-    def refresh(provider):
-        assert provider == "anthropic"
-        credential["value"] = "refreshed-anthropic-token"
-        return True
+    def refresh(_provider):
+        raise AssertionError("closed route must not ambient refresh")
 
     monkeypatch.setattr(aux, "_get_cached_client", get_cached)
     monkeypatch.setattr(aux, "_refresh_provider_credentials", refresh)
-    result = call_public(
-        async_mode,
-        task="web_extract",
-        main_runtime={
-            "provider": "anthropic",
-            "model": "claude-refresh",
-            "base_url": "https://api.anthropic.com",
-            "api_key": "expired-anthropic-token",
-        },
-        messages=[{"role": "user", "content": "extract"}],
-    )
-
-    assert result.choices[0].message.content == "refreshed"
-    assert resolutions == [
-        ("expired-anthropic-token", "expired-anthropic-token"),
-        (None, "refreshed-anthropic-token"),
-    ]
+    with pytest.raises(type(auth_error)) as caught:
+        call_public(
+            async_mode,
+            task="web_extract",
+            main_runtime={
+                "provider": "anthropic",
+                "model": "claude-refresh",
+                "base_url": "https://api.anthropic.com",
+                "api_key": "expired-anthropic-token",
+            },
+            messages=[{"role": "user", "content": "extract"}],
+        )
+    assert caught.value is auth_error
+    assert resolutions == ["expired-anthropic-token"]
 
 
 @pytest.mark.parametrize("async_mode", [False, True])
-def test_closed_explicit_anthropic_route_keeps_frozen_credential_on_refresh(
+def test_closed_explicit_anthropic_route_never_refreshes(
     monkeypatch, async_mode
 ):
     config = {
@@ -1678,33 +1654,31 @@ def test_closed_explicit_anthropic_route_keeps_frozen_credential_on_refresh(
     first_calls = (
         AsyncCompletions(auth_error) if async_mode else SyncCompletions(auth_error)
     )
-    retry_calls = (
-        AsyncCompletions(response("frozen retry"))
-        if async_mode
-        else SyncCompletions(response("frozen retry"))
-    )
+
     resolutions = []
     monkeypatch.setattr(aux, "_get_auxiliary_task_config", lambda _task: config)
 
     def get_cached(*_args, **kwargs):
         resolutions.append(kwargs.get("api_key"))
-        calls = first_calls if len(resolutions) == 1 else retry_calls
-        return Client(calls, "https://api.anthropic.com"), "claude-frozen"
+        return Client(first_calls, "https://api.anthropic.com"), "claude-frozen"
 
     monkeypatch.setattr(aux, "_get_cached_client", get_cached)
     monkeypatch.setattr(
         aux,
         "_refresh_provider_credentials",
-        lambda provider: provider == "anthropic",
+        lambda _provider: (_ for _ in ()).throw(
+            AssertionError("closed route must not ambient refresh")
+        ),
     )
-    result = call_public(
-        async_mode,
-        task="web_extract",
-        messages=[{"role": "user", "content": "extract"}],
-    )
+    with pytest.raises(type(auth_error)) as caught:
+        call_public(
+            async_mode,
+            task="web_extract",
+            messages=[{"role": "user", "content": "extract"}],
+        )
 
-    assert result.choices[0].message.content == "frozen retry"
-    assert resolutions == ["frozen-anthropic-token", "frozen-anthropic-token"]
+    assert caught.value is auth_error
+    assert resolutions == ["frozen-anthropic-token"]
 
 
 @pytest.mark.parametrize("async_mode", [False, True])
@@ -1740,3 +1714,503 @@ def test_compression_timeout_skips_same_provider_retry(monkeypatch, async_mode):
         assert caught.value is timeout_error
 
     assert len(calls.calls) == 1
+
+
+class TestQ3ClassARegression:
+    @pytest.mark.parametrize("async_mode", [False, True])
+    @pytest.mark.parametrize(
+        "authority",
+        [
+            "quota exhausted",
+            "QUOTA_EXHAUSTED",
+            "quota-exhausted",
+            "quotaexhausted",
+            "insufficient quota",
+            "usage-limit-reached",
+        ],
+    )
+    def test_public_accepts_only_bounded_generic_authority_variants(
+        self, monkeypatch, async_mode, authority
+    ):
+        original = ProviderError(
+            "provider error",
+            status_code=429,
+            body={"error": {"code": authority}},
+        )
+        primary_calls = (
+            AsyncCompletions(original) if async_mode else SyncCompletions(original)
+        )
+        backup_calls = (
+            AsyncCompletions(response("fallback"))
+            if async_mode
+            else SyncCompletions(response("fallback"))
+        )
+        install_sync_chain(monkeypatch, Client(primary_calls), [Client(backup_calls)])
+        result = call_public(
+            async_mode,
+            task="compression",
+            messages=[{"role": "user", "content": "compress"}],
+        )
+        assert result.choices[0].message.content == "fallback"
+
+    @pytest.mark.parametrize("async_mode", [False, True])
+    @pytest.mark.parametrize(
+        "conflict",
+        [
+            "authentication error",
+            "AUTHENTICATION_ERROR",
+            "authentication-error",
+            "authenticationerror",
+            "model not found",
+            "service_unavailable",
+            "network-failure",
+            "validationerror",
+            "context length exceeded",
+            "payload-too-large",
+            "rate_limit_exceeded",
+            "toomanyrequests",
+        ],
+    )
+    def test_public_negative_classes_veto_quota_across_separator_variants(
+        self, monkeypatch, async_mode, conflict
+    ):
+        original = ProviderError(
+            "provider error",
+            status_code=429,
+            body={
+                "error": {
+                    "code": "quota_exhausted",
+                    "details": {"message": conflict},
+                }
+            },
+        )
+        primary_calls = AsyncCompletions(original) if async_mode else SyncCompletions(original)
+        backup_calls = (
+            AsyncCompletions(response("must not run"))
+            if async_mode
+            else SyncCompletions(response("must not run"))
+        )
+        install_sync_chain(monkeypatch, Client(primary_calls), [Client(backup_calls)])
+        with pytest.raises(ProviderError) as caught:
+            call_public(
+                async_mode,
+                task="compression",
+                messages=[{"role": "user", "content": "compress"}],
+            )
+        assert caught.value is original
+        assert backup_calls.calls == []
+
+    @pytest.mark.parametrize(
+        "authority",
+        [
+            "quota.exhausted",
+            "quota/exhausted",
+            "quota:exhausted",
+            "quota__exhausted",
+            "_quota_exhausted",
+            "quota_exhausted_",
+            "quota\u200bexhausted",
+            "quota_exhausted🙂",
+        ],
+    )
+    def test_generic_authority_rejects_forbidden_punctuation(self, authority):
+        assert not error_classifier.is_explicit_usage_quota_exhaustion(
+            ProviderError(body={"error": {"code": authority}})
+        )
+
+    @pytest.mark.parametrize("async_mode", [False, True])
+    def test_status_must_share_the_authority_component(self, monkeypatch, async_mode):
+        original = ProviderError(body={"error": {"code": "quota_exhausted"}})
+        original.__cause__ = ProviderError("sibling", status_code=429)
+        primary_calls = AsyncCompletions(original) if async_mode else SyncCompletions(original)
+        backup_calls = (
+            AsyncCompletions(response("must not run"))
+            if async_mode
+            else SyncCompletions(response("must not run"))
+        )
+        install_sync_chain(monkeypatch, Client(primary_calls), [Client(backup_calls)])
+        with pytest.raises(ProviderError) as caught:
+            call_public(
+                async_mode,
+                task="compression",
+                messages=[{"role": "user", "content": "compress"}],
+            )
+        assert caught.value is original
+        assert backup_calls.calls == []
+
+    def test_xai_403_cannot_be_borrowed_from_a_causal_sibling(self):
+        original = ProviderError(
+            body={"error": {"code": "personal-team-blocked:spending-limit"}}
+        )
+        original.__context__ = ProviderError(status_code=403)
+        assert not error_classifier.is_explicit_usage_quota_exhaustion(original)
+
+    def test_exception_details_has_mapping_parity(self):
+        assert error_classifier.is_explicit_usage_quota_exhaustion(
+            ProviderError(details={"error": {"reason": "usage_limit_reached"}})
+        )
+        assert not error_classifier.is_explicit_usage_quota_exhaustion(
+            ProviderError(
+                details={
+                    "error": {
+                        "reason": "usage_limit_reached",
+                        "message": "authentication failure",
+                    }
+                }
+            )
+        )
+
+    @pytest.mark.parametrize("async_mode", [False, True])
+    def test_public_nonquota_candidate_diagnostic_graph_is_acyclic(
+        self, monkeypatch, async_mode
+    ):
+        original = quota_error("primary quota")
+        candidate = ProviderError("candidate transport failure")
+        primary_calls = AsyncCompletions(original) if async_mode else SyncCompletions(original)
+        candidate_calls = AsyncCompletions(candidate) if async_mode else SyncCompletions(candidate)
+        install_sync_chain(monkeypatch, Client(primary_calls), [Client(candidate_calls)])
+        with pytest.raises(ProviderError) as caught:
+            call_public(
+                async_mode,
+                task="compression",
+                messages=[{"role": "user", "content": "compress"}],
+            )
+        assert caught.value is original
+        assert original.__cause__ is candidate
+        seen = set()
+        current = original
+        for _ in range(8):
+            if current is None:
+                break
+            assert id(current) not in seen
+            seen.add(id(current))
+            current = current.__cause__ or current.__context__
+
+
+class TestQ3ClassBCredentialBinding:
+    @pytest.mark.parametrize("async_mode", [False, True])
+    @pytest.mark.parametrize("provider", ["openrouter", "anthropic", "xai"])
+    def test_public_builtin_primary_without_captured_key_fails_before_resolution(
+        self, monkeypatch, async_mode, provider
+    ):
+        config = {
+            "provider": provider,
+            "model": "explicit-model",
+            "fallback_on": ["quota_exhausted"],
+            "fallback_chain": [
+                {
+                    "provider": "custom",
+                    "model": "backup",
+                    "base_url": "https://backup.example/v1",
+                    "api_key": "backup-key",
+                }
+            ],
+        }
+        monkeypatch.setattr(aux, "_get_auxiliary_task_config", lambda _task: config)
+        monkeypatch.setattr(
+            aux,
+            "_get_cached_client",
+            lambda *_args, **_kwargs: pytest.fail("ambient resolver was reached"),
+        )
+        for name in ("OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "XAI_API_KEY"):
+            monkeypatch.delenv(name, raising=False)
+        with pytest.raises(RuntimeError, match="no concrete primary"):
+            call_public(
+                async_mode,
+                task="web_extract",
+                messages=[{"role": "user", "content": "extract"}],
+            )
+
+    @pytest.mark.parametrize("async_mode", [False, True])
+    def test_missing_key_env_candidate_is_rejected_without_ambient_resolution(
+        self, monkeypatch, async_mode
+    ):
+        config = quota_config(0)
+        config["fallback_chain"] = [
+            {
+                "provider": "custom",
+                "model": "backup",
+                "base_url": "https://backup.example/v1",
+                "key_env": "ABSENT_BACKUP_KEY",
+            }
+        ]
+        monkeypatch.delenv("ABSENT_BACKUP_KEY", raising=False)
+        original = quota_error()
+        primary_calls = AsyncCompletions(original) if async_mode else SyncCompletions(original)
+        resolutions = []
+        monkeypatch.setattr(aux, "_get_auxiliary_task_config", lambda _task: config)
+
+        def get_cached(*_args, **kwargs):
+            resolutions.append(dict(kwargs))
+            if kwargs.get("base_url") != "https://primary.example/v1":
+                pytest.fail("candidate with missing key_env reached resolution")
+            return Client(primary_calls), "primary-model"
+
+        monkeypatch.setattr(aux, "_get_cached_client", get_cached)
+        with pytest.raises(ProviderError) as caught:
+            call_public(
+                async_mode,
+                task="compression",
+                messages=[{"role": "user", "content": "compress"}],
+            )
+        assert caught.value is original
+        assert len(resolutions) == 1
+
+    def test_remote_custom_requires_auth_but_explicit_loopback_is_no_auth(self):
+        remote = policy.capture_closed_plan(
+            "compression",
+            {
+                "fallback_on": ["quota_exhausted"],
+                "fallback_chain": [
+                    {
+                        "provider": "custom",
+                        "model": "remote",
+                        "base_url": "https://remote.example/v1",
+                    }
+                ],
+            },
+        )
+        local = policy.capture_closed_plan(
+            "compression",
+            {
+                "fallback_on": ["quota_exhausted"],
+                "fallback_chain": [
+                    {
+                        "provider": "custom",
+                        "model": "local",
+                        "base_url": "http://127.0.0.1:8000/v1",
+                    }
+                ],
+            },
+        )
+        assert remote.candidates == ()
+        assert local.candidates[0].credential.kind == "no_auth"
+        assert "no-key-required" not in repr(local.candidates[0])
+
+    @pytest.mark.parametrize("async_mode", [False, True])
+    def test_closed_resolution_is_strict_and_bound_to_captured_credential(
+        self, monkeypatch, async_mode
+    ):
+        config = quota_config(0)
+        calls = AsyncCompletions(response("ok")) if async_mode else SyncCompletions(response("ok"))
+        observed = []
+        monkeypatch.setattr(aux, "_get_auxiliary_task_config", lambda _task: config)
+
+        def get_cached(*_args, **kwargs):
+            observed.append(dict(kwargs))
+            return Client(calls), "primary-model"
+
+        monkeypatch.setattr(aux, "_get_cached_client", get_cached)
+        call_public(
+            async_mode,
+            task="web_extract",
+            messages=[{"role": "user", "content": "extract"}],
+        )
+        assert observed[0]["strict_runtime"] is True
+        assert observed[0]["api_key"] == "primary-key"
+        assert observed[0]["credential_identity"]
+        assert "primary-key" not in observed[0]["credential_identity"]
+
+    def test_callable_binding_is_preserved_and_secret_safe(self):
+        class TokenProvider:
+            def __call__(self):
+                return "CALLABLE-RAW-TOKEN"
+
+            def __repr__(self):
+                return "TokenProvider(CALLABLE-RAW-TOKEN)"
+
+        provider = TokenProvider()
+        snapshot = policy.capture_closed_plan(
+            "compression",
+            {
+                "provider": "custom",
+                "model": "primary",
+                "base_url": "https://callable.example/v1",
+                "api_key": provider,
+                "fallback_on": ["quota_exhausted"],
+                "fallback_chain": [
+                    {
+                        "provider": "custom",
+                        "model": "backup",
+                        "base_url": "https://backup.example/v1",
+                        "api_key": "backup-key",
+                    }
+                ],
+            },
+        )
+        assert snapshot.primary.api_key is provider
+        assert snapshot.primary.credential.kind == "callable"
+        assert "CALLABLE-RAW-TOKEN" not in repr(snapshot)
+        assert "CALLABLE-RAW-TOKEN" not in snapshot.primary.credential.identity
+
+
+class TestQ3ClassCControlsAndCapabilities:
+    @pytest.mark.parametrize("async_mode", [False, True])
+    def test_strict_openrouter_resolution_uses_only_frozen_headers(
+        self, monkeypatch, async_mode
+    ):
+        constructed = []
+
+        class StrictClient:
+            def __init__(self, **kwargs):
+                constructed.append(dict(kwargs))
+                self.api_key = kwargs["api_key"]
+                self.base_url = kwargs["base_url"]
+
+        monkeypatch.setattr(
+            aux,
+            "_create_openai_client",
+            lambda **kwargs: StrictClient(**kwargs),
+        )
+        monkeypatch.setattr(sys.modules["openai"], "AsyncOpenAI", StrictClient)
+        monkeypatch.setattr(
+            aux,
+            "build_or_headers",
+            lambda *_args, **_kwargs: pytest.fail("strict route rebuilt ambient headers"),
+        )
+        monkeypatch.setattr(
+            aux,
+            "_apply_user_default_headers",
+            lambda *_args, **_kwargs: pytest.fail("strict route loaded ambient headers"),
+        )
+
+        client, model = aux.resolve_provider_client(
+            "openrouter",
+            "vendor/frozen-model",
+            async_mode=async_mode,
+            explicit_base_url="https://openrouter.ai/api/v1",
+            explicit_api_key="FROZEN-OPENROUTER-KEY",
+            strict_runtime=True,
+            default_headers={
+                "HTTP-Referer": "https://frozen.example",
+                "Authorization": "Bearer FROZEN-HEADER-TOKEN",
+            },
+        )
+
+        assert isinstance(client, StrictClient)
+        assert model == "vendor/frozen-model"
+        assert constructed[-1]["default_headers"] == {
+            "HTTP-Referer": "https://frozen.example",
+            "Authorization": "Bearer FROZEN-HEADER-TOKEN",
+        }
+
+    @pytest.mark.parametrize("async_mode", [False, True])
+    def test_named_candidate_freezes_route_local_controls(self, monkeypatch, async_mode):
+        named = {
+            "base_url": "https://named.example/v1",
+            "api_key": "named-key",
+            "model": "named-model",
+            "extra_headers": {"X-Frozen": "header-a"},
+            "extra_body": {"provider_default": "a", "precedence": "provider"},
+            "max_output_tokens": 321,
+            "supports_vision": True,
+            "context_length": 131072,
+        }
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider._get_named_custom_provider",
+            lambda _provider: dict(named),
+        )
+        config = quota_config(0)
+        config["fallback_chain"] = [
+            {
+                "provider": "custom:backup",
+                "model": "named-model",
+                "timeout": 17,
+                "extra_body": {"precedence": "route", "route": "b"},
+                "extra_headers": {"X-Route": "header-b"},
+                "max_output_tokens": 222,
+            }
+        ]
+        original = quota_error()
+        primary_calls = AsyncCompletions(original) if async_mode else SyncCompletions(original)
+        backup_calls = (
+            AsyncCompletions(response("frozen"))
+            if async_mode
+            else SyncCompletions(response("frozen"))
+        )
+        resolutions = []
+        monkeypatch.setattr(aux, "_get_auxiliary_task_config", lambda _task: config)
+
+        def get_cached(*_args, **kwargs):
+            resolutions.append(dict(kwargs))
+            if kwargs.get("base_url") == "https://primary.example/v1":
+                named.update(
+                    extra_headers={"X-Mutated": "later"},
+                    max_output_tokens=999,
+                    supports_vision=False,
+                    context_length=1,
+                )
+                return Client(primary_calls), "primary-model"
+            return Client(backup_calls), "named-model"
+
+        monkeypatch.setattr(aux, "_get_cached_client", get_cached)
+        result = call_public(
+            async_mode,
+            task="compression",
+            messages=[{"role": "user", "content": "compress"}],
+        )
+        assert result.choices[0].message.content == "frozen"
+        candidate_resolution = resolutions[1]
+        assert candidate_resolution["default_headers"] == {
+            "X-Frozen": "header-a",
+            "X-Route": "header-b",
+        }
+        assert candidate_resolution["strict_runtime"] is True
+        assert backup_calls.calls[0]["timeout"] == 17
+        assert backup_calls.calls[0]["max_tokens"] == 222
+        assert backup_calls.calls[0]["extra_body"] == {
+            "provider_default": "a",
+            "precedence": "route",
+            "route": "b",
+            "snapshot": "a",
+        }
+
+    @pytest.mark.parametrize("async_mode", [False, True])
+    def test_primary_scoped_controls_do_not_leak_to_candidate(self, monkeypatch, async_mode):
+        config = quota_config(1)
+        config.update(
+            extra_headers={"X-Primary": "only"},
+            max_output_tokens=111,
+            request_overrides={"extra_body": {"primary": "only"}},
+        )
+        original = quota_error()
+        primary_calls = AsyncCompletions(original) if async_mode else SyncCompletions(original)
+        backup_calls = (
+            AsyncCompletions(response("backup"))
+            if async_mode
+            else SyncCompletions(response("backup"))
+        )
+        resolutions = []
+        monkeypatch.setattr(aux, "_get_auxiliary_task_config", lambda _task: config)
+
+        def get_cached(*_args, **kwargs):
+            resolutions.append(dict(kwargs))
+            return (
+                (Client(primary_calls), "primary-model")
+                if len(resolutions) == 1
+                else (Client(backup_calls), "backup-model")
+            )
+
+        monkeypatch.setattr(aux, "_get_cached_client", get_cached)
+        result = call_public(
+            async_mode,
+            task="web_extract",
+            messages=[{"role": "user", "content": "extract"}],
+        )
+        assert result.choices[0].message.content == "backup"
+        assert resolutions[0]["default_headers"] == {"X-Primary": "only"}
+        assert resolutions[1].get("default_headers") in (None, {})
+        assert "max_tokens" not in backup_calls.calls[0]
+        assert backup_calls.calls[0].get("extra_body") == {"snapshot": "a"}
+
+    def test_frozen_route_repr_hides_header_and_credential_values(self):
+        snapshot = policy.capture_closed_plan(
+            "compression",
+            {
+                **quota_config(0),
+                "extra_headers": {"Authorization": "Bearer RAW-HEADER-SECRET"},
+            },
+        )
+        rendered = repr(snapshot)
+        assert "primary-key" not in rendered
+        assert "RAW-HEADER-SECRET" not in rendered

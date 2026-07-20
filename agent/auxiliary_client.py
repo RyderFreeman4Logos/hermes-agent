@@ -54,7 +54,7 @@ import time
 from collections.abc import Mapping
 from pathlib import Path  # noqa: F401 — used by test mocks
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Dict, List, NoReturn, Optional, Tuple, TYPE_CHECKING
 from urllib.parse import urlparse, parse_qs, urlunparse
 
 # NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
@@ -4140,7 +4140,10 @@ def _candidate_context_window(
     provider: str,
     model: str,
     base_url: str = "",
-    api_key: str = "",
+    api_key: Any = "",
+    *,
+    config_context_length: Optional[int] = None,
+    closed_runtime: bool = False,
 ) -> Optional[int]:
     """Resolve the effective context window for a fallback candidate.
 
@@ -4162,6 +4165,8 @@ def _candidate_context_window(
             base_url=base_url,
             api_key=api_key,
             provider=provider,
+            config_context_length=config_context_length,
+            custom_providers=[] if closed_runtime else None,
         )
     except Exception as exc:
         logger.debug(
@@ -4603,7 +4608,14 @@ def _resolve_auto(
 # below — never look up auth env vars ad-hoc.
 
 
-def _to_async_client(sync_client, model: str, is_vision: bool = False):
+def _to_async_client(
+    sync_client,
+    model: str,
+    is_vision: bool = False,
+    *,
+    default_headers: Optional[Mapping[str, Any]] = None,
+    strict_runtime: bool = False,
+):
     """Convert a sync client to its async counterpart, preserving Codex routing.
 
     When ``is_vision=True`` and the underlying base URL is Copilot, the
@@ -4638,35 +4650,39 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
         "base_url": str(sync_client.base_url),
     }
     sync_base_url = str(sync_client.base_url)
-    if base_url_host_matches(sync_base_url, "openrouter.ai"):
-        async_kwargs["default_headers"] = build_or_headers()
-    elif base_url_host_matches(sync_base_url, "githubcopilot.com"):
-        from hermes_cli.copilot_auth import copilot_request_headers
-
-        async_kwargs["default_headers"] = copilot_request_headers(
-            is_agent_turn=True, is_vision=is_vision
-        )
-    elif base_url_host_matches(sync_base_url, "api.kimi.com"):
-        async_kwargs["default_headers"] = {"User-Agent": "claude-code/0.1.0"}
-    elif base_url_host_matches(sync_base_url, "integrate.api.nvidia.com"):
-        async_kwargs["default_headers"] = build_nvidia_nim_headers(sync_base_url)
+    if strict_runtime:
+        if default_headers:
+            async_kwargs["default_headers"] = dict(default_headers)
     else:
-        # Fall back to profile.default_headers for providers that declare
-        # client-level headers on their ProviderProfile (e.g. attribution
-        # User-Agent strings). Provider is inferred from the hostname.
-        try:
-            from agent.model_metadata import _infer_provider_from_url
-            from providers import get_provider_profile as _gpf_async
-            _inferred = _infer_provider_from_url(sync_base_url)
-            if _inferred:
-                _ph_async = _gpf_async(_inferred)
-                if _ph_async and _ph_async.default_headers:
-                    async_kwargs["default_headers"] = dict(_ph_async.default_headers)
-        except Exception:
-            pass
-    _merged_async = _apply_user_default_headers(async_kwargs.get("default_headers"))
-    if _merged_async:
-        async_kwargs["default_headers"] = _merged_async
+        if base_url_host_matches(sync_base_url, "openrouter.ai"):
+            async_kwargs["default_headers"] = build_or_headers()
+        elif base_url_host_matches(sync_base_url, "githubcopilot.com"):
+            from hermes_cli.copilot_auth import copilot_request_headers
+
+            async_kwargs["default_headers"] = copilot_request_headers(
+                is_agent_turn=True, is_vision=is_vision
+            )
+        elif base_url_host_matches(sync_base_url, "api.kimi.com"):
+            async_kwargs["default_headers"] = {"User-Agent": "claude-code/0.1.0"}
+        elif base_url_host_matches(sync_base_url, "integrate.api.nvidia.com"):
+            async_kwargs["default_headers"] = build_nvidia_nim_headers(sync_base_url)
+        else:
+            # Fall back to profile.default_headers for providers that declare
+            # client-level headers on their ProviderProfile (e.g. attribution
+            # User-Agent strings). Provider is inferred from the hostname.
+            try:
+                from agent.model_metadata import _infer_provider_from_url
+                from providers import get_provider_profile as _gpf_async
+                _inferred = _infer_provider_from_url(sync_base_url)
+                if _inferred:
+                    _ph_async = _gpf_async(_inferred)
+                    if _ph_async and _ph_async.default_headers:
+                        async_kwargs["default_headers"] = dict(_ph_async.default_headers)
+            except Exception:
+                pass
+        _merged_async = _apply_user_default_headers(async_kwargs.get("default_headers"))
+        if _merged_async:
+            async_kwargs["default_headers"] = _merged_async
     async_kwargs = {
         **_openai_http_client_kwargs(sync_base_url, async_mode=True),
         **async_kwargs,
@@ -4689,18 +4705,43 @@ def _normalize_resolved_model(model_name: Optional[str], provider: str) -> Optio
         return model_name
 
 
+def _safe_client_cache_digest(value: Any) -> str:
+    if callable(value):
+        target = getattr(value, "__func__", value)
+        material = f"callable:{type(target).__module__}.{type(target).__qualname__}:{id(target)}"
+    elif value is None:
+        material = "none"
+    else:
+        material = str(value)
+    return hashlib.sha256(material.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def _safe_headers_cache_digest(headers: Optional[Mapping[str, Any]]) -> str:
+    if not headers:
+        return "none"
+    canonical = json.dumps(
+        sorted((str(key), str(value)) for key, value in headers.items()),
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
 def resolve_provider_client(
     provider: str,
-    model: str = None,
+    model: Optional[str] = None,
     async_mode: bool = False,
     raw_codex: bool = False,
-    explicit_base_url: str = None,
-    explicit_api_key: str = None,
-    api_mode: str = None,
+    explicit_base_url: Optional[str] = None,
+    explicit_api_key: Any = None,
+    api_mode: Optional[str] = None,
     main_runtime: Optional[Dict[str, Any]] = None,
     is_vision: bool = False,
     task: Optional[str] = None,
+    strict_runtime: bool = False,
+    default_headers: Optional[Mapping[str, Any]] = None,
 ) -> Tuple[Optional[Any], Optional[str]]:
+
     """Central router: given a provider name and optional model, return a
     configured client with the correct auth, base URL, and API format.
 
@@ -4776,7 +4817,7 @@ def resolve_provider_client(
     # sent to Codex after the main lane fell back to gpt-5.5). Let _resolve_auto()
     # return the actual current runtime model when the caller did not explicitly
     # request one. (# compression-current-model)
-    if not model and provider != "auto":
+    if not model and provider != "auto" and not strict_runtime:
         model = _get_aux_model_for_provider(provider) or _read_main_model() or model
 
     def _needs_codex_wrap(client_obj, base_url_str: str, model_str: str) -> bool:
@@ -4826,6 +4867,37 @@ def resolve_provider_client(
         # chat.completions.create() is translated to /v1/messages.
         return _maybe_wrap_anthropic(
             client_obj, final_model_str, api_key_str, base_url_str, api_mode,
+        )
+
+    if strict_runtime:
+        if provider in {"", "auto", "main"} or not model or not explicit_base_url:
+            return None, None
+        if explicit_api_key is None:
+            return None, None
+        headers: Dict[str, Any] = {}
+        if provider in {"openai-codex", "codex"} and isinstance(
+            explicit_api_key, str
+        ):
+            headers.update(_codex_cloudflare_headers(explicit_api_key))
+        if default_headers:
+            headers.update(dict(default_headers))
+        sdk_key = explicit_api_key or "no-key-required"
+        client = _create_openai_client(
+            api_key=sdk_key,
+            base_url=explicit_base_url,
+            **({"default_headers": headers} if headers else {}),
+        )
+        client = _wrap_if_needed(client, model, explicit_base_url, sdk_key)
+        return (
+            _to_async_client(
+                client,
+                model,
+                is_vision=is_vision,
+                default_headers=headers,
+                strict_runtime=True,
+            )
+            if async_mode
+            else (client, model)
         )
 
     # ── Auto: try all providers in priority order ────────────────────
@@ -5910,35 +5982,48 @@ def _client_cache_key(
     *,
     async_mode: bool,
     base_url: Optional[str] = None,
-    api_key: Optional[str] = None,
+    api_key: Any = None,
     api_mode: Optional[str] = None,
     main_runtime: Optional[Dict[str, Any]] = None,
     is_vision: bool = False,
     task: Optional[str] = None,
     model: Optional[str] = None,
+    strict_runtime: bool = False,
+    default_headers: Optional[Mapping[str, Any]] = None,
+    credential_identity: Optional[str] = None,
 ) -> tuple:
-    runtime = _normalize_main_runtime(main_runtime)
-    runtime_key = tuple(
-        _runtime_cache_discriminator(field, runtime.get(field, ""))
-        for field in _MAIN_RUNTIME_FIELDS
-    ) if provider == "auto" else ()
-    # `auto` can now resolve through task-specific or main fallback policy,
-    # so the task participates in the cache key. Non-auto providers keep the
-    # old cache shape because the explicit provider/model tuple is sufficient.
-    task_key = (task or "") if provider == "auto" else ""
-    pool_hint = _pool_cache_hint(provider, main_runtime=main_runtime)
-    # The model MUST participate in the key. Two concurrent auxiliary calls to
-    # the SAME provider/base_url/key but DIFFERENT models (e.g. a MoA reference
-    # fan-out running opus + gpt-5.5 in parallel threads) would otherwise share
-    # one cache entry. On a cache MISS both build a client for the same key; the
-    # second's _store_cached_client sees the first as the "old" entry and CLOSES
-    # it — while the first call is still mid-request on it — yielding a spurious
-    # APIConnectionError that fails the sibling advisor (root cause of the run2
-    # double-advisor "Connection error" collapse). Keying on model gives each
-    # model its own client, so concurrent fan-out calls never cross-close.
+    runtime = {} if strict_runtime else _normalize_main_runtime(main_runtime)
+    runtime_key = (
+        tuple(
+            _runtime_cache_discriminator(field, runtime.get(field, ""))
+            for field in _MAIN_RUNTIME_FIELDS
+        )
+        if provider == "auto" and not strict_runtime
+        else ()
+    )
+    task_key = (task or "") if provider == "auto" and not strict_runtime else ""
+    pool_hint = () if strict_runtime else _pool_cache_hint(
+        provider, main_runtime=main_runtime
+    )
     model_key = model or runtime.get("model", "")
-    api_key_key = _runtime_cache_discriminator("api_key", api_key or "")
-    return (provider, async_mode, base_url or "", api_key_key, api_mode or "", runtime_key, is_vision, task_key, pool_hint, model_key)
+    api_key_key = credential_identity or _runtime_cache_discriminator(
+        "api_key", api_key or ""
+    )
+    headers_key = _safe_headers_cache_digest(default_headers)
+    return (
+        provider,
+        async_mode,
+        base_url or "",
+        api_key_key,
+        api_mode or "",
+        runtime_key,
+        is_vision,
+        task_key,
+        pool_hint,
+        model_key,
+        strict_runtime,
+        headers_key,
+    )
 
 
 def _store_cached_client(cache_key: tuple, client: Any, default_model: Optional[str], *, bound_loop: Any = None) -> None:
@@ -6120,14 +6205,17 @@ def _compat_model(client: Any, model: Optional[str], cached_default: Optional[st
 
 def _get_cached_client(
     provider: str,
-    model: str = None,
+    model: Optional[str] = None,
     async_mode: bool = False,
-    base_url: str = None,
-    api_key: str = None,
-    api_mode: str = None,
+    base_url: Optional[str] = None,
+    api_key: Any = None,
+    api_mode: Optional[str] = None,
     main_runtime: Optional[Dict[str, Any]] = None,
     is_vision: bool = False,
     task: Optional[str] = None,
+    strict_runtime: bool = False,
+    default_headers: Optional[Mapping[str, Any]] = None,
+    credential_identity: Optional[str] = None,
 ) -> Tuple[Optional[Any], Optional[str]]:
     """Get or create a cached client for the given provider.
 
@@ -6156,7 +6244,7 @@ def _get_cached_client(
             current_loop = _aio.get_event_loop()
         except RuntimeError:
             pass
-    runtime = _normalize_main_runtime(main_runtime)
+    runtime = {} if strict_runtime else _normalize_main_runtime(main_runtime)
     cache_key = _client_cache_key(
         provider,
         async_mode=async_mode,
@@ -6167,6 +6255,9 @@ def _get_cached_client(
         is_vision=is_vision,
         task=task,
         model=model,
+        strict_runtime=strict_runtime,
+        default_headers=default_headers,
+        credential_identity=credential_identity,
     )
     with _client_cache_lock:
         if cache_key in _client_cache:
@@ -6196,7 +6287,7 @@ def _get_cached_client(
     # after key #1 is marked exhausted the retry would still get key #1 from
     # the env var and fail again, causing the retry2_err handler to mark key #2.
     effective_api_key = api_key
-    if not effective_api_key:
+    if not strict_runtime and not effective_api_key:
         _pe = _peek_pool_entry(_normalize_aux_provider(provider))
         if _pe is not None:
             _pk = _pool_runtime_api_key(_pe)
@@ -6212,6 +6303,8 @@ def _get_cached_client(
         main_runtime=runtime,
         is_vision=is_vision,
         task=task,
+        strict_runtime=strict_runtime,
+        default_headers=default_headers,
     )
     if client is not None:
         # For async clients, remember which loop they were created on so we
@@ -6962,6 +7055,9 @@ def _resolve_closed_route(
         main_runtime={},
         is_vision=task == "vision",
         task=None,
+        strict_runtime=True,
+        default_headers=thaw_json_payload(route.extra_headers),
+        credential_identity=route.credential.identity,
     )
 
 
@@ -6978,18 +7074,37 @@ def _closed_candidate_kwargs(
     reasoning_config: Optional[dict],
 ) -> dict:
     timeout = route.timeout or effective_timeout
+    route_overrides = thaw_json_payload(route.request_overrides)
+    route_body = thaw_json_payload(route.extra_body)
+    override_body = route_overrides.pop("extra_body", {})
+    if isinstance(override_body, Mapping):
+        route_body.update(override_body)
+    route_body.update(effective_extra_body)
+    route_max_tokens = max_tokens or route.max_output_tokens
     kwargs = _build_call_kwargs(
         route.provider,
         model or route.model,
         messages,
         temperature=temperature,
-        max_tokens=max_tokens,
+        max_tokens=route_max_tokens,
         tools=tools,
         timeout=timeout,
-        extra_body=effective_extra_body,
+        extra_body=route_body,
         reasoning_config=reasoning_config,
         base_url=route.base_url,
     )
+    kwargs.update(route_overrides)
+    kwargs["model"] = model or route.model
+    kwargs["messages"] = messages
+    kwargs["timeout"] = timeout
+    if temperature is not None:
+        kwargs["temperature"] = temperature
+    if route_max_tokens is not None:
+        kwargs["max_tokens"] = route_max_tokens
+    if tools is not None:
+        kwargs["tools"] = tools
+    if route_body:
+        kwargs["extra_body"] = route_body
     if _is_anthropic_compat_endpoint(route.provider, route.base_url):
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
     return kwargs
@@ -7034,21 +7149,58 @@ def _closed_route_is_capable(
     route: FrozenRoute,
 ) -> bool:
     if plan.task == "vision":
+        if route.supports_vision is not None:
+            return route.supports_vision
         return _main_model_supports_vision(
-            route.declared_provider,
+            route.provider,
             route.model,
-            config=_closed_vision_capability_config(plan, route),
+            config={"model": {"provider": route.provider}},
         )
     if plan.task != "compression":
         return True
-    known_window = _candidate_context_window(
-        route.declared_provider,
-        route.model,
-        base_url=route.base_url,
-        api_key=route.api_key,
-    )
+    if route.context_length is not None:
+        known_window = route.context_length
+    else:
+        known_window = _candidate_context_window(
+            route.provider,
+            route.model,
+            base_url=route.base_url,
+            api_key=route.api_key,
+            closed_runtime=True,
+        )
     minimum = _task_minimum_context_length(plan.task)
     return minimum is None or known_window is None or known_window >= minimum
+
+
+def _raise_original_with_candidate_diagnostic(
+    original_error: BaseException,
+    candidate_error: BaseException,
+) -> NoReturn:
+    """Re-raise the original with a bounded, cycle-free candidate diagnostic."""
+
+    pending = [candidate_error]
+    seen: set[int] = set()
+    safe_to_attach = candidate_error is not original_error
+    while pending and len(seen) < 32:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        for edge in ("__cause__", "__context__"):
+            child = getattr(current, edge, None)
+            if child is original_error:
+                try:
+                    setattr(current, edge, None)
+                except Exception:
+                    safe_to_attach = False
+                continue
+            if isinstance(child, BaseException):
+                pending.append(child)
+    if pending:
+        safe_to_attach = False
+    if safe_to_attach:
+        raise original_error from candidate_error
+    raise original_error from None
 
 
 def _execute_closed_fallback_sync(
@@ -7094,7 +7246,9 @@ def _execute_closed_fallback_sync(
                 stop_exceptions=(original_error,),
             ):
                 continue
-            raise original_error from candidate_error
+            _raise_original_with_candidate_diagnostic(
+                original_error, candidate_error
+            )
     return None
 
 
@@ -7141,7 +7295,9 @@ async def _execute_closed_fallback_async(
                 stop_exceptions=(original_error,),
             ):
                 continue
-            raise original_error from candidate_error
+            _raise_original_with_candidate_diagnostic(
+                original_error, candidate_error
+            )
     return None
 
 
@@ -7278,15 +7434,23 @@ def call_llm(
             )
         resolved_provider = effective_provider or resolved_provider
     else:
-        client, final_model = _get_cached_client(
-            resolved_provider,
-            resolved_model,
-            base_url=resolved_base_url,
-            api_key=resolved_api_key,
-            api_mode=resolved_api_mode,
-            main_runtime=main_runtime,
-            is_vision=task == "vision",
-        )
+        if closed_plan is not None:
+            assert closed_plan.primary is not None
+            client, final_model = _resolve_closed_route(
+                closed_plan.primary,
+                task=task,
+                async_mode=False,
+            )
+        else:
+            client, final_model = _get_cached_client(
+                resolved_provider,
+                resolved_model,
+                base_url=resolved_base_url,
+                api_key=resolved_api_key,
+                api_mode=resolved_api_mode,
+                main_runtime=main_runtime,
+                is_vision=task == "vision",
+            )
         if client is None:
             if closed_plan is not None:
                 raise RuntimeError(
@@ -7342,17 +7506,31 @@ def call_llm(
     # Pass the client's actual base_url (not just resolved_base_url) so
     # endpoint-specific temperature overrides can distinguish
     # api.moonshot.ai vs api.kimi.com/coding even on auto-detected routes.
-    kwargs = _build_call_kwargs(
-        resolved_provider, final_model, messages,
-        temperature=temperature, max_tokens=max_tokens,
-        tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
-        reasoning_config=reasoning_config,
-        base_url=_base_info or resolved_base_url)
+    if closed_plan is not None:
+        assert closed_plan.primary is not None
+        kwargs = _closed_candidate_kwargs(
+            closed_plan.primary,
+            final_model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tools=tools,
+            effective_timeout=effective_timeout,
+            effective_extra_body=effective_extra_body,
+            reasoning_config=reasoning_config,
+        )
+    else:
+        kwargs = _build_call_kwargs(
+            resolved_provider, final_model, messages,
+            temperature=temperature, max_tokens=max_tokens,
+            tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
+            reasoning_config=reasoning_config,
+            base_url=_base_info or resolved_base_url)
 
-    # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
-    _client_base = str(getattr(client, "base_url", "") or "")
-    if _is_anthropic_compat_endpoint(resolved_provider, _client_base):
-        kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
+        # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
+        _client_base = str(getattr(client, "base_url", "") or "")
+        if _is_anthropic_compat_endpoint(resolved_provider, _client_base):
+            kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
 
     # Streaming path: return the raw SDK Stream iterator directly. This is used by
     # the MoA aggregator so its tokens stream to the user. It deliberately skips
@@ -7436,41 +7614,6 @@ def call_llm(
             raise _last_transient
     except Exception as first_err:
         if closed_plan is not None:
-            auth_refresh_provider = _auth_refresh_provider_for_route(
-                resolved_provider, _base_info
-            )
-            if (
-                _is_auth_error(first_err)
-                and auth_refresh_provider not in {"auto", "", None, "nous"}
-                and _refresh_provider_credentials(auth_refresh_provider)
-            ):
-                if auth_refresh_provider != _normalize_aux_provider(
-                    resolved_provider
-                ):
-                    _evict_cached_clients(resolved_provider)
-                try:
-                    return _retry_same_provider_sync(
-                        task=task,
-                        resolved_provider=auth_refresh_provider,
-                        resolved_model=resolved_model or final_model,
-                        resolved_base_url=resolved_base_url,
-                        resolved_api_key=_closed_refresh_retry_api_key(
-                            closed_plan, resolved_api_key
-                        ),
-                        resolved_api_mode=resolved_api_mode,
-                        main_runtime=main_runtime,
-                        final_model=final_model,
-                        messages=messages,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                        tools=tools,
-                        effective_timeout=effective_timeout,
-                        effective_extra_body=effective_extra_body,
-                        reasoning_config=reasoning_config,
-                        frozen_route=True,
-                    )
-                except Exception as retry_err:
-                    first_err = retry_err
             if not _closed_allows_next(closed_plan, first_err):
                 raise first_err
             closed_response = _execute_closed_fallback_sync(
@@ -8019,16 +8162,24 @@ async def async_call_llm(
             )
         resolved_provider = effective_provider or resolved_provider
     else:
-        client, final_model = _get_cached_client(
-            resolved_provider,
-            resolved_model,
-            async_mode=True,
-            base_url=resolved_base_url,
-            api_key=resolved_api_key,
-            api_mode=resolved_api_mode,
-            main_runtime=main_runtime,
-            is_vision=task == "vision",
-        )
+        if closed_plan is not None:
+            assert closed_plan.primary is not None
+            client, final_model = _resolve_closed_route(
+                closed_plan.primary,
+                task=task,
+                async_mode=True,
+            )
+        else:
+            client, final_model = _get_cached_client(
+                resolved_provider,
+                resolved_model,
+                async_mode=True,
+                base_url=resolved_base_url,
+                api_key=resolved_api_key,
+                api_mode=resolved_api_mode,
+                main_runtime=main_runtime,
+                is_vision=task == "vision",
+            )
         if client is None:
             if closed_plan is not None:
                 raise RuntimeError(
@@ -8070,16 +8221,30 @@ async def async_call_llm(
     # endpoint-specific temperature overrides can distinguish
     # api.moonshot.ai vs api.kimi.com/coding even on auto-detected routes.
     _client_base = str(getattr(client, "base_url", "") or "")
-    kwargs = _build_call_kwargs(
-        resolved_provider, final_model, messages,
-        temperature=temperature, max_tokens=max_tokens,
-        tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
-        reasoning_config=reasoning_config,
-        base_url=_client_base or resolved_base_url)
+    if closed_plan is not None:
+        assert closed_plan.primary is not None
+        kwargs = _closed_candidate_kwargs(
+            closed_plan.primary,
+            final_model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            tools=tools,
+            effective_timeout=effective_timeout,
+            effective_extra_body=effective_extra_body,
+            reasoning_config=reasoning_config,
+        )
+    else:
+        kwargs = _build_call_kwargs(
+            resolved_provider, final_model, messages,
+            temperature=temperature, max_tokens=max_tokens,
+            tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
+            reasoning_config=reasoning_config,
+            base_url=_client_base or resolved_base_url)
 
-    # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
-    if _is_anthropic_compat_endpoint(resolved_provider, _client_base):
-        kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
+        # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
+        if _is_anthropic_compat_endpoint(resolved_provider, _client_base):
+            kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
 
     try:
         # Retry ONCE on the same provider for a transient transport blip
@@ -8133,40 +8298,6 @@ async def async_call_llm(
             raise _last_transient
     except Exception as first_err:
         if closed_plan is not None:
-            auth_refresh_provider = _auth_refresh_provider_for_route(
-                resolved_provider, _client_base
-            )
-            if (
-                _is_auth_error(first_err)
-                and auth_refresh_provider not in {"auto", "", None, "nous"}
-                and _refresh_provider_credentials(auth_refresh_provider)
-            ):
-                if auth_refresh_provider != _normalize_aux_provider(
-                    resolved_provider
-                ):
-                    _evict_cached_clients(resolved_provider)
-                try:
-                    return await _retry_same_provider_async(
-                        task=task,
-                        resolved_provider=auth_refresh_provider,
-                        resolved_model=resolved_model or final_model,
-                        resolved_base_url=resolved_base_url,
-                        resolved_api_key=_closed_refresh_retry_api_key(
-                            closed_plan, resolved_api_key
-                        ),
-                        resolved_api_mode=resolved_api_mode,
-                        final_model=final_model,
-                        messages=messages,
-                        temperature=temperature,
-                        max_tokens=max_tokens,
-                        tools=tools,
-                        effective_timeout=effective_timeout,
-                        effective_extra_body=effective_extra_body,
-                        reasoning_config=reasoning_config,
-                        frozen_route=True,
-                    )
-                except Exception as retry_err:
-                    first_err = retry_err
             if not _closed_allows_next(closed_plan, first_err):
                 raise first_err
             closed_response = await _execute_closed_fallback_async(

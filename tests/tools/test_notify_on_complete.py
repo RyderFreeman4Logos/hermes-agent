@@ -429,7 +429,8 @@ class TestCompletionConsumed:
 
     def test_wait_and_log_still_skip_cli_drain(self, registry):
         """wait()/read_log() consume the output, so the CLI drain skips their
-        completions via _completion_consumed (the original #8228 contract)."""
+        completions via _completion_consumed (the original #8228 contract).
+        """
         for sid, action in (("proc_w", "wait"), ("proc_l", "log")):
             s = _make_session(sid=sid, notify_on_complete=True, output="done")
             s.exited = True
@@ -466,6 +467,10 @@ def _silent_bg_base_config(tmp_path):
         "daytona_image": "",
         "cwd": str(tmp_path),
         "timeout": 30,
+        # Keep silent-bg hint tests opt-in: disable default notify so
+        # omitted notify_on_complete remains silent (legacy footgun path).
+        "auto_background_long_timeout": True,
+        "default_notify_on_background": False,
     }
 
 

@@ -2258,7 +2258,11 @@ PROCESS_SCHEMA = {
             },
             "timeout": {
                 "type": "integer",
-                "description": "Max seconds to block for 'wait' action. Returns partial output on timeout.",
+                "description": (
+                    "Max seconds to block for 'wait' action. Returns partial output on timeout. "
+                    "When auto_background_timeout_threshold is set, waits exceeding it return "
+                    "immediately instead of blocking."
+                ),
                 "minimum": 1
             },
             "offset": {
@@ -2329,6 +2333,41 @@ def _handle_process(args, **kw):
             return json.dumps(_redact_process_result(process_registry.read_log(
                 session_id, offset=args.get("offset", 0), limit=args.get("limit", 200))), ensure_ascii=False)
         elif action == "wait":
+            raw_timeout = args.get("timeout")
+            try:
+                from tools.terminal_tool import _get_env_config as _get_terminal_env
+                terminal_config = _get_terminal_env()
+            except Exception:
+                terminal_config = {}
+            auto_background_enabled = terminal_config.get("auto_background_long_timeout", True)
+            threshold = terminal_config.get("auto_background_timeout_threshold", 200)
+            effective_timeout = raw_timeout if raw_timeout is not None else 300
+            if (
+                auto_background_enabled
+                and isinstance(effective_timeout, (int, float))
+                and effective_timeout > threshold
+            ):
+                poll_result = process_registry.poll(session_id)
+                return json.dumps(
+                    {
+                        **_redact_process_result(poll_result),
+                        "note": (
+                            f"process(wait) timeout={int(effective_timeout)}s exceeds "
+                            f"auto_background_timeout_threshold={threshold}s. The process is "
+                            "already backgrounded. DO NOT use process(wait) or poll loops to "
+                            "wait for completion — they burn tokens and rot the context. "
+                            "Instead: (1) if this process was started with "
+                            "notify_on_complete=true, simply continue working; the completion "
+                            "notification will re-enter the conversation automatically when the "
+                            "process finishes. (2) For long-running or potentially long-running "
+                            "work, use the wd skill (launch a watchdog that sleeps CHECKIN "
+                            "seconds, then fires one heartbeat) so your KV cache stays warm. "
+                            "(3) Use process(action='poll') only for occasional quick status "
+                            "checks, never for waiting."
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
             return json.dumps(_redact_process_result(process_registry.wait(session_id, timeout=args.get("timeout"))), ensure_ascii=False)
         elif action == "kill":
             return json.dumps(

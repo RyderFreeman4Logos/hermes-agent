@@ -1135,7 +1135,20 @@ DEFAULT_CONFIG = {
         "backend": "local",
         "modal_mode": "auto",
         "cwd": ".",  # Use current directory
-        "timeout": 180,
+        # Default command timeout. When background is OMITTED and this effective
+        # value exceeds auto_background_timeout_threshold with the master switch
+        # on, promote to background+notify. Explicit background=false is kept.
+        "timeout": 3300,
+        # Master switch: auto-promote only when background was omitted and
+        # effective_timeout > auto_background_timeout_threshold.
+        "auto_background_long_timeout": True,
+        # Promote when effective_timeout > this threshold (seconds). Boundary
+        # equality stays foreground (timeout=200 stays fg).
+        "auto_background_timeout_threshold": 200,
+        # When background is true/promoted and notify_on_complete was omitted
+        # (and no watch_patterns), default notify_on_complete to true.
+        # Explicit notify_on_complete=false is always respected.
+        "default_notify_on_background": True,
         # Bounded grace period (seconds) between SIGTERM and an escalated
         # SIGKILL when terminating a host process tree (browser daemons, etc.).
         # A daemon that stalls in its SIGTERM handler is force-killed after this
@@ -7378,6 +7391,9 @@ TERMINAL_CONFIG_ENV_MAP = {
     "modal_mode": "TERMINAL_MODAL_MODE",
     "cwd": "TERMINAL_CWD",
     "timeout": "TERMINAL_TIMEOUT",
+    "auto_background_long_timeout": "TERMINAL_AUTO_BACKGROUND_LONG_TIMEOUT",
+    "auto_background_timeout_threshold": "TERMINAL_AUTO_BACKGROUND_TIMEOUT_THRESHOLD",
+    "default_notify_on_background": "TERMINAL_DEFAULT_NOTIFY_ON_BACKGROUND",
     "lifetime_seconds": "TERMINAL_LIFETIME_SECONDS",
     "docker_image": "TERMINAL_DOCKER_IMAGE",
     "docker_forward_env": "TERMINAL_DOCKER_FORWARD_ENV",

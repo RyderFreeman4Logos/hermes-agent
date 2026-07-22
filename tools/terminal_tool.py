@@ -43,7 +43,7 @@ import atexit
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 
 from utils import env_var_enabled
 
@@ -966,6 +966,7 @@ Reserve terminal for: builds, installs, git, processes, scripts, network, packag
 Because exported environment state persists, activate a virtualenv or export setup variables once per session; do not re-source the same environment before every command unless a command proves the shell state was reset.
 
 Foreground (default): Commands return INSTANTLY when done, even if the timeout is high. Set timeout=300 for long builds/scripts — you'll still get the result in seconds if it's fast. Prefer foreground for short commands.
+Auto-background: When background is OMITTED and timeout exceeds the configured threshold (200s by default), the command starts as a managed background process. Its timeout is rewritten to terminal.timeout (3300s by default). With omitted/default or explicit notify_on_complete=true, the tool still waits inline and returns the final result while the background process remains steer-safe; explicit notify_on_complete=false is true detach and returns a handle immediately with no completion notification.
 Background: Set background=true to get a session_id. Almost always pair with notify_on_complete=true — bg without notify runs SILENTLY and you have no way to learn it finished short of calling process(action='poll') yourself. Two legitimate uses:
   (1) Long-lived processes that never exit (servers, watchers, daemons) — silent is correct, there's no exit to notify on.
   (2) Long-running bounded tasks (tests, builds, deploys, CI pollers, batch jobs) — MUST set notify_on_complete=true. Without it you'll either forget to poll or sit blocked waiting for the user to surface the result.
@@ -1305,15 +1306,27 @@ def _is_unusable_container_cwd(cwd: str) -> bool:
     return False
 
 
-# One-shot guard for the config-fallback bridge below.  Purely an
-# optimization: after the first attempt either TERMINAL_ENV is set (bridge
-# succeeded — merged config always carries terminal.backend) or the import
-# failed and retrying every call would be wasted work.
-_terminal_config_bridge_attempted = False
+# Signature cache for the config → env bridge: last successfully applied
+# (mtime_ns, size) of get_hermes_home()/config.yaml, or None if missing /
+# not yet applied.  When the file signature is unchanged we skip re-bridge;
+# when it changes (or prior apply failed) we re-run so live config.yaml
+# edits hot-reload TERMINAL_* keys (e.g. auto_background_timeout_threshold).
+_terminal_config_bridge_sig: Optional[Tuple[int, int]] = None
+
+
+def _config_yaml_signature() -> Optional[Tuple[int, int]]:
+    """Return (mtime_ns, size) for Hermes home config.yaml, or None if absent."""
+    try:
+        from hermes_constants import get_hermes_home
+
+        st = (get_hermes_home() / "config.yaml").stat()
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
 
 
 def _ensure_terminal_env_bridged() -> None:
-    """Backfill TERMINAL_* env vars from config.yaml when no launcher did.
+    """Bridge TERMINAL_* env vars from config.yaml (mtime-based hot-reload).
 
     terminal_tool reads ALL terminal settings from os.environ (TERMINAL_*).
     The CLI (cli.py ``env_mappings``), the gateway (gateway/run.py
@@ -1325,24 +1338,36 @@ def _ensure_terminal_env_bridged() -> None:
     config.yaml selects ``terminal.backend: docker``, running commands on the
     host the user intended to sandbox (#63141, #54449, #61115, #65696).
 
-    Explicit env always wins: when TERMINAL_ENV is already set (a launcher's
-    bridge or the user's .env made a deliberate choice) this is a no-op.  The
-    config bridge only fills the unset case, so it changes an accidental
-    default — never an explicit selection.
+    Hot-reload: re-apply when config.yaml's (mtime_ns, size) changes so live
+    edits to ``terminal.*`` (including ``auto_background_timeout_threshold``)
+    take effect without restarting the process.  Signature is cached only on
+    successful apply so a transient failure can retry on the next call.
+
+    When config.yaml has a ``terminal:`` section, that section is authoritative
+    for keys present in it (matches ``apply_terminal_config_to_env`` with
+    ``override=None``).  Env-only keys not listed under ``terminal:`` survive.
     """
-    global _terminal_config_bridge_attempted
-    if "TERMINAL_ENV" in os.environ or _terminal_config_bridge_attempted:
+    global _terminal_config_bridge_sig
+    sig = _config_yaml_signature()
+    # Cache key: real (mtime_ns, size), or (0, 0) when the file is missing and
+    # we already successfully applied that path.  _terminal_config_bridge_sig
+    # stays None until the first successful apply so failures can retry.
+    cache_key = sig if sig is not None else (0, 0)
+    if _terminal_config_bridge_sig is not None and cache_key == _terminal_config_bridge_sig:
         return
-    _terminal_config_bridge_attempted = True
     try:
         from hermes_cli.config import apply_terminal_config_to_env
 
-        # env=None targets os.environ inside the helper; override=False keeps
-        # any already-set TERMINAL_* values (e.g. from .env) authoritative.
-        apply_terminal_config_to_env(env=None, override=False)
+        # env=None targets os.environ. override=None: when config.yaml has a
+        # terminal: section, config is authoritative for keys present there;
+        # otherwise only missing env vars are backfilled.
+        apply_terminal_config_to_env(env=None, override=None)
+        # Cache only on success so failures can retry later.
+        _terminal_config_bridge_sig = cache_key
     except Exception:
         # Never let a config problem take the terminal tool down — the
-        # historical local default still applies.
+        # historical local default still applies.  Leave sig unchanged so a
+        # later successful reload is not permanently disabled.
         logger.debug("terminal config → env fallback bridge failed", exc_info=True)
 
 
@@ -1427,7 +1452,16 @@ def _get_env_config() -> Dict[str, Any]:
         "cwd": cwd,
         "host_cwd": host_cwd,
         "docker_mount_cwd_to_workspace": mount_docker_cwd,
-        "timeout": _parse_env_var("TERMINAL_TIMEOUT", "180"),
+        "timeout": _parse_env_var("TERMINAL_TIMEOUT", "3300"),
+        "auto_background_long_timeout": os.getenv(
+            "TERMINAL_AUTO_BACKGROUND_LONG_TIMEOUT", "true"
+        ).lower() in {"true", "1", "yes"},
+        "auto_background_timeout_threshold": _parse_env_var(
+            "TERMINAL_AUTO_BACKGROUND_TIMEOUT_THRESHOLD", "200"
+        ),
+        "default_notify_on_background": os.getenv(
+            "TERMINAL_DEFAULT_NOTIFY_ON_BACKGROUND", "true"
+        ).lower() in {"true", "1", "yes"},
         "lifetime_seconds": _parse_env_var("TERMINAL_LIFETIME_SECONDS", "300"),
         # SSH-specific config
         "ssh_host": os.getenv("TERMINAL_SSH_HOST", ""),
@@ -2099,14 +2133,14 @@ def _resolve_command_cwd(
 
 def terminal_tool(
     command: str,
-    background: bool = False,
+    background: Optional[bool] = None,
     timeout: Optional[int] = None,
     task_id: Optional[str] = None,
     session_id: Optional[str] = None,
     force: bool = False,
     workdir: Optional[str] = None,
     pty: bool = False,
-    notify_on_complete: bool = False,
+    notify_on_complete: Optional[bool] = None,
     watch_patterns: Optional[List[str]] = None,
 ) -> str:
     """
@@ -2114,14 +2148,18 @@ def terminal_tool(
 
     Args:
         command: The command to execute
-        background: Whether to run in background (default: False)
+        background: Whether to run in background. None means omitted (auto-promote
+            may apply when effective_timeout > threshold). Auto-promoted commands
+            remain managed background sessions; default/explicit notify waits inline
+            for their result. Explicit False is always respected; explicit True stays
+            background.
         timeout: Command timeout in seconds (default: from config)
         task_id: Unique identifier for environment isolation (optional)
         session_id: Conversation/session identifier for durable observability
         force: If True, skip dangerous command check (use after user confirms)
         workdir: Working directory for this command (optional, uses session cwd if not set)
         pty: If True, use pseudo-terminal for interactive CLI tools (local backend only)
-        notify_on_complete: If True and background=True, you'll be notified exactly once when the process exits. The right choice for almost every long task. MUTUALLY EXCLUSIVE with watch_patterns.
+        notify_on_complete: If True and background=True, notify once on exit. None means omitted (defaults may apply for background / long-timeout promotion). Explicit False is always respected. MUTUALLY EXCLUSIVE with watch_patterns.
         watch_patterns: List of strings to watch for in background output. HARD rate limit: 1 notification per 15s per process. After 3 strike windows in a row, watch_patterns is disabled and the session is auto-promoted to notify_on_complete. Use ONLY for rare, one-shot mid-process signals on long-lived processes (server readiness, migration-done markers). NEVER use in loops/batch jobs — error patterns there will hit the strike limit and get disabled. MUTUALLY EXCLUSIVE with notify_on_complete — set one, not both.
 
     Returns:
@@ -2206,9 +2244,76 @@ def terminal_tool(
         default_timeout = config["timeout"]
         effective_timeout = timeout or default_timeout
 
-        # Reject foreground commands where the model explicitly requests
-        # a timeout above FOREGROUND_MAX_TIMEOUT — nudge it toward background.
-        if not background and timeout and timeout > FOREGROUND_MAX_TIMEOUT:
+        # Track omitted vs explicit params so defaults apply only when omitted.
+        # Explicit background=False and notify_on_complete=False are always
+        # respected (never force-promoted / force-notified).
+        background_was_omitted = background is None
+        if background_was_omitted:
+            background = False
+
+        notify_was_omitted = notify_on_complete is None
+        if notify_was_omitted:
+            notify_on_complete = False
+
+        auto_bg_long = bool(config.get("auto_background_long_timeout", True))
+        auto_bg_threshold = int(
+            config.get("auto_background_timeout_threshold", 200) or 200
+        )
+        default_notify_on_bg = bool(config.get("default_notify_on_background", True))
+
+        # Auto-promote long timeouts only when background was OMITTED.
+        # Threshold is effective_timeout > auto_background_timeout_threshold
+        # (default 200), not FOREGROUND_MAX_TIMEOUT. Explicit background=False
+        # stays foreground even when timeout > threshold.
+        auto_promoted = False
+        if (
+            auto_bg_long
+            and background_was_omitted
+            and effective_timeout
+            and effective_timeout > auto_bg_threshold
+        ):
+            background = True
+            auto_promoted = True
+            # The model-supplied long timeout only selects background mode. Once
+            # promoted, wait against the configured terminal default (3300s by
+            # default) rather than preserving an arbitrary 7200s+ value.
+            effective_timeout = default_timeout
+            logger.info(
+                "Auto-promoted terminal command to background "
+                "(requested_timeout=%ss > threshold=%ss; wait_timeout=%ss; "
+                "background omitted)",
+                timeout or default_timeout,
+                auto_bg_threshold,
+                effective_timeout,
+            )
+
+        # Default notify for any background (explicit or auto) when notify was
+        # omitted and watch_patterns is not set.
+        if (
+            background
+            and default_notify_on_bg
+            and notify_was_omitted
+            and not watch_patterns
+        ):
+            notify_on_complete = True
+
+        # Auto-promotion keeps the process registered as background so a user
+        # can steer the turn without killing it. But the default-notify (or
+        # explicit notify=True) path remains synchronous: wait for this process
+        # result inline, just as the pre-auto-promotion foreground invocation
+        # did. Keep this decision before the async-delivery capability gate:
+        # synchronous waiting is valid even when a future push notification is
+        # not routable.
+        sync_wait_after_auto_promotion = auto_promoted and bool(notify_on_complete)
+
+        # Hard-reject foreground commands when the model explicitly requested
+        # a timeout above FOREGROUND_MAX and the final mode is still foreground
+        # (explicit background=False, or auto off / below threshold).
+        if (
+            not background
+            and timeout
+            and timeout > FOREGROUND_MAX_TIMEOUT
+        ):
             return json.dumps({
                 "error": (
                     f"Foreground timeout {timeout}s exceeds the maximum of "
@@ -2693,6 +2798,21 @@ def terminal_tool(
                     proc_session.watch_patterns = list(watch_patterns)
                     result_data["watch_patterns"] = proc_session.watch_patterns
 
+                if sync_wait_after_auto_promotion:
+                    # Remain a managed background session while synchronously
+                    # waiting. process_registry.wait() observes thread
+                    # interrupts without killing the child, preserving steering;
+                    # if it returns an exited result it marks completion consumed,
+                    # so gateway/TUI/CLI notification drains skip the duplicate.
+                    from tools.process_registry import _redact_process_result
+
+                    wait_result = _redact_process_result(
+                        process_registry.wait(proc_session.id, timeout=effective_timeout)
+                    )
+                    wait_result["session_id"] = proc_session.id
+                    wait_result["notify_on_complete"] = bool(notify_on_complete)
+                    return json.dumps(wait_result, ensure_ascii=False)
+
                 return json.dumps(result_data, ensure_ascii=False)
             except Exception as e:
                 return json.dumps({
@@ -3082,12 +3202,12 @@ TERMINAL_SCHEMA = {
             },
             "background": {
                 "type": "boolean",
-                "description": "Run the command in the background. Almost always pair with notify_on_complete=true — without it, the process runs silently and you'll have no way to learn it finished short of calling process(action='poll') yourself (easy to forget, leading to silent blindness on long jobs). Two legitimate patterns: (1) Long-lived processes that never exit (servers, watchers, daemons) — these stay silent because there's no exit to notify on. (2) Long-running bounded tasks (tests, builds, deploys, CI pollers, batch jobs) — these MUST set notify_on_complete=true. For short commands, prefer foreground with a generous timeout instead.",
+                "description": "Run the command in the background. When OMITTED and auto_background_long_timeout is on, effective timeouts above 200s auto-enable a managed background session. If its default/explicit notify_on_complete is true, this tool still waits inline for the result while the process remains steer-safe background work; explicit notify_on_complete=false returns the handle immediately. Explicit background=false is always respected (even for long timeouts).",
                 "default": False
             },
             "timeout": {
                 "type": "integer",
-                "description": f"Max seconds to wait (default: 180, foreground max: {FOREGROUND_MAX_TIMEOUT}). Returns INSTANTLY when command finishes — set high for long tasks, you won't wait unnecessarily. Foreground timeout above {FOREGROUND_MAX_TIMEOUT}s is rejected; use background=true for longer commands.",
+                "description": f"Max seconds to wait (default: 3300). When auto_background_long_timeout is enabled and background is OMITTED, timeouts above 200s create a managed background process and rewrite its wait timeout to the configured default (3300 by default). Default/explicit notify_on_complete=true waits inline for that result; explicit false detaches immediately. Explicit background=false is never force-promoted; FOREGROUND_MAX_TIMEOUT={FOREGROUND_MAX_TIMEOUT}s remains the hard cap for foreground.",
                 "minimum": 1
             },
             "workdir": {
@@ -3101,7 +3221,7 @@ TERMINAL_SCHEMA = {
             },
             "notify_on_complete": {
                 "type": "boolean",
-                "description": "When true (and background=true), you'll be automatically notified exactly once when the process finishes. **This is the right choice for almost every long-running task** — tests, builds, deployments, multi-item batch jobs, anything that takes over a minute and has a defined end. Use this and keep working on other things; the system notifies you on exit. MUTUALLY EXCLUSIVE with watch_patterns — when both are set, watch_patterns is dropped.",
+                "description": "When true (and background=true), completion is delivered exactly once. Default for background (and auto-promoted long timeouts) is true when omitted and no watch_patterns. For auto-promoted commands, default/explicit true synchronously waits and returns the final result while the process remains background; that consumed result is not also notified later. Explicit false is true detach: return the handle immediately with no completion notification. MUTUALLY EXCLUSIVE with watch_patterns — when both are set, watch_patterns is dropped.",
                 "default": False
             },
             "watch_patterns": {
@@ -3118,13 +3238,13 @@ TERMINAL_SCHEMA = {
 def _handle_terminal(args, **kw):
     return terminal_tool(
         command=args.get("command"),
-        background=args.get("background", False),
+        background=args.get("background"),  # None when omitted (auto-promote gate)
         timeout=args.get("timeout"),
         task_id=kw.get("task_id"),
         session_id=kw.get("session_id"),
         workdir=args.get("workdir"),
         pty=args.get("pty", False),
-        notify_on_complete=args.get("notify_on_complete", False),
+        notify_on_complete=args.get("notify_on_complete"),  # None when omitted
         watch_patterns=args.get("watch_patterns"),
     )
 

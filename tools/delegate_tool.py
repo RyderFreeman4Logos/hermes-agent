@@ -2436,6 +2436,7 @@ def delegate_task(
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
     background: Optional[bool] = None,
+    force_background: bool = False,
     parent_agent=None,
 ) -> str:
     """
@@ -2475,6 +2476,7 @@ def delegate_task(
     # as one message once ALL children finish — the chat is not blocked while
     # they run.
     background = is_truthy_value(background, default=False) if background is not None else False
+    force_background = is_truthy_value(force_background, default=False)
 
     # Depth limit — configurable via delegation.max_spawn_depth,
     # default 2 for parity with the original MAX_DEPTH constant.
@@ -2924,10 +2926,12 @@ def delegate_task(
 
         # Finite sessions cannot route a detached subagent result back to the
         # agent after their turn/process ends. This includes stateless HTTP
-        # requests (#10760) and one-shot Kanban workers (#63169). Fall back to
-        # SYNCHRONOUS execution so the result returns in this same turn instead
-        # of handing out a handle with no durable consumer. Mirrors the
-        # pool-at-capacity inline fallback below.
+        # requests (#10760) and one-shot Kanban workers (#63169). Ordinary
+        # background work falls back to synchronous execution so its result
+        # returns in this same turn instead of handing out a handle with no
+        # durable consumer. An explicit force_background guarantee instead
+        # rejects before starting work: executing inline would block the
+        # orchestrator/main-agent turn and violate the advertised contract.
         try:
             from gateway.session_context import async_delivery_supported
             _async_ok = async_delivery_supported()
@@ -2958,6 +2962,25 @@ def delegate_task(
                 _async_ok = True
 
         if not _async_ok:
+            if force_background:
+                return json.dumps(
+                    {
+                        "status": "rejected",
+                        "mode": "background",
+                        "error": (
+                            "delegation.force_background=true requires a durable "
+                            "async completion route, but this session cannot receive "
+                            "a detached subagent result."
+                        ),
+                        "note": (
+                            "The child was not started, so the orchestrator/main "
+                            "agent remains free. Retry from a durable session or "
+                            "disable delegation.force_background for the historical "
+                            "synchronous fallback."
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
             logger.info(
                 "delegate_task: async delivery unsupported on this session "
                 "runtime; running the batch synchronously instead."
@@ -3007,7 +3030,10 @@ def delegate_task(
             _agent_session_id = str(getattr(parent_agent, "session_id", "") or "")
             if _agent_session_id:
                 _session_key = _agent_session_id
-        _parent_session_id = getattr(parent_agent, "session_id", None)
+        # A nested orchestrator has its own short-lived session. Completion
+        # routing must use its durable parent/root instead: the gateway can
+        # reject the child session after that orchestrator turn exits.
+        _parent_session_id = _resolve_durable_completion_parent(parent_agent)
         _child_agents = [c for (_, _, c) in children]
 
         # Detach every child from the parent's interrupt-propagation list — the
@@ -3093,7 +3119,25 @@ def delegate_task(
 
         # Pool at capacity / schedule failure — children are still attached
         # (we detach above only on the parent list, but the async unit was
-        # never accepted, so re-attaching isn't needed: we just run inline).
+        # never accepted, so re-attaching isn't needed). The force contract
+        # rejects instead of taking the historical inline fallback.
+        if force_background:
+            return json.dumps(
+                {
+                    "status": "rejected",
+                    "mode": "background",
+                    "error": (
+                        "delegation.force_background=true did not start work because "
+                        f"the async delegation pool rejected it: {dispatch.get('error', 'rejected')}"
+                    ),
+                    "note": (
+                        "The child was not started, so the orchestrator/main agent "
+                        "remains free. Wait for a completion or raise "
+                        "delegation.max_concurrent_children before retrying."
+                    ),
+                },
+                ensure_ascii=False,
+            )
         logger.info(
             "delegate_task: async pool at capacity (%s); running the whole "
             "batch synchronously instead.",
@@ -3112,6 +3156,37 @@ def delegate_task(
 
     # ----- Synchronous path -----
     return json.dumps(_execute_and_aggregate(), ensure_ascii=False)
+
+
+def _resolve_durable_completion_parent(parent_agent) -> Optional[str]:
+    """Return the root session that can consume a nested async completion.
+
+    A leaf may outlive its orchestrator. Prefer that orchestrator's recorded
+    parent lineage, then walk the session DB to the conversation root when it
+    is available. The raw local session id is only a best-effort final fallback
+    for callers without lineage metadata.
+    """
+    session_id = getattr(parent_agent, "session_id", None)
+    parent_session_id = getattr(parent_agent, "_parent_session_id", None)
+    start = (
+        parent_session_id
+        if isinstance(parent_session_id, str) and parent_session_id
+        else session_id
+        if isinstance(session_id, str) and session_id
+        else None
+    )
+    if not start:
+        return None
+    session_db = getattr(parent_agent, "_session_db", None)
+    get_root = getattr(session_db, "get_conversation_root", None)
+    if callable(get_root):
+        try:
+            root = get_root(start)
+            if isinstance(root, str) and root:
+                return root
+        except Exception:
+            logger.debug("Could not resolve durable delegation parent", exc_info=True)
+    return start
 
 
 def _resolve_child_credential_pool(
@@ -3639,21 +3714,32 @@ DELEGATE_TASK_SCHEMA = {
 from tools.registry import registry, tool_error
 
 
+def _force_background_enabled(parent_agent=None) -> bool:
+    """Whether this nested dispatch has the explicit no-inline guarantee."""
+    if getattr(parent_agent, "_delegate_depth", 0) <= 0:
+        return False
+    try:
+        cfg = _load_config()
+        return bool(cfg.get("force_background", False))
+    except Exception:
+        return False
+
+
 def _model_background_value(args: dict, parent_agent=None) -> bool:
     """Background flag for the MODEL-facing dispatch path (registry fallback).
 
     Delegations from the top-level agent always run in the background — the
     model does not choose. This applies to both a single task and a fan-out
     batch (the whole batch is one async unit that joins on all children and
-    returns one consolidated result). The one
-    exception is a delegation from an orchestrator subagent (depth > 0), which
-    needs its workers' results within its own turn. The live path is
-    ``run_agent._dispatch_delegate_task``; this lambda mirrors it for the rare
-    case the intercept is bypassed. Direct Python callers of ``delegate_task``
-    keep the historical synchronous default.
+    returns one consolidated result). The one exception is a delegation from
+    an orchestrator subagent (depth > 0), which needs its workers' results
+    within its own turn. ``delegation.force_background`` overrides that
+    exception. The live path is ``run_agent._dispatch_delegate_task``; this
+    helper mirrors it for the rare case the intercept is bypassed. Direct
+    Python callers of ``delegate_task`` keep the historical synchronous default.
     """
     is_subagent = getattr(parent_agent, "_delegate_depth", 0) > 0
-    return not is_subagent
+    return _force_background_enabled(parent_agent) or not is_subagent
 
 
 _MODEL_HIDDEN_TASK_FIELDS = {"acp_command", "acp_args"}
@@ -3689,6 +3775,7 @@ registry.register(
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")),
+        force_background=_force_background_enabled(kw.get("parent_agent")),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,

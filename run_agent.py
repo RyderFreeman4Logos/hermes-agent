@@ -6598,6 +6598,7 @@ class AIAgent:
         invocation paths (concurrent, sequential, inline).
         """
         from tools.delegate_tool import (
+            _load_config as _load_delegation_config,
             _strip_model_hidden_task_fields,
             delegate_task as _delegate_task,
         )
@@ -6606,12 +6607,14 @@ class AIAgent:
         # with a handle (one per task) and each subagent's result re-enters the
         # conversation as a new message when it finishes. This applies to BOTH
         # a single task and a fan-out batch (each task becomes its own
-        # independent background subagent). The one exception:
-        #   - A delegation from an ORCHESTRATOR SUBAGENT (depth > 0) stays
-        #     synchronous: the orchestrator needs its workers' results within
-        #     its own turn to compose a summary, and a subagent doesn't own the
-        #     gateway session the async result would route back to.
+        # independent background subagent). Normally, a delegation from an
+        # ORCHESTRATOR SUBAGENT (depth > 0) stays synchronous so it can compose
+        # its workers' results within its own turn. Set
+        # delegation.force_background=true to override that exception and keep
+        # orchestrator→leaf dispatches asynchronous, preventing KV cache cooling.
         # The schema-level `background` param is intentionally ignored here.
+        _delegation_cfg = _load_delegation_config()
+        _force_bg = bool(_delegation_cfg.get("force_background", False))
         _is_subagent = getattr(self, "_delegate_depth", 0) > 0
         return _delegate_task(
             goal=function_args.get("goal"),
@@ -6619,7 +6622,12 @@ class AIAgent:
             tasks=_strip_model_hidden_task_fields(function_args.get("tasks")),
             max_iterations=function_args.get("max_iterations"),
             role=function_args.get("role"),
-            background=(not _is_subagent),
+            background=(True if _force_bg else (not _is_subagent)),
+            # Preserve the distinction between ordinary top-level background
+            # work (which may use the historical inline fallback) and the
+            # explicit nested force guarantee. The latter must never turn a
+            # full/undeliverable async path into a blocking main-agent turn.
+            force_background=(_force_bg and _is_subagent),
             parent_agent=self,
         )
 

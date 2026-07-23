@@ -2428,13 +2428,21 @@ DEFAULT_CONFIG = {
         "max_concurrent_children": 3,  # unified concurrency cap: max parallel children per batch
                                        # AND max concurrent background (background=true)
                                        # delegation units. New async dispatches beyond the cap
-                                       # fall back to synchronous execution. Floor of 1, no ceiling.
-                                       # (Replaces the deprecated max_async_children.)
+                                       # normally fall back to synchronous execution. Forced nested
+                                       # dispatches reject instead, preserving the force guarantee.
+                                       # Floor of 1, no ceiling.
         # Orchestrator role controls (see tools/delegate_tool.py:_get_max_spawn_depth
         # and _get_orchestrator_enabled).  Floored at 1, no upper ceiling —
         # raise deliberately, each level multiplies API cost.
         "max_spawn_depth": 1,        # depth (1 = flat [default], 2 = orchestrator→leaf, 3+ = deeper)
         "orchestrator_enabled": True,  # kill switch for role="orchestrator"
+        # When True, even orchestrator→leaf dispatches run in the background,
+        # preventing the orchestrator's KV cache from cooling while it waits.
+        # This is a strict no-inline guarantee: a full async pool or a session
+        # without durable completion delivery rejects before the child starts,
+        # leaving the main agent free; raise the pool limit/retry or disable it
+        # to opt into the ordinary synchronous fallback.
+        "force_background": False,
         # When a subagent hits a dangerous-command approval prompt, the parent's
         # prompt_toolkit TUI owns stdin — a thread-local input() call from the
         # subagent worker would deadlock the parent UI. To avoid the deadlock,

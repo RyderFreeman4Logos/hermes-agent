@@ -3647,12 +3647,21 @@ def _model_background_value(args: dict, parent_agent=None) -> bool:
     batch (the whole batch is one async unit that joins on all children and
     returns one consolidated result). The one
     exception is a delegation from an orchestrator subagent (depth > 0), which
-    needs its workers' results within its own turn. The live path is
+    needs its workers' results within its own turn. When
+    ``delegation.force_background`` is enabled, that exception is overridden so
+    even orchestrator→leaf dispatches stay asynchronous. The live path is
     ``run_agent._dispatch_delegate_task``; this lambda mirrors it for the rare
     case the intercept is bypassed. Direct Python callers of ``delegate_task``
     keep the historical synchronous default.
     """
     is_subagent = getattr(parent_agent, "_delegate_depth", 0) > 0
+    if is_subagent:
+        try:
+            cfg = _load_config()
+            if bool(cfg.get("force_background", False)):
+                return True
+        except Exception:
+            pass
     return not is_subagent
 
 

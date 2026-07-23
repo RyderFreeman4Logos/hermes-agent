@@ -2419,6 +2419,9 @@ DEFAULT_CONFIG = {
         # raise deliberately, each level multiplies API cost.
         "max_spawn_depth": 1,        # depth (1 = flat [default], 2 = orchestrator→leaf, 3+ = deeper)
         "orchestrator_enabled": True,  # kill switch for role="orchestrator"
+        # When True, even orchestrator→leaf dispatches run in the background,
+        # preventing the orchestrator's KV cache from cooling while it waits.
+        "force_background": False,
         # When a subagent hits a dangerous-command approval prompt, the parent's
         # prompt_toolkit TUI owns stdin — a thread-local input() call from the
         # subagent worker would deadlock the parent UI. To avoid the deadlock,

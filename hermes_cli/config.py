@@ -1171,7 +1171,7 @@ DEFAULT_CONFIG = {
         # Default command timeout. When background is OMITTED and this effective
         # value exceeds auto_background_timeout_threshold with the master switch
         # on, promote to background+notify.
-        "timeout": 3300,
+        "timeout": 180,
         # Master switch: auto-promote when background is omitted and
         # effective_timeout > auto_background_timeout_threshold; timeouts above
         # auto_background_timeout force background even when false was explicit.

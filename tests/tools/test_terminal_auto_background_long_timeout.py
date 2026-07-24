@@ -124,11 +124,11 @@ def _run_foreground(command: str, **tool_kwargs):
 
 
 class TestConfigDefaults:
-    def test_default_config_timeout_is_3300(self):
+    def test_default_config_timeout_is_180(self):
         from hermes_cli.config import DEFAULT_CONFIG
 
         term = DEFAULT_CONFIG["terminal"]
-        assert term["timeout"] == 3300
+        assert term["timeout"] == 180
         assert term["auto_background_timeout_threshold"] == 200
         assert term["auto_background_timeout"] == 3300
         assert term["auto_background_long_timeout"] is True

@@ -1186,7 +1186,22 @@ class TestProcessToolHandler:
 # format_process_notification + drain_notifications (shared helpers)
 # =========================================================================
 
-from tools.process_registry import format_process_notification
+from tools.process_registry import _notification_lateness, format_process_notification
+
+
+def test_late_uses_finished_at_not_started_at(monkeypatch):
+    import tools.process_registry as process_registry_module
+
+    monkeypatch.setattr(
+        process_registry_module,
+        "_completion_notify_settings",
+        lambda: {"late_after_seconds": 5},
+    )
+
+    assert _notification_lateness(
+        {"started_at": 1.0, "finished_at": 98.0}, now=100.0
+    ) == (False, 2.0)
+    assert _notification_lateness({"started_at": 1.0}, now=100.0) == (False, 0.0)
 
 
 def test_format_completion_event(monkeypatch):

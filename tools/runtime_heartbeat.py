@@ -120,6 +120,16 @@ def _heartbeat_settings(runtime: Dict[str, Any], provider: str | None) -> tuple[
     return True, max(minimum, min(maximum, ttl * max(0.0, ratio)))
 
 
+def _reset_on_caller_activation(runtime: Dict[str, Any]) -> bool:
+    """Return whether caller activity may reschedule outstanding targets."""
+    heartbeat = runtime.get("heartbeat") if isinstance(runtime, dict) else {}
+    heartbeat = heartbeat if isinstance(heartbeat, dict) else {}
+    raw = heartbeat.get("reset_on_caller_activation", True)
+    if isinstance(raw, str):
+        return raw.strip().lower() not in {"false", "0", "no", "off"}
+    return bool(raw)
+
+
 @dataclass
 class _Target:
     target_id: str
@@ -138,8 +148,8 @@ class RuntimeHeartbeat:
 
     ``inspect`` returns a compact snapshot.  Process snapshots are compared to
     their previous output/CPU values; a live PID alone never qualifies as
-    ALIVE.  Delegations can declare an explicit ``progress`` boolean because
-    their session runtime supplies status/activity rather than a local PID.
+    ALIVE. Delegation snapshots compare their per-target ``last_activity_at``
+    baseline so a still-running but frozen delegation is surfaced as STUCK.
     """
 
     def __init__(
@@ -238,12 +248,14 @@ class RuntimeHeartbeat:
         """Reset all outstanding targets of exactly one caller to a full TTL window."""
         if not caller_id:
             return 0
+        runtime = self._config()
+        if not _reset_on_caller_activation(runtime):
+            return 0
         count = 0
         with self._lock:
             for key, target in tuple(self._targets.items()):
                 if target.caller_id != str(caller_id):
                     continue
-                runtime = self._config()
                 enabled, interval = _heartbeat_settings(runtime, target.provider)
                 if target.timer is not None:
                     target.timer.cancel()
@@ -273,9 +285,12 @@ class RuntimeHeartbeat:
             if new_cpu > old_cpu:
                 return "ALIVE", f"CPU advanced {old_cpu:.2f}->{new_cpu:.2f}s"
             return "STUCK", str(snapshot.get("evidence") or "process is live but produced no output or CPU progress")
-        if snapshot.get("progress", True):
-            return "ALIVE", str(snapshot.get("evidence") or "delegation remains active")
-        return "STUCK", str(snapshot.get("evidence") or "delegation reports no progress")
+        old_activity = target.baseline.get("last_activity_at")
+        new_activity = snapshot.get("last_activity_at")
+        if new_activity != old_activity:
+            return "ALIVE", str(snapshot.get("evidence") or "delegation activity advanced")
+        evidence = str(snapshot.get("evidence") or "delegation remains active")
+        return "STUCK", f"{evidence}; activity did not advance"
 
     def _fire(self, key: str, generation: int) -> None:
         with self._lock:
@@ -352,7 +367,7 @@ def inspect_delegation(target_id: str) -> Dict[str, Any]:
         activity = record.get("last_activity_at") or record.get("dispatched_at")
         return {
             "alive": True,
-            "progress": True,
+            "last_activity_at": activity,
             "evidence": f"delegation status={status}; last activity={activity}",
         }
     return {"alive": False, "evidence": f"delegation status={status}"}

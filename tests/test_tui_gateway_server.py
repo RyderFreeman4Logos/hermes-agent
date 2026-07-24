@@ -10779,7 +10779,7 @@ def test_notification_poller_requeues_when_busy(monkeypatch):
 
 @pytest.mark.parametrize("shutdown_drain", [False, True])
 def test_notification_poller_steers_busy_completion_when_enabled(monkeypatch, shutdown_drain):
-    """A capable busy TUI agent accepts completion delivery in-place."""
+    """Busy steer is a hint; idle drain still owns final event delivery."""
     import queue as _queue_mod
 
     from tools.process_registry import process_registry
@@ -10808,6 +10808,9 @@ def test_notification_poller_steers_busy_completion_when_enabled(monkeypatch, sh
     isolated_queue.put({
         "type": "completion",
         "session_id": "proc_busy_steer",
+        # Keep a concurrently leaked poller from treating this retained event
+        # as its own idle-delivery work before this test can inspect the queue.
+        "origin_ui_session_id": "sid_busy_steer",
         "command": "make build",
         "exit_code": 0,
         "output": "ok",
@@ -10821,7 +10824,10 @@ def test_notification_poller_steers_busy_completion_when_enabled(monkeypatch, sh
 
         assert len(steered) == 1
         assert "Background process proc_busy_steer completed normally" in steered[0]
-        assert isolated_queue.empty()
+        assert not isolated_queue.empty()
+        requeued = isolated_queue.get_nowait()
+        assert requeued["session_id"] == "proc_busy_steer"
+        assert process_registry.is_completion_consumed("proc_busy_steer") is False
         status_calls = [a for a in emitted if a[0] == "status.update"]
         assert len(status_calls) == 1
     finally:

@@ -115,7 +115,7 @@ def _completion_notify_settings() -> dict:
 
 
 def _notification_lateness(evt: dict, *, now: float | None = None) -> tuple[bool, float]:
-    """Return (is_late, lag_seconds) based on finished_at/started_at vs now."""
+    """Return delivery lag only when the producer recorded ``finished_at``."""
     now = time.time() if now is None else float(now)
     settings = _completion_notify_settings()
     try:
@@ -125,20 +125,9 @@ def _notification_lateness(evt: dict, *, now: float | None = None) -> tuple[bool
         threshold = 5.0
     threshold = max(0.0, threshold)
     finished = evt.get("finished_at")
-    started = evt.get("started_at")
-    anchor = None
-    for candidate in (finished, started):
-        if isinstance(candidate, (int, float)) and candidate > 0:
-            anchor = float(candidate)
-            break
-    if anchor is None:
+    if not isinstance(finished, (int, float)) or finished <= 0:
         return False, 0.0
-    lag = max(0.0, now - anchor)
-    # If only started_at is present, lag is wall-clock age of the job — still
-    # useful for "this finished a while ago relative to delivery" when combined
-    # with finished_at. Prefer finished_at when both exist.
-    if isinstance(finished, (int, float)) and finished > 0:
-        lag = max(0.0, now - float(finished))
+    lag = max(0.0, now - float(finished))
     return lag > threshold, lag
 
 

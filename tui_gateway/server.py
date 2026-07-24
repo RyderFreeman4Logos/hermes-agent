@@ -10310,8 +10310,15 @@ def _try_steer_busy_notification(session: dict, evt: dict, text: str) -> bool | 
     if not callable(steer):
         return False
 
+    # A successful steer only queues a best-effort hint in the live agent. It
+    # never proves the queued completion was consumed, so keep this event for
+    # the normal idle delivery path. Avoid injecting the same hint on every
+    # busy-poller pass while it waits in the queue.
+    if evt.get("_tui_busy_steer_hint_injected"):
+        return False
+
     from tools.async_delegation import (
-        claim_event_delivery, complete_event_delivery, release_event_delivery,
+        claim_event_delivery, release_event_delivery,
     )
 
     claim = claim_event_delivery(evt, "tui-poller-steer")
@@ -10328,14 +10335,15 @@ def _try_steer_busy_notification(session: dict, evt: dict, text: str) -> bool | 
     with session["history_lock"]:
         session["last_active"] = time.time()
     try:
-        complete_event_delivery(evt, claim)
+        release_event_delivery(evt, claim)
     except Exception as exc:
         logger.warning(
-            "TUI busy-steer completion acknowledgement failed: %s: %s",
+            "TUI busy-steer delivery release failed: %s: %s",
             type(exc).__name__,
             exc,
         )
-    return True
+    evt["_tui_busy_steer_hint_injected"] = True
+    return False
 
 
 def _notification_poller_loop(

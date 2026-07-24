@@ -28,7 +28,7 @@ class FakeTimer:
         self.cancelled = True
 
 
-def _runtime(*, enabled=True):
+def _runtime(*, enabled=True, reset_on_caller_activation=True):
     return {
         "kv_cache_ttl": {
             "default": 100,
@@ -40,7 +40,7 @@ def _runtime(*, enabled=True):
             "safety_ratio": 0.8,
             "min_interval_seconds": 10,
             "max_interval_seconds": 250,
-            "reset_on_caller_activation": True,
+            "reset_on_caller_activation": reset_on_caller_activation,
         },
     }
 
@@ -89,6 +89,22 @@ def test_reset_on_caller_activation_reschedules_only_that_callers_outstanding_ta
     assert manager.outstanding_for_caller("caller-b") == ["b"]
 
 
+def test_reset_disabled_by_config():
+    manager = _manager(_runtime(reset_on_caller_activation=False))
+    manager.arm(
+        "proc-no-reset",
+        caller_id="caller",
+        kind="process",
+        provider="openai",
+        inspect=lambda: {"alive": True, "output_size": 0},
+    )
+    original_timer = FakeTimer.created[-1]
+
+    assert manager.reset_for_caller("caller") == 0
+    assert original_timer.cancelled is False
+    assert manager.outstanding_for_caller("caller") == ["proc-no-reset"]
+
+
 def test_process_heartbeat_requires_output_or_cpu_growth_not_just_a_live_pid():
     manager = _manager()
     snapshots = [
@@ -102,6 +118,28 @@ def test_process_heartbeat_requires_output_or_cpu_growth_not_just_a_live_pid():
     assert evt["type"] == "heartbeat"
     assert evt["status"] == "STUCK"
     assert "no output or CPU progress" in evt["evidence"]
+    assert manager.outstanding_for_caller("caller") == []
+
+
+def test_delegation_stuck_when_activity_frozen():
+    manager = _manager()
+    snapshots = [
+        {"alive": True, "last_activity_at": 100.0, "evidence": "delegation running"},
+        {"alive": True, "last_activity_at": 100.0, "evidence": "delegation running"},
+    ]
+    manager.arm(
+        "delegation-stuck",
+        caller_id="caller",
+        kind="delegation",
+        provider="openai",
+        inspect=lambda: snapshots.pop(0),
+    )
+
+    FakeTimer.created[-1].callback()
+
+    evt = manager._event_queue.get_nowait()
+    assert evt["status"] == "STUCK"
+    assert "activity did not advance" in evt["evidence"]
     assert manager.outstanding_for_caller("caller") == []
 
 

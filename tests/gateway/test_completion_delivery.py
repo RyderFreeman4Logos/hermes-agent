@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+import gateway.run as gateway_run
 from gateway.config import Platform
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
@@ -94,6 +95,45 @@ def _stop_after_sleeps(monkeypatch, runner, count):
             runner._running = False
 
     monkeypatch.setattr(asyncio, "sleep", _bounded_sleep)
+
+
+def test_process_watcher_completion_records_finished_at(monkeypatch, isolated_registry):
+    """Gateway-produced completion timestamps delivery lag at process exit."""
+    session = ProcessSession(
+        id="proc_gateway_finished_at",
+        command="echo done",
+        started_at=1.0,
+        exited=True,
+        exit_code=0,
+        output_buffer="done\n",
+    )
+    isolated_registry._finished[session.id] = session
+    captured = []
+    runner = _runner(SimpleNamespace())
+    runner._load_background_notifications_mode = lambda: "result"
+
+    async def _capture_delivery(_text, event):
+        captured.append(event)
+        return True
+
+    async def _immediate_sleep(_delay):
+        return None
+
+    runner._deliver_completion_notification = _capture_delivery
+    monkeypatch.setattr(gateway_run.time, "time", lambda: 1234.5)
+    monkeypatch.setattr(gateway_run.asyncio, "sleep", _immediate_sleep)
+    monkeypatch.setattr(
+        "tools.process_registry.format_process_notification", lambda _event: "completion"
+    )
+
+    asyncio.run(runner._run_process_watcher({
+        "session_id": session.id,
+        "check_interval": 0,
+        "notify_on_complete": True,
+    }))
+
+    assert captured[0]["started_at"] == 1.0
+    assert captured[0]["finished_at"] == 1234.5
 
 
 def test_duplicate_async_queue_replay_injects_once(monkeypatch, isolated_registry):

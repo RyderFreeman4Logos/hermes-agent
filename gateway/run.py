@@ -18140,6 +18140,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "user_name": user_name,
                         "message_id": message_id,
                         "started_at": getattr(session, "started_at", None),
+                        "finished_at": time.time(),
                         "command": _command,
                         "exit_code": session.exit_code,
                         "completion_reason": getattr(session, "completion_reason", "exited"),

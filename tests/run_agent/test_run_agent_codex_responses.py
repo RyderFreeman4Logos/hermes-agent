@@ -1088,6 +1088,27 @@ def test_run_conversation_codex_plain_text(monkeypatch):
     assert result["messages"][-1]["content"] == "OK"
 
 
+def test_successful_llm_response_resets_runtime_heartbeats(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    calls = []
+    monkeypatch.setattr(
+        agent,
+        "_reset_runtime_heartbeats_for_caller",
+        lambda task_id, *, reason: calls.append((task_id, reason)),
+    )
+    monkeypatch.setattr(
+        agent, "_interruptible_api_call", lambda _api_kwargs: _codex_message_response("OK")
+    )
+
+    result = agent.run_conversation("Say OK", task_id="heartbeat-caller")
+
+    assert result["completed"] is True
+    assert calls == [
+        ("heartbeat-caller", "turn start"),
+        ("heartbeat-caller", "successful LLM response"),
+    ]
+
+
 def test_copilot_final_preflight_sanitizes_both_middleware_layers(monkeypatch):
     """The dispatch chokepoint must sanitize after every mutable layer."""
     agent = _build_copilot_agent(monkeypatch)

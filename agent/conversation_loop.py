@@ -1979,6 +1979,16 @@ def run_conversation(
                         if _model_request_active is not None:
                             _model_request_active.clear()
                         _redirect_crossed_response = agent._has_pending_redirect()
+                # A provider response completed successfully. Reset only here
+                # (never while tools are executing) so each LLM request opens
+                # a fresh caller heartbeat window.
+                _reset_heartbeats = getattr(
+                    agent, "_reset_runtime_heartbeats_for_caller", None,
+                )
+                if callable(_reset_heartbeats):
+                    _reset_heartbeats(
+                        effective_task_id, reason="successful LLM response",
+                    )
                 if _redirect_crossed_response:
                     # The response and redirect can cross on different threads:
                     # redirect() observed the request as active just before this

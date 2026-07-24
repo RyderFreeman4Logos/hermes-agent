@@ -6610,6 +6610,28 @@ class AIAgent:
                 logger.debug("Conversation root lineage walk failed", exc_info=True)
         return start
 
+    def _reset_runtime_heartbeats_for_caller(
+        self, task_id: Optional[str], *, reason: str,
+    ) -> None:
+        """Reset this caller's heartbeat timers after an LLM activation."""
+        try:
+            from tools.approval import get_current_session_key
+            from tools.runtime_heartbeat import runtime_heartbeat
+
+            heartbeat_caller = (
+                get_current_session_key(default="")
+                or task_id
+                or getattr(self, "session_id", "")
+            )
+            if heartbeat_caller:
+                # ``reset_for_caller`` itself honors
+                # heartbeat.reset_on_caller_activation.
+                runtime_heartbeat.reset_for_caller(heartbeat_caller)
+        except Exception:
+            logger.debug(
+                "Failed to reset runtime heartbeats after %s", reason, exc_info=True,
+            )
+
     def run_conversation(
         self,
         user_message: Any,
@@ -6647,7 +6669,6 @@ class AIAgent:
         from agent.auxiliary_client import scoped_runtime_main
         from tools.runtime_heartbeat import (
             reset_current_provider,
-            runtime_heartbeat,
             set_current_provider,
         )
 
@@ -6656,17 +6677,7 @@ class AIAgent:
         # the next quiet interval into a short-poll loop. Tool workers inherit
         # the live provider ContextVar when they arm their target timer.
         heartbeat_token = set_current_provider(getattr(self, "provider", ""))
-        try:
-            from tools.approval import get_current_session_key
-            heartbeat_caller = (
-                get_current_session_key(default="")
-                or task_id
-                or getattr(self, "session_id", "")
-            )
-            if heartbeat_caller:
-                runtime_heartbeat.reset_for_caller(heartbeat_caller)
-        except Exception:
-            logger.debug("Failed to reset runtime heartbeats at turn start", exc_info=True)
+        self._reset_runtime_heartbeats_for_caller(task_id, reason="turn start")
 
         # The outer token restores the caller's Context even though turn setup
         # replaces the value with the live runtime after fallback restoration.

@@ -1081,6 +1081,14 @@ class ProcessRegistry:
             was_running = self._running.pop(session.id, None) is not None
             self._finished[session.id] = session
         session._completion_event.set()
+        # Completion is authoritative for this target only.  Do this before
+        # publishing the notification so a racing heartbeat cannot emit a stale
+        # check-in after its terminal result is already available.
+        try:
+            from tools.runtime_heartbeat import runtime_heartbeat
+            runtime_heartbeat.cancel(session.id)
+        except Exception:
+            logger.debug("Failed to cancel heartbeat for completed process %s", session.id, exc_info=True)
         self._write_checkpoint()
 
         # Only enqueue completion notification on the FIRST move.  Without
@@ -2182,6 +2190,13 @@ def format_process_notification(evt: dict) -> "str | None":
 
     if evt_type == "watch_disabled":
         return f"[IMPORTANT: {evt.get('message', '')}]"
+
+    if evt_type == "heartbeat":
+        target = evt.get("target_id", _sid)
+        kind = evt.get("target_kind", "target")
+        status = evt.get("status", "STUCK")
+        evidence = evt.get("evidence", "no evidence available")
+        return f"[IMPORTANT: HEARTBEAT {status} {kind} {target}: {evidence}]"
 
     if evt_type == "watch_match":
         _pat = evt.get("pattern", "?")

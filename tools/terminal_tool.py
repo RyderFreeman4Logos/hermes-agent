@@ -2790,6 +2790,22 @@ def terminal_tool(
                     proc_session.notify_on_complete = True
                     result_data["notify_on_complete"] = True
 
+                    # Per-target WD: this is deliberately armed only for a
+                    # completion-notified target. True-detached work has no
+                    # guaranteed caller re-entry path and must remain silent.
+                    from tools.runtime_heartbeat import (
+                        get_current_provider as _heartbeat_provider,
+                        inspect_process as _inspect_process,
+                        runtime_heartbeat,
+                    )
+                    runtime_heartbeat.arm(
+                        proc_session.id,
+                        caller_id=session_key,
+                        kind="process",
+                        provider=_heartbeat_provider(),
+                        inspect=lambda _id=proc_session.id: _inspect_process(_id),
+                    )
+
                     # In gateway mode, auto-register a fast watcher so the
                     # gateway can detect completion and trigger a new agent
                     # turn.  CLI mode uses the completion_queue directly.

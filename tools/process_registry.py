@@ -87,6 +87,61 @@ def format_uptime_short(seconds: int) -> str:
     return f"{hours}h {mins}m"
 
 
+def _completion_notify_settings() -> dict:
+    """Read runtime.completion_notify (compact / late / steer) with safe defaults.
+
+    This is intentionally defined before ``ProcessRegistry`` because
+    ``_move_to_finished`` uses it while producing a completion event.
+    """
+    defaults = {
+        "compact": True,
+        "max_output_chars": 2000,
+        "late_after_seconds": 5,
+        "steer_when_busy": True,
+    }
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = load_config_readonly() or {}
+        runtime = cfg.get("runtime") if isinstance(cfg, dict) else {}
+        raw = (runtime or {}).get("completion_notify") if isinstance(runtime, dict) else {}
+        if not isinstance(raw, dict):
+            return defaults
+        out = dict(defaults)
+        out.update(raw)
+        return out
+    except Exception:
+        return defaults
+
+
+def _notification_lateness(evt: dict, *, now: float | None = None) -> tuple[bool, float]:
+    """Return (is_late, lag_seconds) based on finished_at/started_at vs now."""
+    now = time.time() if now is None else float(now)
+    settings = _completion_notify_settings()
+    try:
+        raw_threshold = settings.get("late_after_seconds", 5)
+        threshold = float(5 if raw_threshold is None else raw_threshold)
+    except (TypeError, ValueError):
+        threshold = 5.0
+    threshold = max(0.0, threshold)
+    finished = evt.get("finished_at")
+    started = evt.get("started_at")
+    anchor = None
+    for candidate in (finished, started):
+        if isinstance(candidate, (int, float)) and candidate > 0:
+            anchor = float(candidate)
+            break
+    if anchor is None:
+        return False, 0.0
+    lag = max(0.0, now - anchor)
+    # If only started_at is present, lag is wall-clock age of the job — still
+    # useful for "this finished a while ago relative to delivery" when combined
+    # with finished_at. Prefer finished_at when both exist.
+    if isinstance(finished, (int, float)) and finished > 0:
+        lag = max(0.0, now - float(finished))
+    return lag > threshold, lag
+
+
 @dataclass
 class ProcessSession:
     """A tracked background process with output buffering."""
@@ -1165,7 +1220,18 @@ class ProcessRegistry:
         # _move_to_finished(), producing duplicate [IMPORTANT: ...] messages.
         if was_running and session.notify_on_complete:
             from tools.ansi_strip import strip_ansi
-            output_tail = strip_ansi(session.output_buffer[-2000:]) if session.output_buffer else ""
+            _cn = _completion_notify_settings()
+            try:
+                _max = int(_cn.get("max_output_chars") or 2000)
+            except (TypeError, ValueError):
+                _max = 2000
+            _max = max(0, _max)
+            raw = session.output_buffer or ""
+            if _max and len(raw) > _max:
+                output_tail = strip_ansi(raw[-_max:])
+            else:
+                output_tail = strip_ansi(raw) if raw else ""
+            now = time.time()
             self.completion_queue.put({
                 "type": "completion",
                 "session_id": session.id,
@@ -1179,6 +1245,7 @@ class ProcessRegistry:
                 # a consumer-observed completion timestamp, this does not vary
                 # based on which watcher notices exit first.
                 "started_at": session.started_at,
+                "finished_at": now,
             })
 
     # ----- Query Methods -----
@@ -2252,6 +2319,9 @@ def format_process_notification(evt: dict) -> "str | None":
 
     Handles completion events (notify_on_complete), watch pattern matches,
     and watch disabled events from the unified completion_queue.
+
+    Completions are compact by default (runtime.completion_notify) and mark
+    LATE deliveries so the agent can ACK without expensive output restatement.
     """
     evt_type = evt.get("type", "completion")
     _sid = evt.get("session_id", "unknown")
@@ -2265,7 +2335,10 @@ def format_process_notification(evt: dict) -> "str | None":
         kind = evt.get("target_kind", "target")
         status = evt.get("status", "STUCK")
         evidence = evt.get("evidence", "no evidence available")
-        return f"[IMPORTANT: HEARTBEAT {status} {kind} {target}: {evidence}]"
+        return (
+            f"[IMPORTANT: HEARTBEAT {status} {kind} {target}: {evidence}. "
+            f"Check progress only; do not dump logs or write long commentary.]"
+        )
 
     if evt_type == "watch_match":
         _pat = evt.get("pattern", "?")
@@ -2286,7 +2359,7 @@ def format_process_notification(evt: dict) -> "str | None":
         return _format_async_delegation(evt)
 
     _exit = evt.get("exit_code", "?")
-    _out = evt.get("output", "")
+    _out = evt.get("output", "") or ""
     _reason = evt.get("completion_reason") or "exited"
     _source = evt.get("termination_source") or ""
     _signal = ""
@@ -2302,12 +2375,40 @@ def format_process_notification(evt: dict) -> "str | None":
         _status = "completed normally"
     else:
         _status = "exited"
-    return (
+
+    settings = _completion_notify_settings()
+    compact = bool(settings.get("compact", True))
+    try:
+        max_chars = int(settings.get("max_output_chars") or 2000)
+    except (TypeError, ValueError):
+        max_chars = 2000
+    max_chars = max(0, max_chars)
+    if compact and max_chars and len(_out) > max_chars:
+        _out = _out[-max_chars:]
+
+    is_late, lag = _notification_lateness(evt)
+    late_bits = ""
+    if is_late:
+        late_bits = (
+            f" LATE by {int(lag)}s — if unrelated to the current goal, "
+            f"ACK in ≤1 line and do not restate output or write long analysis. "
+            f"Full log remains available via process(action='log')."
+        )
+    elif compact:
+        late_bits = (
+            " Assimilate briefly if relevant; do not restate full output "
+            "(use process(log) only when needed)."
+        )
+
+    header = (
         f"[IMPORTANT: Background process {_sid} {_status} "
-        f"(exit code {_exit}{_signal}).\n"
+        f"(exit code {_exit}{_signal}).{late_bits}\n"
         f"Command: {_cmd}\n"
-        f"Output:\n{_out}]"
     )
+    if compact:
+        label = "Output tail" if _out else "Output"
+        return f"{header}{label}:\n{_out}]" if _out else f"{header}]"
+    return f"{header}Output:\n{_out}]"
 
 
 # ---------------------------------------------------------------------------

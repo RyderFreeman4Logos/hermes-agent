@@ -10273,6 +10273,71 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
     return (evt_sid, evt_type)
 
 
+def _completion_notify_steer_when_busy() -> bool:
+    """Return the completion-notify busy-steer policy with the product default."""
+    try:
+        cfg = _load_cfg()
+        runtime = cfg.get("runtime") if isinstance(cfg, dict) else {}
+        notify = (
+            runtime.get("completion_notify")
+            if isinstance(runtime, dict)
+            else {}
+        )
+        value = notify.get("steer_when_busy", True) if isinstance(notify, dict) else True
+        if isinstance(value, str):
+            return value.strip().lower() not in {"0", "false", "no", "off"}
+        return bool(value)
+    except Exception:
+        return True
+
+
+def _try_steer_busy_notification(session: dict, evt: dict, text: str) -> bool | None:
+    """Deliver a completion to a running steer-capable agent when allowed.
+
+    ``True`` means the event was consumed (or another consumer already owns its
+    durable claim); ``False`` means the session is busy but must use the legacy
+    requeue path; ``None`` means the session was idle and should dispatch a new
+    turn as before.
+    """
+    with session["history_lock"]:
+        if not session.get("running"):
+            return None
+        agent = session.get("agent")
+
+    if not _completion_notify_steer_when_busy():
+        return False
+    steer = getattr(agent, "steer", None)
+    if not callable(steer):
+        return False
+
+    from tools.async_delegation import (
+        claim_event_delivery, complete_event_delivery, release_event_delivery,
+    )
+
+    claim = claim_event_delivery(evt, "tui-poller-steer")
+    if claim is None:
+        return True
+    try:
+        accepted = bool(steer(text))
+    except Exception:
+        accepted = False
+    if not accepted:
+        release_event_delivery(evt, claim)
+        return False
+
+    with session["history_lock"]:
+        session["last_active"] = time.time()
+    try:
+        complete_event_delivery(evt, claim)
+    except Exception as exc:
+        logger.warning(
+            "TUI busy-steer completion acknowledgement failed: %s: %s",
+            type(exc).__name__,
+            exc,
+        )
+    return True
+
+
 def _notification_poller_loop(
     stop_event: threading.Event, sid: str, session: dict
 ) -> None:
@@ -10344,13 +10409,20 @@ def _notification_poller_loop(
             _emit("status.update", sid, {"kind": "process", "text": text})
             _emitted.add(_dedup_key)
 
-        _requeued = False
-        with session["history_lock"]:
-            if session.get("running"):
-                process_registry.completion_queue.put(evt)
-                _requeued = True
-            else:
-                session["running"] = True
+        steer_result = _try_steer_busy_notification(session, evt, text)
+        if steer_result is True:
+            continue
+
+        _requeued = steer_result is False
+        if _requeued:
+            process_registry.completion_queue.put(evt)
+        else:
+            with session["history_lock"]:
+                if session.get("running"):
+                    process_registry.completion_queue.put(evt)
+                    _requeued = True
+                else:
+                    session["running"] = True
         if _requeued:
             # Back off before re-polling: the re-queued event keeps the queue
             # non-empty, so without a sleep this loop spins at full speed
@@ -10430,6 +10502,12 @@ def _notification_poller_loop(
             _emit("status.update", sid, {"kind": "process", "text": text})
             _emitted.add(_dedup_key)
 
+        steer_result = _try_steer_busy_notification(session, evt, text)
+        if steer_result is True:
+            continue
+        if steer_result is False:
+            process_registry.completion_queue.put(evt)
+            break
         with session["history_lock"]:
             if session.get("running"):
                 process_registry.completion_queue.put(evt)

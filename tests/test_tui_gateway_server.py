@@ -13121,6 +13121,59 @@ def test_notification_poller_requeues_when_busy(monkeypatch):
             process_registry.completion_queue.get_nowait()
 
 
+@pytest.mark.parametrize("shutdown_drain", [False, True])
+def test_notification_poller_steers_busy_completion_when_enabled(monkeypatch, shutdown_drain):
+    """A capable busy TUI agent accepts completion delivery in-place."""
+    import queue as _queue_mod
+
+    from tools.process_registry import process_registry
+
+    steered = []
+    emitted = []
+    stop = threading.Event()
+
+    class _Agent:
+        def steer(self, text):
+            steered.append(text)
+            if not shutdown_drain:
+                stop.set()
+            return True
+
+    sess = _session(agent=_Agent(), running=True)
+    server._sessions["sid_busy_steer"] = sess
+    monkeypatch.setattr(server, "_emit", lambda *a, **kw: emitted.append(a))
+    # TUI reads raw YAML independently of hermes_cli.config, so the product
+    # default must remain enabled when runtime.completion_notify is absent.
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    process_registry._completion_consumed.discard("proc_busy_steer")
+    isolated_queue.put({
+        "type": "completion",
+        "session_id": "proc_busy_steer",
+        "command": "make build",
+        "exit_code": 0,
+        "output": "ok",
+    })
+
+    if shutdown_drain:
+        stop.set()
+
+    try:
+        server._notification_poller_loop(stop, "sid_busy_steer", sess)
+
+        assert len(steered) == 1
+        assert "Background process proc_busy_steer completed normally" in steered[0]
+        assert isolated_queue.empty()
+        status_calls = [a for a in emitted if a[0] == "status.update"]
+        assert len(status_calls) == 1
+    finally:
+        server._sessions.pop("sid_busy_steer", None)
+        while not process_registry.completion_queue.empty():
+            process_registry.completion_queue.get_nowait()
+
+
 def test_session_save_writes_under_hermes_home_with_system_prompt(monkeypatch, tmp_path):
     """TUI /save (session.save RPC) must snapshot under the Hermes profile
     home — not the project/workspace CWD — and include the system prompt,

@@ -253,7 +253,12 @@ DEFAULT_CONFIG = {
             "max_interval_seconds": 3300,
             "reset_on_caller_activation": True,
         },
-        "completion_notify": {"compact": True, "max_output_chars": 2000},
+        "completion_notify": {
+            "compact": True,
+            "max_output_chars": 2000,
+            "late_after_seconds": 5,
+            "steer_when_busy": True,
+        },
     },
 
     "terminal": {

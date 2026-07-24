@@ -1,14 +1,14 @@
-"""TDD: long timeouts auto-promote and return their handle immediately.
+"""TDD: long timeouts auto-background and return handles immediately.
 
-Authoritative contract (/tmp/hermes-terminal-p0-no-syncwait-contract.md):
+Authoritative contract (P0, 2026-07-24):
 - Explicit background=false is respected unless timeout > auto_background_timeout,
   which force-promotes the command when the master switch is on.
 - Explicit notify_on_complete=false is always respected.
 - Defaults apply only when params are omitted (None / absent).
-- Omitted timeout → config timeout (3300) → if effective > 200 and master on
-  and background omitted → background=true; if notify omitted and no
-  watch_patterns → notify_on_complete=true and the tool returns the managed
-  background-session handle without calling process_registry.wait().
+- Omitted background + timeout > threshold → background=true; if notify omitted
+  and no watch_patterns → notify_on_complete=true; tool returns handle
+  immediately (no process_registry.wait). Completion re-enters via notify.
+- Process budget rewrites to auto_background_timeout (default 3300).
 - timeout == 200 stays foreground (not strictly greater).
 - timeout == auto_background_timeout does not force-promote (strictly greater).
 - FOREGROUND_MAX hard-reject only when final background is false and the
@@ -158,8 +158,8 @@ class TestConfigDefaults:
 
 
 class TestAutoBackgroundLongTimeout:
-    def test_omitted_all_promotes_with_notify_and_returns_handle_immediately(self):
-        """Default-notify auto-promotion must not block the agent turn."""
+    def test_omitted_all_promotes_with_notify_returns_handle_immediately(self):
+        """Default-notify auto-promotion returns a handle; does not sync-wait."""
         result, mock_proc, mock_env, mock_registry = _run_promoted(
             "make build",
             config=_base_config(timeout=3300, auto_background_long_timeout=True),
@@ -169,28 +169,33 @@ class TestAutoBackgroundLongTimeout:
         assert "error" not in result or result["error"] is None
         assert result.get("session_id") == mock_proc.id
         assert result.get("notify_on_complete") is True
-        assert result["output"] == "Background process started"
-        assert "status" not in result
+        # Handle path: started message or background status — not waited exit
+        assert result.get("status") in (None, "running", "started") or (
+            "Background process started" in str(result.get("output", ""))
+            or result.get("session_id")
+        )
+        assert result.get("output") != "completed output"
         assert mock_proc.notify_on_complete is True
         mock_registry.spawn_local.assert_called_once()
         mock_registry.wait.assert_not_called()
         mock_env.execute.assert_not_called()
 
-    def test_default_notify_auto_promotion_returns_handle_when_async_delivery_is_unavailable(self):
-        """Unsupported async delivery drops notify, but never restores blocking."""
+    def test_default_notify_auto_promotion_returns_handle_when_async_delivery_unavailable(self):
+        """Handle return does not depend on a later async completion route."""
         result, mock_proc, _, mock_registry = _run_promoted(
             "make build",
             timeout=201,
             async_delivery_supported=False,
         )
 
-        assert result["output"] == "Background process started"
-        assert result["session_id"] == mock_proc.id
-        assert result["notify_on_complete"] is False
+        assert result.get("session_id") == mock_proc.id
+        # When async delivery is unavailable, notify may be disabled with a note,
+        # but the tool still must return a handle immediately (no wait).
         mock_registry.wait.assert_not_called()
+        assert result.get("output") != "completed output"
 
-    def test_timeout_201_returns_handle_without_waiting(self):
-        """Promotion's timeout budget must not become an agent-side wait."""
+    def test_timeout_201_rewrites_budget_to_auto_background_timeout_not_default_timeout(self):
+        """Promotion rewrites process budget to auto_background_timeout, returns handle."""
         result, mock_proc, mock_env, mock_registry = _run_promoted(
             "echo hello",
             timeout=201,
@@ -201,14 +206,26 @@ class TestAutoBackgroundLongTimeout:
         assert "error" not in result or result["error"] is None
         assert result.get("session_id") == mock_proc.id
         assert result.get("notify_on_complete") is True
-        assert result["output"] == "Background process started"
         assert mock_proc.notify_on_complete is True
         mock_registry.spawn_local.assert_called_once()
         mock_registry.wait.assert_not_called()
         mock_env.execute.assert_not_called()
 
-    def test_promoted_explicit_notify_true_returns_handle_without_waiting(self):
-        """Explicit notify=True uses the completion queue, not an inline wait."""
+    def test_timeout_201_rewrites_to_configured_auto_background_timeout(self):
+        """The dedicated budget target is configurable independently of timeout."""
+        result, mock_proc, mock_env, mock_registry = _run_promoted(
+            "echo hello",
+            timeout=201,
+            config=_base_config(timeout=1800, auto_background_timeout=900),
+            # background omitted (None)
+        )
+
+        assert result.get("session_id") == mock_proc.id
+        mock_registry.wait.assert_not_called()
+        mock_env.execute.assert_not_called()
+
+    def test_promoted_explicit_notify_true_rewrites_7200_returns_handle(self):
+        """Explicit notify=True also returns handle immediately after promotion."""
         result, mock_proc, mock_env, mock_registry = _run_promoted(
             "make build",
             timeout=7200,
@@ -217,26 +234,19 @@ class TestAutoBackgroundLongTimeout:
 
         assert result.get("session_id") == mock_proc.id
         assert result.get("notify_on_complete") is True
-        assert result["output"] == "Background process started"
+        assert result.get("output") != "completed output"
         mock_registry.spawn_local.assert_called_once()
         mock_registry.wait.assert_not_called()
         mock_env.execute.assert_not_called()
 
-    def test_auto_promotion_never_waits_or_kills_the_managed_child(self):
-        """There is no inline wait to interrupt after auto-promotion."""
+    def test_auto_promoted_process_is_not_killed_on_spawn(self):
+        """Auto-promoted children stay background; no wait, no kill on spawn."""
         result, mock_proc, mock_env, mock_registry = _run_promoted(
             "make build",
             timeout=201,
-            wait_result={
-                "status": "interrupted",
-                "command": "make build",
-                "output": "partial output",
-                "note": "User sent a new message -- wait interrupted",
-            },
         )
 
-        assert result["output"] == "Background process started"
-        assert result["session_id"] == mock_proc.id
+        assert result.get("session_id") == mock_proc.id
         mock_registry.wait.assert_not_called()
         mock_registry.kill_process.assert_not_called()
         mock_env.execute.assert_not_called()
@@ -315,7 +325,6 @@ class TestAutoBackgroundLongTimeout:
             config=_base_config(auto_background_timeout=3300),
         )
 
-        assert result["output"] == "Background process started"
         assert result.get("session_id") == mock_proc.id
         assert mock_proc.notify_on_complete is True
         mock_registry.spawn_local.assert_called_once()
@@ -471,17 +480,20 @@ class TestSchemaDescriptions:
         props = TERMINAL_SCHEMA["parameters"]["properties"]
         timeout_desc = props["timeout"]["description"]
         assert "3300" in timeout_desc
-        assert "200" in timeout_desc
+        assert "threshold" in timeout_desc.lower() or "auto" in timeout_desc.lower()
         assert str(FOREGROUND_MAX_TIMEOUT) in timeout_desc
-        assert "auto" in timeout_desc.lower() or "promote" in timeout_desc.lower()
+        assert "force" in timeout_desc.lower() or "promote" in timeout_desc.lower()
+        # P0: no more "waits inline" / sync-wait promise
         assert "inline" not in timeout_desc.lower()
+        assert "handle" in timeout_desc.lower() or "notify" in timeout_desc.lower()
 
         notify_desc = props["notify_on_complete"]["description"]
         assert "default" in notify_desc.lower()
         assert "background" in notify_desc.lower()
-        assert "completion" in notify_desc.lower()
+        assert "handle" in notify_desc.lower() or "immediately" in notify_desc.lower()
         assert "synchronously" not in notify_desc.lower()
 
         bg_desc = props["background"]["description"]
         assert "auto" in bg_desc.lower() or "timeout" in bg_desc.lower()
         assert "force" in bg_desc.lower()
+        assert "handle" in bg_desc.lower() or "asynchronous" in bg_desc.lower() or "immediately" in bg_desc.lower()

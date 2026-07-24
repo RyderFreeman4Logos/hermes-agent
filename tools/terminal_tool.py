@@ -966,7 +966,7 @@ Reserve terminal for: builds, installs, git, processes, scripts, network, packag
 Because exported environment state persists, activate a virtualenv or export setup variables once per session; do not re-source the same environment before every command unless a command proves the shell state was reset.
 
 Foreground (default): Commands return INSTANTLY when done, even if the timeout is high. Set timeout=300 for long builds/scripts — you'll still get the result in seconds if it's fast. Prefer foreground for short commands.
-Auto-background: When background is OMITTED and timeout exceeds the configured threshold (200s by default), the command starts as a managed background process. Its timeout budget is rewritten to terminal.auto_background_timeout (3300s by default), and the tool returns its session handle immediately. With omitted/default or explicit notify_on_complete=true, completion is delivered asynchronously; explicit notify_on_complete=false is true detach with no completion notification.
+Auto-background: When background is OMITTED and timeout exceeds the configured threshold (200s by default), the command starts as a managed background process. Its timeout budget is rewritten to terminal.auto_background_timeout (3300s by default). With omitted/default or explicit notify_on_complete=true, the tool returns a session_id handle immediately and completion re-enters via notify (do not block the agent turn); explicit notify_on_complete=false is true detach with no completion notification. Timeouts strictly above auto_background_timeout force-promote even explicit background=false.
 Background: Set background=true to get a session_id. Almost always pair with notify_on_complete=true — bg without notify runs SILENTLY and you have no way to learn it finished short of calling process(action='poll') yourself. Two legitimate uses:
   (1) Long-lived processes that never exit (servers, watchers, daemons) — silent is correct, there's no exit to notify on.
   (2) Long-running bounded tasks (tests, builds, deploys, CI pollers, batch jobs) — MUST set notify_on_complete=true. Without it you'll either forget to poll or sit blocked waiting for the user to surface the result.
@@ -2153,9 +2153,10 @@ def terminal_tool(
         command: The command to execute
         background: Whether to run in background. None means omitted (auto-promote
             may apply when effective_timeout > threshold). Auto-promoted commands
-            remain managed background sessions and return their handle immediately;
-            default/explicit notify delivers completion asynchronously. Explicit False
-            may be force-promoted above auto_background_timeout; explicit True stays
+            remain managed background sessions and the tool returns a handle
+            immediately; default/explicit notify delivers completion
+            asynchronously. Explicit False is respected unless timeout exceeds
+            auto_background_timeout (force-promote). Explicit True stays
             background.
         timeout: Command timeout in seconds (default: from config)
         task_id: Unique identifier for environment isolation (optional)
@@ -2272,6 +2273,7 @@ def terminal_tool(
         # stronger guardrail: it force-promotes even explicit background=False.
         # Explicit background=True is already managed and therefore retains its
         # requested wait timeout.
+        auto_promoted = False
         threshold_promotes = (
             auto_bg_long
             and background_was_omitted
@@ -2286,6 +2288,7 @@ def terminal_tool(
         )
         if threshold_promotes or force_promotes:
             background = True
+            auto_promoted = True
             # The model-supplied long timeout only selects background mode. Once
             # promoted, wait against the dedicated auto-background timeout rather
             # than terminal.timeout or an arbitrary 7200s+ request.
@@ -2310,6 +2313,13 @@ def terminal_tool(
             and not watch_patterns
         ):
             notify_on_complete = True
+
+        # Auto-promotion keeps the process as managed background so the user can
+        # steer without killing it. The tool call itself must return immediately
+        # with a handle: blocking here freezes the whole agent turn and delays
+        # other command/subagent completion notifications (and user prompts)
+        # for up to auto_background_timeout. Completion re-enters via
+        # notify_on_complete + process_registry.completion_queue.
 
         # Hard-reject foreground commands when the model explicitly requested
         # a timeout above FOREGROUND_MAX and the final mode is still foreground
@@ -2803,6 +2813,8 @@ def terminal_tool(
                     proc_session.watch_patterns = list(watch_patterns)
                     result_data["watch_patterns"] = proc_session.watch_patterns
 
+                # Always return the handle immediately for background /
+                # auto-promoted work. Do not process_registry.wait() here.
                 return json.dumps(result_data, ensure_ascii=False)
             except Exception as e:
                 return json.dumps({
@@ -3192,12 +3204,12 @@ TERMINAL_SCHEMA = {
             },
             "background": {
                 "type": "boolean",
-                "description": "Run the command in the background. When OMITTED and auto_background_long_timeout is on, effective timeouts above 200s auto-enable a managed background session. Any timeout above auto_background_timeout (3300s by default) force-promotes even explicit background=false. Auto-promoted commands return their handle immediately; default/explicit notify_on_complete=true delivers completion asynchronously, while explicit false is true detach.",
+                "description": "Run the command in the background. When OMITTED and auto_background_long_timeout is on, effective timeouts above the threshold auto-enable a managed background session. Any timeout above auto_background_timeout (3300s by default) force-promotes even explicit background=false. Default/explicit notify_on_complete=true returns a handle immediately and delivers completion asynchronously; explicit notify_on_complete=false is true detach with no completion notification.",
                 "default": False
             },
             "timeout": {
                 "type": "integer",
-                "description": f"Max seconds to wait (default: 3300). When auto_background_long_timeout is enabled and background is OMITTED, timeouts above 200s create a managed background process and rewrite its timeout budget to auto_background_timeout (3300 by default). A requested/effective timeout strictly above auto_background_timeout force-promotes even explicit background=false. Auto-promoted commands return their handle immediately; default/explicit notify_on_complete=true delivers completion asynchronously, while explicit false detaches. FOREGROUND_MAX_TIMEOUT={FOREGROUND_MAX_TIMEOUT}s remains the hard cap for foreground.",
+                "description": f"Max seconds for the command budget (default: 3300). When auto_background_long_timeout is enabled and background is OMITTED, timeouts above the threshold create a managed background process and rewrite its budget to auto_background_timeout (3300 by default). A requested timeout strictly above auto_background_timeout force-promotes even explicit background=false. Default/explicit notify_on_complete=true returns a handle immediately (completion via notify); explicit false detaches. FOREGROUND_MAX_TIMEOUT={FOREGROUND_MAX_TIMEOUT}s remains the hard cap for true foreground.",
                 "minimum": 1
             },
             "workdir": {
@@ -3211,7 +3223,7 @@ TERMINAL_SCHEMA = {
             },
             "notify_on_complete": {
                 "type": "boolean",
-                "description": "When true (and background=true), completion is delivered exactly once. Default for background (and auto-promoted long timeouts) is true when omitted and no watch_patterns. Auto-promoted commands return their handle immediately and deliver completion through the existing async completion path. Explicit false is true detach: return the handle immediately with no completion notification. MUTUALLY EXCLUSIVE with watch_patterns — when both are set, watch_patterns is dropped.",
+                "description": "When true (and background=true), completion is delivered exactly once via the completion queue / watcher. Default for background (and auto-promoted long timeouts) is true when omitted and no watch_patterns. The tool always returns a handle immediately for background work — it does not block the agent turn waiting for the process. Explicit false is true detach: return the handle immediately with no completion notification. MUTUALLY EXCLUSIVE with watch_patterns — when both are set, watch_patterns is dropped.",
                 "default": False
             },
             "watch_patterns": {

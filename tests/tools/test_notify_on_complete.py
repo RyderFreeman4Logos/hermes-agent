@@ -427,9 +427,12 @@ class TestCompletionConsumed:
         registry.poll("proc_run2")
         assert "proc_run2" not in registry._poll_observed
 
-    def test_wait_and_log_still_skip_cli_drain(self, registry):
+    def test_sync_wait_and_log_still_skip_cli_drain(self, registry):
         """wait()/read_log() consume the output, so the CLI drain skips their
         completions via _completion_consumed (the original #8228 contract).
+
+        terminal's auto-promoted default-notify path returns ``wait()`` inline,
+        so this is the no-double-delivery invariant for that sync result too.
         """
         for sid, action in (("proc_w", "wait"), ("proc_l", "log")):
             s = _make_session(sid=sid, notify_on_complete=True, output="done")

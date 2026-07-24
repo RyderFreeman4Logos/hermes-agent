@@ -1,7 +1,10 @@
 """Tests for foreground timeout cap in terminal_tool.
 
-Ensures that foreground commands with timeout > FOREGROUND_MAX_TIMEOUT
-are rejected with an error suggesting background=true.
+Ensures that:
+- with auto_background_long_timeout=false, timeout > FOREGROUND_MAX is rejected
+- with auto true, long timeouts promote to background (covered in
+  test_terminal_auto_background_long_timeout.py)
+- short timeouts still execute in foreground
 """
 import json
 from unittest.mock import patch, MagicMock
@@ -22,16 +25,20 @@ def _make_env_config(**overrides):
         "singularity_image": "",
         "modal_image": "",
         "daytona_image": "",
+        # Legacy reject path tests opt into auto=false; promotion covered elsewhere.
+        "auto_background_long_timeout": False,
+        "auto_background_timeout_threshold": 200,
+        "default_notify_on_background": True,
     }
     config.update(overrides)
     return config
 
 
 class TestForegroundTimeoutCap:
-    """FOREGROUND_MAX_TIMEOUT rejects foreground commands that exceed it."""
+    """FOREGROUND_MAX_TIMEOUT rejects foreground commands that exceed it (auto off)."""
 
     def test_foreground_timeout_rejected_above_max(self):
-        """When model requests timeout > FOREGROUND_MAX_TIMEOUT, return error."""
+        """When auto is false and model requests timeout > max, return error."""
         from tools.terminal_tool import terminal_tool, FOREGROUND_MAX_TIMEOUT
 
         with patch("tools.terminal_tool._get_env_config", return_value=_make_env_config()), \
@@ -116,17 +123,20 @@ class TestForegroundTimeoutCap:
         assert call_kwargs[1]["timeout"] == 300
         assert "error" not in result or result["error"] is None
 
-    def test_config_default_above_cap_not_rejected(self):
-        """When config default timeout > cap but model passes no timeout, execute normally.
+    def test_config_default_above_cap_not_rejected_when_auto_false(self):
+        """When auto is false, config default timeout > cap is still allowed foreground.
 
-        Only the model's explicit timeout parameter triggers rejection,
-        not the user's configured default.
+        Only the model's explicit timeout parameter triggers rejection when
+        auto_background_long_timeout is disabled.
         """
         from tools.terminal_tool import terminal_tool
 
-        # User configured TERMINAL_TIMEOUT=900 in their env
+        # User configured TERMINAL_TIMEOUT=900 in their env; auto promotion off.
         with patch("tools.terminal_tool._get_env_config",
-                    return_value=_make_env_config(timeout=900)), \
+                    return_value=_make_env_config(
+                        timeout=900,
+                        auto_background_long_timeout=False,
+                    )), \
              patch("tools.terminal_tool._start_cleanup_thread"):
 
             mock_env = MagicMock()
@@ -167,13 +177,14 @@ class TestForegroundTimeoutCap:
                     command="python server.py",
                     background=True,
                     timeout=9999,
+                    notify_on_complete=False,
                 ))
 
         # Background should NOT be rejected
         assert "error" not in result or result["error"] is None
 
-    def test_default_timeout_not_rejected(self):
-        """Default timeout (180s) should not trigger rejection."""
+    def test_short_default_timeout_not_rejected(self):
+        """Short config default timeout should not trigger rejection."""
         from tools.terminal_tool import terminal_tool, FOREGROUND_MAX_TIMEOUT
 
         # 180 < 600, so no rejection
@@ -226,8 +237,8 @@ class TestForegroundMaxTimeoutConstant:
         assert FOREGROUND_MAX_TIMEOUT == 600
 
     def test_schema_mentions_max(self):
-        """Tool schema description should mention the max timeout."""
+        """Tool schema description should mention the max timeout / promote path."""
         from tools.terminal_tool import TERMINAL_SCHEMA, FOREGROUND_MAX_TIMEOUT
         timeout_desc = TERMINAL_SCHEMA["parameters"]["properties"]["timeout"]["description"]
         assert str(FOREGROUND_MAX_TIMEOUT) in timeout_desc
-        assert "background=true" in timeout_desc
+        assert "background" in timeout_desc.lower()

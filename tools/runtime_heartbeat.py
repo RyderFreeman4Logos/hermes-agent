@@ -148,8 +148,9 @@ class RuntimeHeartbeat:
 
     ``inspect`` returns a compact snapshot.  Process snapshots are compared to
     their previous output/CPU values; a live PID alone never qualifies as
-    ALIVE. Delegation snapshots compare their per-target ``last_activity_at``
-    baseline so a still-running but frozen delegation is surfaced as STUCK.
+    ALIVE. Async delegations do not expose reliable per-turn activity, so
+    running/finalizing snapshots explicitly report progress instead of
+    comparing their static dispatch timestamp.
     """
 
     def __init__(
@@ -285,6 +286,8 @@ class RuntimeHeartbeat:
             if new_cpu > old_cpu:
                 return "ALIVE", f"CPU advanced {old_cpu:.2f}->{new_cpu:.2f}s"
             return "STUCK", str(snapshot.get("evidence") or "process is live but produced no output or CPU progress")
+        if snapshot.get("progress") is True:
+            return "ALIVE", str(snapshot.get("evidence") or "delegation in progress")
         old_activity = target.baseline.get("last_activity_at")
         new_activity = snapshot.get("last_activity_at")
         if new_activity != old_activity:
@@ -364,11 +367,13 @@ def inspect_delegation(target_id: str) -> Dict[str, Any]:
         return {"alive": False, "evidence": "delegation record is no longer available"}
     status = str(record.get("status") or "unknown")
     if status in {"running", "finalizing"}:
-        activity = record.get("last_activity_at") or record.get("dispatched_at")
         return {
             "alive": True,
-            "last_activity_at": activity,
-            "evidence": f"delegation status={status}; last activity={activity}",
+            "progress": True,
+            "evidence": (
+                "delegation in progress "
+                f"(no granular activity tracking; status={status})"
+            ),
         }
     return {"alive": False, "evidence": f"delegation status={status}"}
 

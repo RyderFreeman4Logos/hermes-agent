@@ -6,6 +6,7 @@ import queue
 
 from tools.runtime_heartbeat import (
     RuntimeHeartbeat,
+    inspect_delegation,
     resolve_kv_cache_ttl,
 )
 
@@ -121,26 +122,37 @@ def test_process_heartbeat_requires_output_or_cpu_growth_not_just_a_live_pid():
     assert manager.outstanding_for_caller("caller") == []
 
 
-def test_delegation_stuck_when_activity_frozen():
-    manager = _manager()
-    snapshots = [
-        {"alive": True, "last_activity_at": 100.0, "evidence": "delegation running"},
-        {"alive": True, "last_activity_at": 100.0, "evidence": "delegation running"},
-    ]
-    manager.arm(
-        "delegation-stuck",
-        caller_id="caller",
-        kind="delegation",
-        provider="openai",
-        inspect=lambda: snapshots.pop(0),
+def test_active_delegation_without_granular_activity_remains_alive(monkeypatch):
+    record = {}
+    monkeypatch.setattr(
+        "tools.async_delegation.list_async_delegations",
+        lambda: [record],
     )
 
-    FakeTimer.created[-1].callback()
+    for status in ("running", "finalizing"):
+        target_id = f"delegation-{status}"
+        record = {
+            "delegation_id": target_id,
+            "status": status,
+            "dispatched_at": 100.0,
+            "last_activity_at": 100.0,
+        }
+        manager = _manager()
+        manager.arm(
+            target_id,
+            caller_id="caller",
+            kind="delegation",
+            provider="openai",
+            inspect=lambda: inspect_delegation(target_id),
+        )
 
-    evt = manager._event_queue.get_nowait()
-    assert evt["status"] == "STUCK"
-    assert "activity did not advance" in evt["evidence"]
-    assert manager.outstanding_for_caller("caller") == []
+        FakeTimer.created[-1].callback()
+
+        assert manager._event_queue is not None
+        evt = manager._event_queue.get_nowait()
+        assert evt["status"] == "ALIVE"
+        assert f"no granular activity tracking; status={status}" in evt["evidence"]
+        assert manager.outstanding_for_caller("caller") == [target_id]
 
 
 def test_alive_heartbeat_is_compact_and_rearms_that_target():

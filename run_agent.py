@@ -6745,6 +6745,28 @@ class AIAgent:
             getattr(self, "_session_db", None), getattr(self, "session_id", None)
         )
         from agent.auxiliary_client import scoped_runtime_main
+        from tools.runtime_heartbeat import (
+            reset_current_provider,
+            runtime_heartbeat,
+            set_current_provider,
+        )
+
+        # An LLM activation is the timer-hygiene boundary. Reset every remaining
+        # target owned by this caller so a completion/heartbeat cannot collapse
+        # the next quiet interval into a short-poll loop. Tool workers inherit
+        # the live provider ContextVar when they arm their target timer.
+        heartbeat_token = set_current_provider(getattr(self, "provider", ""))
+        try:
+            from tools.approval import get_current_session_key
+            heartbeat_caller = (
+                get_current_session_key(default="")
+                or task_id
+                or getattr(self, "session_id", "")
+            )
+            if heartbeat_caller:
+                runtime_heartbeat.reset_for_caller(heartbeat_caller)
+        except Exception:
+            logger.debug("Failed to reset runtime heartbeats at turn start", exc_info=True)
 
         # The outer token restores the caller's Context even though turn setup
         # replaces the value with the live runtime after fallback restoration.
@@ -6764,6 +6786,7 @@ class AIAgent:
                     moa_config=moa_config,
                 )
             finally:
+                reset_current_provider(heartbeat_token)
                 reset_accounting_context(acct_token)
                 reset_conversation_context(token)
 

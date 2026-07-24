@@ -198,6 +198,30 @@ model:
 # worktree_sync: false  # Branch from local HEAD (offline / pinned base)
 
 # =============================================================================
+# Runtime Coordination
+# =============================================================================
+# Provider-aware cache keepalive/check-in policy for managed long work.
+runtime:
+  # Exact provider -> canonical family -> default -> documented 3300-second fallback.
+  kv_cache_ttl:
+    default: 3300
+    providers:
+      openai: 3300
+      openai-codex: 3300
+      custom:pm: 3300
+      custom:z1: 1700
+  heartbeat:
+    enabled: true
+    mode: per_target
+    safety_ratio: 0.8
+    min_interval_seconds: 60
+    max_interval_seconds: 3300
+    reset_on_caller_activation: true
+  completion_notify:
+    compact: true
+    max_output_chars: 2000
+
+# =============================================================================
 # Terminal Tool Configuration
 # =============================================================================
 # Choose ONE of the following terminal configurations by uncommenting it.
@@ -213,7 +237,7 @@ model:
 terminal:
   backend: "local"
   cwd: "."  # For local backend: "." = current directory. Ignored for remote backends unless a backend documents otherwise.
-  timeout: 3300
+  timeout: 180
   # When background is OMITTED and effective timeout > threshold (200s),
   # auto-promote to background+notify. A timeout > auto_background_timeout
   # force-promotes even explicit background=false.

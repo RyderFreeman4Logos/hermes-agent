@@ -239,7 +239,11 @@ DEFAULT_CONFIG = {
         "backend": "local",
         "modal_mode": "auto",
         "cwd": ".",  # Use current directory
-        "timeout": 180,
+        "timeout": 3300,
+        "auto_background_long_timeout": True,
+        "auto_background_timeout_threshold": 19,
+        "auto_background_timeout": 3300,
+        "default_notify_on_background": True,
         # Bounded grace period (seconds) between SIGTERM and an escalated
         # SIGKILL when terminating a host process tree (browser daemons, etc.).
         # A daemon that stalls in its SIGTERM handler is force-killed after this

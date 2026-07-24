@@ -230,7 +230,16 @@ model:
 terminal:
   backend: "local"
   cwd: "."  # For local backend: "." = current directory. Ignored for remote backends unless a backend documents otherwise.
-  timeout: 180
+  timeout: 3300
+  # When background is OMITTED and effective timeout > threshold (19s),
+  # auto-promote to background+notify. A timeout > auto_background_timeout
+  # force-promotes even explicit background=false.
+  auto_background_long_timeout: true
+  auto_background_timeout_threshold: 19
+  # Promoted commands wait this long; this is independent of terminal.timeout.
+  auto_background_timeout: 3300
+  # When background is true/promoted and notify/watch were omitted, default notify.
+  default_notify_on_background: true
   # HOME policy for tool subprocesses:
   #   auto    - default: host uses your real HOME; containers use HERMES_HOME/home
   #   real    - force your real OS-user HOME

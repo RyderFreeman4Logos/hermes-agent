@@ -1159,7 +1159,17 @@ DEFAULT_CONFIG = {
             "max_interval_seconds": 3300,
             "reset_on_caller_activation": True,
         },
-        "completion_notify": {"compact": True, "max_output_chars": 2000},
+        "completion_notify": {
+            # Compact agent-facing payloads; full logs stay on the process session.
+            "compact": True,
+            "max_output_chars": 2000,
+            # Delivery lag above this marks the event LATE so models do not
+            # spend expensive output tokens restating stale investigation spam.
+            "late_after_seconds": 5,
+            # When the TUI session is mid-turn, try agent.steer() (same path as
+            # user steer) instead of re-queuing completions until idle.
+            "steer_when_busy": True,
+        },
     },
 
     "terminal": {

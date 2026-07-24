@@ -1336,7 +1336,19 @@ class TestProcessToolHandler:
 from tools.process_registry import format_process_notification
 
 
-def test_format_completion_event():
+def test_format_completion_event(monkeypatch):
+    import tools.process_registry as process_registry_module
+
+    monkeypatch.setattr(
+        process_registry_module,
+        "_completion_notify_settings",
+        lambda: {
+            "compact": True,
+            "max_output_chars": 2000,
+            "late_after_seconds": 5,
+            "steer_when_busy": True,
+        },
+    )
     evt = {
         "type": "completion",
         "session_id": "proc_abc",
@@ -1345,10 +1357,93 @@ def test_format_completion_event():
         "output": "done",
     }
     result = format_process_notification(evt)
+    assert result is not None
     assert "[IMPORTANT: Background process proc_abc completed normally" in result
     assert "exit code 0" in result
     assert "Command: sleep 5" in result
-    assert "Output:\ndone]" in result
+    assert "Output tail:\ndone]" in result
+    assert "do not restate full output" in result
+
+
+def test_format_completion_event_marks_late_delivery(monkeypatch):
+    import tools.process_registry as process_registry_module
+
+    monkeypatch.setattr(
+        process_registry_module,
+        "_completion_notify_settings",
+        lambda: {
+            "compact": True,
+            "max_output_chars": 2000,
+            "late_after_seconds": 5,
+            "steer_when_busy": True,
+        },
+    )
+    result = format_process_notification({
+        "type": "completion",
+        "session_id": "proc_late",
+        "command": "echo done",
+        "exit_code": 0,
+        "output": "done",
+        "finished_at": time.time() - 60,
+    })
+
+    assert result is not None
+    assert "LATE by" in result
+    assert "ACK in ≤1 line" in result
+    assert "do not restate output" in result
+
+
+def test_format_completion_event_honors_zero_late_threshold(monkeypatch):
+    import tools.process_registry as process_registry_module
+
+    monkeypatch.setattr(
+        process_registry_module,
+        "_completion_notify_settings",
+        lambda: {
+            "compact": True,
+            "max_output_chars": 2000,
+            "late_after_seconds": 0,
+            "steer_when_busy": True,
+        },
+    )
+    result = format_process_notification({
+        "type": "completion",
+        "session_id": "proc_immediately_late",
+        "command": "echo done",
+        "exit_code": 0,
+        "output": "done",
+        "finished_at": time.time() - 1,
+    })
+
+    assert result is not None
+    assert "LATE by" in result
+
+
+def test_format_completion_event_compacts_output_tail(monkeypatch):
+    import tools.process_registry as process_registry_module
+
+    monkeypatch.setattr(
+        process_registry_module,
+        "_completion_notify_settings",
+        lambda: {
+            "compact": True,
+            "max_output_chars": 12,
+            "late_after_seconds": 5,
+            "steer_when_busy": True,
+        },
+    )
+    result = format_process_notification({
+        "type": "completion",
+        "session_id": "proc_compact",
+        "command": "echo done",
+        "exit_code": 0,
+        "output": "discard-this-prefix-tail-visible",
+    })
+
+    assert result is not None
+    assert "Output tail:" in result
+    assert "tail-visible" in result
+    assert "discard-this-prefix" not in result
 
 
 def test_format_killed_completion_event_names_source_and_signal():

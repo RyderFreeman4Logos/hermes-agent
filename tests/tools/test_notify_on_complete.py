@@ -102,6 +102,8 @@ class TestCompletionQueue:
         assert completion["completion_reason"] == "exited"
         assert completion["termination_source"] == ""
         assert "build succeeded" in completion["output"]
+        assert isinstance(completion["finished_at"], float)
+        assert completion["finished_at"] >= s.started_at
 
     def test_move_to_finished_nonzero_exit(self, registry):
         """Nonzero exit codes are captured correctly."""

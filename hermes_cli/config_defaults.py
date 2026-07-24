@@ -235,11 +235,32 @@ DEFAULT_CONFIG = {
         "reasoning_overrides": {},
     },
 
+    "runtime": {
+        "kv_cache_ttl": {
+            "default": 3300,
+            "providers": {
+                "openai": 3300,
+                "openai-codex": 3300,
+                "custom:pm": 3300,
+                "custom:z1": 1700,
+            },
+        },
+        "heartbeat": {
+            "enabled": True,
+            "mode": "per_target",
+            "safety_ratio": 0.8,
+            "min_interval_seconds": 60,
+            "max_interval_seconds": 3300,
+            "reset_on_caller_activation": True,
+        },
+        "completion_notify": {"compact": True, "max_output_chars": 2000},
+    },
+
     "terminal": {
         "backend": "local",
         "modal_mode": "auto",
         "cwd": ".",  # Use current directory
-        "timeout": 3300,
+        "timeout": 180,
         "auto_background_long_timeout": True,
         "auto_background_timeout_threshold": 19,
         "auto_background_timeout": 3300,

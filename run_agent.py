@@ -7046,6 +7046,11 @@ class AIAgent:
             start_task_run,
         )
         from agent.subagent_lifecycle import bind_subagent_parent
+        from tools.runtime_heartbeat import (
+            reset_current_provider,
+            runtime_heartbeat,
+            set_current_provider,
+        )
         effective_task_id = task_id or str(uuid.uuid4())
         session_id = str(getattr(self, "session_id", None) or "")
         task_context = {
@@ -7066,6 +7071,7 @@ class AIAgent:
         relay_turn = None
         token = None
         acct_token = None
+        heartbeat_token = None
         task_started = False
         task_finished = False
         relay_outcome = "failed"
@@ -7102,6 +7108,28 @@ class AIAgent:
                 getattr(self, "session_id", None),
             )
             from agent.auxiliary_client import scoped_runtime_main
+
+            # An LLM activation is the timer-hygiene boundary. Reset every
+            # remaining target owned by this caller so a completion/heartbeat
+            # cannot collapse the next quiet interval into a short-poll loop.
+            try:
+                heartbeat_token = set_current_provider(
+                    getattr(self, "provider", "")
+                )
+                from tools.approval import get_current_session_key
+
+                heartbeat_caller = (
+                    get_current_session_key(default="")
+                    or task_id
+                    or getattr(self, "session_id", "")
+                )
+                if heartbeat_caller:
+                    runtime_heartbeat.reset_for_caller(heartbeat_caller)
+            except Exception:
+                logger.debug(
+                    "Failed to reset runtime heartbeats at turn start",
+                    exc_info=True,
+                )
 
             # The outer token restores the caller's Context even though turn setup
             # replaces the value with the live runtime after fallback restoration.
@@ -7167,6 +7195,8 @@ class AIAgent:
                 finally:
                     if getattr(self, "_relay_pending_turn_id", None) == relay_turn_id:
                         self._relay_pending_turn_id = None
+                    if heartbeat_token is not None:
+                        reset_current_provider(heartbeat_token)
                     if acct_token is not None:
                         reset_accounting_context(acct_token)
                     if token is not None:

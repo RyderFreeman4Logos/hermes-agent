@@ -92,6 +92,30 @@ def test_dispatch_returns_immediately_without_blocking():
     gate.set()
 
 
+def test_async_dispatch_arms_and_completion_cancels_its_own_heartbeat(monkeypatch):
+    from tools.runtime_heartbeat import runtime_heartbeat
+
+    armed, cancelled = [], []
+    monkeypatch.setattr(runtime_heartbeat, "arm", lambda *args, **kwargs: armed.append((args, kwargs)) or True)
+    monkeypatch.setattr(runtime_heartbeat, "cancel", lambda target_id: cancelled.append(target_id) or True)
+    gate = threading.Event()
+
+    def runner():
+        gate.wait(2)
+        return {"summary": "done"}
+
+    result = ad.dispatch_async_delegation(
+        goal="heartbeat", context=None, toolsets=None, role="leaf", model="m",
+        session_key="caller", runner=runner,
+        max_async_children=1,
+    )
+    assert armed[0][0] == (result["delegation_id"],)
+    assert armed[0][1]["caller_id"] == "caller"
+    gate.set()
+    assert _drain_for(result["delegation_id"]) is not None
+    assert cancelled == [result["delegation_id"]]
+
+
 def test_async_executor_workers_are_daemon_threads():
     gate = threading.Event()
 

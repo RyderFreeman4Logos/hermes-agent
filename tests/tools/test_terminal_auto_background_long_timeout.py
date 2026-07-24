@@ -497,3 +497,14 @@ class TestSchemaDescriptions:
         assert "auto" in bg_desc.lower() or "timeout" in bg_desc.lower()
         assert "force" in bg_desc.lower()
         assert "handle" in bg_desc.lower() or "asynchronous" in bg_desc.lower() or "immediately" in bg_desc.lower()
+
+
+def test_completion_notified_auto_background_arms_per_target_heartbeat():
+    with patch("tools.runtime_heartbeat.runtime_heartbeat.arm") as arm:
+        result, proc, _, _ = _run_promoted("make build", timeout=201)
+
+    assert result["notify_on_complete"] is True
+    arm.assert_called_once()
+    assert arm.call_args.args[0] == proc.id
+    assert arm.call_args.kwargs["caller_id"] == ""
+    assert arm.call_args.kwargs["kind"] == "process"

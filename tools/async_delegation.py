@@ -760,6 +760,21 @@ def dispatch_async_delegation(
     if progress_fn is not None:
         _ensure_stale_monitor()
 
+    # Async delegations use the same per-target lifecycle as managed
+    # terminal work. Completion cancels this ID only (in _finalize).
+    from tools.runtime_heartbeat import (
+        get_current_provider,
+        inspect_delegation,
+        runtime_heartbeat,
+    )
+    runtime_heartbeat.arm(
+        delegation_id,
+        caller_id=session_key,
+        kind="delegation",
+        provider=get_current_provider(),
+        inspect=lambda _id=delegation_id: inspect_delegation(_id),
+    )
+
     logger.info(
         "Dispatched async delegation %s (session_key=%s): %s",
         delegation_id, session_key or "<cli>", (goal or "")[:80],
@@ -769,6 +784,15 @@ def dispatch_async_delegation(
 
 def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
     """Mark a record complete and push the completion event onto the queue."""
+    try:
+        from tools.runtime_heartbeat import runtime_heartbeat
+        runtime_heartbeat.cancel(delegation_id)
+    except Exception:
+        logger.debug(
+            "Failed to cancel heartbeat for async delegation %s",
+            delegation_id,
+            exc_info=True,
+        )
     claimed = _begin_finalization(delegation_id)
     if claimed is None:
         return
@@ -1001,6 +1025,19 @@ def dispatch_async_delegation_batch(
     if progress_fn is not None:
         _ensure_stale_monitor()
 
+    from tools.runtime_heartbeat import (
+        get_current_provider,
+        inspect_delegation,
+        runtime_heartbeat,
+    )
+    runtime_heartbeat.arm(
+        delegation_id,
+        caller_id=session_key,
+        kind="delegation",
+        provider=get_current_provider(),
+        inspect=lambda _id=delegation_id: inspect_delegation(_id),
+    )
+
     logger.info(
         "Dispatched async delegation batch %s (%d task(s), session_key=%s)",
         delegation_id, n, session_key or "<cli>",
@@ -1012,6 +1049,15 @@ def _finalize_batch(
     delegation_id: str, combined: Dict[str, Any], status: str
 ) -> None:
     """Mark a batch record complete and push ONE combined completion event."""
+    try:
+        from tools.runtime_heartbeat import runtime_heartbeat
+        runtime_heartbeat.cancel(delegation_id)
+    except Exception:
+        logger.debug(
+            "Failed to cancel heartbeat for async delegation batch %s",
+            delegation_id,
+            exc_info=True,
+        )
     claimed = _begin_finalization(delegation_id)
     if claimed is None:
         return

@@ -1099,3 +1099,72 @@ def test_persist_dispatch_retries_through_execute_write(tmp_path, monkeypatch):
     assert durable is not None
     assert durable["state"] == "running"
 
+
+def _fail_first_execute_with_lock(monkeypatch):
+    """Make the next database statement lock, then use real connections."""
+    original_connect = ad._connect
+    attempts = {"n": 0}
+    sleeps: list[float] = []
+
+    class _FlakyConnection:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def __enter__(self):
+            self._conn.__enter__()
+            return self
+
+        def __exit__(self, *exc_info):
+            return self._conn.__exit__(*exc_info)
+
+        def execute(self, *args, **kwargs):
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise sqlite3.OperationalError("database is locked")
+            return self._conn.execute(*args, **kwargs)
+
+    monkeypatch.setattr(ad.time, "sleep", lambda delay: sleeps.append(delay))
+    monkeypatch.setattr(ad.random, "uniform", lambda _low, _high: 0.05)
+    monkeypatch.setattr(ad, "_connect", lambda: _FlakyConnection(original_connect()))
+    return attempts, sleeps
+
+
+def test_mark_completion_delivered_retries_on_lock(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._persist_dispatch({
+        "delegation_id": "deleg_mark_lock", "session_key": "owner",
+        "origin_ui_session_id": "", "parent_session_id": None,
+        "dispatched_at": 1.0,
+    })
+    ad._persist_completion(
+        {"delegation_id": "deleg_mark_lock", "status": "completed", "completed_at": 2.0},
+        {"status": "completed", "summary": "done"},
+    )
+
+    attempts, sleeps = _fail_first_execute_with_lock(monkeypatch)
+
+    assert ad.mark_completion_delivered("deleg_mark_lock")
+    assert attempts["n"] == 2
+    assert sleeps == [0.05]
+
+
+def test_claim_completion_delivery_retries_on_lock(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._persist_dispatch({
+        "delegation_id": "deleg_claim_lock", "session_key": "owner",
+        "origin_ui_session_id": "", "parent_session_id": None,
+        "dispatched_at": 1.0,
+    })
+    ad._persist_completion(
+        {"delegation_id": "deleg_claim_lock", "status": "completed", "completed_at": 2.0},
+        {"status": "completed", "summary": "done"},
+    )
+
+    attempts, sleeps = _fail_first_execute_with_lock(monkeypatch)
+
+    assert ad.claim_completion_delivery("deleg_claim_lock", "consumer")
+    # The initial SELECT is retried with the paired UPDATE, preventing a
+    # stale read/write split from escaping the retry boundary.
+    assert attempts["n"] == 3
+    assert sleeps == [0.05]
+

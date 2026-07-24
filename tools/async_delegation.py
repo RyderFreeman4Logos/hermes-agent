@@ -168,23 +168,18 @@ def _execute_write(fn: Callable[[sqlite3.Connection], _T]) -> _T:
     retries so competing openers can progress (same pattern as
     ``SessionDB._execute_write``).
     """
-    last_err: Optional[Exception] = None
-    for attempt in range(_WRITE_MAX_RETRIES):
+    if _WRITE_MAX_RETRIES < 1:
+        raise ValueError("_WRITE_MAX_RETRIES must be at least 1")
+    attempt = 0
+    while True:
         try:
             with _DB_LOCK, _connect() as conn:
                 return fn(conn)
         except sqlite3.OperationalError as exc:
-            if _is_db_locked_error(exc):
-                last_err = exc
-                if attempt < _WRITE_MAX_RETRIES - 1:
-                    time.sleep(
-                        random.uniform(_WRITE_RETRY_MIN_S, _WRITE_RETRY_MAX_S)
-                    )
-                    continue
-            raise
-    raise last_err or sqlite3.OperationalError(
-        "database is locked after max retries"
-    )
+            if not _is_db_locked_error(exc) or attempt >= _WRITE_MAX_RETRIES - 1:
+                raise
+            time.sleep(random.uniform(_WRITE_RETRY_MIN_S, _WRITE_RETRY_MAX_S))
+            attempt += 1
 
 
 def _persist_dispatch(record: Dict[str, Any]) -> None:
@@ -306,8 +301,9 @@ def recover_abandoned_delegations() -> int:
     except Exception:
         return 0
     now = time.time()
-    recovered = 0
-    with _DB_LOCK, _connect() as conn:
+
+    def _write(conn: sqlite3.Connection) -> int:
+        recovered = 0
         rows = conn.execute(
             """SELECT delegation_id, origin_session, origin_ui_session_id,
                       parent_session_id, dispatched_at, owner_pid,
@@ -347,7 +343,9 @@ def recover_abandoned_delegations() -> int:
                 (now, now, json.dumps(event), json.dumps(result), delegation_id),
             )
             recovered += 1
-    return recovered
+        return recovered
+
+    return _execute_write(_write)
 
 
 def restore_undelivered_completions(target_queue) -> int:
@@ -380,7 +378,8 @@ def restore_undelivered_completions(target_queue) -> int:
 def mark_completion_delivered(delegation_id: str) -> bool:
     """Atomically acknowledge successful injection of a durable completion."""
     now = time.time()
-    with _DB_LOCK, _connect() as conn:
+
+    def _write(conn: sqlite3.Connection) -> bool:
         cur = conn.execute(
             """UPDATE async_delegations SET delivery_state='delivered', delivered_at=?, updated_at=?
                WHERE delegation_id=? AND delivery_state!='delivered'""",
@@ -388,11 +387,14 @@ def mark_completion_delivered(delegation_id: str) -> bool:
         )
         return cur.rowcount == 1
 
+    return _execute_write(_write)
+
 
 def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     """Claim one pending completion across competing consumers/processes."""
     now = time.time()
-    with _DB_LOCK, _connect() as conn:
+
+    def _write(conn: sqlite3.Connection) -> bool:
         row = conn.execute(
             "SELECT delivery_state FROM async_delegations WHERE delegation_id=?",
             (delegation_id,),
@@ -407,6 +409,8 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
             (claim_id, now, now, delegation_id, now - 300),
         )
         return cur.rowcount == 1
+
+    return _execute_write(_write)
 
 
 def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
@@ -431,7 +435,8 @@ def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     pending rows).
     """
     now = time.time()
-    with _DB_LOCK, _connect() as conn:
+
+    def _write(conn: sqlite3.Connection) -> tuple[bool, bool]:
         capped = conn.execute(
             """UPDATE async_delegations SET delivery_state='dropped',
                       delivery_claim=NULL, delivery_claimed_at=NULL, updated_at=?
@@ -440,12 +445,7 @@ def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
             (now, delegation_id, claim_id, _MAX_DELIVERY_ATTEMPTS),
         )
         if capped.rowcount == 1:
-            logger.warning(
-                "Async delegation %s exhausted its %d delivery attempts; "
-                "marking terminally dropped (result remains queryable).",
-                delegation_id, _MAX_DELIVERY_ATTEMPTS,
-            )
-            return True
+            return True, True
         cur = conn.execute(
             """UPDATE async_delegations SET delivery_claim=NULL,
                       delivery_claimed_at=NULL, updated_at=?
@@ -453,7 +453,16 @@ def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
                  AND delivery_claim=?""",
             (now, delegation_id, claim_id),
         )
-        return cur.rowcount == 1
+        return False, cur.rowcount == 1
+
+    capped, released = _execute_write(_write)
+    if capped:
+        logger.warning(
+            "Async delegation %s exhausted its %d delivery attempts; "
+            "marking terminally dropped (result remains queryable).",
+            delegation_id, _MAX_DELIVERY_ATTEMPTS,
+        )
+    return released
 
 
 def drop_completion_delivery(delegation_id: str, claim_id: str) -> bool:
@@ -466,7 +475,8 @@ def drop_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     completion that will be fail-closed dropped again every time.
     """
     now = time.time()
-    with _DB_LOCK, _connect() as conn:
+
+    def _write(conn: sqlite3.Connection) -> bool:
         cur = conn.execute(
             """UPDATE async_delegations SET delivery_state='dropped',
                       updated_at=?, delivery_claim=NULL,
@@ -477,11 +487,14 @@ def drop_completion_delivery(delegation_id: str, claim_id: str) -> bool:
         )
         return cur.rowcount == 1
 
+    return _execute_write(_write)
+
 
 def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     """Acknowledge acceptance for the consumer holding this claim."""
     now = time.time()
-    with _DB_LOCK, _connect() as conn:
+
+    def _write(conn: sqlite3.Connection) -> bool:
         cur = conn.execute(
             """UPDATE async_delegations SET delivery_state='delivered',
                       delivered_at=?, updated_at=?, delivery_claim=NULL,
@@ -491,6 +504,8 @@ def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
             (now, now, delegation_id, claim_id),
         )
         return cur.rowcount == 1
+
+    return _execute_write(_write)
 
 
 def complete_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:

@@ -8,6 +8,7 @@ formatting, capacity rejection, and crash handling.
 import json
 import os
 import queue
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -1014,4 +1015,87 @@ def test_gateway_cli_origin_event_left_unrouted():
     evt = _make_async_evt(session_key="")
     runner._enrich_async_delegation_routing(evt)
     assert "platform" not in evt
+
+
+def test_connect_sets_busy_timeout(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    with ad._connect() as conn:
+        assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == ad._BUSY_TIMEOUT_MS
+
+
+def test_execute_write_retries_on_database_locked(monkeypatch):
+    """Lock contention must release the Python lock and jitter-retry."""
+    sleeps: list[float] = []
+    monkeypatch.setattr(ad.time, "sleep", lambda s: sleeps.append(s))
+    monkeypatch.setattr(ad.random, "uniform", lambda a, b: 0.05)
+
+    attempts = {"n": 0}
+
+    def flaky(_conn):
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            raise sqlite3.OperationalError("database is locked")
+        return "ok"
+
+    # Avoid opening a real state.db for this unit path.
+    class _DummyConn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(ad, "_connect", lambda: _DummyConn())
+    assert ad._execute_write(flaky) == "ok"
+    assert attempts["n"] == 3
+    assert sleeps == [0.05, 0.05]
+
+
+def test_execute_write_raises_after_max_retries(monkeypatch):
+    sleeps: list[float] = []
+    monkeypatch.setattr(ad.time, "sleep", lambda s: sleeps.append(s))
+    monkeypatch.setattr(ad.random, "uniform", lambda a, b: 0.01)
+    monkeypatch.setattr(ad, "_WRITE_MAX_RETRIES", 4)
+
+    class _DummyConn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(ad, "_connect", lambda: _DummyConn())
+
+    def always_locked(_conn):
+        raise sqlite3.OperationalError("database is locked")
+
+    with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+        ad._execute_write(always_locked)
+    assert len(sleeps) == 3  # retries between attempts, not after last
+
+
+def test_persist_dispatch_retries_through_execute_write(tmp_path, monkeypatch):
+    """_persist_dispatch must go through the jittered write helper."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    calls: list[str] = []
+    original = ad._execute_write
+
+    def wrapped(fn):
+        calls.append("execute_write")
+        return original(fn)
+
+    monkeypatch.setattr(ad, "_execute_write", wrapped)
+    record = {
+        "delegation_id": "deleg_lock_retry",
+        "session_key": "owner",
+        "origin_ui_session_id": "",
+        "parent_session_id": None,
+        "dispatched_at": 1.0,
+        "goal": "persist me",
+    }
+    ad._persist_dispatch(record)
+    assert "execute_write" in calls
+    durable = ad.get_durable_delegation("deleg_lock_retry")
+    assert durable is not None
+    assert durable["state"] == "running"
 

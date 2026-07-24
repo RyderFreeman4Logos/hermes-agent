@@ -38,12 +38,13 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import sqlite3
 import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, TypeVar
 
 from hermes_constants import get_hermes_home
 from tools.daemon_pool import DaemonThreadPoolExecutor
@@ -83,6 +84,17 @@ _MAX_DURABLE_PENDING = 1000
 # instead of replaying on every restart forever.
 _MAX_DELIVERY_ATTEMPTS = 8
 _DB_LOCK = threading.Lock()
+# Align with SessionDB write-contention policy: keep a bounded SQLite busy
+# wait, then jitter-retry at the application layer so concurrent openers of
+# state.db (gateway + many TUI sessions + optimize-storage) do not convoy on
+# the WAL write lock and surface bare "database is locked" to callers.
+_WRITE_MAX_RETRIES = 15
+_WRITE_RETRY_MIN_S = 0.020  # 20ms
+_WRITE_RETRY_MAX_S = 0.150  # 150ms
+_CONNECT_TIMEOUT_S = 10
+_BUSY_TIMEOUT_MS = 10_000
+
+_T = TypeVar("_T")
 
 
 def _db_path():
@@ -94,7 +106,11 @@ def _connect() -> sqlite3.Connection:
 
     path = _db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path, timeout=10)
+    conn = sqlite3.connect(path, timeout=_CONNECT_TIMEOUT_S)
+    # sqlite3.connect(timeout=...) maps to busy wait, but set the pragma
+    # explicitly so nested statements see the same bound even if a caller
+    # later changes connection defaults.
+    conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
     apply_wal_with_fallback(conn, db_label="state.db (async_delegation)")
     conn.execute(
         """CREATE TABLE IF NOT EXISTS async_delegations (
@@ -137,6 +153,40 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
+def _is_db_locked_error(exc: BaseException) -> bool:
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    msg = str(exc).lower()
+    return "locked" in msg or "busy" in msg
+
+
+def _execute_write(fn: Callable[[sqlite3.Connection], _T]) -> _T:
+    """Run a write under ``_DB_LOCK`` with jittered retry on lock contention.
+
+    *fn* receives an open connection and must perform the write; the connection
+    context manager commits on clean exit. The Python lock is released between
+    retries so competing openers can progress (same pattern as
+    ``SessionDB._execute_write``).
+    """
+    last_err: Optional[Exception] = None
+    for attempt in range(_WRITE_MAX_RETRIES):
+        try:
+            with _DB_LOCK, _connect() as conn:
+                return fn(conn)
+        except sqlite3.OperationalError as exc:
+            if _is_db_locked_error(exc):
+                last_err = exc
+                if attempt < _WRITE_MAX_RETRIES - 1:
+                    time.sleep(
+                        random.uniform(_WRITE_RETRY_MIN_S, _WRITE_RETRY_MAX_S)
+                    )
+                    continue
+            raise
+    raise last_err or sqlite3.OperationalError(
+        "database is locked after max retries"
+    )
+
+
 def _persist_dispatch(record: Dict[str, Any]) -> None:
     now = time.time()
     try:
@@ -149,7 +199,15 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
         for key in ("goal", "goals", "context", "toolsets", "role", "model", "is_batch")
         if key in record
     }
-    with _DB_LOCK, _connect() as conn:
+    payload = (
+        record["delegation_id"], record.get("session_key", ""),
+        record.get("origin_ui_session_id", ""), record.get("parent_session_id"),
+        record["dispatched_at"], now, __import__("os").getpid(),
+        owner_started_at, json.dumps(task_payload),
+        record.get("origin_session_id", ""),
+    )
+
+    def _write(conn: sqlite3.Connection) -> None:
         conn.execute(
             """INSERT OR REPLACE INTO async_delegations
                (delegation_id, origin_session, origin_ui_session_id,
@@ -157,25 +215,29 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
                 delivery_state, delivery_attempts, owner_pid,
                 owner_started_at, task_json, origin_session_id)
                VALUES (?, ?, ?, ?, 'running', ?, ?, 'pending', 0, ?, ?, ?, ?)""",
-            (record["delegation_id"], record.get("session_key", ""),
-             record.get("origin_ui_session_id", ""), record.get("parent_session_id"),
-             record["dispatched_at"], now, __import__("os").getpid(),
-             owner_started_at, json.dumps(task_payload),
-             record.get("origin_session_id", "")),
+            payload,
         )
+
+    _execute_write(_write)
     _prune_durable_records()
 
 
 def _delete_durable_delegation(delegation_id: str) -> None:
-    with _DB_LOCK, _connect() as conn:
-        conn.execute("DELETE FROM async_delegations WHERE delegation_id=?", (delegation_id,))
+    def _write(conn: sqlite3.Connection) -> None:
+        conn.execute(
+            "DELETE FROM async_delegations WHERE delegation_id=?",
+            (delegation_id,),
+        )
+
+    _execute_write(_write)
 
 
 def _prune_durable_records() -> None:
     """Bound terminal history, preferring delivered records for deletion."""
     now = time.time()
     cutoff = now - _DURABLE_RETENTION_SECONDS
-    with _DB_LOCK, _connect() as conn:
+
+    def _write(conn: sqlite3.Connection) -> None:
         conn.execute(
             "DELETE FROM async_delegations WHERE delivery_state='delivered' AND updated_at < ?",
             (cutoff,),
@@ -209,10 +271,13 @@ def _prune_durable_records() -> None:
                 (overflow,),
             )
 
+    _execute_write(_write)
+
 
 def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
     now = time.time()
-    with _DB_LOCK, _connect() as conn:
+
+    def _write(conn: sqlite3.Connection) -> None:
         conn.execute(
             """UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
                event_json=?, result_json=?, delivery_state='pending'
@@ -221,13 +286,17 @@ def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
              json.dumps(event), json.dumps(result), event["delegation_id"]),
         )
 
+    _execute_write(_write)
+
 
 def _note_delivery_attempt(delegation_id: str) -> None:
-    with _DB_LOCK, _connect() as conn:
+    def _write(conn: sqlite3.Connection) -> None:
         conn.execute(
             "UPDATE async_delegations SET delivery_attempts=delivery_attempts+1, updated_at=? WHERE delegation_id=?",
             (time.time(), delegation_id),
         )
+
+    _execute_write(_write)
 
 
 def recover_abandoned_delegations() -> int:

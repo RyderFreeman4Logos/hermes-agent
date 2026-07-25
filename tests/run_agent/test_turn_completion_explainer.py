@@ -160,6 +160,59 @@ def test_run_conversation_empty_exhausted_surfaces_explanation():
     assert result["final_response"] != "(empty)"
     assert result["final_response"].strip() != ""
     assert "No reply:" in result["final_response"]
+    assert result.get("silent_noop") is not True
+
+
+def test_idle_completion_empty_stop_is_silent_and_keeps_notification():
+    """A clean empty completion notification is durable but costs no retry turn."""
+    agent = _make_agent(max_iterations=10)
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(content="", finish_reason="stop"),
+    ]
+
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation(
+            "[IMPORTANT: Background process proc_idle completed normally]",
+            turn_origin="idle_completion",
+            allow_silent_noop=True,
+        )
+
+    assert agent.client.chat.completions.create.call_count == 1
+    assert result["final_response"] is None
+    assert result["completed"] is True
+    assert result["silent_noop"] is True
+    assert result["turn_exit_reason"] == "idle_notification_noop"
+    assert all(message.get("role") != "assistant" for message in result["messages"])
+    assert any(
+        message.get("role") == "user"
+        and "proc_idle completed normally" in str(message.get("content"))
+        for message in result["messages"]
+    )
+
+
+def test_idle_completion_timeout_or_error_is_not_silent():
+    """Transport failures keep the normal retry/failure path, never no-op."""
+    for failure in (TimeoutError("provider timed out"), RuntimeError("provider failed")):
+        agent = _make_agent(max_iterations=10)
+        with (
+            patch.object(agent, "_interruptible_api_call", side_effect=failure),
+            patch("agent.conversation_loop.time.sleep"),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(
+                "[IMPORTANT: Background process proc_failed completed]",
+                turn_origin="idle_completion",
+                allow_silent_noop=True,
+            )
+
+        assert result.get("silent_noop") is not True
+        assert result.get("error")
 
 
 def test_run_conversation_partial_stream_recovery_surfaces_explanation():
@@ -185,12 +238,17 @@ def test_run_conversation_partial_stream_recovery_surfaces_explanation():
         patch.object(agent, "_save_trajectory"),
         patch.object(agent, "_cleanup_task_resources"),
     ):
-        result = agent.run_conversation("do something")
+        result = agent.run_conversation(
+            "do something",
+            turn_origin="idle_completion",
+            allow_silent_noop=True,
+        )
 
     assert result["turn_exit_reason"] == "partial_stream_recovery"
     assert result["final_response"].startswith(recovered)
     assert "No reply:" in result["final_response"]
     assert result["response_previewed"] is False
+    assert result.get("silent_noop") is not True
 
 
 def test_run_conversation_normal_reply_stays_quiet():

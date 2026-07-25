@@ -1093,6 +1093,8 @@ def run_conversation(
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    turn_origin: str = "user",
+    allow_silent_noop: bool = False,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -1117,7 +1119,10 @@ def run_conversation(
             the message unchanged.
         persist_user_display_metadata: Optional payload for that event
             (e.g. a delegation's task count).
-                or queuing follow-up prefetch work.
+        turn_origin: Source policy for this turn. Only the explicit
+            ``idle_completion`` origin can opt into a silent noop.
+        allow_silent_noop: Allow a clean empty idle-completion response to
+            end without recovery nudges or a synthetic visible response.
 
     Returns:
         Dict: Complete conversation result with final response and message history
@@ -1218,6 +1223,7 @@ def run_conversation(
     _last_preflight_pressure: Optional[int] = None
     _preflight_compression_blocked = _ctx.preflight_compression_blocked
     _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
+    _silent_noop = False
     # Last composed answer intentionally held back by a verification gate. If
     # that continuation consumes the remaining budget, this is the best
     # user-facing result available; it must not be confused with error or
@@ -6321,6 +6327,70 @@ def run_conversation(
                 # chokepoint below, after final_msg is built, so it catches
                 # every path that reaches turn finalization, not just this one.)
                 final_response = assistant_message.content or ""
+
+                # An idle completion is information-bearing even when the
+                # model has nothing to add: its user message was appended by
+                # build_turn_context before this loop and will be persisted in
+                # the normal finalizer path.  Do not spend more provider turns
+                # manufacturing an acknowledgement, but only for the narrow,
+                # fully-normal response shape below.  Any timeout, partial
+                # stream, reasoning-only reply, tool call, or structured
+                # provider anomaly must retain the existing recovery path.
+                _silent_noop_reasoning = any(
+                    bool(getattr(assistant_message, field, None))
+                    for field in (
+                        "reasoning",
+                        "reasoning_content",
+                        "reasoning_details",
+                        "thinking",
+                    )
+                )
+                _silent_noop_streamed = (
+                    getattr(agent, "_current_streamed_assistant_text", "") or ""
+                )
+                _silent_noop_streamed_reasoning = (
+                    getattr(agent, "_current_streamed_reasoning_text", "") or ""
+                )
+                _silent_noop_response_status = getattr(response, "status", None)
+                _silent_noop_structured_abnormal = (
+                    getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID
+                    or any(
+                        bool(getattr(response, field, None))
+                        for field in (
+                            "error",
+                            "incomplete_details",
+                            "failure",
+                            "failed",
+                            "interrupted",
+                        )
+                    )
+                    or _silent_noop_response_status
+                    not in (None, "", "completed", "success", "ok")
+                    or any(
+                        bool(getattr(assistant_message, field, None))
+                        for field in ("refusal", "function_call", "audio", "annotations")
+                    )
+                )
+                _silent_noop_inline_reasoning = isinstance(final_response, str) and bool(
+                    re.search(r"<think>|<thinking>|<reasoning>", final_response, re.IGNORECASE)
+                )
+                if (
+                    turn_origin == "idle_completion"
+                    and allow_silent_noop is True
+                    and getattr(agent, "_turn_received_provider_response", False) is True
+                    and finish_reason == "stop"
+                    and not getattr(assistant_message, "tool_calls", None)
+                    and not agent._has_content_after_think_block(final_response)
+                    and not _silent_noop_reasoning
+                    and not _silent_noop_inline_reasoning
+                    and not str(_silent_noop_streamed).strip()
+                    and not str(_silent_noop_streamed_reasoning).strip()
+                    and not _silent_noop_structured_abnormal
+                ):
+                    _silent_noop = True
+                    _turn_exit_reason = "idle_notification_noop"
+                    final_response = None
+                    break
                 
                 # Fix: unmute output when entering the no-tool-call branch
                 # so the user can see empty-response warnings and recovery
@@ -7040,6 +7110,7 @@ def run_conversation(
         _turn_exit_reason=_turn_exit_reason,
         _pending_verification_response=_pending_verification_response,
         _pending_verification_response_previewed=_pending_verification_response_previewed,
+        silent_noop=_silent_noop,
     )
 
 

@@ -4217,6 +4217,7 @@ def test_notification_poller_live_loop_requeues_foreign_completion_for_owner(
     from tools.process_registry import process_registry
 
     delivered = {"a": [], "b": []}
+    turn_origins = []
     emitted = []
     session_a = _session(session_key="session-a-live-handoff")
     session_b = _session(session_key="session-b-live-handoff")
@@ -4234,8 +4235,9 @@ def test_notification_poller_live_loop_requeues_foreign_completion_for_owner(
     monkeypatch.setattr(server, "_get_db", lambda: None)
     monkeypatch.setattr(server, "_emit", lambda *args, **_kwargs: emitted.append(args))
 
-    def _deliver(_rid, sid, session, text):
+    def _deliver(_rid, sid, session, text, **kwargs):
         delivered["a" if sid == "sid-a-live-handoff" else "b"].append(text)
+        turn_origins.append(kwargs.get("turn_origin"))
         session["running"] = False
 
     monkeypatch.setattr(server, "_run_prompt_submit", _deliver)
@@ -4263,6 +4265,7 @@ def test_notification_poller_live_loop_requeues_foreign_completion_for_owner(
 
         assert len(delivered["a"]) == 1
         assert "proc-live-handoff completed normally" in delivered["a"][0]
+        assert turn_origins == ["idle_completion"]
         assert delivered["b"] == []
         assert isolated_queue.empty()
     finally:
@@ -4343,7 +4346,7 @@ def test_notification_poller_live_loop_drops_addressed_orphan(
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda _rid, _sid, _session, text: delivered.append(text),
+        lambda _rid, _sid, _session, text, **_kwargs: delivered.append(text),
     )
     server._sessions["sid-live-orphan"] = session
     process_registry._completion_consumed.discard(event["session_id"])
@@ -4384,7 +4387,7 @@ def test_notification_poller_drops_orphaned_events(monkeypatch, routing):
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda _rid, _sid, _session, text: delivered.append(text),
+        lambda _rid, _sid, _session, text, **_kwargs: delivered.append(text),
     )
     monkeypatch.setattr(server, "_get_db", lambda: None)
 
@@ -4450,7 +4453,7 @@ def test_notification_poller_delivers_owned_events(
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda _rid, _sid, _session, text: delivered.append(text),
+        lambda _rid, _sid, _session, text, **_kwargs: delivered.append(text),
     )
     monkeypatch.setattr(server, "_get_db", lambda: _CompressionDB())
 
@@ -11504,6 +11507,58 @@ def test_prompt_submit_preserves_empty_response_without_error(monkeypatch):
     assert text in {"", None}, f"expected empty text, got {text!r}"
 
 
+def test_prompt_submit_marks_idle_completion_silent_noop(monkeypatch):
+    """Idle completion no-ops must not create an assistant bubble in the TUI."""
+    calls = []
+    emitted = []
+
+    class _Agent:
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **kwargs):
+            calls.append((prompt, kwargs))
+            return {
+                "final_response": None,
+                "completed": True,
+                "silent_noop": True,
+                "messages": [
+                    *(conversation_history or []),
+                    {"role": "user", "content": prompt},
+                ],
+            }
+
+    session = _session(agent=_Agent())
+    server._sessions["sid_idle_noop"] = session
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event, sid, payload=None: emitted.append((event, sid, payload or {})),
+    )
+    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
+    monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+
+    notification = "[IMPORTANT: Background process proc_idle completed normally]"
+    try:
+        server._run_prompt_submit(
+            "idle-noop",
+            "sid_idle_noop",
+            session,
+            notification,
+            turn_origin="idle_completion",
+        )
+    finally:
+        server._sessions.pop("sid_idle_noop", None)
+
+    assert calls[0][0] == notification
+    assert calls[0][1]["turn_origin"] == "idle_completion"
+    assert calls[0][1]["allow_silent_noop"] is True
+    complete_events = [event for event in emitted if event[0] == "message.complete"]
+    assert complete_events[-1][2]["status"] == "complete"
+    assert complete_events[-1][2]["text"] is None
+    assert complete_events[-1][2]["silent"] is True
+    assert session["history"][-1] == {"role": "user", "content": notification}
+
+
 # ── active live TUI sessions ─────────────────────────────────────────
 
 
@@ -12951,11 +13006,13 @@ def test_notification_poller_delivers_completion(monkeypatch):
     from tools.process_registry import process_registry
 
     turns = []
+    turn_kwargs = []
     emitted = []
 
     class _Agent:
-        def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **kwargs):
             turns.append(prompt)
+            turn_kwargs.append(kwargs)
             return {
                 "final_response": "ok",
                 "messages": [{"role": "assistant", "content": "ok"}],
@@ -13010,6 +13067,8 @@ def test_notification_poller_delivers_completion(monkeypatch):
         # Should have triggered an agent turn
         assert len(turns) == 1
         assert "[IMPORTANT: Background process proc_poller_test completed normally" in turns[0]
+        assert turn_kwargs[0]["turn_origin"] == "idle_completion"
+        assert turn_kwargs[0]["allow_silent_noop"] is True
     finally:
         server._sessions.pop("sid_poll", None)
         while not process_registry.completion_queue.empty():
@@ -13318,6 +13377,7 @@ def test_notification_poller_retries_accepted_steer_when_idle(monkeypatch):
     assert len(submitted) == 1
     assert submitted[0][0][1] == "sid_steer_retry"
     assert submitted[0][0][3] == "child completed"
+    assert submitted[0][1]["turn_origin"] == "idle_completion"
 
 
 def test_session_save_writes_under_hermes_home_with_system_prompt(monkeypatch, tmp_path):
@@ -13428,10 +13488,12 @@ def test_notification_poller_emits_distinct_watch_matches_once(monkeypatch):
     from tools.process_registry import process_registry
 
     turns = []
+    turn_origins = []
     emitted = []
 
-    def _fake_run_prompt_submit(rid, sid, session, text):
+    def _fake_run_prompt_submit(rid, sid, session, text, **kwargs):
         turns.append(text)
+        turn_origins.append(kwargs.get("turn_origin"))
         with session["history_lock"]:
             session["running"] = False
 
@@ -13466,6 +13528,7 @@ def test_notification_poller_emits_distinct_watch_matches_once(monkeypatch):
         assert "READY on port 8000" in status_text
         assert "READY on port 9000" in status_text
         assert len(turns) == 3
+        assert turn_origins == ["idle_completion"] * 3
     finally:
         server._sessions.pop("sid_watch_dedup", None)
         while not process_registry.completion_queue.empty():

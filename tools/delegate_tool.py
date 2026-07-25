@@ -3174,11 +3174,40 @@ def delegate_task(
         # durable consumer. An explicit force_background guarantee instead
         # rejects before starting work: executing inline would block the
         # orchestrator/main-agent turn and violate the advertised contract.
+        _async_capability_error = ""
         try:
             from gateway.session_context import async_delivery_supported
             _async_ok = async_delivery_supported()
-        except Exception:
-            _async_ok = True
+        except Exception as exc:
+            # force_background advertises a non-blocking guarantee. A broken
+            # capability probe cannot establish that guarantee, so reject it
+            # rather than silently treating the unknown route as supported.
+            _async_ok = False
+            _async_capability_error = f"{type(exc).__name__}: {exc}"
+            logger.warning(
+                "delegate_task could not verify async delivery capability: %s",
+                _async_capability_error,
+            )
+
+        if force_background and _async_capability_error:
+            return json.dumps(
+                {
+                    "status": "rejected",
+                    "mode": "background",
+                    "error": (
+                        "delegation.force_background=true requires a durable async "
+                        "completion route, but its capability could not be verified "
+                        f"({_async_capability_error})."
+                    ),
+                    "note": (
+                        "The child was not started, so the orchestrator/main agent "
+                        "remains free. Retry after the async delivery capability check "
+                        "succeeds or disable delegation.force_background for the "
+                        "historical synchronous fallback."
+                    ),
+                },
+                ensure_ascii=False,
+            )
 
         _wake_sid = ""
         if not _async_ok:

@@ -133,6 +133,55 @@ def test_forced_orchestrator_rejects_when_async_delivery_is_unsupported(
     run_child.assert_not_called()
 
 
+def test_forced_orchestrator_rejects_when_async_capability_check_fails(
+    tmp_path, monkeypatch
+) -> None:
+    """A force guarantee fails closed when its async route check cannot run."""
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    config_path = hermes_home / "config.yaml"
+    _write_force_background_config(config_path, enabled=True)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    agent = cast(Any, object.__new__(AIAgent))
+    agent._delegate_depth = 1
+    agent.session_id = "orchestrator-session"
+    child = SimpleNamespace(_delegate_role="leaf", tool_progress_callback=None)
+    credentials = {
+        "model": "test-model",
+        "provider": None,
+        "base_url": None,
+        "api_key": None,
+        "api_mode": None,
+        "command": None,
+        "args": None,
+    }
+
+    with (
+        patch("tools.delegate_tool._build_child_agent", return_value=child),
+        patch("tools.delegate_tool._resolve_delegation_credentials", return_value=credentials),
+        patch("tools.delegate_tool._run_single_child") as run_child,
+        patch(
+            "gateway.session_context.async_delivery_supported",
+            side_effect=RuntimeError("capability probe failed"),
+        ) as async_delivery_supported,
+        patch(
+            "tools.async_delegation.dispatch_async_delegation_batch",
+            return_value={"status": "dispatched", "delegation_id": "must-not-dispatch"},
+        ) as dispatch_async,
+    ):
+        result = json.loads(agent._dispatch_delegate_task({"goal": "complete this"}))
+
+    assert result["status"] == "rejected"
+    assert result["mode"] == "background"
+    assert "could not be verified" in result["error"]
+    assert "RuntimeError: capability probe failed" in result["error"]
+    assert "not started" in result["note"]
+    async_delivery_supported.assert_called_once()
+    dispatch_async.assert_not_called()
+    run_child.assert_not_called()
+
+
 def test_forced_orchestrator_rejects_when_async_pool_is_full(tmp_path, monkeypatch) -> None:
     """Capacity rejection is non-blocking under the explicit force guarantee."""
     hermes_home = tmp_path / "hermes-home"

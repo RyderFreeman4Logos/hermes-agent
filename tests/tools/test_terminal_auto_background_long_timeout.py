@@ -184,6 +184,19 @@ class TestAutoBackgroundLongTimeout:
         mock_registry.wait.assert_not_called()
         assert result.get("output") != "completed output"
 
+    def test_auto_promoted_pure_watchdog_forces_notify_false(self):
+        """Watchdog suppression runs after timeout promotion resolves background mode."""
+        result, mock_proc, mock_env, mock_registry = _run_promoted(
+            "sleep $CHECKIN; echo HEARTBEAT",
+            timeout=201,
+        )
+
+        assert result.get("session_id") == mock_proc.id
+        assert result.get("notify_on_complete") is not True
+        assert mock_proc.notify_on_complete is False
+        mock_registry.wait.assert_not_called()
+        mock_env.execute.assert_not_called()
+
     def test_timeout_201_rewrites_budget_to_auto_background_timeout_not_default_timeout(self):
         """Promotion rewrites process budget to auto_background_timeout, returns handle."""
         result, mock_proc, mock_env, mock_registry = _run_promoted(

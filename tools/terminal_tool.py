@@ -2310,14 +2310,6 @@ def terminal_tool(
                 "status": "error",
             }, ensure_ascii=False)
 
-        # Resolver-only and TTL-heartbeat commands create no task progress.
-        # Their completion notification can make a model immediately re-run the
-        # resolver, so force them detached even when the model requests notify.
-        watchdog_notify_suppressed = background and _is_pure_watchdog_command(command)
-        if watchdog_notify_suppressed:
-            notify_on_complete = False
-            watch_patterns = None
-
         # Get configuration
         config = _get_env_config()
         env_type = config["env_type"]
@@ -2441,6 +2433,17 @@ def terminal_tool(
             and not watch_patterns
         ):
             notify_on_complete = True
+
+        # Resolver-only and TTL-heartbeat commands create no task progress.
+        # Determine this after timeout promotion has resolved the final mode:
+        # an omitted background value can become True above the promotion
+        # threshold. Their completion notification can make a model immediately
+        # re-run the resolver, so force them detached even when the model
+        # explicitly requests notification.
+        watchdog_notify_suppressed = bool(background) and _is_pure_watchdog_command(command)
+        if watchdog_notify_suppressed:
+            notify_on_complete = False
+            watch_patterns = None
 
         # Auto-promotion keeps the process as managed background so the user can
         # steer without killing it. The tool call itself must return immediately

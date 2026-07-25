@@ -3110,6 +3110,7 @@ class AIAgent:
         """
         if not text or not text.strip():
             return False
+        self._reset_wd_resolver_loop_state()
         cleaned = text.strip()
         _lock = getattr(self, "_pending_steer_lock", None)
         if _lock is None:
@@ -4354,6 +4355,82 @@ class AIAgent:
         Mutates entries in place and returns the same list.
         """
         return _sanitize_uniquify_tool_call_ids(tool_calls)
+
+    @staticmethod
+    def _resolve_checkin_fingerprint(
+        function_name: str, function_args: Any
+    ) -> Optional[str]:
+        if function_name != "terminal" or not isinstance(function_args, dict):
+            return None
+        command = function_args.get("command")
+        if not isinstance(command, str) or not re.search(
+            r"\bresolve-checkin(?:\.sh)?\b", command, re.IGNORECASE
+        ):
+            return None
+        return "resolve-checkin"
+
+    @staticmethod
+    def _extract_resolved_checkin(result: Any) -> Optional[str]:
+        text = (
+            json.dumps(result, ensure_ascii=False, sort_keys=True)
+            if isinstance(result, (dict, list))
+            else str(result or "")
+        )
+        match = re.search(r"\bCHECKIN\s*=\s*(\d+)\b", text, re.IGNORECASE)
+        return match.group(1) if match else None
+
+    def _reset_wd_resolver_loop_state(self) -> None:
+        self._wd_resolver_loop_state = None
+
+    def _wd_resolver_loop_break_result(
+        self, function_name: str, function_args: Any
+    ) -> Optional[str]:
+        fingerprint = self._resolve_checkin_fingerprint(
+            function_name, function_args
+        )
+        state = getattr(self, "_wd_resolver_loop_state", None)
+        if (
+            not fingerprint
+            or not isinstance(state, dict)
+            or state.get("fingerprint") != fingerprint
+            or state.get("count", 0) < 2
+            or not state.get("checkin")
+        ):
+            return None
+        checkin = state["checkin"]
+        logger.warning(
+            "Stopped repeated resolve-checkin call in session %s",
+            getattr(self, "session_id", ""),
+        )
+        return (
+            f"Watchdog resolver loop stopped: interval already resolved "
+            f"(CHECKIN={checkin}). DO NOT call resolve-checkin again. Wait for "
+            "authoritative completion or use the built-in runtime heartbeat."
+        )
+
+    def _record_wd_resolver_tool_result(
+        self, function_name: str, function_args: Any, result: Any
+    ) -> None:
+        fingerprint = self._resolve_checkin_fingerprint(
+            function_name, function_args
+        )
+        checkin = self._extract_resolved_checkin(result) if fingerprint else None
+        if not checkin:
+            self._reset_wd_resolver_loop_state()
+            return
+        state = getattr(self, "_wd_resolver_loop_state", None)
+        if (
+            isinstance(state, dict)
+            and state.get("fingerprint") == fingerprint
+            and state.get("checkin") == checkin
+        ):
+            state["count"] = int(state.get("count", 0)) + 1
+            return
+        self._wd_resolver_loop_state = {
+            "fingerprint": fingerprint,
+            "checkin": checkin,
+            "count": 1,
+        }
 
     def _repair_tool_call(self, tool_name: str) -> str | None:
         """Forwarder — see ``agent.agent_runtime_helpers.repair_tool_call``."""

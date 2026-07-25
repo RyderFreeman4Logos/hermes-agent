@@ -1487,6 +1487,9 @@ def init_agent(
     
     # Track conversation messages for session logging
     agent._session_messages: List[Dict[str, Any]] = []
+    # Narrow, in-memory state for the resolve-checkin idle-spin breaker.
+    # A new user turn, steer, or real tool progress clears this state.
+    agent._wd_resolver_loop_state = None
     # Responses encrypted reasoning replay state.  Some OpenAI-compatible
     # routes accept GPT-5 Responses requests but later reject replayed
     # encrypted reasoning blobs (HTTP 400 ``invalid_encrypted_content``).

@@ -1409,11 +1409,29 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             pass
 
         middleware_trace: list[dict[str, Any]] = []
-        _execution_blocked = False
+        _wd_loop_break_result = agent._wd_resolver_loop_break_result(
+            function_name, function_args
+        )
+        _execution_blocked = _wd_loop_break_result is not None
 
         tool_start_time = time.time()
 
-        if function_name == "todo":
+        if _wd_loop_break_result is not None:
+            function_result = _wd_loop_break_result
+            tool_duration = 0.0
+            _emit_terminal_post_tool_call(
+                agent,
+                function_name=function_name,
+                function_args=function_args,
+                result=function_result,
+                effective_task_id=effective_task_id,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+                status="suppressed",
+                error_type="wd_idle_loop",
+                error_message="Repeated resolve-checkin call suppressed",
+                middleware_trace=[],
+            )
+        elif function_name == "todo":
             def _execute(next_args: dict) -> Any:
                 from tools.todo_tool import todo_tool as _todo_tool
                 return _todo_tool(
@@ -1836,6 +1854,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 middleware_trace=list(middleware_trace),
             )
         if not _execution_blocked:
+            try:
+                agent._record_wd_resolver_tool_result(
+                    function_name, function_args, function_result
+                )
+            except Exception as exc:
+                logging.debug("WD resolver loop state update failed: %s", exc)
             function_result = agent._append_guardrail_observation(
                 function_name,
                 function_args,

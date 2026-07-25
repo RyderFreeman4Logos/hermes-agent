@@ -518,6 +518,71 @@ def test_durable_delivery_claim_is_exclusive_and_retryable(tmp_path, monkeypatch
     assert ad.get_durable_delegation("deleg_claim")["delivery_state"] == "delivered"
 
 
+def test_busy_steer_release_does_not_consume_delivery_attempt_budget(tmp_path, monkeypatch):
+    """A buffered steer leaves the final normal delivery retry available."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    delegation_id = "deleg_steer_budget"
+    ad._persist_dispatch({
+        "delegation_id": delegation_id,
+        "session_key": "owner",
+        "origin_ui_session_id": "",
+        "parent_session_id": None,
+        "dispatched_at": 1.0,
+    })
+    ad._persist_completion(
+        {"delegation_id": delegation_id, "status": "completed", "completed_at": 2.0},
+        {"status": "completed", "summary": "done"},
+    )
+
+    # Seven ordinary failed deliveries consume seven attempts.
+    for attempt in range(ad._MAX_DELIVERY_ATTEMPTS - 1):
+        claim_id = f"normal-{attempt}"
+        assert ad.claim_completion_delivery(delegation_id, claim_id)
+        assert ad.release_completion_delivery(delegation_id, claim_id)
+
+    # The eighth claim is only a busy-steer hint, so releasing it must restore
+    # the count instead of terminally dropping the durable event.
+    assert ad.claim_completion_delivery(delegation_id, "steer")
+    assert ad.release_completion_delivery(
+        delegation_id, "steer", consume_attempt=False
+    )
+    pending = ad.get_durable_delegation(delegation_id)
+    assert pending["delivery_state"] == "pending"
+    assert pending["delivery_attempts"] == ad._MAX_DELIVERY_ATTEMPTS - 1
+
+    # An idle drain can still claim and complete the retained event.
+    assert ad.claim_completion_delivery(delegation_id, "idle-drain")
+    assert ad.complete_completion_delivery(delegation_id, "idle-drain")
+    assert ad.get_durable_delegation(delegation_id)["delivery_state"] == "delivered"
+
+
+def test_normal_delivery_releases_still_drop_at_attempt_budget(tmp_path, monkeypatch):
+    """The non-steer retry cap remains terminal after eight failures."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    delegation_id = "deleg_normal_budget"
+    ad._persist_dispatch({
+        "delegation_id": delegation_id,
+        "session_key": "owner",
+        "origin_ui_session_id": "",
+        "parent_session_id": None,
+        "dispatched_at": 1.0,
+    })
+    ad._persist_completion(
+        {"delegation_id": delegation_id, "status": "completed", "completed_at": 2.0},
+        {"status": "completed", "summary": "done"},
+    )
+
+    for attempt in range(ad._MAX_DELIVERY_ATTEMPTS):
+        claim_id = f"normal-{attempt}"
+        assert ad.claim_completion_delivery(delegation_id, claim_id)
+        assert ad.release_completion_delivery(delegation_id, claim_id)
+
+    dropped = ad.get_durable_delegation(delegation_id)
+    assert dropped["delivery_state"] == "dropped"
+    assert dropped["delivery_attempts"] == ad._MAX_DELIVERY_ATTEMPTS
+    assert not ad.claim_completion_delivery(delegation_id, "idle-drain")
+
+
 # ---------------------------------------------------------------------------
 # Integration: delegate_task(background=True) routing
 # ---------------------------------------------------------------------------

@@ -11280,7 +11280,7 @@ def _try_steer_busy_notification(session: dict, evt: dict, text: str) -> str | b
     except Exception:
         accepted = False
     if not accepted:
-        release_event_delivery(evt, claim)
+        release_event_delivery(evt, claim, consume_attempt=False)
         return False
 
     with session["history_lock"]:
@@ -11289,7 +11289,7 @@ def _try_steer_busy_notification(session: dict, evt: dict, text: str) -> str | b
         # steer() only appends to the agent's pending-steer buffer. The turn may
         # end before consuming that buffer, so leave the durable completion
         # pending for a later idle drain instead of marking it delivered here.
-        release_event_delivery(evt, claim)
+        release_event_delivery(evt, claim, consume_attempt=False)
     except Exception as exc:
         logger.warning(
             "TUI busy-steer completion claim release failed: %s: %s",

@@ -12132,6 +12132,47 @@ def test_notification_poller_steers_busy_completion_when_enabled(monkeypatch, sh
             process_registry.completion_queue.get_nowait()
 
 
+def test_busy_steer_acceptance_releases_durable_claim_for_idle_retry(monkeypatch):
+    """Buffering a steer is not proof that the model consumed the completion."""
+    import tools.async_delegation as async_delegation
+
+    delivery = {"held": False, "delivered": False}
+    released = []
+    completed = []
+
+    def claim(evt, consumer):
+        if delivery["held"] or delivery["delivered"]:
+            return None
+        delivery["held"] = True
+        return f"claim-{consumer}"
+
+    def release(evt, token):
+        assert token == "claim-tui-poller-steer"
+        delivery["held"] = False
+        released.append((evt, token))
+
+    def complete(evt, token):
+        delivery["held"] = False
+        delivery["delivered"] = True
+        completed.append((evt, token))
+
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+    monkeypatch.setattr(async_delegation, "claim_event_delivery", claim)
+    monkeypatch.setattr(async_delegation, "release_event_delivery", release)
+    monkeypatch.setattr(async_delegation, "complete_event_delivery", complete)
+
+    evt = {"type": "async_delegation", "delegation_id": "delegation-steer-retry"}
+    session = _session(
+        agent=types.SimpleNamespace(steer=lambda text: True),
+        running=True,
+    )
+
+    assert server._try_steer_busy_notification(session, evt, "child completed") is True
+    assert released == [(evt, "claim-tui-poller-steer")]
+    assert completed == []
+    assert async_delegation.claim_event_delivery(evt, "tui-idle-drain") == "claim-tui-idle-drain"
+
+
 def test_session_save_writes_under_hermes_home_with_system_prompt(monkeypatch, tmp_path):
     """TUI /save (session.save RPC) must snapshot under the Hermes profile
     home — not the project/workspace CWD — and include the system prompt,

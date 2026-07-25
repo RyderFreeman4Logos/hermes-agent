@@ -922,6 +922,13 @@ def run_conversation(
         except Exception:
             pass
 
+    # A new user turn is an intervening message, not another iteration of a
+    # prior watchdog resolver loop.
+    try:
+        agent._reset_wd_resolver_loop_state()
+    except Exception:
+        pass
+
     # The gateway caches agents across user turns.  Compression state is
     # per-turn: carrying a prior in-place boundary forward would make a later
     # uncompressed result look like a compacted transcript to gateway writers.

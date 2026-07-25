@@ -547,6 +547,67 @@ assert ad.mark_completion_delivered({delegation_id!r})
     assert probe.stdout.strip().splitlines()[-1] == "0"
 
 
+def test_busy_steer_release_does_not_consume_delivery_attempt_budget(tmp_path, monkeypatch):
+    """A buffered steer leaves the final normal delivery retry available."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    delegation_id = "deleg_steer_budget"
+    ad._persist_dispatch({
+        "delegation_id": delegation_id,
+        "session_key": "owner",
+        "origin_ui_session_id": "",
+        "parent_session_id": None,
+        "dispatched_at": 1.0,
+    })
+    ad._persist_completion(
+        {"delegation_id": delegation_id, "status": "completed", "completed_at": 2.0},
+        {"status": "completed", "summary": "done"},
+    )
+
+    for attempt in range(ad._MAX_DELIVERY_ATTEMPTS - 1):
+        claim_id = f"normal-{attempt}"
+        assert ad.claim_completion_delivery(delegation_id, claim_id)
+        assert ad.release_completion_delivery(delegation_id, claim_id)
+
+    assert ad.claim_completion_delivery(delegation_id, "steer")
+    assert ad.release_completion_delivery(
+        delegation_id, "steer", consume_attempt=False
+    )
+    pending = ad.get_durable_delegation(delegation_id)
+    assert pending["delivery_state"] == "pending"
+    assert pending["delivery_attempts"] == ad._MAX_DELIVERY_ATTEMPTS - 1
+
+    assert ad.claim_completion_delivery(delegation_id, "idle-drain")
+    assert ad.complete_completion_delivery(delegation_id, "idle-drain")
+    assert ad.get_durable_delegation(delegation_id)["delivery_state"] == "delivered"
+
+
+def test_normal_delivery_releases_still_drop_at_attempt_budget(tmp_path, monkeypatch):
+    """The normal retry cap remains terminal after repeated failures."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    delegation_id = "deleg_normal_budget"
+    ad._persist_dispatch({
+        "delegation_id": delegation_id,
+        "session_key": "owner",
+        "origin_ui_session_id": "",
+        "parent_session_id": None,
+        "dispatched_at": 1.0,
+    })
+    ad._persist_completion(
+        {"delegation_id": delegation_id, "status": "completed", "completed_at": 2.0},
+        {"status": "completed", "summary": "done"},
+    )
+
+    for attempt in range(ad._MAX_DELIVERY_ATTEMPTS):
+        claim_id = f"normal-{attempt}"
+        assert ad.claim_completion_delivery(delegation_id, claim_id)
+        assert ad.release_completion_delivery(delegation_id, claim_id)
+
+    dropped = ad.get_durable_delegation(delegation_id)
+    assert dropped["delivery_state"] == "dropped"
+    assert dropped["delivery_attempts"] == ad._MAX_DELIVERY_ATTEMPTS
+    assert not ad.claim_completion_delivery(delegation_id, "idle-drain")
+
+
 # ---------------------------------------------------------------------------
 # Integration: delegate_task(background=True) routing
 # ---------------------------------------------------------------------------
@@ -752,4 +813,3 @@ def test_gateway_cli_origin_event_left_unrouted():
     evt = _make_async_evt(session_key="")
     runner._enrich_async_delegation_routing(evt)
     assert "platform" not in evt
-

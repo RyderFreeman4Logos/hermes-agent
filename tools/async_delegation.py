@@ -411,18 +411,31 @@ def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
     return claim_id if claim_completion_delivery(delegation_id, claim_id) else None
 
 
-def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
+def release_completion_delivery(
+    delegation_id: str, claim_id: str, consume_attempt: bool = True
+) -> bool:
     """Release a failed delivery claim so another consumer may retry.
 
-    Attempts are counted at claim time, so a row that keeps being claimed and
-    released has burned real delivery attempts. Once the budget is exhausted
-    the row converges to a terminal ``dropped`` state instead of returning to
-    ``pending`` — otherwise an undeliverable completion replays on every
-    gateway restart forever (restore_undelivered_completions only restores
-    pending rows).
+    Attempts are counted at claim time. The default release therefore keeps a
+    claim's count and terminally drops a row once the retry budget is exhausted.
+    A best-effort busy-steer is only a hint, not a delivery attempt: callers
+    can set ``consume_attempt=False`` to atomically release its claim and roll
+    back the increment without allowing the count to fall below zero.
     """
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
+        if not consume_attempt:
+            cur = conn.execute(
+                """UPDATE async_delegations SET delivery_claim=NULL,
+                          delivery_claimed_at=NULL,
+                          delivery_attempts=CASE WHEN delivery_attempts > 0
+                              THEN delivery_attempts - 1 ELSE 0 END,
+                          updated_at=?
+                   WHERE delegation_id=? AND delivery_state='pending'
+                     AND delivery_claim=?""",
+                (now, delegation_id, claim_id),
+            )
+            return cur.rowcount == 1
         capped = conn.execute(
             """UPDATE async_delegations SET delivery_state='dropped',
                       delivery_claim=NULL, delivery_claimed_at=NULL, updated_at=?
@@ -489,9 +502,15 @@ def complete_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
         complete_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
 
 
-def release_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
+def release_event_delivery(
+    evt: Dict[str, Any], claim_id: str, consume_attempt: bool = True
+) -> None:
     if claim_id and evt.get("type") == "async_delegation":
-        release_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
+        release_completion_delivery(
+            str(evt.get("delegation_id") or ""),
+            claim_id,
+            consume_attempt=consume_attempt,
+        )
 
 
 def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:

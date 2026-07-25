@@ -13192,8 +13192,9 @@ def test_busy_steer_acceptance_releases_durable_claim_for_idle_retry(monkeypatch
         delivery["held"] = True
         return f"claim-{consumer}"
 
-    def release(evt, token):
+    def release(evt, token, *, consume_attempt=True):
         assert token == "claim-tui-poller-steer"
+        assert consume_attempt is False
         delivery["held"] = False
         released.append((evt, token))
 
@@ -13269,9 +13270,10 @@ def test_notification_poller_retries_accepted_steer_when_idle(monkeypatch):
         claims.append(consumer)
         return f"claim-{consumer}"
 
-    def release(evt, token):
+    def release(evt, token, *, consume_attempt=True):
         assert evt is event
         assert token == "claim-tui-poller-steer"
+        assert consume_attempt is False
         delivery["held"] = False
         releases.append(token)
 

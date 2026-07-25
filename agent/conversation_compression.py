@@ -34,6 +34,7 @@ import json
 import logging
 import math
 import os
+import random
 import tempfile
 import time
 import uuid
@@ -390,6 +391,73 @@ def compression_skipped_due_to_lock(agent: Any) -> bool:
     """
     _sig = getattr(agent, "_compression_skipped_due_to_lock", None)
     return _sig is True or isinstance(_sig, str)
+
+
+_COMPRESSION_LOCK_ACQUIRE_MAX_ATTEMPTS = 9
+_COMPRESSION_LOCK_ACQUIRE_RETRY_BUDGET_SECONDS = 2.0
+_COMPRESSION_LOCK_ACQUIRE_MIN_JITTER_SECONDS = 0.020
+_COMPRESSION_LOCK_ACQUIRE_MAX_JITTER_SECONDS = 0.150
+
+
+def _try_acquire_compression_lock_with_retry(
+    session_db: Any,
+    session_id: str,
+    holder: str,
+    *,
+    ttl_seconds: float,
+    max_attempts: int = _COMPRESSION_LOCK_ACQUIRE_MAX_ATTEMPTS,
+    retry_budget_seconds: float = _COMPRESSION_LOCK_ACQUIRE_RETRY_BUDGET_SECONDS,
+    sleep: Any = time.sleep,
+    jitter: Any = random.uniform,
+    clock: Any = time.monotonic,
+) -> Tuple[bool, Optional[str]]:
+    """Acquire a compression lease, retrying only an unconfirmed SQLite busy.
+
+    ``try_acquire_compression_lock`` intentionally returns ``False`` both for
+    a live owner and for its internally handled ``sqlite3.Error`` path.  Read
+    the holder after every failed attempt: a non-empty string is a confirmed
+    competing compressor and must return immediately; an absent/unconfirmed
+    holder is treated as transient writer contention and gets short jittered
+    retries.  The deadline bounds the total retry sleep even if callers change
+    the attempt count in tests or future tuning.
+    """
+    deadline = clock() + max(0.0, retry_budget_seconds)
+    get_holder = getattr(session_db, "get_compression_lock_holder", None)
+
+    for attempt in range(max(1, max_attempts)):
+        if session_db.try_acquire_compression_lock(
+            session_id, holder, ttl_seconds=ttl_seconds
+        ):
+            return True, None
+
+        existing = None
+        if callable(get_holder):
+            try:
+                existing = get_holder(session_id)
+            except Exception:
+                # The acquire failure is already fail-closed.  An unavailable
+                # holder lookup cannot confirm a live owner, so use the bounded
+                # busy retry rather than incorrectly reporting "in progress".
+                existing = None
+        if isinstance(existing, str) and existing.strip():
+            return False, existing
+
+        if attempt + 1 >= max(1, max_attempts):
+            break
+        remaining = deadline - clock()
+        if remaining <= 0:
+            break
+        delay = min(
+            max(0.0, jitter(
+                _COMPRESSION_LOCK_ACQUIRE_MIN_JITTER_SECONDS,
+                _COMPRESSION_LOCK_ACQUIRE_MAX_JITTER_SECONDS,
+            )),
+            remaining,
+        )
+        if delay > 0:
+            sleep(delay)
+
+    return False, None
 
 
 def _adopt_live_compression_child(
@@ -1504,6 +1572,7 @@ def compress_context(
     _lock_refresher: Optional[_CompressionLockLeaseRefresher] = None
     if _lock_db is not None and _lock_sid:
         _lock_holder = _compression_lock_holder(agent)
+        _live_lock_holder: Optional[str] = None
         if _lock_lookup_error is not None:
             # Attribute lookup itself failed for a reason other than a missing
             # lock API. It is unsafe to proceed without a lock in that case.
@@ -1531,8 +1600,13 @@ def compress_context(
             _lock_acquired = True  # acquired-but-unlocked compatibility path
         else:
             try:
-                _lock_acquired = _try_acquire_lock(
-                    _lock_sid, _lock_holder, ttl_seconds=_lock_ttl
+                _lock_acquired, _live_lock_holder = (
+                    _try_acquire_compression_lock_with_retry(
+                        _lock_db,
+                        _lock_sid,
+                        _lock_holder,
+                        ttl_seconds=_lock_ttl,
+                    )
                 )
             except Exception as _lock_err:
                 # The method exists and entered its implementation but failed.
@@ -1557,15 +1631,20 @@ def compress_context(
                 )
                 _lock_acquired = False
         if not _lock_acquired:
-            try:
-                existing = _lock_db.get_compression_lock_holder(_lock_sid)
-            except Exception:
-                existing = None
-            logger.warning(
-                "compression skipped: another path is compressing session=%s "
-                "(holder=%s) — returning messages unchanged to avoid session fork",
-                _lock_sid, existing,
-            )
+            existing = _live_lock_holder
+            if existing:
+                logger.warning(
+                    "compression skipped: another path is compressing session=%s "
+                    "(holder=%s) — returning messages unchanged to avoid session fork",
+                    _lock_sid,
+                    existing,
+                )
+            else:
+                logger.warning(
+                    "compression skipped: database busy while acquiring lock for "
+                    "session=%s after jittered retries",
+                    _lock_sid,
+                )
             _lock_holder = None  # don't release a lock we don't own
             # Signal to callers that this no-op is due to a concurrent lock,
             # not a genuine "nothing to compress" or aux-model failure.
@@ -1576,11 +1655,14 @@ def compress_context(
             if getattr(agent, "_last_compression_lock_warning_sid", None) != _lock_sid:
                 agent._last_compression_lock_warning_sid = _lock_sid
                 try:
-                    agent._emit_warning(
-                        "⚠ Skipping concurrent compression — another path "
-                        "is already compressing this session. Will retry "
-                        "after it finishes."
+                    warning = (
+                        "⚠ Skipping concurrent compression — another path is "
+                        "already compressing this session. Will retry after it "
+                        "finishes."
+                        if existing
+                        else "⚠ Compression skipped: database busy; try again."
                     )
+                    agent._emit_warning(warning)
                 except Exception:
                     pass
             _existing_sp = getattr(agent, "_cached_system_prompt", None)

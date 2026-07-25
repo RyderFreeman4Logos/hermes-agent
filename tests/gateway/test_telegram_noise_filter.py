@@ -92,11 +92,7 @@ VISIBLE_COMPRESSION_MESSAGES = [
         "(holder: pid=12345:tid=7:agent=1:nonce=ab). Please wait for it to "
         "finish."
     ),
-    (
-        "⏳ Compression skipped: could not acquire this session's "
-        "compression lock. Another compression may still be running, or "
-        "the lock check failed — try again shortly."
-    ),
+    "⏳ Compression skipped: database busy, try again",
     # Blocked-overflow warning (#62625/#62708): the context is over the
     # compression threshold but compression is blocked (summary-LLM cooldown
     # or the anti-thrash breaker). FAILURE-CLASS — must reach chat users so

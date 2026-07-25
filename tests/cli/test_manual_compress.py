@@ -313,8 +313,7 @@ def test_manual_compress_shows_lock_skip_without_confirmed_holder(capsys):
         shell._manual_compress()
 
     output = capsys.readouterr().out
-    assert "Compression skipped" in output
-    assert "could not acquire" in output
+    assert "⏳ Compression skipped: database busy, try again" in output
     # No confirmed holder → must not assert one is running.
     assert "already in progress" not in output
     assert "No changes from compression" not in output

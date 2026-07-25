@@ -284,6 +284,8 @@ export interface SessionCompressResponse {
   before_messages?: number
   before_tokens?: number
   info?: SessionInfo
+  lock_held?: boolean
+  message?: string
   messages?: GatewayTranscriptMessage[]
   removed?: number
   summary?: {

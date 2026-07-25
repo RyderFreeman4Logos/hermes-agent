@@ -30,11 +30,7 @@ def describe_compression_lock_skip(lock_signal: Any) -> str:
             f"⏳ Compression already in progress for this session "
             f"(holder: {holder}). Please wait for it to finish."
         )
-    return (
-        "⏳ Compression skipped: could not acquire this session's "
-        "compression lock. Another compression may still be running, or "
-        "the lock check failed — try again shortly."
-    )
+    return "⏳ Compression skipped: database busy, try again"
 
 
 def summarize_manual_compression(

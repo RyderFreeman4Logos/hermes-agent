@@ -11473,9 +11473,12 @@ def _notification_poller_loop(
                     text,
                     display_kind="async_delegation_complete",
                     display_metadata=_async_delegation_display_metadata(evt),
+                    turn_origin="idle_completion",
                 )
             else:
-                _run_prompt_submit(rid, sid, session, text)
+                _run_prompt_submit(
+                    rid, sid, session, text, turn_origin="idle_completion"
+                )
             complete_event_delivery(evt, _claim)
         except Exception as exc:
             release_event_delivery(evt, _claim)
@@ -11563,9 +11566,12 @@ def _notification_poller_loop(
                     text,
                     display_kind="async_delegation_complete",
                     display_metadata=_async_delegation_display_metadata(evt),
+                    turn_origin="idle_completion",
                 )
             else:
-                _run_prompt_submit(rid, sid, session, text)
+                _run_prompt_submit(
+                    rid, sid, session, text, turn_origin="idle_completion"
+                )
             complete_event_delivery(evt, _claim)
         except Exception as exc:
             release_event_delivery(evt, _claim)
@@ -11693,6 +11699,7 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
 def _run_prompt_submit(
     rid, sid: str, session: dict, text: Any, *, display_kind: str | None = None,
     display_metadata: dict | None = None,
+    turn_origin: str | None = None,
 ) -> None:
     with session["history_lock"]:
         history = list(session["history"])
@@ -11909,6 +11916,9 @@ def _run_prompt_submit(
                     _build_persist_user_message(prompt, images, run_message) if images else prompt
                 ),
             }
+            if turn_origin is not None:
+                run_kwargs["turn_origin"] = turn_origin
+                run_kwargs["allow_silent_noop"] = turn_origin == "idle_completion"
             try:
                 if "task_id" in inspect.signature(agent.run_conversation).parameters:
                     run_kwargs["task_id"] = session["session_key"]
@@ -12043,6 +12053,8 @@ def _run_prompt_submit(
                 status = "complete"
 
             payload = {"text": raw, "usage": _get_usage(agent), "status": status}
+            if isinstance(result, dict) and result.get("silent_noop") is True:
+                payload["silent"] = True
             if last_reasoning:
                 payload["reasoning"] = last_reasoning
             if status_note:
@@ -12353,7 +12365,9 @@ def _run_prompt_submit(
                     continue
                 try:
                     _emit("message.start", sid)
-                    _run_prompt_submit(rid, sid, session, synth)
+                    _run_prompt_submit(
+                        rid, sid, session, synth, turn_origin="idle_completion"
+                    )
                     complete_event_delivery(_evt, _claim)
                 except Exception as _n_exc:
                     release_event_delivery(_evt, _claim)

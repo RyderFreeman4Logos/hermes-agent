@@ -6804,6 +6804,8 @@ class AIAgent:
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         moa_config: Optional[dict[str, Any]] = None,
+        turn_origin: str = "user",
+        allow_silent_noop: bool = False,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         from agent.aux_accounting import (
@@ -6868,6 +6870,8 @@ class AIAgent:
                     persist_user_message,
                     persist_user_timestamp=persist_user_timestamp,
                     moa_config=moa_config,
+                    turn_origin=turn_origin,
+                    allow_silent_noop=allow_silent_noop,
                 )
             finally:
                 reset_current_provider(heartbeat_token)

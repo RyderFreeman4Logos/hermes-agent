@@ -102,3 +102,19 @@ def test_real_terminal_progress_resets_resolve_checkin_loop_state(agent):
             )
 
     assert calls == [resolver, resolver, "echo progress", resolver]
+
+
+def test_resolve_checkin_fingerprint_includes_normalized_command_arguments():
+    """Resolvers for different targets must not share one idle-spin streak."""
+    first = "/skills/watchdog/resolve-checkin.sh --target worker-a --pid 101"
+    equivalent_spacing = "  /skills/watchdog/resolve-checkin.sh   --target worker-a --pid 101  "
+    second = "/skills/watchdog/resolve-checkin.sh --target worker-b --pid 202"
+    fingerprint = getattr(AIAgent, "_resolve_checkin_fingerprint")
+
+    first_fingerprint = fingerprint("terminal", {"command": first})
+    assert first_fingerprint == fingerprint(
+        "terminal", {"command": equivalent_spacing}
+    )
+    assert first_fingerprint != fingerprint(
+        "terminal", {"command": second}
+    )

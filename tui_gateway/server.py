@@ -11127,10 +11127,11 @@ def _completion_notify_steer_when_busy() -> bool:
 def _try_steer_busy_notification(session: dict, evt: dict, text: str) -> bool | None:
     """Deliver a completion to a running steer-capable agent when allowed.
 
-    ``True`` means the event was consumed (or another consumer already owns its
-    durable claim); ``False`` means the session is busy but must use the legacy
-    requeue path; ``None`` means the session was idle and should dispatch a new
-    turn as before.
+    ``True`` means the agent accepted a best-effort steer (or another consumer
+    already owns its durable claim); ``False`` means the session is busy but
+    must use the legacy requeue path; ``None`` means the session was idle and
+    should dispatch a new turn as before. Steer acceptance only buffers the
+    text, so it must not acknowledge durable delivery before model consumption.
     """
     with session["history_lock"]:
         if not session.get("running"):
@@ -11143,9 +11144,7 @@ def _try_steer_busy_notification(session: dict, evt: dict, text: str) -> bool | 
     if not callable(steer):
         return False
 
-    from tools.async_delegation import (
-        claim_event_delivery, complete_event_delivery, release_event_delivery,
-    )
+    from tools.async_delegation import claim_event_delivery, release_event_delivery
 
     claim = claim_event_delivery(evt, "tui-poller-steer")
     if claim is None:
@@ -11161,10 +11160,13 @@ def _try_steer_busy_notification(session: dict, evt: dict, text: str) -> bool | 
     with session["history_lock"]:
         session["last_active"] = time.time()
     try:
-        complete_event_delivery(evt, claim)
+        # steer() only appends to the agent's pending-steer buffer. The turn may
+        # end before consuming that buffer, so leave the durable completion
+        # pending for a later idle drain instead of marking it delivered here.
+        release_event_delivery(evt, claim)
     except Exception as exc:
         logger.warning(
-            "TUI busy-steer completion acknowledgement failed: %s: %s",
+            "TUI busy-steer completion claim release failed: %s: %s",
             type(exc).__name__,
             exc,
         )

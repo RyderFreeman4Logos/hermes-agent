@@ -4224,7 +4224,9 @@ class AIAgent:
             r"\bresolve-checkin(?:\.sh)?\b", command, re.IGNORECASE
         ):
             return None
-        return "resolve-checkin"
+        # Preserve the target/arguments while normalizing formatting so the
+        # breaker only stops repetitions of the same resolver invocation.
+        return f"resolve-checkin:{' '.join(command.split())}"
 
     @staticmethod
     def _extract_resolved_checkin(result: Any) -> Optional[str]:

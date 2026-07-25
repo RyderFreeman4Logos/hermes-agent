@@ -967,9 +967,9 @@ Because exported environment state persists, activate a virtualenv or export set
 
 Foreground (default): Commands return INSTANTLY when done, even if the timeout is high. Set timeout=300 for long builds/scripts — you'll still get the result in seconds if it's fast. Prefer foreground for short commands.
 Auto-background: When background is OMITTED and timeout exceeds the configured threshold (200s by default), the command starts as a managed background process. Its timeout budget is rewritten to terminal.auto_background_timeout (3300s by default). With omitted/default or explicit notify_on_complete=true, the tool returns a session_id handle immediately and completion re-enters via notify (do not block the agent turn); explicit notify_on_complete=false is true detach with no completion notification. Timeouts strictly above auto_background_timeout force-promote even explicit background=false.
-Background: Set background=true to get a session_id. Almost always pair with notify_on_complete=true — bg without notify runs SILENTLY and you have no way to learn it finished short of calling process(action='poll') yourself. Two legitimate uses:
+Background: Set background=true to get a session_id. Pair bounded real work (tests, builds, deploys, CI pollers, batch jobs) with notify_on_complete=true; without it the process runs silently. Two legitimate silent uses:
   (1) Long-lived processes that never exit (servers, watchers, daemons) — silent is correct, there's no exit to notify on.
-  (2) Long-running bounded tasks (tests, builds, deploys, CI pollers, batch jobs) — MUST set notify_on_complete=true. Without it you'll either forget to poll or sit blocked waiting for the user to surface the result.
+  (2) Pure watchdog/TTL waits — do NOT notify. DO NOT use resolve-checkin in a loop. DO NOT notify on pure TTL sleep heartbeats. Prefer the built-in runtime heartbeat; if a single TTL sleep is truly needed, use notify_on_complete=false and wait for real task completion.
 For servers/watchers, do NOT use shell-level background wrappers (nohup/disown/setsid/trailing '&') in foreground mode. Use background=true so Hermes can track lifecycle and output.
 After starting a server, verify readiness with a health check or log signal, then run tests in a separate terminal() call. Avoid blind sleep loops.
 Use process(action="poll") for progress checks, process(action="wait") to block until done.
@@ -2087,6 +2087,36 @@ def _foreground_background_guidance(command: str) -> str | None:
     return None
 
 
+_WD_RESOLVER_RE = re.compile(r"\bresolve-checkin(?:\.sh)?\b", re.IGNORECASE)
+_WD_SLEEP_CHECKIN_RE = re.compile(r"\bsleep\s+\$\{?checkin\}?\b", re.IGNORECASE)
+_WD_HEARTBEAT_RE = re.compile(r"\b(?:echo|printf)\b[^\n;]*\bheartbeat\b", re.IGNORECASE)
+_WD_LOOP_RE = re.compile(r"\b(?:while|for)\b", re.IGNORECASE)
+_WD_REAL_WORK_RE = re.compile(
+    r"(?:^|(?:&&|\|\||[;|])\s*)(?:pytest|cargo|npm|pnpm|yarn|bun|just|make|git|gh|curl|wget|uv\s+run)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_pure_watchdog_command(command: str) -> bool:
+    """Identify narrow resolve/TTL heartbeat commands with no real work.
+
+    These commands are useful only as an internal watchdog. A completion
+    notification for them asks the model to make another decision without any
+    new task state, which is precisely the idle-spin pattern this avoids.
+    """
+    if not isinstance(command, str) or not command.strip():
+        return False
+    normalized = " ".join(command.split())
+    if _WD_REAL_WORK_RE.search(normalized):
+        return False
+
+    has_resolver = bool(_WD_RESOLVER_RE.search(normalized))
+    has_heartbeat = bool(_WD_HEARTBEAT_RE.search(normalized))
+    has_checkin_sleep = bool(_WD_SLEEP_CHECKIN_RE.search(normalized))
+    is_heartbeat_loop = has_heartbeat and bool(_WD_LOOP_RE.search(normalized))
+    return has_resolver or (has_heartbeat and (has_checkin_sleep or is_heartbeat_loop))
+
+
 def _resolve_notification_flag_conflict(
     *,
     notify_on_complete: bool,
@@ -2164,7 +2194,7 @@ def terminal_tool(
         force: If True, skip dangerous command check (use after user confirms)
         workdir: Working directory for this command (optional, uses session cwd if not set)
         pty: If True, use pseudo-terminal for interactive CLI tools (local backend only)
-        notify_on_complete: If True and background=True, notify once on exit. None means omitted (defaults may apply for background / long-timeout promotion). Explicit False is always respected. MUTUALLY EXCLUSIVE with watch_patterns.
+        notify_on_complete: If True and background=True, notify once when bounded real work exits. None means omitted (defaults may apply for background / long-timeout promotion). Explicit False is always respected. Pure resolver/TTL heartbeat watchdogs are forced to notify_on_complete=False so they do not trigger an idle loop. MUTUALLY EXCLUSIVE with watch_patterns.
         watch_patterns: List of strings to watch for in background output. HARD rate limit: 1 notification per 15s per process. After 3 strike windows in a row, watch_patterns is disabled and the session is auto-promoted to notify_on_complete. Use ONLY for rare, one-shot mid-process signals on long-lived processes (server readiness, migration-done markers). NEVER use in loops/batch jobs — error patterns there will hit the strike limit and get disabled. MUTUALLY EXCLUSIVE with notify_on_complete — set one, not both.
 
     Returns:
@@ -2195,6 +2225,14 @@ def terminal_tool(
                 "error": f"Invalid command: expected string, got {type(command).__name__}",
                 "status": "error",
             }, ensure_ascii=False)
+
+        # Resolver-only and TTL-heartbeat commands create no task progress.
+        # Their completion notification can make a model immediately re-run the
+        # resolver, so force them detached even when the model requests notify.
+        watchdog_notify_suppressed = background and _is_pure_watchdog_command(command)
+        if watchdog_notify_suppressed:
+            notify_on_complete = False
+            watch_patterns = None
 
         # Get configuration
         config = _get_env_config()
@@ -2617,6 +2655,11 @@ def terminal_tool(
                     result_data["approval"] = approval_note
                 if pty_disabled_reason:
                     result_data["pty_note"] = pty_disabled_reason
+                if watchdog_notify_suppressed:
+                    result_data["watchdog_notice"] = (
+                        "WD/TTL sleep: no notify; wait for real task completion. "
+                        "Do not loop resolve-checkin; prefer the built-in runtime heartbeat."
+                    )
 
                 # Nudge: background=True without notify_on_complete=True OR
                 # watch_patterns is a silent process. The agent has NO way to
@@ -2630,7 +2673,12 @@ def terminal_tool(
                 # surface the result. Cheap nudge here costs ~one read for
                 # server cases (false positive) and prevents silent
                 # blindness for bounded-task cases (false negative).
-                if background and not notify_on_complete and not watch_patterns:
+                if (
+                    background
+                    and not watchdog_notify_suppressed
+                    and not notify_on_complete
+                    and not watch_patterns
+                ):
                     result_data["hint"] = (
                         "background=true without notify_on_complete=true means "
                         "this process runs SILENTLY — you will not be told when "
@@ -3220,7 +3268,7 @@ TERMINAL_SCHEMA = {
             },
             "background": {
                 "type": "boolean",
-                "description": "Run the command in the background. When OMITTED and auto_background_long_timeout is on, effective timeouts above the threshold auto-enable a managed background session. Any timeout above auto_background_timeout (3300s by default) force-promotes even explicit background=false. Default/explicit notify_on_complete=true returns a handle immediately and delivers completion asynchronously; explicit notify_on_complete=false is true detach with no completion notification.",
+                "description": "Run the command in the background and return an immediate handle. When OMITTED and auto_background_long_timeout is on, effective timeouts above the threshold auto-enable a managed background session. Any timeout above auto_background_timeout (3300s by default) force-promotes even explicit background=false. Bounded real work should use notify_on_complete=true; pure resolve-checkin / TTL sleep heartbeats force notify_on_complete=false. Explicit notify_on_complete=false is true detach. Never loop resolve-checkin.",
                 "default": False
             },
             "timeout": {
@@ -3239,7 +3287,7 @@ TERMINAL_SCHEMA = {
             },
             "notify_on_complete": {
                 "type": "boolean",
-                "description": "When true (and background=true), completion is delivered exactly once via the completion queue / watcher. Default for background (and auto-promoted long timeouts) is true when omitted and no watch_patterns. The tool always returns a handle immediately for background work — it does not block the agent turn waiting for the process. Explicit false is true detach: return the handle immediately with no completion notification. MUTUALLY EXCLUSIVE with watch_patterns — when both are set, watch_patterns is dropped.",
+                "description": "When true (and background=true), completion for bounded real work is delivered exactly once via the completion queue / watcher and the command returns an immediate handle. Default for background (and auto-promoted long timeouts) is true when omitted and no watch_patterns. Pure resolve-checkin and TTL-heartbeat watchdogs force this false. Explicit false is true detach. MUTUALLY EXCLUSIVE with watch_patterns — when both are set, watch_patterns is dropped.",
                 "default": False
             },
             "watch_patterns": {

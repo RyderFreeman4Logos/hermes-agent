@@ -1159,7 +1159,19 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             if not guardrail_decision.allows_execution:
                 _guardrail_block_decision = guardrail_decision
 
-        _execution_blocked = _block_msg is not None or _guardrail_block_decision is not None
+        # A pair of identical successful resolver calls means the interval is
+        # already known.  Return guidance locally before a third shell spawn.
+        _wd_loop_break_result: Optional[str] = None
+        if _block_msg is None and _guardrail_block_decision is None:
+            _wd_loop_break_result = agent._wd_resolver_loop_break_result(
+                function_name, function_args
+            )
+
+        _execution_blocked = (
+            _block_msg is not None
+            or _guardrail_block_decision is not None
+            or _wd_loop_break_result is not None
+        )
 
         if _execution_blocked:
             # Tool blocked by plugin or guardrail policy — skip counters,
@@ -1267,6 +1279,21 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 status="blocked",
                 error_type="guardrail_block",
                 error_message=getattr(_guardrail_block_decision, "message", None) or "Tool blocked by guardrail policy",
+                middleware_trace=list(middleware_trace),
+            )
+        elif _wd_loop_break_result is not None:
+            function_result = _wd_loop_break_result
+            tool_duration = 0.0
+            _emit_terminal_post_tool_call(
+                agent,
+                function_name=function_name,
+                function_args=function_args,
+                result=function_result,
+                effective_task_id=effective_task_id,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+                status="suppressed",
+                error_type="wd_idle_loop",
+                error_message="Repeated resolve-checkin call suppressed",
                 middleware_trace=list(middleware_trace),
             )
         elif function_name == "todo":
@@ -1619,6 +1646,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 middleware_trace=list(middleware_trace),
             )
         if not _execution_blocked:
+            try:
+                agent._record_wd_resolver_tool_result(
+                    function_name, function_args, function_result
+                )
+            except Exception as _wd_state_err:
+                logging.debug("WD resolver loop state update failed: %s", _wd_state_err)
             function_result = agent._append_guardrail_observation(
                 function_name,
                 function_args,

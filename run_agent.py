@@ -3021,6 +3021,9 @@ class AIAgent:
         """
         if not text or not text.strip():
             return False
+        # A steer is an intervening user message, so it must end an idle
+        # resolve-checkin streak before the next model/tool iteration.
+        self._reset_wd_resolver_loop_state()
         cleaned = text.strip()
         _lock = getattr(self, "_pending_steer_lock", None)
         if _lock is None:
@@ -4201,6 +4204,85 @@ class AIAgent:
             else:
                 logger.warning("Removed duplicate tool call: %s", tc.function.name)
         return unique if len(unique) < len(tool_calls) else tool_calls
+
+    @staticmethod
+    def _resolve_checkin_fingerprint(function_name: str, function_args: Any) -> Optional[str]:
+        """Return the narrow terminal pattern guarded against WD idle spinning."""
+        if function_name != "terminal" or not isinstance(function_args, dict):
+            return None
+        command = function_args.get("command")
+        if not isinstance(command, str) or not re.search(
+            r"\bresolve-checkin(?:\.sh)?\b", command, re.IGNORECASE
+        ):
+            return None
+        return "resolve-checkin"
+
+    @staticmethod
+    def _extract_resolved_checkin(result: Any) -> Optional[str]:
+        """Extract ``CHECKIN=N`` without retaining the terminal output."""
+        if isinstance(result, (dict, list)):
+            text = json.dumps(result, ensure_ascii=False, sort_keys=True)
+        else:
+            text = str(result or "")
+        match = re.search(r"\bCHECKIN\s*=\s*(\d+)\b", text, re.IGNORECASE)
+        return match.group(1) if match else None
+
+    def _reset_wd_resolver_loop_state(self) -> None:
+        """Forget a resolver streak after user input or actual progress."""
+        self._wd_resolver_loop_state = None
+
+    def _wd_resolver_loop_break_result(
+        self, function_name: str, function_args: Any
+    ) -> Optional[str]:
+        """Return a local result before a third identical resolver reaches shell."""
+        fingerprint = self._resolve_checkin_fingerprint(function_name, function_args)
+        state = getattr(self, "_wd_resolver_loop_state", None)
+        if not fingerprint or not isinstance(state, dict):
+            return None
+        if state.get("fingerprint") != fingerprint or state.get("count", 0) < 2:
+            return None
+
+        checkin = state.get("checkin")
+        if not checkin:
+            return None
+        logger.warning(
+            "Stopped repeated resolve-checkin call in session %s",
+            getattr(self, "session_id", ""),
+        )
+        return (
+            f"Watchdog resolver loop stopped: interval already resolved (CHECKIN={checkin}). "
+            "DO NOT call resolve-checkin again. Wait for authoritative completion or use the "
+            "built-in runtime heartbeat; if a TTL sleep is truly needed, start one background "
+            "sleep with notify_on_complete=false."
+        )
+
+    def _record_wd_resolver_tool_result(
+        self, function_name: str, function_args: Any, result: Any
+    ) -> None:
+        """Record equal CHECKIN results; other successful tools end the streak."""
+        fingerprint = self._resolve_checkin_fingerprint(function_name, function_args)
+        if not fingerprint:
+            self._reset_wd_resolver_loop_state()
+            return
+
+        checkin = self._extract_resolved_checkin(result)
+        if not checkin:
+            self._reset_wd_resolver_loop_state()
+            return
+
+        state = getattr(self, "_wd_resolver_loop_state", None)
+        if (
+            isinstance(state, dict)
+            and state.get("fingerprint") == fingerprint
+            and state.get("checkin") == checkin
+        ):
+            state["count"] = int(state.get("count", 0)) + 1
+            return
+        self._wd_resolver_loop_state = {
+            "fingerprint": fingerprint,
+            "checkin": checkin,
+            "count": 1,
+        }
 
     def _repair_tool_call(self, tool_name: str) -> str | None:
         """Forwarder — see ``agent.agent_runtime_helpers.repair_tool_call``."""

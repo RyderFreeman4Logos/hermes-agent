@@ -105,7 +105,4 @@ def test_lock_skip_without_confirmed_holder_does_not_claim_concurrency():
     for signal in (True, None, "", "   "):
         text = describe_compression_lock_skip(signal)
 
-        assert "already in progress" not in text, f"signal={signal!r}"
-        assert "Compression skipped" in text
-        assert "could not acquire" in text
-        assert "try again" in text
+        assert text == "⏳ Compression skipped: database busy, try again"

@@ -13165,7 +13165,11 @@ def test_notification_poller_steers_busy_completion_when_enabled(monkeypatch, sh
 
         assert len(steered) == 1
         assert "Background process proc_busy_steer completed normally" in steered[0]
-        assert isolated_queue.empty()
+        # Steer buffers text but does not prove model consumption. The pending
+        # event is returned to the shared queue if this poller stops first.
+        assert not isolated_queue.empty()
+        requeued = isolated_queue.get_nowait()
+        assert requeued["session_id"] == "proc_busy_steer"
         status_calls = [a for a in emitted if a[0] == "status.update"]
         assert len(status_calls) == 1
     finally:
@@ -13209,10 +13213,109 @@ def test_busy_steer_acceptance_releases_durable_claim_for_idle_retry(monkeypatch
         running=True,
     )
 
-    assert server._try_steer_busy_notification(session, evt, "child completed") is True
+    assert server._try_steer_busy_notification(session, evt, "child completed") == "steered"
     assert released == [(evt, "claim-tui-poller-steer")]
     assert completed == []
     assert async_delegation.claim_event_delivery(evt, "tui-idle-drain") == "claim-tui-idle-drain"
+
+
+def test_notification_poller_retries_accepted_steer_when_idle(monkeypatch):
+    """An accepted steer stays available until the idle-drain injects it.
+
+    The first retry remains busy, then the session becomes idle.  The same
+    event must be injected exactly once without asking ``agent.steer`` again.
+    """
+    import queue as _queue_mod
+    import tools.async_delegation as async_delegation
+    import tools.process_registry as process_registry_module
+    from tools.process_registry import process_registry
+
+    stop_event = threading.Event()
+    event = {
+        "type": "async_delegation",
+        "delegation_id": "delegation-steer-idle-retry",
+        "origin_ui_session_id": "sid_steer_retry",
+    }
+
+    class _StopAfterIdleDrainQueue(_queue_mod.Queue):
+        def __init__(self):
+            super().__init__()
+            self._initial_event_read = False
+
+        def get(self, block=True, timeout=None):
+            if self._initial_event_read:
+                stop_event.set()
+                raise _queue_mod.Empty
+            self._initial_event_read = True
+            return super().get(block=block, timeout=timeout)
+
+    isolated_queue = _StopAfterIdleDrainQueue()
+    isolated_queue.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(process_registry_module, "format_process_notification", lambda _evt: "child completed")
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+
+    delivery = {"held": False, "delivered": False}
+    claims = []
+    releases = []
+    steers = []
+    submitted = []
+
+    def claim(evt, consumer):
+        assert evt is event
+        if delivery["held"] or delivery["delivered"]:
+            return None
+        delivery["held"] = True
+        claims.append(consumer)
+        return f"claim-{consumer}"
+
+    def release(evt, token):
+        assert evt is event
+        assert token == "claim-tui-poller-steer"
+        delivery["held"] = False
+        releases.append(token)
+
+    def complete(evt, token):
+        assert evt is event
+        assert token == "claim-tui-poller"
+        delivery["held"] = False
+        delivery["delivered"] = True
+
+    monkeypatch.setattr(async_delegation, "claim_event_delivery", claim)
+    monkeypatch.setattr(async_delegation, "release_event_delivery", release)
+    monkeypatch.setattr(async_delegation, "complete_event_delivery", complete)
+
+    session = _session(
+        agent=types.SimpleNamespace(steer=lambda text: steers.append(text) or True),
+        running=True,
+    )
+    sleeps = []
+
+    def fake_sleep(seconds):
+        sleeps.append(seconds)
+        # First backoff follows the accepted steer. The second is the retry
+        # while still busy; after it, the next poll cycle must idle-drain.
+        if len(sleeps) == 2:
+            with session["history_lock"]:
+                session["running"] = False
+
+    monkeypatch.setattr(server.time, "sleep", fake_sleep)
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *args, **kwargs: submitted.append((args, kwargs)),
+    )
+
+    server._notification_poller_loop(stop_event, "sid_steer_retry", session)
+
+    assert steers == ["child completed"]
+    assert claims == ["tui-poller-steer", "tui-poller"]
+    assert releases == ["claim-tui-poller-steer"]
+    assert delivery["delivered"] is True
+    assert sleeps == [0.25, 0.25]
+    assert len(submitted) == 1
+    assert submitted[0][0][1] == "sid_steer_retry"
+    assert submitted[0][0][3] == "child completed"
 
 
 def test_session_save_writes_under_hermes_home_with_system_prompt(monkeypatch, tmp_path):

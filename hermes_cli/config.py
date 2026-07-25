@@ -1176,19 +1176,20 @@ DEFAULT_CONFIG = {
         "backend": "local",
         "modal_mode": "auto",
         "cwd": ".",  # Use current directory
-        # Default command timeout. When background is OMITTED and this effective
-        # value exceeds auto_background_timeout_threshold with the master switch
-        # on, promote to background+notify.
+        # Default command timeout. This is an execution budget, not a request to
+        # promote every command; auto-promotion uses an explicitly supplied
+        # timeout when background is omitted.
         "timeout": 3300,
-        # Master switch: auto-promote when background is omitted and
-        # effective_timeout > auto_background_timeout_threshold; timeouts above
+        # Master switch: auto-promote when background is omitted and an explicit
+        # timeout > auto_background_timeout_threshold; timeouts above
         # auto_background_timeout force background even when false was explicit.
         "auto_background_long_timeout": True,
-        # Promote when effective_timeout > this threshold (seconds). Boundary
+        # Promote when an explicit timeout > this threshold (seconds). Boundary
         # equality stays foreground (timeout=200 stays fg).
         "auto_background_timeout_threshold": 200,
         # Promoted commands wait for this many seconds rather than terminal.timeout.
-        # A requested/effective timeout strictly above this value forces background.
+        # An explicitly requested timeout strictly above this value forces
+        # background.
         "auto_background_timeout": 3300,
         # When background is true/promoted and notify_on_complete was omitted
         # (and no watch_patterns), default notify_on_complete to true.

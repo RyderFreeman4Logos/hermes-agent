@@ -1281,7 +1281,11 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         const { finalMessages, finalText, wasInterrupted } = turnController.recordMessageComplete(ev.payload ?? {})
 
         if (!wasInterrupted) {
-          const msgs: Msg[] = finalMessages.length ? finalMessages : [{ role: 'assistant', text: finalText }]
+          const msgs: Msg[] = finalMessages.length
+            ? finalMessages
+            : ev.payload?.silent
+              ? []
+              : [{ role: 'assistant' as const, text: finalText }]
           msgs.forEach(appendMessage)
 
           // Pet beat: celebrate a finished plan, otherwise a clean-finish wave.

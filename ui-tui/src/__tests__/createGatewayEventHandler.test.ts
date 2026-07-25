@@ -401,6 +401,19 @@ describe('createGatewayEventHandler', () => {
     }
   })
 
+  it('closes a silent completion without appending an assistant bubble', () => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+    onEvent({ payload: {}, type: 'message.start' } as any)
+    expect(getUiState().busy).toBe(true)
+
+    onEvent({ payload: { silent: true, text: undefined }, type: 'message.complete' } as any)
+
+    expect(getUiState().busy).toBe(false)
+    expect(appended).toHaveLength(0)
+  })
+
   it('preserves streamed reasoning as one completed thinking panel after segment flushes', () => {
     const appended: Msg[] = []
     const streamed = 'first reasoning chunk\nsecond reasoning chunk'

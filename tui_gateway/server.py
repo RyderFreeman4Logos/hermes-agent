@@ -11124,14 +11124,16 @@ def _completion_notify_steer_when_busy() -> bool:
         return True
 
 
-def _try_steer_busy_notification(session: dict, evt: dict, text: str) -> bool | None:
+def _try_steer_busy_notification(session: dict, evt: dict, text: str) -> str | bool | None:
     """Deliver a completion to a running steer-capable agent when allowed.
 
-    ``True`` means the agent accepted a best-effort steer (or another consumer
-    already owns its durable claim); ``False`` means the session is busy but
-    must use the legacy requeue path; ``None`` means the session was idle and
-    should dispatch a new turn as before. Steer acceptance only buffers the
-    text, so it must not acknowledge durable delivery before model consumption.
+    ``"steered"`` means the agent accepted a best-effort steer and the event
+    must remain available for a later idle drain. ``"claimed_elsewhere"`` means
+    another consumer owns its durable claim. ``False`` means the session is
+    busy but must use the legacy requeue path; ``None`` means the session was
+    idle and should dispatch a new turn as before. Steer acceptance only
+    buffers the text, so it must not acknowledge durable delivery before model
+    consumption.
     """
     with session["history_lock"]:
         if not session.get("running"):
@@ -11148,7 +11150,7 @@ def _try_steer_busy_notification(session: dict, evt: dict, text: str) -> bool | 
 
     claim = claim_event_delivery(evt, "tui-poller-steer")
     if claim is None:
-        return True
+        return "claimed_elsewhere"
     try:
         accepted = bool(steer(text))
     except Exception:
@@ -11170,7 +11172,7 @@ def _try_steer_busy_notification(session: dict, evt: dict, text: str) -> bool | 
             type(exc).__name__,
             exc,
         )
-    return True
+    return "steered"
 
 
 def _notification_poller_loop(
@@ -11189,11 +11191,19 @@ def _notification_poller_loop(
     from tools.process_registry import process_registry, format_process_notification
 
     _emitted = set()  # dedup re-queued events so same completion isn't emitted 50 times while session is busy
+    # A successful steer only buffers the notification in the active turn. Keep
+    # the event off the blocking shared queue, but retry this list at the normal
+    # busy-poller cadence until the session can inject a durable idle-drain turn.
+    _steered_pending: list[dict] = []
     while not stop_event.is_set() and not session.get("_finalized"):
-        try:
-            evt = process_registry.completion_queue.get(timeout=0.5)
-        except Exception:
-            continue
+        _steered_retry = bool(_steered_pending)
+        if _steered_retry:
+            evt = _steered_pending.pop(0)
+        else:
+            try:
+                evt = process_registry.completion_queue.get(timeout=0.5)
+            except Exception:
+                continue
 
         # Multiple desktop sessions share this one process-wide queue. Only
         # consume events that belong to *this* session — otherwise a background
@@ -11244,17 +11254,29 @@ def _notification_poller_loop(
             _emit("status.update", sid, {"kind": "process", "text": text})
             _emitted.add(_dedup_key)
 
-        steer_result = _try_steer_busy_notification(session, evt, text)
-        if steer_result is True:
+        # A pending retry was already offered to steer(); do not offer it again
+        # while it waits for the current turn to finish.
+        steer_result = None if _steered_retry else _try_steer_busy_notification(session, evt, text)
+        if steer_result == "steered":
+            _steered_pending.append(evt)
+            time.sleep(0.25)
+            continue
+        if steer_result == "claimed_elsewhere":
             continue
 
         _requeued = steer_result is False
         if _requeued:
-            process_registry.completion_queue.put(evt)
+            if _steered_retry:
+                _steered_pending.append(evt)
+            else:
+                process_registry.completion_queue.put(evt)
         else:
             with session["history_lock"]:
                 if session.get("running"):
-                    process_registry.completion_queue.put(evt)
+                    if _steered_retry:
+                        _steered_pending.append(evt)
+                    else:
+                        process_registry.completion_queue.put(evt)
                     _requeued = True
                 else:
                     session["running"] = True
@@ -11300,7 +11322,10 @@ def _notification_poller_loop(
     # before exiting so nothing is lost on shutdown). Events owned by other
     # live sessions are set aside and re-queued so their poller still sees them.
     # Orphaned events (owner gone) are dropped — same guard as the main loop.
-    deferred: list = []
+    # Return steered-but-unconsumed events to the shared queue if this poller
+    # stops before it gets an idle retry. Their durable claim was released, so
+    # another live poller or a later session can still deliver them.
+    deferred: list = list(_steered_pending)
     while not process_registry.completion_queue.empty():
         try:
             evt = process_registry.completion_queue.get_nowait()
@@ -11338,7 +11363,10 @@ def _notification_poller_loop(
             _emitted.add(_dedup_key)
 
         steer_result = _try_steer_busy_notification(session, evt, text)
-        if steer_result is True:
+        if steer_result == "steered":
+            deferred.append(evt)
+            continue
+        if steer_result == "claimed_elsewhere":
             continue
         if steer_result is False:
             process_registry.completion_queue.put(evt)

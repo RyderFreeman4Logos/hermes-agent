@@ -682,6 +682,7 @@ export type GatewayEvent =
         reasoning?: string
         rendered?: string
         response_previewed?: boolean
+        silent?: boolean
         text?: string
         usage?: Usage
       }

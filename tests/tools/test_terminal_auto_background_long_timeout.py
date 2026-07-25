@@ -5,7 +5,7 @@ Authoritative contract (P0, 2026-07-24):
   which force-promotes the command when the master switch is on.
 - Explicit notify_on_complete=false is always respected.
 - Defaults apply only when params are omitted (None / absent).
-- Omitted background + timeout > threshold → background=true; if notify omitted
+- Omitted background + an explicit timeout > threshold → background=true; if notify omitted
   and no watch_patterns → notify_on_complete=true; tool returns handle
   immediately (no process_registry.wait). Completion re-enters via notify.
 - Process budget rewrites to auto_background_timeout (default 3300).
@@ -158,27 +158,17 @@ class TestConfigDefaults:
 
 
 class TestAutoBackgroundLongTimeout:
-    def test_omitted_all_promotes_with_notify_returns_handle_immediately(self):
-        """Default-notify auto-promotion returns a handle; does not sync-wait."""
-        result, mock_proc, mock_env, mock_registry = _run_promoted(
+    def test_omitted_all_stays_foreground_with_config_default_timeout(self):
+        """The configured default is a foreground budget, not background intent."""
+        result, mock_env = _run_foreground(
             "make build",
-            config=_base_config(timeout=3300, auto_background_long_timeout=True),
+            config=_base_config(timeout=7200, auto_background_long_timeout=True),
             # timeout / background / notify all omitted
         )
 
         assert "error" not in result or result["error"] is None
-        assert result.get("session_id") == mock_proc.id
-        assert result.get("notify_on_complete") is True
-        # Handle path: started message or background status — not waited exit
-        assert result.get("status") in (None, "running", "started") or (
-            "Background process started" in str(result.get("output", ""))
-            or result.get("session_id")
-        )
-        assert result.get("output") != "completed output"
-        assert mock_proc.notify_on_complete is True
-        mock_registry.spawn_local.assert_called_once()
-        mock_registry.wait.assert_not_called()
-        mock_env.execute.assert_not_called()
+        assert "session_id" not in result
+        assert mock_env.execute.call_args.kwargs["timeout"] == 7200
 
     def test_default_notify_auto_promotion_returns_handle_when_async_delivery_unavailable(self):
         """Handle return does not depend on a later async completion route."""

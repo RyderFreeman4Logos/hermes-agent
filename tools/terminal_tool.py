@@ -2182,7 +2182,7 @@ def terminal_tool(
     Args:
         command: The command to execute
         background: Whether to run in background. None means omitted (auto-promote
-            may apply when effective_timeout > threshold). Auto-promoted commands
+            may apply when an explicit timeout exceeds the threshold). Auto-promoted commands
             remain managed background sessions and the tool returns a handle
             immediately; default/explicit notify delivers completion
             asynchronously. Explicit False is respected unless timeout exceeds
@@ -2285,7 +2285,8 @@ def terminal_tool(
                 )
             cwd = config["cwd"]
         default_timeout = config["timeout"]
-        effective_timeout = timeout or default_timeout
+        timeout_was_omitted = timeout is None
+        effective_timeout = default_timeout if timeout_was_omitted else timeout
 
         # Track omitted vs explicit params so defaults apply only when omitted.
         # Explicit notify_on_complete=False is always respected. Explicit
@@ -2306,20 +2307,25 @@ def terminal_tool(
         auto_bg_timeout = int(config.get("auto_background_timeout", 3300) or 3300)
         default_notify_on_bg = bool(config.get("default_notify_on_background", True))
 
-        # Omitted background is promoted when effective_timeout exceeds the
-        # threshold. A timeout strictly above auto_background_timeout is a
-        # stronger guardrail: it force-promotes even explicit background=False.
+        # Omitted background is promoted only when the caller explicitly
+        # requested a timeout above the threshold. The configured default is an
+        # execution budget, not an intent to background every ordinary command.
+        # An explicitly requested timeout strictly above
+        # auto_background_timeout is a stronger guardrail: it force-promotes
+        # even explicit background=False.
         # Explicit background=True is already managed and therefore retains its
         # requested wait timeout.
         auto_promoted = False
         threshold_promotes = (
             auto_bg_long
             and background_was_omitted
+            and not timeout_was_omitted
             and effective_timeout
             and effective_timeout > auto_bg_threshold
         )
         force_promotes = (
             auto_bg_long
+            and not timeout_was_omitted
             and not background
             and effective_timeout
             and effective_timeout > auto_bg_timeout
@@ -2335,7 +2341,7 @@ def terminal_tool(
                 "Auto-promoted terminal command to background "
                 "(requested_timeout=%ss; threshold=%ss; rewrite_target=%ss; "
                 "wait_timeout=%ss; reason=%s)",
-                timeout or default_timeout,
+                timeout,
                 auto_bg_threshold,
                 auto_bg_timeout,
                 effective_timeout,
@@ -3268,12 +3274,12 @@ TERMINAL_SCHEMA = {
             },
             "background": {
                 "type": "boolean",
-                "description": "Run the command in the background and return an immediate handle. When OMITTED and auto_background_long_timeout is on, effective timeouts above the threshold auto-enable a managed background session. Any timeout above auto_background_timeout (3300s by default) force-promotes even explicit background=false. Bounded real work should use notify_on_complete=true; pure resolve-checkin / TTL sleep heartbeats force notify_on_complete=false. Explicit notify_on_complete=false is true detach. Never loop resolve-checkin.",
+                "description": "Run the command in the background and return an immediate handle. When OMITTED and auto_background_long_timeout is on, an explicit timeout above the threshold auto-enables a managed background session; the configured default timeout alone remains foreground. Any timeout above auto_background_timeout (3300s by default) force-promotes even explicit background=false. Bounded real work should use notify_on_complete=true; pure resolve-checkin / TTL sleep heartbeats force notify_on_complete=false. Explicit notify_on_complete=false is true detach. Never loop resolve-checkin.",
                 "default": False
             },
             "timeout": {
                 "type": "integer",
-                "description": f"Max seconds for the command budget (default: 3300). When auto_background_long_timeout is enabled and background is OMITTED, timeouts above the threshold create a managed background process and rewrite its budget to auto_background_timeout (3300 by default). A requested timeout strictly above auto_background_timeout force-promotes even explicit background=false. Default/explicit notify_on_complete=true returns a handle immediately (completion via notify); explicit false detaches. FOREGROUND_MAX_TIMEOUT={FOREGROUND_MAX_TIMEOUT}s remains the hard cap for true foreground.",
+                "description": f"Max seconds for the command budget (default: 3300). When auto_background_long_timeout is enabled and background is OMITTED, an explicit timeout above the threshold creates a managed background process and rewrites its budget to auto_background_timeout (3300 by default); omitting timeout keeps the configured default in the foreground. A requested timeout strictly above auto_background_timeout force-promotes even explicit background=false. Default/explicit notify_on_complete=true returns a handle immediately (completion via notify); explicit false detaches. FOREGROUND_MAX_TIMEOUT={FOREGROUND_MAX_TIMEOUT}s remains the hard cap for true foreground.",
                 "minimum": 1
             },
             "workdir": {

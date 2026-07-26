@@ -28,8 +28,14 @@ from run_agent import AIAgent
 # --------------------------------------------------------------------------
 # Fixtures (mirrors tests/run_agent/test_tool_call_guardrail_runtime.py)
 # --------------------------------------------------------------------------
-def _mock_response(content="Hello", finish_reason="stop", tool_calls=None):
-    msg = SimpleNamespace(content=content, tool_calls=tool_calls)
+def _mock_response(
+    content="Hello", finish_reason="stop", tool_calls=None, reasoning_content=None
+):
+    msg = SimpleNamespace(
+        content=content,
+        tool_calls=tool_calls,
+        reasoning_content=reasoning_content,
+    )
     choice = SimpleNamespace(message=msg, finish_reason=finish_reason)
     return SimpleNamespace(choices=[choice], model="test/model", usage=None)
 
@@ -139,6 +145,7 @@ def test_run_conversation_empty_exhausted_surfaces_explanation():
     assert result["final_response"].strip() != ""
     assert "No reply:" in result["final_response"]
     assert result.get("silent_noop") is not True
+    assert agent.client.chat.completions.create.call_count == 4
 
 
 def test_idle_completion_empty_stop_is_silent_and_keeps_notification():
@@ -170,6 +177,65 @@ def test_idle_completion_empty_stop_is_silent_and_keeps_notification():
         and "proc_idle completed normally" in str(message.get("content"))
         for message in result["messages"]
     )
+
+
+def test_idle_completion_reasoning_only_stop_or_success_is_silent_without_retries():
+    """Reasoning without visible text is a no-op for an idle completion."""
+    for finish_reason in ("stop", "success"):
+        agent = _make_agent(max_iterations=10)
+        agent.client.chat.completions.create.side_effect = [
+            _mock_response(
+                content="",
+                finish_reason=finish_reason,
+                reasoning_content="The notification does not need a reply.",
+            )
+            for _ in range(8)
+        ]
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(
+                "[IMPORTANT: Background process proc_idle completed normally]",
+                turn_origin="idle_completion",
+                allow_silent_noop=True,
+            )
+
+        assert result["final_response"] is None
+        assert result["silent_noop"] is True
+        assert result["turn_exit_reason"] == "idle_notification_noop"
+        assert result["api_calls"] == 1
+        assert agent.client.chat.completions.create.call_count == 1
+
+
+def test_idle_completion_streamed_reasoning_without_text_is_silent_without_retries():
+    """Streamed reasoning alone must not enter the empty-response retry path."""
+    agent = _make_agent(max_iterations=10)
+    response = _mock_response(content="", finish_reason="stop")
+
+    def _response_with_streamed_reasoning(**_kwargs):
+        agent._current_streamed_reasoning_text = "No visible response is needed."
+        return response
+
+    agent.client.chat.completions.create.side_effect = _response_with_streamed_reasoning
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation(
+            "[IMPORTANT: Background process proc_idle completed normally]",
+            turn_origin="idle_completion",
+            allow_silent_noop=True,
+        )
+
+    assert result["final_response"] is None
+    assert result["silent_noop"] is True
+    assert result["turn_exit_reason"] == "idle_notification_noop"
+    assert result["api_calls"] == 1
+    assert agent.client.chat.completions.create.call_count == 1
 
 
 def test_idle_completion_noop_instruction_is_api_only_and_persists_clean_notification():

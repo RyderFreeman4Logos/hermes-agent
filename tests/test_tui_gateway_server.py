@@ -14796,3 +14796,112 @@ def test_prompt_submit_passes_persist_user_message_to_agent(monkeypatch):
         assert captured.get("persist_user_message") == "hi"
     finally:
         server._sessions.pop("sid", None)
+
+
+def test_tool_complete_attaches_active_background_timer_snapshot(monkeypatch):
+    emitted: list[tuple[str, str, dict]] = []
+
+    class _Heartbeat:
+        @staticmethod
+        def snapshot_active_targets():
+            return [
+                {"session_id": "proc-1", "elapsed_s": 42, "ttl_remaining_s": 330},
+                {"session_id": "proc-2", "elapsed_s": 10, "ttl_remaining_s": 320},
+                {"session_id": "proc-3", "elapsed_s": 5, "ttl_remaining_s": 315},
+            ]
+
+    monkeypatch.setattr(server, "runtime_heartbeat", _Heartbeat())
+    monkeypatch.setattr(
+        server, "_emit", lambda event_type, sid, payload: emitted.append((event_type, sid, payload))
+    )
+    server._sessions["bg-timer-test"] = {"tool_progress_mode": "all", "tool_started_at": {}}
+    try:
+        server._on_tool_start("bg-timer-test", "tool-1", "terminal", {"command": "pwd"})
+        server._on_tool_complete("bg-timer-test", "tool-1", "terminal", {"command": "pwd"}, "done")
+    finally:
+        server._sessions.pop("bg-timer-test", None)
+
+    completed = [payload for event, _sid, payload in emitted if event == "tool.complete"]
+    assert completed[-1]["bg_timers"] == [
+        {"session_id": "proc-1", "elapsed_s": 42, "ttl_remaining_s": 330},
+        {"session_id": "proc-2", "elapsed_s": 10, "ttl_remaining_s": 320},
+        {"session_id": "proc-3", "elapsed_s": 5, "ttl_remaining_s": 315},
+    ]
+
+
+@pytest.mark.parametrize(
+    ("usage", "expected"),
+    [
+        (
+            {"cache_read_tokens": 1_740, "cache_write_tokens": 0, "prompt_tokens": 2_000},
+            {"read_tokens": 1_740, "prompt_tokens": 2_000, "pct": 87, "state": "hit"},
+        ),
+        (
+            {"cache_read_tokens": 0, "cache_write_tokens": 2_000, "prompt_tokens": 2_000},
+            {"read_tokens": 0, "prompt_tokens": 2_000, "pct": 0, "state": "cold_write"},
+        ),
+        (
+            {"cache_read_tokens": 0, "cache_write_tokens": 0, "prompt_tokens": 512},
+            {"read_tokens": 0, "prompt_tokens": 512, "pct": 0, "state": "unknown"},
+        ),
+        (
+            {"cache_read_tokens": 0, "cache_write_tokens": 0, "prompt_tokens": 2_000},
+            {"read_tokens": 0, "prompt_tokens": 2_000, "pct": 0, "state": "miss"},
+        ),
+        ({"prompt_tokens": 512}, None),
+    ],
+)
+def test_cache_info_classifies_canonical_turn_usage(usage, expected):
+    assert server._cache_info_from_usage(usage) == expected
+
+
+def test_prompt_submit_message_complete_includes_cache_info_from_last_turn_usage(monkeypatch):
+    emitted: list[tuple[str, str, dict]] = []
+
+    class _Agent:
+        _last_turn_usage = {
+            "cache_read_tokens": 1_740,
+            "cache_write_tokens": 0,
+            "prompt_tokens": 2_000,
+        }
+
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
+            return {
+                "final_response": "reply",
+                "messages": [{"role": "assistant", "content": "reply"}],
+            }
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    server._sessions["cache-info-sid"] = _session(agent=_Agent())
+    try:
+        monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+        monkeypatch.setattr(server, "_get_usage", lambda _agent: {})
+        monkeypatch.setattr(server, "render_message", lambda _text, _cols: "")
+        monkeypatch.setattr(
+            server, "_emit", lambda event_type, sid, payload=None: emitted.append((event_type, sid, payload))
+        )
+
+        response = server.handle_request(
+            {
+                "id": "cache-info",
+                "method": "prompt.submit",
+                "params": {"session_id": "cache-info-sid", "text": "hi"},
+            }
+        )
+        assert response.get("result")
+    finally:
+        server._sessions.pop("cache-info-sid", None)
+
+    complete = [payload for event, _sid, payload in emitted if event == "message.complete"]
+    assert complete[-1]["cache_info"] == {
+        "read_tokens": 1_740,
+        "prompt_tokens": 2_000,
+        "pct": 87,
+        "state": "hit",
+    }

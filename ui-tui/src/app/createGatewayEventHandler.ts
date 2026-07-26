@@ -1077,7 +1077,8 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
             ev.payload.name,
             ev.payload.error,
             ev.payload.duration_s,
-            resultText
+            resultText,
+            ev.payload.bg_timers
           )
         } else {
           turnController.recordToolComplete(
@@ -1087,7 +1088,8 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
             ev.payload.summary,
             ev.payload.duration_s,
             ev.payload.todos,
-            resultText
+            resultText,
+            ev.payload.bg_timers
           )
         }
 

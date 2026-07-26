@@ -38,6 +38,12 @@ import type {
 } from '../types.js'
 
 const THINK: BrailleSpinnerName[] = ['helix', 'breathe', 'orbit', 'dna', 'waverows', 'snake', 'pulse']
+
+const splitBackgroundTimer = (line: string) => {
+  const match = line.match(/( →checkin \d+s\/\d+s(?: \+\d+)?)$/)
+
+  return match ? { call: line.slice(0, -match[1]!.length), timer: match[1]! } : { call: line, timer: '' }
+}
 const TOOL: BrailleSpinnerName[] = ['cascade', 'scan', 'diagswipe', 'fillsweep', 'rain', 'columns', 'sparkle']
 
 const fmtElapsed = (ms: number) => {
@@ -804,12 +810,13 @@ export const ToolTrail = memo(function ToolTrail({
   const pushDetail = (row: DetailRow) => (groups.at(-1)?.details ?? meta).push(row)
 
   for (const [i, line] of trail.entries()) {
-    const parsed = parseToolTrailResultLine(line)
+    const { call: toolLine, timer } = splitBackgroundTimer(line)
+    const parsed = parseToolTrailResultLine(toolLine)
 
     if (parsed) {
       groups.push({
         color: parsed.mark === '✗' ? t.color.error : t.color.text,
-        content: parsed.call,
+        content: `${parsed.call}${timer}`,
         details: [],
         key: `tr-${i}`,
         label: parsed.call
@@ -915,14 +922,14 @@ export const ToolTrail = memo(function ToolTrail({
   const inlineDelegateKey = hasSubagents && delegateGroups.length === 1 ? delegateGroups[0]!.key : null
 
   const toolLabel = (group: Group) => {
-    const { duration, label } = splitToolDuration(String(group.content))
+    const { call, timer } = splitBackgroundTimer(String(group.content))
+    const { duration, label } = splitToolDuration(call)
 
-    return duration ? (
+    return duration || timer ? (
       <>
         {label}
-        <Text color={t.color.statusFg} dim>
-          {duration}
-        </Text>
+        {duration ? <Text color={t.color.statusFg} dim>{duration}</Text> : null}
+        {timer ? <Text color={t.color.muted} dim>{timer}</Text> : null}
       </>
     ) : (
       group.content

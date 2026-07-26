@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextvars
 import logging
+import math
 import queue
 import threading
 import time
@@ -138,6 +139,8 @@ class _Target:
     provider: str
     inspect: Callable[[], Dict[str, Any]]
     interval: float
+    started_at: float
+    due_at: float = 0.0
     generation: int = 0
     timer: Any = None
     baseline: Dict[str, Any] = field(default_factory=dict)
@@ -205,6 +208,7 @@ class RuntimeHeartbeat:
             target = _Target(
                 target_id=str(target_id), caller_id=str(caller_id), kind=str(kind),
                 provider=str(provider or ""), inspect=inspect, interval=interval,
+                started_at=time.time(),
             )
             # Register before inspecting. A racing completion can now cancel this
             # exact entry; it can never leave a timer armed after completion.
@@ -226,6 +230,7 @@ class RuntimeHeartbeat:
     def _schedule_locked(self, key: str, target: _Target) -> None:
         target.generation += 1
         generation = target.generation
+        target.due_at = time.time() + target.interval
         timer = self._timer_factory(
             target.interval, lambda: self._fire(key, generation)
         )
@@ -271,6 +276,44 @@ class RuntimeHeartbeat:
     def outstanding_for_caller(self, caller_id: str) -> list[str]:
         with self._lock:
             return [target.target_id for target in self._targets.values() if target.caller_id == caller_id]
+
+    def snapshot_active_targets(self) -> list[dict[str, int | str]]:
+        """Return compact elapsed/TTL observability for active watchdog targets.
+
+        Managed processes get their wall-clock age from the registry's durable
+        ``ProcessSession.started_at`` instead of the watchdog arm time. Other
+        target kinds fall back to their arm time because they have no process
+        session. ``due_at`` is refreshed on every arm/re-arm, so the TTL is the
+        remaining interval until that target's next heartbeat.
+        """
+        now = time.time()
+        with self._lock:
+            targets = tuple(self._targets.values())
+
+        rows: list[dict[str, int | str]] = []
+        for target in targets:
+            started_at = target.started_at
+            if target.kind == "process":
+                try:
+                    from tools.process_registry import process_registry
+
+                    session = process_registry.get(target.target_id)
+                    session_started_at = getattr(session, "started_at", None)
+                    if isinstance(session_started_at, (int, float)) and session_started_at > 0:
+                        started_at = float(session_started_at)
+                except Exception:
+                    logger.debug("Could not read process start time for %s", target.target_id, exc_info=True)
+
+            elapsed_s = max(0, int(now - started_at))
+            ttl_remaining_s = max(0, int(math.ceil(target.due_at - now)))
+            rows.append(
+                {
+                    "session_id": target.target_id,
+                    "elapsed_s": elapsed_s,
+                    "ttl_remaining_s": ttl_remaining_s,
+                }
+            )
+        return rows
 
     @staticmethod
     def _assess(target: _Target, snapshot: Dict[str, Any]) -> tuple[str, str]:

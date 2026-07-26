@@ -630,6 +630,7 @@ export type GatewayEvent =
     }
   | {
       payload: {
+        bg_timers?: Array<{ elapsed_s: number; session_id: string; ttl_remaining_s: number }>
         duration_s?: number
         error?: string
         inline_diff?: string
@@ -678,6 +679,12 @@ export type GatewayEvent =
   | {
       payload?: {
         billing?: BillingBlock
+        cache_info?: {
+          pct: number
+          prompt_tokens: number
+          read_tokens: number
+          state: 'hit' | 'cold_write' | 'miss' | 'unknown'
+        }
         failure_reason?: string
         reasoning?: string
         rendered?: string

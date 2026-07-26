@@ -685,6 +685,7 @@ export type GatewayEvent =
           read_tokens: number
           state: 'hit' | 'cold_write' | 'miss' | 'unknown'
         }
+        completed_at?: number
         failure_reason?: string
         reasoning?: string
         rendered?: string

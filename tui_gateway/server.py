@@ -1291,6 +1291,12 @@ def _event_frame(event: str, sid: str, payload: dict | None = None) -> dict:
 
 
 def _emit(event: str, sid: str, payload: dict | None = None):
+    # This is the authoritative moment a terminal turn frame leaves the
+    # gateway. Keep it on the frame (rather than a client-side Date.now()) so
+    # the TUI can distinguish a delayed delivery from an agent that just
+    # stopped. Copy rather than mutate because some callers reuse payloads.
+    if event == "message.complete":
+        payload = {**(payload or {}), "completed_at": time.time()}
     write_json(_event_frame(event, sid, payload))
 
 

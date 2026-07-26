@@ -1977,6 +1977,29 @@ describe('createGatewayEventHandler', () => {
     expect(appended[1]?.eventTone).toBe(eventTone)
   })
 
+  it('adds the local completion time after the assistant response', () => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+    const formatTime = vi.spyOn(Date.prototype, 'toLocaleTimeString').mockReturnValue('14:23:05')
+
+    try {
+      onEvent({ payload: { completed_at: 1_700_000_000.25, text: 'final answer' }, type: 'message.complete' } as any)
+
+      expect(appended).toEqual([
+        { role: 'assistant', text: 'final answer' },
+        { kind: 'event', role: 'system', text: '完成 14:23:05' }
+      ])
+      expect(formatTime).toHaveBeenCalledWith('en-GB', {
+        hour: '2-digit',
+        hour12: false,
+        minute: '2-digit',
+        second: '2-digit'
+      })
+    } finally {
+      formatTime.mockRestore()
+    }
+  })
+
   it('keeps cache % after a response-previewed assistant message', () => {
     const appended: Msg[] = []
     const onEvent = createGatewayEventHandler(buildCtx(appended))

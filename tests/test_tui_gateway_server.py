@@ -37,6 +37,30 @@ def _neuter_agent_prewarm_timer(request, monkeypatch):
     yield
 
 
+def test_message_complete_event_includes_completion_timestamp(monkeypatch):
+    """Terminal turn events carry the gateway's completion time for the TUI."""
+    emitted = []
+    payload = {"text": "done"}
+    monkeypatch.setattr(server, "write_json", emitted.append)
+    monkeypatch.setattr(server.time, "time", lambda: 1_700_000_000.25)
+
+    server._emit("message.complete", "sid", payload)
+
+    assert emitted == [
+        {
+            "jsonrpc": "2.0",
+            "method": "event",
+            "params": {
+                "payload": {"completed_at": 1_700_000_000.25, "text": "done"},
+                "session_id": "sid",
+                "type": "message.complete",
+            },
+        }
+    ]
+    # Emission metadata must not leak back into a payload callers may reuse.
+    assert payload == {"text": "done"}
+
+
 def test_session_create_rejects_at_active_session_limit(monkeypatch, tmp_path):
     home = tmp_path / ".hermes"
     home.mkdir()

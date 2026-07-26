@@ -775,6 +775,11 @@ def init_agent(
     # iteration. Message-role alternation is preserved (we modify an
     # existing tool message rather than inserting a new user turn).
     agent._pending_steer: Optional[str] = None
+    # Optional callbacks are registered by delivery surfaces which need to
+    # distinguish ``steer() accepted this text`` from ``the agent actually
+    # appended it to a tool result``.  Keep them parallel to the buffered
+    # text; normal /steer callers do not register a callback.
+    agent._pending_steer_applied_callbacks = []
     agent._pending_steer_lock = threading.Lock()
 
     # Active-turn redirect mechanism. A regular follow-up sent while the model

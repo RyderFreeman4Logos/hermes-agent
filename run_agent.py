@@ -2999,9 +2999,13 @@ class AIAgent:
         if _steer_lock is not None:
             with _steer_lock:
                 self._pending_steer = None
+                self._pending_steer_applied_callbacks = []
+        else:
+            self._pending_steer = None
+            self._pending_steer_applied_callbacks = []
         return True
 
-    def steer(self, text: str) -> bool:
+    def steer(self, text: str, *, on_applied=None) -> bool:
         """
         Inject a user message into the next tool result without interrupting.
 
@@ -3015,6 +3019,10 @@ class AIAgent:
 
         Args:
             text: The user text to inject. Empty strings are ignored.
+            on_applied: Optional callback invoked only after the buffered text
+                was appended to a concrete tool-result message.  Acceptance is
+                deliberately weaker: a turn can end, be interrupted, or fail
+                before it reaches a tool boundary.
 
         Returns:
             True if the steer was accepted, False if the text was empty.
@@ -3032,12 +3040,20 @@ class AIAgent:
             # in those stubs.
             existing = getattr(self, "_pending_steer", None)
             self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
+            if callable(on_applied):
+                callbacks = list(getattr(self, "_pending_steer_applied_callbacks", []) or [])
+                callbacks.append(on_applied)
+                self._pending_steer_applied_callbacks = callbacks
             return True
         with _lock:
             if self._pending_steer:
                 self._pending_steer = self._pending_steer + "\n" + cleaned
             else:
                 self._pending_steer = cleaned
+            if callable(on_applied):
+                callbacks = list(getattr(self, "_pending_steer_applied_callbacks", []) or [])
+                callbacks.append(on_applied)
+                self._pending_steer_applied_callbacks = callbacks
         return True
 
     def redirect(self, text: str) -> bool:
@@ -3152,21 +3168,57 @@ class AIAgent:
             self._pending_redirect = None
         return text
 
-    def _drain_pending_steer(self) -> Optional[str]:
+    def _drain_pending_steer(
+        self, *, with_callbacks: bool = False
+    ) -> Optional[str] | tuple[Optional[str], list]:
         """Return the pending steer text (if any) and clear the slot.
 
         Safe to call from the agent execution thread after appending tool
-        results. Returns None when no steer is pending.
+        results. ``with_callbacks`` additionally returns the delivery
+        callbacks paired with this buffered text.  They are deliberately not
+        run here: a caller must first append the text to a tool result.
         """
         _lock = getattr(self, "_pending_steer_lock", None)
         if _lock is None:
             text = getattr(self, "_pending_steer", None)
             self._pending_steer = None
-            return text
+            callbacks = list(getattr(self, "_pending_steer_applied_callbacks", []) or [])
+            self._pending_steer_applied_callbacks = []
+            return (text, callbacks) if with_callbacks else text
         with _lock:
             text = self._pending_steer
             self._pending_steer = None
-        return text
+            callbacks = list(getattr(self, "_pending_steer_applied_callbacks", []) or [])
+            self._pending_steer_applied_callbacks = []
+        return (text, callbacks) if with_callbacks else text
+
+    def _restore_pending_steer(self, text: str, callbacks=None) -> None:
+        """Put an undelivered steer back ahead of the next safe boundary."""
+        if not text:
+            return
+        callbacks = list(callbacks or [])
+        _lock = getattr(self, "_pending_steer_lock", None)
+        if _lock is None:
+            existing = getattr(self, "_pending_steer", None)
+            self._pending_steer = (existing + "\n" + text) if existing else text
+            existing_callbacks = list(getattr(self, "_pending_steer_applied_callbacks", []) or [])
+            self._pending_steer_applied_callbacks = existing_callbacks + callbacks
+            return
+        with _lock:
+            if self._pending_steer:
+                self._pending_steer = self._pending_steer + "\n" + text
+            else:
+                self._pending_steer = text
+            existing_callbacks = list(getattr(self, "_pending_steer_applied_callbacks", []) or [])
+            self._pending_steer_applied_callbacks = existing_callbacks + callbacks
+
+    def _notify_pending_steer_applied(self, callbacks) -> None:
+        """Notify receipt listeners after a real tool-result append."""
+        for callback in callbacks or []:
+            try:
+                callback()
+            except Exception:
+                logger.debug("pending steer applied callback failed", exc_info=True)
 
     def _record_file_mutation_result(
         self,

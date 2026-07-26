@@ -89,6 +89,25 @@ class TestSteerDrain:
         agent = _bare_agent()
         assert agent._drain_pending_steer() is None
 
+    def test_delivery_receipt_is_applied_only_after_a_tool_boundary(self):
+        """steer() acceptance is not durable-completion consumption."""
+        agent = _bare_agent()
+        applied = []
+        assert agent.steer("child completed", on_applied=lambda: applied.append("yes"))
+
+        # Merely draining / ending a turn must not fire the completion receipt.
+        text, callbacks = agent._drain_pending_steer(with_callbacks=True)
+        assert text == "child completed"
+        assert isinstance(text, str)
+        assert applied == []
+        agent._restore_pending_steer(text, callbacks)
+
+        messages = [{"role": "tool", "content": "tool result", "tool_call_id": "t1"}]
+        agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=1)
+
+        assert applied == ["yes"]
+        assert STEER_MARKER_OPEN in messages[-1]["content"]
+
 
 class TestActiveTurnRedirect:
     def test_rejects_when_no_turn_is_active(self):

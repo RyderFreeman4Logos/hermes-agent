@@ -11323,16 +11323,18 @@ def _completion_notify_steer_when_busy() -> bool:
         return True
 
 
-def _try_steer_busy_notification(session: dict, evt: dict, text: str) -> str | bool | None:
+def _try_steer_busy_notification(
+    session: dict, evt: dict, text: str, *, on_applied=None
+) -> str | bool | None:
     """Deliver a completion to a running steer-capable agent when allowed.
 
-    ``"steered"`` means the agent accepted a best-effort steer and the event
-    must remain available for a later idle drain. ``"claimed_elsewhere"`` means
-    another consumer owns its durable claim. ``False`` means the session is
-    busy but must use the legacy requeue path; ``None`` means the session was
-    idle and should dispatch a new turn as before. Steer acceptance only
-    buffers the text, so it must not acknowledge durable delivery before model
-    consumption.
+    ``"steered"`` means the agent accepted a best-effort steer.  The optional
+    receipt is invoked only when the agent actually applies it at a tool
+    boundary; acceptance alone remains pending for idle fallback.
+    ``"claimed_elsewhere"`` means another consumer owns its durable claim.
+    ``False`` means the session is busy but must use the legacy requeue path;
+    ``None`` means the session was idle and should dispatch a new turn as
+    before.
     """
     with session["history_lock"]:
         if not session.get("running"):
@@ -11350,8 +11352,32 @@ def _try_steer_busy_notification(session: dict, evt: dict, text: str) -> str | b
     claim = claim_event_delivery(evt, "tui-poller-steer")
     if claim is None:
         return "claimed_elsewhere"
+    # An AIAgent calls its receipt at a later tool boundary.  Third-party
+    # agents may apply synchronously, though, so gate the acknowledgement until
+    # this function has released the first (best-effort) durable claim.  Without
+    # that gate a synchronous callback sees its own temporary claim and marks a
+    # receipt applied without ever recording ``delivered``.
+    receipt_lock = threading.Lock()
+    release_finished = False
+    applied_before_release = False
+
+    def applied_receipt() -> None:
+        nonlocal applied_before_release
+        with receipt_lock:
+            if not release_finished:
+                applied_before_release = True
+                return
+        if callable(on_applied):
+            on_applied()
+
     try:
-        accepted = bool(steer(text))
+        try:
+            accepted = bool(steer(text, on_applied=applied_receipt))
+        except TypeError:
+            # Compatibility with third-party agents which still expose the
+            # historical one-argument steer API.  Those steers cannot prove
+            # application, so the event remains eligible for idle fallback.
+            accepted = bool(steer(text))
     except Exception:
         accepted = False
     if not accepted:
@@ -11365,6 +11391,11 @@ def _try_steer_busy_notification(session: dict, evt: dict, text: str) -> str | b
         # end before consuming that buffer, so leave the durable completion
         # pending for a later idle drain instead of marking it delivered here.
         release_event_delivery(evt, claim, consume_attempt=False)
+        with receipt_lock:
+            release_finished = True
+            apply_now = applied_before_release
+        if apply_now and callable(on_applied):
+            on_applied()
     except Exception as exc:
         logger.warning(
             "TUI busy-steer completion claim release failed: %s: %s",
@@ -11372,6 +11403,226 @@ def _try_steer_busy_notification(session: dict, evt: dict, text: str) -> str | b
             exc,
         )
     return "steered"
+
+
+_COMPLETION_IDLE_BATCH_WINDOW_SECONDS = 0.075
+_COMPLETION_IDLE_BATCH_MAX = 32
+
+
+def _is_terminal_completion_event(evt: dict) -> bool:
+    """Whether an event can share one idle-completion model turn."""
+    return evt.get("type", "completion") in {"completion", "async_delegation"}
+
+
+def _completion_event_requires_visible_response(evt: dict) -> bool:
+    """Failures must never obtain the actionless idle-completion noop policy."""
+    if evt.get("type") == "async_delegation":
+        results = evt.get("results")
+        if isinstance(results, list) and any(
+            isinstance(result, dict)
+            and (
+                str(result.get("status") or "").lower()
+                in {"failed", "error", "cancelled"}
+                or (
+                    result.get("exit_code") is not None
+                    and str(result.get("exit_code")) not in {"0", "0.0"}
+                )
+            )
+            for result in results
+        ):
+            return True
+        status = str(evt.get("status") or "").lower()
+        return status in {"failed", "error", "cancelled"}
+    try:
+        if int(evt.get("exit_code", 0) or 0) != 0:
+            return True
+    except (TypeError, ValueError):
+        return True
+    return str(evt.get("completion_reason") or "exited") in {
+        "failed_start", "killed", "lost", "failed",
+    }
+
+
+def _format_idle_completion_batch(entries: list[tuple[dict, str]]) -> str:
+    """Format a bounded, independently traceable idle completion batch."""
+    if len(entries) == 1:
+        return entries[0][1]
+    lines = [
+        f"[IMPORTANT: BACKGROUND COMPLETION BATCH: {len(entries)}]",
+        "Background completions arrived while no active tool boundary was available.",
+        "Each entry is independently traceable; do not silently ignore failed entries.",
+    ]
+    for index, (evt, text) in enumerate(entries, 1):
+        process_id = str(
+            evt.get("process_id")
+            or evt.get("session_id")
+            or evt.get("delegation_id")
+            or f"event-{index}"
+        )
+        status = str(evt.get("status") or evt.get("completion_reason") or "completed")
+        exit_code = evt.get("exit_code")
+        results = evt.get("results")
+        summary = str(evt.get("summary") or "").strip()
+        if not summary and isinstance(results, list):
+            result_summaries = [
+                str(result.get("summary") or "").strip()
+                for result in results
+                if isinstance(result, dict) and result.get("summary")
+            ]
+            summary = " | ".join(result_summaries)
+        output = str(evt.get("output") or evt.get("output_tail") or "").strip()
+        if len(output) > 2000:
+            output = output[-2000:]
+        lines.extend(
+            [
+                "",
+                f"[{index}] process_id: {process_id}",
+                f"event_type: {evt.get('type', 'completion')}",
+                f"status: {status}",
+                f"exit_code: {exit_code if exit_code is not None else 'n/a'}",
+                f"summary: {summary or '(none provided)'}",
+                f"output_tail: {output or '(none provided)'}",
+                f"notification: {text}",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def _complete_steered_notification(evt: dict, receipt: dict) -> None:
+    """Durably acknowledge a steer only after its marker reached a tool result."""
+    from tools.async_delegation import (
+        claim_event_delivery,
+        complete_event_delivery,
+        release_event_delivery,
+    )
+
+    try:
+        claim = claim_event_delivery(evt, "tui-poller-steer-applied")
+        if claim is None:
+            # The model did receive the result.  Another valid consumer may
+            # have won the durable race, but this poller must not manufacture a
+            # second idle model turn for an already-applied steer.
+            receipt["applied"] = True
+            return
+        try:
+            complete_event_delivery(evt, claim)
+        except Exception:
+            release_event_delivery(evt, claim, consume_attempt=False)
+            raise
+        receipt["applied"] = True
+    except Exception:
+        logger.warning("Failed to acknowledge applied completion steer", exc_info=True)
+
+
+def _drain_idle_completion_backlog(
+    sid: str, session: dict, emitted: set, process_registry
+) -> list[tuple[dict, str]]:
+    """Drain an existing idle backlog plus a small coalescing window.
+
+    The registry applies the same positive ownership proof as the poller.  A
+    terminal completion is model-batched; non-terminal watch notifications are
+    put back for their normal individual delivery path.
+    """
+    def drain_once() -> list[tuple[dict, str]]:
+        try:
+            drained = process_registry.drain_notifications(
+                session_key=session.get("session_key", ""),
+                owns_event=lambda evt: _session_owns_notification_event(sid, session, evt),
+                skip_poll_observed=False,
+            )
+        except Exception:
+            logger.debug("Failed to drain completion backlog", exc_info=True)
+            return []
+        selected: list[tuple[dict, str]] = []
+        for evt, text in drained:
+            if not _is_terminal_completion_event(evt):
+                process_registry.completion_queue.put(evt)
+                continue
+            key = _notification_event_dedup_key(evt)
+            if key not in emitted:
+                _emit("status.update", sid, {"kind": "process", "text": text})
+                emitted.add(key)
+            selected.append((evt, text))
+        return selected
+
+    entries = drain_once()
+    if len(entries) < _COMPLETION_IDLE_BATCH_MAX:
+        # Deliberately wait only one compact window. This catches a real burst
+        # without turning a quiet idle completion into an observable delay.
+        time.sleep(_COMPLETION_IDLE_BATCH_WINDOW_SECONDS)
+        remaining = _COMPLETION_IDLE_BATCH_MAX - len(entries)
+        later_entries = drain_once()
+        entries.extend(later_entries[:remaining])
+        # ``drain_notifications`` owns the queue while it formats events, so
+        # return over-cap arrivals explicitly instead of dropping a true burst.
+        for evt, _text in later_entries[remaining:]:
+            process_registry.completion_queue.put(evt)
+    return entries
+
+
+def _dispatch_idle_completion_batch(
+    rid: str, sid: str, session: dict, entries: list[tuple[dict, str]], *, consumer: str
+) -> bool:
+    """Claim each event, then inject one idle turn without merging durability."""
+    if len(entries) > _COMPLETION_IDLE_BATCH_MAX:
+        # Batch size caps model input only. The excess events remain queued and
+        # retain their individual durable delivery records for the next batch.
+        from tools.process_registry import process_registry
+
+        for evt, _text in entries[_COMPLETION_IDLE_BATCH_MAX:]:
+            process_registry.completion_queue.put(evt)
+        entries = entries[:_COMPLETION_IDLE_BATCH_MAX]
+    from tools.async_delegation import (
+        claim_event_delivery,
+        complete_event_delivery,
+        release_event_delivery,
+    )
+
+    claims: list[tuple[dict, str]] = []
+    for evt, _text in entries:
+        claim = claim_event_delivery(evt, consumer)
+        if claim is not None:
+            claims.append((evt, claim))
+    if not claims:
+        with session["history_lock"]:
+            session["running"] = False
+        return False
+
+    claimed_entries = [
+        (evt, text)
+        for evt, text in entries
+        if any(evt is claimed_evt for claimed_evt, _claim in claims)
+    ]
+    batch_text = _format_idle_completion_batch(claimed_entries)
+    allow_silent_noop = not any(
+        _completion_event_requires_visible_response(evt) for evt, _text in claimed_entries
+    )
+    display_kind = None
+    display_metadata = None
+    if len(claimed_entries) == 1 and claimed_entries[0][0].get("type") == "async_delegation":
+        display_kind = "async_delegation_complete"
+        display_metadata = _async_delegation_display_metadata(claimed_entries[0][0])
+    try:
+        _run_prompt_submit(
+            rid,
+            sid,
+            session,
+            batch_text,
+            display_kind=display_kind,
+            display_metadata=display_metadata,
+            turn_origin="idle_completion",
+            allow_silent_noop=allow_silent_noop,
+        )
+        for evt, claim in claims:
+            complete_event_delivery(evt, claim)
+        return True
+    except Exception:
+        for evt, claim in claims:
+            release_event_delivery(evt, claim)
+        with session["history_lock"]:
+            session["running"] = False
+        logger.warning("Idle completion batch dispatch failed", exc_info=True)
+        return False
 
 
 def _notification_poller_loop(
@@ -11394,11 +11645,11 @@ def _notification_poller_loop(
     """
     from tools.process_registry import process_registry, format_process_notification
 
-    _emitted = set()  # dedup re-queued events so same completion isn't emitted 50 times while session is busy
+    _emitted = set()  # dedup re-queued events so same completion isn't emitted repeatedly
     _last_kanban_poll = 0.0
-    # A successful steer only buffers the notification in the active turn. Keep
-    # the event off the blocking shared queue, but retry this list at the normal
-    # busy-poller cadence until the session can inject a durable idle-drain turn.
+    # Each accepted steer has its own receipt. This local list never gates
+    # completion_queue.get(): other completions must continue into the active
+    # turn instead of waiting behind the first accepted steer.
     _steered_pending: list[dict] = []
     while not stop_event.is_set() and not session.get("_finalized"):
         _now = time.monotonic()
@@ -11407,17 +11658,11 @@ def _notification_poller_loop(
             try:
                 _kanban_texts = _collect_kanban_notifications(session)
             except Exception as _kb_exc:
-                print(
-                    f"[tui_gateway] kanban notification poll failed: "
-                    f"{type(_kb_exc).__name__}: {_kb_exc}",
-                    file=sys.stderr,
-                )
+                print(f"[tui_gateway] kanban notification poll failed: {type(_kb_exc).__name__}: {_kb_exc}", file=sys.stderr)
                 _kanban_texts = []
             if _kanban_texts:
                 for _kb_text in _kanban_texts:
                     _emit("status.update", sid, {"kind": "process", "text": _kb_text})
-                # Events are cursor-claimed (never re-queued), so buffer them
-                # until the session is idle instead of dropping the agent turn.
                 session.setdefault("_kanban_pending", []).extend(_kanban_texts)
             _pending = session.get("_kanban_pending") or []
             if _pending:
@@ -11433,21 +11678,32 @@ def _notification_poller_loop(
                         _emit("message.start", sid)
                         _run_prompt_submit(rid, sid, session, "\n".join(_batch))
                     except Exception as exc:
-                        print(
-                            f"[tui_gateway] kanban notification dispatch failed: "
-                            f"{type(exc).__name__}: {exc}",
-                            file=sys.stderr,
-                        )
+                        print(f"[tui_gateway] kanban notification dispatch failed: {type(exc).__name__}: {exc}", file=sys.stderr)
                         with session["history_lock"]:
                             session["running"] = False
-        _steered_retry = bool(_steered_pending)
-        if _steered_retry:
-            evt = _steered_pending.pop(0)
-        else:
-            try:
-                evt = process_registry.completion_queue.get(timeout=0.5)
-            except Exception:
+        _steered_pending = [receipt for receipt in _steered_pending if not receipt.get("applied")]
+        if _steered_pending:
+            with session["history_lock"]:
+                idle = not session.get("running")
+                if idle:
+                    session["running"] = True
+            if idle:
+                entries = [(receipt["evt"], receipt["text"]) for receipt in _steered_pending]
+                _steered_pending.clear()
+                entries.extend(_drain_idle_completion_backlog(sid, session, _emitted, process_registry))
+                _dispatch_idle_completion_batch(
+                    f"__notif__{int(time.time() * 1000)}", sid, session, entries,
+                    consumer="tui-poller-idle-batch",
+                )
                 continue
+        try:
+            # Pending receipts need a shorter wakeup so a turn-end fallback is
+            # prompt, but they never become head-of-line queue ownership.
+            evt = process_registry.completion_queue.get(
+                timeout=0.05 if _steered_pending else 0.5
+            )
+        except Exception:
+            continue
 
         # Multiple desktop sessions share this one process-wide queue. Only
         # consume events that belong to *this* session — otherwise a background
@@ -11498,29 +11754,31 @@ def _notification_poller_loop(
             _emit("status.update", sid, {"kind": "process", "text": text})
             _emitted.add(_dedup_key)
 
-        # A pending retry was already offered to steer(); do not offer it again
-        # while it waits for the current turn to finish.
-        steer_result = None if _steered_retry else _try_steer_busy_notification(session, evt, text)
+        # Allocate the receipt before steer() so a tool-boundary application
+        # cannot be mistaken for acceptance.  A callback from AIAgent is fired
+        # only after the marker is attached to a tool result.
+        receipt = {"evt": evt, "text": text, "applied": False}
+        steer_result = _try_steer_busy_notification(
+            session,
+            evt,
+            text,
+            on_applied=lambda evt=evt, receipt=receipt: _complete_steered_notification(
+                evt, receipt
+            ),
+        )
         if steer_result == "steered":
-            _steered_pending.append(evt)
-            time.sleep(0.25)
+            _steered_pending.append(receipt)
             continue
         if steer_result == "claimed_elsewhere":
             continue
 
         _requeued = steer_result is False
         if _requeued:
-            if _steered_retry:
-                _steered_pending.append(evt)
-            else:
-                process_registry.completion_queue.put(evt)
+            process_registry.completion_queue.put(evt)
         else:
             with session["history_lock"]:
                 if session.get("running"):
-                    if _steered_retry:
-                        _steered_pending.append(evt)
-                    else:
-                        process_registry.completion_queue.put(evt)
+                    process_registry.completion_queue.put(evt)
                     _requeued = True
                 else:
                     session["running"] = True
@@ -11531,39 +11789,17 @@ def _notification_poller_loop(
             time.sleep(0.25)
             continue
 
-        rid = f"__notif__{int(time.time() * 1000)}"
-        from tools.async_delegation import (
-            claim_event_delivery, complete_event_delivery, release_event_delivery,
+        entries = [(evt, text)]
+        entries.extend(
+            _drain_idle_completion_backlog(sid, session, _emitted, process_registry)
         )
-        _claim = claim_event_delivery(evt, "tui-poller")
-        if _claim is None:
-            continue
-        try:
-            _emit("message.start", sid)
-            if evt.get("type") == "async_delegation":
-                _run_prompt_submit(
-                    rid,
-                    sid,
-                    session,
-                    text,
-                    display_kind="async_delegation_complete",
-                    display_metadata=_async_delegation_display_metadata(evt),
-                    turn_origin="idle_completion",
-                )
-            else:
-                _run_prompt_submit(
-                    rid, sid, session, text, turn_origin="idle_completion"
-                )
-            complete_event_delivery(evt, _claim)
-        except Exception as exc:
-            release_event_delivery(evt, _claim)
-            print(
-                f"[tui_gateway] notification poller dispatch failed: "
-                f"{type(exc).__name__}: {exc}",
-                file=sys.stderr,
-            )
-            with session["history_lock"]:
-                session["running"] = False
+        _dispatch_idle_completion_batch(
+            f"__notif__{int(time.time() * 1000)}",
+            sid,
+            session,
+            entries,
+            consumer="tui-poller-idle-batch",
+        )
 
     # Drain any remaining events after stop signal (process all pending
     # before exiting so nothing is lost on shutdown). Events owned by other
@@ -11572,7 +11808,9 @@ def _notification_poller_loop(
     # Return steered-but-unconsumed events to the shared queue if this poller
     # stops before it gets an idle retry. Their durable claim was released, so
     # another live poller or a later session can still deliver them.
-    deferred: list = list(_steered_pending)
+    deferred: list = [
+        receipt["evt"] for receipt in _steered_pending if not receipt.get("applied")
+    ]
     while not process_registry.completion_queue.empty():
         try:
             evt = process_registry.completion_queue.get_nowait()
@@ -11775,6 +12013,7 @@ def _run_prompt_submit(
     rid, sid: str, session: dict, text: Any, *, display_kind: str | None = None,
     display_metadata: dict | None = None,
     turn_origin: str | None = None,
+    allow_silent_noop: bool | None = None,
 ) -> None:
     with session["history_lock"]:
         history = list(session["history"])
@@ -11993,7 +12232,11 @@ def _run_prompt_submit(
             }
             if turn_origin is not None:
                 run_kwargs["turn_origin"] = turn_origin
-                run_kwargs["allow_silent_noop"] = turn_origin == "idle_completion"
+                run_kwargs["allow_silent_noop"] = (
+                    turn_origin == "idle_completion"
+                    if allow_silent_noop is None
+                    else bool(allow_silent_noop)
+                )
             try:
                 if "task_id" in inspect.signature(agent.run_conversation).parameters:
                     run_kwargs["task_id"] = session["session_key"]
@@ -12431,34 +12674,44 @@ def _run_prompt_submit(
                 owns_event=lambda e: _session_owns_notification_event(sid, session, e),
                 skip_poll_observed=False,
             )
-            for index, (_evt, synth) in enumerate(drained):
+            # One post-turn drain may recover a burst that raced the active
+            # tool chain.  Preserve individual durability claims, but give the
+            # model one structured idle-completion batch rather than N nested
+            # idle turns/API calls.  Watch notifications are not terminal
+            # completions, so hand them back to the poller unchanged.
+            terminal = [
+                (evt, synth)
+                for evt, synth in drained
+                if _is_terminal_completion_event(evt)
+            ]
+            for evt, _synth in drained:
+                if not _is_terminal_completion_event(evt):
+                    process_registry.completion_queue.put(evt)
+            if terminal:
+                # Give a just-finished tool chain the same compact coalescing
+                # window as an already-idle poller.  Without this, completions
+                # arriving a few milliseconds after the first post-turn drain
+                # can each start their own idle turn.
+                terminal.extend(
+                    _drain_idle_completion_backlog(
+                        sid, session, emitted=set(), process_registry=process_registry
+                    )
+                )
                 with session["history_lock"]:
                     if session.get("running"):
-                        for pending_evt, _pending_synth in drained[index:]:
+                        for pending_evt, _pending_synth in terminal:
                             process_registry.completion_queue.put(pending_evt)
-                        break
-                    session["running"] = True
-                from tools.async_delegation import (
-                    claim_event_delivery, complete_event_delivery, release_event_delivery,
-                )
-                _claim = claim_event_delivery(_evt, "tui-post-turn")
-                if _claim is None:
-                    continue
-                try:
-                    _emit("message.start", sid)
-                    _run_prompt_submit(
-                        rid, sid, session, synth, turn_origin="idle_completion"
+                        terminal = []
+                    else:
+                        session["running"] = True
+                if terminal:
+                    _dispatch_idle_completion_batch(
+                        rid,
+                        sid,
+                        session,
+                        terminal,
+                        consumer="tui-post-turn-batch",
                     )
-                    complete_event_delivery(_evt, _claim)
-                except Exception as _n_exc:
-                    release_event_delivery(_evt, _claim)
-                    print(
-                        f"[tui_gateway] completion notification dispatch failed: "
-                        f"{type(_n_exc).__name__}: {_n_exc}",
-                        file=sys.stderr,
-                    )
-                    with session["history_lock"]:
-                        session["running"] = False
         except Exception as _drain_exc:
             print(
                 f"[tui_gateway] completion queue drain failed: "

@@ -3991,26 +3991,18 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
         assert nested_started.wait(timeout=5)
         threads[0].join(timeout=5)
         assert not threads[0].is_alive()
-        # Membership, not order: the completion_queue is process-global, and
-        # notification pollers leaked by earlier session.init tests in this
-        # file legitimately steal-and-requeue foreign-session events (see
-        # _notification_poller_loop's belongs-elsewhere branch), rotating the
-        # queue. The requeue contract is that batch_2 and batch_3 both remain
-        # queued (never consumed) while batch_1's turn is in flight — so drain
-        # with a deadline (an event may be transiently held by a poller
-        # mid-cycle) and assert exactly {batch_2, batch_3} come back.
-        queued: dict = {}
-        deadline = time.time() + 5.0
-        while time.time() < deadline and set(queued) != {
-            "proc_batch_2",
-            "proc_batch_3",
-        }:
-            try:
-                evt = isolated_queue.get(timeout=0.1)
-            except _queue_mod.Empty:
-                continue
-            queued[evt["session_id"]] = evt
-        assert set(queued) == {"proc_batch_2", "proc_batch_3"}
+        # A post-turn drain now owns the existing terminal backlog and starts
+        # exactly one structured idle-completion turn.  It must not leave two
+        # more individually queued turns behind the first notification.
+        assert isolated_queue.empty()
+        release_nested.set()
+        for thread in threads:
+            thread.join(timeout=5)
+        assert all(not thread.is_alive() for thread in threads)
+        assert len(turns) == 2
+        completion_batch = turns[1]
+        assert "[IMPORTANT: BACKGROUND COMPLETION BATCH: 3]" in completion_batch
+        assert all(event["session_id"] in completion_batch for event in events)
     finally:
         release_nested.set()
         for thread in threads:
@@ -12261,12 +12253,8 @@ def test_busy_steer_acceptance_releases_durable_claim_for_idle_retry(monkeypatch
     assert async_delegation.claim_event_delivery(evt, "tui-idle-drain") == "claim-tui-idle-drain"
 
 
-def test_notification_poller_retries_accepted_steer_when_idle(monkeypatch):
-    """An accepted steer stays available until the idle-drain injects it.
-
-    The first retry remains busy, then the session becomes idle.  The same
-    event must be injected exactly once without asking ``agent.steer`` again.
-    """
+def test_notification_poller_falls_back_when_accepted_steer_never_drains(monkeypatch):
+    """A merely accepted steer is retried through one idle turn if its turn ends."""
     import queue as _queue_mod
     import tools.async_delegation as async_delegation
     import tools.process_registry as process_registry_module
@@ -12320,7 +12308,7 @@ def test_notification_poller_retries_accepted_steer_when_idle(monkeypatch):
 
     def complete(evt, token):
         assert evt is event
-        assert token == "claim-tui-poller"
+        assert token == "claim-tui-poller-idle-batch"
         delivery["held"] = False
         delivery["delivered"] = True
 
@@ -12328,21 +12316,16 @@ def test_notification_poller_retries_accepted_steer_when_idle(monkeypatch):
     monkeypatch.setattr(async_delegation, "release_event_delivery", release)
     monkeypatch.setattr(async_delegation, "complete_event_delivery", complete)
 
-    session = _session(
-        agent=types.SimpleNamespace(steer=lambda text: steers.append(text) or True),
-        running=True,
-    )
-    sleeps = []
-
-    def fake_sleep(seconds):
-        sleeps.append(seconds)
-        # First backoff follows the accepted steer. The second is the retry
-        # while still busy; after it, the next poll cycle must idle-drain.
-        if len(sleeps) == 2:
+    class _EndsBeforeDrainAgent:
+        def steer(self, text):
+            steers.append(text)
+            # Simulate the provider/turn ending before any actual tool-result
+            # drain: acceptance is not delivery, so the poller must batch-fallback.
             with session["history_lock"]:
                 session["running"] = False
+            return True
 
-    monkeypatch.setattr(server.time, "sleep", fake_sleep)
+    session = _session(agent=_EndsBeforeDrainAgent(), running=True)
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
@@ -12352,10 +12335,9 @@ def test_notification_poller_retries_accepted_steer_when_idle(monkeypatch):
     server._notification_poller_loop(stop_event, "sid_steer_retry", session)
 
     assert steers == ["child completed"]
-    assert claims == ["tui-poller-steer", "tui-poller"]
+    assert claims == ["tui-poller-steer", "tui-poller-idle-batch"]
     assert releases == ["claim-tui-poller-steer"]
     assert delivery["delivered"] is True
-    assert sleeps == [0.25, 0.25]
     assert len(submitted) == 1
     assert submitted[0][0][1] == "sid_steer_retry"
     assert submitted[0][0][3] == "child completed"
@@ -12515,6 +12497,247 @@ def test_notification_poller_emits_distinct_watch_matches_once(monkeypatch):
         server._sessions.pop("sid_watch_dedup", None)
         while not process_registry.completion_queue.empty():
             process_registry.completion_queue.get_nowait()
+
+
+def _async_completion_event(
+    index: int, *, exit_code: int = 0, origin_ui_session_id: str = ""
+) -> dict:
+    """Create an owned durable completion for notification-delivery tests."""
+    return {
+        "type": "async_delegation",
+        "delegation_id": f"deleg-burst-{index}",
+        "session_key": "completion-owner",
+        "origin_ui_session_id": origin_ui_session_id,
+        "status": "completed" if exit_code == 0 else "failed",
+        "results": [
+            {
+                "status": "completed" if exit_code == 0 else "failed",
+                "summary": f"result-{index}",
+            }
+        ],
+        "exit_code": exit_code,
+        "output": f"output tail {index}",
+    }
+
+
+def test_notification_poller_steers_burst_without_hol_or_idle_duplicates(monkeypatch):
+    """Seven busy completions all reach one tool-chain, not seven later turns."""
+    import queue as _queue_mod
+
+    import tools.async_delegation as async_delegation
+    from tools.process_registry import process_registry
+
+    class _BoundaryAgent:
+        def __init__(self):
+            self.callbacks = []
+            self.texts = []
+            self.accepted = threading.Event()
+
+        def steer(self, text, *, on_applied=None):
+            self.texts.append(text)
+            self.callbacks.append(on_applied)
+            if len(self.callbacks) == 7:
+                self.accepted.set()
+            return True
+
+        def apply_all(self):
+            for callback in list(self.callbacks):
+                assert callback is not None
+                callback()
+
+    delivery = {"held": set(), "delivered": set(), "completed": []}
+
+    def claim(evt, consumer):
+        delegation_id = evt["delegation_id"]
+        if delegation_id in delivery["held"] or delegation_id in delivery["delivered"]:
+            return None
+        delivery["held"].add(delegation_id)
+        return f"{consumer}:{delegation_id}"
+
+    def release(evt, token, *, consume_attempt=True):
+        assert consume_attempt is False
+        delivery["held"].discard(evt["delegation_id"])
+
+    def complete(evt, token):
+        delegation_id = evt["delegation_id"]
+        assert delegation_id in delivery["held"]
+        delivery["held"].remove(delegation_id)
+        delivery["delivered"].add(delegation_id)
+        delivery["completed"].append((delegation_id, token))
+
+    agent = _BoundaryAgent()
+    session = _session(
+        agent=agent, running=True, session_key="completion-owner"
+    )
+    stop = threading.Event()
+    events = [
+        _async_completion_event(index, origin_ui_session_id="sid-burst-steer")
+        for index in range(7)
+    ]
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    for event in events:
+        isolated_queue.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_run_prompt_submit", lambda *_args, **_kwargs: pytest.fail("idle retry"))
+    monkeypatch.setattr(async_delegation, "claim_event_delivery", claim)
+    monkeypatch.setattr(async_delegation, "release_event_delivery", release)
+    monkeypatch.setattr(async_delegation, "complete_event_delivery", complete)
+    server._sessions["sid-burst-steer"] = session
+
+    worker = threading.Thread(
+        target=server._notification_poller_loop,
+        args=(stop, "sid-burst-steer", session),
+    )
+    try:
+        worker.start()
+        assert agent.accepted.wait(timeout=2), "queue was blocked after first steer"
+        agent.apply_all()
+        stop.set()
+        worker.join(timeout=2)
+
+        assert not worker.is_alive()
+        assert len(agent.texts) == 7
+        assert len(delivery["completed"]) == 7
+        assert delivery["delivered"] == {event["delegation_id"] for event in events}
+        assert isolated_queue.empty()
+    finally:
+        stop.set()
+        worker.join(timeout=2)
+        server._sessions.pop("sid-burst-steer", None)
+
+
+def test_notification_poller_batches_unapplied_steers_and_completes_durable_once(monkeypatch):
+    """A turn ending before its drain yields one batch; a restart cannot replay it."""
+    import queue as _queue_mod
+
+    import tools.async_delegation as async_delegation
+    from tools.process_registry import process_registry
+
+    class _NoBoundaryAgent:
+        def __init__(self):
+            self.accepted = threading.Event()
+            self.count = 0
+
+        def steer(self, _text, *, on_applied=None):
+            self.count += 1
+            if self.count == 7:
+                self.accepted.set()
+            # Intentionally do not call on_applied: the active turn finishes
+            # after its final drain and must fall back to one idle batch.
+            return True
+
+    delivery = {"held": set(), "delivered": set(), "completed": []}
+
+    def claim(evt, consumer):
+        delegation_id = evt["delegation_id"]
+        if delegation_id in delivery["held"] or delegation_id in delivery["delivered"]:
+            return None
+        delivery["held"].add(delegation_id)
+        return f"{consumer}:{delegation_id}"
+
+    def release(evt, _token, *, consume_attempt=True):
+        assert consume_attempt is False
+        delivery["held"].discard(evt["delegation_id"])
+
+    def complete(evt, token):
+        delegation_id = evt["delegation_id"]
+        assert delegation_id in delivery["held"]
+        delivery["held"].remove(delegation_id)
+        delivery["delivered"].add(delegation_id)
+        delivery["completed"].append((delegation_id, token))
+
+    idle_turns = []
+    batch_started = threading.Event()
+    stop = threading.Event()
+    session = _session(
+        agent=_NoBoundaryAgent(), running=True, session_key="completion-owner"
+    )
+    events = [
+        _async_completion_event(index, origin_ui_session_id="sid-burst-fallback")
+        for index in range(7)
+    ]
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    for event in events:
+        isolated_queue.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_COMPLETION_IDLE_BATCH_WINDOW_SECONDS", 0.01)
+    monkeypatch.setattr(async_delegation, "claim_event_delivery", claim)
+    monkeypatch.setattr(async_delegation, "release_event_delivery", release)
+    monkeypatch.setattr(async_delegation, "complete_event_delivery", complete)
+
+    def submit(_rid, _sid, _session, text, **kwargs):
+        idle_turns.append((text, kwargs))
+        batch_started.set()
+        stop.set()
+
+    monkeypatch.setattr(server, "_run_prompt_submit", submit)
+    server._sessions["sid-burst-fallback"] = session
+    worker = threading.Thread(
+        target=server._notification_poller_loop,
+        args=(stop, "sid-burst-fallback", session),
+    )
+    try:
+        worker.start()
+        assert session["agent"].accepted.wait(timeout=2)
+        # Model/provider return before the pending steer reaches a tool result.
+        with session["history_lock"]:
+            session["running"] = False
+        assert batch_started.wait(timeout=2)
+        worker.join(timeout=2)
+
+        assert len(idle_turns) == 1
+        text, kwargs = idle_turns[0]
+        assert "[IMPORTANT: BACKGROUND COMPLETION BATCH: 7]" in text
+        assert all(event["delegation_id"] in text for event in events)
+        assert kwargs["turn_origin"] == "idle_completion"
+        assert kwargs["allow_silent_noop"] is True
+        assert len(delivery["completed"]) == 7
+        # A recreated/restarted consumer cannot claim a record already
+        # completed by the one batch.
+        assert all(claim(event, "restart") is None for event in events)
+        assert isolated_queue.empty()
+    finally:
+        stop.set()
+        worker.join(timeout=2)
+        server._sessions.pop("sid-burst-fallback", None)
+
+
+def test_idle_completion_failure_disables_silent_noop_and_stays_traceable(monkeypatch):
+    """A failed background job must not be hidden by the clean-exit noop policy."""
+    dispatched = []
+    session = _session(running=True)
+    event = _async_completion_event(99, exit_code=7)
+    # Parent-level failure status remains visible even when a provider supplied
+    # no per-child result records.
+    assert server._completion_event_requires_visible_response(
+        {"type": "async_delegation", "status": "failed", "results": []}
+    )
+    text = f"[IMPORTANT: async child {event['delegation_id']} failed]"
+
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda _rid, _sid, _session, payload, **kwargs: dispatched.append((payload, kwargs)),
+    )
+    assert server._dispatch_idle_completion_batch(
+        "rid-failure",
+        "sid-failure",
+        session,
+        [(event, text)],
+        consumer="failure-test",
+    )
+
+    assert len(dispatched) == 1
+    payload, kwargs = dispatched[0]
+    assert payload == text
+    assert kwargs["turn_origin"] == "idle_completion"
+    assert kwargs["allow_silent_noop"] is False
+    assert event["delegation_id"] in payload
+    assert event["exit_code"] == 7
 
 
 def test_notification_event_dedup_key_keeps_completions_one_shot():

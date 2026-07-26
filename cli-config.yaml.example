@@ -200,10 +200,10 @@ model:
 # =============================================================================
 # Runtime Coordination
 # =============================================================================
-# Provider-aware cache keepalive/check-in policy for managed long work.
+# Provider-aware warm KV timeout/check-in policy for managed long work.
 runtime:
   # Exact provider -> canonical family -> default -> documented 3300-second fallback.
-  kv_cache_ttl:
+  warm_kv_timeout:
     default: 3300
     providers:
       openai: 3300

@@ -19,7 +19,7 @@ from typing import Any, Callable, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
-DOCUMENTED_FALLBACK_TTL_SECONDS = 3300
+DOCUMENTED_FALLBACK_WARM_KV_TIMEOUT_SECONDS = 3300
 _current_provider: contextvars.ContextVar[str] = contextvars.ContextVar(
     "runtime_heartbeat_provider", default=""
 )
@@ -57,16 +57,20 @@ def canonical_provider_family(provider: str | None) -> str:
     return value
 
 
-def resolve_kv_cache_ttl(
+def resolve_warm_kv_timeout(
     runtime_config: Optional[Dict[str, Any]], provider: str | None,
-    *, fallback: int = DOCUMENTED_FALLBACK_TTL_SECONDS,
+    *, fallback: int = DOCUMENTED_FALLBACK_WARM_KV_TIMEOUT_SECONDS,
 ) -> int:
-    """Resolve TTL: exact provider, canonical family, default, documented fallback."""
+    """Resolve warm-up timeout: new key, legacy key, provider, then fallback."""
     cfg = runtime_config if isinstance(runtime_config, dict) else {}
-    ttl_cfg = cfg.get("kv_cache_ttl")
-    if not isinstance(ttl_cfg, dict):
+    timeout_cfg = cfg.get("warm_kv_timeout")
+    if not isinstance(timeout_cfg, dict):
+        # ``kv_cache_ttl`` described the wrong behavior.  Keep it as a read
+        # alias so existing user config continues to set the warm-up timeout.
+        timeout_cfg = cfg.get("kv_cache_ttl")
+    if not isinstance(timeout_cfg, dict):
         return fallback
-    providers = ttl_cfg.get("providers")
+    providers = timeout_cfg.get("providers")
     providers = providers if isinstance(providers, dict) else {}
     lookup = (provider or "").strip().lower()
     lowered = {str(k).strip().lower(): v for k, v in providers.items()}
@@ -74,7 +78,7 @@ def resolve_kv_cache_ttl(
     for candidate in candidates:
         value = lowered.get(candidate) if candidate else None
         if value is None and candidate == "default":
-            value = ttl_cfg.get("default")
+            value = timeout_cfg.get("default")
         if value is None:
             continue
         try:
@@ -103,7 +107,7 @@ def _heartbeat_settings(runtime: Dict[str, Any], provider: str | None) -> tuple[
     heartbeat = heartbeat if isinstance(heartbeat, dict) else {}
     if not heartbeat.get("enabled", True) or heartbeat.get("mode", "per_target") != "per_target":
         return False, 0.0
-    ttl = resolve_kv_cache_ttl(runtime, provider)
+    warm_kv_timeout = resolve_warm_kv_timeout(runtime, provider)
     try:
         ratio = float(heartbeat.get("safety_ratio", 0.8))
     except (TypeError, ValueError):
@@ -113,12 +117,12 @@ def _heartbeat_settings(runtime: Dict[str, Any], provider: str | None) -> tuple[
     except (TypeError, ValueError):
         minimum = 60.0
     try:
-        maximum = float(heartbeat.get("max_interval_seconds", ttl))
+        maximum = float(heartbeat.get("max_interval_seconds", warm_kv_timeout))
     except (TypeError, ValueError):
-        maximum = float(ttl)
+        maximum = float(warm_kv_timeout)
     minimum = max(1.0, minimum)
     maximum = max(minimum, maximum)
-    return True, max(minimum, min(maximum, ttl * max(0.0, ratio)))
+    return True, max(minimum, min(maximum, warm_kv_timeout * max(0.0, ratio)))
 
 
 def _reset_on_caller_activation(runtime: Dict[str, Any]) -> bool:

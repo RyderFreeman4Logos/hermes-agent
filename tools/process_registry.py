@@ -2390,8 +2390,10 @@ def format_process_notification(evt: dict) -> "str | None":
     late_bits = ""
     if is_late:
         late_bits = (
-            f" LATE by {int(lag)}s — if unrelated to the current goal, "
-            f"ACK in ≤1 line and do not restate output or write long analysis. "
+            f" LATE by {int(lag)}s — if unrelated to the current task and no user "
+            f"decision is needed, return no visible text if no action is needed. "
+            f"Only produce visible text for a failure, a needed decision, or something "
+            f"relevant to the current task; do not restate output or write long analysis. "
             f"Full log remains available via process(action='log')."
         )
     elif compact:

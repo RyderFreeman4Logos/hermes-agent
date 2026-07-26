@@ -1389,7 +1389,8 @@ def test_format_completion_event_marks_late_delivery(monkeypatch):
 
     assert result is not None
     assert "LATE by" in result
-    assert "ACK in ≤1 line" in result
+    assert "ACK in ≤1 line" not in result
+    assert "no visible text if no action" in result
     assert "do not restate output" in result
 
 

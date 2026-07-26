@@ -1154,7 +1154,9 @@ DEFAULT_CONFIG = {
         "heartbeat": {
             "enabled": True,
             "mode": "per_target",
-            "safety_ratio": 0.8,
+            # 1.0 keeps check-in interval equal to warm_kv_timeout. Set
+            # below 1.0 only when you want an earlier re-arm margin.
+            "safety_ratio": 1.0,
             "min_interval_seconds": 60,
             "max_interval_seconds": 3300,
             "reset_on_caller_activation": True,

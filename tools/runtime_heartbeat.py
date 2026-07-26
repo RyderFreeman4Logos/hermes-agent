@@ -109,9 +109,12 @@ def _heartbeat_settings(runtime: Dict[str, Any], provider: str | None) -> tuple[
         return False, 0.0
     warm_kv_timeout = resolve_warm_kv_timeout(runtime, provider)
     try:
-        ratio = float(heartbeat.get("safety_ratio", 0.8))
+        # Default 1.0: configured warm_kv_timeout already encodes the
+        # operator's chosen check-in cadence.  A second implicit 0.8
+        # "safety" factor was silently turning 3300s into 2640s.
+        ratio = float(heartbeat.get("safety_ratio", 1.0))
     except (TypeError, ValueError):
-        ratio = 0.8
+        ratio = 1.0
     try:
         minimum = float(heartbeat.get("min_interval_seconds", 60))
     except (TypeError, ValueError):

@@ -213,7 +213,9 @@ runtime:
   heartbeat:
     enabled: true
     mode: per_target
-    safety_ratio: 0.8
+    # Multiplier on warm_kv_timeout for the check-in interval (default 1.0).
+    # Set to e.g. 0.8 only if you want to re-arm before the warm timeout.
+    safety_ratio: 1.0
     min_interval_seconds: 60
     max_interval_seconds: 3300
     reset_on_caller_activation: true

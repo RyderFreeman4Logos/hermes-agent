@@ -14803,7 +14803,7 @@ def test_tool_complete_attaches_active_background_timer_snapshot(monkeypatch):
 
     class _Heartbeat:
         @staticmethod
-        def snapshot_active_targets():
+        def snapshot_active_targets(caller_id=None):
             return [
                 {"session_id": "proc-1", "elapsed_s": 42, "ttl_remaining_s": 330},
                 {"session_id": "proc-2", "elapsed_s": 10, "ttl_remaining_s": 320},

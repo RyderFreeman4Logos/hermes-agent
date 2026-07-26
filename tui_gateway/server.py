@@ -5473,6 +5473,16 @@ def _agent_cbs(sid: str) -> dict:
     return callbacks
 
 
+def _attach_tui_cache_callback(agent, sid: str):
+    """Attach the first-provider-call cache signal to a live TUI agent."""
+    def emit_cache_state(state: str, pct: int, _read: int, _prompt: int) -> None:
+        text = f"cache {pct}%" if state == "hit" else f"cache {state.upper()}"
+        _emit("status.update", sid, {"kind": "cache_hit", "text": text})
+
+    agent._tui_cache_callback = emit_cache_state
+    return agent
+
+
 def _apply_project_workspace(task_id: str, path: str, _name: str = "") -> None:
     """Intentional workspace move from the project_* tools: re-anchor the live
     session's cwd to the chosen project's folder and push session.info so the
@@ -6072,7 +6082,7 @@ def _make_agent(
 
     synthetic = maybe_build_synthetic_agent(session_id or key, model_override)
     if synthetic is not None:
-        return synthetic
+        return _attach_tui_cache_callback(synthetic, sid)
 
     from run_agent import AIAgent
 
@@ -6192,7 +6202,7 @@ def _make_agent(
                 raise RuntimeError("Auth fallback resolved without a model")
             model = resolution.selected_model
     _pr = _load_provider_routing()
-    return AIAgent(
+    agent = AIAgent(
         model=model,
         max_iterations=_cfg_max_turns(cfg, 500),
         provider=runtime.get("provider"),
@@ -6239,6 +6249,7 @@ def _make_agent(
         fallback_model=_load_fallback_model(),
         **_agent_cbs(sid),
     )
+    return _attach_tui_cache_callback(agent, sid)
 
 
 def _init_session(

@@ -15589,6 +15589,25 @@ def test_cache_info_classifies_canonical_turn_usage(usage, expected):
     assert server._cache_info_from_usage(usage) == expected
 
 
+def test_tui_cache_callback_emits_first_call_cache_status():
+    class _Agent:
+        pass
+
+    agent = _Agent()
+    emitted: list[tuple[str, str, dict]] = []
+    with patch.object(
+        server,
+        "_emit",
+        lambda event_type, sid, payload: emitted.append((event_type, sid, payload)),
+    ):
+        assert server._attach_tui_cache_callback(agent, "cache-sid") is agent
+        agent._tui_cache_callback("hit", 87, 1_740, 2_000)
+
+    assert emitted == [
+        ("status.update", "cache-sid", {"kind": "cache_hit", "text": "cache 87%"})
+    ]
+
+
 def test_prompt_submit_message_complete_includes_cache_info_from_last_turn_usage(monkeypatch):
     emitted: list[tuple[str, str, dict]] = []
 

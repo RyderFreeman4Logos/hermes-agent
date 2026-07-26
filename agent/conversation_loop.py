@@ -1148,9 +1148,12 @@ def run_conversation(
         except Exception:
             pass
 
-    # The idle-completion no-op instruction is deliberately API-only. Seed the
-    # existing persistence override before the turn prologue's crash-resilient
-    # flush, then append the instruction to the live/API message below.
+    # The idle-completion no-op instruction is API-only: it is appended to the
+    # request copy at the API boundary (see request_messages construction), never
+    # to the live ``messages`` list.  Mutating ``messages`` here would leak the
+    # suffix into early-exit persistence paths (content_filter, budget exhaustion)
+    # that bypass the turn finalizer's cleanup.  ``persist_user_message`` is set
+    # to the clean text so the durable transcript is always pristine.
     _inject_idle_completion_noop_instruction = (
         turn_origin == "idle_completion"
         and allow_silent_noop
@@ -1207,9 +1210,6 @@ def run_conversation(
     original_user_message = _ctx.original_user_message
     messages = _ctx.messages
 
-    if _inject_idle_completion_noop_instruction:
-        _turn_user_msg = messages[_ctx.current_turn_user_idx]
-        _turn_user_msg["content"] += _IDLE_COMPLETION_NOOP_EPHEMERAL_SUFFIX
     conversation_history = _ctx.conversation_history
     active_system_prompt = _ctx.active_system_prompt
     effective_task_id = _ctx.effective_task_id
@@ -3226,6 +3226,46 @@ def run_conversation(
                     agent.session_cache_read_tokens += canonical_usage.cache_read_tokens
                     agent.session_cache_write_tokens += canonical_usage.cache_write_tokens
                     agent.session_reasoning_tokens += canonical_usage.reasoning_tokens
+
+                    # The first provider call is the useful cache-health
+                    # signal: a miss here means the request prefix was cold;
+                    # later calls mostly hit because this turn just populated
+                    # the cache. Keep this optional TUI callback out of the
+                    # normal runtime/UI contract and never let it affect the
+                    # turn if an observer fails.
+                    if api_call_count == 1:
+                        cache_callback = getattr(agent, "_tui_cache_callback", None)
+                        if callable(cache_callback):
+                            cache_read = canonical_usage.cache_read_tokens or 0
+                            cache_write = canonical_usage.cache_write_tokens or 0
+                            if cache_read > 0:
+                                cache_state = "hit"
+                                cache_pct = (
+                                    round(100 * cache_read / prompt_tokens)
+                                    if prompt_tokens
+                                    else 0
+                                )
+                            elif cache_write > 0:
+                                cache_state = "cold_write"
+                                cache_pct = 0
+                            else:
+                                # read==0 and write==0: the provider either does
+                                # not report cache accounting or the prefix was
+                                # not cache-eligible.  Without a positive cache
+                                # write as evidence of a cold start, we cannot
+                                # distinguish this from "provider doesn't track
+                                # caches" — so it is unknown, not a definitive
+                                # miss.  A true TTL eviction miss would show
+                                # read==0 with a prior warm write on an earlier
+                                # turn, not here.
+                                cache_state = "unknown"
+                                cache_pct = 0
+                            try:
+                                cache_callback(
+                                    cache_state, cache_pct, cache_read, prompt_tokens
+                                )
+                            except Exception:
+                                logger.debug("TUI first-call cache callback failed", exc_info=True)
 
                     # Log API call details for debugging/observability
                     _cache_pct = ""

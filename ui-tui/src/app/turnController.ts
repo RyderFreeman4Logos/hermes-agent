@@ -29,7 +29,7 @@ const INTERRUPT_COOLDOWN_MS = 1500
 const ACTIVITY_LIMIT = 8
 const TRAIL_LIMIT = 8
 
-type BackgroundTimer = { elapsed_s: number; session_id: string; ttl_remaining_s: number }
+type BackgroundTimer = { elapsed_s: number; interval_s?: number; session_id: string; started_at?: number; ttl_remaining_s: number }
 type CacheInfo = {
   pct: number
   prompt_tokens: number
@@ -48,10 +48,12 @@ const backgroundTimerTrail = (timers?: BackgroundTimer[]) => {
 
   const first = active[0]!
   const elapsed = Math.max(0, Math.floor(first.elapsed_s))
-  const ttlRemaining = Math.max(0, Math.ceil(first.ttl_remaining_s))
+  // Denominator is the total check-in interval (NOT ttl_remaining),
+  // so the user sees "elapsed / total interval" like a stopwatch.
+  const interval = first.interval_s ?? first.ttl_remaining_s ?? 0
   const extra = active.length > 1 ? ` +${active.length - 1}` : ''
 
-  return ` →checkin ${elapsed}s/${ttlRemaining}s${extra}`
+  return ` →checkin ${elapsed}s/${interval}s${extra}`
 }
 
 const cacheFootnote = (cacheInfo?: CacheInfo): Msg | null => {

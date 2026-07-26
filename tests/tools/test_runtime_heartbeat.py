@@ -205,9 +205,12 @@ def test_snapshot_active_targets_reports_process_elapsed_and_ttl_remaining(monke
     )
 
     now["value"] = 1_002.0
-    assert manager.snapshot_active_targets() == [
-        {"session_id": "proc-1", "elapsed_s": 44, "ttl_remaining_s": 158}
-    ]
+    snap = manager.snapshot_active_targets()
+    assert len(snap) == 1
+    assert snap[0]["session_id"] == "proc-1"
+    assert snap[0]["elapsed_s"] == 44
+    assert snap[0]["ttl_remaining_s"] == 158
+    assert snap[0]["interval_s"] == 160  # ttl=200, safety_ratio=0.8 -> 160
 
 
 def test_snapshot_active_targets_filters_by_caller_id(monkeypatch):

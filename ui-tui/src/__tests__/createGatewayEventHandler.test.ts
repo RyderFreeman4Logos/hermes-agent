@@ -1910,9 +1910,9 @@ describe('createGatewayEventHandler', () => {
     onEvent({
       payload: {
         bg_timers: [
-          { elapsed_s: 42, session_id: 'proc-1', ttl_remaining_s: 330 },
-          { elapsed_s: 10, session_id: 'proc-2', ttl_remaining_s: 320 },
-          { elapsed_s: 5, session_id: 'proc-3', ttl_remaining_s: 315 }
+          { elapsed_s: 42, interval_s: 2640, session_id: 'proc-1', ttl_remaining_s: 330 },
+          { elapsed_s: 10, interval_s: 2640, session_id: 'proc-2', ttl_remaining_s: 320 },
+          { elapsed_s: 5, interval_s: 2640, session_id: 'proc-3', ttl_remaining_s: 315 }
         ],
         summary: 'done',
         tool_id: 'tool-1'
@@ -1922,7 +1922,7 @@ describe('createGatewayEventHandler', () => {
     onEvent({ payload: { text: 'final answer' }, type: 'message.complete' } as any)
 
     const trail = appended.find(msg => msg.kind === 'trail' && msg.tools?.length)
-    expect(trail?.tools?.[0]).toContain('→checkin 42s/330s +2')
+    expect(trail?.tools?.[0]).toContain('→checkin 42s/2640s +2')
   })
 
   it.each([

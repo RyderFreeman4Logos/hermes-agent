@@ -7058,6 +7058,7 @@ class AIAgent:
             tasks=_strip_model_hidden_task_fields(function_args.get("tasks")),
             max_iterations=function_args.get("max_iterations"),
             role=function_args.get("role"),
+            model_profile=function_args.get("model_profile"),
             background=(True if _force_bg else (not _is_subagent)),
             # Preserve the distinction between ordinary top-level background
             # work (which may use the historical inline fallback) and the

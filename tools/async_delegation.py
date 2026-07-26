@@ -206,7 +206,10 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
         owner_started_at = None
     task_payload = {
         key: record.get(key)
-        for key in ("goal", "goals", "context", "toolsets", "role", "model", "is_batch")
+        for key in (
+            "goal", "goals", "context", "toolsets", "role", "model",
+            "is_batch", "provider", "reasoning_effort",
+        )
         if key in record
     }
     with _DB_LOCK, _transaction() as conn:

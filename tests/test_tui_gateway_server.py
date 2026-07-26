@@ -15710,6 +15710,167 @@ def test_clarify_timeout_seconds_maps_non_positive_to_unlimited(monkeypatch, con
     assert server._clarify_timeout_seconds() == expected
 
 
+@pytest.mark.parametrize("turn_raises", [False, True])
+def test_prompt_submit_restores_one_turn_model_before_heap_trim(
+    monkeypatch, turn_raises
+):
+    """One-turn cleanup must restore runtime, release snapshots, then trim.
+
+    The trim still runs under the profile's HERMES_HOME override, and every
+    ordering/cleanup invariant applies to both successful and failed turns.
+    """
+    cleanup_order = []
+
+    class _Agent:
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None
+        ):
+            if turn_raises:
+                raise RuntimeError("turn failed")
+            return {
+                "final_response": "reply",
+                "messages": [{"role": "assistant", "content": "reply"}],
+            }
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            assert self._target is not None
+            self._target()
+
+    def _inspect_trim_frame(**_kwargs):
+        import inspect
+
+        cleanup_order.append("trim")
+        frame = inspect.currentframe()
+        assert frame is not None and frame.f_back is not None
+        caller_locals = frame.f_back.f_locals
+        assert caller_locals.get("history") == []
+        assert caller_locals.get("run_kwargs") == {}
+
+    mem_trim_module = types.ModuleType("hermes_cli.mem_trim")
+    mem_trim_module.trim_memory = _inspect_trim_frame
+    monkeypatch.setitem(sys.modules, "hermes_cli.mem_trim", mem_trim_module)
+
+    session = _session(agent=_Agent(), running=True)
+    session["profile_home"] = "/tmp/test-profile"
+    session["history"] = [
+        {"role": "tool", "tool_call_id": "old", "content": "x" * 20_000}
+    ]
+    session["one_turn_model_restore"] = {"model": "original/model"}
+    server._sessions["sid_trim_restore"] = session
+
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "_get_usage", lambda _agent: {})
+    monkeypatch.setattr(server, "render_message", lambda _text, _cols: "")
+    monkeypatch.setattr(server, "_restart_slash_worker", lambda *args: None)
+    monkeypatch.setattr(server, "_persist_live_session_runtime", lambda *_args: None)
+    monkeypatch.setattr(
+        server,
+        "_persist_live_session_system_prompt", lambda *_args: None
+    )
+    monkeypatch.setattr(
+        server,
+        "_restore_agent_model_runtime",
+        lambda *_args: cleanup_order.append("restore"),
+    )
+    monkeypatch.setattr(server, "set_hermes_home_override", lambda _home: object())
+    monkeypatch.setattr(
+        server,
+        "reset_hermes_home_override",
+        lambda _token: cleanup_order.append("reset_home"),
+    )
+    monkeypatch.setattr(
+        server,
+        "_set_session_context",
+        lambda *_args, **_kwargs: ["context-token"],
+    )
+    monkeypatch.setattr(
+        server,
+        "_clear_session_context",
+        lambda _tokens: cleanup_order.append("clear_context"),
+    )
+
+    try:
+        server._run_prompt_submit(
+            "1", "sid_trim_restore", session, "exercise cleanup"
+        )
+
+        assert cleanup_order == ["restore", "trim", "reset_home", "clear_context"]
+    finally:
+        server._sessions.pop("sid_trim_restore", None)
+
+
+def test_prompt_submit_releases_old_history_before_heap_trim(monkeypatch):
+    """The trim boundary must not retain the just-pruned history snapshots."""
+    observed = {}
+    cleanup_order = []
+
+    class _Agent:
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None
+        ):
+            return {
+                "final_response": "reply",
+                "messages": [{"role": "assistant", "content": "reply"}],
+            }
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            assert self._target is not None
+            self._target()
+
+    def _inspect_trim_frame(**_kwargs):
+        import inspect
+
+        cleanup_order.append("trim")
+        frame = inspect.currentframe()
+        assert frame is not None and frame.f_back is not None
+        caller_locals = frame.f_back.f_locals
+        observed["history"] = caller_locals.get("history")
+        observed["run_kwargs"] = caller_locals.get("run_kwargs")
+
+    session = _session(agent=_Agent())
+    session["profile_home"] = "/tmp/test-profile"
+    session["history"] = [
+        {"role": "tool", "tool_call_id": "old", "content": "x" * 20_000}
+    ]
+    server._sessions["sid_trim"] = session
+    try:
+        monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+        monkeypatch.setattr(server, "_get_usage", lambda _a: {})
+        monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
+        monkeypatch.setattr(server, "_emit", lambda *a: None)
+        monkeypatch.setattr(server, "set_hermes_home_override", lambda _home: object())
+        monkeypatch.setattr(
+            server,
+            "reset_hermes_home_override",
+            lambda _token: cleanup_order.append("reset_home"),
+        )
+        monkeypatch.setattr("hermes_cli.mem_trim.trim_memory", _inspect_trim_frame)
+
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid_trim", "text": "hi"},
+            }
+        )
+
+        assert resp is not None and resp.get("result")
+        assert not observed["history"]
+        assert not observed["run_kwargs"]
+        assert cleanup_order == ["trim", "reset_home"]
+    finally:
+        server._sessions.pop("sid_trim", None)
+
+
 def test_build_persist_message_with_image_refs_without_images_returns_text(monkeypatch):
     """#70720: when no images are attached the persisted message is the raw
     prompt — no @image directive prefix is introduced."""

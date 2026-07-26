@@ -35,9 +35,10 @@ export const StreamingAssistant = memo(function StreamingAssistant({
   const streamPendingTools = useTurnSelector(state => state.streamPendingTools)
   const streaming = useTurnSelector(state => state.streaming)
   const activeTools = useTurnSelector(state => state.tools)
+  const bgTimer = useTurnSelector(state => state.bgTimer)
   const showStreamingArea = Boolean(streaming)
 
-  if (!progress.showProgressArea && !showStreamingArea && !activeTools.length) {
+  if (!progress.showProgressArea && !showStreamingArea && !activeTools.length && !streamPendingTools.length && !bgTimer) {
     return null
   }
 
@@ -62,12 +63,16 @@ export const StreamingAssistant = memo(function StreamingAssistant({
     blocks.push({ key: 'pending-tools', msg: { kind: 'trail', role: 'system', text: '', tools: streamPendingTools } })
   }
 
+  const timerBlockIndex = bgTimer
+    ? blocks.reduce((last, block, index) => (block.tools?.length || block.msg.tools?.length ? index : last), -1)
+    : -1
+
   const detailsCtx = { commandOverride: detailsModeCommandOverride, detailsMode, sections }
   let prev = prevMsg
 
   return (
     <>
-      {blocks.map(block => {
+      {blocks.map((block, index) => {
         const node = (
           <MessageLine
             cols={cols}
@@ -76,6 +81,7 @@ export const StreamingAssistant = memo(function StreamingAssistant({
             detailsModeCommandOverride={detailsModeCommandOverride}
             isStreaming={block.isStreaming}
             key={block.key}
+            live={index === timerBlockIndex}
             msg={block.msg}
             prev={prev}
             sections={sections}

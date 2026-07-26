@@ -1995,7 +1995,7 @@ describe('createGatewayEventHandler', () => {
     })
   })
 
-  it('keeps raw background timer data on the active tool for live rendering', () => {
+  it('keeps raw background timer data on turn state for live rendering', () => {
     const appended: Msg[] = []
     const onEvent = createGatewayEventHandler(buildCtx(appended))
 
@@ -2013,17 +2013,44 @@ describe('createGatewayEventHandler', () => {
       type: 'tool.complete'
     } as any)
 
-    expect(getTurnState().tools).toEqual([
-      expect.objectContaining({
-        bgTimer: { interval_s: 2640, started_at: 1_700_000_000 },
-        id: 'tool-1'
-      })
-    ])
+    expect(getTurnState().bgTimer).toEqual({ count: 3, interval_s: 2640, started_at: 1_700_000_000 })
+    expect(getTurnState().tools).toEqual([])
 
     onEvent({ payload: { text: 'final answer' }, type: 'message.complete' } as any)
 
     const trail = appended.find(msg => msg.kind === 'trail' && msg.tools?.length)
     expect(trail?.tools?.[0]).not.toContain('→checkin')
+  })
+
+  it('does not set a background timer for an ordinary tool completion', () => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+    onEvent({ payload: { name: 'read_file', tool_id: 'tool-1' }, type: 'tool.start' } as any)
+    onEvent({ payload: { summary: 'done', tool_id: 'tool-1' }, type: 'tool.complete' } as any)
+
+    expect(getTurnState().bgTimer).toBeUndefined()
+  })
+
+  it('clears the turn background timer when a tool completion reports an empty snapshot', () => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+    onEvent({ payload: { name: 'terminal', tool_id: 'tool-1' }, type: 'tool.start' } as any)
+    onEvent({
+      payload: {
+        bg_timers: [{ elapsed_s: 42, interval_s: 2640, session_id: 'proc-1', started_at: 1_700_000_000, ttl_remaining_s: 330 }],
+        summary: 'done',
+        tool_id: 'tool-1'
+      },
+      type: 'tool.complete'
+    } as any)
+    expect(getTurnState().bgTimer).toEqual({ count: 1, interval_s: 2640, started_at: 1_700_000_000 })
+
+    onEvent({ payload: { name: 'read_file', tool_id: 'tool-2' }, type: 'tool.start' } as any)
+    onEvent({ payload: { bg_timers: [], summary: 'done', tool_id: 'tool-2' }, type: 'tool.complete' } as any)
+
+    expect(getTurnState().bgTimer).toBeUndefined()
   })
 
   it.each([

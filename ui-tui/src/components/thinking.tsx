@@ -2,6 +2,7 @@ import { Box, NoSelect, Text } from '@hermes/ink'
 import { memo, type ReactNode, useEffect, useMemo, useRef, useState } from 'react'
 import spinners, { type BrailleSpinnerName } from 'unicode-animations'
 
+import { useTurnSelector } from '../app/turnStore.js'
 import { THINKING_COT_MAX } from '../config/limits.js'
 import { sectionMode } from '../domain/details.js'
 import {
@@ -38,12 +39,6 @@ import type {
 } from '../types.js'
 
 const THINK: BrailleSpinnerName[] = ['helix', 'breathe', 'orbit', 'dna', 'waverows', 'snake', 'pulse']
-
-const splitBackgroundTimer = (line: string) => {
-  const match = line.match(/( →checkin \d+s\/\d+s(?: \+\d+)?)$/)
-
-  return match ? { call: line.slice(0, -match[1]!.length), timer: match[1]! } : { call: line, timer: '' }
-}
 const TOOL: BrailleSpinnerName[] = ['cascade', 'scan', 'diagswipe', 'fillsweep', 'rain', 'columns', 'sparkle']
 
 const fmtElapsed = (ms: number) => {
@@ -683,6 +678,7 @@ export const ToolTrail = memo(function ToolTrail({
   busy = false,
   commandOverride = false,
   detailsMode = 'collapsed',
+  live = false,
   outcome = '',
   reasoningActive = false,
   reasoning = '',
@@ -700,6 +696,7 @@ export const ToolTrail = memo(function ToolTrail({
   busy?: boolean
   commandOverride?: boolean
   detailsMode?: DetailsMode
+  live?: boolean
   outcome?: string
   reasoningActive?: boolean
   reasoning?: string
@@ -727,6 +724,8 @@ export const ToolTrail = memo(function ToolTrail({
     [commandOverride, detailsMode, sections]
   )
 
+  const turnBgTimer = useTurnSelector(state => state.bgTimer)
+  const bgTimer = live ? turnBgTimer : undefined
   const [now, setNow] = useState(() => Date.now())
   // Local toggles own the open state once mounted.  Init from the resolved
   // section visibility so default-expanded sections (thinking/tools) render
@@ -748,14 +747,14 @@ export const ToolTrail = memo(function ToolTrail({
   const [openMeta, setOpenMeta] = useState(visible.activity === 'expanded')
 
   useEffect(() => {
-    if (!tools.length || (visible.tools !== 'expanded' && !openTools)) {
+    if ((!tools.length && !bgTimer) || (visible.tools !== 'expanded' && !openTools)) {
       return
     }
 
     const id = setInterval(() => setNow(Date.now()), 500)
 
     return () => clearInterval(id)
-  }, [openTools, tools.length, visible.tools])
+  }, [bgTimer, openTools, tools.length, visible.tools])
 
   // Effects run after the FIRST render too, not just on later updates — so
   // this re-sync was clobbering the reasoningAlwaysVisible mount value above
@@ -792,6 +791,7 @@ export const ToolTrail = memo(function ToolTrail({
 
   if (
     !busy &&
+    !bgTimer &&
     !trail.length &&
     !tools.length &&
     !subagents.length &&
@@ -810,13 +810,12 @@ export const ToolTrail = memo(function ToolTrail({
   const pushDetail = (row: DetailRow) => (groups.at(-1)?.details ?? meta).push(row)
 
   for (const [i, line] of trail.entries()) {
-    const { call: toolLine, timer } = splitBackgroundTimer(line)
-    const parsed = parseToolTrailResultLine(toolLine)
+    const parsed = parseToolTrailResultLine(line)
 
     if (parsed) {
       groups.push({
         color: parsed.mark === '✗' ? t.color.error : t.color.text,
-        content: `${parsed.call}${timer}`,
+        content: parsed.call,
         details: [],
         key: `tr-${i}`,
         label: parsed.call
@@ -889,9 +888,6 @@ export const ToolTrail = memo(function ToolTrail({
         <>
           <Spinner color={t.color.tool} variant="tool" /> {label}
           {tool.startedAt ? ` (${fmtElapsed(now - tool.startedAt)})` : ''}
-          {tool.bgTimer
-            ? ` →checkin ${Math.max(0, Math.floor((now - tool.bgTimer.started_at * 1000) / 1000))}s/${tool.bgTimer.interval_s}s`
-            : ''}
         </>
       )
     })
@@ -905,7 +901,13 @@ export const ToolTrail = memo(function ToolTrail({
 
   // ── Derived ────────────────────────────────────────────────────
 
-  const hasTools = groups.length > 0
+  const bgTimerLabel = bgTimer
+    ? `→checkin ${Math.max(0, Math.floor((now - bgTimer.started_at * 1000) / 1000))}s/${bgTimer.interval_s}s${
+        bgTimer.count > 1 ? ` +${bgTimer.count - 1}` : ''
+      }`
+    : null
+
+  const hasTools = groups.length > 0 || Boolean(bgTimerLabel)
   const hasSubagents = subagents.length > 0
   const hasMeta = meta.length > 0
   const hasThinking = !!cot || reasoningActive || reasoningStreaming
@@ -925,14 +927,12 @@ export const ToolTrail = memo(function ToolTrail({
   const inlineDelegateKey = hasSubagents && delegateGroups.length === 1 ? delegateGroups[0]!.key : null
 
   const toolLabel = (group: Group) => {
-    const { call, timer } = splitBackgroundTimer(String(group.content))
-    const { duration, label } = splitToolDuration(call)
+    const { duration, label } = splitToolDuration(String(group.content))
 
-    return duration || timer ? (
+    return duration ? (
       <>
         {label}
-        {duration ? <Text color={t.color.statusFg} dim>{duration}</Text> : null}
-        {timer ? <Text color={t.color.muted} dim>{timer}</Text> : null}
+        <Text color={t.color.statusFg} dim>{duration}</Text>
       </>
     ) : (
       group.content
@@ -1093,7 +1093,7 @@ export const ToolTrail = memo(function ToolTrail({
       render: rails => (
         <Box flexDirection="column">
           {groups.map((group, index) => {
-            const branch: TreeBranch = index === groups.length - 1 ? 'last' : 'mid'
+            const branch: TreeBranch = index === groups.length - 1 && !bgTimerLabel ? 'last' : 'mid'
             const childRails = nextTreeRails(rails, branch)
             const hasInlineSubagents = inlineDelegateKey === group.key
             // Surface the /agents hint the moment a delegate group appears —
@@ -1133,6 +1133,16 @@ export const ToolTrail = memo(function ToolTrail({
               </Box>
             )
           })}
+          {bgTimerLabel ? (
+            <TreeTextRow
+              branch="last"
+              color={t.color.muted}
+              content={bgTimerLabel}
+              dimColor
+              rails={rails}
+              t={t}
+            />
+          ) : null}
         </Box>
       )
     })

@@ -6,6 +6,7 @@ import type { ActiveTool, ActivityItem, Msg, SubagentProgress, TodoItem } from '
 
 const buildTurnState = (): TurnState => ({
   activity: [],
+  bgTimer: undefined,
   outcome: '',
   reasoning: '',
   reasoningActive: false,
@@ -68,6 +69,11 @@ export const resetTurnState = () => $turnState.set(buildTurnState())
 
 export interface TurnState {
   activity: ActivityItem[]
+  bgTimer?: {
+    count: number
+    interval_s: number
+    started_at: number
+  }
   outcome: string
   reasoning: string
   reasoningActive: boolean

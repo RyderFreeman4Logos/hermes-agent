@@ -236,7 +236,7 @@ DEFAULT_CONFIG = {
     },
 
     "runtime": {
-        "kv_cache_ttl": {
+        "warm_kv_timeout": {
             "default": 3300,
             "providers": {
                 "openai": 3300,

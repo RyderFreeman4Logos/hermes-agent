@@ -7,7 +7,7 @@ import queue
 from tools.runtime_heartbeat import (
     RuntimeHeartbeat,
     inspect_delegation,
-    resolve_kv_cache_ttl,
+    resolve_warm_kv_timeout,
 )
 
 
@@ -31,7 +31,7 @@ class FakeTimer:
 
 def _runtime(*, enabled=True, reset_on_caller_activation=True):
     return {
-        "kv_cache_ttl": {
+        "warm_kv_timeout": {
             "default": 100,
             "providers": {"openai": 200, "custom:pm": 300},
         },
@@ -55,12 +55,18 @@ def _manager(runtime=None):
     )
 
 
-def test_resolve_ttl_exact_then_canonical_family_then_default_then_documented_fallback():
+def test_resolve_warm_kv_timeout_prefers_new_key_then_legacy_then_documented_fallback():
     runtime = _runtime()
-    assert resolve_kv_cache_ttl(runtime, "custom:pm") == 300  # exact
-    assert resolve_kv_cache_ttl(runtime, "openai-codex") == 200  # family openai
-    assert resolve_kv_cache_ttl(runtime, "unknown") == 100  # configured default
-    assert resolve_kv_cache_ttl({}, "unknown") == 3300  # documented fallback
+    assert resolve_warm_kv_timeout(runtime, "custom:pm") == 300  # exact
+    assert resolve_warm_kv_timeout(runtime, "openai-codex") == 200  # family openai
+    assert resolve_warm_kv_timeout(runtime, "unknown") == 100  # configured default
+    assert resolve_warm_kv_timeout(
+        {"kv_cache_ttl": {"default": 90}}, "unknown"
+    ) == 90  # legacy fallback
+    assert resolve_warm_kv_timeout(
+        {"kv_cache_ttl": {"default": 90}, "warm_kv_timeout": {"default": 100}}, "unknown"
+    ) == 100  # new key wins
+    assert resolve_warm_kv_timeout({}, "unknown") == 3300  # documented fallback
 
 
 def test_arm_and_cancel_are_per_target_not_shared_per_caller():
@@ -179,7 +185,7 @@ def test_default_config_exposes_per_target_runtime_contract():
     from hermes_cli.config import DEFAULT_CONFIG
 
     runtime = DEFAULT_CONFIG["runtime"]
-    assert runtime["kv_cache_ttl"]["providers"]["custom:z1"] == 1700
+    assert runtime["warm_kv_timeout"]["providers"]["custom:z1"] == 1700
     assert runtime["heartbeat"]["mode"] == "per_target"
     assert runtime["heartbeat"]["reset_on_caller_activation"] is True
 

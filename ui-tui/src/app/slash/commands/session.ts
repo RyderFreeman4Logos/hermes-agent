@@ -236,10 +236,6 @@ export const sessionCommands: SlashCommand[] = [
         })
         .then(
           ctx.guarded<SessionCompressResponse>(r => {
-            if (r.lock_held) {
-              return ctx.transcript.sys(r.message ?? '⏳ Compression skipped: database busy, try again')
-            }
-
             if (Array.isArray(r.messages)) {
               const rows = toTranscriptMessages(r.messages)
 

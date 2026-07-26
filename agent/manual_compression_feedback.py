@@ -13,11 +13,12 @@ def describe_compression_lock_skip(lock_signal: Any) -> str:
     ``lock_signal`` is ``agent._compression_skipped_due_to_lock`` (or the
     ``holder`` carried by the TUI's ``CompressionLockHeld``): a descriptive
     holder string when another compressor CONFIRMED holds the lock, or
-    ``True``/``None`` for an unconfirmed transient busy timeout. Permanent
-    SQLite errors propagate out of ``try_acquire_compression_lock`` and are
-    surfaced by the caller as their real error, never through this busy
-    feedback. The two non-error cases must be worded differently: claiming
-    "already in progress" on an unconfirmed timeout misdirects the user.
+    ``True``/``None`` when acquisition failed without a confirmed holder
+    (``hermes_state.try_acquire_compression_lock`` catches ``sqlite3.Error``
+    internally and returns ``False``, so a failed acquire is NOT proof that
+    another compression is running). The two cases must be worded
+    differently: claiming "already in progress" on an unconfirmed failure
+    misdirects the user when the real problem is a broken lock subsystem.
     """
     holder = (
         lock_signal
@@ -29,7 +30,11 @@ def describe_compression_lock_skip(lock_signal: Any) -> str:
             f"⏳ Compression already in progress for this session "
             f"(holder: {holder}). Please wait for it to finish."
         )
-    return "⏳ Compression skipped: database busy, try again"
+    return (
+        "⏳ Compression skipped: could not acquire this session's "
+        "compression lock. Another compression may still be running, or "
+        "the lock check failed — try again shortly."
+    )
 
 
 def summarize_manual_compression(

@@ -93,6 +93,14 @@ logger = logging.getLogger(__name__)
 # to treat it as cancellation metadata rather than assistant prose.
 INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
 
+# Idle-completion turns may wake the model solely to let it decide whether a
+# background result needs user-visible follow-up. This instruction is added to
+# the API request only; the clean notification remains the durable transcript.
+_IDLE_COMPLETION_NOOP_EPHEMERAL_SUFFIX = (
+    "\n\n[Note: If this background completion requires no action, return an "
+    "empty response with no text and no tool calls.]"
+)
+
 # Modules that indicate a deterministic local processing error when they
 # appear in an exception traceback WITHOUT any API-call module. Used by the
 # outer-loop error classifier to avoid retrying bugs that will fail
@@ -980,6 +988,17 @@ def run_conversation(
         except Exception:
             pass
 
+    # The idle-completion no-op instruction is deliberately API-only. Seed the
+    # existing persistence override before the turn prologue's crash-resilient
+    # flush, then append the instruction to the live/API message below.
+    _inject_idle_completion_noop_instruction = (
+        turn_origin == "idle_completion"
+        and allow_silent_noop
+        and isinstance(user_message, str)
+    )
+    if _inject_idle_completion_noop_instruction and persist_user_message is None:
+        persist_user_message = user_message
+
     # A new user turn is an intervening message, not another iteration of a
     # prior watchdog resolver loop.
     try:
@@ -1025,6 +1044,10 @@ def run_conversation(
     user_message = _ctx.user_message
     original_user_message = _ctx.original_user_message
     messages = _ctx.messages
+
+    if _inject_idle_completion_noop_instruction:
+        _turn_user_msg = messages[_ctx.current_turn_user_idx]
+        _turn_user_msg["content"] += _IDLE_COMPLETION_NOOP_EPHEMERAL_SUFFIX
     conversation_history = _ctx.conversation_history
     active_system_prompt = _ctx.active_system_prompt
     effective_task_id = _ctx.effective_task_id
@@ -1303,6 +1326,17 @@ def run_conversation(
                     )
                     if _composed is not None:
                         api_msg["content"] = _composed
+                # A prologue-stamped api_content sidecar replaces the live
+                # message above. Re-add this transient suffix after that
+                # substitution so it reaches the provider without becoming a
+                # persisted api_content sidecar itself.
+                if (
+                    _inject_idle_completion_noop_instruction
+                    and isinstance(api_msg.get("content"), str)
+                    and _IDLE_COMPLETION_NOOP_EPHEMERAL_SUFFIX
+                    not in api_msg["content"]
+                ):
+                    api_msg["content"] += _IDLE_COMPLETION_NOOP_EPHEMERAL_SUFFIX
             elif (
                 isinstance(_api_content, str)
                 and _api_content

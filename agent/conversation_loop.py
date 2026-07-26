@@ -6087,23 +6087,16 @@ def run_conversation(
                 # build_turn_context before this loop and will be persisted in
                 # the normal finalizer path.  Do not spend more provider turns
                 # manufacturing an acknowledgement, but only for the narrow,
-                # fully-normal response shape below.  Any timeout, partial
-                # stream, reasoning-only reply, tool call, or structured
-                # provider anomaly must retain the existing recovery path.
-                _silent_noop_reasoning = any(
-                    bool(getattr(assistant_message, field, None))
-                    for field in (
-                        "reasoning",
-                        "reasoning_content",
-                        "reasoning_details",
-                        "thinking",
-                    )
-                )
+                # fully-normal response shape below.  Reasoning-only output
+                # (including streamed reasoning) has no visible text to add
+                # to this notification, so it is also a no-op.  Any timeout,
+                # partial stream, tool call, or structured provider anomaly
+                # must retain the existing recovery path.
                 _silent_noop_streamed = (
                     getattr(agent, "_current_streamed_assistant_text", "") or ""
                 )
-                _silent_noop_streamed_reasoning = (
-                    getattr(agent, "_current_streamed_reasoning_text", "") or ""
+                _silent_noop_streamed_visible = agent._has_content_after_think_block(
+                    _silent_noop_streamed
                 )
                 _silent_noop_response_status = getattr(response, "status", None)
                 _silent_noop_structured_abnormal = (
@@ -6125,20 +6118,14 @@ def run_conversation(
                         for field in ("refusal", "function_call", "audio", "annotations")
                     )
                 )
-                _silent_noop_inline_reasoning = isinstance(final_response, str) and bool(
-                    re.search(r"<think>|<thinking>|<reasoning>", final_response, re.IGNORECASE)
-                )
                 if (
                     turn_origin == "idle_completion"
                     and allow_silent_noop is True
                     and getattr(agent, "_turn_received_provider_response", False) is True
-                    and finish_reason == "stop"
+                    and finish_reason in {"stop", "success"}
                     and not getattr(assistant_message, "tool_calls", None)
                     and not agent._has_content_after_think_block(final_response)
-                    and not _silent_noop_reasoning
-                    and not _silent_noop_inline_reasoning
-                    and not str(_silent_noop_streamed).strip()
-                    and not str(_silent_noop_streamed_reasoning).strip()
+                    and not _silent_noop_streamed_visible
                     and not _silent_noop_structured_abnormal
                 ):
                     _silent_noop = True

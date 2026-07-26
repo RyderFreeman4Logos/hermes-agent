@@ -1140,9 +1140,9 @@ DEFAULT_CONFIG = {
     },
 
     "runtime": {
-        # Provider-aware quiet window for built-in per-target check-ins.
+        # Provider-aware warm-up timeout for built-in per-target check-ins.
         # Resolution is exact provider -> canonical family -> default -> 3300s.
-        "kv_cache_ttl": {
+        "warm_kv_timeout": {
             "default": 3300,
             "providers": {
                 "openai": 3300,

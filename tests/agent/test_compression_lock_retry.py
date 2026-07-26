@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import sqlite3
+
+import pytest
+
 from agent import conversation_compression
 
 
@@ -12,7 +16,12 @@ class _BusyThenAvailableLockDB:
         self.acquire_calls = 0
 
     def try_acquire_compression_lock(
-        self, _session_id: str, _holder: str, *, ttl_seconds: float
+        self,
+        _session_id: str,
+        _holder: str,
+        *,
+        ttl_seconds: float,
+        deadline: float,
     ) -> bool:
         assert ttl_seconds == 300.0
         self.acquire_calls += 1
@@ -29,7 +38,12 @@ class _LiveHolderLockDB:
         self.acquire_calls = 0
 
     def try_acquire_compression_lock(
-        self, _session_id: str, _holder: str, *, ttl_seconds: float
+        self,
+        _session_id: str,
+        _holder: str,
+        *,
+        ttl_seconds: float,
+        deadline: float,
     ) -> bool:
         assert ttl_seconds == 300.0
         self.acquire_calls += 1
@@ -44,7 +58,12 @@ class _AlwaysBusyLockDB:
         self.acquire_calls = 0
 
     def try_acquire_compression_lock(
-        self, _session_id: str, _holder: str, *, ttl_seconds: float
+        self,
+        _session_id: str,
+        _holder: str,
+        *,
+        ttl_seconds: float,
+        deadline: float,
     ) -> bool:
         assert ttl_seconds == 300.0
         self.acquire_calls += 1
@@ -52,6 +71,25 @@ class _AlwaysBusyLockDB:
 
     def get_compression_lock_holder(self, _session_id: str):
         return None
+
+
+class _MalformedLockDB:
+    """A permanent SQLite failure must not be mistaken for writer contention."""
+
+    def __init__(self) -> None:
+        self.acquire_calls = 0
+
+    def try_acquire_compression_lock(
+        self,
+        _session_id: str,
+        _holder: str,
+        *,
+        ttl_seconds: float,
+        deadline: float,
+    ) -> bool:
+        assert ttl_seconds == 300.0
+        self.acquire_calls += 1
+        raise sqlite3.DatabaseError("database disk image is malformed")
 
 
 def test_acquire_retries_on_busy_then_succeeds() -> None:
@@ -116,3 +154,21 @@ def test_acquire_retry_respects_wall_budget() -> None:
     assert live_holder is None
     assert db.acquire_calls == 2
     assert slept == [0.025]
+
+
+def test_acquire_propagates_non_busy_sqlite_error_without_retry() -> None:
+    db = _MalformedLockDB()
+    slept: list[float] = []
+
+    with pytest.raises(sqlite3.DatabaseError, match="disk image is malformed"):
+        conversation_compression._try_acquire_compression_lock_with_retry(
+            db,
+            "session-malformed",
+            "candidate-holder",
+            ttl_seconds=300.0,
+            sleep=slept.append,
+            jitter=lambda _low, _high: 0.02,
+        )
+
+    assert db.acquire_calls == 1
+    assert slept == []

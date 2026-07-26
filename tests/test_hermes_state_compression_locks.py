@@ -13,6 +13,7 @@ diagnostic accessor) — not the wiring into compression.
 from __future__ import annotations
 
 import os
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -324,6 +325,53 @@ def test_release_empty_session_id_is_noop(db: SessionDB) -> None:
 
 def test_holder_empty_session_id_returns_none(db: SessionDB) -> None:
     assert db.get_compression_lock_holder("") is None
+
+
+def test_acquire_propagates_non_busy_sqlite_error(
+    db: SessionDB, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only transient busy/locked errors may become a retryable ``False``."""
+    calls = 0
+
+    def fail_write(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise sqlite3.DatabaseError("database disk image is malformed")
+
+    monkeypatch.setattr(db, "_execute_write", fail_write)
+
+    with pytest.raises(sqlite3.DatabaseError, match="disk image is malformed"):
+        db.try_acquire_compression_lock("sess-malformed", "holder")
+
+    assert calls == 1
+
+
+def test_acquire_passes_remaining_deadline_budget_to_execute_write(
+    db: SessionDB, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A compression lock acquire must not use the generic 15-retry budget."""
+    now = 1_000.0
+    deadline = now + 0.25
+    observed: dict[str, object] = {}
+
+    monkeypatch.setattr(hermes_state.time, "time", lambda: now)
+
+    def acquire_write(_fn, **kwargs):
+        observed.update(kwargs)
+        return True, None
+
+    monkeypatch.setattr(db, "_execute_write", acquire_write)
+
+    assert db.try_acquire_compression_lock(
+        "sess-budget", "holder", deadline=deadline
+    ) is True
+    assert observed["deadline"] == deadline
+    assert observed["max_retries"] == 1
+    timeout = observed["timeout"]
+    assert isinstance(timeout, float)
+    assert timeout <= deadline - now
+    assert timeout > 0
+    assert observed["recover_fts_errors"] is False
 
 
 # ----------------------------------------------------------------------

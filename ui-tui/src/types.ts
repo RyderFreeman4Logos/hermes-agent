@@ -1,8 +1,4 @@
 export interface ActiveTool {
-  bgTimer?: {
-    interval_s: number
-    started_at: number
-  }
   context?: string
   id: string
   name: string

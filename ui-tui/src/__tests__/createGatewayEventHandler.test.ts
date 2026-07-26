@@ -1995,7 +1995,7 @@ describe('createGatewayEventHandler', () => {
     })
   })
 
-  it('shows active background elapsed and ttl on the completed tool trail', () => {
+  it('keeps raw background timer data on the active tool for live rendering', () => {
     const appended: Msg[] = []
     const onEvent = createGatewayEventHandler(buildCtx(appended))
 
@@ -2003,7 +2003,7 @@ describe('createGatewayEventHandler', () => {
     onEvent({
       payload: {
         bg_timers: [
-          { elapsed_s: 42, interval_s: 2640, session_id: 'proc-1', ttl_remaining_s: 330 },
+          { elapsed_s: 42, interval_s: 2640, session_id: 'proc-1', started_at: 1_700_000_000, ttl_remaining_s: 330 },
           { elapsed_s: 10, interval_s: 2640, session_id: 'proc-2', ttl_remaining_s: 320 },
           { elapsed_s: 5, interval_s: 2640, session_id: 'proc-3', ttl_remaining_s: 315 }
         ],
@@ -2012,10 +2012,18 @@ describe('createGatewayEventHandler', () => {
       },
       type: 'tool.complete'
     } as any)
+
+    expect(getTurnState().tools).toEqual([
+      expect.objectContaining({
+        bgTimer: { interval_s: 2640, started_at: 1_700_000_000 },
+        id: 'tool-1'
+      })
+    ])
+
     onEvent({ payload: { text: 'final answer' }, type: 'message.complete' } as any)
 
     const trail = appended.find(msg => msg.kind === 'trail' && msg.tools?.length)
-    expect(trail?.tools?.[0]).toContain('→checkin 42s/2640s +2')
+    expect(trail?.tools?.[0]).not.toContain('→checkin')
   })
 
   it.each([

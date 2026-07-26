@@ -30,6 +30,7 @@ const ACTIVITY_LIMIT = 8
 const TRAIL_LIMIT = 8
 
 type BackgroundTimer = { elapsed_s: number; interval_s?: number; session_id: string; started_at?: number; ttl_remaining_s: number }
+type TurnBackgroundTimer = { count: number; interval_s: number; started_at: number }
 type CacheInfo = {
   pct: number
   prompt_tokens: number
@@ -37,26 +38,7 @@ type CacheInfo = {
   state: 'hit' | 'cold_write' | 'miss' | 'unknown'
 }
 
-const backgroundTimerTrail = (timers?: BackgroundTimer[]) => {
-  const active = timers?.filter(
-    timer => Number.isFinite(timer.elapsed_s) && Number.isFinite(timer.ttl_remaining_s)
-  )
-
-  if (!active?.length) {
-    return ''
-  }
-
-  const first = active[0]!
-  const elapsed = Math.max(0, Math.floor(first.elapsed_s))
-  // Denominator is the total check-in interval (NOT ttl_remaining),
-  // so the user sees "elapsed / total interval" like a stopwatch.
-  const interval = first.interval_s ?? first.ttl_remaining_s ?? 0
-  const extra = active.length > 1 ? ` +${active.length - 1}` : ''
-
-  return ` →checkin ${elapsed}s/${interval}s${extra}`
-}
-
-const firstBackgroundTimer = (timers?: BackgroundTimer[]): ActiveTool['bgTimer'] | undefined => {
+const backgroundTimerSnapshot = (timers?: BackgroundTimer[]): TurnBackgroundTimer | undefined => {
   const first = timers?.[0]
 
   if (
@@ -69,7 +51,7 @@ const firstBackgroundTimer = (timers?: BackgroundTimer[]): ActiveTool['bgTimer']
     return undefined
   }
 
-  return { interval_s: first.interval_s!, started_at: first.started_at! }
+  return { count: timers!.length, interval_s: first.interval_s!, started_at: first.started_at! }
 }
 
 const cacheFootnote = (cacheInfo?: CacheInfo): Msg | null => {
@@ -343,6 +325,7 @@ class TurnController {
     this.segmentMessages = []
 
     patchTurnState({
+      bgTimer: undefined,
       streamPendingTools: [],
       streamSegments: [],
       streaming: '',
@@ -873,7 +856,8 @@ class TurnController {
     }
 
     this.recordTodos(todos)
-    const line = this.completeTool(toolId, fallbackName, error, summary, duration, resultText, bgTimers)
+    this.syncBackgroundTimer(bgTimers)
+    const line = this.completeTool(toolId, fallbackName, error, summary, duration, resultText)
 
     this.pendingSegmentTools = [...this.pendingSegmentTools, line]
     this.flushPendingToolsIntoLastSegment()
@@ -894,11 +878,16 @@ class TurnController {
     }
 
     this.flushStreamingSegment()
+    this.syncBackgroundTimer(bgTimers)
     this.pushInlineDiffSegment(
       diffText,
-      [this.completeTool(toolId, fallbackName, error, '', duration, resultText, bgTimers)]
+      [this.completeTool(toolId, fallbackName, error, '', duration, resultText)]
     )
     this.publishToolState()
+  }
+
+  private syncBackgroundTimer(timers?: BackgroundTimer[]) {
+    patchTurnState({ bgTimer: backgroundTimerSnapshot(timers) })
   }
 
   private completeTool(
@@ -907,8 +896,7 @@ class TurnController {
     error?: string,
     summary?: string,
     duration?: number,
-    resultText?: string,
-    bgTimers?: BackgroundTimer[]
+    resultText?: string
   ) {
     const done = this.activeTools.find(tool => tool.id === toolId)
     const name = done?.name ?? fallbackName ?? 'tool'
@@ -933,10 +921,7 @@ class TurnController {
             duration ?? fallbackDuration
           )
 
-    const bgTimer = firstBackgroundTimer(bgTimers)
-    this.activeTools = this.activeTools
-      .map(tool => (tool.id === toolId && bgTimer ? { ...tool, bgTimer } : tool))
-      .filter(tool => tool.id !== toolId || Boolean(bgTimer))
+    this.activeTools = this.activeTools.filter(tool => tool.id !== toolId)
 
     const next = this.turnTools.filter(item => !sameToolTrailGroup(label, item))
 
@@ -1085,7 +1070,7 @@ class TurnController {
     }
 
     patchUiState({ busy: true })
-    patchTurnState({ activity: [], outcome: '', subagents: [], toolTokens: 0, tools: [], turnTrail: [] })
+    patchTurnState({ activity: [], bgTimer: undefined, outcome: '', subagents: [], toolTokens: 0, tools: [], turnTrail: [] })
   }
 
   upsertSubagent(

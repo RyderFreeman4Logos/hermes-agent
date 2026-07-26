@@ -630,7 +630,7 @@ export type GatewayEvent =
     }
   | {
       payload: {
-        bg_timers?: Array<{ elapsed_s: number; session_id: string; ttl_remaining_s: number }>
+        bg_timers?: Array<{ elapsed_s: number; interval_s?: number; session_id: string; started_at?: number; ttl_remaining_s: number }>
         duration_s?: number
         error?: string
         inline_diff?: string

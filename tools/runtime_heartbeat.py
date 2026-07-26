@@ -317,7 +317,9 @@ class RuntimeHeartbeat:
                 {
                     "session_id": target.target_id,
                     "elapsed_s": elapsed_s,
+                    "interval_s": int(round(target.interval)),
                     "ttl_remaining_s": ttl_remaining_s,
+                    "started_at": float(started_at),
                 }
             )
         return rows

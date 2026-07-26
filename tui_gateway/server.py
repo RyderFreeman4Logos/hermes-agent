@@ -4778,7 +4778,8 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
     except Exception:
         pass
     try:
-        bg_timers = runtime_heartbeat.snapshot_active_targets()
+        _caller = session.get("session_key") or sid if session else sid
+        bg_timers = runtime_heartbeat.snapshot_active_targets(caller_id=_caller)
         if bg_timers:
             payload["bg_timers"] = bg_timers
     except Exception:

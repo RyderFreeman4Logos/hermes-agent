@@ -277,8 +277,12 @@ class RuntimeHeartbeat:
         with self._lock:
             return [target.target_id for target in self._targets.values() if target.caller_id == caller_id]
 
-    def snapshot_active_targets(self) -> list[dict[str, int | str]]:
+    def snapshot_active_targets(self, caller_id: str | None = None) -> list[dict[str, int | str]]:
         """Return compact elapsed/TTL observability for active watchdog targets.
+
+        When *caller_id* is provided, only targets armed by that caller (i.e.
+        the current session) are included.  This prevents a tool completion in
+        session A from surfacing background timers that belong to session B.
 
         Managed processes get their wall-clock age from the registry's durable
         ``ProcessSession.started_at`` instead of the watchdog arm time. Other
@@ -288,7 +292,10 @@ class RuntimeHeartbeat:
         """
         now = time.time()
         with self._lock:
-            targets = tuple(self._targets.values())
+            targets = tuple(
+                t for t in self._targets.values()
+                if caller_id is None or t.caller_id == caller_id
+            )
 
         rows: list[dict[str, int | str]] = []
         for target in targets:

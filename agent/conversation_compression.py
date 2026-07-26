@@ -75,6 +75,19 @@ def _emit_compaction_done(agent: Any) -> None:
         logger.debug("status_callback error in compaction completion", exc_info=True)
 
 
+def _refresh_delegate_model_pool_schema_after_compression(agent: Any) -> None:
+    """Admit a changed delegation model pool at the compaction cache boundary."""
+    try:
+        from tools.delegate_tool import refresh_model_pool_schema_after_compression
+
+        if refresh_model_pool_schema_after_compression(agent):
+            logger.info("refreshed delegate model-pool schema after context compression")
+    except Exception:
+        # Schema refresh is an optional convenience; it must never invalidate a
+        # successfully committed compression boundary.
+        logger.debug("delegate model-pool schema refresh failed", exc_info=True)
+
+
 # ── Routine compression status templates ────────────────────────────────────
 # Every ROUTINE (non-failure, non-manual-/compress) compression status line the
 # agent emits lives here so the gateway noise filter and its tests can couple
@@ -2453,6 +2466,16 @@ def compress_context(
                 else None
             ),
         )
+        # Tool schemas are fixed during ordinary turns to preserve the prompt
+        # prefix. A successfully committed compaction is the established
+        # cache-boundary exception, so a failed or rolled-back split must not
+        # publish a changed model-pool enum into the still-live session.
+        if split_status in {
+            "not_applicable",
+            "in_place_committed",
+            "rotated_committed",
+        }:
+            _refresh_delegate_model_pool_schema_after_compression(agent)
         return compressed, new_system_prompt
     finally:
         # Release the lock on the OLD session_id only AFTER rotation completed
@@ -2598,6 +2621,11 @@ def _compress_context_via_codex_app_server(
         reset_file_dedup(task_id)
     except Exception:
         pass
+
+    # Codex owns the compacted thread and keeps Hermes' local transcript
+    # unchanged, but this is still a real cache boundary and must receive the
+    # same one-shot model-pool refresh as normal compression.
+    _refresh_delegate_model_pool_schema_after_compression(agent)
 
     logger.info(
         "codex app-server compaction done: session=%s thread=%s turn=%s",

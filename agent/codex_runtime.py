@@ -203,6 +203,8 @@ def _record_codex_app_server_compaction(
     """
     if not force and not getattr(turn, "compacted", False):
         return False
+    if getattr(turn, "interrupted", False) or getattr(turn, "error", None):
+        return False
 
     thread_id = getattr(turn, "thread_id", None) or ""
     turn_id = getattr(turn, "turn_id", None) or ""
@@ -266,6 +268,22 @@ def _record_codex_app_server_compaction(
             )
     except Exception:
         logger.debug("event_callback error on codex session:compress", exc_info=True)
+
+    # Explicit compact_thread() calls refresh through
+    # _compress_context_via_codex_app_server(). The default native-auto route
+    # reaches only this observed turn boundary, so refresh it here instead.
+    if not force:
+        try:
+            from agent.conversation_compression import (
+                _refresh_delegate_model_pool_schema_after_compression,
+            )
+
+            _refresh_delegate_model_pool_schema_after_compression(agent)
+        except Exception:
+            logger.debug(
+                "delegate model-pool schema refresh failed after Codex compaction",
+                exc_info=True,
+            )
 
     return True
 

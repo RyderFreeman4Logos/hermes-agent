@@ -2490,13 +2490,38 @@ DEFAULT_CONFIG = {
         # Flip to true only if you trust delegated work to run dangerous cmds
         # without human review (cron pipelines, batch automation, etc.).
         "subagent_auto_approve": False,
+        # Default model-pool profile used when delegate_task is invoked from an
+        # internal call path with model_profile=None (the model-facing schema
+        # makes model_profile required, but internal Python callers and tests may
+        # still pass it implicitly). Empty (default) = no default: internal
+        # callers fall back to the global delegation model/provider. Set it to a
+        # profile name present in delegation.model_pool to make that the implicit
+        # default for any profile-less delegation.
+        "default_profile": "",
         # Named model pool — maps a profile name to a {provider, model,
         # base_url?, api_key?, api_mode?, reasoning_effort?, fallback_chain?}
         # dict. The main agent selects a subagent's model by passing
         # model_profile="<name>" to delegate_task (top-level or per-task in a
         # batch). Unknown profile names fall back to the global delegation
         # model/provider. See tools/delegate_tool.py:_resolve_model_profile.
-        "model_pool": {},  # name → {provider, model, ...}
+        #
+        # Each profile may optionally declare a `fallback_chain`: an ordered
+        # list of {provider, model, base_url?, api_key?, api_mode?,
+        # reasoning_effort?} entries tried in order when the profile's primary
+        # model fails with a fall-over-eligible error (rate-limit / quota /
+        # server error / connection timeout). The chain is handed to the child
+        # agent's existing provider-fallback machinery — non-fall-over errors
+        # (tool bugs, iteration exhaustion, user interrupt) never trigger it.
+        # Example:
+        #   fast:
+        #     provider: custom:localrouter
+        #     model: grok-4.5
+        #     reasoning_effort: high
+        #     fallback_chain:
+        #       - provider: openai-codex
+        #         model: gpt-5.6-terra
+        #         reasoning_effort: high
+        "model_pool": {},  # name → {provider, model, ..., fallback_chain?}
     },
 
     # Ephemeral prefill messages file — JSON list of {role, content} dicts

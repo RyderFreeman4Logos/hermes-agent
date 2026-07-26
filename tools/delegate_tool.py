@@ -1082,6 +1082,11 @@ def _build_child_agent(
     # Per-profile reasoning_effort override (from model_pool.<name>).
     # Takes precedence over the global delegation.reasoning_effort.
     override_reasoning_effort: Optional[Any] = None,
+    # Per-profile fallback_chain override (from model_pool.<name>.fallback_chain).
+    # When non-empty it takes precedence over the parent's inherited
+    # _fallback_chain, so a profile can declare its own provider failover list.
+    # Format: AIAgent fallback_model list-of-dicts ({provider, model, ...}).
+    override_fallback_chain: Optional[List[Dict[str, Any]]] = None,
     # ACP transport overrides from trusted delegation config.
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
@@ -1328,7 +1333,12 @@ def _build_child_agent(
     # from rate-limits and credential exhaustion exactly like the top-level
     # agent does.  _fallback_chain is a list accepted by AIAgent's
     # fallback_model parameter (which handles both list and dict forms).
+    # A per-profile fallback_chain (from model_pool.<name>.fallback_chain)
+    # takes precedence over the parent's inherited chain so each profile can
+    # declare its own failover sequence independent of the parent.
     parent_fallback = getattr(parent_agent, "_fallback_chain", None) or None
+    if override_fallback_chain:
+        parent_fallback = list(override_fallback_chain)
 
     # Inherit the parent's OpenRouter provider-preference filters by default
     # (so subagents routed to the same provider honour the same routing
@@ -2644,6 +2654,7 @@ def delegate_task(
                 override_request_overrides=_task_creds.get("request_overrides"),
                 override_max_tokens=_task_creds.get("max_output_tokens"),
                 override_reasoning_effort=_task_creds.get("reasoning_effort"),
+                override_fallback_chain=_task_creds.get("fallback_chain") or None,
                 override_acp_command=_task_creds.get("command"),
                 override_acp_args=_task_creds.get("args"),
                 role=effective_role,
@@ -3338,6 +3349,12 @@ def _resolve_model_profile(cfg: dict, model_profile: Optional[str]) -> Optional[
     ``_build_child_agent`` can apply a per-profile thinking level via
     ``override_reasoning_effort`` — a field the global
     ``_resolve_delegation_credentials`` path does not surface.
+
+    A normalized ``_profile_fallback_chain`` (list of provider dicts in the
+    AIAgent ``fallback_model`` format) is also stashed on the returned dict so
+    ``_resolve_delegation_credentials`` can surface it to the caller. Entries
+    missing ``provider``/``model`` are dropped (the agent's fallback machinery
+    rejects them anyway); ``reasoning_effort`` is preserved per-entry.
     """
     if not model_profile:
         return None
@@ -3367,6 +3384,28 @@ def _resolve_model_profile(cfg: dict, model_profile: Optional[str]) -> Optional[
     # Stash the resolved effort so _build_child_agent can read it without
     # re-merging. ``_resolve_delegation_credentials`` passes this through in
     # the returned credential dict as ``reasoning_effort``.
+    #
+    # Normalize the profile's fallback_chain into the AIAgent fallback_model
+    # list format so _build_child_agent can hand it directly to the child's
+    # provider-fallback machinery. Each kept entry needs at least provider +
+    # model; reasoning_effort/base_url/api_key/api_mode are forwarded when set.
+    chain = profile.get("fallback_chain")
+    normalized_chain: List[Dict[str, Any]] = []
+    if isinstance(chain, list):
+        for entry in chain:
+            if not isinstance(entry, dict):
+                continue
+            ep = str(entry.get("provider") or "").strip()
+            em = str(entry.get("model") or "").strip()
+            if not ep or not em:
+                continue
+            fb_entry: Dict[str, Any] = {"provider": ep, "model": em}
+            for opt in ("base_url", "api_key", "api_mode", "reasoning_effort"):
+                ev = entry.get(opt)
+                if ev is not None and str(ev).strip() != "":
+                    fb_entry[opt] = ev
+            normalized_chain.append(fb_entry)
+    merged["_profile_fallback_chain"] = normalized_chain
     return merged
 
 
@@ -3379,6 +3418,12 @@ def _resolve_delegation_credentials(
     profile's provider/model/base_url/api_key/api_mode/reasoning_effort take
     precedence over the global delegation fields (back-compatible: an unknown
     profile name is ignored and the global config is used).
+
+    The model-facing schema makes ``model_profile`` required, but this function
+    is also reached from internal call paths / tests that may pass
+    ``model_profile=None``. To stay crash-safe there, a ``None`` profile first
+    falls back to ``delegation.default_profile`` (if set to a known profile
+    name) before degrading to the global delegation model/provider.
 
     If ``delegation.base_url`` is configured, subagents use that direct
     OpenAI-compatible endpoint. ``delegation.api_key`` overrides the key; when
@@ -3396,13 +3441,31 @@ def _resolve_delegation_credentials(
     If neither base_url nor provider is configured, returns None values so the
     child inherits everything from the parent agent.
 
+    Every returned dict carries a ``fallback_chain`` key: the per-profile
+    fallback chain (already normalized to AIAgent's ``fallback_model`` list
+    format) when a profile supplied one, else an empty list.
+
     Raises ValueError with a user-friendly message on credential failure.
     """
-    # Named model-pool profile overlays the global delegation config.
+    # Named model-pool profile overlays the global delegation config. The
+    # model-facing schema makes model_profile required, but internal callers
+    # (tests, direct Python callers) may omit it — fall back to the configured
+    # default_profile first so a None profile degrades to the global delegation
+    # model/provider only when no default is configured. This keeps internal
+    # paths crash-safe without weakening the model-facing contract.
+    if not model_profile:
+        _default_profile = str(cfg.get("default_profile") or "").strip()
+        if _default_profile:
+            model_profile = _default_profile
+
     profile_effort: Optional[Any] = None
+    profile_fallback_chain: List[Dict[str, Any]] = []
     if model_profile:
         merged = _resolve_model_profile(cfg, model_profile)
         if merged is not None:
+            profile_fallback_chain = list(
+                merged.get("_profile_fallback_chain") or []
+            )
             cfg = merged
             profile_effort = merged.get("reasoning_effort")
             if profile_effort == "":
@@ -3469,6 +3532,7 @@ def _resolve_delegation_credentials(
             "api_key": api_key,
             "api_mode": api_mode,
             "reasoning_effort": profile_effort,
+            "fallback_chain": profile_fallback_chain,
         }
 
     if not configured_provider:
@@ -3482,6 +3546,7 @@ def _resolve_delegation_credentials(
             "request_overrides": None,
             "max_output_tokens": None,
             "reasoning_effort": profile_effort,
+            "fallback_chain": profile_fallback_chain,
         }
 
     # Provider is configured — resolve full credentials
@@ -3515,6 +3580,7 @@ def _resolve_delegation_credentials(
         "command": runtime.get("command"),
         "args": list(runtime.get("args") or []),
         "reasoning_effort": profile_effort,
+        "fallback_chain": profile_fallback_chain,
     }
 
 
@@ -3856,10 +3922,11 @@ DELEGATE_TASK_SCHEMA = {
                     "delegation.model_pool in config.yaml) to run this "
                     "subagent on, instead of the global delegation "
                     "model/provider. Each profile pins a provider/model pair "
-                    "(and optionally reasoning_effort). Per-task "
-                    "model_profile in the tasks array overrides this. An "
-                    "unknown profile name silently falls back to the global "
-                    "delegation config."
+                    "(and optionally reasoning_effort + fallback_chain). "
+                    "REQUIRED: you must specify model_profile for every "
+                    "delegate_task call. Per-task model_profile in the tasks "
+                    "array overrides this top-level value. An unknown profile "
+                    "name silently falls back to the global delegation config."
                 ),
             },
             "background": {
@@ -3875,7 +3942,7 @@ DELEGATE_TASK_SCHEMA = {
                 ),
             },
         },
-        "required": [],
+        "required": ["model_profile"],
     },
 }
 

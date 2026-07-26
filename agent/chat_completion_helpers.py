@@ -1944,6 +1944,13 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         ):
             fb_api_mode = "bedrock_converse"
 
+        # A fallback chain entry may deliberately target a non-default API
+        # surface for its provider/model.  Respect that explicit runtime
+        # contract rather than replacing it with the primary-path heuristic.
+        fb_explicit_api_mode = fb.get("api_mode")
+        if isinstance(fb_explicit_api_mode, str) and fb_explicit_api_mode.strip():
+            fb_api_mode = fb_explicit_api_mode.strip()
+
         old_model = agent.model
         old_provider = agent.provider
         old_base_url = agent.base_url
@@ -2099,21 +2106,38 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 api_mode=agent.api_mode,
             )
 
-        # Re-resolve reasoning_config for the new fallback model (Closes #21256).
-        # Shared chokepoint: per-model override > global reasoning_effort
-        # (YAML boolean False = disabled). Wrapped in try/except because a
-        # config load failure must not kill the swap.
+        # Resolve reasoning for the fallback entry.  An entry-level value
+        # deliberately outranks global and per-model config because it is the
+        # runtime contract for this exact failover target.  Preserve False so
+        # YAML ``reasoning_effort: false`` explicitly disables reasoning.
         try:
             from hermes_cli.config import load_config
-            from hermes_constants import resolve_reasoning_config
+            from hermes_constants import parse_reasoning_effort, resolve_reasoning_config
 
-            agent.reasoning_config = resolve_reasoning_config(
-                load_config() or {}, agent.model
-            )
-            logger.info(
-                "Fallback %s: reasoning_config resolved: %s",
-                agent.model, agent.reasoning_config,
-            )
+            fb_entry_reasoning_effort = fb.get("reasoning_effort")
+            fb_entry_reasoning_config = None
+            if fb_entry_reasoning_effort is False or (
+                isinstance(fb_entry_reasoning_effort, str)
+                and fb_entry_reasoning_effort.strip()
+            ):
+                fb_entry_reasoning_config = parse_reasoning_effort(
+                    fb_entry_reasoning_effort
+                )
+
+            if fb_entry_reasoning_config is not None:
+                agent.reasoning_config = fb_entry_reasoning_config
+                logger.info(
+                    "Fallback %s: reasoning_config from chain entry: %s",
+                    agent.model, agent.reasoning_config,
+                )
+            else:
+                agent.reasoning_config = resolve_reasoning_config(
+                    load_config() or {}, agent.model
+                )
+                logger.info(
+                    "Fallback %s: reasoning_config resolved: %s",
+                    agent.model, agent.reasoning_config,
+                )
         except Exception as _reasoning_err:
             logger.debug(
                 "Failed to resolve reasoning_config for fallback %s; keeping current: %s",

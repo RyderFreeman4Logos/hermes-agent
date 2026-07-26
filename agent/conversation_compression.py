@@ -409,24 +409,28 @@ def _try_acquire_compression_lock_with_retry(
     retry_budget_seconds: float = _COMPRESSION_LOCK_ACQUIRE_RETRY_BUDGET_SECONDS,
     sleep: Any = time.sleep,
     jitter: Any = random.uniform,
-    clock: Any = time.monotonic,
+    clock: Any = time.time,
 ) -> Tuple[bool, Optional[str]]:
     """Acquire a compression lease, retrying only an unconfirmed SQLite busy.
 
-    ``try_acquire_compression_lock`` intentionally returns ``False`` both for
-    a live owner and for its internally handled ``sqlite3.Error`` path.  Read
-    the holder after every failed attempt: a non-empty string is a confirmed
-    competing compressor and must return immediately; an absent/unconfirmed
-    holder is treated as transient writer contention and gets short jittered
-    retries.  The deadline bounds the total retry sleep even if callers change
-    the attempt count in tests or future tuning.
+    ``try_acquire_compression_lock`` returns ``False`` both for a live owner
+    and for transient SQLite ``locked``/``busy`` contention. Read the holder
+    after every failed attempt: a non-empty string is a confirmed competing
+    compressor and must return immediately; an absent/unconfirmed holder is
+    transient writer contention and gets short jittered retries. Any exception
+    is permanent for this operation and propagates unchanged. The absolute
+    epoch deadline also reaches the lock API, so SQLite's own busy wait cannot
+    outlive the caller's wall-time budget.
     """
     deadline = clock() + max(0.0, retry_budget_seconds)
     get_holder = getattr(session_db, "get_compression_lock_holder", None)
 
     for attempt in range(max(1, max_attempts)):
         if session_db.try_acquire_compression_lock(
-            session_id, holder, ttl_seconds=ttl_seconds
+            session_id,
+            holder,
+            ttl_seconds=ttl_seconds,
+            deadline=deadline,
         ):
             return True, None
 
@@ -1611,11 +1615,12 @@ def compress_context(
             except Exception as _lock_err:
                 # The method exists and entered its implementation but failed.
                 # Do not mistake an internal AttributeError or TypeError for
-                # version skew: fail closed and preserve session lineage. A
-                # failure after SQLite committed the acquire can leave our
-                # holder row behind, so release it best-effort before returning
-                # unchanged messages; release is holder-qualified and safe when
-                # acquisition never succeeded.
+                # version skew: preserve session lineage, then propagate the
+                # true failure to the TUI/gateway rather than relabeling it as
+                # transient "database busy" contention. A failure after SQLite
+                # committed the acquire can leave our holder row behind, so
+                # release it best-effort before raising; release is
+                # holder-qualified and safe when acquisition never succeeded.
                 try:
                     _lock_db.release_compression_lock(_lock_sid, _lock_holder)
                 except Exception as _release_err:
@@ -1623,13 +1628,13 @@ def compress_context(
                         "compression lock cleanup after failed acquire failed: %s",
                         _release_err,
                     )
-                _lock_holder = None
                 logger.warning(
-                    "compression lock acquisition raised unexpectedly for "
-                    "session=%s (%s: %s) — skipping compression this cycle",
-                    _lock_sid, type(_lock_err).__name__, _lock_err,
+                    "compression lock acquisition failed for session=%s (%s: %s)",
+                    _lock_sid,
+                    type(_lock_err).__name__,
+                    _lock_err,
                 )
-                _lock_acquired = False
+                raise
         if not _lock_acquired:
             existing = _live_lock_holder
             if existing:

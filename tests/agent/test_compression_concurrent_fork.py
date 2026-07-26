@@ -829,8 +829,21 @@ def test_lock_refresh_keeps_owner_live_past_initial_ttl(tmp_path: Path, monkeypa
     """The owning compression call must keep its lease alive while it runs."""
     real_try_acquire = SessionDB.try_acquire_compression_lock
 
-    def _short_ttl(self, session_id: str, holder: str, ttl_seconds: float = 300.0) -> bool:
-        return real_try_acquire(self, session_id, holder, ttl_seconds=1.0)
+    def _short_ttl(
+        self,
+        session_id: str,
+        holder: str,
+        ttl_seconds: float = 300.0,
+        *,
+        deadline: float | None = None,
+    ) -> bool:
+        return real_try_acquire(
+            self,
+            session_id,
+            holder,
+            ttl_seconds=1.0,
+            deadline=deadline,
+        )
 
     monkeypatch.setattr(SessionDB, "try_acquire_compression_lock", _short_ttl)
 
@@ -884,8 +897,21 @@ def test_post_compress_exception_stops_lock_refresher(tmp_path: Path, monkeypatc
     """A warning-path exception after compress() returns must still release the lock."""
     real_try_acquire = SessionDB.try_acquire_compression_lock
 
-    def _short_ttl(self, session_id: str, holder: str, ttl_seconds: float = 300.0) -> bool:
-        return real_try_acquire(self, session_id, holder, ttl_seconds=1.0)
+    def _short_ttl(
+        self,
+        session_id: str,
+        holder: str,
+        ttl_seconds: float = 300.0,
+        *,
+        deadline: float | None = None,
+    ) -> bool:
+        return real_try_acquire(
+            self,
+            session_id,
+            holder,
+            ttl_seconds=1.0,
+            deadline=deadline,
+        )
 
     monkeypatch.setattr(SessionDB, "try_acquire_compression_lock", _short_ttl)
 
@@ -912,8 +938,21 @@ def test_abort_warning_exception_stops_lock_refresher(tmp_path: Path, monkeypatc
     """An abort-path warning exception must still release the refreshed lock."""
     real_try_acquire = SessionDB.try_acquire_compression_lock
 
-    def _short_ttl(self, session_id: str, holder: str, ttl_seconds: float = 300.0) -> bool:
-        return real_try_acquire(self, session_id, holder, ttl_seconds=1.0)
+    def _short_ttl(
+        self,
+        session_id: str,
+        holder: str,
+        ttl_seconds: float = 300.0,
+        *,
+        deadline: float | None = None,
+    ) -> bool:
+        return real_try_acquire(
+            self,
+            session_id,
+            holder,
+            ttl_seconds=1.0,
+            deadline=deadline,
+        )
 
     monkeypatch.setattr(SessionDB, "try_acquire_compression_lock", _short_ttl)
 
@@ -946,8 +985,21 @@ def test_internal_typeerror_stops_lock_refresher_without_retry(tmp_path: Path, m
     """An engine TypeError must release the refreshed lock without a second call."""
     real_try_acquire = SessionDB.try_acquire_compression_lock
 
-    def _short_ttl(self, session_id: str, holder: str, ttl_seconds: float = 300.0) -> bool:
-        return real_try_acquire(self, session_id, holder, ttl_seconds=1.0)
+    def _short_ttl(
+        self,
+        session_id: str,
+        holder: str,
+        ttl_seconds: float = 300.0,
+        *,
+        deadline: float | None = None,
+    ) -> bool:
+        return real_try_acquire(
+            self,
+            session_id,
+            holder,
+            ttl_seconds=1.0,
+            deadline=deadline,
+        )
 
     monkeypatch.setattr(SessionDB, "try_acquire_compression_lock", _short_ttl)
 
@@ -1372,31 +1424,24 @@ def test_nonmissing_lock_lookup_errors_fail_closed(
         TypeError("simulated internal lock type error"),
     ],
 )
-def test_real_lock_api_internal_errors_fail_closed_skips_compression(
+def test_real_lock_api_internal_errors_propagate_without_compression(
     tmp_path: Path, monkeypatch, error: Exception
 ) -> None:
-    """Errors after a real lock API resolves must preserve session lineage.
-
-    ``AttributeError`` only means version skew while resolving the method. This
-    test injects failures beneath the real ``SessionDB.try_acquire...`` body,
-    proving that an internal AttributeError or TypeError cannot take the
-    structural-absence compatibility path.
-    """
+    """A real lock API error must preserve lineage and reach the caller."""
     db = SessionDB(db_path=tmp_path / "state.db")
     parent_sid = "ERRORING_LOCK_TEST"
     db.create_session(parent_sid, source="discord")
 
-    def _fail_lock_write(_fn):
+    def _fail_lock_write(_fn, **_kwargs):
         raise error
 
     monkeypatch.setattr(db, "_execute_write", _fail_lock_write)
     agent = _build_agent_with_db(db, parent_sid)
     messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
 
-    compressed, _sp = agent._compress_context(messages, "sys", approx_tokens=120_000)
+    with pytest.raises(type(error), match=str(error)):
+        agent._compress_context(messages, "sys", approx_tokens=120_000)
 
-    # Skipped: messages returned verbatim, no rotation, compressor never ran.
-    assert compressed is messages or compressed == messages
     assert agent.session_id == parent_sid
     assert _count_children(db, parent_sid) == 0
     agent.context_compressor.compress.assert_not_called()
@@ -1410,17 +1455,28 @@ def test_post_acquire_error_releases_owned_lock(tmp_path: Path, monkeypatch) -> 
 
     original_acquire = db.try_acquire_compression_lock
 
-    def _acquire_then_raise(session_id, holder, ttl_seconds=300.0):
-        assert original_acquire(session_id, holder, ttl_seconds=ttl_seconds) is True
+    def _acquire_then_raise(
+        session_id,
+        holder,
+        ttl_seconds=300.0,
+        *,
+        deadline=None,
+    ):
+        assert original_acquire(
+            session_id,
+            holder,
+            ttl_seconds=ttl_seconds,
+            deadline=deadline,
+        ) is True
         raise RuntimeError("simulated post-acquire failure")
 
     monkeypatch.setattr(db, "try_acquire_compression_lock", _acquire_then_raise)
     agent = _build_agent_with_db(db, parent_sid)
     messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
 
-    compressed, _sp = agent._compress_context(messages, "sys", approx_tokens=120_000)
+    with pytest.raises(RuntimeError, match="simulated post-acquire failure"):
+        agent._compress_context(messages, "sys", approx_tokens=120_000)
 
-    assert compressed is messages or compressed == messages
     assert agent.session_id == parent_sid
     assert _count_children(db, parent_sid) == 0
     assert db.get_compression_lock_holder(parent_sid) is None

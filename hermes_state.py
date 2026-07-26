@@ -33,7 +33,7 @@ from hermes_constants import get_hermes_home
 from hermes_cli.sqlite_runtime import (
     is_sqlite_wal_reset_vulnerable as _is_sqlite_wal_reset_vulnerable,
 )
-from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
+from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar, cast
 
 try:  # Hard dependency, but tolerate scaffold-phase imports before pip install.
     import psutil
@@ -2314,6 +2314,11 @@ class SessionDB:
     def _execute_write(
         self,
         fn: Callable[[sqlite3.Connection], T],
+        *,
+        timeout: Optional[float] = None,
+        deadline: Optional[float] = None,
+        max_retries: Optional[int] = None,
+        recover_fts_errors: bool = True,
     ) -> T:
         """Execute a write transaction with BEGIN IMMEDIATE and jitter retry.
 
@@ -2327,12 +2332,60 @@ class SessionDB:
         random 20-150ms, and retry — breaking the convoy pattern that
         SQLite's built-in deterministic backoff creates.
 
+        ``deadline`` is an absolute ``time.time()`` deadline. When present,
+        acquisition of the in-process lock and SQLite's busy handler are both
+        bounded by its remaining wall-time budget. A spent deadline returns
+        ``False`` without entering SQLite; callers that need that sentinel
+        (the compression-lock path) must make their callback return a type
+        other than ``False``.
+
+        ``max_retries`` and ``recover_fts_errors`` let latency-sensitive,
+        non-FTS writes opt out of this generic writer's retry/recovery policy.
+        All other callers retain the established defaults.
+
         Returns whatever *fn* returns.
         """
+        retry_count = (
+            self._WRITE_MAX_RETRIES
+            if max_retries is None
+            else max(1, max_retries)
+        )
         last_err: Optional[Exception] = None
-        for attempt in range(self._WRITE_MAX_RETRIES):
+        for attempt in range(retry_count):
             try:
-                with self._lock:
+                # A deadline must also bound waiting for this process's
+                # connection lock, not just SQLite's inter-process writer lock.
+                if deadline is not None:
+                    remaining = deadline - time.time()
+                    if remaining <= 0:
+                        return cast(T, False)
+                    if not self._lock.acquire(timeout=remaining):
+                        return cast(T, False)
+                else:
+                    self._lock.acquire()
+
+                try:
+                    assert self._conn is not None
+                    previous_busy_timeout_ms: Optional[int] = None
+                    if deadline is not None:
+                        remaining = deadline - time.time()
+                        if remaining <= 0:
+                            return cast(T, False)
+                        timeout = (
+                            remaining
+                            if timeout is None
+                            else min(max(0.0, timeout), remaining)
+                        )
+                    if timeout is not None:
+                        previous_busy_timeout_ms = int(
+                            self._conn.execute("PRAGMA busy_timeout").fetchone()[0]
+                        )
+                        # SQLite accepts integer milliseconds. Floor instead
+                        # of ceil so its busy handler cannot exceed the
+                        # caller's remaining budget.
+                        self._conn.execute(
+                            f"PRAGMA busy_timeout={max(0, int(timeout * 1000))}"
+                        )
                     self._conn.execute("BEGIN IMMEDIATE")
                     try:
                         result = fn(self._conn)
@@ -2343,6 +2396,17 @@ class SessionDB:
                         except Exception:
                             pass
                         raise
+                finally:
+                    if previous_busy_timeout_ms is not None:
+                        try:
+                            self._conn.execute(
+                                f"PRAGMA busy_timeout={previous_busy_timeout_ms}"
+                            )
+                        except sqlite3.Error:
+                            logger.debug(
+                                "failed to restore SQLite busy timeout", exc_info=True
+                            )
+                    self._lock.release()
                 # Success — periodic best-effort checkpoint + FTS merge.
                 self._write_count += 1
                 if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
@@ -2354,11 +2418,16 @@ class SessionDB:
                 err_msg = str(exc).lower()
                 if "locked" in err_msg or "busy" in err_msg:
                     last_err = exc
-                    if attempt < self._WRITE_MAX_RETRIES - 1:
+                    if attempt < retry_count - 1:
                         jitter = random.uniform(
                             self._WRITE_RETRY_MIN_S,
                             self._WRITE_RETRY_MAX_S,
                         )
+                        if deadline is not None:
+                            remaining = deadline - time.time()
+                            if remaining <= 0:
+                                return cast(T, False)
+                            jitter = min(jitter, remaining)
                         time.sleep(jitter)
                         continue
                 # Non-lock error or retries exhausted — propagate.
@@ -2373,7 +2442,7 @@ class SessionDB:
                 # until the next process restart triggers the offline repair.
                 # Rebuild the FTS index in place (once per instance) via
                 # rebuild_fts() and retry the failed write immediately.
-                if not self._try_runtime_fts_rebuild(exc):
+                if not recover_fts_errors or not self._try_runtime_fts_rebuild(exc):
                     raise
                 continue
         # Retries exhausted (shouldn't normally reach here).
@@ -4635,14 +4704,18 @@ class SessionDB:
         session_id: str,
         holder: str,
         ttl_seconds: float = 300.0,
+        *,
+        deadline: Optional[float] = None,
     ) -> bool:
         """Try to atomically acquire the compression lock for ``session_id``.
 
         Returns ``True`` on success (caller now owns the lock and must
-        release via :meth:`release_compression_lock`).  Returns ``False``
-        if another holder already owns a non-expired lock — the caller
-        MUST NOT proceed with compression in that case (its rotation would
-        race against the holder's, splitting the session lineage).
+        release via :meth:`release_compression_lock`). Returns ``False`` for a
+        live holder or transient SQLite ``locked``/``busy`` contention. Other
+        SQLite failures propagate so callers can surface the real database
+        error instead of misreporting it as contention. ``deadline`` is an
+        absolute ``time.time()`` wall-time budget for a latency-sensitive
+        acquisition; a spent deadline returns ``False`` without entering SQLite.
 
         Expired locks (``expires_at < now``) are reclaimed transparently.
         Structured holders whose local ``pid=`` no longer exists are reclaimed
@@ -4654,6 +4727,8 @@ class SessionDB:
         writes, so the whole sequence is atomic against other writers.
         """
         if not session_id:
+            return False
+        if deadline is not None and deadline - time.time() <= 0:
             return False
         now = time.time()
         expires_at = now + ttl_seconds
@@ -4700,7 +4775,21 @@ class SessionDB:
             return acquired, reclaimed_holder
 
         try:
-            acquired, reclaimed_holder = self._execute_write(_do)
+            remaining: Optional[float] = None
+            if deadline is not None:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    return False
+            write_result = self._execute_write(
+                _do,
+                timeout=remaining,
+                deadline=deadline,
+                max_retries=1,
+                recover_fts_errors=False,
+            )
+            if write_result is False:
+                return False
+            acquired, reclaimed_holder = write_result
             if reclaimed_holder:
                 logger.warning(
                     "Reclaimed stale compression lock for session=%s "
@@ -4709,13 +4798,15 @@ class SessionDB:
                     reclaimed_holder,
                 )
             return bool(acquired)
-        except sqlite3.Error as exc:
-            logger.warning(
-                "try_acquire_compression_lock(%s) failed: %s",
-                session_id, exc,
+        except sqlite3.OperationalError as exc:
+            err_msg = str(exc).lower()
+            if "locked" not in err_msg and "busy" not in err_msg:
+                raise
+            logger.debug(
+                "try_acquire_compression_lock(%s) hit transient SQLite contention: %s",
+                session_id,
+                exc,
             )
-            # Fail open: returning False makes the caller skip compression,
-            # which is the safe behaviour when the lock subsystem is broken.
             return False
 
     def release_compression_lock(self, session_id: str, holder: str) -> None:

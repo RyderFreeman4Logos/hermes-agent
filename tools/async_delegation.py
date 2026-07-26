@@ -894,7 +894,11 @@ def dispatch_async_delegation_batch(
         try:
             combined = runner() or {}
             # Batch status: completed unless every child errored/was interrupted.
-            child_results = combined.get("results") or []
+            # Preserve an absent/malformed result envelope for the completion
+            # consumer. Normalizing ``None`` to ``[]`` makes an unknown batch
+            # appear to be a clean, empty success and bypasses its fail-closed
+            # visible-response policy.
+            child_results = combined.get("results")
             if child_results and all(
                 (r.get("status") not in ("completed", "success"))
                 for r in child_results
@@ -990,9 +994,10 @@ def _finalize_batch(
         "model": event_record.get("model"),
         "status": status,
         "is_batch": True,
-        # The full per-task results list — the formatter renders a
-        # consolidated multi-task block from this.
-        "results": combined.get("results") or [],
+        # Preserve the runner's result envelope verbatim. In particular,
+        # ``None`` must remain observable by consumers so they fail closed
+        # instead of treating it as an empty successful batch.
+        "results": combined.get("results"),
         # Per-task live transcript log paths (cache/delegation/live/...).
         # They persist after completion and double as the full-fidelity
         # operational record of each child's run.

@@ -873,6 +873,51 @@ def test_delegate_task_background_batch_runs_as_one_unit(monkeypatch):
     assert _drain_one() is None
 
 
+def test_batch_none_results_remain_visible_to_consumer():
+    """A malformed batch envelope must reach the consumer unchanged."""
+    from tui_gateway import server
+
+    dispatched = ad.dispatch_async_delegation_batch(
+        goals=["malformed batch"], context=None, toolsets=None, role="leaf",
+        model="m", session_key="", max_async_children=1,
+        runner=lambda: {"results": None},
+    )
+    event = _drain_for(dispatched["delegation_id"])
+
+    assert event is not None
+    assert event["results"] is None
+    assert server._completion_event_requires_visible_response(event) is True
+
+
+def test_batch_none_results_disables_idle_silent_noop(monkeypatch):
+    """The producer's malformed envelope must disable the idle noop policy."""
+    from tui_gateway import server
+
+    dispatched = ad.dispatch_async_delegation_batch(
+        goals=["malformed batch"], context=None, toolsets=None, role="leaf",
+        model="m", session_key="", max_async_children=1,
+        runner=lambda: {"results": None},
+    )
+    event = _drain_for(dispatched["delegation_id"])
+    submitted = []
+    session = {"history_lock": threading.RLock(), "running": True}
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda _rid, _sid, _session, payload, **kwargs: submitted.append((payload, kwargs)),
+    )
+
+    assert event is not None
+    assert server._dispatch_idle_completion_batch(
+        "rid-none-results",
+        "sid-none-results",
+        session,
+        [(event, "[IMPORTANT: malformed async batch]")],
+        consumer="none-results-test",
+    )
+    assert submitted[0][1]["allow_silent_noop"] is False
+
+
 def test_model_dispatch_forces_background():
     """The MODEL-facing dispatch path forces background=True for any top-level
     delegation (single task OR batch), and keeps it off for an orchestrator

@@ -213,8 +213,8 @@ def test_mirror_slash_side_effects_reports_lock_skip():
 
 
 def test_mirror_slash_side_effects_unconfirmed_lock_skip_wording():
-    """signal=True (no confirmed holder) must report database busy rather
-    than claiming another compression is running."""
+    """signal=True (no confirmed holder) must use the 'could not acquire'
+    wording rather than claiming another compression is running."""
     from tui_gateway import server
 
     agent = _make_lock_skip_agent(True)
@@ -234,5 +234,6 @@ def test_mirror_slash_side_effects_unconfirmed_lock_skip_wording():
     finally:
         server._sessions.pop(sid, None)
 
-    assert output == "⏳ Compression skipped: database busy, try again"
+    assert "Compression skipped" in output
+    assert "could not acquire" in output
     assert "already in progress" not in output

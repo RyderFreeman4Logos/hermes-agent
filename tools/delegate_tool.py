@@ -1208,6 +1208,8 @@ def _build_child_agent(
     # Per-profile reasoning_effort override (from model_pool.<name>).
     # Takes precedence over the global delegation.reasoning_effort.
     override_reasoning_effort: Optional[Any] = None,
+    # Per-profile fallback chain, in AIAgent fallback_model format.
+    override_fallback_chain: Optional[List[Dict[str, Any]]] = None,
     # ACP transport overrides from trusted delegation config.
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
@@ -1466,6 +1468,8 @@ def _build_child_agent(
     # agent does.  _fallback_chain is a list accepted by AIAgent's
     # fallback_model parameter (which handles both list and dict forms).
     parent_fallback = getattr(parent_agent, "_fallback_chain", None) or None
+    if override_fallback_chain:
+        parent_fallback = list(override_fallback_chain)
 
     # Inherit the parent's OpenRouter provider-preference filters by default
     # (so subagents routed to the same provider honour the same routing
@@ -2980,6 +2984,7 @@ def delegate_task(
             override_request_overrides=task_creds.get("request_overrides"),
             override_max_tokens=task_creds.get("max_output_tokens"),
             override_reasoning_effort=task_creds.get("reasoning_effort"),
+            override_fallback_chain=task_creds.get("fallback_chain") or None,
             override_acp_command=task_creds.get("command"),
             override_acp_args=task_creds.get("args"),
             role=effective_role,
@@ -3641,9 +3646,24 @@ def _resolve_model_profile(cfg: dict, model_profile: Optional[str]) -> Optional[
         val = profile.get(key)
         if val is not None and val != "":
             merged[key] = val
-    # Stash the resolved effort so _build_child_agent can read it without
-    # re-merging. ``_resolve_delegation_credentials`` passes this through in
-    # the returned credential dict as ``reasoning_effort``.
+    # Normalize a per-profile fallback chain for AIAgent.
+    chain = profile.get("fallback_chain")
+    normalized_chain: List[Dict[str, Any]] = []
+    if isinstance(chain, list):
+        for entry in chain:
+            if not isinstance(entry, dict):
+                continue
+            provider = str(entry.get("provider") or "").strip()
+            model = str(entry.get("model") or "").strip()
+            if not provider or not model:
+                continue
+            fallback: Dict[str, Any] = {"provider": provider, "model": model}
+            for key in ("base_url", "api_key", "api_mode", "reasoning_effort"):
+                value = entry.get(key)
+                if value is not None and str(value).strip():
+                    fallback[key] = value
+            normalized_chain.append(fallback)
+    merged["_profile_fallback_chain"] = normalized_chain
     return merged
 
 
@@ -3676,10 +3696,18 @@ def _resolve_delegation_credentials(
     Raises ValueError with a user-friendly message on credential failure.
     """
     # Named model-pool profile overlays the global delegation config.
+    if not model_profile:
+        default_profile = str(cfg.get("default_profile") or "").strip()
+        if default_profile:
+            model_profile = default_profile
     profile_effort: Optional[Any] = None
+    profile_fallback_chain: List[Dict[str, Any]] = []
     if model_profile:
         merged = _resolve_model_profile(cfg, model_profile)
         if merged is not None:
+            profile_fallback_chain = list(
+                merged.get("_profile_fallback_chain") or []
+            )
             cfg = merged
             profile_effort = merged.get("reasoning_effort")
             if profile_effort == "":
@@ -3746,6 +3774,7 @@ def _resolve_delegation_credentials(
             "api_key": api_key,
             "api_mode": api_mode,
             "reasoning_effort": profile_effort,
+            "fallback_chain": profile_fallback_chain,
         }
 
     if not configured_provider:
@@ -3759,6 +3788,7 @@ def _resolve_delegation_credentials(
             "request_overrides": None,
             "max_output_tokens": None,
             "reasoning_effort": profile_effort,
+            "fallback_chain": profile_fallback_chain,
         }
 
     # Provider is configured — resolve full credentials
@@ -3792,6 +3822,7 @@ def _resolve_delegation_credentials(
         "command": runtime.get("command"),
         "args": list(runtime.get("args") or []),
         "reasoning_effort": profile_effort,
+        "fallback_chain": profile_fallback_chain,
     }
 
 
@@ -4133,8 +4164,9 @@ DELEGATE_TASK_SCHEMA = {
                     "delegation.model_pool in config.yaml) to run this "
                     "subagent on, instead of the global delegation "
                     "model/provider. Each profile pins a provider/model pair "
-                    "(and optionally reasoning_effort). Per-task "
-                    "model_profile in the tasks array overrides this. An "
+                    "(and optionally reasoning_effort + fallback_chain). "
+                    "REQUIRED: specify model_profile for every delegate_task "
+                    "call. Per-task model_profile overrides this. An "
                     "unknown profile name silently falls back to the global "
                     "delegation config."
                 ),
@@ -4152,7 +4184,7 @@ DELEGATE_TASK_SCHEMA = {
                 ),
             },
         },
-        "required": [],
+        "required": ["model_profile"],
     },
 }
 

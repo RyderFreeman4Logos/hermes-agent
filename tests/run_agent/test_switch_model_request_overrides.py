@@ -140,7 +140,7 @@ class _StatefulCompressor:
             raise RuntimeError(f"compressor rejected {model}")
 
 
-def _fallback_patches(*, clients, custom_providers=None, fallback_pool=None):
+def _fallback_patches(*, clients, custom_providers=None, fallback_pool=None, config=None):
     return (
         patch(
             "agent.auxiliary_client.resolve_provider_client",
@@ -155,8 +155,8 @@ def _fallback_patches(*, clients, custom_providers=None, fallback_pool=None):
             "agent.chat_completion_helpers.get_provider_request_timeout",
             return_value=None,
         ),
-        patch("hermes_cli.config.load_config", return_value={}),
-        patch("hermes_cli.config.load_config_readonly", return_value={}),
+        patch("hermes_cli.config.load_config", return_value=config or {}),
+        patch("hermes_cli.config.load_config_readonly", return_value=config or {}),
         patch(
             "hermes_cli.config.get_compatible_custom_providers",
             return_value=list(custom_providers or []),
@@ -423,14 +423,59 @@ def test_fallback_success_rebuilds_overrides_for_target_runtime():
                 _fallback_client(_CODEX_BASE_URL, "codex-key"),
                 "gpt-5.6-luna",
             )
-        ]
+        ],
+        config={"agent": {"reasoning_effort": "low"}},
     )
 
     with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
         assert agent._try_activate_fallback() is True
 
     assert agent.provider == "openai-codex"
+    # Entries without api_mode/reasoning_effort keep existing heuristics and
+    # global config resolution.
+    assert agent.api_mode == "codex_responses"
+    assert agent.reasoning_config == {"enabled": True, "effort": "low"}
     assert agent.request_overrides == {}
+
+
+def test_fallback_entry_api_mode_overrides_provider_heuristic():
+    agent = _make_fallback_agent(
+        [
+            {
+                "provider": "openai-codex",
+                "model": "gpt-5.6-luna",
+                "api_mode": "chat_completions",
+            }
+        ]
+    )
+    patches = _fallback_patches(
+        clients=[(_fallback_client(_CODEX_BASE_URL), "gpt-5.6-luna")]
+    )
+
+    with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
+        assert agent._try_activate_fallback() is True
+
+    assert agent.api_mode == "chat_completions"
+
+
+def test_fallback_entry_reasoning_effort_overrides_global_resolution():
+    agent = _make_fallback_agent(
+        [
+            {
+                "provider": "openai-codex",
+                "model": "gpt-5.6-terra",
+                "reasoning_effort": "high",
+            }
+        ]
+    )
+    patches = _fallback_patches(
+        clients=[(_fallback_client(_CODEX_BASE_URL), "gpt-5.6-terra")]
+    )
+
+    with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5], patches[6]:
+        assert agent._try_activate_fallback() is True
+
+    assert agent.reasoning_config == {"enabled": True, "effort": "high"}
 
 
 def test_fallback_exact_runtime_and_canonical_endpoint_keeps_nested_overrides():

@@ -434,6 +434,335 @@ class TestModelProfileSchemaEnum(unittest.TestCase):
         }
         self.assertEqual(_available_model_profile_names(), ["alpha", "zeta"])
 
+    @patch("tools.delegate_tool._load_config")
+    def test_model_profile_is_required_in_schema(self, mock_cfg):
+        """model_profile is required in the top-level schema (model path)."""
+        mock_cfg.return_value = {"model_pool": {}}
+        overrides = _build_dynamic_schema_overrides()
+        self.assertIn("model_profile", overrides["parameters"].get("required", []))
+        # The static schema itself also declares it required.
+        from tools.delegate_tool import DELEGATE_TASK_SCHEMA
+
+        self.assertIn(
+            "model_profile",
+            DELEGATE_TASK_SCHEMA["parameters"].get("required", []),
+        )
+
+
+# =========================================================================
+# Per-profile fallback_chain
+# =========================================================================
+
+
+class TestResolveModelProfileFallbackChain(unittest.TestCase):
+    """_resolve_model_profile normalizes a profile's fallback_chain."""
+
+    def test_fallback_chain_extracted_and_normalized(self):
+        cfg = {
+            "model_pool": {
+                "fast": {
+                    "provider": "custom:localrouter",
+                    "model": "grok-4.5",
+                    "reasoning_effort": "high",
+                    "fallback_chain": [
+                        {"provider": "openai-codex", "model": "gpt-5.6-terra"},
+                        {"provider": "nous", "model": "hermes-4"},
+                    ],
+                }
+            }
+        }
+        merged = _resolve_model_profile(cfg, "fast")
+        self.assertIsNotNone(merged)
+        chain = merged["_profile_fallback_chain"]
+        self.assertEqual(len(chain), 2)
+        self.assertEqual(chain[0]["provider"], "openai-codex")
+        self.assertEqual(chain[0]["model"], "gpt-5.6-terra")
+        self.assertEqual(chain[1]["provider"], "nous")
+
+    def test_fallback_chain_drops_invalid_entries(self):
+        """Entries missing provider/model are dropped; reasoning_effort kept."""
+        cfg = {
+            "model_pool": {
+                "fast": {
+                    "provider": "x",
+                    "model": "m",
+                    "fallback_chain": [
+                        {"provider": "ok", "model": "m1", "reasoning_effort": "low"},
+                        {"provider": "", "model": "no-provider"},  # dropped
+                        {"provider": "no-model", "model": ""},  # dropped
+                        "not-a-dict",  # dropped
+                    ],
+                }
+            }
+        }
+        merged = _resolve_model_profile(cfg, "fast")
+        chain = merged["_profile_fallback_chain"]
+        self.assertEqual(len(chain), 1)
+        self.assertEqual(chain[0]["provider"], "ok")
+        self.assertEqual(chain[0]["reasoning_effort"], "low")
+
+    def test_no_fallback_chain_yields_empty_list(self):
+        cfg = {"model_pool": {"fast": {"provider": "x", "model": "m"}}}
+        merged = _resolve_model_profile(cfg, "fast")
+        self.assertEqual(merged["_profile_fallback_chain"], [])
+
+
+class TestResolveCredentialsFallbackChain(unittest.TestCase):
+    """_resolve_delegation_credentials surfaces fallback_chain + default_profile."""
+
+    def test_fallback_chain_returned_in_creds(self):
+        cfg = {
+            "base_url": "http://localhost:8000/v1",
+            "model_pool": {
+                "fast": {
+                    "provider": "custom:localrouter",
+                    "model": "grok-4.5",
+                    "fallback_chain": [
+                        {"provider": "openai-codex", "model": "gpt-5.6-terra"},
+                    ],
+                }
+            },
+        }
+        parent = _make_mock_parent()
+        creds = _resolve_delegation_credentials(cfg, parent, model_profile="fast")
+        self.assertEqual(creds["fallback_chain"][0]["provider"], "openai-codex")
+        self.assertEqual(creds["fallback_chain"][0]["model"], "gpt-5.6-terra")
+
+    def test_empty_fallback_chain_when_no_chain_configured(self):
+        cfg = {
+            "base_url": "http://localhost:8000/v1",
+            "model_pool": {"fast": {"provider": "x", "model": "m"}},
+        }
+        parent = _make_mock_parent()
+        creds = _resolve_delegation_credentials(cfg, parent, model_profile="fast")
+        self.assertEqual(creds["fallback_chain"], [])
+
+    def test_default_profile_used_when_model_profile_none(self):
+        """Internal path (model_profile=None) falls back to default_profile."""
+        cfg = {
+            "base_url": "http://localhost:8000/v1",
+            "default_profile": "fast",
+            "model_pool": {
+                "fast": {
+                    "provider": "custom:localrouter",
+                    "model": "grok-4.5",
+                    "fallback_chain": [
+                        {"provider": "openai-codex", "model": "gpt-5.6-terra"},
+                    ],
+                }
+            },
+        }
+        parent = _make_mock_parent()
+        creds = _resolve_delegation_credentials(cfg, parent, model_profile=None)
+        # default_profile "fast" was applied: its model + chain surfaced.
+        self.assertEqual(creds["model"], "grok-4.5")
+        self.assertEqual(creds["fallback_chain"][0]["provider"], "openai-codex")
+
+    def test_no_default_profile_degrades_to_global(self):
+        """When model_profile=None and no default_profile, global config used."""
+        cfg = {
+            "provider": "openrouter",
+        }
+        parent = _make_mock_parent()
+        with patch(
+            "hermes_cli.runtime_provider.resolve_runtime_provider"
+        ) as mock_resolve:
+            mock_resolve.return_value = {
+                "provider": "custom",
+                "model": "global-model",
+                "base_url": "https://openrouter.ai/api/v1",
+                "api_key": "key",
+                "api_mode": "chat_completions",
+            }
+            creds = _resolve_delegation_credentials(cfg, parent, model_profile=None)
+        # No profile → no chain, global provider resolved.
+        self.assertEqual(creds["fallback_chain"], [])
+        self.assertIsNotNone(creds["provider"])
+
+
+class TestBuildChildAgentFallbackChain(unittest.TestCase):
+    """_build_child_agent hands the per-profile chain to AIAgent's fallback_model."""
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("run_agent.AIAgent")
+    def test_profile_chain_overrides_parent_chain(self, MockAgent, mock_cfg):
+        """A per-profile fallback_chain takes precedence over parent's chain."""
+        mock_cfg.return_value = {"max_iterations": 50}
+        MockAgent.return_value = MagicMock()
+        parent = _make_mock_parent()
+        # Parent has its own fallback chain; the profile's must win.
+        parent._fallback_chain = [
+            {"provider": "parent-provider", "model": "parent-model"}
+        ]
+
+        profile_chain = [
+            {"provider": "openai-codex", "model": "gpt-5.6-terra"},
+            {"provider": "nous", "model": "hermes-4"},
+        ]
+        _build_child_agent(
+            task_index=0,
+            goal="test",
+            context=None,
+            toolsets=None,
+            model=None,
+            max_iterations=50,
+            task_count=1,
+            parent_agent=parent,
+            override_fallback_chain=profile_chain,
+        )
+        call_kwargs = MockAgent.call_args[1]
+        self.assertEqual(call_kwargs["fallback_model"], profile_chain)
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("run_agent.AIAgent")
+    def test_no_profile_chain_inherits_parent_chain(self, MockAgent, mock_cfg):
+        """Without a profile chain, the parent's chain is inherited (back-compat)."""
+        mock_cfg.return_value = {"max_iterations": 50}
+        MockAgent.return_value = MagicMock()
+        parent = _make_mock_parent()
+        parent_chain = [
+            {"provider": "parent-provider", "model": "parent-model"}
+        ]
+        parent._fallback_chain = parent_chain
+
+        _build_child_agent(
+            task_index=0,
+            goal="test",
+            context=None,
+            toolsets=None,
+            model=None,
+            max_iterations=50,
+            task_count=1,
+            parent_agent=parent,
+            # No override_fallback_chain → parent chain inherited
+        )
+        call_kwargs = MockAgent.call_args[1]
+        self.assertEqual(call_kwargs["fallback_model"], parent_chain)
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("run_agent.AIAgent")
+    def test_empty_profile_chain_inherits_parent_chain(self, MockAgent, mock_cfg):
+        """An empty list (no profile chain) still inherits the parent chain."""
+        mock_cfg.return_value = {"max_iterations": 50}
+        MockAgent.return_value = MagicMock()
+        parent = _make_mock_parent()
+        parent._fallback_chain = [{"provider": "p", "model": "m"}]
+
+        _build_child_agent(
+            task_index=0,
+            goal="test",
+            context=None,
+            toolsets=None,
+            model=None,
+            max_iterations=50,
+            task_count=1,
+            parent_agent=parent,
+            override_fallback_chain=[],  # empty → inherit parent
+        )
+        call_kwargs = MockAgent.call_args[1]
+        self.assertEqual(call_kwargs["fallback_model"], parent._fallback_chain)
+
+
+class TestDelegateTaskFallbackChainIntegration(unittest.TestCase):
+    """delegate_task threads the profile's fallback_chain end-to-end."""
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("run_agent.AIAgent")
+    def test_profile_chain_reaches_child_agent(
+        self, MockAgent, mock_creds, mock_cfg
+    ):
+        """The profile's fallback_chain reaches _build_child_agent."""
+        mock_cfg.return_value = {"max_iterations": 45, "model_pool": {"fast": {}}}
+        chain = [{"provider": "openai-codex", "model": "gpt-5.6-terra"}]
+        mock_creds.return_value = {
+            "model": "grok-4.5",
+            "provider": "custom",
+            "base_url": "http://localhost:8000/v1",
+            "api_key": "fast-key",
+            "api_mode": "chat_completions",
+            "reasoning_effort": "high",
+            "fallback_chain": chain,
+        }
+        parent = _make_mock_parent(depth=0)
+
+        mock_child = MagicMock()
+        mock_child.run_conversation.return_value = {
+            "final_response": "done",
+            "completed": True,
+            "api_calls": 1,
+        }
+        MockAgent.return_value = mock_child
+
+        delegate_task(
+            goal="Test fallback chain routing",
+            model_profile="fast",
+            parent_agent=parent,
+        )
+        _, child_kwargs = MockAgent.call_args
+        self.assertEqual(child_kwargs["fallback_model"], chain)
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("run_agent.AIAgent")
+    def test_per_task_profiles_have_distinct_chains(
+        self, MockAgent, mock_creds, mock_cfg
+    ):
+        """Each per-task profile carries its own fallback_chain."""
+        mock_cfg.return_value = {"max_iterations": 45}
+        fast_chain = [{"provider": "openai-codex", "model": "gpt-5.6-terra"}]
+        smart_chain = [{"provider": "nous", "model": "hermes-4"}]
+        mock_creds.side_effect = [
+            {  # top-level (no profile)
+                "model": "base-model",
+                "provider": "openrouter",
+                "base_url": "https://openrouter.ai/api/v1",
+                "api_key": "base-key",
+                "api_mode": "chat_completions",
+                "reasoning_effort": None,
+                "fallback_chain": [],
+            },
+            {  # fast task
+                "model": "grok-4.5",
+                "provider": "custom",
+                "base_url": "http://localhost:8000/v1",
+                "api_key": "fast-key",
+                "api_mode": "chat_completions",
+                "reasoning_effort": "high",
+                "fallback_chain": fast_chain,
+            },
+            {  # smart task
+                "model": "gpt-5.6-terra",
+                "provider": "custom",
+                "base_url": "http://pm.example.com/v1",
+                "api_key": "smart-key",
+                "api_mode": "chat_completions",
+                "reasoning_effort": "high",
+                "fallback_chain": smart_chain,
+            },
+        ]
+        parent = _make_mock_parent(depth=0)
+
+        mock_child = MagicMock()
+        mock_child.run_conversation.return_value = {
+            "final_response": "done",
+            "completed": True,
+            "api_calls": 1,
+        }
+        MockAgent.return_value = mock_child
+
+        delegate_task(
+            tasks=[
+                {"goal": "task A", "model_profile": "fast"},
+                {"goal": "task B", "model_profile": "smart"},
+            ],
+            parent_agent=parent,
+        )
+        # Two children built; each got its own chain.
+        all_kwargs = [c[1] for c in MockAgent.call_args_list]
+        self.assertEqual(all_kwargs[0]["fallback_model"], fast_chain)
+        self.assertEqual(all_kwargs[1]["fallback_model"], smart_chain)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1994,4 +1994,74 @@ describe('createGatewayEventHandler', () => {
       expect(appended).toHaveLength(0)
     })
   })
+
+  it('shows active background elapsed and ttl on the completed tool trail', () => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+    onEvent({ payload: { name: 'terminal', tool_id: 'tool-1' }, type: 'tool.start' } as any)
+    onEvent({
+      payload: {
+        bg_timers: [
+          { elapsed_s: 42, session_id: 'proc-1', ttl_remaining_s: 330 },
+          { elapsed_s: 10, session_id: 'proc-2', ttl_remaining_s: 320 },
+          { elapsed_s: 5, session_id: 'proc-3', ttl_remaining_s: 315 }
+        ],
+        summary: 'done',
+        tool_id: 'tool-1'
+      },
+      type: 'tool.complete'
+    } as any)
+    onEvent({ payload: { text: 'final answer' }, type: 'message.complete' } as any)
+
+    const trail = appended.find(msg => msg.kind === 'trail' && msg.tools?.length)
+    expect(trail?.tools?.[0]).toContain('→checkin 42s/330s +2')
+  })
+
+  it.each([
+    [{ pct: 87, read_tokens: 1_740, prompt_tokens: 2_000, state: 'hit' }, 'cache 87%', undefined],
+    [{ pct: 0, read_tokens: 0, prompt_tokens: 2_000, state: 'cold_write' }, 'cache cold-write', undefined],
+    [{ pct: 0, read_tokens: 0, prompt_tokens: 2_000, state: 'miss' }, 'cache MISS', 'warn'],
+    [{ pct: 0, read_tokens: 0, prompt_tokens: 512, state: 'unknown' }, 'cache unknown', undefined]
+  ])('adds cache % as a footnote after the assistant response', (cache_info, text, eventTone) => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+    onEvent({ payload: { cache_info, text: 'final answer' }, type: 'message.complete' } as any)
+
+    expect(appended).toHaveLength(2)
+    expect(appended[0]).toMatchObject({ role: 'assistant', text: 'final answer' })
+    expect(appended[1]).toMatchObject({ kind: 'event', role: 'system', text })
+    expect(appended[1]?.eventTone).toBe(eventTone)
+  })
+
+  it('keeps cache % after a response-previewed assistant message', () => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+    onEvent({ payload: {}, type: 'message.start' } as any)
+    onEvent({ payload: { already_streamed: true, text: 'same reply' }, type: 'message.interim' } as any)
+    onEvent({
+      payload: {
+        cache_info: { pct: 87, prompt_tokens: 2_000, read_tokens: 1_740, state: 'hit' },
+        response_previewed: true,
+        text: 'same reply'
+      },
+      type: 'message.complete'
+    } as any)
+
+    expect(appended).toEqual([
+      { role: 'assistant', text: 'same reply' },
+      { kind: 'event', role: 'system', text: 'cache 87%' }
+    ])
+  })
+
+  it('does not add a cache footnote when the gateway has no cache data', () => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+    onEvent({ payload: { text: 'final answer' }, type: 'message.complete' } as any)
+
+    expect(appended).toEqual([{ role: 'assistant', text: 'final answer' }])
+  })
 })

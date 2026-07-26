@@ -182,3 +182,29 @@ def test_default_config_exposes_per_target_runtime_contract():
     assert runtime["kv_cache_ttl"]["providers"]["custom:z1"] == 1700
     assert runtime["heartbeat"]["mode"] == "per_target"
     assert runtime["heartbeat"]["reset_on_caller_activation"] is True
+
+
+def test_snapshot_active_targets_reports_process_elapsed_and_ttl_remaining(monkeypatch):
+    manager = _manager()
+    now = {"value": 1_000.0}
+    monkeypatch.setattr("tools.runtime_heartbeat.time.time", lambda: now["value"])
+
+    class _ProcessSession:
+        started_at = 958.0
+
+    monkeypatch.setattr(
+        "tools.process_registry.process_registry.get",
+        lambda target_id: _ProcessSession() if target_id == "proc-1" else None,
+    )
+    assert manager.arm(
+        "proc-1",
+        caller_id="caller",
+        kind="process",
+        provider="openai",
+        inspect=lambda: {"alive": True, "output_size": 0},
+    )
+
+    now["value"] = 1_002.0
+    assert manager.snapshot_active_targets() == [
+        {"session_id": "proc-1", "elapsed_s": 44, "ttl_remaining_s": 158}
+    ]

@@ -13724,6 +13724,34 @@ def test_notification_poller_batches_unapplied_steers_and_completes_durable_once
         server._sessions.pop("sid-burst-fallback", None)
 
 
+@pytest.mark.parametrize(
+    "results",
+    [
+        ({"status": "completed", "summary": "tuple child"},),
+        None,
+        {"status": "completed", "summary": "dict child"},
+    ],
+    ids=["tuple", "none", "dict"],
+)
+def test_idle_completion_non_list_async_results_require_visible_response(results):
+    """Malformed batch result envelopes must never be silently acknowledged."""
+    event = _async_completion_event(98)
+    event["results"] = results
+
+    assert server._completion_event_requires_visible_response(event) is True
+
+
+def test_idle_completion_all_completed_async_results_preserve_silent_noop():
+    """A valid all-completed batch remains eligible for the idle noop policy."""
+    event = _async_completion_event(99)
+    event["results"] = [
+        {"status": "completed", "summary": "first child finished"},
+        {"status": "success", "summary": "second child finished"},
+    ]
+
+    assert server._completion_event_requires_visible_response(event) is False
+
+
 def test_idle_completion_failure_disables_silent_noop_and_stays_traceable(monkeypatch):
     """A failed background job must not be hidden by the clean-exit noop policy."""
     dispatched = []
@@ -13756,6 +13784,71 @@ def test_idle_completion_failure_disables_silent_noop_and_stays_traceable(monkey
     assert kwargs["allow_silent_noop"] is False
     assert event["delegation_id"] in payload
     assert event["exit_code"] == 7
+
+
+def test_idle_completion_batch_keeps_interrupted_async_child_visible(monkeypatch):
+    """One interrupted child prevents a mixed idle batch from becoming a noop."""
+    dispatched = []
+    session = _session(running=True)
+    interrupted = _async_completion_event(100)
+    interrupted["results"] = [
+        {"status": "completed", "summary": "first child finished"},
+        {"status": "interrupted", "summary": "parent stopped second child"},
+    ]
+    clean_process = {
+        "type": "completion",
+        "session_id": "proc-clean",
+        "exit_code": 0,
+        "completion_reason": "exited",
+    }
+
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda _rid, _sid, _session, payload, **kwargs: dispatched.append((payload, kwargs)),
+    )
+    assert server._dispatch_idle_completion_batch(
+        "rid-interrupted-batch",
+        "sid-interrupted-batch",
+        session,
+        [
+            (interrupted, "[IMPORTANT: async child interrupted]"),
+            (clean_process, "[IMPORTANT: clean process completed]"),
+        ],
+        consumer="interrupted-batch-test",
+    )
+
+    assert server._completion_event_requires_visible_response(interrupted) is True
+    assert len(dispatched) == 1
+    assert dispatched[0][1]["allow_silent_noop"] is False
+
+
+def test_idle_completion_clean_process_preserves_silent_noop(monkeypatch):
+    """A normal zero-exit process remains eligible for the idle noop policy."""
+    dispatched = []
+    session = _session(running=True)
+    clean_process = {
+        "type": "completion",
+        "session_id": "proc-clean-noop",
+        "exit_code": 0,
+        "completion_reason": "exited",
+    }
+
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda _rid, _sid, _session, payload, **kwargs: dispatched.append((payload, kwargs)),
+    )
+    assert server._dispatch_idle_completion_batch(
+        "rid-clean-noop",
+        "sid-clean-noop",
+        session,
+        [(clean_process, "[IMPORTANT: clean process completed]")],
+        consumer="clean-noop-test",
+    )
+
+    assert server._completion_event_requires_visible_response(clean_process) is False
+    assert dispatched[0][1]["allow_silent_noop"] is True
 
 
 def test_notification_event_dedup_key_keeps_completions_one_shot():

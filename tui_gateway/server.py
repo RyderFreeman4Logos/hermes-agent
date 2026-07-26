@@ -8785,24 +8785,24 @@ def _is_terminal_completion_event(evt: dict) -> bool:
 
 
 def _completion_event_requires_visible_response(evt: dict) -> bool:
-    """Failures must never obtain the actionless idle-completion noop policy."""
+    """Only clean completions may obtain the actionless idle noop policy."""
     if evt.get("type") == "async_delegation":
+        clean_statuses = {"completed", "success"}
         results = evt.get("results")
-        if isinstance(results, list) and any(
-            isinstance(result, dict)
-            and (
-                str(result.get("status") or "").lower()
-                in {"failed", "error", "cancelled"}
-                or (
-                    result.get("exit_code") is not None
-                    and str(result.get("exit_code")) not in {"0", "0.0"}
-                )
+        if not isinstance(results, list):
+            return True
+        if any(
+            not isinstance(result, dict)
+            or str(result.get("status") or "").lower() not in clean_statuses
+            or (
+                result.get("exit_code") is not None
+                and str(result.get("exit_code")) not in {"0", "0.0"}
             )
             for result in results
         ):
             return True
         status = str(evt.get("status") or "").lower()
-        return status in {"failed", "error", "cancelled"}
+        return status not in clean_statuses
     try:
         if int(evt.get("exit_code", 0) or 0) != 0:
             return True

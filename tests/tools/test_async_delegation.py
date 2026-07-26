@@ -253,6 +253,23 @@ def test_interrupt_all_signals_running_children():
     assert evt["status"] == "interrupted"
 
 
+def test_real_interrupted_single_delegation_requires_visible_response():
+    """A child interrupted by its parent cannot use the idle noop policy."""
+    from tui_gateway import server
+
+    dispatched = ad.dispatch_async_delegation(
+        goal="interrupted child", context=None, toolsets=None, role="leaf",
+        model="m", session_key="", max_async_children=1,
+        runner=lambda: {"status": "interrupted", "error": "parent stopped"},
+    )
+
+    event = _drain_for(dispatched["delegation_id"])
+
+    assert event is not None
+    assert event["status"] == "interrupted"
+    assert server._completion_event_requires_visible_response(event) is True
+
+
 def _fast_stale_monitor(monkeypatch, *, idle=0.15, in_tool=0.3, grace=0.15):
     """Shrink the stale-monitor cadence so tests run in milliseconds."""
     monkeypatch.setattr(ad, "_STALE_CHECK_INTERVAL", 0.03)

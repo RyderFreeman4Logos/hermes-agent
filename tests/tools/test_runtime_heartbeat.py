@@ -250,3 +250,32 @@ def test_snapshot_active_targets_filters_by_caller_id(monkeypatch):
 
     snapshot_all = manager.snapshot_active_targets()
     assert len(snapshot_all) == 2
+
+
+def test_default_safety_ratio_is_one_when_key_omitted(monkeypatch):
+    """Configured warm_kv_timeout is the check-in interval unless ratio is set."""
+    runtime = {
+        "warm_kv_timeout": {"default": 3300, "providers": {"openai": 3300}},
+        "heartbeat": {
+            "enabled": True,
+            "mode": "per_target",
+            # intentionally omit safety_ratio — default must be 1.0
+            "min_interval_seconds": 60,
+            "max_interval_seconds": 3300,
+        },
+    }
+    manager = _manager(runtime)
+    monkeypatch.setattr(
+        "tools.process_registry.process_registry.get",
+        lambda target_id: None,
+    )
+    assert manager.arm(
+        "proc-1",
+        caller_id="caller",
+        kind="process",
+        provider="openai",
+        inspect=lambda: {"alive": True, "output_size": 0},
+    )
+    assert FakeTimer.created[-1].interval == 3300
+    snap = manager.snapshot_active_targets()
+    assert snap[0]["interval_s"] == 3300

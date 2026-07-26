@@ -889,6 +889,9 @@ export const ToolTrail = memo(function ToolTrail({
         <>
           <Spinner color={t.color.tool} variant="tool" /> {label}
           {tool.startedAt ? ` (${fmtElapsed(now - tool.startedAt)})` : ''}
+          {tool.bgTimer
+            ? ` →checkin ${Math.max(0, Math.floor((now - tool.bgTimer.started_at * 1000) / 1000))}s/${tool.bgTimer.interval_s}s`
+            : ''}
         </>
       )
     })

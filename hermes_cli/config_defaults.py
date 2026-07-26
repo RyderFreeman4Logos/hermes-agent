@@ -248,7 +248,7 @@ DEFAULT_CONFIG = {
         "heartbeat": {
             "enabled": True,
             "mode": "per_target",
-            "safety_ratio": 0.8,
+            "safety_ratio": 1.0,
             "min_interval_seconds": 60,
             "max_interval_seconds": 3300,
             "reset_on_caller_activation": True,

@@ -253,6 +253,23 @@ def test_interrupt_all_signals_running_children():
     assert evt["status"] == "interrupted"
 
 
+def test_real_interrupted_single_delegation_requires_visible_response():
+    """A child interrupted by its parent cannot use the idle noop policy."""
+    from tui_gateway import server
+
+    dispatched = ad.dispatch_async_delegation(
+        goal="interrupted child", context=None, toolsets=None, role="leaf",
+        model="m", session_key="", max_async_children=1,
+        runner=lambda: {"status": "interrupted", "error": "parent stopped"},
+    )
+
+    event = _drain_for(dispatched["delegation_id"])
+
+    assert event is not None
+    assert event["status"] == "interrupted"
+    assert server._completion_event_requires_visible_response(event) is True
+
+
 def test_completed_records_pruned_to_cap():
     # Run more than the retention cap quickly; ensure list doesn't grow forever.
     for i in range(ad._MAX_RETAINED_COMPLETED + 10):

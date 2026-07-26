@@ -56,6 +56,22 @@ const backgroundTimerTrail = (timers?: BackgroundTimer[]) => {
   return ` →checkin ${elapsed}s/${interval}s${extra}`
 }
 
+const firstBackgroundTimer = (timers?: BackgroundTimer[]): ActiveTool['bgTimer'] | undefined => {
+  const first = timers?.[0]
+
+  if (
+    !first ||
+    !Number.isFinite(first.started_at) ||
+    !Number.isFinite(first.interval_s) ||
+    first.started_at! <= 0 ||
+    first.interval_s! <= 0
+  ) {
+    return undefined
+  }
+
+  return { interval_s: first.interval_s!, started_at: first.started_at! }
+}
+
 const cacheFootnote = (cacheInfo?: CacheInfo): Msg | null => {
   if (!cacheInfo) {
     return null
@@ -917,7 +933,10 @@ class TurnController {
             duration ?? fallbackDuration
           )
 
-    this.activeTools = this.activeTools.filter(tool => tool.id !== toolId)
+    const bgTimer = firstBackgroundTimer(bgTimers)
+    this.activeTools = this.activeTools
+      .map(tool => (tool.id === toolId && bgTimer ? { ...tool, bgTimer } : tool))
+      .filter(tool => tool.id !== toolId || Boolean(bgTimer))
 
     const next = this.turnTools.filter(item => !sameToolTrailGroup(label, item))
 
@@ -927,7 +946,7 @@ class TurnController {
 
     this.turnTools = next.slice(-TRAIL_LIMIT)
 
-    return `${line}${backgroundTimerTrail(bgTimers)}`
+    return line
   }
 
   private publishToolState() {

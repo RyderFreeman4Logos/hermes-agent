@@ -1079,6 +1079,9 @@ def _build_child_agent(
     override_api_mode: Optional[str] = None,
     override_request_overrides: Optional[Dict[str, Any]] = None,
     override_max_tokens: Optional[int] = None,
+    # Per-profile reasoning_effort override (from model_pool.<name>).
+    # Takes precedence over the global delegation.reasoning_effort.
+    override_reasoning_effort: Optional[Any] = None,
     # ACP transport overrides from trusted delegation config.
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
@@ -1295,14 +1298,18 @@ def _build_child_agent(
         effective_provider = "copilot-acp"
         effective_api_mode = "chat_completions"
 
-    # Resolve reasoning config: delegation override > parent inherit
+    # Resolve reasoning config: profile override > delegation override > parent inherit
     parent_reasoning = getattr(parent_agent, "reasoning_config", None)
     child_reasoning = parent_reasoning
     try:
         # Keep the raw value — ``str(x or "")`` would coerce a YAML boolean
         # False (``reasoning_effort: false``) to "" and inherit the parent
         # instead of disabling thinking for children.
-        delegation_effort = delegation_cfg.get("reasoning_effort")
+        # Precedence: per-profile override_reasoning_effort (from model_pool)
+        # wins over the global delegation.reasoning_effort.
+        delegation_effort = override_reasoning_effort
+        if delegation_effort is None:
+            delegation_effort = delegation_cfg.get("reasoning_effort")
         if delegation_effort or delegation_effort is False:
             from hermes_constants import parse_reasoning_effort
 
@@ -1311,11 +1318,11 @@ def _build_child_agent(
                 child_reasoning = parsed
             else:
                 logger.warning(
-                    "Unknown delegation.reasoning_effort '%s', inheriting parent level",
+                    "Unknown reasoning_effort '%s', inheriting parent level",
                     delegation_effort,
                 )
     except Exception as exc:
-        logger.debug("Could not load delegation reasoning_effort: %s", exc)
+        logger.debug("Could not load reasoning_effort: %s", exc)
 
     # Inherit the parent's fallback provider chain so subagents can recover
     # from rate-limits and credential exhaustion exactly like the top-level
@@ -2437,6 +2444,7 @@ def delegate_task(
     role: Optional[str] = None,
     background: Optional[bool] = None,
     force_background: bool = False,
+    model_profile: Optional[str] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -2517,7 +2525,7 @@ def delegate_task(
     # used by CLI/gateway startup.  When unconfigured, returns None values so
     # children inherit from the parent.
     try:
-        creds = _resolve_delegation_credentials(cfg, parent_agent)
+        creds = _resolve_delegation_credentials(cfg, parent_agent, model_profile=model_profile)
     except ValueError as exc:
         return tool_error(str(exc))
 
@@ -2606,6 +2614,18 @@ def delegate_task(
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
             effective_role = _normalize_role(t.get("role") or top_role)
+            # Per-task model_profile overrides the top-level one. Re-resolve
+            # credentials so a batch can fan out across different model pools.
+            _task_profile = t.get("model_profile") or model_profile
+            if _task_profile and _task_profile != model_profile:
+                try:
+                    _task_creds = _resolve_delegation_credentials(
+                        cfg, parent_agent, model_profile=_task_profile
+                    )
+                except ValueError as exc:
+                    return tool_error(str(exc))
+            else:
+                _task_creds = creds
             child = _build_child_agent(
                 task_index=i,
                 goal=t["goal"],
@@ -2613,18 +2633,19 @@ def delegate_task(
                 # Subagents always inherit the parent's toolsets; the model
                 # cannot choose or narrow them (no model-facing toolsets arg).
                 toolsets=None,
-                model=creds["model"],
+                model=_task_creds["model"],
                 max_iterations=effective_max_iter,
                 task_count=n_tasks,
                 parent_agent=parent_agent,
-                override_provider=creds["provider"],
-                override_base_url=creds["base_url"],
-                override_api_key=creds["api_key"],
-                override_api_mode=creds["api_mode"],
-                override_request_overrides=creds.get("request_overrides"),
-                override_max_tokens=creds.get("max_output_tokens"),
-                override_acp_command=creds.get("command"),
-                override_acp_args=creds.get("args"),
+                override_provider=_task_creds["provider"],
+                override_base_url=_task_creds["base_url"],
+                override_api_key=_task_creds["api_key"],
+                override_api_mode=_task_creds["api_mode"],
+                override_request_overrides=_task_creds.get("request_overrides"),
+                override_max_tokens=_task_creds.get("max_output_tokens"),
+                override_reasoning_effort=_task_creds.get("reasoning_effort"),
+                override_acp_command=_task_creds.get("command"),
+                override_acp_args=_task_creds.get("args"),
                 role=effective_role,
             )
             # Override with correct parent tool names (before child construction mutated global)
@@ -3303,8 +3324,61 @@ def _resolve_child_credential_pool(
     return None
 
 
-def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
+def _resolve_model_profile(cfg: dict, model_profile: Optional[str]) -> Optional[dict]:
+    """Resolve a named model-pool profile into a delegation-config overlay.
+
+    Looks up ``model_pool.<name>`` in the delegation config (``cfg``) and
+    returns a new dict where the profile's ``provider`` / ``model`` /
+    ``base_url`` / ``api_key`` / ``api_mode`` / ``reasoning_effort`` overlay
+    the global delegation fields. Returns ``None`` when ``model_profile`` is
+    empty or the profile name is not found (caller falls back to the global
+    delegation model/provider).
+
+    The returned dict carries a ``reasoning_effort`` key so the downstream
+    ``_build_child_agent`` can apply a per-profile thinking level via
+    ``override_reasoning_effort`` — a field the global
+    ``_resolve_delegation_credentials`` path does not surface.
+    """
+    if not model_profile:
+        return None
+    name = str(model_profile).strip()
+    if not name:
+        return None
+    pool = cfg.get("model_pool") or {}
+    if not isinstance(pool, dict):
+        return None
+    profile = pool.get(name)
+    if not isinstance(profile, dict) or not profile:
+        return None
+
+    # Merge: profile values win over global delegation fields.
+    merged: Dict[str, Any] = dict(cfg)
+    for key in (
+        "provider",
+        "model",
+        "base_url",
+        "api_key",
+        "api_mode",
+        "reasoning_effort",
+    ):
+        val = profile.get(key)
+        if val is not None and val != "":
+            merged[key] = val
+    # Stash the resolved effort so _build_child_agent can read it without
+    # re-merging. ``_resolve_delegation_credentials`` passes this through in
+    # the returned credential dict as ``reasoning_effort``.
+    return merged
+
+
+def _resolve_delegation_credentials(
+    cfg: dict, parent_agent, model_profile: Optional[str] = None
+) -> dict:
     """Resolve credentials for subagent delegation.
+
+    If ``model_profile`` names an entry in ``delegation.model_pool``, that
+    profile's provider/model/base_url/api_key/api_mode/reasoning_effort take
+    precedence over the global delegation fields (back-compatible: an unknown
+    profile name is ignored and the global config is used).
 
     If ``delegation.base_url`` is configured, subagents use that direct
     OpenAI-compatible endpoint. ``delegation.api_key`` overrides the key; when
@@ -3324,6 +3398,16 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
 
     Raises ValueError with a user-friendly message on credential failure.
     """
+    # Named model-pool profile overlays the global delegation config.
+    profile_effort: Optional[Any] = None
+    if model_profile:
+        merged = _resolve_model_profile(cfg, model_profile)
+        if merged is not None:
+            cfg = merged
+            profile_effort = merged.get("reasoning_effort")
+            if profile_effort == "":
+                profile_effort = None
+
     configured_model = str(cfg.get("model") or "").strip() or None
     configured_provider = str(cfg.get("provider") or "").strip() or None
     configured_base_url = str(cfg.get("base_url") or "").strip() or None
@@ -3384,6 +3468,7 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
             "base_url": configured_base_url,
             "api_key": api_key,
             "api_mode": api_mode,
+            "reasoning_effort": profile_effort,
         }
 
     if not configured_provider:
@@ -3396,6 +3481,7 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
             "api_mode": None,
             "request_overrides": None,
             "max_output_tokens": None,
+            "reasoning_effort": profile_effort,
         }
 
     # Provider is configured — resolve full credentials
@@ -3428,6 +3514,7 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         "max_output_tokens": runtime.get("max_output_tokens"),
         "command": runtime.get("command"),
         "args": list(runtime.get("args") or []),
+        "reasoning_effort": profile_effort,
     }
 
 
@@ -3636,6 +3723,25 @@ def _build_role_param_description() -> str:
     )
 
 
+def _available_model_profile_names() -> list:
+    """Return the sorted list of configured model-pool profile names.
+
+    Reads ``delegation.model_pool`` from the live config. Failures (missing
+    config, malformed pool) return an empty list so the schema stays
+    free-form instead of breaking tool definitions.
+    """
+    try:
+        cfg = _load_config()
+    except Exception:
+        return []
+    pool = cfg.get("model_pool")
+    if not isinstance(pool, dict):
+        return []
+    names = [str(k) for k in pool.keys()]
+    names.sort()
+    return names
+
+
 def _build_dynamic_schema_overrides() -> dict:
     """Return per-call schema overrides reflecting current config.
 
@@ -3652,6 +3758,21 @@ def _build_dynamic_schema_overrides() -> dict:
     }
     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
     overrides_params["properties"]["role"]["description"] = _build_role_param_description()
+
+    # Inject the dynamic enum of model-pool profile names so the model can only
+    # select from profiles the user actually configured. Deep-copy the property
+    # first (the outer copy above is shallow) so we don't mutate the static
+    # schema's nested dict. When no profiles exist, leave the field free-form
+    # so an explicit profile name still reaches the (graceful) fallback path.
+    _profile_names = _available_model_profile_names()
+    if _profile_names:
+        _mp_prop = dict(overrides_params["properties"]["model_profile"])
+        _mp_prop["enum"] = _profile_names
+        _mp_prop["description"] = (
+            "Select a model-pool profile to run this subagent on. "
+            f"Available profiles: {', '.join(_profile_names)}."
+        )
+        overrides_params["properties"]["model_profile"] = _mp_prop
 
     return {
         "description": _build_top_level_description(),
@@ -3708,6 +3829,13 @@ DELEGATE_TASK_SCHEMA = {
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
                         },
+                        "model_profile": {
+                            "type": "string",
+                            "description": (
+                                "Per-task model-pool profile override. See "
+                                "top-level 'model_profile'."
+                            ),
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -3720,6 +3848,19 @@ DELEGATE_TASK_SCHEMA = {
                 "type": "string",
                 "enum": ["leaf", "orchestrator"],
                 "description": "(rebuilt at get_definitions() time)",
+            },
+            "model_profile": {
+                "type": "string",
+                "description": (
+                    "Name of a preconfigured model-pool profile (from "
+                    "delegation.model_pool in config.yaml) to run this "
+                    "subagent on, instead of the global delegation "
+                    "model/provider. Each profile pins a provider/model pair "
+                    "(and optionally reasoning_effort). Per-task "
+                    "model_profile in the tasks array overrides this. An "
+                    "unknown profile name silently falls back to the global "
+                    "delegation config."
+                ),
             },
             "background": {
                 "type": "boolean",
@@ -3803,6 +3944,7 @@ registry.register(
         tasks=_strip_model_hidden_task_fields(args.get("tasks")),
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
+        model_profile=args.get("model_profile"),
         background=_model_background_value(args, kw.get("parent_agent")),
         force_background=_force_background_enabled(kw.get("parent_agent")),
         parent_agent=kw.get("parent_agent"),

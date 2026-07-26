@@ -2490,6 +2490,13 @@ DEFAULT_CONFIG = {
         # Flip to true only if you trust delegated work to run dangerous cmds
         # without human review (cron pipelines, batch automation, etc.).
         "subagent_auto_approve": False,
+        # Named model pool — maps a profile name to a {provider, model,
+        # base_url?, api_key?, api_mode?, reasoning_effort?, fallback_chain?}
+        # dict. The main agent selects a subagent's model by passing
+        # model_profile="<name>" to delegate_task (top-level or per-task in a
+        # batch). Unknown profile names fall back to the global delegation
+        # model/provider. See tools/delegate_tool.py:_resolve_model_profile.
+        "model_pool": {},  # name → {provider, model, ...}
     },
 
     # Ephemeral prefill messages file — JSON list of {role, content} dicts

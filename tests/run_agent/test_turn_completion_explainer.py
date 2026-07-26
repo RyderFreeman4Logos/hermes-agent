@@ -213,7 +213,7 @@ def test_idle_completion_noop_instruction_is_api_only_and_persists_clean_notific
         patch.object(agent, "_save_trajectory"),
         patch.object(agent, "_cleanup_task_resources"),
     ):
-        agent.run_conversation(
+        result = agent.run_conversation(
             notification,
             turn_origin="idle_completion",
             allow_silent_noop=True,
@@ -221,6 +221,7 @@ def test_idle_completion_noop_instruction_is_api_only_and_persists_clean_notific
 
     api_messages = agent.client.chat.completions.create.call_args.kwargs["messages"]
     assert api_messages[-1]["content"] == notification + suffix
+    assert result["messages"][-1]["content"] == notification
 
     durable_user_rows = [
         call.kwargs
@@ -229,6 +230,33 @@ def test_idle_completion_noop_instruction_is_api_only_and_persists_clean_notific
     ]
     assert durable_user_rows[-1]["content"] == notification
     assert suffix not in str(durable_user_rows[-1].get("api_content") or "")
+
+
+def test_first_api_call_reports_cache_hit_to_tui_callback():
+    """Only the first provider call reports the cache state that diagnoses a cold prefix."""
+    agent = _make_agent(max_iterations=10)
+    response = _mock_response(content="Done.", finish_reason="stop")
+    response.usage = SimpleNamespace(
+        prompt_tokens=2_000,
+        completion_tokens=10,
+        total_tokens=2_010,
+        prompt_tokens_details=SimpleNamespace(cached_tokens=1_740),
+    )
+    agent.client.chat.completions.create.side_effect = [response]
+    cache_events = []
+    agent._tui_cache_callback = lambda state, pct, read, prompt: cache_events.append(
+        (state, pct, read, prompt)
+    )
+
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("do something")
+
+    assert result["final_response"] == "Done."
+    assert cache_events == [("hit", 87, 1_740, 2_000)]
 
 
 def test_idle_completion_timeout_or_error_is_not_silent():

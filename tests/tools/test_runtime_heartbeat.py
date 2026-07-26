@@ -208,3 +208,36 @@ def test_snapshot_active_targets_reports_process_elapsed_and_ttl_remaining(monke
     assert manager.snapshot_active_targets() == [
         {"session_id": "proc-1", "elapsed_s": 44, "ttl_remaining_s": 158}
     ]
+
+
+def test_snapshot_active_targets_filters_by_caller_id(monkeypatch):
+    """Targets from a different caller/session must not leak into the snapshot."""
+    manager = _manager()
+    now = {"value": 1_000.0}
+    monkeypatch.setattr("tools.runtime_heartbeat.time.time", lambda: now["value"])
+    monkeypatch.setattr(
+        "tools.process_registry.process_registry.get",
+        lambda target_id: None,
+    )
+    manager.arm(
+        "proc-a",
+        caller_id="session-a",
+        kind="process",
+        provider="openai",
+        inspect=lambda: {"alive": True, "output_size": 0},
+    )
+    manager.arm(
+        "proc-b",
+        caller_id="session-b",
+        kind="process",
+        provider="openai",
+        inspect=lambda: {"alive": True, "output_size": 0},
+    )
+    snapshot_a = manager.snapshot_active_targets(caller_id="session-a")
+    assert [r["session_id"] for r in snapshot_a] == ["proc-a"]
+
+    snapshot_b = manager.snapshot_active_targets(caller_id="session-b")
+    assert [r["session_id"] for r in snapshot_b] == ["proc-b"]
+
+    snapshot_all = manager.snapshot_active_targets()
+    assert len(snapshot_all) == 2

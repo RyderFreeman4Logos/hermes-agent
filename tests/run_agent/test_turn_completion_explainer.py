@@ -194,6 +194,43 @@ def test_idle_completion_empty_stop_is_silent_and_keeps_notification():
     )
 
 
+def test_idle_completion_noop_instruction_is_api_only_and_persists_clean_notification():
+    """The model sees the silent-noop hint, but the durable row never does."""
+    notification = "[IMPORTANT: Background process proc_idle completed normally]"
+    suffix = (
+        "\n\n[Note: If this background completion requires no action, return an "
+        "empty response with no text and no tool calls.]"
+    )
+    agent = _make_agent(max_iterations=10)
+    agent._session_db = MagicMock()
+    agent._session_db_created = True
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(content="", finish_reason="stop"),
+    ]
+
+    with (
+        patch.object(agent, "_save_session_log"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        agent.run_conversation(
+            notification,
+            turn_origin="idle_completion",
+            allow_silent_noop=True,
+        )
+
+    api_messages = agent.client.chat.completions.create.call_args.kwargs["messages"]
+    assert api_messages[-1]["content"] == notification + suffix
+
+    durable_user_rows = [
+        call.kwargs
+        for call in agent._session_db.append_message.call_args_list
+        if call.kwargs.get("role") == "user"
+    ]
+    assert durable_user_rows[-1]["content"] == notification
+    assert suffix not in str(durable_user_rows[-1].get("api_content") or "")
+
+
 def test_idle_completion_timeout_or_error_is_not_silent():
     """Transport failures keep the normal retry/failure path, never no-op."""
     for failure in (TimeoutError("provider timed out"), RuntimeError("provider failed")):

@@ -27,6 +27,7 @@ from hermes_constants import (
 from hermes_cli.env_loader import load_hermes_dotenv
 from utils import is_truthy_value
 from tools.environments.local import hermes_subprocess_env
+from tools.runtime_heartbeat import runtime_heartbeat
 from agent.replay_cleanup import sanitize_replay_history
 from tui_gateway import git_probe
 from tui_gateway.turn_marker import (
@@ -4269,6 +4270,56 @@ def _get_usage(agent) -> dict:
     return usage
 
 
+def _cache_info_from_usage(usage: Any) -> dict[str, int | str] | None:
+    """Summarize canonical per-turn cache usage for the activity trail.
+
+    Session totals cannot distinguish a fresh cache miss from a prior hit, so
+    callers must pass the latest canonical usage dict captured for this turn.
+    Return ``None`` when the provider supplied no cache-related data at all.
+    """
+    if not isinstance(usage, dict):
+        return None
+
+    read_keys = ("cache_read_tokens",)
+    write_keys = ("cache_write_tokens", "cache_creation_tokens", "cache_creation_input_tokens")
+    prompt_keys = ("prompt_tokens",)
+    # Prompt count alone is ordinary usage, not evidence that the provider
+    # reported cache accounting. Avoid a misleading "cache unknown" footnote
+    # when a non-cache-aware provider only supplies prompt_tokens.
+    if not any(key in usage for key in (*read_keys, *write_keys)):
+        return None
+
+    def _tokens(*keys: str) -> int:
+        for key in keys:
+            value = usage.get(key)
+            if value is None:
+                continue
+            try:
+                return max(0, int(float(value)))
+            except (TypeError, ValueError):
+                continue
+        return 0
+
+    read_tokens = _tokens(*read_keys)
+    write_tokens = _tokens(*write_keys)
+    prompt_tokens = _tokens(*prompt_keys)
+    pct = int(round(100 * read_tokens / prompt_tokens)) if prompt_tokens else 0
+    if read_tokens > 0:
+        state = "hit"
+    elif write_tokens > 0:
+        state = "cold_write"
+    elif prompt_tokens < 1024:
+        state = "unknown"
+    else:
+        state = "miss"
+    return {
+        "read_tokens": read_tokens,
+        "prompt_tokens": prompt_tokens,
+        "pct": pct,
+        "state": state,
+    }
+
+
 def _probe_credentials(agent) -> str:
     """Light credential check at session creation — returns warning or ''.
 
@@ -4726,6 +4777,12 @@ def _on_tool_complete(sid: str, tool_call_id: str, name: str, args: dict, result
             payload["inline_diff"] = "\n".join(rendered)
     except Exception:
         pass
+    try:
+        bg_timers = runtime_heartbeat.snapshot_active_targets()
+        if bg_timers:
+            payload["bg_timers"] = bg_timers
+    except Exception:
+        logger.debug("Could not snapshot active background timers", exc_info=True)
     if _tool_progress_enabled(sid) or payload.get("inline_diff") or _tool_lifecycle_required_for_ui(name):
         _emit("tool.complete", sid, payload)
 
@@ -12053,6 +12110,12 @@ def _run_prompt_submit(
                 status = "complete"
 
             payload = {"text": raw, "usage": _get_usage(agent), "status": status}
+            turn_usage = result.get("usage") if isinstance(result, dict) else None
+            cache_info = _cache_info_from_usage(turn_usage)
+            if cache_info is None:
+                cache_info = _cache_info_from_usage(getattr(agent, "_last_turn_usage", None))
+            if cache_info is not None:
+                payload["cache_info"] = cache_info
             if isinstance(result, dict) and result.get("silent_noop") is True:
                 payload["silent"] = True
             if last_reasoning:

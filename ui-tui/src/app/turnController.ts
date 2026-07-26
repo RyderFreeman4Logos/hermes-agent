@@ -29,6 +29,53 @@ const INTERRUPT_COOLDOWN_MS = 1500
 const ACTIVITY_LIMIT = 8
 const TRAIL_LIMIT = 8
 
+type BackgroundTimer = { elapsed_s: number; session_id: string; ttl_remaining_s: number }
+type CacheInfo = {
+  pct: number
+  prompt_tokens: number
+  read_tokens: number
+  state: 'hit' | 'cold_write' | 'miss' | 'unknown'
+}
+
+const backgroundTimerTrail = (timers?: BackgroundTimer[]) => {
+  const active = timers?.filter(
+    timer => Number.isFinite(timer.elapsed_s) && Number.isFinite(timer.ttl_remaining_s)
+  )
+
+  if (!active?.length) {
+    return ''
+  }
+
+  const first = active[0]!
+  const elapsed = Math.max(0, Math.floor(first.elapsed_s))
+  const ttlRemaining = Math.max(0, Math.ceil(first.ttl_remaining_s))
+  const extra = active.length > 1 ? ` +${active.length - 1}` : ''
+
+  return ` →checkin ${elapsed}s/${ttlRemaining}s${extra}`
+}
+
+const cacheFootnote = (cacheInfo?: CacheInfo): Msg | null => {
+  if (!cacheInfo) {
+    return null
+  }
+
+  if (cacheInfo.state === 'hit') {
+    const pct = Number.isFinite(cacheInfo.pct) ? Math.max(0, Math.round(cacheInfo.pct)) : 0
+
+    return { kind: 'event', role: 'system', text: `cache ${pct}%` }
+  }
+
+  if (cacheInfo.state === 'cold_write') {
+    return { kind: 'event', role: 'system', text: 'cache cold-write' }
+  }
+
+  if (cacheInfo.state === 'miss') {
+    return { eventTone: 'warn', kind: 'event', role: 'system', text: 'cache MISS' }
+  }
+
+  return { kind: 'event', role: 'system', text: 'cache unknown' }
+}
+
 // Extracts the raw patch from a diff-only segment produced by
 // pushInlineDiffSegment. Used at message.complete to dedupe against final
 // assistant text that narrates the same patch. Returns null for anything
@@ -556,6 +603,7 @@ class TurnController {
   }
 
   recordMessageComplete(payload: {
+    cache_info?: CacheInfo
     rendered?: string
     reasoning?: string
     response_previewed?: boolean
@@ -633,6 +681,14 @@ class TurnController {
 
     if (finalText) {
       finalMessages.push({ role: 'assistant', text: finalText })
+    }
+
+    // A response preview may have already sealed the assistant text into a
+    // segment, leaving finalText empty after dedupe. Keep its cache footnote
+    // adjacent to that visible assistant response instead of dropping it.
+    const footnote = cacheFootnote(payload.cache_info)
+    if (footnote && finalMessages.some(message => message.role === 'assistant')) {
+      finalMessages.push(footnote)
     }
 
     const wasInterrupted = this.interrupted
@@ -791,14 +847,15 @@ class TurnController {
     summary?: string,
     duration?: number,
     todos?: unknown,
-    resultText?: string
+    resultText?: string,
+    bgTimers?: BackgroundTimer[]
   ) {
     if (this.interrupted) {
       return
     }
 
     this.recordTodos(todos)
-    const line = this.completeTool(toolId, fallbackName, error, summary, duration, resultText)
+    const line = this.completeTool(toolId, fallbackName, error, summary, duration, resultText, bgTimers)
 
     this.pendingSegmentTools = [...this.pendingSegmentTools, line]
     this.flushPendingToolsIntoLastSegment()
@@ -811,14 +868,18 @@ class TurnController {
     fallbackName?: string,
     error?: string,
     duration?: number,
-    resultText?: string
+    resultText?: string,
+    bgTimers?: BackgroundTimer[]
   ) {
     if (this.interrupted) {
       return
     }
 
     this.flushStreamingSegment()
-    this.pushInlineDiffSegment(diffText, [this.completeTool(toolId, fallbackName, error, '', duration, resultText)])
+    this.pushInlineDiffSegment(
+      diffText,
+      [this.completeTool(toolId, fallbackName, error, '', duration, resultText, bgTimers)]
+    )
     this.publishToolState()
   }
 
@@ -828,7 +889,8 @@ class TurnController {
     error?: string,
     summary?: string,
     duration?: number,
-    resultText?: string
+    resultText?: string,
+    bgTimers?: BackgroundTimer[]
   ) {
     const done = this.activeTools.find(tool => tool.id === toolId)
     const name = done?.name ?? fallbackName ?? 'tool'
@@ -863,7 +925,7 @@ class TurnController {
 
     this.turnTools = next.slice(-TRAIL_LIMIT)
 
-    return line
+    return `${line}${backgroundTimerTrail(bgTimers)}`
   }
 
   private publishToolState() {

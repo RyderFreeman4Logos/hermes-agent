@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import os
 import time
+from copy import deepcopy
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -26,6 +27,8 @@ import pytest
 
 from agent.context_compressor import ContextCompressor
 from hermes_state import SessionDB
+import model_tools
+import tools.delegate_tool as delegate_tool
 
 
 def _build_agent_with_db(db: SessionDB, session_id: str, platform: str = "telegram"):
@@ -66,6 +69,24 @@ def _build_agent_with_db(db: SessionDB, session_id: str, platform: str = "telegr
 
 def _msgs(n=20):
     return [{"role": "user", "content": f"m{i}"} for i in range(n)]
+
+
+def _delegate_tool_definition() -> dict:
+    overrides = delegate_tool._build_dynamic_schema_overrides()
+    return {
+        "type": "function",
+        "function": {
+            "name": "delegate_task",
+            "parameters": overrides["parameters"],
+        },
+    }
+
+
+def _delegate_model_profile_enum(definition: dict) -> list[str] | None:
+    return (
+        definition["function"]["parameters"]["properties"]
+        ["model_profile"].get("enum")
+    )
 
 
 def _bound_context_compressor(db: SessionDB, session_id: str) -> ContextCompressor:
@@ -155,6 +176,39 @@ class TestOrphanRollbackOnCreateFailure:
         assert parent_row is not None
         assert parent_row["ended_at"] is None
         assert db.find_live_compression_child(parent) is None
+
+    def test_aborted_rotation_does_not_refresh_delegate_model_pool_schema(
+        self, refresh_state_db: SessionDB, monkeypatch
+    ):
+        """A rolled-back publish must not admit config into the live schema."""
+        db = refresh_state_db
+        parent = "PARENT_POOL_ABORT"
+        db.create_session(parent, source="cli")
+        agent = _build_agent_with_db(db, parent)
+
+        config = {"model_pool": {"fast": {}}}
+        monkeypatch.setattr(delegate_tool, "_load_config", lambda: config)
+        monkeypatch.setattr(delegate_tool, "_MODEL_POOL_SCHEMA_NAMES", None)
+        initial_definition = _delegate_tool_definition()
+        assert _delegate_model_profile_enum(initial_definition) == ["fast"]
+        setattr(agent, "tools", [initial_definition])
+        tools_before = deepcopy(getattr(agent, "tools"))
+
+        # The refresh must not clear memoized definitions on a failed boundary.
+        definitions_cache = {("delegate", "before-abort"): ["cached"]}
+        monkeypatch.setattr(model_tools, "_tool_defs_cache", definitions_cache)
+        config["model_pool"] = {"smart": {}}
+
+        with patch.object(
+            db,
+            "publish_compression_child",
+            side_effect=RuntimeError("simulated atomic publication failure"),
+        ):
+            agent._compress_context(_msgs(), "sys", approx_tokens=120_000)
+
+        assert delegate_tool._MODEL_POOL_SCHEMA_NAMES == ("fast",)
+        assert model_tools._tool_defs_cache == {("delegate", "before-abort"): ["cached"]}
+        assert getattr(agent, "tools") == tools_before
 
 
 class TestWorkspaceMetadataFollowsRotation:

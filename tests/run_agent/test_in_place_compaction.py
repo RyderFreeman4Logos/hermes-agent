@@ -59,10 +59,18 @@ def _seed(db, sid, title, n=8):
 
 
 class TestInPlaceCompaction:
-    def test_in_place_keeps_same_session_id(self):
+    def test_in_place_keeps_same_session_id(self, monkeypatch):
         """In-place mode: id unchanged, no child row, no rename, history kept."""
         from hermes_state import SessionDB
+        import agent.conversation_compression as conversation_compression
         from agent.conversation_compression import compress_context
+
+        refreshed = []
+        monkeypatch.setattr(
+            conversation_compression,
+            "_refresh_delegate_model_pool_schema_after_compression",
+            refreshed.append,
+        )
 
         with tempfile.TemporaryDirectory() as tmp:
             db = SessionDB(db_path=Path(tmp) / "t.db")
@@ -123,6 +131,58 @@ class TestInPlaceCompaction:
             assert agent._last_compaction_in_place is True
             # Live transcript actually shrank.
             assert len(compressed) == 2
+            # Standard (non-Codex) compaction also reaches the one-shot schema
+            # refresh gate only after its compressed transcript is committed.
+            assert refreshed == [agent]
+
+    def test_committed_in_place_refreshes_changed_delegate_model_pool(self, monkeypatch):
+        """A committed in-place boundary publishes the new model-pool enum."""
+        from hermes_state import SessionDB
+        from agent.conversation_compression import compress_context
+        import model_tools
+        import tools.delegate_tool as delegate_tool
+
+        config = {"model_pool": {"fast": {}}}
+        monkeypatch.setattr(delegate_tool, "_load_config", lambda: config)
+        monkeypatch.setattr(delegate_tool, "_MODEL_POOL_SCHEMA_NAMES", None)
+        overrides = delegate_tool._build_dynamic_schema_overrides()
+        delegate_definition = {
+            "type": "function",
+            "function": {
+                "name": "delegate_task",
+                "parameters": overrides["parameters"],
+            },
+        }
+        assert (
+            delegate_definition["function"]["parameters"]["properties"]
+            ["model_profile"]["enum"]
+            == ["fast"]
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "20260619_120000_poolok"
+            _seed(db, sid, "model-pool")
+            agent = _make_agent(db, sid, in_place=True)
+            setattr(agent, "tools", [delegate_definition])
+            definitions_cache = {("delegate", "before-commit"): ["cached"]}
+            monkeypatch.setattr(model_tools, "_tool_defs_cache", definitions_cache)
+            config["model_pool"] = {"smart": {}}
+
+            compress_context(
+                agent,
+                [{"role": "user", "content": f"m{i}"} for i in range(8)],
+                approx_tokens=100_000,
+                system_message="sys",
+            )
+
+        assert delegate_tool._MODEL_POOL_SCHEMA_NAMES == ("smart",)
+        assert model_tools._tool_defs_cache == {}
+        assert (
+            getattr(agent, "tools")[0]["function"]["parameters"]["properties"]
+            ["model_profile"]["enum"]
+            == ["smart"]
+        )
 
     def test_in_place_alternation_preserved(self):
         """The compacted list must not introduce consecutive same-role messages."""

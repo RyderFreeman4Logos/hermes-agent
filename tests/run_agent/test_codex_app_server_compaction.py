@@ -3,9 +3,11 @@ from types import SimpleNamespace
 
 import pytest
 
+import agent.conversation_compression as conversation_compression
 from agent.codex_runtime import _record_codex_app_server_compaction
 from agent.conversation_compression import COMPACTION_DONE_STATUS, COMPACTION_STATUS, compress_context
 from agent.transports.codex_app_server_session import TurnResult
+import tools.delegate_tool as delegate_tool
 
 
 class FakeCodexSession:
@@ -67,6 +69,7 @@ class DummyAgent:
         self.status_callback = lambda kind, text: self.status_events.append((kind, text))
         self.warnings = []
         self.events = []
+        self.tools = []
         self.built_prompts = []
         self.touch_calls = []
         self._compression_activity_heartbeat_interval = 0.1
@@ -140,10 +143,101 @@ def test_codex_app_server_compaction_heartbeat_refreshes_activity_while_waiting(
 
 
 
+def test_codex_app_server_hermes_mode_auto_compression_routes_to_codex_thread(monkeypatch):
+    agent = DummyAgent(
+        TurnResult(thread_id="thread-1", turn_id="compact-turn-1"),
+        auto_compaction="hermes",
+    )
+    messages = [{"role": "user", "content": "hi"}]
+    refreshed = []
+    monkeypatch.setattr(
+        conversation_compression,
+        "_refresh_delegate_model_pool_schema_after_compression",
+        refreshed.append,
+    )
+
+    returned, prompt = compress_context(
+        agent,
+        messages,
+        "system",
+        approx_tokens=100000,
+    )
+
+    assert returned is messages
+    assert prompt == "cached prompt"
+    assert agent._codex_session.calls == 1
+    assert agent.context_compressor.compression_count == 1
+    assert refreshed == [agent]
 
 
 
 
+
+
+def test_codex_native_auto_compaction_refreshes_changed_model_pool(monkeypatch):
+    monkeypatch.setattr(delegate_tool, "_MODEL_POOL_SCHEMA_NAMES", None)
+    config = {"model_pool": {"fast": {}}}
+    monkeypatch.setattr(delegate_tool, "_load_config", lambda: config)
+    initial_parameters = delegate_tool._build_dynamic_schema_overrides()["parameters"]
+    agent = DummyAgent(TurnResult(thread_id="thread-1", turn_id="normal-turn-1"))
+    agent.tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "delegate_task",
+                "parameters": initial_parameters,
+            },
+        }
+    ]
+    config["model_pool"] = {"smart": {}}
+
+    recorded = _record_codex_app_server_compaction(
+        agent,
+        TurnResult(
+            thread_id="thread-1",
+            turn_id="normal-turn-1",
+            compacted=True,
+        ),
+    )
+
+    assert recorded is True
+    assert (
+        agent.tools[0]["function"]["parameters"]["properties"]["model_profile"]["enum"]
+        == ["smart"]
+    )
+
+
+@pytest.mark.parametrize(
+    "turn",
+    [
+        TurnResult(compacted=True, error="turn failed"),
+        TurnResult(compacted=True, interrupted=True),
+    ],
+)
+def test_codex_native_failed_compaction_does_not_refresh_model_pool(monkeypatch, turn):
+    monkeypatch.setattr(delegate_tool, "_MODEL_POOL_SCHEMA_NAMES", None)
+    config = {"model_pool": {"fast": {}}}
+    monkeypatch.setattr(delegate_tool, "_load_config", lambda: config)
+    initial_parameters = delegate_tool._build_dynamic_schema_overrides()["parameters"]
+    agent = DummyAgent(TurnResult(thread_id="thread-1", turn_id="normal-turn-1"))
+    agent.tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "delegate_task",
+                "parameters": initial_parameters,
+            },
+        }
+    ]
+    config["model_pool"] = {"smart": {}}
+
+    recorded = _record_codex_app_server_compaction(agent, turn)
+
+    assert recorded is False
+    assert (
+        agent.tools[0]["function"]["parameters"]["properties"]["model_profile"]["enum"]
+        == ["fast"]
+    )
 
 
 def test_codex_native_boundary_clears_stale_hermes_fallback_streak():

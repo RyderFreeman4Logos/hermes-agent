@@ -4031,23 +4031,104 @@ def _build_role_param_description() -> str:
     )
 
 
-def _available_model_profile_names() -> list:
-    """Return the sorted list of configured model-pool profile names.
+_MODEL_POOL_SCHEMA_NAMES: Optional[tuple[str, ...]] = None
+_MODEL_POOL_SCHEMA_LOCK = threading.Lock()
 
-    Reads ``delegation.model_pool`` from the live config. Failures (missing
-    config, malformed pool) return an empty list so the schema stays
-    free-form instead of breaking tool definitions.
-    """
+
+def _read_model_profile_names() -> tuple[str, ...]:
+    """Read configured model-pool names without publishing them to schemas."""
     try:
         cfg = _load_config()
     except Exception:
-        return []
+        return ()
     pool = cfg.get("model_pool")
     if not isinstance(pool, dict):
-        return []
+        return ()
     names = [str(k) for k in pool.keys()]
     names.sort()
-    return names
+    return tuple(names)
+
+
+def _available_model_profile_names() -> list:
+    """Return the model-pool names published in the current tool schema.
+
+    The enum is deliberately snapshotted on first schema construction and is
+    refreshed only by :func:`refresh_model_pool_schema_after_compression`.
+    Reading config on every definitions pass would silently alter a live
+    session's prompt prefix and defeat provider KV caches.
+    """
+    global _MODEL_POOL_SCHEMA_NAMES
+    with _MODEL_POOL_SCHEMA_LOCK:
+        if _MODEL_POOL_SCHEMA_NAMES is None:
+            _MODEL_POOL_SCHEMA_NAMES = _read_model_profile_names()
+        return list(_MODEL_POOL_SCHEMA_NAMES)
+
+
+def refresh_model_pool_schema_after_compression(agent: Any) -> bool:
+    """Publish a changed model-pool enum after a completed compaction only.
+
+    A compaction is already a prompt-cache boundary, making it the one safe
+    time to admit a config change into a running agent's ``delegate_task``
+    schema.  The rest of the delegate schema remains untouched, and an
+    unchanged pool does not replace ``agent.tools`` or invalidate definitions.
+    """
+    global _MODEL_POOL_SCHEMA_NAMES
+    names = _read_model_profile_names()
+    with _MODEL_POOL_SCHEMA_LOCK:
+        if _MODEL_POOL_SCHEMA_NAMES is None:
+            # A delegate schema normally initializes this during agent startup.
+            # If it did not exist, establish a baseline without treating it as
+            # a mid-session schema change.
+            _MODEL_POOL_SCHEMA_NAMES = names
+            return False
+        if _MODEL_POOL_SCHEMA_NAMES == names:
+            return False
+        _MODEL_POOL_SCHEMA_NAMES = names
+
+    # Quiet-mode definitions are memoized. Clearing only after a real pool
+    # change makes the next rebuild observe the committed snapshot; it never
+    # runs on normal turns or unchanged compactions.
+    try:
+        from model_tools import _clear_tool_defs_cache
+
+        _clear_tool_defs_cache()
+    except Exception:
+        logger.debug("Could not clear cached tool definitions after compression", exc_info=True)
+
+    # Keep the currently running agent in sync as well. Replacing just the
+    # delegate model-profile property preserves injected MCP/context tools and
+    # all other per-session schema state.
+    tools = getattr(agent, "tools", None)
+    if not isinstance(tools, list):
+        return True
+    fresh_property: Dict[str, Any] = dict(
+        _build_dynamic_schema_overrides()["parameters"]["properties"]["model_profile"]
+    )
+    for index, tool in enumerate(tools):
+        function = tool.get("function") if isinstance(tool, dict) else None
+        if not isinstance(function, dict) or function.get("name") != "delegate_task":
+            continue
+        parameters = function.get("parameters")
+        if not isinstance(parameters, dict):
+            continue
+        properties = parameters.get("properties") if isinstance(parameters, dict) else None
+        if not isinstance(properties, dict) or "model_profile" not in properties:
+            continue
+        if properties["model_profile"] == fresh_property:
+            return True
+        refreshed_properties = dict(properties)
+        refreshed_properties["model_profile"] = fresh_property
+        refreshed_parameters: Dict[str, Any] = dict(parameters)
+        refreshed_parameters["properties"] = refreshed_properties
+        refreshed_function = dict(function)
+        refreshed_function["parameters"] = refreshed_parameters
+        refreshed_tool = dict(tool)
+        refreshed_tool["function"] = refreshed_function
+        refreshed_tools = list(tools)
+        refreshed_tools[index] = refreshed_tool
+        agent.tools = refreshed_tools
+        break
+    return True
 
 
 def _build_dynamic_schema_overrides() -> dict:

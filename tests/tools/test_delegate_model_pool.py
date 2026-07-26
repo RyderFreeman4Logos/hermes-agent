@@ -19,6 +19,7 @@ import threading
 import unittest
 from unittest.mock import MagicMock, patch
 
+import tools.delegate_tool as delegate_tool
 from tools.delegate_tool import (
     _available_model_profile_names,
     _build_child_agent,
@@ -404,6 +405,15 @@ class TestDelegateTaskModelProfile(unittest.TestCase):
 
 class TestModelProfileSchemaEnum(unittest.TestCase):
     """_build_dynamic_schema_overrides injects the profile enum."""
+
+    def setUp(self):
+        # Each test models a newly constructed session. Production deliberately
+        # freezes this snapshot until a successful context compression.
+        self._previous_snapshot = delegate_tool._MODEL_POOL_SCHEMA_NAMES
+        delegate_tool._MODEL_POOL_SCHEMA_NAMES = None
+
+    def tearDown(self):
+        delegate_tool._MODEL_POOL_SCHEMA_NAMES = self._previous_snapshot
 
     @patch("tools.delegate_tool._load_config")
     def test_enum_lists_profiles_when_present(self, mock_cfg):

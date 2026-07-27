@@ -2266,7 +2266,7 @@ def terminal_tool(
     Args:
         command: The command to execute
         background: Whether to run in background. None means omitted (auto-promote
-            may apply when an explicit timeout exceeds the threshold). Auto-promoted commands
+            may apply when the effective timeout exceeds the threshold). Auto-promoted commands
             remain managed background sessions and the tool returns a handle
             immediately; default/explicit notify delivers completion
             asynchronously. Explicit False is respected unless timeout exceeds
@@ -2383,10 +2383,10 @@ def terminal_tool(
         auto_bg_timeout = int(config.get("auto_background_timeout", 3300) or 3300)
         default_notify_on_bg = bool(config.get("default_notify_on_background", True))
 
-        # Omitted background is promoted only when the caller explicitly
-        # requested a timeout above the threshold. The configured default is an
-        # execution budget, not an intent to background every ordinary command.
-        # An explicitly requested timeout strictly above
+        # Omitted background is promoted when the effective timeout exceeds the
+        # threshold. This keeps a long configured default from blocking the
+        # foreground; defaults below the threshold remain ordinary foreground
+        # execution budgets. An effective timeout strictly above
         # auto_background_timeout is a stronger guardrail: it force-promotes
         # even explicit background=False.
         # Explicit background=True is already managed and therefore retains its
@@ -2395,13 +2395,11 @@ def terminal_tool(
         threshold_promotes = (
             auto_bg_long
             and background_was_omitted
-            and not timeout_was_omitted
             and effective_timeout
             and effective_timeout > auto_bg_threshold
         )
         force_promotes = (
             auto_bg_long
-            and not timeout_was_omitted
             and not background
             and effective_timeout
             and effective_timeout > auto_bg_timeout
@@ -2452,16 +2450,16 @@ def terminal_tool(
         # for up to auto_background_timeout. Completion re-enters via
         # notify_on_complete + process_registry.completion_queue.
 
-        # Hard-reject foreground commands when the model explicitly requested
-        # a timeout above FOREGROUND_MAX and the final mode is still foreground
+        # Hard-reject foreground commands when their effective timeout exceeds
+        # FOREGROUND_MAX and the final mode is still foreground
         # (explicit background=False, or auto off / below threshold).
         if (
             not background
-            and timeout
-            and timeout > FOREGROUND_MAX_TIMEOUT
+            and effective_timeout
+            and effective_timeout > FOREGROUND_MAX_TIMEOUT
         ):
             return tool_error(
-                f"Foreground timeout {timeout}s exceeds the maximum of "
+                f"Foreground timeout {effective_timeout}s exceeds the maximum of "
                 f"{FOREGROUND_MAX_TIMEOUT}s. Use background=true with "
                 f"notify_on_complete=true for long-running commands."
             )
@@ -3363,12 +3361,12 @@ TERMINAL_SCHEMA = {
             },
             "background": {
                 "type": "boolean",
-                "description": "Run the command in the background and return an immediate handle. When OMITTED and auto_background_long_timeout is on, an explicit timeout above the threshold auto-enables a managed background session; the configured default timeout alone remains foreground. Any timeout above auto_background_timeout (3300s by default) force-promotes even explicit background=false. Bounded real work should use notify_on_complete=true; pure resolve-checkin / TTL sleep heartbeats force notify_on_complete=false. Explicit notify_on_complete=false is true detach. Never loop resolve-checkin.",
+                "description": "Run the command in the background and return an immediate handle. When OMITTED and auto_background_long_timeout is on, an effective timeout above the threshold auto-enables a managed background session; a configured default below the threshold remains foreground. Any effective timeout above auto_background_timeout (3300s by default) force-promotes even explicit background=false. Bounded real work should use notify_on_complete=true; pure resolve-checkin / TTL sleep heartbeats force notify_on_complete=false. Explicit notify_on_complete=false is true detach. Never loop resolve-checkin.",
                 "default": False
             },
             "timeout": {
                 "type": "integer",
-                "description": f"Max seconds for the command budget (default: 3300). When auto_background_long_timeout is enabled and background is OMITTED, an explicit timeout above the threshold creates a managed background process and rewrites its budget to auto_background_timeout (3300 by default); omitting timeout keeps the configured default in the foreground. A requested timeout strictly above auto_background_timeout force-promotes even explicit background=false. Default/explicit notify_on_complete=true returns a handle immediately (completion via notify); explicit false detaches. FOREGROUND_MAX_TIMEOUT={FOREGROUND_MAX_TIMEOUT}s remains the hard cap for true foreground.",
+                "description": f"Max seconds for the command budget (default: 3300). When auto_background_long_timeout is enabled and background is OMITTED, an effective timeout above the threshold creates a managed background process and rewrites its budget to auto_background_timeout (3300 by default); omitting timeout remains foreground only when the configured default is at or below the threshold. An effective timeout strictly above auto_background_timeout force-promotes even explicit background=false. Default/explicit notify_on_complete=true returns a handle immediately (completion via notify); explicit false detaches. FOREGROUND_MAX_TIMEOUT={FOREGROUND_MAX_TIMEOUT}s remains the hard cap for true foreground.",
                 "minimum": 1
             },
             "workdir": {

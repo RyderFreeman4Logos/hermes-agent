@@ -123,20 +123,16 @@ class TestForegroundTimeoutCap:
         assert call_kwargs[1]["timeout"] == 300
         assert "error" not in result or result["error"] is None
 
-    def test_config_default_above_cap_not_rejected_when_auto_false(self):
-        """When auto is false, config default timeout > cap is still allowed foreground.
-
-        Only the model's explicit timeout parameter triggers rejection when
-        auto_background_long_timeout is disabled.
-        """
-        from tools.terminal_tool import terminal_tool
+    def test_config_default_above_cap_is_rejected_when_auto_false(self):
+        """The cap applies to default-derived effective foreground timeouts too."""
+        from tools.terminal_tool import FOREGROUND_MAX_TIMEOUT, terminal_tool
 
         # User configured TERMINAL_TIMEOUT=900 in their env; auto promotion off.
         with patch("tools.terminal_tool._get_env_config",
-                    return_value=_make_env_config(
-                        timeout=900,
-                        auto_background_long_timeout=False,
-                    )), \
+                   return_value=_make_env_config(
+                       timeout=900,
+                       auto_background_long_timeout=False,
+                   )), \
              patch("tools.terminal_tool._start_cleanup_thread"):
 
             mock_env = MagicMock()
@@ -145,12 +141,14 @@ class TestForegroundTimeoutCap:
             with patch("tools.terminal_tool._active_environments", {"default": mock_env}), \
                  patch("tools.terminal_tool._last_activity", {"default": 0}), \
                  patch("tools.terminal_tool._check_all_guards", return_value={"approved": True}):
-                result = json.loads(terminal_tool(command="make build"))
+                result = json.loads(
+                    terminal_tool(command="make build", background=False)
+                )
 
-        # Should execute with the config default, NOT be rejected
-        call_kwargs = mock_env.execute.call_args
-        assert call_kwargs[1]["timeout"] == 900
-        assert "error" not in result or result["error"] is None
+        mock_env.execute.assert_not_called()
+        assert "error" in result
+        assert "900" in result["error"]
+        assert str(FOREGROUND_MAX_TIMEOUT) in result["error"]
 
     def test_background_not_rejected(self):
         """Background commands should NOT be subject to foreground timeout cap."""

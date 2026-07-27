@@ -5,14 +5,13 @@ Authoritative contract (P0, 2026-07-24):
   which force-promotes the command when the master switch is on.
 - Explicit notify_on_complete=false is always respected.
 - Defaults apply only when params are omitted (None / absent).
-- Omitted background + an explicit timeout > threshold → background=true; if notify omitted
+- Omitted background + an effective timeout > threshold → background=true; if notify omitted
   and no watch_patterns → notify_on_complete=true; tool returns handle
   immediately (no process_registry.wait). Completion re-enters via notify.
 - Process budget rewrites to auto_background_timeout (default 3300).
 - timeout == 200 stays foreground (not strictly greater).
 - timeout == auto_background_timeout does not force-promote (strictly greater).
-- FOREGROUND_MAX hard-reject only when final background is false and the
-  model explicitly requested timeout > FOREGROUND_MAX.
+- FOREGROUND_MAX hard-rejects any final foreground effective timeout above the cap.
 """
 
 from __future__ import annotations
@@ -158,17 +157,56 @@ class TestConfigDefaults:
 
 
 class TestAutoBackgroundLongTimeout:
-    def test_omitted_all_stays_foreground_with_config_default_timeout(self):
-        """The configured default is a foreground budget, not background intent."""
-        result, mock_env = _run_foreground(
+    def test_omitted_timeout_above_threshold_promotes_from_config_default(self):
+        """A long configured default cannot leave an omitted command blocking."""
+        result, mock_proc, mock_env, mock_registry = _run_promoted(
             "make build",
-            config=_base_config(timeout=7200, auto_background_long_timeout=True),
+            config=_base_config(
+                timeout=3300,
+                auto_background_timeout_threshold=19,
+            ),
             # timeout / background / notify all omitted
         )
 
         assert "error" not in result or result["error"] is None
+        assert result.get("session_id") == mock_proc.id
+        assert result.get("notify_on_complete") is True
+        mock_registry.wait.assert_not_called()
+        mock_env.execute.assert_not_called()
+
+    def test_omitted_timeout_below_threshold_stays_foreground(self):
+        """A short configured default remains a foreground execution budget."""
+        result, mock_env = _run_foreground(
+            "echo hello",
+            config=_base_config(
+                timeout=50,
+                auto_background_timeout_threshold=200,
+            ),
+        )
+
+        assert mock_env.execute.call_args.kwargs["timeout"] == 50
         assert "session_id" not in result
-        assert mock_env.execute.call_args.kwargs["timeout"] == 7200
+
+    def test_explicit_short_timeout_stays_foreground(self):
+        result, mock_env = _run_foreground(
+            "echo hello",
+            timeout=10,
+            config=_base_config(auto_background_timeout_threshold=19),
+        )
+
+        assert mock_env.execute.call_args.kwargs["timeout"] == 10
+        assert "session_id" not in result
+
+    def test_explicit_timeout_above_threshold_promotes(self):
+        result, mock_proc, mock_env, mock_registry = _run_promoted(
+            "echo hello",
+            timeout=500,
+            config=_base_config(auto_background_timeout_threshold=19),
+        )
+
+        assert result.get("session_id") == mock_proc.id
+        mock_registry.wait.assert_not_called()
+        mock_env.execute.assert_not_called()
 
     def test_default_notify_auto_promotion_returns_handle_when_async_delivery_unavailable(self):
         """Handle return does not depend on a later async completion route."""
@@ -331,6 +369,22 @@ class TestAutoBackgroundLongTimeout:
         assert result.get("session_id") == mock_proc.id
         assert mock_proc.notify_on_complete is True
         mock_registry.spawn_local.assert_called_once()
+        mock_registry.wait.assert_not_called()
+        mock_env.execute.assert_not_called()
+
+    def test_omitted_timeout_force_promotes_explicit_background_false(self):
+        """The force boundary applies to default-derived effective timeouts too."""
+        result, mock_proc, mock_env, mock_registry = _run_promoted(
+            "echo hello",
+            background=False,
+            config=_base_config(
+                timeout=3301,
+                auto_background_timeout=3300,
+                auto_background_timeout_threshold=19,
+            ),
+        )
+
+        assert result.get("session_id") == mock_proc.id
         mock_registry.wait.assert_not_called()
         mock_env.execute.assert_not_called()
 

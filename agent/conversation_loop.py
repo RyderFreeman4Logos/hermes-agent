@@ -1111,6 +1111,10 @@ def run_conversation(
     # (early failure / interrupt) so the hook receives None rather than a
     # stale prior turn's usage.
     agent._last_turn_usage = None
+    # The first call is separately retained for TUI cache-health reporting:
+    # it tells us whether this turn's inherited prefix hit the prior turn's
+    # cache, before later calls naturally reuse the cache written by call #1.
+    agent._first_turn_usage = None
 
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
     # turn to the codex app-server subprocess (terminal/file ops/patching
@@ -2955,6 +2959,8 @@ def run_conversation(
                     # of interest is the cost/size of the latest assembled
                     # request, so we keep the most recent call's usage.
                     agent._last_turn_usage = dict(usage_dict)
+                    if api_call_count == 1:
+                        agent._first_turn_usage = dict(usage_dict)
                 elif getattr(
                     agent.context_compressor,
                     "awaiting_real_usage_after_compression",

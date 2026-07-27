@@ -15323,14 +15323,21 @@ def test_tui_cache_callback_emits_first_call_cache_status():
     ]
 
 
-def test_prompt_submit_message_complete_includes_cache_info_from_last_turn_usage(monkeypatch):
+def test_prompt_submit_message_complete_prefers_first_call_cache_usage(monkeypatch):
     emitted: list[tuple[str, str, dict]] = []
 
     class _Agent:
-        _last_turn_usage = {
+        # First call measures whether this turn's inherited prefix was warm.
+        _first_turn_usage = {
             "cache_read_tokens": 1_740,
             "cache_write_tokens": 0,
             "prompt_tokens": 2_000,
+        }
+        # A tool-loop continuation naturally hits the cache written by call #1.
+        _last_turn_usage = {
+            "cache_read_tokens": 4_000,
+            "cache_write_tokens": 0,
+            "prompt_tokens": 4_000,
         }
 
         def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
@@ -15373,3 +15380,67 @@ def test_prompt_submit_message_complete_includes_cache_info_from_last_turn_usage
         "pct": 87,
         "state": "hit",
     }
+
+
+@pytest.mark.parametrize(
+    ("result_usage", "last_usage", "expected"),
+    [
+        (
+            {"cache_read_tokens": 900, "cache_write_tokens": 0, "prompt_tokens": 1_000},
+            {"cache_read_tokens": 4_000, "cache_write_tokens": 0, "prompt_tokens": 4_000},
+            {"read_tokens": 900, "prompt_tokens": 1_000, "pct": 90, "state": "hit"},
+        ),
+        (
+            None,
+            {"cache_read_tokens": 1_740, "cache_write_tokens": 0, "prompt_tokens": 2_000},
+            {"read_tokens": 1_740, "prompt_tokens": 2_000, "pct": 87, "state": "hit"},
+        ),
+    ],
+)
+def test_prompt_submit_message_complete_cache_usage_falls_back_when_first_call_missing(
+    monkeypatch, result_usage, last_usage, expected
+):
+    emitted: list[tuple[str, str, dict]] = []
+
+    class _Agent:
+        _first_turn_usage = None
+        _last_turn_usage = last_usage
+
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
+            result = {
+                "final_response": "reply",
+                "messages": [{"role": "assistant", "content": "reply"}],
+            }
+            if result_usage is not None:
+                result["usage"] = result_usage
+            return result
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    server._sessions["cache-info-fallback-sid"] = _session(agent=_Agent())
+    try:
+        monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+        monkeypatch.setattr(server, "_get_usage", lambda _agent: {})
+        monkeypatch.setattr(server, "render_message", lambda _text, _cols: "")
+        monkeypatch.setattr(
+            server, "_emit", lambda event_type, sid, payload=None: emitted.append((event_type, sid, payload))
+        )
+
+        response = server.handle_request(
+            {
+                "id": "cache-info-fallback",
+                "method": "prompt.submit",
+                "params": {"session_id": "cache-info-fallback-sid", "text": "hi"},
+            }
+        )
+        assert response.get("result")
+    finally:
+        server._sessions.pop("cache-info-fallback-sid", None)
+
+    complete = [payload for event, _sid, payload in emitted if event == "message.complete"]
+    assert complete[-1]["cache_info"] == expected

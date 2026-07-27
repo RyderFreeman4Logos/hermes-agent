@@ -12518,10 +12518,15 @@ def _run_prompt_submit(
                 status = "complete"
 
             payload = {"text": raw, "usage": _get_usage(agent), "status": status}
-            turn_usage = result.get("usage") if isinstance(result, dict) else None
+            # Prefer first-call usage: the first API call's cache hit rate is the
+            # meaningful health signal (did this turn's prefix hit the prior turn's
+            # cache?). Later calls mostly hit because call #1 just wrote the cache.
+            turn_usage = getattr(agent, "_first_turn_usage", None)
+            if turn_usage is None:
+                turn_usage = result.get("usage") if isinstance(result, dict) else None
+            if turn_usage is None:
+                turn_usage = getattr(agent, "_last_turn_usage", None)
             cache_info = _cache_info_from_usage(turn_usage)
-            if cache_info is None:
-                cache_info = _cache_info_from_usage(getattr(agent, "_last_turn_usage", None))
             if cache_info is not None:
                 payload["cache_info"] = cache_info
             if isinstance(result, dict) and result.get("silent_noop") is True:

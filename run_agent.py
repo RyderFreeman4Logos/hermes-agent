@@ -6748,7 +6748,15 @@ class AIAgent:
         # its workers' results within its own turn. Set
         # delegation.force_background=true to override that exception and keep
         # orchestrator→leaf dispatches asynchronous, preventing KV cache cooling.
-        # The schema-level `background` param is intentionally ignored here.
+        #
+        # force_background is config-derived and applies to BOTH top-level
+        # (depth 0) and nested (depth > 0) dispatch. The old
+        # ``_force_bg and _is_subagent`` gate made the main agent fall through
+        # to the synchronous inline fallback when the async pool was full,
+        # violating the advertised no-inline contract. We now mirror the config
+        # value directly; delegate_task accepts an explicit False opt-out from
+        # other (non-model) callers. The schema-level `background` param is
+        # intentionally ignored here.
         _delegation_cfg = _load_delegation_config()
         _force_bg = bool(_delegation_cfg.get("force_background", False))
         _is_subagent = getattr(self, "_delegate_depth", 0) > 0
@@ -6760,11 +6768,10 @@ class AIAgent:
             role=function_args.get("role"),
             model_profile=function_args.get("model_profile"),
             background=(True if _force_bg else (not _is_subagent)),
-            # Preserve the distinction between ordinary top-level background
-            # work (which may use the historical inline fallback) and the
-            # explicit nested force guarantee. The latter must never turn a
-            # full/undeliverable async path into a blocking main-agent turn.
-            force_background=(_force_bg and _is_subagent),
+            # force_background mirrors the config value for every depth (see
+            # the note above). delegate_task also accepts an explicit False
+            # opt-out from non-model Python callers.
+            force_background=_force_bg,
             parent_agent=self,
         )
 

@@ -2453,7 +2453,7 @@ def delegate_task(
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
     background: Optional[bool] = None,
-    force_background: bool = False,
+    force_background: Optional[bool] = None,
     model_profile: Optional[str] = None,
     parent_agent=None,
 ) -> str:
@@ -2494,7 +2494,14 @@ def delegate_task(
     # as one message once ALL children finish — the chat is not blocked while
     # they run.
     background = is_truthy_value(background, default=False) if background is not None else False
-    force_background = is_truthy_value(force_background, default=False)
+    # force_background resolution: config is the DEFAULT for all depths. Only an
+    # explicit force_background=False from the caller opts out. This means the
+    # no-inline guarantee applies to both the top-level main agent (depth 0) and
+    # nested orchestrators (depth > 0) once config sets force_background=true.
+    force_background = _resolve_force_background(force_background, parent_agent=parent_agent)
+    # An effective force guarantee implies background (no-blocking) dispatch.
+    if force_background:
+        background = True
 
     # Depth limit — configurable via delegation.max_spawn_depth,
     # default 2 for parity with the original MAX_DEPTH constant.
@@ -4032,15 +4039,42 @@ DELEGATE_TASK_SCHEMA = {
 from tools.registry import registry, tool_error
 
 
+def _resolve_force_background(explicit=None, *, parent_agent=None) -> bool:
+    """Resolve the effective no-inline guarantee flag.
+
+    Semantics: ``delegation.force_background`` in config is the DEFAULT for ALL
+    depths (top-level main agent and nested orchestrator alike). Only an explicit
+    ``force_background=False`` from the caller opts out.
+
+      - ``explicit is False`` -> ``False``  (caller forced opt-out)
+      - ``explicit is True``  -> ``True``   (caller forced opt-in)
+      - ``explicit is None``  -> ``bool(config.force_background)`` (the default)
+
+    A truthy string such as ``"false"`` is treated as an explicit False via
+    ``is_truthy_value``, so config/YAML values are interpreted consistently.
+    ``parent_agent`` is accepted for call-site symmetry but intentionally does
+    NOT gate on depth — the guarantee applies to top-level dispatch too.
+    """
+    if explicit is None:
+        try:
+            cfg = _load_config()
+            return bool(cfg.get("force_background", False))
+        except Exception:
+            return False
+    return is_truthy_value(explicit, default=False)
+
+
 def _force_background_enabled(parent_agent=None) -> bool:
-    """Whether this nested dispatch has the explicit no-inline guarantee."""
-    if getattr(parent_agent, "_delegate_depth", 0) <= 0:
-        return False
-    try:
-        cfg = _load_config()
-        return bool(cfg.get("force_background", False))
-    except Exception:
-        return False
+    """Whether this dispatch carries the explicit no-inline guarantee.
+
+    Config is the default for every depth (top-level main agent AND nested
+    orchestrator). Only an explicit ``force_background=False`` opts out. The
+    historical ``depth <= 0`` gate is intentionally removed: the bug it caused
+    was that a config-enabled force guarantee silently fell through to the
+    synchronous inline fallback when the main agent (depth 0) hit a full async
+    pool, violating the advertised contract.
+    """
+    return _resolve_force_background(None, parent_agent=parent_agent)
 
 
 def _model_background_value(args: dict, parent_agent=None) -> bool:
@@ -4051,10 +4085,13 @@ def _model_background_value(args: dict, parent_agent=None) -> bool:
     batch (the whole batch is one async unit that joins on all children and
     returns one consolidated result). The one exception is a delegation from
     an orchestrator subagent (depth > 0), which needs its workers' results
-    within its own turn. ``delegation.force_background`` overrides that
-    exception. The live path is ``run_agent._dispatch_delegate_task``; this
-    helper mirrors it for the rare case the intercept is bypassed. Direct
-    Python callers of ``delegate_task`` keep the historical synchronous default.
+    within its own turn — UNLESS ``delegation.force_background`` is enabled in
+    config, in which case that exception is overridden for ALL depths
+    (top-level and nested). The live path is
+    ``run_agent._dispatch_delegate_task``; this helper mirrors it for the rare
+    case the intercept is bypassed. Direct Python callers of ``delegate_task``
+    keep the historical synchronous default unless they pass an explicit
+    ``force_background`` or config sets it.
     """
     is_subagent = getattr(parent_agent, "_delegate_depth", 0) > 0
     return _force_background_enabled(parent_agent) or not is_subagent

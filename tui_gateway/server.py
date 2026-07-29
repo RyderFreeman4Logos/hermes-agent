@@ -9248,7 +9248,7 @@ def _handle_heartbeat_event(sid: str, session: dict, evt: dict) -> None:
             session,
             checkin_text,
             turn_origin="heartbeat_warm",
-            allow_silent_noop=True,
+            allow_silent_noop=status == "ALIVE",
         )
     except Exception:
         with session["history_lock"]:
@@ -9946,7 +9946,12 @@ def _run_prompt_submit(
                 run_kwargs["persist_user_display_kind"] = display_kind
                 run_kwargs["persist_user_display_metadata"] = display_metadata
             result = agent.run_conversation(run_message, **run_kwargs)
-            if display_kind and isinstance(text, str):
+            heartbeat_silent_noop = (
+                turn_origin == "heartbeat_warm"
+                and isinstance(result, dict)
+                and result.get("silent_noop") is True
+            )
+            if display_kind and isinstance(text, str) and not heartbeat_silent_noop:
                 db = getattr(agent, "_session_db", None)
                 current_session_id = getattr(agent, "session_id", None) or session.get("session_key")
                 if db is not None:
@@ -10012,7 +10017,10 @@ def _run_prompt_submit(
             last_reasoning = None
             status_note = None
             if isinstance(result, dict):
-                if isinstance(result.get("messages"), list):
+                if (
+                    not heartbeat_silent_noop
+                    and isinstance(result.get("messages"), list)
+                ):
                     with session["history_lock"]:
                         current_version = int(session.get("history_version", 0))
                         if current_version == history_version:

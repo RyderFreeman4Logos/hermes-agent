@@ -8,16 +8,20 @@ state (when available) is acknowledged through its authoritative SQLite API.
 
 import asyncio
 import json
+import logging
 import queue
 from collections import OrderedDict
+from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from gateway.config import Platform
+import gateway.run as gateway_run
+from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
 from gateway.run import GatewayRunner
-from gateway.session import SessionSource
+from gateway.session import SessionEntry, SessionSource
 from tools.process_registry import ProcessRegistry, ProcessSession
 
 
@@ -34,12 +38,23 @@ def isolated_registry(tmp_path, monkeypatch):
 
 
 def _runner(adapter, *, origins=None):
+    if origins is None:
+        origins = {
+            "agent:main:telegram:dm:12345:678": SimpleNamespace(
+                origin=SessionSource(
+                    platform=Platform.TELEGRAM,
+                    chat_id="12345",
+                    chat_type="dm",
+                    user_id="678",
+                )
+            )
+        }
     runner = object.__new__(GatewayRunner)
     runner._running = True
     runner.adapters = {Platform.TELEGRAM: adapter}
     runner.session_store = SimpleNamespace(
         _ensure_loaded=lambda: None,
-        _entries=origins or {},
+        _entries=origins,
     )
     runner._session_source_cache = {}
     runner._completion_delivery_lock = __import__("threading").Lock()
@@ -98,6 +113,49 @@ def _heartbeat_event(**overrides):
     return event
 
 
+def _message_runner(monkeypatch, tmp_path):
+    """Minimal real message-delivery path for response-return assertions."""
+    runner = gateway_run.GatewayRunner(GatewayConfig())
+    runner.adapters = {}
+    runner._running_agents = {}
+    runner._running_agents_ts = {}
+    runner._pending_messages = {}
+    runner._pending_approvals = {}
+    runner._is_user_authorized = lambda source: True
+    runner._set_session_env = lambda context: []
+    runner._handle_active_session_busy_message = AsyncMock(return_value=False)
+    runner._session_db = MagicMock()
+    runner._recover_telegram_topic_thread_id = lambda _source: None
+    runner._cache_session_source = lambda _key, _source: None
+    runner._is_session_run_current = lambda _key, _generation: True
+    runner._reply_anchor_for_event = lambda _event: None
+    runner._get_guild_id = lambda _event: None
+    runner._should_send_voice_reply = lambda *_args, **_kwargs: False
+    runner.hooks = MagicMock()
+    runner.hooks.emit = AsyncMock()
+    runner.session_store = MagicMock()
+    runner.session_store.get_or_create_session.return_value = SessionEntry(
+        session_key="agent:main:telegram:dm:12345:678",
+        session_id="sess-heartbeat",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner.session_store.load_transcript.return_value = []
+    runner.session_store.append_to_transcript = MagicMock()
+    runner.session_store.update_session = MagicMock()
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"}
+    )
+    monkeypatch.setattr(
+        "agent.model_metadata.get_model_context_length",
+        lambda *_args, **_kwargs: 100_000,
+    )
+    return runner
+
+
 def test_gateway_heartbeat_event_injects_a_silent_warm_turn(monkeypatch, isolated_registry):
     """The idle gateway watcher consumes heartbeats instead of leaving them queued."""
     isolated = queue.Queue()
@@ -126,7 +184,81 @@ def test_gateway_heartbeat_event_injects_a_silent_warm_turn(monkeypatch, isolate
     assert isolated.empty()
 
 
-def test_gateway_alive_heartbeat_skips_a_running_session(monkeypatch):
+@pytest.mark.asyncio
+async def test_gateway_heartbeat_silent_noop_returns_no_platform_response(
+    monkeypatch, tmp_path
+):
+    """A warm no-op must reach the adapter as no response, never fallback text."""
+    runner = _message_runner(monkeypatch, tmp_path)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="12345",
+        chat_type="dm",
+        user_id="678",
+    )
+    event = MessageEvent(
+        text='[HEARTBEAT] checkin #1. Background target "proc-heartbeat" is ALIVE.',
+        source=source,
+        message_id="heartbeat-noop",
+        internal=True,
+        metadata={
+            "turn_origin": "heartbeat_warm",
+            "allow_silent_noop": True,
+        },
+    )
+
+    class _HeartbeatCaptureAdapter(BasePlatformAdapter):
+        def __init__(self):
+            super().__init__(
+                PlatformConfig(
+                    enabled=True, token="fake-token", typing_indicator=False
+                ),
+                Platform.TELEGRAM,
+            )
+            self.sent = []
+
+        async def connect(self, *, is_reconnect=False):
+            return True
+
+        async def disconnect(self):
+            return None
+
+        async def send(self, chat_id, content, reply_to=None, metadata=None):
+            self.sent.append({"chat_id": chat_id, "content": content})
+            return SendResult(success=True, message_id="heartbeat-message")
+
+        async def get_chat_info(self, chat_id):
+            return {"id": chat_id}
+
+    adapter = _HeartbeatCaptureAdapter()
+    append_to_transcript = MagicMock()
+    runner.session_store.append_to_transcript = append_to_transcript
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": None,
+            "silent_noop": True,
+            "messages": [{"role": "user", "content": event.text}],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+            "api_calls": 1,
+            "failed": False,
+        }
+    )
+
+    async def _handle_heartbeat_event(adapter_event):
+        return await runner._handle_message_with_agent(
+            adapter_event, source, "agent:main:telegram:dm:12345:678", 1
+        )
+
+    adapter._message_handler = _handle_heartbeat_event
+    await adapter._process_message_background(event, "agent:main:telegram:dm:12345:678")
+
+    assert adapter.sent == []
+    append_to_transcript.assert_not_called()
+
+
+def test_gateway_alive_heartbeat_skips_a_running_session(monkeypatch, caplog):
     """A keepalive never enters the gateway's busy-message interrupt path."""
     adapter = SimpleNamespace(handle_message=AsyncMock())
     runner = _runner(adapter)
@@ -141,10 +273,17 @@ def test_gateway_alive_heartbeat_skips_a_running_session(monkeypatch):
         "snapshot_active_targets",
         lambda caller_id=None: [{"target_id": "proc-heartbeat", "elapsed_s": 17}],
     )
+    caplog.set_level(logging.INFO, logger="gateway.run")
 
     asyncio.run(runner._handle_heartbeat_event(_heartbeat_event()))
 
     adapter.handle_message.assert_not_awaited()
+    assert any(
+        record.levelno == logging.INFO
+        and "ALIVE" in record.getMessage()
+        and _heartbeat_event()["session_key"] in record.getMessage()
+        for record in caplog.records
+    )
 
 
 def test_gateway_stuck_heartbeat_steers_a_running_session(monkeypatch):
@@ -174,6 +313,45 @@ def test_gateway_stuck_heartbeat_steers_a_running_session(monkeypatch):
     assert len(steers) == 1
     assert "stuck" in steers[0].lower()
     assert "intervene" in steers[0].lower()
+    adapter.handle_message.assert_not_awaited()
+
+
+def test_gateway_stuck_idle_heartbeat_disables_silent_noop(monkeypatch):
+    """Only ALIVE warm probes may use the silent-noop contract."""
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    runner._running_agents = {}
+
+    from tools.runtime_heartbeat import runtime_heartbeat
+
+    monkeypatch.setattr(
+        runtime_heartbeat,
+        "snapshot_active_targets",
+        lambda caller_id=None: [{"target_id": "proc-heartbeat", "elapsed_s": 17}],
+    )
+
+    asyncio.run(runner._handle_heartbeat_event(_heartbeat_event(status="STUCK")))
+
+    adapter.handle_message.assert_awaited_once()
+    assert adapter.handle_message.await_args.args[0].metadata["allow_silent_noop"] is False
+
+
+def test_gateway_foreign_heartbeat_is_not_injected(monkeypatch):
+    """A heartbeat without a gateway-owned session is dropped before routing."""
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter, origins={})
+    runner._running_agents = {}
+
+    from tools.runtime_heartbeat import runtime_heartbeat
+
+    monkeypatch.setattr(
+        runtime_heartbeat,
+        "snapshot_active_targets",
+        lambda caller_id=None: [{"target_id": "proc-heartbeat", "elapsed_s": 17}],
+    )
+
+    asyncio.run(runner._handle_heartbeat_event(_heartbeat_event()))
+
     adapter.handle_message.assert_not_awaited()
 
 

@@ -5228,14 +5228,22 @@ class TurnRunner:
         )
 
         if not final_response:
-            final_response = _normalize_empty_agent_response(
-                result, final_response or "", history_len=len(agent_history),
+            heartbeat_warm_silent_noop = (
+                ctx.turn_origin == "heartbeat_warm"
+                and result.get("silent_noop") is True
             )
-            final_response = _sanitize_gateway_final_response(ctx.source.platform, final_response)
-            if not final_response:
-                final_response = f"⚠️ {result['error']}" if result.get("error") else ""
+            if not heartbeat_warm_silent_noop:
+                final_response = _normalize_empty_agent_response(
+                    result, final_response or "", history_len=len(agent_history),
+                )
+                final_response = _sanitize_gateway_final_response(
+                    ctx.source.platform, final_response
+                )
+                if not final_response:
+                    final_response = f"⚠️ {result['error']}" if result.get("error") else ""
             return {
                 "final_response": final_response,
+                "silent_noop": heartbeat_warm_silent_noop,
                 "messages": result.get("messages", []),
                 "api_calls": result.get("api_calls", 0),
                 "failed": result.get("failed", False),
@@ -16725,6 +16733,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _stale_adapter._post_delivery_callbacks.pop(_quick_key, None)
                 return None
 
+            if (
+                turn_origin == "heartbeat_warm"
+                and agent_result.get("silent_noop") is True
+            ):
+                logger.info(
+                    "Heartbeat warm turn completed as a silent no-op; no platform delivery: %s",
+                    _quick_key or "?",
+                )
+                return None
+
             response = agent_result.get("final_response") or ""
             # Hidden-reasoning-only retry exhaustion: the loop's sentinel text
             # ("Codex response remained incomplete after 3 continuation
@@ -21212,6 +21230,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not caller_id:
             logger.debug("Ignoring heartbeat without a caller session key")
             return
+        try:
+            self.session_store._ensure_loaded()
+            owned_session = self.session_store._entries.get(caller_id)
+        except Exception:
+            logger.warning(
+                "Dropping heartbeat because gateway ownership lookup failed: %s",
+                caller_id,
+                exc_info=True,
+            )
+            return
+        if owned_session is None:
+            logger.info(
+                "Dropping heartbeat without a gateway-owned session: %s", caller_id
+            )
+            return
         target_id = str(evt.get("target_id") or evt.get("session_id") or "unknown")
         target_kind = str(evt.get("target_kind") or "target")
         target_key = f"{caller_id}:{target_kind}:{target_id}"
@@ -21253,8 +21286,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     except Exception:
                         logger.debug("Could not steer STUCK heartbeat", exc_info=True)
             else:
-                logger.debug(
-                    "Skipping heartbeat warm turn for active gateway session %s", caller_id
+                logger.info(
+                    "ALIVE heartbeat confirms active gateway session %s; warm turn skipped",
+                    caller_id,
                 )
                 return
 
@@ -21262,7 +21296,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             synth_text,
             evt,
             turn_origin="heartbeat_warm",
-            allow_silent_noop=True,
+            allow_silent_noop=status == "ALIVE",
         )
         if delivered is None:
             logger.warning(

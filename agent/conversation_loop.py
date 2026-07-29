@@ -1163,6 +1163,13 @@ def run_conversation(
     if _inject_idle_completion_noop_instruction and persist_user_message is None:
         persist_user_message = user_message
 
+    # A heartbeat warm turn is a deliberately ephemeral cache exercise. Defer
+    # the crash-resilience write until the finalizer can distinguish a visible
+    # response from its allowed silent no-op result.
+    _defer_heartbeat_warm_persistence = (
+        turn_origin == "heartbeat_warm" and allow_silent_noop is True
+    )
+
     # A new user turn is an intervening message, not another iteration of a
     # prior watchdog resolver loop.
     try:
@@ -1206,6 +1213,7 @@ def run_conversation(
         # MoA turns append per-call aggregated context to the API copy of the
         # user message, so no byte-stable api_content sidecar can be stamped.
         moa_active=bool(moa_config),
+        defer_early_persistence=_defer_heartbeat_warm_persistence,
     )
     user_message = _ctx.user_message
     original_user_message = _ctx.original_user_message
@@ -7198,6 +7206,7 @@ def run_conversation(
         _pending_verification_response=_pending_verification_response,
         _pending_verification_response_previewed=_pending_verification_response_previewed,
         silent_noop=_silent_noop,
+        turn_origin=turn_origin,
     )
 
 

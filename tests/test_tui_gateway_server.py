@@ -4333,7 +4333,7 @@ def test_heartbeat_stuck_idle_warms_agent_with_intervention_prompt(monkeypatch):
     assert "stuck" in text.lower()
     assert "intervene" in text.lower()
     assert kwargs["turn_origin"] == "heartbeat_warm"
-    assert kwargs["allow_silent_noop"] is True
+    assert kwargs["allow_silent_noop"] is False
 
 
 def test_heartbeat_with_unmatched_session_key_is_not_injected(monkeypatch):
@@ -12154,6 +12154,50 @@ def test_prompt_submit_marks_idle_completion_silent_noop(monkeypatch):
     assert complete_events[-1][2]["text"] is None
     assert complete_events[-1][2]["silent"] is True
     assert session["history"][-1] == {"role": "user", "content": notification}
+
+
+def test_prompt_submit_heartbeat_silent_noop_keeps_live_history_clean(monkeypatch):
+    """A warm heartbeat may exercise the API but must not become a TUI turn."""
+    calls = []
+    prior_history = [{"role": "assistant", "content": "previous visible answer"}]
+
+    class _Agent:
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **kwargs):
+            calls.append((prompt, kwargs))
+            return {
+                "final_response": None,
+                "completed": True,
+                "silent_noop": True,
+                "messages": [
+                    *(conversation_history or []),
+                    {"role": "user", "content": prompt},
+                ],
+            }
+
+    session = _session(agent=_Agent(), history=list(prior_history))
+    server._sessions["sid_heartbeat_noop"] = session
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
+    monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+
+    notification = '[HEARTBEAT] checkin #1. Background target "proc-heartbeat" is ALIVE.'
+    try:
+        server._run_prompt_submit(
+            "heartbeat-noop",
+            "sid_heartbeat_noop",
+            session,
+            notification,
+            turn_origin="heartbeat_warm",
+            allow_silent_noop=True,
+        )
+    finally:
+        server._sessions.pop("sid_heartbeat_noop", None)
+
+    assert calls[0][1]["turn_origin"] == "heartbeat_warm"
+    assert calls[0][1]["allow_silent_noop"] is True
+    assert session["history"] == prior_history
 
 
 # ── active live TUI sessions ─────────────────────────────────────────

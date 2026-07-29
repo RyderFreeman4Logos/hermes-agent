@@ -1313,6 +1313,7 @@ class ProcessRegistry:
         owns_event=None,
         *,
         skip_poll_observed: bool = True,
+        preserve_event_types: "set[str] | None" = None,
     ) -> "list[tuple[dict, str]]":
         """Pop all pending notification events and return formatted pairs.
 
@@ -1321,6 +1322,10 @@ class ProcessRegistry:
         observed inline via poll() (see ``_drain_should_skip``). Gateway/TUI
         callers pass ``skip_poll_observed=False`` because read-only polling must
         not suppress autonomous delivery there.
+
+        ``preserve_event_types`` lets a specialized consumer leave control
+        events (such as runtime heartbeats) on the shared queue instead of
+        losing them in this completion-only formatter.
 
         When a routing filter is supplied, addressed notifications must not be
         drained into the wrong session. Async-delegation events always require
@@ -1345,11 +1350,15 @@ class ProcessRegistry:
         """
         results: "list[tuple[dict, str]]" = []
         requeue: "list[dict]" = []
+        preserved_types = set(preserve_event_types or ())
         while not self.completion_queue.empty():
             try:
                 evt = self.completion_queue.get_nowait()
             except Exception:
                 break
+            if evt.get("type") in preserved_types:
+                requeue.append(evt)
+                continue
             # Positive-proof ownership beats bare key equality. Delegation
             # payloads always require proof; ordinary events require it once
             # they carry routing metadata. Ownerless ordinary events preserve
@@ -2318,7 +2327,9 @@ def format_process_notification(evt: dict) -> "str | None":
     """Format a process notification event into a [IMPORTANT: ...] message.
 
     Handles completion events (notify_on_complete), watch pattern matches,
-    and watch disabled events from the unified completion_queue.
+    and watch disabled events from the unified completion_queue. Runtime
+    heartbeats are control events consumed by their dedicated TUI/gateway
+    handlers, not completion notifications.
 
     Completions are compact by default (runtime.completion_notify) and mark
     LATE deliveries so the agent can ACK without expensive output restatement.
@@ -2331,14 +2342,7 @@ def format_process_notification(evt: dict) -> "str | None":
         return f"[IMPORTANT: {evt.get('message', '')}]"
 
     if evt_type == "heartbeat":
-        target = evt.get("target_id", _sid)
-        kind = evt.get("target_kind", "target")
-        status = evt.get("status", "STUCK")
-        evidence = evt.get("evidence", "no evidence available")
-        return (
-            f"[IMPORTANT: HEARTBEAT {status} {kind} {target}: {evidence}. "
-            f"Check progress only; do not dump logs or write long commentary.]"
-        )
+        return None
 
     if evt_type == "watch_match":
         _pat = evt.get("pattern", "?")

@@ -84,6 +84,111 @@ def _completion_event(*, started_at, session_id="proc_reused"):
     }
 
 
+def _heartbeat_event(**overrides):
+    event = {
+        "type": "heartbeat",
+        "target_id": "proc-heartbeat",
+        "target_kind": "process",
+        "session_id": "proc-heartbeat",
+        "session_key": "agent:main:telegram:dm:12345:678",
+        "status": "ALIVE",
+        "evidence": "output grew 0->128 bytes",
+    }
+    event.update(overrides)
+    return event
+
+
+def test_gateway_heartbeat_event_injects_a_silent_warm_turn(monkeypatch, isolated_registry):
+    """The idle gateway watcher consumes heartbeats instead of leaving them queued."""
+    isolated = queue.Queue()
+    monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
+    isolated.put(_heartbeat_event())
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+
+    from tools.runtime_heartbeat import runtime_heartbeat
+
+    monkeypatch.setattr(
+        runtime_heartbeat,
+        "snapshot_active_targets",
+        lambda caller_id=None: [{"target_id": "proc-heartbeat", "elapsed_s": 17}],
+    )
+
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    adapter.handle_message.assert_awaited_once()
+    synth_event = adapter.handle_message.await_args.args[0]
+    assert "checkin #1" in synth_event.text
+    assert "Elapsed: 17s" in synth_event.text
+    assert synth_event.metadata["turn_origin"] == "heartbeat_warm"
+    assert synth_event.metadata["allow_silent_noop"] is True
+    assert isolated.empty()
+
+
+def test_gateway_alive_heartbeat_skips_a_running_session(monkeypatch):
+    """A keepalive never enters the gateway's busy-message interrupt path."""
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    runner._running_agents = {}
+    running_agent = object()
+    runner._running_agents[_heartbeat_event()["session_key"]] = running_agent
+
+    from tools.runtime_heartbeat import runtime_heartbeat
+
+    monkeypatch.setattr(
+        runtime_heartbeat,
+        "snapshot_active_targets",
+        lambda caller_id=None: [{"target_id": "proc-heartbeat", "elapsed_s": 17}],
+    )
+
+    asyncio.run(runner._handle_heartbeat_event(_heartbeat_event()))
+
+    adapter.handle_message.assert_not_awaited()
+
+
+def test_gateway_stuck_heartbeat_steers_a_running_session(monkeypatch):
+    """A busy gateway agent receives a STUCK alert without a competing turn."""
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    runner._running_agents = {}
+    steers = []
+
+    class _RunningAgent:
+        def steer(self, text):
+            steers.append(text)
+            return True
+
+    runner._running_agents[_heartbeat_event()["session_key"]] = _RunningAgent()
+
+    from tools.runtime_heartbeat import runtime_heartbeat
+
+    monkeypatch.setattr(
+        runtime_heartbeat,
+        "snapshot_active_targets",
+        lambda caller_id=None: [{"target_id": "proc-heartbeat", "elapsed_s": 17}],
+    )
+
+    asyncio.run(runner._handle_heartbeat_event(_heartbeat_event(status="STUCK")))
+
+    assert len(steers) == 1
+    assert "stuck" in steers[0].lower()
+    assert "intervene" in steers[0].lower()
+    adapter.handle_message.assert_not_awaited()
+
+
+def test_gateway_post_turn_drain_requeues_heartbeat_for_warm_watcher():
+    """The post-turn watch drain cannot silently discard a pending heartbeat."""
+    from gateway.run import _drain_gateway_watch_events
+
+    isolated = queue.Queue()
+    event = _heartbeat_event()
+    isolated.put(event)
+
+    assert _drain_gateway_watch_events(isolated) == []
+    assert isolated.get_nowait() is event
+
+
 def _stop_after_sleeps(monkeypatch, runner, count):
     sleep_calls = 0
 

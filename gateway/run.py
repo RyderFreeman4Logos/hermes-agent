@@ -3110,7 +3110,7 @@ def _drain_gateway_watch_events(completion_queue) -> "list[dict]":
         evt_type = evt.get("type", "completion")
         if evt_type in {"watch_match", "watch_disabled"}:
             watch_events.append(evt)
-        elif evt_type == "async_delegation":
+        elif evt_type in {"async_delegation", "heartbeat"}:
             requeue.append(evt)
         # else: process completion events are handled by the watcher task
     for evt in requeue:
@@ -5085,6 +5085,9 @@ class TurnRunner:
                 _conversation_kwargs["moa_config"] = ctx.moa_config
             if _persist_user_timestamp_override is not None:
                 _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
+            if ctx.turn_origin == "heartbeat_warm":
+                _conversation_kwargs["turn_origin"] = ctx.turn_origin
+                _conversation_kwargs["allow_silent_noop"] = ctx.allow_silent_noop
             result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
         finally:
             unregister_gateway_notify(_approval_session_key)
@@ -16657,6 +16660,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # below; a /new or another lifecycle transition may move
             # session_entry.session_id while the old run is still unwinding.
             _run_start_session_id = session_entry.session_id
+            _event_metadata = getattr(event, "metadata", None)
+            turn_origin = None
+            allow_silent_noop = False
+            if (
+                getattr(event, "internal", False)
+                and isinstance(_event_metadata, dict)
+                and _event_metadata.get("turn_origin") == "heartbeat_warm"
+            ):
+                turn_origin = "heartbeat_warm"
+                allow_silent_noop = bool(_event_metadata.get("allow_silent_noop"))
             agent_result = await self._run_agent(
                 message=message_text,
                 context_prompt=context_prompt,
@@ -16671,6 +16684,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=event.message_type,
+                turn_origin=turn_origin,
+                allow_silent_noop=allow_silent_noop,
             )
 
             # Stop persistent typing indicator now that the agent is done.
@@ -20812,7 +20827,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
 
     async def _inject_watch_notification(
-        self, synth_text: str, evt: dict,
+        self,
+        synth_text: str,
+        evt: dict,
+        *,
+        turn_origin: str | None = None,
+        allow_silent_noop: bool = False,
     ) -> Optional[bool]:
         """Inject a watch/completion notification as a synthetic message event.
 
@@ -20904,6 +20924,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             parent_session_id = str(evt.get("parent_session_id") or "").strip()
             if parent_session_id:
                 metadata["gateway_session_id"] = parent_session_id
+            if turn_origin is not None:
+                metadata["turn_origin"] = turn_origin
+                metadata["allow_silent_noop"] = bool(allow_silent_noop)
             synth_event = MessageEvent(
                 text=synth_text,
                 message_type=MessageType.TEXT,
@@ -21149,8 +21172,109 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if parsed.get("thread_id"):
             evt["thread_id"] = parsed["thread_id"]
 
+    def _heartbeat_elapsed_seconds(self, evt: dict) -> int:
+        """Return the best available elapsed age without changing event shape."""
+        target_id = str(evt.get("target_id") or evt.get("session_id") or "")
+        target_kind = str(evt.get("target_kind") or "")
+        caller_id = str(evt.get("session_key") or "")
+        elapsed: int | None = None
+        try:
+            from tools.runtime_heartbeat import runtime_heartbeat
+
+            for target in runtime_heartbeat.snapshot_active_targets(caller_id=caller_id):
+                if str(target.get("target_id") or "") != target_id:
+                    continue
+                if target_kind and str(target.get("target_kind") or "") not in {"", target_kind}:
+                    continue
+                elapsed = max(0, int(float(target.get("elapsed_s") or 0)))
+                break
+        except Exception:
+            logger.debug("Could not snapshot gateway heartbeat elapsed time", exc_info=True)
+
+        target_key = f"{caller_id}:{target_kind or 'target'}:{target_id or 'unknown'}"
+        starts = getattr(self, "_heartbeat_checkin_started_at", None)
+        if not isinstance(starts, dict):
+            starts = {}
+            self._heartbeat_checkin_started_at = starts
+        now = time.monotonic()
+        if elapsed is not None:
+            starts[target_key] = now - elapsed
+            return elapsed
+        prior_started_at = starts.get(target_key)
+        if isinstance(prior_started_at, (int, float)):
+            return max(0, int(now - prior_started_at))
+        starts[target_key] = now
+        return 0
+
+    async def _handle_heartbeat_event(self, evt: dict) -> None:
+        """Inject one lightweight warm turn for a gateway-owned heartbeat."""
+        caller_id = str(evt.get("session_key") or "")
+        if not caller_id:
+            logger.debug("Ignoring heartbeat without a caller session key")
+            return
+        target_id = str(evt.get("target_id") or evt.get("session_id") or "unknown")
+        target_kind = str(evt.get("target_kind") or "target")
+        target_key = f"{caller_id}:{target_kind}:{target_id}"
+        counts = getattr(self, "_heartbeat_checkin_count", None)
+        if not isinstance(counts, dict):
+            counts = {}
+            self._heartbeat_checkin_count = counts
+        try:
+            count = int(counts.get(target_key, 0) or 0) + 1
+        except (TypeError, ValueError):
+            count = 1
+        counts[target_key] = count
+        status = str(evt.get("status") or "STUCK").upper()
+        evidence = str(evt.get("evidence") or "no evidence available")
+        elapsed_s = self._heartbeat_elapsed_seconds(evt)
+        if status == "STUCK":
+            synth_text = (
+                f'[HEARTBEAT] checkin #{count}. Background target "{target_id}" '
+                f"is STUCK: {evidence}. Elapsed: {elapsed_s}s. "
+                "This target may be stuck; consider whether to intervene."
+            )
+        else:
+            synth_text = (
+                f'[HEARTBEAT] checkin #{count}. Background target "{target_id}" '
+                f"is {status}: {evidence}. Elapsed: {elapsed_s}s. "
+                "KV cache warm check-in."
+            )
+
+        running_agent = getattr(self, "_running_agents", {}).get(caller_id)
+        if running_agent is not None:
+            if status == "STUCK":
+                if (
+                    running_agent is not _AGENT_PENDING_SENTINEL
+                    and hasattr(running_agent, "steer")
+                ):
+                    try:
+                        if running_agent.steer(synth_text):
+                            return
+                    except Exception:
+                        logger.debug("Could not steer STUCK heartbeat", exc_info=True)
+            else:
+                logger.debug(
+                    "Skipping heartbeat warm turn for active gateway session %s", caller_id
+                )
+                return
+
+        delivered = await self._inject_watch_notification(
+            synth_text,
+            evt,
+            turn_origin="heartbeat_warm",
+            allow_silent_noop=True,
+        )
+        if delivered is None:
+            logger.warning(
+                "Heartbeat for target %s had no gateway route (caller=%s)",
+                target_id,
+                caller_id,
+            )
+        elif delivered is False:
+            logger.warning("Heartbeat warm check-in injection failed for %s", target_id)
+
     async def _async_delegation_watcher(self, interval: float = 2.0) -> None:
-        """Drain async-delegation completions and inject them as new turns.
+        """Drain async completions and runtime heartbeats as new turns.
 
         Background subagents (``delegate_task(background=true)``) run on the
         async-delegation daemon executor — they have no per-process watcher
@@ -21172,6 +21296,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # so requeue anything that isn't ours.
                 requeue = []
                 async_events = []
+                heartbeat_events = []
                 while not _pr.completion_queue.empty():
                     try:
                         evt = _pr.completion_queue.get_nowait()
@@ -21179,6 +21304,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         break
                     if evt.get("type") == "async_delegation":
                         async_events.append(evt)
+                    elif evt.get("type") == "heartbeat":
+                        heartbeat_events.append(evt)
                     else:
                         requeue.append(evt)
                 for evt in requeue:
@@ -21195,6 +21322,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     except Exception as e:
                         _pr.completion_queue.put(evt)
                         logger.error("Async delegation injection error: %s", e)
+                for evt in heartbeat_events:
+                    try:
+                        await self._handle_heartbeat_event(evt)
+                    except Exception as e:
+                        # Heartbeats are ephemeral; a later cadence retries a
+                        # live target, so malformed events must not spin.
+                        logger.error("Heartbeat warm check-in injection error: %s", e)
             except Exception as e:
                 logger.debug("Async delegation watcher error: %s", e)
             await asyncio.sleep(interval)
@@ -22980,6 +23114,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        turn_origin: Optional[str] = None,
+        allow_silent_noop: bool = False,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -22999,6 +23135,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
+                turn_origin=turn_origin,
+                allow_silent_noop=allow_silent_noop,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -23011,6 +23149,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
+                turn_origin=turn_origin,
+                allow_silent_noop=allow_silent_noop,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -23133,6 +23273,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        turn_origin: Optional[str] = None,
+        allow_silent_noop: bool = False,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -23417,6 +23559,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             moa_config=moa_config,
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
+            turn_origin=turn_origin,
+            allow_silent_noop=allow_silent_noop,
         )
         turn_runner = TurnRunner(self, turn_ctx)
         # Callback invoked by agent on tool lifecycle events — extracted to

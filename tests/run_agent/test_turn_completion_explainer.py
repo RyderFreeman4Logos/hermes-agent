@@ -179,6 +179,30 @@ def test_idle_completion_empty_stop_is_silent_and_keeps_notification():
     )
 
 
+def test_heartbeat_warm_empty_stop_is_silent_after_one_api_call():
+    """A cache warm check-in may be empty, but it must still make one API call."""
+    agent = _make_agent(max_iterations=10)
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(content="", finish_reason="stop"),
+    ]
+
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation(
+            '[HEARTBEAT] checkin #1. Background target "proc-heartbeat" is ALIVE.',
+            turn_origin="heartbeat_warm",
+            allow_silent_noop=True,
+        )
+
+    assert agent.client.chat.completions.create.call_count == 1
+    assert result["final_response"] is None
+    assert result["silent_noop"] is True
+    assert result["turn_exit_reason"] == "idle_notification_noop"
+
+
 def test_idle_completion_reasoning_only_stop_or_success_is_silent_without_retries():
     """Reasoning without visible text is a no-op for an idle completion."""
     for finish_reason in ("stop", "success"):

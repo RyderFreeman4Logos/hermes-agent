@@ -1128,8 +1128,9 @@ def run_conversation(
         persist_user_display_metadata: Optional payload for that event
             (e.g. a delegation's task count).
         turn_origin: Source policy for this turn. Only the explicit
-            ``idle_completion`` origin can opt into a silent noop.
-        allow_silent_noop: Allow a clean empty idle-completion response to
+            ``idle_completion`` and ``heartbeat_warm`` origins can opt into a
+            silent noop.
+        allow_silent_noop: Allow a clean empty internal-notification response to
             end without recovery nudges or a synthetic visible response.
 
     Returns:
@@ -1148,14 +1149,14 @@ def run_conversation(
         except Exception:
             pass
 
-    # The idle-completion no-op instruction is API-only: it is appended to the
+    # The internal-notification no-op instruction is API-only: it is appended to the
     # request copy at the API boundary (see request_messages construction), never
     # to the live ``messages`` list.  Mutating ``messages`` here would leak the
     # suffix into early-exit persistence paths (content_filter, budget exhaustion)
     # that bypass the turn finalizer's cleanup.  ``persist_user_message`` is set
     # to the clean text so the durable transcript is always pristine.
     _inject_idle_completion_noop_instruction = (
-        turn_origin == "idle_completion"
+        turn_origin in {"idle_completion", "heartbeat_warm"}
         and allow_silent_noop
         and isinstance(user_message, str)
     )
@@ -6464,7 +6465,7 @@ def run_conversation(
                     )
                 )
                 if (
-                    turn_origin == "idle_completion"
+                    turn_origin in {"idle_completion", "heartbeat_warm"}
                     and allow_silent_noop is True
                     and getattr(agent, "_turn_received_provider_response", False) is True
                     and finish_reason in {"stop", "success"}

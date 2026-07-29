@@ -84,6 +84,7 @@ def finalize_turn(
     _pending_verification_response=None,
     _pending_verification_response_previewed=False,
     silent_noop=False,
+    turn_origin: str = "user",
 ):
     """Run the post-loop finalization and return the turn ``result`` dict.
 
@@ -91,6 +92,16 @@ def finalize_turn(
     loop). See module docstring.
     """
     from agent.conversation_loop import logger
+
+    # A successful heartbeat warm no-op is an internal cache exercise, not a
+    # conversation turn. Restore the caller's exact pre-turn history in place
+    # so every live reference (including ``agent._session_messages``) loses the
+    # synthetic bare user tail before any durable or external-memory work runs.
+    _ephemeral_heartbeat_warm_noop = (
+        turn_origin == "heartbeat_warm" and silent_noop is True
+    )
+    if _ephemeral_heartbeat_warm_noop:
+        messages[:] = list(conversation_history or [])
 
     budget_exhausted = (
         api_call_count >= agent.max_iterations
@@ -245,13 +256,18 @@ def finalize_turn(
     # killing the turn.
     _cleanup_errors = []
 
-    # Save trajectory if enabled.  ``user_message`` may be a multimodal
-    # list of parts; the trajectory format wants a plain string.
-    try:
-        agent._save_trajectory(messages, _summarize_user_message_for_log(user_message), completed)
-    except Exception as _save_err:
-        _cleanup_errors.append(f"save_trajectory: {_save_err}")
-        logger.error("finalize_turn: _save_trajectory failed: %s", _save_err, exc_info=True)
+    # Save trajectory if enabled. ``user_message`` may be a multimodal
+    # list of parts; the trajectory format wants a plain string. A heartbeat
+    # warm silent no-op deliberately has no transcript, so it gets no durable
+    # trajectory either.
+    if _ephemeral_heartbeat_warm_noop:
+        logger.debug("Skipping trajectory for heartbeat warm silent no-op")
+    else:
+        try:
+            agent._save_trajectory(messages, _summarize_user_message_for_log(user_message), completed)
+        except Exception as _save_err:
+            _cleanup_errors.append(f"save_trajectory: {_save_err}")
+            logger.error("finalize_turn: _save_trajectory failed: %s", _save_err, exc_info=True)
 
     # Clean up VM and browser for this task after conversation completes
     try:
@@ -350,7 +366,10 @@ def finalize_turn(
         _apply_override = getattr(agent, "_apply_persist_user_message_override", None)
         if callable(_apply_override):
             _apply_override(messages)
-        agent._persist_session(messages, conversation_history)
+        if _ephemeral_heartbeat_warm_noop:
+            logger.debug("Skipping session persistence for heartbeat warm silent no-op")
+        else:
+            agent._persist_session(messages, conversation_history)
     except Exception as _persist_err:
         _cleanup_errors.append(f"persist_session: {_persist_err}")
         logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)
@@ -641,12 +660,17 @@ def finalize_turn(
         agent._iters_since_skill = 0
 
     # External memory provider: sync the completed turn + queue next prefetch.
-    agent._sync_external_memory_for_turn(
-        original_user_message=original_user_message,
-        final_response=final_response,
-        interrupted=interrupted,
-        messages=messages,
-    )
+    # The synthetic heartbeat prompt is not user intent, so a silent no-op must
+    # not be indexed or otherwise become durable external history.
+    if _ephemeral_heartbeat_warm_noop:
+        logger.debug("Skipping external-memory sync for heartbeat warm silent no-op")
+    else:
+        agent._sync_external_memory_for_turn(
+            original_user_message=original_user_message,
+            final_response=final_response,
+            interrupted=interrupted,
+            messages=messages,
+        )
 
     # Background memory/skill review — runs AFTER the response is delivered
     # so it never competes with the user's task for model attention.

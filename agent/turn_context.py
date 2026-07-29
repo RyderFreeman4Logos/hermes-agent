@@ -344,6 +344,7 @@ def build_turn_context(
     set_current_write_origin,
     ra,
     moa_active: bool = False,
+    defer_early_persistence: bool = False,
 ) -> TurnContext:
     """Run the once-per-turn setup and return the loop's input context.
 
@@ -1206,24 +1207,33 @@ def build_turn_context(
         agent._ensure_db_session()
         agent._persist_session(messages, conversation_history)
 
-    try:
-        if persist_lock is None:
-            _ensure_and_persist()
-        else:
-            with persist_lock:
-                _ensure_and_persist()
-    except Exception:
-        logger.warning(
-            "Early turn-start session persistence failed for session=%s",
+    if defer_early_persistence:
+        # ``heartbeat_warm`` can legitimately resolve to a silent no-op. Keep
+        # its synthetic user input in memory until finalization decides whether
+        # a visible response makes this a real conversation turn.
+        logger.debug(
+            "Deferring early persistence for an eligible heartbeat warm turn: session=%s",
             agent.session_id or "none",
-            exc_info=True,
         )
-    finally:
-        # Keep an unmarked staged input available to a later close retry if the
-        # normal persistence attempt failed. Once the marker is present, the
-        # close path must no longer treat it as a pre-worker UI input.
-        if not isinstance(pending_cli_message, dict) or pending_cli_message.get("_db_persisted"):
-            agent._pending_cli_user_message = None
+    else:
+        try:
+            if persist_lock is None:
+                _ensure_and_persist()
+            else:
+                with persist_lock:
+                    _ensure_and_persist()
+        except Exception:
+            logger.warning(
+                "Early turn-start session persistence failed for session=%s",
+                agent.session_id or "none",
+                exc_info=True,
+            )
+
+    # Keep an unmarked staged input available to a later close retry if the
+    # normal persistence attempt failed. Once the marker is present, the
+    # close path must no longer treat it as a pre-worker UI input.
+    if not isinstance(pending_cli_message, dict) or pending_cli_message.get("_db_persisted"):
+        agent._pending_cli_user_message = None
 
     return TurnContext(
         user_message=user_message,

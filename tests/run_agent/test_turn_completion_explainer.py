@@ -225,6 +225,54 @@ def test_heartbeat_warm_empty_stop_is_silent_after_one_api_call():
     assert result["turn_exit_reason"] == "idle_notification_noop"
 
 
+def test_heartbeat_warm_silent_noop_is_ephemeral_not_persisted():
+    """A warm cache call must not leave a synthetic user tail anywhere durable."""
+    agent = _make_agent(max_iterations=10)
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(content="", finish_reason="stop"),
+    ]
+
+    with (
+        patch.object(agent, "_persist_session") as persist_session,
+        patch.object(agent, "_save_trajectory") as save_trajectory,
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation(
+            '[HEARTBEAT] checkin #1. Background target "proc-heartbeat" is ALIVE.',
+            turn_origin="heartbeat_warm",
+            allow_silent_noop=True,
+        )
+
+    assert result["silent_noop"] is True
+    assert result["messages"] == []
+    persist_session.assert_not_called()
+    save_trajectory.assert_not_called()
+
+
+def test_stuck_heartbeat_empty_response_is_not_silent_noop():
+    """A STUCK event must retain an actionable completion explanation."""
+    agent = _make_agent(max_iterations=10)
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(content="", finish_reason="stop") for _ in range(8)
+    ]
+
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation(
+            '[HEARTBEAT] checkin #1. Background target "proc-heartbeat" is STUCK.',
+            turn_origin="heartbeat_warm",
+            allow_silent_noop=False,
+        )
+
+    assert agent.client.chat.completions.create.call_count == 4
+    assert result.get("silent_noop") is not True
+    assert result["final_response"]
+    assert "No reply:" in result["final_response"]
+
+
 def test_idle_completion_reasoning_only_stop_or_success_is_silent_without_retries():
     """Reasoning without visible text is a no-op for an idle completion."""
     for finish_reason in ("stop", "success"):

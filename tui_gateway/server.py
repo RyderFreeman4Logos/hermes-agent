@@ -11676,6 +11676,10 @@ def _drain_idle_completion_backlog(
                 session_key=session.get("session_key", ""),
                 owns_event=lambda evt: _session_owns_notification_event(sid, session, evt),
                 skip_poll_observed=False,
+                # Heartbeats need their own short cache-warm turn. Do not let
+                # completion batching consume one merely because it arrived
+                # beside a terminal process event.
+                preserve_event_types={"heartbeat"},
             )
         except Exception:
             logger.debug("Failed to drain completion backlog", exc_info=True)
@@ -11770,6 +11774,120 @@ def _dispatch_idle_completion_batch(
             session["running"] = False
         logger.warning("Idle completion batch dispatch failed", exc_info=True)
         return False
+
+
+def _heartbeat_target_key(evt: dict) -> str:
+    """Return a session-local identity for one runtime heartbeat target."""
+    kind = str(evt.get("target_kind") or "target")
+    target_id = str(evt.get("target_id") or evt.get("session_id") or "unknown")
+    return f"{kind}:{target_id}"
+
+
+def _heartbeat_elapsed_seconds(session: dict, evt: dict) -> int:
+    """Resolve the target elapsed time without changing the producer event.
+
+    ALIVE targets remain in ``runtime_heartbeat`` after a fire, so its snapshot
+    is authoritative. A first STUCK fire has already been removed; retain the
+    first-observed monotonic time in the TUI session as a conservative fallback.
+    """
+    target_key = _heartbeat_target_key(evt)
+    target_id = str(evt.get("target_id") or evt.get("session_id") or "")
+    target_kind = str(evt.get("target_kind") or "")
+    caller_id = str(evt.get("session_key") or session.get("session_key") or "")
+    elapsed: int | None = None
+    try:
+        active_targets = runtime_heartbeat.snapshot_active_targets(caller_id=caller_id)
+        for target in active_targets:
+            if str(target.get("target_id") or "") != target_id:
+                continue
+            if target_kind and str(target.get("target_kind") or "") not in {"", target_kind}:
+                continue
+            elapsed = max(0, int(float(target.get("elapsed_s") or 0)))
+            break
+    except Exception:
+        logger.debug("Could not snapshot heartbeat target elapsed time", exc_info=True)
+
+    started_at = session.setdefault("_heartbeat_checkin_started_at", {})
+    now = time.monotonic()
+    if elapsed is not None:
+        started_at[target_key] = now - elapsed
+        return elapsed
+    prior_started_at = started_at.get(target_key)
+    if isinstance(prior_started_at, (int, float)):
+        return max(0, int(now - prior_started_at))
+    started_at[target_key] = now
+    return 0
+
+
+def _handle_heartbeat_event(sid: str, session: dict, evt: dict) -> None:
+    """Consume an owned heartbeat without routing it through completions.
+
+    A live target warms an idle caller with a deliberately tiny real agent turn.
+    When the caller is already running, that API activity already keeps the
+    prefix warm, so only surface a compact status line. STUCK events use the
+    same idle-turn path but ask the agent to decide whether to intervene.
+    """
+    event_key = str(evt.get("session_key") or "")
+    direct_owner_keys = {
+        str(sid or ""),
+        str(session.get("session_key") or ""),
+    }
+    if not event_key or (
+        event_key not in direct_owner_keys
+        and not _session_owns_notification_event(sid, session, evt)
+    ):
+        return
+
+    target_key = _heartbeat_target_key(evt)
+    target_id = str(evt.get("target_id") or evt.get("session_id") or "unknown")
+    status = str(evt.get("status") or "STUCK").upper()
+    evidence = str(evt.get("evidence") or "no evidence available")
+    counts = session.setdefault("_heartbeat_checkin_count", {})
+    try:
+        count = int(counts.get(target_key, 0) or 0) + 1
+    except (TypeError, ValueError):
+        count = 1
+    counts[target_key] = count
+    elapsed_s = _heartbeat_elapsed_seconds(session, evt)
+
+    with session["history_lock"]:
+        if session.get("running"):
+            _status_update(
+                sid,
+                "process",
+                f"checkin #{count} · {status.lower()} · elapsed {elapsed_s}s",
+            )
+            return
+        # _run_prompt_submit is intentionally non-blocking. Reserve the turn
+        # first so a concurrent notification cannot launch a competing turn.
+        session["running"] = True
+
+    if status == "STUCK":
+        checkin_text = (
+            f'[HEARTBEAT] checkin #{count}. Background target "{target_id}" '
+            f"is STUCK: {evidence}. Elapsed: {elapsed_s}s. "
+            "This target may be stuck; consider whether to intervene."
+        )
+    else:
+        checkin_text = (
+            f'[HEARTBEAT] checkin #{count}. Background target "{target_id}" '
+            f"is {status}: {evidence}. Elapsed: {elapsed_s}s. "
+            "KV cache warm check-in."
+        )
+    rid = f"__heartbeat__{int(time.time() * 1000)}"
+    try:
+        _run_prompt_submit(
+            rid,
+            sid,
+            session,
+            checkin_text,
+            turn_origin="heartbeat_warm",
+            allow_silent_noop=True,
+        )
+    except Exception:
+        with session["history_lock"]:
+            session["running"] = False
+        logger.warning("Heartbeat warm check-in dispatch failed", exc_info=True)
 
 
 def _notification_poller_loop(
@@ -11886,6 +12004,10 @@ def _notification_poller_loop(
 
         _evt_sid = evt.get("session_id", "")
         if evt.get("type") == "completion" and process_registry.is_completion_consumed(_evt_sid):
+            continue
+
+        if evt.get("type") == "heartbeat":
+            _handle_heartbeat_event(sid, session, evt)
             continue
 
         text = format_process_notification(evt)

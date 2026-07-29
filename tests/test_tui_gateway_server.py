@@ -3522,6 +3522,179 @@ class _StopAfterOneNotificationPoll:
         return self._checks > 1
 
 
+def _heartbeat_event(**overrides):
+    event = {
+        "type": "heartbeat",
+        "target_id": "proc-heartbeat",
+        "target_kind": "process",
+        "session_id": "proc-heartbeat",
+        "session_key": "heartbeat-owner",
+        "status": "ALIVE",
+        "evidence": "output grew 0->128 bytes",
+    }
+    event.update(overrides)
+    return event
+
+
+def test_notification_poller_heartbeat_alive_idle_warms_cache(monkeypatch):
+    """An idle owner receives a real lightweight heartbeat turn, not a dropped event."""
+    import queue as _queue_mod
+
+    from tools import process_registry as process_registry_module
+    from tools.process_registry import process_registry
+
+    sid = "heartbeat-idle-sid"
+    session = _session(session_key="heartbeat-owner")
+    event = _heartbeat_event()
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    isolated_queue.put(event)
+    submitted = []
+
+    def _submit(rid, submitted_sid, submitted_session, text, **kwargs):
+        submitted.append((rid, submitted_sid, submitted_session, text, kwargs))
+        submitted_session["running"] = False
+
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_run_prompt_submit", _submit)
+    monkeypatch.setattr(
+        process_registry_module,
+        "format_process_notification",
+        lambda _event: pytest.fail("heartbeat must bypass completion formatting"),
+    )
+    monkeypatch.setattr(
+        server.runtime_heartbeat,
+        "snapshot_active_targets",
+        lambda caller_id=None: [
+            {
+                "target_id": "proc-heartbeat",
+                "target_kind": "process",
+                "caller_id": caller_id,
+                "elapsed_s": 42,
+            }
+        ],
+    )
+    server._sessions[sid] = session
+
+    try:
+        server._notification_poller_loop(_StopAfterOneNotificationPoll(), sid, session)
+
+        assert len(submitted) == 1
+        _, submitted_sid, submitted_session, text, kwargs = submitted[0]
+        assert submitted_sid == sid
+        assert submitted_session is session
+        assert "checkin #1" in text
+        assert 'Background target "proc-heartbeat" is ALIVE' in text
+        assert "Elapsed: 42s" in text
+        assert kwargs["turn_origin"] == "heartbeat_warm"
+        assert kwargs["allow_silent_noop"] is True
+    finally:
+        server._sessions.pop(sid, None)
+
+
+def test_heartbeat_alive_while_running_emits_status_without_warm_turn(monkeypatch):
+    """A busy agent is already warm, so a heartbeat only updates TUI status."""
+    session = _session(session_key="heartbeat-owner", running=True)
+    emitted = []
+    monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *_args, **_kwargs: pytest.fail("busy heartbeat must not create a turn"),
+    )
+    monkeypatch.setattr(
+        server.runtime_heartbeat,
+        "snapshot_active_targets",
+        lambda caller_id=None: [{"target_id": "proc-heartbeat", "elapsed_s": 31}],
+    )
+
+    server._handle_heartbeat_event("heartbeat-running-sid", session, _heartbeat_event())
+
+    assert emitted == [
+        (
+            "status.update",
+            "heartbeat-running-sid",
+            {"kind": "process", "text": "checkin #1 · alive · elapsed 31s"},
+        )
+    ]
+
+
+def test_heartbeat_stuck_idle_warms_agent_with_intervention_prompt(monkeypatch):
+    """A stuck idle target still creates a turn so the agent can decide what to do."""
+    session = _session(session_key="heartbeat-owner")
+    submitted = []
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *args, **kwargs: submitted.append((args, kwargs)),
+    )
+    monkeypatch.setattr(server.runtime_heartbeat, "snapshot_active_targets", lambda caller_id=None: [])
+
+    server._handle_heartbeat_event(
+        "heartbeat-stuck-sid",
+        session,
+        _heartbeat_event(
+            status="STUCK",
+            evidence="process is live but made no progress",
+        ),
+    )
+
+    assert len(submitted) == 1
+    _, kwargs = submitted[0]
+    text = submitted[0][0][3]
+    assert "stuck" in text.lower()
+    assert "intervene" in text.lower()
+    assert kwargs["turn_origin"] == "heartbeat_warm"
+    assert kwargs["allow_silent_noop"] is True
+
+
+def test_heartbeat_with_unmatched_session_key_is_not_injected(monkeypatch):
+    """A heartbeat can never wake a different TUI session."""
+    session = _session(session_key="heartbeat-owner")
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *_args, **_kwargs: pytest.fail("foreign heartbeat must not inject"),
+    )
+
+    server._handle_heartbeat_event(
+        "heartbeat-owner-sid",
+        session,
+        _heartbeat_event(session_key="some-other-session"),
+    )
+
+    assert "_heartbeat_checkin_count" not in session
+
+
+def test_format_process_notification_ignores_heartbeat():
+    """The existing completion formatter intentionally has no heartbeat text."""
+    from tools.process_registry import format_process_notification
+
+    assert not format_process_notification(_heartbeat_event())
+
+
+def test_idle_completion_batch_preserves_heartbeat_for_the_poller(monkeypatch):
+    """Completion coalescing cannot consume a heartbeat before its handler sees it."""
+    import queue
+    from tools.process_registry import process_registry
+
+    isolated = queue.Queue()
+    event = _heartbeat_event()
+    isolated.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated)
+    monkeypatch.setattr(server.time, "sleep", lambda _delay: None)
+
+    entries = server._drain_idle_completion_backlog(
+        "heartbeat-sid",
+        _session(session_key="heartbeat-owner"),
+        set(),
+        process_registry,
+    )
+
+    assert entries == []
+    assert isolated.get_nowait() is event
+
+
 def test_notification_poller_live_loop_requeues_foreign_completion_for_owner(
     monkeypatch,
 ):

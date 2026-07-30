@@ -43,6 +43,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from contextlib import contextmanager
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
@@ -274,15 +275,31 @@ def _prune_durable_records() -> None:
 
 
 def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
+    """Persist terminal completion. Retry once on failure; never silent-drop."""
     now = time.time()
-    with _DB_LOCK, _transaction() as conn:
-        conn.execute(
-            """UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
-               event_json=?, result_json=?, delivery_state='pending'
-               WHERE delegation_id=?""",
-            (event.get("status", "completed"), event.get("completed_at", now), now,
-             json.dumps(event), json.dumps(result), event["delegation_id"]),
-        )
+    args = (
+        event.get("status", "completed"), event.get("completed_at", now), now,
+        json.dumps(event), json.dumps(result), event["delegation_id"],
+    )
+    last_exc: Optional[Exception] = None
+    for attempt in range(2):
+        try:
+            with _DB_LOCK, _transaction() as conn:
+                conn.execute(
+                    """UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
+                       event_json=?, result_json=?, delivery_state='pending'
+                       WHERE delegation_id=?""",
+                    args,
+                )
+            return
+        except Exception as exc:  # noqa: BLE001 — must surface loudly
+            last_exc = exc
+            logger.error(
+                "Async delegation %s: _persist_completion failed (attempt %d/2): %s",
+                event.get("delegation_id"), attempt + 1, exc, exc_info=True,
+            )
+    if last_exc is not None:
+        raise last_exc
 
 
 def _note_delivery_attempt(delegation_id: str) -> None:
@@ -344,6 +361,246 @@ def recover_abandoned_delegations() -> int:
     return recovered
 
 
+_TERMINAL_LIVE_STATUSES = frozenset({
+    "completed", "error", "interrupted", "failed", "cancelled", "canceled", "unknown",
+})
+_NONTERMINAL_LIVE_STATUSES = frozenset({"running", "finalizing", "pending", "dispatched"})
+
+
+def _read_live_manifest(delegation_id: str) -> Optional[Dict[str, Any]]:
+    """Best-effort load of cache/delegation/live/<id>/manifest.json."""
+    try:
+        from tools.delegation_live_log import live_transcript_root
+
+        mp = live_transcript_root() / delegation_id / "manifest.json"
+        if not mp.is_file():
+            return None
+        data = json.loads(mp.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except Exception as exc:
+        logger.debug("live manifest read failed for %s: %s", delegation_id, exc)
+        return None
+
+
+def _task_log_has_terminal_marker(log_path: Optional[str]) -> bool:
+    if not log_path:
+        return False
+    try:
+        path = Path(log_path) if not isinstance(log_path, Path) else log_path
+        if not path.is_file():
+            return False
+        # Read a small tail — markers are written at the end of the log.
+        with path.open("rb") as fh:
+            fh.seek(0, 2)
+            size = fh.tell()
+            fh.seek(max(0, size - 8192))
+            tail = fh.read().decode("utf-8", errors="replace")
+        for line in reversed(tail.splitlines()):
+            s = line.strip()
+            if not s:
+                continue
+            # LiveTranscriptWriter.finalize / subagent.complete markers
+            if "end status=" in s:
+                return True
+            if "status=completed" in s or "status=error" in s or "status=interrupted" in s:
+                return True
+            if "status=failed" in s or "status=cancelled" in s or "status=canceled" in s:
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def inspect_live_completion_evidence(delegation_id: str) -> Optional[Dict[str, Any]]:
+    """Return terminal live evidence for a delegation, or None if still live/unknown.
+
+    Prefer the live manifest (``completed`` stamp + per-task statuses). Fall back
+    to task-log terminal markers when the manifest is incomplete.
+    """
+    if not delegation_id:
+        return None
+    manifest = _read_live_manifest(delegation_id)
+    if not manifest:
+        return None
+
+    tasks = [t for t in (manifest.get("tasks") or []) if isinstance(t, dict)]
+    statuses = [str(t.get("status") or "").lower() for t in tasks]
+    terminal_tasks = [
+        s for s in statuses if s in _TERMINAL_LIVE_STATUSES
+    ]
+    nonterminal = [
+        s for s in statuses if s in _NONTERMINAL_LIVE_STATUSES or not s
+    ]
+
+    # Manifest-level completed stamp is authoritative once present.
+    completed_stamp = manifest.get("completed")
+    all_tasks_terminal = bool(tasks) and not nonterminal and len(terminal_tasks) == len(tasks)
+
+    if not completed_stamp and not all_tasks_terminal:
+        # Last-chance: every task log has a terminal marker even if status
+        # fields lagged.
+        logs_terminal = all(
+            _task_log_has_terminal_marker(t.get("log")) for t in tasks
+        ) if tasks else False
+        if not logs_terminal:
+            return None
+
+    # Aggregate status from task statuses.
+    status = "completed"
+    if any(s in {"error", "failed"} for s in statuses):
+        if all(s in {"error", "failed", "interrupted", "cancelled", "canceled"} for s in statuses if s):
+            status = "error"
+        else:
+            status = "completed"  # mixed — still terminal aggregate
+    elif any(s in {"interrupted", "cancelled", "canceled"} for s in statuses):
+        status = "interrupted"
+
+    summary_bits: List[str] = []
+    for t in tasks:
+        goal = str(t.get("goal") or "")[:80]
+        st = str(t.get("status") or "?")
+        summary_bits.append(f"task[{t.get('index')}]: {st}" + (f" — {goal}" if goal else ""))
+    summary = "; ".join(summary_bits) if summary_bits else (
+        f"live transcript reports terminal completion"
+        + (f" at {completed_stamp}" if completed_stamp else "")
+    )
+
+    evidence = (
+        f"live manifest terminal (status={status}"
+        + (f", completed={completed_stamp}" if completed_stamp else "")
+        + f", tasks={len(tasks)})"
+    )
+    return {
+        "status": status,
+        "summary": summary,
+        "evidence": evidence,
+        "completed_stamp": completed_stamp,
+        "task_count": len(tasks),
+        "manifest": manifest,
+        "reclaimed_from_live": True,
+    }
+
+
+def reclaim_orphaned_completed_delegations(
+    target_queue=None, *, enqueue: bool = True
+) -> int:
+    """Reclaim durable running/finalizing rows whose live transcripts are terminal.
+
+    Covers the owner-alive zombie case: child work finished and wrote a live
+    manifest/log, but ``_persist_completion`` never landed (process race,
+    finalize crash, etc.). Owner-dead rows remain ``recover_abandoned_delegations``'s
+    job; this path only acts when live evidence proves terminal completion.
+    """
+    try:
+        from tools.process_registry import process_registry as _pr
+    except Exception:
+        _pr = None
+
+    if target_queue is None and enqueue:
+        target_queue = getattr(_pr, "completion_queue", None) if _pr is not None else None
+
+    now = time.time()
+    reclaimed = 0
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(
+            """SELECT delegation_id, origin_session, origin_ui_session_id,
+                      parent_session_id, dispatched_at, owner_pid,
+                      owner_started_at, task_json, origin_session_id, delivery_state
+               FROM async_delegations WHERE state IN ('running','finalizing')"""
+        ).fetchall()
+
+    events_to_enqueue: List[Dict[str, Any]] = []
+    for row in rows:
+        (delegation_id, session_key, origin_ui, parent_id, dispatched_at,
+         _pid, _started, task_json, origin_session_id, delivery_state) = row
+        # Already-delivered rows should not be re-enqueued even if state lagging.
+        if delivery_state == "delivered":
+            continue
+        live = inspect_live_completion_evidence(delegation_id)
+        if not live:
+            continue
+        task = json.loads(task_json or "{}")
+        status = str(live.get("status") or "completed")
+        summary = live.get("summary")
+        completed_at = now
+        event = {
+            "type": "async_delegation",
+            "delegation_id": delegation_id,
+            "session_key": session_key or "",
+            "origin_ui_session_id": origin_ui or "",
+            "origin_session_id": origin_session_id or "",
+            "parent_session_id": parent_id,
+            "goal": task.get("goal", ""),
+            "goals": task.get("goals"),
+            "context": task.get("context"),
+            "toolsets": task.get("toolsets"),
+            "role": task.get("role"),
+            "model": task.get("model"),
+            "is_batch": bool(task.get("is_batch")) or bool(task.get("goals")),
+            "status": status,
+            "summary": summary,
+            "error": None if status == "completed" else (
+                f"Reclaimed from live transcript with terminal status={status}"
+            ),
+            "dispatched_at": dispatched_at,
+            "completed_at": completed_at,
+            "reclaimed_from_live": True,
+            "live_evidence": live.get("evidence"),
+        }
+        result = {
+            "status": status,
+            "summary": summary,
+            "error": event.get("error"),
+            "reclaimed_from_live": True,
+        }
+        try:
+            # Only transition rows that are STILL non-terminal + pending so a
+            # concurrent real finalize cannot be clobbered into a double-fire.
+            with _DB_LOCK, _transaction() as conn:
+                cur = conn.execute(
+                    """UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
+                       event_json=?, result_json=?, delivery_state='pending'
+                       WHERE delegation_id=? AND state IN ('running','finalizing')
+                         AND delivery_state='pending'""",
+                    (status, completed_at, now, json.dumps(event),
+                     json.dumps(result), delegation_id),
+                )
+                if cur.rowcount != 1:
+                    continue
+            reclaimed += 1
+            events_to_enqueue.append(event)
+            # Keep in-memory view consistent when present.
+            with _records_lock:
+                rec = _records.get(delegation_id)
+                if rec is not None:
+                    rec["status"] = status
+                    rec["completed_at"] = completed_at
+            logger.warning(
+                "Reclaimed orphaned completed async delegation %s from live "
+                "transcript (durable was still running/finalizing): %s",
+                delegation_id, live.get("evidence"),
+            )
+        except Exception as exc:
+            logger.error(
+                "Failed to reclaim orphaned delegation %s: %s",
+                delegation_id, exc, exc_info=True,
+            )
+
+    if enqueue and target_queue is not None:
+        for evt in events_to_enqueue:
+            try:
+                # restored=True so ownership filters fail-closed on foreign sessions
+                evt_out = dict(evt)
+                evt_out["restored"] = True
+                target_queue.put(evt_out)
+            except Exception as exc:
+                logger.error(
+                    "Reclaimed %s but enqueue failed: %s",
+                    evt.get("delegation_id"), exc,
+                )
+    return reclaimed
+
+
 def restore_undelivered_completions(target_queue) -> int:
     """Enqueue durable pending completions as fresh turns after process start.
 
@@ -357,10 +614,18 @@ def restore_undelivered_completions(target_queue) -> int:
     results seconds after boot (#64484).
     """
     recover_abandoned_delegations()
+    # Owner-alive zombies: live transcript finished but durable still running.
+    # Persist only here; this function re-reads event_json and enqueues once so
+    # reclaim must not double-put onto target_queue.
+    try:
+        reclaim_orphaned_completed_delegations(target_queue, enqueue=False)
+    except Exception as exc:
+        logger.warning("reclaim_orphaned_completed_delegations failed: %s", exc)
     with _DB_LOCK, _transaction() as conn:
         rows = conn.execute(
             """SELECT delegation_id, event_json FROM async_delegations
-               WHERE state != 'running' AND delivery_state='pending' AND event_json IS NOT NULL
+               WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'
+                 AND event_json IS NOT NULL
                ORDER BY completed_at, delegation_id"""
         ).fetchall()
         for _delegation_id, payload in rows:
@@ -911,7 +1176,14 @@ def _push_completion_event(
     ):
         if _k in result:
             evt[_k] = result[_k]
-    _persist_completion(evt, result)
+    try:
+        _persist_completion(evt, result)
+    except Exception as exc:
+        logger.error(
+            "Async delegation %s: durable completion persist failed after retry; "
+            "will rely on live-transcript reclaim: %s",
+            record.get("delegation_id"), exc, exc_info=True,
+        )
     try:
         process_registry.completion_queue.put(evt)
     except Exception as exc:  # pragma: no cover
@@ -1147,7 +1419,14 @@ def _push_batch_completion_event(
     ):
         if _k in combined:
             evt[_k] = combined[_k]
-    _persist_completion(evt, combined)
+    try:
+        _persist_completion(evt, combined)
+    except Exception as exc:
+        logger.error(
+            "Async delegation batch %s: durable completion persist failed after "
+            "retry; will rely on live-transcript reclaim: %s",
+            delegation_id, exc, exc_info=True,
+        )
     try:
         process_registry.completion_queue.put(evt)
     except Exception as exc:  # pragma: no cover

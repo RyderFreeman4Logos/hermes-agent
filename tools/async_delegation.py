@@ -550,6 +550,35 @@ _local_pending_requeue_at: Dict[str, float] = {}
 _LOCAL_PENDING_REQUEUE_COOLDOWN_S = 15.0
 
 
+def _restore_durable_event_routing(
+    evt: Dict[str, Any],
+    *,
+    origin_session: Any,
+    origin_ui_session_id: Any,
+    parent_session_id: Any,
+    origin_session_id: Any,
+) -> Dict[str, Any]:
+    """Backfill a replayed event's missing routing from its durable row.
+
+    Old completion payloads can have an empty ``origin_session_id`` (normal for
+    non-api-server sessions) and, after a partial finalize, may also be missing
+    the otherwise durable session/UI selectors.  Preserve any populated event
+    field so a stale/foreign event cannot be rewritten into another chat; only
+    use the durable dispatch record to restore an absent return address.
+    """
+    for field, value in (
+        ("session_key", origin_session),
+        ("origin_ui_session_id", origin_ui_session_id),
+        ("parent_session_id", parent_session_id),
+        ("origin_session_id", origin_session_id),
+    ):
+        if not str(evt.get(field) or "").strip() and value is not None:
+            restored = str(value).strip()
+            if restored:
+                evt[field] = restored
+    return evt
+
+
 def requeue_local_pending_async_completions(target_queue) -> int:
     """Re-enqueue durable pending completions owned by this process.
 
@@ -572,14 +601,25 @@ def requeue_local_pending_async_completions(target_queue) -> int:
     enqueued = 0
     with _DB_LOCK, _transaction() as conn:
         rows = conn.execute(
-            """SELECT delegation_id, owner_pid, owner_started_at, event_json
+            """SELECT delegation_id, owner_pid, owner_started_at, event_json,
+                      origin_session, origin_ui_session_id, parent_session_id,
+                      origin_session_id
                FROM async_delegations
                WHERE state NOT IN ('running','finalizing')
                  AND delivery_state='pending'
                  AND event_json IS NOT NULL
                ORDER BY completed_at, delegation_id"""
         ).fetchall()
-    for delegation_id, owner_pid, owner_started_at, payload in rows:
+    for (
+        delegation_id,
+        owner_pid,
+        owner_started_at,
+        payload,
+        origin_session,
+        origin_ui_session_id,
+        parent_session_id,
+        origin_session_id,
+    ) in rows:
         if not local_process_should_enqueue_delegation(
             owner_pid, owner_started_at, local_pid=me
         ):
@@ -594,6 +634,13 @@ def requeue_local_pending_async_completions(target_queue) -> int:
         if not isinstance(evt, dict):
             continue
         evt = dict(evt)
+        _restore_durable_event_routing(
+            evt,
+            origin_session=origin_session,
+            origin_ui_session_id=origin_ui_session_id,
+            parent_session_id=parent_session_id,
+            origin_session_id=origin_session_id,
+        )
         evt["restored"] = True
         evt.setdefault("type", "async_delegation")
         evt["delegation_id"] = delegation_id
@@ -614,6 +661,130 @@ def requeue_local_pending_async_completions(target_queue) -> int:
         for k in stale:
             _local_pending_requeue_at.pop(k, None)
     return enqueued
+
+
+def _arm_pending_delivery_heartbeat(
+    delegation_id: str,
+    *,
+    caller_id: str,
+    provider: str = "",
+) -> bool:
+    """Wake a parent once if a terminal delegation is still undelivered.
+
+    The normal running-target heartbeat is cancelled at completion.  Keep a
+    separate one-interval watchdog while its durable delivery remains pending:
+    a lost/foreign queue event can then wake the rightful idle parent without
+    extending the configured warm-KV cadence.  The first inspection arms the
+    timer; the expiry inspection reports the still-pending row as STUCK, which
+    intentionally produces one owner-routed check-in.
+    """
+    delegation_id = str(delegation_id or "")
+    caller_id = str(caller_id or "")
+    if not delegation_id or not caller_id:
+        return False
+
+    first_inspection = True
+
+    def inspect_delivery() -> Dict[str, Any]:
+        nonlocal first_inspection
+        if first_inspection:
+            first_inspection = False
+            return {
+                "alive": True,
+                "progress": True,
+                "evidence": "awaiting durable async completion delivery",
+            }
+        durable = get_durable_delegation(delegation_id)
+        if (
+            durable is not None
+            and str(durable.get("state") or "") not in {"running", "finalizing"}
+            and str(durable.get("delivery_state") or "") == "pending"
+        ):
+            return {
+                "alive": False,
+                "evidence": "async completion remains durable-pending after one warm-KV interval",
+            }
+        return {"alive": False, "evidence": "async completion delivery is no longer pending"}
+
+    try:
+        from tools.runtime_heartbeat import runtime_heartbeat
+
+        return bool(
+            runtime_heartbeat.arm(
+                delegation_id,
+                caller_id=caller_id,
+                kind="async_delivery",
+                provider=provider,
+                inspect=inspect_delivery,
+            )
+        )
+    except Exception:
+        logger.debug(
+            "Could not arm pending-delivery heartbeat for %s", delegation_id,
+            exc_info=True,
+        )
+        return False
+
+
+def _cancel_pending_delivery_heartbeat(delegation_id: str) -> None:
+    try:
+        from tools.runtime_heartbeat import runtime_heartbeat
+
+        runtime_heartbeat.cancel(delegation_id)
+    except Exception:
+        logger.debug(
+            "Could not cancel delivery heartbeat for %s",
+            delegation_id,
+            exc_info=True,
+        )
+
+
+def ensure_owner_pending_delivery_heartbeats() -> int:
+    """Arm one configured-interval fallback for local terminal pending rows."""
+    me = os.getpid()
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(
+            """SELECT delegation_id, origin_session, origin_ui_session_id,
+                      owner_pid, owner_started_at, task_json
+               FROM async_delegations
+               WHERE state NOT IN ('running','finalizing')
+                 AND delivery_state='pending'
+               ORDER BY completed_at, delegation_id"""
+        ).fetchall()
+    try:
+        from tools.runtime_heartbeat import runtime_heartbeat
+    except Exception:
+        return 0
+
+    armed = 0
+    for (
+        delegation_id,
+        origin_session,
+        origin_ui_session_id,
+        owner_pid,
+        owner_started_at,
+        task_json,
+    ) in rows:
+        if not local_process_should_enqueue_delegation(
+            owner_pid, owner_started_at, local_pid=me
+        ):
+            continue
+        caller_id = str(origin_session or origin_ui_session_id or "")
+        if not caller_id:
+            continue
+        if delegation_id in runtime_heartbeat.outstanding_for_caller(caller_id):
+            continue
+        try:
+            task = json.loads(task_json or "{}")
+        except Exception:
+            task = {}
+        if _arm_pending_delivery_heartbeat(
+            str(delegation_id),
+            caller_id=caller_id,
+            provider=str(task.get("provider") or ""),
+        ):
+            armed += 1
+    return armed
 
 
 def poll_owner_local_async_completions(target_queue=None) -> int:
@@ -640,6 +811,13 @@ def poll_owner_local_async_completions(target_queue=None) -> int:
         n += int(requeue_local_pending_async_completions(target_queue) or 0)
     except Exception:
         logger.debug("poll_owner_local requeue failed", exc_info=True)
+    try:
+        ensure_owner_pending_delivery_heartbeats()
+    except Exception:
+        logger.debug(
+            "poll_owner_local pending-delivery heartbeat arm failed",
+            exc_info=True,
+        )
     return n
 
 
@@ -807,14 +985,30 @@ def restore_undelivered_completions(target_queue) -> int:
         logger.warning("reclaim_orphaned_completed_delegations failed: %s", exc)
     with _DB_LOCK, _transaction() as conn:
         rows = conn.execute(
-            """SELECT delegation_id, event_json FROM async_delegations
+            """SELECT delegation_id, event_json, origin_session,
+                      origin_ui_session_id, parent_session_id, origin_session_id
+               FROM async_delegations
                WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'
                  AND event_json IS NOT NULL
                ORDER BY completed_at, delegation_id"""
         ).fetchall()
-        for _delegation_id, payload in rows:
+        for (
+            _delegation_id,
+            payload,
+            origin_session,
+            origin_ui_session_id,
+            parent_session_id,
+            origin_session_id,
+        ) in rows:
             evt = json.loads(payload)
             if isinstance(evt, dict):
+                _restore_durable_event_routing(
+                    evt,
+                    origin_session=origin_session,
+                    origin_ui_session_id=origin_ui_session_id,
+                    parent_session_id=parent_session_id,
+                    origin_session_id=origin_session_id,
+                )
                 evt["restored"] = True
             target_queue.put(evt)
     return len(rows)
@@ -829,7 +1023,10 @@ def mark_completion_delivered(delegation_id: str) -> bool:
                WHERE delegation_id=? AND delivery_state!='delivered'""",
             (now, now, delegation_id),
         )
-        return cur.rowcount == 1
+        delivered = cur.rowcount == 1
+    if delivered:
+        _cancel_pending_delivery_heartbeat(delegation_id)
+    return delivered
 
 
 def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
@@ -931,7 +1128,10 @@ def drop_completion_delivery(delegation_id: str, claim_id: str) -> bool:
                  AND delivery_claim=?""",
             (now, delegation_id, claim_id),
         )
-        return cur.rowcount == 1
+        dropped = cur.rowcount == 1
+    if dropped:
+        _cancel_pending_delivery_heartbeat(delegation_id)
+    return dropped
 
 
 def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
@@ -946,7 +1146,10 @@ def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
                  AND delivery_claim=?""",
             (now, now, delegation_id, claim_id),
         )
-        return cur.rowcount == 1
+        delivered = cur.rowcount == 1
+    if delivered:
+        _cancel_pending_delivery_heartbeat(delegation_id)
+    return delivered
 
 
 def complete_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
@@ -1279,13 +1482,23 @@ def _push_completion_event(
         "completed_at": completed_at,
         "exit_reason": result.get("exit_reason"),
     }
+    persisted = False
     try:
         _persist_completion(evt, result)
+        persisted = True
     except Exception as exc:
         logger.error(
             "Async delegation %s: durable completion persist failed after retry; "
             "will rely on live-transcript reclaim: %s",
             record.get("delegation_id"), exc, exc_info=True,
+        )
+    if persisted:
+        _arm_pending_delivery_heartbeat(
+            str(record.get("delegation_id") or ""),
+            caller_id=str(
+                record.get("session_key") or record.get("origin_ui_session_id") or ""
+            ),
+            provider=str(record.get("provider") or ""),
         )
     try:
         process_registry.completion_queue.put(evt)
@@ -1496,13 +1709,25 @@ def _finalize_batch(
         "dispatched_at": dispatched_at,
         "completed_at": completed_at,
     }
+    persisted = False
     try:
         _persist_completion(evt, combined)
+        persisted = True
     except Exception as exc:
         logger.error(
             "Async delegation batch %s: durable completion persist failed after "
             "retry; will rely on live-transcript reclaim: %s",
             delegation_id, exc, exc_info=True,
+        )
+    if persisted:
+        _arm_pending_delivery_heartbeat(
+            delegation_id,
+            caller_id=str(
+                event_record.get("session_key")
+                or event_record.get("origin_ui_session_id")
+                or ""
+            ),
+            provider=str(event_record.get("provider") or ""),
         )
     try:
         process_registry.completion_queue.put(evt)

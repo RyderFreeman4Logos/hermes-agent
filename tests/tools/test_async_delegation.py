@@ -92,7 +92,7 @@ def test_dispatch_returns_immediately_without_blocking():
     gate.set()
 
 
-def test_async_dispatch_arms_and_completion_cancels_its_own_heartbeat(monkeypatch):
+def test_async_dispatch_rearms_heartbeat_while_completion_delivery_is_pending(monkeypatch):
     from tools.runtime_heartbeat import runtime_heartbeat
 
     armed, cancelled = [], []
@@ -114,6 +114,9 @@ def test_async_dispatch_arms_and_completion_cancels_its_own_heartbeat(monkeypatc
     gate.set()
     assert _drain_for(result["delegation_id"]) is not None
     assert cancelled == [result["delegation_id"]]
+    assert armed[1][0] == (result["delegation_id"],)
+    assert armed[1][1]["caller_id"] == "caller"
+    assert armed[1][1]["kind"] == "async_delivery"
 
 
 def test_async_executor_workers_are_daemon_threads():

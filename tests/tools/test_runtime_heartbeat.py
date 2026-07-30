@@ -185,9 +185,41 @@ def test_default_config_exposes_per_target_runtime_contract():
     from hermes_cli.config import DEFAULT_CONFIG
 
     runtime = DEFAULT_CONFIG["runtime"]
+    assert runtime["warm_kv_timeout"]["default"] == 3300
     assert runtime["warm_kv_timeout"]["providers"]["custom:z1"] == 1700
     assert runtime["heartbeat"]["mode"] == "per_target"
+    assert runtime["heartbeat"]["safety_ratio"] == 1.0
+    assert runtime["heartbeat"]["max_interval_seconds"] == 3300
     assert runtime["heartbeat"]["reset_on_caller_activation"] is True
+
+
+def test_default_config_arms_owner_delivery_wake_at_3300_seconds():
+    from hermes_cli.config import DEFAULT_CONFIG
+
+    snapshots = [
+        {"alive": True, "progress": True, "evidence": "delivery pending"},
+        {"alive": False, "evidence": "delivery still pending"},
+    ]
+    manager = _manager(DEFAULT_CONFIG["runtime"])
+    assert manager.arm(
+        "deleg-pending",
+        caller_id="owner-session",
+        kind="async_delivery",
+        inspect=lambda: snapshots.pop(0),
+    )
+
+    timer = FakeTimer.created[-1]
+    assert timer.interval == 3300
+    timer.callback()
+    assert manager._event_queue.get_nowait() == {
+        "type": "heartbeat",
+        "target_id": "deleg-pending",
+        "target_kind": "async_delivery",
+        "session_id": "",
+        "session_key": "owner-session",
+        "status": "STUCK",
+        "evidence": "delivery still pending",
+    }
 
 
 def test_snapshot_active_targets_reports_process_elapsed_and_ttl_remaining(monkeypatch):

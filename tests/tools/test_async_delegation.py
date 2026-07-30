@@ -1166,3 +1166,221 @@ def test_gateway_cli_origin_event_left_unrouted():
     runner._enrich_async_delegation_routing(evt)
     assert "platform" not in evt
 
+
+
+# ---------------------------------------------------------------------------
+# Live-transcript reclaim (owner-alive zombies)
+# ---------------------------------------------------------------------------
+
+def _write_live_manifest(tmp_path, delegation_id, *, status="completed", with_log=True):
+    """Write a minimal live transcript dir under HERMES_HOME cache."""
+    live_root = tmp_path / "cache" / "delegation" / "live" / delegation_id
+    live_root.mkdir(parents=True, exist_ok=True)
+    log_path = live_root / "task-0.log"
+    if with_log:
+        log_path.write_text(
+            "=== Hermes subagent live transcript ===\n"
+            f">>> end status={status}\n",
+            encoding="utf-8",
+        )
+    manifest = {
+        "delegation_id": delegation_id,
+        "started": "2026-06-24 20:25:00",
+        "completed": "2026-06-24 20:46:33",
+        "task_count": 1,
+        "tasks": [
+            {
+                "index": 0,
+                "goal": "do the work",
+                "log": str(log_path) if with_log else None,
+                "status": status,
+            }
+        ],
+    }
+    (live_root / "manifest.json").write_text(
+        __import__("json").dumps(manifest, indent=2), encoding="utf-8"
+    )
+    return live_root
+
+
+def test_reclaim_orphaned_completed_when_owner_alive(tmp_path, monkeypatch):
+    """durable running + live completed + owner pid alive → reclaim + enqueue."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    import os
+    delegation_id = "deleg_zombie_alive"
+    record = {
+        "delegation_id": delegation_id,
+        "session_key": "owner-session",
+        "origin_ui_session_id": "ui-1",
+        "parent_session_id": "parent-1",
+        "origin_session_id": "wake-1",
+        "dispatched_at": 1.0,
+        "goal": "do the work",
+        "context": "ctx",
+        "toolsets": ["terminal"],
+        "role": "leaf",
+        "model": "m",
+    }
+    ad._persist_dispatch(record)
+    # Owner is THIS process (alive) — classic recover_abandoned skips it.
+    with ad._DB_LOCK, ad._connect() as conn:
+        conn.execute(
+            "UPDATE async_delegations SET owner_pid=?, owner_started_at=NULL WHERE delegation_id=?",
+            (os.getpid(), delegation_id),
+        )
+    _write_live_manifest(tmp_path, delegation_id, status="completed")
+
+    # Sanity: owner-alive recovery does nothing.
+    assert ad.recover_abandoned_delegations() == 0
+    durable = ad.get_durable_delegation(delegation_id)
+    assert durable["state"] == "running"
+    assert durable["delivery_state"] == "pending"
+
+    q = queue.Queue()
+    assert ad.reclaim_orphaned_completed_delegations(q, enqueue=True) == 1
+    durable = ad.get_durable_delegation(delegation_id)
+    assert durable["state"] == "completed"
+    assert durable["delivery_state"] == "pending"
+    assert durable["completed_at"] is not None
+    evt = q.get_nowait()
+    assert evt["type"] == "async_delegation"
+    assert evt["delegation_id"] == delegation_id
+    assert evt["status"] == "completed"
+    assert evt.get("reclaimed_from_live") is True
+    assert evt.get("restored") is True
+
+    # No double reclaim after first success.
+    assert ad.reclaim_orphaned_completed_delegations(q, enqueue=True) == 0
+    assert q.empty()
+
+
+def test_reclaim_skips_after_delivery_delivered(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    import os
+    delegation_id = "deleg_zombie_delivered"
+    record = {
+        "delegation_id": delegation_id,
+        "session_key": "owner",
+        "origin_ui_session_id": "",
+        "parent_session_id": None,
+        "dispatched_at": 1.0,
+        "goal": "g",
+    }
+    ad._persist_dispatch(record)
+    with ad._DB_LOCK, ad._connect() as conn:
+        conn.execute(
+            "UPDATE async_delegations SET owner_pid=? WHERE delegation_id=?",
+            (os.getpid(), delegation_id),
+        )
+    _write_live_manifest(tmp_path, delegation_id)
+    q = queue.Queue()
+    assert ad.reclaim_orphaned_completed_delegations(q, enqueue=True) == 1
+    while not q.empty():
+        q.get_nowait()
+    ad.mark_completion_delivered(delegation_id)
+    # Even if state somehow flipped back, delivery_state=delivered blocks reclaim.
+    with ad._DB_LOCK, ad._connect() as conn:
+        conn.execute(
+            "UPDATE async_delegations SET state='running', completed_at=NULL WHERE delegation_id=?",
+            (delegation_id,),
+        )
+    assert ad.reclaim_orphaned_completed_delegations(q, enqueue=True) == 0
+    assert q.empty()
+
+
+def test_owner_dead_unknown_recovery_unchanged(tmp_path, monkeypatch):
+    """Dead owner still becomes unknown; live reclaim must not steal that path."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    delegation_id = "deleg_dead_owner"
+    record = {
+        "delegation_id": delegation_id,
+        "session_key": "owner",
+        "origin_ui_session_id": "",
+        "parent_session_id": None,
+        "dispatched_at": 1.0,
+        "goal": "g",
+    }
+    ad._persist_dispatch(record)
+    with ad._DB_LOCK, ad._connect() as conn:
+        conn.execute(
+            "UPDATE async_delegations SET owner_pid=?, owner_started_at=NULL WHERE delegation_id=?",
+            (99999999, delegation_id),
+        )
+    # No live manifest → reclaim no-op; recover still marks unknown.
+    assert ad.reclaim_orphaned_completed_delegations(queue.Queue(), enqueue=True) == 0
+    assert ad.recover_abandoned_delegations() == 1
+    durable = ad.get_durable_delegation(delegation_id)
+    assert durable["state"] == "unknown"
+    assert durable["delivery_state"] == "pending"
+
+
+def test_inspect_delegation_sees_live_completed_when_memory_empty(tmp_path, monkeypatch):
+    """Heartbeat inspect must not return infinite ALIVE for live-terminal zombies."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    import os
+    from tools.runtime_heartbeat import inspect_delegation
+
+    delegation_id = "deleg_inspect_live"
+    record = {
+        "delegation_id": delegation_id,
+        "session_key": "owner",
+        "origin_ui_session_id": "",
+        "parent_session_id": None,
+        "dispatched_at": 1.0,
+        "goal": "g",
+    }
+    ad._persist_dispatch(record)
+    with ad._DB_LOCK, ad._connect() as conn:
+        conn.execute(
+            "UPDATE async_delegations SET owner_pid=? WHERE delegation_id=?",
+            (os.getpid(), delegation_id),
+        )
+    _write_live_manifest(tmp_path, delegation_id, status="completed")
+    # Memory empty (fresh process / no in-memory record).
+    ad._reset_for_tests()
+
+    snap = inspect_delegation(delegation_id)
+    assert snap["alive"] is False
+    evidence = snap.get("evidence") or ""
+    assert "live" in evidence.lower() or "undelivered" in evidence.lower() or "completed" in evidence.lower()
+
+    # Reclaim during inspect should have persisted completion.
+    durable = ad.get_durable_delegation(delegation_id)
+    assert durable is not None
+    assert durable["state"] == "completed"
+    assert durable["delivery_state"] == "pending"
+
+
+def test_restore_undelivered_reclaims_owner_alive_zombies(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    import os
+    delegation_id = "deleg_restore_reclaim"
+    record = {
+        "delegation_id": delegation_id,
+        "session_key": "owner",
+        "origin_ui_session_id": "ui",
+        "parent_session_id": None,
+        "dispatched_at": 1.0,
+        "goal": "g",
+    }
+    ad._persist_dispatch(record)
+    with ad._DB_LOCK, ad._connect() as conn:
+        conn.execute(
+            "UPDATE async_delegations SET owner_pid=? WHERE delegation_id=?",
+            (os.getpid(), delegation_id),
+        )
+    _write_live_manifest(tmp_path, delegation_id)
+    restored = queue.Queue()
+    n = ad.restore_undelivered_completions(restored)
+    assert n >= 1
+    # At least one event for this id
+    found = None
+    while not restored.empty():
+        evt = restored.get_nowait()
+        if evt.get("delegation_id") == delegation_id:
+            found = evt
+            break
+    assert found is not None
+    assert found["status"] == "completed"
+    durable = ad.get_durable_delegation(delegation_id)
+    assert durable["state"] == "completed"

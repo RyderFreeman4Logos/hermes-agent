@@ -279,3 +279,47 @@ def test_default_safety_ratio_is_one_when_key_omitted(monkeypatch):
     assert FakeTimer.created[-1].interval == 3300
     snap = manager.snapshot_active_targets()
     assert snap[0]["interval_s"] == 3300
+
+
+
+def test_inspect_delegation_live_terminal_is_not_alive(tmp_path, monkeypatch):
+    """Live completed + durable running must not keep heartbeat ALIVE forever."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    import json
+    import os
+    from tools import async_delegation as ad
+
+    delegation_id = "deleg_hb_live"
+    ad._reset_for_tests()
+    record = {
+        "delegation_id": delegation_id,
+        "session_key": "caller",
+        "origin_ui_session_id": "",
+        "parent_session_id": None,
+        "dispatched_at": 1.0,
+        "goal": "g",
+    }
+    ad._persist_dispatch(record)
+    with ad._DB_LOCK, ad._connect() as conn:
+        conn.execute(
+            "UPDATE async_delegations SET owner_pid=? WHERE delegation_id=?",
+            (os.getpid(), delegation_id),
+        )
+    live_root = tmp_path / "cache" / "delegation" / "live" / delegation_id
+    live_root.mkdir(parents=True, exist_ok=True)
+    log_path = live_root / "task-0.log"
+    log_path.write_text(">>> end status=completed\n", encoding="utf-8")
+    (live_root / "manifest.json").write_text(
+        json.dumps({
+            "delegation_id": delegation_id,
+            "completed": "2026-06-24 20:46:33",
+            "tasks": [{"index": 0, "status": "completed", "log": str(log_path), "goal": "g"}],
+        }),
+        encoding="utf-8",
+    )
+    # Clear memory so inspect must use durable+live.
+    ad._reset_for_tests()
+
+    snap = inspect_delegation(delegation_id)
+    assert snap["alive"] is False
+    assert "live" in (snap.get("evidence") or "").lower() or "completed" in (snap.get("evidence") or "").lower()

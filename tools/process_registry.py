@@ -1348,6 +1348,13 @@ class ProcessRegistry:
         filter is provided, ownerless async-delegation events remain
         fail-closed and require positive proof.
         """
+        # Opportunistic reclaim of owner-alive zombies whose live transcripts
+        # already finished (durable state can lag finalize persistence).
+        try:
+            from tools.async_delegation import reclaim_orphaned_completed_delegations
+            reclaim_orphaned_completed_delegations(self.completion_queue, enqueue=True)
+        except Exception:
+            logger.debug("async delegation reclaim during drain failed", exc_info=True)
         results: "list[tuple[dict, str]]" = []
         requeue: "list[dict]" = []
         preserved_types = set(preserve_event_types or ())

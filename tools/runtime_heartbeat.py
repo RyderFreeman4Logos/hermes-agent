@@ -418,13 +418,69 @@ def inspect_process(target_id: str) -> Dict[str, Any]:
 
 
 def inspect_delegation(target_id: str) -> Dict[str, Any]:
-    """Inspect one async delegation by its durable runtime status/activity."""
-    from tools.async_delegation import list_async_delegations
+    """Inspect one async delegation using memory, durable state, and live evidence.
 
-    record = next((r for r in list_async_delegations() if r.get("delegation_id") == target_id), None)
-    if record is None:
+    Memory-only status is insufficient after process restart or when finalize
+    fails to persist: a durable row can stay ``running`` while the live
+    transcript already shows terminal completion. Heartbeat must treat that as
+    not-alive so the STUCK/reclaim path can fire instead of infinite ALIVE.
+    """
+    from tools.async_delegation import (
+        get_durable_delegation,
+        inspect_live_completion_evidence,
+        list_async_delegations,
+        reclaim_orphaned_completed_delegations,
+    )
+
+    # Opportunistic reclaim on heartbeat so owner-alive zombies converge
+    # without waiting for a full process restart.
+    try:
+        reclaim_orphaned_completed_delegations()
+    except Exception:
+        logger.debug("delegation reclaim during inspect failed", exc_info=True)
+
+    record = next(
+        (r for r in list_async_delegations() if r.get("delegation_id") == target_id),
+        None,
+    )
+    durable = None
+    try:
+        durable = get_durable_delegation(target_id)
+    except Exception:
+        logger.debug("durable delegation lookup failed for %s", target_id, exc_info=True)
+
+    mem_status = str((record or {}).get("status") or "")
+    durable_state = str((durable or {}).get("state") or "")
+    delivery_state = str((durable or {}).get("delivery_state") or "")
+
+    # Prefer explicit terminal durable/memory status.
+    for status in (mem_status, durable_state):
+        if status and status not in {"running", "finalizing"}:
+            evidence = f"delegation status={status}"
+            if delivery_state == "pending":
+                evidence += " (completion undelivered)"
+            return {"alive": False, "evidence": evidence}
+
+    # Live transcript may already be terminal while durable lags.
+    live = None
+    try:
+        live = inspect_live_completion_evidence(target_id)
+    except Exception:
+        logger.debug("live evidence inspect failed for %s", target_id, exc_info=True)
+    if live:
+        return {
+            "alive": False,
+            "progress": False,
+            "evidence": (
+                f"live transcript terminal but undelivered "
+                f"({live.get('evidence') or live.get('status')})"
+            ),
+        }
+
+    if record is None and durable is None:
         return {"alive": False, "evidence": "delegation record is no longer available"}
-    status = str(record.get("status") or "unknown")
+
+    status = mem_status or durable_state or "unknown"
     if status in {"running", "finalizing"}:
         return {
             "alive": True,

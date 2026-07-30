@@ -2291,7 +2291,8 @@ def _(rid, params: dict) -> dict:
     # Neither is what the user wants — make them /interrupt first.
     if session.get("running"):
         return _err(
-            rid, 4009, "session busy — /interrupt the current turn before /undo"
+            rid, 4009,
+            "session busy — press Escape or Ctrl+C, or run /interrupt before /undo",
         )
     removed = 0
     with session["history_lock"]:
@@ -2368,7 +2369,8 @@ def _(rid, params: dict) -> dict:
     _clear_stale_running_for_compress(session)
     if session.get("running"):
         return _err(
-            rid, 4009, "session busy — /interrupt the current turn before /compress"
+            rid, 4009,
+            "session busy — press Escape or Ctrl+C, or run /interrupt before /compress",
         )
     from agent.conversation_compression import (
         finalize_context_engine_compression_notification,

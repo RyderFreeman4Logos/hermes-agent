@@ -713,7 +713,8 @@ def _(rid, params: dict) -> dict:
             return _err(rid, 4001, "no active session to retry")
         if session.get("running"):
             return _err(
-                rid, 4009, "session busy — /interrupt the current turn before /retry"
+                rid, 4009,
+                "session busy — press Escape or Ctrl+C, or run /interrupt before /retry",
             )
         history = session.get("history", [])
         if not history:
@@ -849,7 +850,8 @@ def _(rid, params: dict) -> dict:
             return _err(rid, 4001, "no active session to undo")
         if session.get("running"):
             return _err(
-                rid, 4009, "session busy — /interrupt the current turn before /undo"
+                rid, 4009,
+                "session busy — press Escape or Ctrl+C, or run /interrupt before /undo",
             )
         db = _get_db()
         if db is None:
@@ -965,7 +967,8 @@ def _(rid, params: dict) -> dict:
         _clear_stale_running_for_compress(session)
         if session.get("running"):
             return _err(
-                rid, 4009, "session busy — /interrupt the current turn before /compress"
+                rid, 4009,
+                "session busy — press Escape or Ctrl+C, or run /interrupt before /compress",
             )
         from agent.conversation_compression import (
             finalize_context_engine_compression_notification,

@@ -1802,13 +1802,14 @@ def _push_batch_completion_event(
     event_record: Dict[str, Any], combined: Dict[str, Any], status: str
 ) -> None:
     """Push a combined async-delegation batch completion event."""
+    delegation_id = str(event_record.get("delegation_id") or "")
     try:
         from tools.process_registry import process_registry
     except Exception as exc:  # pragma: no cover
         logger.error(
             "Async delegation batch %s finished but process_registry import "
             "failed; result lost: %s",
-            event_record.get("delegation_id"), exc,
+            delegation_id, exc,
         )
         return
 
@@ -1816,7 +1817,7 @@ def _push_batch_completion_event(
     completed_at = event_record.get("completed_at") or time.time()
     evt = {
         "type": "async_delegation",
-        "delegation_id": event_record.get("delegation_id"),
+        "delegation_id": delegation_id,
         "session_key": event_record.get("session_key", ""),
         "origin_ui_session_id": event_record.get("origin_ui_session_id", ""),
         "origin_session_id": event_record.get("origin_session_id", ""),
@@ -1878,7 +1879,7 @@ def _push_batch_completion_event(
         logger.error(
             "Async delegation batch %s: failed to enqueue completion event; "
             "result lost: %s",
-            event_record.get("delegation_id"), exc,
+            delegation_id, exc,
         )
 
 

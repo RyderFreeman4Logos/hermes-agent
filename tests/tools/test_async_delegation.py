@@ -185,6 +185,29 @@ def test_async_batch_persists_provider_for_delivery_heartbeat(monkeypatch):
     assert delivery_arm[1]["provider"] == "custom:batch-provider"
 
 
+def test_async_batch_persist_failure_still_finishes_and_enqueues(monkeypatch):
+    def fail_persist(*_args, **_kwargs):
+        raise RuntimeError("db unavailable")
+
+    monkeypatch.setattr(ad, "_persist_completion", fail_persist)
+
+    result = ad.dispatch_async_delegation_batch(
+        goals=["persist failure"],
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="caller",
+        runner=lambda: {"results": [{"status": "completed", "summary": "done"}]},
+        max_async_children=1,
+    )
+
+    event = _drain_for(result["delegation_id"])
+    assert event is not None
+    assert event["delegation_id"] == result["delegation_id"]
+    assert ad.active_count() == 0
+
+
 def test_async_executor_workers_are_daemon_threads():
     gate = threading.Event()
 

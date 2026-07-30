@@ -12831,7 +12831,10 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
     if name == "compress":
         _clear_stale_running_for_compress(session)
     if name in _MUTATES_WHILE_RUNNING and session.get("running"):
-        return f"session busy — /interrupt the current turn before running /{name}"
+        return (
+            "session busy — press Escape or Ctrl+C, or run "
+            f"/interrupt before /{name}"
+        )
 
     try:
         if name == "model" and arg and agent:

@@ -123,6 +123,14 @@ def build_top_level_parser():
             "can always account for spend. No effect outside -z/--oneshot."
         ),
     )
+    parser.add_argument(
+        "--no-session-persistence",
+        action="store_true",
+        help=(
+            "One-shot mode only: do not open or write state.db. Session recall "
+            "is disabled and the run cannot be resumed."
+        ),
+    )
     # --model / --provider are accepted at the top level so they can pair
     # with -z without needing the `chat` subcommand.  If neither -z nor a
     # subcommand consumes them, they fall through harmlessly as None.

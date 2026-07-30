@@ -618,7 +618,7 @@ describe('usePromptActions /compress', () => {
 
     const requestGateway = vi.fn(async (method: string) => {
       if (method === 'session.compress') {
-        throw new Error('session busy — /interrupt the current turn before /compress')
+        throw new Error('session busy — press Escape or Ctrl+C, or run /interrupt, before /compress')
       }
 
       return {} as never
@@ -638,6 +638,7 @@ describe('usePromptActions /compress', () => {
 
     const texts = renderedSeedTexts(seeds)
     expect(texts.some(text => text.includes('session busy'))).toBe(true)
+    expect(texts.some(text => text.includes('press Escape or Ctrl+C, or run /interrupt'))).toBe(true)
     expect(texts.some(text => text.includes('not a quick/plugin/skill command'))).toBe(false)
   })
 

@@ -2018,6 +2018,14 @@ def _sess(params, rid):
     return (s, _wait_agent(s, rid))
 
 
+_INTERRUPT_AFFORDANCE = "press Escape or Ctrl+C, or run /interrupt"
+
+
+def _busy_interrupt_message(action: str) -> str:
+    """Describe a real, shared path for stopping the current TUI turn."""
+    return f"session busy — {_INTERRUPT_AFFORDANCE} before {action}"
+
+
 def _normalize_completion_path(path_part: str) -> str:
     expanded = os.path.expanduser(path_part)
     if os.name != "nt":
@@ -10190,9 +10198,7 @@ def _(rid, params: dict) -> dict:
     # silently drop the agent's output (version mismatch, see below).
     # Neither is what the user wants — make them /interrupt first.
     if session.get("running"):
-        return _err(
-            rid, 4009, "session busy — /interrupt the current turn before /undo"
-        )
+        return _err(rid, 4009, _busy_interrupt_message("/undo"))
     removed = 0
     with session["history_lock"]:
         history = session.get("history", [])
@@ -10259,9 +10265,7 @@ def _(rid, params: dict) -> dict:
     if err:
         return err
     if session.get("running"):
-        return _err(
-            rid, 4009, "session busy — /interrupt the current turn before /compress"
-        )
+        return _err(rid, 4009, _busy_interrupt_message("/compress"))
     from agent.conversation_compression import (
         finalize_context_engine_compression_notification,
     )
@@ -13941,11 +13945,7 @@ def _(rid, params: dict) -> dict:
                 # producing 400/404s the user never asked for.  Parity
                 # with the gateway's running-agent /model guard.
                 if session.get("running"):
-                    return _err(
-                        rid,
-                        4009,
-                        "session busy — /interrupt the current turn before switching models",
-                    )
+                    return _err(rid, 4009, _busy_interrupt_message("switching models"))
                 from hermes_cli.model_switch import parse_model_flags_detailed
 
                 parsed_flags = parse_model_flags_detailed(value)
@@ -15757,6 +15757,7 @@ _PENDING_INPUT_COMMANDS: frozenset[str] = frozenset(
         "moa",
         "undo",
         "learn",
+        "interrupt",
         "compress",
         "compact",
     }
@@ -15965,6 +15966,16 @@ def _(rid, params: dict) -> dict:
     if resolved != name:
         name = resolved
     session = _sessions.get(params.get("session_id", ""))
+
+    if name == "interrupt":
+        # Keep slash /interrupt on exactly the same backend path as the TUI's
+        # Escape/Ctrl+C key binding and the Desktop turn controller.
+        response = _methods["session.interrupt"](
+            rid, {"session_id": params.get("session_id", "")}
+        )
+        if "error" in response:
+            return response
+        return _ok(rid, {"type": "exec", "output": "Interrupt requested."})
 
     qcmds = _load_cfg().get("quick_commands", {})
     if name in qcmds:
@@ -16175,9 +16186,7 @@ def _(rid, params: dict) -> dict:
         if not session:
             return _err(rid, 4001, "no active session to retry")
         if session.get("running"):
-            return _err(
-                rid, 4009, "session busy — /interrupt the current turn before /retry"
-            )
+            return _err(rid, 4009, _busy_interrupt_message("/retry"))
         history = session.get("history", [])
         if not history:
             return _err(rid, 4018, "no previous user message to retry")
@@ -16305,9 +16314,7 @@ def _(rid, params: dict) -> dict:
         if not session:
             return _err(rid, 4001, "no active session to undo")
         if session.get("running"):
-            return _err(
-                rid, 4009, "session busy — /interrupt the current turn before /undo"
-            )
+            return _err(rid, 4009, _busy_interrupt_message("/undo"))
         db = _get_db()
         if db is None:
             return _db_unavailable_error(rid, code=5008)
@@ -16420,9 +16427,7 @@ def _(rid, params: dict) -> dict:
         if not session:
             return _err(rid, 4001, "no active session to compress")
         if session.get("running"):
-            return _err(
-                rid, 4009, "session busy — /interrupt the current turn before /compress"
-            )
+            return _err(rid, 4009, _busy_interrupt_message("/compress"))
         from agent.conversation_compression import (
             finalize_context_engine_compression_notification,
         )
@@ -17546,7 +17551,7 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
         _apply_compute_host_metadata_mirror(session, ack)
         return str(ack.get("output") or "")
     if name in _MUTATES_WHILE_RUNNING and session.get("running"):
-        return f"session busy — /interrupt the current turn before running /{name}"
+        return _busy_interrupt_message(f"running /{name}")
 
     try:
         if name == "model" and arg and agent:
@@ -18233,11 +18238,7 @@ def _(rid, params: dict) -> dict:
     # rollback (version-matches path).  A file-scoped rollback only
     # touches disk, so we allow it.
     if not file_path and session.get("running"):
-        return _err(
-            rid,
-            4009,
-            "session busy — /interrupt the current turn before full rollback.restore",
-        )
+        return _err(rid, 4009, _busy_interrupt_message("full rollback.restore"))
     try:
 
         def go(mgr, cwd):

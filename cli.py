@@ -9603,6 +9603,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._handle_rollback_command(cmd_original)
         elif canonical == "snapshot":
             self._handle_snapshot_command(cmd_original)
+        elif canonical == "interrupt":
+            self._handle_interrupt_command()
         elif canonical == "stop":
             self._handle_stop_command()
         elif canonical == "agents":

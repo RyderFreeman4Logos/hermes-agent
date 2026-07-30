@@ -279,7 +279,7 @@ export function useSlashCommand(deps: SlashCommandDeps) {
             if (enqueueQueuedPrompt(queueKey, { attachments: [], text: message })) {
               renderSlashOutput('session busy — message queued to send when the current turn finishes')
             } else {
-              renderSlashOutput('session busy — /interrupt the current turn before sending this command')
+              renderSlashOutput('session busy — press Escape or Ctrl+C, or run /interrupt, before sending this command')
             }
 
             return

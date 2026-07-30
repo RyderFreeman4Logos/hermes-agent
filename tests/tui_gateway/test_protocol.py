@@ -1662,6 +1662,30 @@ def test_slash_exec_routes_pending_input_commands_to_dispatch(server, cmd):
     assert routed.get("error") == direct.get("error")
 
 
+def test_slash_interrupt_routes_to_the_session_interrupt_rpc(server):
+    sid = "interrupt-session"
+    agent = MagicMock()
+    run_thread = MagicMock()
+    run_thread.is_alive.return_value = True
+    server._sessions[sid] = {
+        "session_key": sid,
+        "agent": agent,
+        "history_lock": threading.Lock(),
+        "running": True,
+        "_run_thread": run_thread,
+    }
+
+    response = server.handle_request({
+        "id": "interrupt",
+        "method": "slash.exec",
+        "params": {"command": "/interrupt", "session_id": sid},
+    })
+
+    assert response["result"] == {"type": "exec", "output": "Interrupt requested."}
+    agent.interrupt.assert_called_once_with()
+    assert server._sessions[sid]["_turn_cancel_requested"] is True
+
+
 def test_command_dispatch_queue_sends_message(server):
     """command.dispatch /queue returns {type: 'send', message: ...} for the TUI."""
     sid = "test-session"

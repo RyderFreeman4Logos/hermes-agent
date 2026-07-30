@@ -95,6 +95,13 @@ describe('desktop slash command curation', () => {
     expect(isDesktopSlashSuggestion('/compact')).toBe(false)
   })
 
+  it('exposes /interrupt as an executable foreground-turn command', () => {
+    expect(resolveDesktopCommand('/interrupt')?.surface).toEqual({ kind: 'exec' })
+    expect(isDesktopSlashCommand('/interrupt')).toBe(true)
+    expect(isDesktopSlashSuggestion('/interrupt')).toBe(true)
+    expect(desktopSlashUnavailableMessage('/interrupt')).toBeNull()
+  })
+
   it('routes only stateless session commands through dedicated gateway RPCs', () => {
     const expected = {
       '/save': 'session.save',

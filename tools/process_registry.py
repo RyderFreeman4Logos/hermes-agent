@@ -1350,9 +1350,16 @@ class ProcessRegistry:
         """
         # Opportunistic reclaim of owner-alive zombies whose live transcripts
         # already finished (durable state can lag finalize persistence).
+        # Cross-process: durable update is global, but queue enqueue is owner-
+        # process only (#28). Also requeue local pending completions that may
+        # have been reclaimed elsewhere without landing on THIS process queue.
         try:
-            from tools.async_delegation import reclaim_orphaned_completed_delegations
+            from tools.async_delegation import (
+                reclaim_orphaned_completed_delegations,
+                requeue_local_pending_async_completions,
+            )
             reclaim_orphaned_completed_delegations(self.completion_queue, enqueue=True)
+            requeue_local_pending_async_completions(self.completion_queue)
         except Exception:
             logger.debug("async delegation reclaim during drain failed", exc_info=True)
         results: "list[tuple[dict, str]]" = []

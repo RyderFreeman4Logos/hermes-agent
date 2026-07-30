@@ -1859,10 +1859,22 @@ class SessionDB:
     #
     # Instead, we keep the SQLite timeout short (1s) and handle retries at the
     # application level with random jitter, which naturally staggers competing
-    # writers and avoids the convoy.
+    # writers and avoids the convoy. The fast profile remains the default for
+    # high-frequency transcript appends.
+    _WRITE_BUSY_TIMEOUT_S = 1.0
     _WRITE_MAX_RETRIES = 15
     _WRITE_RETRY_MIN_S = 0.020   # 20ms
     _WRITE_RETRY_MAX_S = 0.150   # 150ms
+    # Explicit user actions such as session resume can wait longer than a hot
+    # append. Keep their retry wait bounded: 30 attempts with at most 250ms of
+    # SQLite busy handling and 100-750ms randomized application backoff stay
+    # within a 30s overall retry budget. This tactical profile does not replace
+    # inter-process writer coordination.
+    _SLOW_WRITE_MAX_RETRIES = 30
+    _SLOW_WRITE_RETRY_MIN_S = 0.100
+    _SLOW_WRITE_RETRY_MAX_S = 0.750
+    _SLOW_WRITE_BUSY_TIMEOUT_S = 0.250
+    _SLOW_WRITE_MAX_WAIT_S = 30.0
     # Attempt a WAL checkpoint every N successful writes (PASSIVE mode).
     _CHECKPOINT_EVERY_N_WRITES = 50
     # Merge fragmented FTS5 segments every N successful writes. The message
@@ -1966,7 +1978,7 @@ class SessionDB:
                     # Short timeout — application-level retry with random
                     # jitter handles contention instead of sitting in
                     # SQLite's internal busy handler for up to 30s.
-                    timeout=1.0,
+                    timeout=self._WRITE_BUSY_TIMEOUT_S,
                     # auto-starts transactions on DML, which conflicts with
                     # our explicit BEGIN IMMEDIATE.  None = we manage
                     # transactions ourselves.
@@ -2361,6 +2373,28 @@ class SessionDB:
                 self._warn_fts5_unavailable(exc)
             return False
 
+    def _write_retry_parameters(
+        self, retry_profile: str
+    ) -> Tuple[int, float, float, Optional[float], Optional[float]]:
+        """Return retries, jitter bounds, busy timeout, and total wait cap."""
+        if retry_profile == "default":
+            return (
+                self._WRITE_MAX_RETRIES,
+                self._WRITE_RETRY_MIN_S,
+                self._WRITE_RETRY_MAX_S,
+                None,
+                None,
+            )
+        if retry_profile == "slow":
+            return (
+                self._SLOW_WRITE_MAX_RETRIES,
+                self._SLOW_WRITE_RETRY_MIN_S,
+                self._SLOW_WRITE_RETRY_MAX_S,
+                self._SLOW_WRITE_BUSY_TIMEOUT_S,
+                self._SLOW_WRITE_MAX_WAIT_S,
+            )
+        raise ValueError(f"unknown write retry profile: {retry_profile!r}")
+
     def _execute_write(
         self,
         fn: Callable[[sqlite3.Connection], T],
@@ -2369,18 +2403,20 @@ class SessionDB:
         deadline: Optional[float] = None,
         max_retries: Optional[int] = None,
         recover_fts_errors: bool = True,
+        retry_profile: str = "default",
     ) -> T:
         """Execute a write transaction with BEGIN IMMEDIATE and jitter retry.
 
         *fn* receives the connection and should perform INSERT/UPDATE/DELETE
-        statements.  The caller must NOT call ``commit()`` — that's handled
+        statements. The caller must NOT call ``commit()`` — that's handled
         here after *fn* returns.
 
         BEGIN IMMEDIATE acquires the WAL write lock at transaction start
-        (not at commit time), so lock contention surfaces immediately.
-        On ``database is locked``, we release the Python lock, sleep a
-        random 20-150ms, and retry — breaking the convoy pattern that
-        SQLite's built-in deterministic backoff creates.
+        (not at commit time), so lock contention surfaces immediately. The
+        default profile keeps the established 20-150ms jitter for hot writes.
+        ``retry_profile="slow"`` is opt-in for explicit user actions that can
+        tolerate waiting, and bounds its total retry time with a monotonic
+        deadline while retaining randomized backoff.
 
         ``deadline`` is an absolute ``time.time()`` deadline. When present,
         acquisition of the in-process lock and SQLite's busy handler are both
@@ -2395,38 +2431,86 @@ class SessionDB:
 
         Returns whatever *fn* returns.
         """
+        (
+            profile_max_retries,
+            retry_min_s,
+            retry_max_s,
+            profile_busy_timeout_s,
+            profile_max_wait_s,
+        ) = self._write_retry_parameters(retry_profile)
         retry_count = (
-            self._WRITE_MAX_RETRIES
-            if max_retries is None
-            else max(1, max_retries)
+            profile_max_retries if max_retries is None else max(1, max_retries)
         )
+        busy_timeout_s = (
+            profile_busy_timeout_s if timeout is None else timeout
+        )
+        retry_deadline = (
+            time.monotonic() + profile_max_wait_s
+            if profile_max_wait_s is not None
+            else None
+        )
+
+        def _profile_remaining() -> Optional[float]:
+            if retry_deadline is None:
+                return None
+            return retry_deadline - time.monotonic()
+
         last_err: Optional[Exception] = None
         for attempt in range(retry_count):
+            profile_remaining = _profile_remaining()
+            if profile_remaining is not None and profile_remaining <= 0:
+                break
+
+            lock_timeout: Optional[float] = None
+            if deadline is not None:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    return cast(T, False)
+                lock_timeout = remaining
+            if profile_remaining is not None:
+                lock_timeout = (
+                    profile_remaining
+                    if lock_timeout is None
+                    else min(lock_timeout, profile_remaining)
+                )
+
             try:
                 # A deadline must also bound waiting for this process's
                 # connection lock, not just SQLite's inter-process writer lock.
-                if deadline is not None:
-                    remaining = deadline - time.time()
-                    if remaining <= 0:
-                        return cast(T, False)
-                    if not self._lock.acquire(timeout=remaining):
-                        return cast(T, False)
-                else:
+                if lock_timeout is None:
                     self._lock.acquire()
+                elif not self._lock.acquire(timeout=lock_timeout):
+                    if deadline is not None:
+                        return cast(T, False)
+                    last_err = last_err or sqlite3.OperationalError("database is locked")
+                    break
 
                 try:
                     assert self._conn is not None
                     previous_busy_timeout_ms: Optional[int] = None
+                    attempt_timeout_s = busy_timeout_s
                     if deadline is not None:
                         remaining = deadline - time.time()
                         if remaining <= 0:
                             return cast(T, False)
-                        timeout = (
+                        attempt_timeout_s = (
                             remaining
-                            if timeout is None
-                            else min(max(0.0, timeout), remaining)
+                            if attempt_timeout_s is None
+                            else min(max(0.0, attempt_timeout_s), remaining)
                         )
-                    if timeout is not None:
+                    profile_remaining = _profile_remaining()
+                    if profile_remaining is not None:
+                        if profile_remaining <= 0:
+                            last_err = last_err or sqlite3.OperationalError(
+                                "database is locked"
+                            )
+                            break
+                        attempt_timeout_s = (
+                            profile_remaining
+                            if attempt_timeout_s is None
+                            else min(max(0.0, attempt_timeout_s), profile_remaining)
+                        )
+                    if attempt_timeout_s is not None:
                         previous_busy_timeout_ms = int(
                             self._conn.execute("PRAGMA busy_timeout").fetchone()[0]
                         )
@@ -2434,7 +2518,8 @@ class SessionDB:
                         # of ceil so its busy handler cannot exceed the
                         # caller's remaining budget.
                         self._conn.execute(
-                            f"PRAGMA busy_timeout={max(0, int(timeout * 1000))}"
+                            "PRAGMA busy_timeout="
+                            f"{max(0, int(attempt_timeout_s * 1000))}"
                         )
                     self._conn.execute("BEGIN IMMEDIATE")
                     try:
@@ -2469,15 +2554,24 @@ class SessionDB:
                 if "locked" in err_msg or "busy" in err_msg:
                     last_err = exc
                     if attempt < retry_count - 1:
-                        jitter = random.uniform(
-                            self._WRITE_RETRY_MIN_S,
-                            self._WRITE_RETRY_MAX_S,
-                        )
+                        jitter = random.uniform(retry_min_s, retry_max_s)
+                        sleep_budget: Optional[float] = None
                         if deadline is not None:
                             remaining = deadline - time.time()
                             if remaining <= 0:
                                 return cast(T, False)
-                            jitter = min(jitter, remaining)
+                            sleep_budget = remaining
+                        profile_remaining = _profile_remaining()
+                        if profile_remaining is not None:
+                            if profile_remaining <= 0:
+                                break
+                            sleep_budget = (
+                                profile_remaining
+                                if sleep_budget is None
+                                else min(sleep_budget, profile_remaining)
+                            )
+                        if sleep_budget is not None:
+                            jitter = min(jitter, sleep_budget)
                         time.sleep(jitter)
                         continue
                 # Non-lock error or retries exhausted — propagate.
@@ -2495,7 +2589,7 @@ class SessionDB:
                 if not recover_fts_errors or not self._try_runtime_fts_rebuild(exc):
                     raise
                 continue
-        # Retries exhausted (shouldn't normally reach here).
+        # Retries exhausted or the profile's bounded wait elapsed.
         raise last_err or sqlite3.OperationalError(
             "database is locked after max retries"
         )
@@ -4407,7 +4501,9 @@ class SessionDB:
                 "UPDATE sessions SET ended_at = NULL, end_reason = NULL WHERE id = ?",
                 (session_id,),
             )
-        self._execute_write(_do)
+        # Resume is an explicit user action, so it may spend the bounded slow
+        # profile instead of failing behind high-frequency transcript appends.
+        self._execute_write(_do, retry_profile="slow")
 
     def promote_to_session_reset(
         self, session_id: str, reason: str = "session_reset"

@@ -5296,16 +5296,10 @@ class TestConcurrentWriteSafety:
         assert len(msgs) == 1
         assert msgs[0]["content"] == "hello after lock"
 
-    def test_sqlite_timeout_is_at_least_30s(self, db):
-        """Connection timeout should be >= 30s to survive CLI/gateway contention."""
-        # Access the underlying connection timeout via sqlite3 introspection.
-        # There is no public API, so we check the kwarg via the module default.
-        import inspect
-        from hermes_state import SessionDB as _SessionDB
-        src = inspect.getsource(_SessionDB.__init__)
-        assert "30" in src, (
-            "SQLite timeout should be at least 30s to handle CLI/gateway lock contention"
-        )
+    def test_default_connection_uses_short_busy_timeout(self, db):
+        """The hot write path retains its one-second SQLite busy handler."""
+        timeout_ms = int(db._conn.execute("PRAGMA busy_timeout").fetchone()[0])
+        assert timeout_ms == int(db._WRITE_BUSY_TIMEOUT_S * 1000)
 
 
 # =========================================================================

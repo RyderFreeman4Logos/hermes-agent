@@ -445,15 +445,40 @@ class TestModelProfileSchemaEnum(unittest.TestCase):
         self.assertEqual(_available_model_profile_names(), ["alpha", "zeta"])
 
     @patch("tools.delegate_tool._load_config")
-    def test_model_profile_is_required_in_schema(self, mock_cfg):
-        """model_profile is required in the top-level schema (model path)."""
+    def test_model_profile_optional_when_pool_empty(self, mock_cfg):
+        """Empty model_pool: model_profile is not required (upstream-compatible)."""
         mock_cfg.return_value = {"model_pool": {}}
         overrides = _build_dynamic_schema_overrides()
-        self.assertIn("model_profile", overrides["parameters"].get("required", []))
-        # The static schema itself also declares it required.
+        self.assertNotIn("model_profile", overrides["parameters"].get("required", []))
+        prop = overrides["parameters"]["properties"]["model_profile"]
+        self.assertNotIn("enum", prop)
+        self.assertIn("optional", prop["description"].lower())
+        # The static schema itself also leaves it optional.
         from tools.delegate_tool import DELEGATE_TASK_SCHEMA
 
-        self.assertIn(
+        self.assertNotIn(
+            "model_profile",
+            DELEGATE_TASK_SCHEMA["parameters"].get("required", []),
+        )
+
+    @patch("tools.delegate_tool._load_config")
+    def test_model_profile_optional_when_pool_nonempty(self, mock_cfg):
+        """Non-empty pool: model_profile remains optional; enum is published."""
+        mock_cfg.return_value = {
+            "model_pool": {
+                "fast": {"provider": "x", "model": "m"},
+                "smart": {"provider": "y", "model": "n"},
+            }
+        }
+        overrides = _build_dynamic_schema_overrides()
+        self.assertNotIn("model_profile", overrides["parameters"].get("required", []))
+        prop = overrides["parameters"]["properties"]["model_profile"]
+        self.assertEqual(prop["enum"], ["fast", "smart"])
+        self.assertIn("optional", prop["description"].lower())
+        self.assertIn("default_profile", prop["description"])
+        from tools.delegate_tool import DELEGATE_TASK_SCHEMA
+
+        self.assertNotIn(
             "model_profile",
             DELEGATE_TASK_SCHEMA["parameters"].get("required", []),
         )

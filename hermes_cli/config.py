@@ -2490,19 +2490,20 @@ DEFAULT_CONFIG = {
         # Flip to true only if you trust delegated work to run dangerous cmds
         # without human review (cron pipelines, batch automation, etc.).
         "subagent_auto_approve": False,
-        # Default model-pool profile used when delegate_task is invoked from an
-        # internal call path with model_profile=None (the model-facing schema
-        # makes model_profile required, but internal Python callers and tests may
-        # still pass it implicitly). Empty (default) = no default: internal
-        # callers fall back to the global delegation model/provider. Set it to a
-        # profile name present in delegation.model_pool to make that the implicit
-        # default for any profile-less delegation.
+        # Default model-pool profile used when delegate_task omits model_profile
+        # (model-facing schema keeps model_profile optional for upstream
+        # compatibility, especially when model_pool is empty). Empty (default)
+        # = no default: callers fall back to the global/parent delegation
+        # model/provider. Set it to a profile name present in
+        # delegation.model_pool to make that the implicit default for any
+        # profile-less delegation.
         "default_profile": "",
         # Named model pool — maps a profile name to a {provider, model,
         # base_url?, api_key?, api_mode?, reasoning_effort?, fallback_chain?}
-        # dict. The main agent selects a subagent's model by passing
+        # dict. The main agent may select a subagent's model by passing
         # model_profile="<name>" to delegate_task (top-level or per-task in a
-        # batch). Unknown profile names fall back to the global delegation
+        # batch). When omitted, default_profile / global delegation credentials
+        # apply. Unknown profile names fall back to the global delegation
         # model/provider. See tools/delegate_tool.py:_resolve_model_profile.
         #
         # Each profile may optionally declare a `fallback_chain`: an ordered

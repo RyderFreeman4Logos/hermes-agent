@@ -17,6 +17,7 @@ const buildUiState = (): UiState => ({
   detailsMode: 'collapsed',
   detailsModeCommandOverride: false,
   focusView: false,
+  gatewayTurnRunning: false,
   indicatorStyle: DEFAULT_INDICATOR_STYLE,
   info: null,
   liveSessionCount: 0,

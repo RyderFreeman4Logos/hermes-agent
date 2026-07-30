@@ -572,7 +572,7 @@ export function useMainApp(gw: GatewayClient) {
 
   useEffect(() => {
     if (!ui.sid) {
-      patchUiState({ liveSessionCount: 0 })
+      patchUiState({ gatewayTurnRunning: false, liveSessionCount: 0 })
 
       return
     }
@@ -592,7 +592,14 @@ export function useMainApp(gw: GatewayClient) {
             // round-trip is needed.
             const currentSid = getUiState().sid
 
-            const sessionTitle = result.sessions.find(s => s.current || s.id === currentSid)?.title?.trim() ?? ''
+            const currentSession = result.sessions.find(s => s.id === currentSid)
+
+            const gatewayTurnRunning =
+              currentSession?.status === 'starting' ||
+              currentSession?.status === 'waiting' ||
+              currentSession?.status === 'working'
+
+            const sessionTitle = currentSession?.title?.trim() ?? ''
 
             // Only patch when something actually changed. patchUiState always
             // produces a new state object, which notifies every $uiState
@@ -600,8 +607,12 @@ export function useMainApp(gw: GatewayClient) {
             // the whole TUI and causes idle flicker.
             const prev = getUiState()
 
-            if (prev.liveSessionCount !== liveSessionCount || prev.sessionTitle !== sessionTitle) {
-              patchUiState({ liveSessionCount, sessionTitle })
+            if (
+              prev.gatewayTurnRunning !== gatewayTurnRunning ||
+              prev.liveSessionCount !== liveSessionCount ||
+              prev.sessionTitle !== sessionTitle
+            ) {
+              patchUiState({ gatewayTurnRunning, liveSessionCount, sessionTitle })
             }
           }
         })

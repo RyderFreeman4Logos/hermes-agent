@@ -33,6 +33,18 @@ import { getUiState } from './uiStore.js'
 const isCtrl = (key: { ctrl: boolean }, ch: string, target: string) => key.ctrl && ch.toLowerCase() === target
 const DASHBOARD_NEW_SESSION_MESSAGE = 'starting a fresh dashboard chat...'
 
+export function handleInterruptHotkey(
+  live: Pick<ReturnType<typeof getUiState>, 'busy' | 'gatewayTurnRunning' | 'sid'>,
+  interrupt: (sid: string) => unknown,
+  fallback: () => unknown
+) {
+  if (live.sid && (live.busy || live.gatewayTurnRunning)) {
+    return interrupt(live.sid)
+  }
+
+  return fallback()
+}
+
 export const shouldAllowIdleHotkeyExit = (dashboardTuiMode = DASHBOARD_TUI_MODE) => !dashboardTuiMode
 
 export function handleIdleHotkeyExit(
@@ -330,6 +342,18 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
   useInput((ch, key) => {
     const live = getUiState()
 
+    const interruptCurrentTurn = (sid: string) =>
+      turnController.interruptTurn({
+        appendMessage: actions.appendMessage,
+        gw: gateway.gw,
+        sid,
+        sys: actions.sys
+      })
+
+    if (isCtrl(key, ch, 'c') && live.sid && (live.busy || live.gatewayTurnRunning)) {
+      return interruptCurrentTurn(live.sid)
+    }
+
     if (key.escape) {
       const now = Date.now()
       const isDouble = now - lastEscRef.current <= DOUBLE_ESC_MS
@@ -518,9 +542,13 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
       return voiceRecordToggle()
     }
 
+    if (key.escape && live.sid && (live.busy || live.gatewayTurnRunning)) {
+      return interruptCurrentTurn(live.sid)
+    }
+
     // Queue-edit cancel beats selection-clear for plain Esc: the queue header
     // explicitly promises "Esc cancel", so honoring it takes priority over the
-    // implicit selection-dismissal convention. Without an active edit, fall through.
+    // implicit selection-dismissal convention when no turn is running.
     if (key.escape && cState.queueEditIdx !== null) {
       return cActions.clearIn()
     }
@@ -595,26 +623,23 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
     }
 
     if (key.ctrl && ch.toLowerCase() === 'c') {
-      if (live.busy && live.sid) {
-        return turnController.interruptTurn({
-          appendMessage: actions.appendMessage,
-          gw: gateway.gw,
-          sid: live.sid,
-          sys: actions.sys
-        })
-      }
+      return handleInterruptHotkey(
+        live,
+        interruptCurrentTurn,
+        () => {
+          if (cState.input || cState.inputBuf.length) {
+            return cActions.clearIn()
+          }
 
-      if (cState.input || cState.inputBuf.length) {
-        return cActions.clearIn()
-      }
-
-      return handleIdleHotkeyExit(actions, DASHBOARD_TUI_MODE, () => {
-        gateway.gw.publishLocalEvent({
-          payload: { reason: 'idle_exit_hotkey' },
-          session_id: live.sid ?? undefined,
-          type: 'dashboard.new_session_requested'
-        })
-      })
+          return handleIdleHotkeyExit(actions, DASHBOARD_TUI_MODE, () => {
+            gateway.gw.publishLocalEvent({
+              payload: { reason: 'idle_exit_hotkey' },
+              session_id: live.sid ?? undefined,
+              type: 'dashboard.new_session_requested'
+            })
+          })
+        }
+      )
     }
 
     if (isAction(key, ch, 'd')) {

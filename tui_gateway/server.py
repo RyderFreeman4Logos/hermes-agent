@@ -9473,6 +9473,12 @@ def _notification_poller_loop(
         _evt_sid = evt.get("session_id", "")
         if evt.get("type") == "completion" and process_registry.is_completion_consumed(_evt_sid):
             continue
+        # Keep shutdown drain behavior aligned with the live loop: heartbeat
+        # events have their own ownership-aware handler and intentionally
+        # format to ``None`` through the generic completion formatter.
+        if evt.get("type") == "heartbeat":
+            _handle_heartbeat_event(sid, session, evt)
+            continue
         text = format_process_notification(evt)
         if not text:
             continue

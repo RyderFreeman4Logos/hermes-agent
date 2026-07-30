@@ -227,6 +227,84 @@ def test_heartbeat_warm_silent_noop_is_ephemeral_not_persisted():
     save_trajectory.assert_not_called()
 
 
+def test_heartbeat_warm_silent_noop_skips_compaction_and_restores_history():
+    """A warm cache no-op must not let any compaction rewrite its rollback baseline."""
+    heartbeat = '[HEARTBEAT] checkin #1. Background target "proc-heartbeat" is ALIVE.'
+    prior_history = [
+        {"role": "user", "content": "earlier question"},
+        {"role": "assistant", "content": "earlier answer"},
+    ]
+    agent = _make_agent(max_iterations=10)
+    agent.compression_enabled = True
+    agent.context_compressor.should_compress = MagicMock(return_value=True)
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(content="", finish_reason="stop"),
+    ]
+
+    def _compact_in_place(messages, *_args, **_kwargs):
+        # This mirrors a real in-place boundary: it changes the flush baseline
+        # while retaining the current synthetic heartbeat user message.
+        agent._last_compression_attempt_recorded = True
+        agent._last_compression_attempt_in_place = True
+        return [dict(messages[-1])], "compacted system prompt"
+
+    compact_context = MagicMock(side_effect=_compact_in_place)
+    agent._compress_context = compact_context
+
+    with (
+        patch("agent.turn_context._should_run_preflight_estimate", return_value=True),
+        patch(
+            "agent.turn_context.estimate_request_tokens_rough",
+            return_value=1_000_000,
+        ),
+        patch(
+            "agent.conversation_loop.estimate_messages_tokens_rough",
+            return_value=1_000_000,
+        ),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation(
+            heartbeat,
+            conversation_history=prior_history,
+            turn_origin="heartbeat_warm",
+            allow_silent_noop=True,
+        )
+
+    assert result["silent_noop"] is True
+    compact_context.assert_not_called()
+    assert result["messages"] == prior_history
+
+
+def test_heartbeat_warm_silent_noop_without_compaction_restores_history():
+    """The ordinary no-compaction warm path retains its existing rollback behavior."""
+    heartbeat = '[HEARTBEAT] checkin #1. Background target "proc-heartbeat" is ALIVE.'
+    prior_history = [
+        {"role": "user", "content": "earlier question"},
+        {"role": "assistant", "content": "earlier answer"},
+    ]
+    agent = _make_agent(max_iterations=10)
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(content="", finish_reason="stop"),
+    ]
+
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation(
+            heartbeat,
+            conversation_history=prior_history,
+            turn_origin="heartbeat_warm",
+            allow_silent_noop=True,
+        )
+
+    assert result["silent_noop"] is True
+    assert result["messages"] == prior_history
+
+
 def test_stuck_heartbeat_empty_response_is_not_silent_noop():
     """A STUCK event must retain an actionable completion explanation."""
     agent = _make_agent(max_iterations=10)

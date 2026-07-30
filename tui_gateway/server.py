@@ -6607,6 +6607,49 @@ def _clear_inflight_turn(session: dict) -> None:
     session["inflight_turn"] = None
 
 
+def _turn_worker_is_alive(worker: Any) -> bool:
+    """Return a conservative liveness result for a foreground worker."""
+    is_alive = getattr(worker, "is_alive", None)
+    if not callable(is_alive):
+        return False
+    try:
+        return bool(is_alive())
+    except Exception:
+        # A broken handle must not let a history-mutating command race a turn
+        # we cannot confidently prove has stopped.
+        return True
+
+
+def _clear_stale_running_for_compress(session: dict) -> bool:
+    """Clear a stranded ``running`` marker when no turn can still use history.
+
+    ``prompt.submit`` installs either ``_agent_build_thread`` or ``_run_thread``
+    before it returns.  A session that reports running with neither live is
+    therefore a completed/crashed turn whose cleanup was skipped, not a turn
+    that compression could safely interrupt.  Clear only that stale state;
+    genuine live workers keep the 4009 guard below.
+    """
+    if not session.get("running"):
+        return False
+    if _turn_worker_is_alive(session.get("_run_thread")) or _turn_worker_is_alive(
+        session.get("_agent_build_thread")
+    ):
+        return False
+
+    with session["history_lock"]:
+        if not session.get("running"):
+            return False
+        if _turn_worker_is_alive(session.get("_run_thread")) or _turn_worker_is_alive(
+            session.get("_agent_build_thread")
+        ):
+            return False
+        session["running"] = False
+        session["last_active"] = time.time()
+        _clear_inflight_turn(session)
+    logger.warning("Cleared stale running marker before manual compression")
+    return True
+
+
 def _fail_inflight_turn(session: dict, error: Any) -> None:
     """Mark the in-flight turn terminal-error but keep it replayable.
 
@@ -10264,6 +10307,7 @@ def _(rid, params: dict) -> dict:
     session, err = _sess(params, rid)
     if err:
         return err
+    _clear_stale_running_for_compress(session)
     if session.get("running"):
         return _err(rid, 4009, _busy_interrupt_message("/compress"))
     from agent.conversation_compression import (
@@ -16426,6 +16470,7 @@ def _(rid, params: dict) -> dict:
     if name in {"compress", "compact"}:
         if not session:
             return _err(rid, 4001, "no active session to compress")
+        _clear_stale_running_for_compress(session)
         if session.get("running"):
             return _err(rid, 4009, _busy_interrupt_message("/compress"))
         from agent.conversation_compression import (
@@ -17550,6 +17595,8 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
             return str(ack.get("message") or f"compute-host {route_name} failed")
         _apply_compute_host_metadata_mirror(session, ack)
         return str(ack.get("output") or "")
+    if name == "compress":
+        _clear_stale_running_for_compress(session)
     if name in _MUTATES_WHILE_RUNNING and session.get("running"):
         return _busy_interrupt_message(f"running /{name}")
 

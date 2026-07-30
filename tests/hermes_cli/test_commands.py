@@ -90,6 +90,17 @@ class TestResolveCommand:
         assert not ctx.cli_only and not ctx.gateway_only
         assert "context" in GATEWAY_KNOWN_COMMANDS
 
+    def test_interrupt_is_a_real_tui_and_cli_command(self):
+        interrupt = resolve_command("/interrupt")
+        assert interrupt is not None
+        assert interrupt.name == "interrupt"
+        assert interrupt.cli_only is True
+        assert "Escape or Ctrl+C" in interrupt.description
+        assert "interrupt" not in GATEWAY_KNOWN_COMMANDS
+
+    def test_leading_slash_stripped(self):
+        assert resolve_command("/help").name == "help"
+        assert resolve_command("/bg").name == "background"
 
 
 

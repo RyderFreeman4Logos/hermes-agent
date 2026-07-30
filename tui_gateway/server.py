@@ -12089,6 +12089,7 @@ _PENDING_INPUT_COMMANDS: frozenset[str] = frozenset(
         "undo",
         "learn",
         "init",
+        "interrupt",
         "compress",
         "compact",
     }

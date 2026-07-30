@@ -309,6 +309,7 @@ const DESKTOP_COMMAND_SPECS: readonly DesktopCommandSpec[] = [
     surface: exec(),
     argumentMode: 'text'
   },
+  { name: '/interrupt', description: 'Interrupt the current turn', surface: exec() },
   { name: '/stop', description: 'Stop running background processes', surface: exec() },
   {
     name: '/tools',

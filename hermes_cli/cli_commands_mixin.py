@@ -396,6 +396,26 @@ class CLICommandsMixin:
             stopped = interrupt_all(reason="/stop")
             print(f"  ✅ Interrupted {stopped} background delegation(s).")
 
+    def _handle_interrupt_command(self):
+        """Handle /interrupt — stop only the foreground agent turn.
+
+        ``/stop`` deliberately remains the background-process/delegation
+        control.  This mirrors the normal Ctrl+C path without widening the
+        interruption to work that the user explicitly sent to the background.
+        """
+        agent = getattr(self, "agent", None)
+        if not getattr(self, "_agent_running", False) or agent is None:
+            print("  No active turn to interrupt.")
+            return
+
+        try:
+            agent.interrupt()
+            self._last_turn_interrupted = True
+            self._clear_active_overlays_for_interrupt()
+            print("  Interrupt requested.")
+        except Exception as exc:
+            print(f"  Could not interrupt the current turn: {exc}")
+
     def _handle_agents_command(self):
         """Handle /agents — show background processes and agent status."""
         from cli import _cprint

@@ -437,6 +437,15 @@ def _(rid, params: dict) -> dict:
         name = resolved
     session = _sessions.get(params.get("session_id", ""))
 
+    if name == "interrupt":
+        # Use the same backend path as Escape/Ctrl+C.
+        response = _methods["session.interrupt"](
+            rid, {"session_id": params.get("session_id", "")}
+        )
+        if "error" in response:
+            return response
+        return _ok(rid, {"type": "exec", "output": "Interrupt requested."})
+
     qcmds = _load_cfg().get("quick_commands", {})
     if name in qcmds:
         qc = qcmds[name]

@@ -5,6 +5,7 @@ import {
   applyVoiceRecordResponse,
   dismissSensitivePrompt,
   handleIdleHotkeyExit,
+  handleInterruptHotkey,
   shouldAllowIdleHotkeyExit,
   shouldFallThroughForScroll
 } from '../app/useInputHandlers.js'
@@ -78,6 +79,38 @@ describe('handleIdleHotkeyExit', () => {
     expect(actions.die).not.toHaveBeenCalled()
     expect(requestDashboardNewSession).toHaveBeenCalledTimes(1)
     expect(actions.sys).toHaveBeenCalledWith('starting a fresh dashboard chat...')
+  })
+})
+
+describe('handleInterruptHotkey', () => {
+  it('interrupts instead of exiting when the UI is busy', () => {
+    const interrupt = vi.fn()
+    const exit = vi.fn()
+
+    handleInterruptHotkey({ busy: true, gatewayTurnRunning: false, sid: 'sid-busy' }, interrupt, exit)
+
+    expect(interrupt).toHaveBeenCalledWith('sid-busy')
+    expect(exit).not.toHaveBeenCalled()
+  })
+
+  it('interrupts instead of exiting when only the gateway reports a running turn', () => {
+    const interrupt = vi.fn()
+    const exit = vi.fn()
+
+    handleInterruptHotkey({ busy: false, gatewayTurnRunning: true, sid: 'sid-zombie' }, interrupt, exit)
+
+    expect(interrupt).toHaveBeenCalledWith('sid-zombie')
+    expect(exit).not.toHaveBeenCalled()
+  })
+
+  it('lets Esc use the same busy-turn interrupt path', () => {
+    const interrupt = vi.fn()
+    const ignoreIdleEscape = vi.fn()
+
+    handleInterruptHotkey({ busy: true, gatewayTurnRunning: false, sid: 'sid-escape' }, interrupt, ignoreIdleEscape)
+
+    expect(interrupt).toHaveBeenCalledWith('sid-escape')
+    expect(ignoreIdleEscape).not.toHaveBeenCalled()
   })
 })
 

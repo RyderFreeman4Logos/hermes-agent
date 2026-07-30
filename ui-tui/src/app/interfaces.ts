@@ -324,6 +324,7 @@ export interface UiState {
   compact: boolean
   detailsMode: DetailsMode
   detailsModeCommandOverride: boolean
+  gatewayTurnRunning: boolean
   info: null | SessionInfo
   liveSessionCount: number
   inlineDiffs: boolean

@@ -174,7 +174,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
     turnController.fullReset()
     setVoiceRecording(false)
     setVoiceProcessing(false)
-    patchUiState({ bgTasks: new Set(), info: null, sid: null, usage: ZERO })
+    patchUiState({ bgTasks: new Set(), gatewayTurnRunning: false, info: null, sid: null, usage: ZERO })
     setHistoryItems([])
     setLastUserMsg('')
     setStickyPrompt('')
@@ -334,6 +334,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
           writeActiveSessionFile(r.session_key ?? r.session_id)
           patchUiState({
             busy: running,
+            gatewayTurnRunning: running,
             info,
             sid: r.session_id,
             status: statusFromLiveSession(r.status, running),
@@ -388,6 +389,7 @@ export function useSessionLifecycle(opts: UseSessionLifecycleOptions) {
             writeActiveSessionFile(r.resumed ?? r.session_id)
             patchUiState({
               busy: running,
+              gatewayTurnRunning: running,
               info,
               sid: r.session_id,
               status: statusFromLiveSession(r.status, running),

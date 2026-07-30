@@ -1843,12 +1843,65 @@ def quarantine_zeroed_state_db(path: Path) -> Optional[Path]:
             handle.close()
 
 
+
+def session_db_write_lock_path(db_path: Path) -> Path:
+    """Return the advisory write-lock path for a SessionDB file.
+
+    Uses ``{db_path}.write.lock`` so the lock sits next to the database and is
+    unique per DB path across TUI/gateway/CLI processes.
+    """
+    return Path(str(db_path) + ".write.lock")
+
+
+def _try_acquire_exclusive_file_lock(handle) -> bool:
+    """Non-blocking exclusive lock. True if acquired, False if contended."""
+    import platform
+
+    if platform.system() == "Windows":
+        import msvcrt
+
+        try:
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError:
+            return False
+
+    import fcntl
+
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except (BlockingIOError, OSError):
+        return False
+
+
+def _release_exclusive_file_lock(handle) -> None:
+    """Release a previously acquired exclusive file lock. Best-effort."""
+    import platform
+
+    try:
+        if platform.system() == "Windows":
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except (OSError, AttributeError):
+        pass
+
+
 class SessionDB:
     """
     SQLite-backed session storage with FTS5 search.
 
     Thread-safe for the common gateway pattern (multiple reader threads,
-    single writer via WAL mode). Each method opens its own cursor.
+    single writer via WAL mode). Cross-process writers are serialized with an
+    advisory exclusive flock on ``{db_path}.write.lock`` around each
+    ``_execute_write`` transaction. Each method opens its own cursor.
     """
 
     # ── Write-contention tuning ──
@@ -1868,8 +1921,8 @@ class SessionDB:
     # Explicit user actions such as session resume can wait longer than a hot
     # append. Keep their retry wait bounded: 30 attempts with at most 250ms of
     # SQLite busy handling and 100-750ms randomized application backoff stay
-    # within a 30s overall retry budget. This tactical profile does not replace
-    # inter-process writer coordination.
+    # within a 30s overall retry budget. The same budget gates the cross-process
+    # advisory write lock acquired before BEGIN IMMEDIATE.
     _SLOW_WRITE_MAX_RETRIES = 30
     _SLOW_WRITE_RETRY_MIN_S = 0.100
     _SLOW_WRITE_RETRY_MAX_S = 0.750
@@ -1902,6 +1955,13 @@ class SessionDB:
         self.read_only = read_only
 
         self._lock = threading.Lock()
+        # Cross-process advisory write lock ({db_path}.write.lock). Opened
+        # lazily on first write; never acquired for read_only instances.
+        self._write_lock_path = (
+            None if read_only else session_db_write_lock_path(self.db_path)
+        )
+        self._write_lock_handle = None
+        self._write_lock_held = False
         self._write_count = 0
         # One-shot guard for the runtime FTS rebuild recovery on the write
         # path. A corrupt FTS shadow table makes EVERY message write raise
@@ -2373,6 +2433,73 @@ class SessionDB:
                 self._warn_fts5_unavailable(exc)
             return False
 
+
+    def _ensure_write_lock_handle(self):
+        """Open the per-db advisory lock file once (writable instances only)."""
+        if self.read_only:
+            raise sqlite3.OperationalError(
+                "read-only SessionDB cannot acquire the advisory write lock"
+            )
+        if self._write_lock_handle is not None:
+            return
+        assert self._write_lock_path is not None
+        self._write_lock_path.parent.mkdir(parents=True, exist_ok=True)
+        # a+b so the file exists without truncating a peer's lock file.
+        self._write_lock_handle = self._write_lock_path.open("a+b")
+
+    def _acquire_advisory_write_lock(self, timeout: Optional[float]) -> bool:
+        """Acquire the cross-process exclusive write lock without blocking forever.
+
+        Uses non-blocking flock/msvcrt attempts. When *timeout* is None, a
+        single attempt is made so the outer ``_execute_write`` retry/jitter
+        loop owns backoff. When *timeout* is set, spins with short sleeps
+        until the deadline (shared with the retry profile wall budget).
+        """
+        if self.read_only:
+            return False
+        self._ensure_write_lock_handle()
+        handle = self._write_lock_handle
+        assert handle is not None
+        if self._write_lock_held:
+            return True
+
+        deadline = (
+            None if timeout is None else time.monotonic() + max(0.0, timeout)
+        )
+        while True:
+            if _try_acquire_exclusive_file_lock(handle):
+                self._write_lock_held = True
+                return True
+            if deadline is None:
+                return False
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(0.020, remaining))
+
+    def _release_advisory_write_lock(self) -> None:
+        """Drop the cross-process write lock if this instance currently holds it."""
+        if not self._write_lock_held:
+            return
+        handle = self._write_lock_handle
+        if handle is not None:
+            _release_exclusive_file_lock(handle)
+        self._write_lock_held = False
+
+    def _close_write_lock_handle(self) -> None:
+        """Release and close the advisory lock fd (called from close())."""
+        try:
+            self._release_advisory_write_lock()
+        finally:
+            handle = self._write_lock_handle
+            self._write_lock_handle = None
+            self._write_lock_held = False
+            if handle is not None:
+                try:
+                    handle.close()
+                except Exception:
+                    pass
+
     def _write_retry_parameters(
         self, retry_profile: str
     ) -> Tuple[int, float, float, Optional[float], Optional[float]]:
@@ -2485,52 +2612,93 @@ class SessionDB:
                     last_err = last_err or sqlite3.OperationalError("database is locked")
                     break
 
+                previous_busy_timeout_ms: Optional[int] = None
                 try:
                     assert self._conn is not None
-                    previous_busy_timeout_ms: Optional[int] = None
-                    attempt_timeout_s = busy_timeout_s
+                    # Serialize all SessionDB writers (TUI/gateway/CLI) with a
+                    # cross-process advisory exclusive lock before SQLite's
+                    # BEGIN IMMEDIATE. read_only instances never reach here.
+                    # Recompute remaining budget after the in-process wait so
+                    # the flock spin cannot outlive the profile wall clock.
+                    flock_timeout: Optional[float] = lock_timeout
                     if deadline is not None:
                         remaining = deadline - time.time()
                         if remaining <= 0:
                             return cast(T, False)
-                        attempt_timeout_s = (
+                        flock_timeout = (
                             remaining
-                            if attempt_timeout_s is None
-                            else min(max(0.0, attempt_timeout_s), remaining)
+                            if flock_timeout is None
+                            else min(flock_timeout, remaining)
                         )
                     profile_remaining = _profile_remaining()
                     if profile_remaining is not None:
                         if profile_remaining <= 0:
+                            # Do not break while holding self._lock.
                             last_err = last_err or sqlite3.OperationalError(
                                 "database is locked"
                             )
-                            break
-                        attempt_timeout_s = (
+                            raise sqlite3.OperationalError("database is locked")
+                        flock_timeout = (
                             profile_remaining
-                            if attempt_timeout_s is None
-                            else min(max(0.0, attempt_timeout_s), profile_remaining)
+                            if flock_timeout is None
+                            else min(flock_timeout, profile_remaining)
                         )
-                    if attempt_timeout_s is not None:
-                        previous_busy_timeout_ms = int(
-                            self._conn.execute("PRAGMA busy_timeout").fetchone()[0]
+                    if not self._acquire_advisory_write_lock(timeout=flock_timeout):
+                        last_err = last_err or sqlite3.OperationalError(
+                            "database is locked"
                         )
-                        # SQLite accepts integer milliseconds. Floor instead
-                        # of ceil so its busy handler cannot exceed the
-                        # caller's remaining budget.
-                        self._conn.execute(
-                            "PRAGMA busy_timeout="
-                            f"{max(0, int(attempt_timeout_s * 1000))}"
-                        )
-                    self._conn.execute("BEGIN IMMEDIATE")
+                        # Fail closed: treat like SQLite lock contention so the
+                        # outer retry/jitter path (or budget exhaustion) owns it.
+                        raise sqlite3.OperationalError("database is locked")
+
                     try:
-                        result = fn(self._conn)
-                        self._conn.commit()
-                    except BaseException:
+                        attempt_timeout_s = busy_timeout_s
+                        if deadline is not None:
+                            remaining = deadline - time.time()
+                            if remaining <= 0:
+                                return cast(T, False)
+                            attempt_timeout_s = (
+                                remaining
+                                if attempt_timeout_s is None
+                                else min(max(0.0, attempt_timeout_s), remaining)
+                            )
+                        profile_remaining = _profile_remaining()
+                        if profile_remaining is not None:
+                            if profile_remaining <= 0:
+                                last_err = last_err or sqlite3.OperationalError(
+                                    "database is locked"
+                                )
+                                raise sqlite3.OperationalError("database is locked")
+                            attempt_timeout_s = (
+                                profile_remaining
+                                if attempt_timeout_s is None
+                                else min(max(0.0, attempt_timeout_s), profile_remaining)
+                            )
+                        if attempt_timeout_s is not None:
+                            previous_busy_timeout_ms = int(
+                                self._conn.execute("PRAGMA busy_timeout").fetchone()[0]
+                            )
+                            # SQLite accepts integer milliseconds. Floor instead
+                            # of ceil so its busy handler cannot exceed the
+                            # caller's remaining budget.
+                            self._conn.execute(
+                                "PRAGMA busy_timeout="
+                                f"{max(0, int(attempt_timeout_s * 1000))}"
+                            )
+                        self._conn.execute("BEGIN IMMEDIATE")
                         try:
-                            self._conn.rollback()
-                        except Exception:
-                            pass
-                        raise
+                            result = fn(self._conn)
+                            self._conn.commit()
+                        except BaseException:
+                            try:
+                                self._conn.rollback()
+                            except Exception:
+                                pass
+                            raise
+                    finally:
+                        # Release flock after commit/rollback, before the
+                        # in-process lock, so the next writer can enter SQLite.
+                        self._release_advisory_write_lock()
                 finally:
                     if previous_busy_timeout_ms is not None:
                         try:
@@ -2709,7 +2877,8 @@ class SessionDB:
         """Close the database connection.
 
         Attempts a TRUNCATE WAL checkpoint first so that exiting processes
-        help shrink the WAL file.
+        help shrink the WAL file. Always drops the advisory write-lock fd so
+        a crashed-in-process hold cannot leak across reopen within this object.
         """
         with self._lock:
             if self._conn:
@@ -2719,6 +2888,7 @@ class SessionDB:
                     logger.debug("WAL checkpoint (TRUNCATE) at close failed: %s", exc)
                 self._conn.close()
                 self._conn = None
+            self._close_write_lock_handle()
 
     # ── Chunked FTS rebuild engine (v23 opt-in optimize) ──
     #

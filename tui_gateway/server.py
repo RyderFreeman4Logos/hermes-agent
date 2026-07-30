@@ -9278,12 +9278,29 @@ def _notification_poller_loop(
 
     _emitted = set()  # dedup re-queued events so same completion isn't emitted repeatedly
     _last_kanban_poll = 0.0
+    # #28: foreign reclaim only updates durable state; this idle poller must
+    # periodically reinject owner-local pending completions or an empty
+    # in-memory queue never wakes the parent.
+    _last_async_pending_poll = 0.0
+    _ASYNC_PENDING_POLL_SECONDS = 2.0
     # Each accepted steer has its own receipt. This local list never gates
     # completion_queue.get(): other completions must continue into the active
     # turn instead of waiting behind the first accepted steer.
     _steered_pending: list[dict] = []
     while not stop_event.is_set() and not session.get("_finalized"):
         _now = time.monotonic()
+        if _now - _last_async_pending_poll >= _ASYNC_PENDING_POLL_SECONDS:
+            _last_async_pending_poll = _now
+            try:
+                from tools.async_delegation import poll_owner_local_async_completions
+
+                poll_owner_local_async_completions(process_registry.completion_queue)
+            except Exception:
+                logger.debug(
+                    "owner-local async pending poll failed for session %s",
+                    sid,
+                    exc_info=True,
+                )
         if _now - _last_kanban_poll >= _KANBAN_POLL_SECONDS:
             _last_kanban_poll = _now
             try:

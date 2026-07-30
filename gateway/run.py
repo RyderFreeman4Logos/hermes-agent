@@ -21323,11 +21323,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         await asyncio.sleep(3)  # let platforms finish connecting
         from tools.process_registry import process_registry as _pr
+        _last_async_pending_poll = 0.0
+        _ASYNC_PENDING_POLL_SECONDS = 2.0
         while self._running:
             try:
-                # Peek the queue for async-delegation events. We must NOT
-                # consume watch/completion events here (other drains own them),
-                # so requeue anything that isn't ours.
+                # #28: foreign reclaim updates durable state only. While idle
+                # this watcher must reinject owner-local pending completions
+                # onto the process queue or the parent never wakes.
+                _now = time.monotonic()
+                if _now - _last_async_pending_poll >= _ASYNC_PENDING_POLL_SECONDS:
+                    _last_async_pending_poll = _now
+                    try:
+                        from tools.async_delegation import (
+                            poll_owner_local_async_completions,
+                        )
+
+                        poll_owner_local_async_completions(_pr.completion_queue)
+                    except Exception:
+                        logger.debug(
+                            "owner-local async pending poll failed",
+                            exc_info=True,
+                        )
+                # Peek the queue for async-delegation and heartbeat events. We
+                # must NOT consume watch/completion events here (other drains own
+                # them), so requeue anything that isn't ours.
                 requeue = []
                 async_events = []
                 heartbeat_events = []

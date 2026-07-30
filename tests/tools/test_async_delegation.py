@@ -969,7 +969,11 @@ def test_reclaim_does_not_enqueue_on_foreign_alive_owner(tmp_path, monkeypatch):
     delegation_id = "deleg_foreign_owner"
     foreign_pid = os.getpid() + 50_000  # not this process
     # Pretend foreign pid is alive.
-    monkeypatch.setattr(ad, "_owner_pid_is_alive", lambda pid: int(pid) == foreign_pid)
+    monkeypatch.setattr(
+        ad,
+        "_owner_process_is_alive",
+        lambda pid, started=None: int(pid) == foreign_pid,
+    )
     record = {
         "delegation_id": delegation_id,
         "session_key": "owner-session",
@@ -1010,7 +1014,11 @@ def test_requeue_local_pending_only_for_this_owner(tmp_path, monkeypatch):
     foreign = "deleg_foreign_pending"
     me = os.getpid()
     foreign_pid = me + 77_000
-    monkeypatch.setattr(ad, "_owner_pid_is_alive", lambda pid: int(pid) == foreign_pid)
+    monkeypatch.setattr(
+        ad,
+        "_owner_process_is_alive",
+        lambda pid, started=None: int(pid) == foreign_pid,
+    )
 
     for did, pid, key in (
         (mine, me, "mine-key"),
@@ -1057,14 +1065,63 @@ def test_requeue_local_pending_only_for_this_owner(tmp_path, monkeypatch):
 
 
 def test_local_process_should_enqueue_rules(monkeypatch):
-    monkeypatch.setattr(ad, "_owner_pid_is_alive", lambda pid: int(pid) == 42)
+    monkeypatch.setattr(
+        ad,
+        "_owner_process_is_alive",
+        lambda pid, started=None: int(pid) == 42 and (started is None or started == 100),
+    )
     assert ad.local_process_should_enqueue_delegation(None, local_pid=1) is True
     assert ad.local_process_should_enqueue_delegation(0, local_pid=1) is True
     assert ad.local_process_should_enqueue_delegation(1, local_pid=1) is True
-    assert ad.local_process_should_enqueue_delegation(42, local_pid=1) is False
+    assert ad.local_process_should_enqueue_delegation(42, 100, local_pid=1) is False
+    # PID reuse: same pid, different start identity → treat as dead owner.
+    assert ad.local_process_should_enqueue_delegation(42, 999, local_pid=1) is True
     # Dead foreign owner → any process may enqueue.
-    monkeypatch.setattr(ad, "_owner_pid_is_alive", lambda pid: False)
-    assert ad.local_process_should_enqueue_delegation(42, local_pid=1) is True
+    monkeypatch.setattr(ad, "_owner_process_is_alive", lambda pid, started=None: False)
+    assert ad.local_process_should_enqueue_delegation(42, 100, local_pid=1) is True
+
+
+def test_poll_owner_local_reinjects_pending_for_idle_owner(tmp_path, monkeypatch):
+    """Idle watcher helper reinjects owner-local durable pending without user prompt."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    import os
+
+    ad._local_pending_requeue_at.clear()
+    did = "deleg_idle_poll"
+    me = os.getpid()
+    rec = {
+        "delegation_id": did,
+        "session_key": "owner-key",
+        "origin_ui_session_id": "ui",
+        "parent_session_id": "owner-key",
+        "origin_session_id": "",
+        "dispatched_at": 1.0,
+        "goal": "g",
+    }
+    ad._persist_dispatch(rec)
+    evt = {
+        "type": "async_delegation",
+        "delegation_id": did,
+        "session_key": "owner-key",
+        "origin_ui_session_id": "ui",
+        "status": "completed",
+        "summary": "done",
+        "dispatched_at": 1.0,
+        "completed_at": 2.0,
+    }
+    ad._persist_completion(evt, {"summary": "done", "status": "completed"})
+    with ad._DB_LOCK, ad._connect() as conn:
+        conn.execute(
+            "UPDATE async_delegations SET owner_pid=? WHERE delegation_id=?",
+            (me, did),
+        )
+
+    q = queue.Queue()
+    n = ad.poll_owner_local_async_completions(q)
+    assert n >= 1
+    got = q.get_nowait()
+    assert got["delegation_id"] == did
+    assert got.get("restored") is True
 
 
 

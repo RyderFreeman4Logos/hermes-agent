@@ -482,8 +482,18 @@ def inspect_live_completion_evidence(delegation_id: str) -> Optional[Dict[str, A
     }
 
 
-def _owner_pid_is_alive(owner_pid: Optional[int]) -> bool:
-    """Best-effort liveness for a durable owner_pid (0/None ⇒ not alive)."""
+def _owner_process_is_alive(
+    owner_pid: Optional[int],
+    owner_started_at: Optional[int] = None,
+) -> bool:
+    """True iff the recorded owner process identity is still running.
+
+    Matches ``recover_abandoned_delegations``: a bare PID existence check is
+    insufficient because PIDs are reused. When ``owner_started_at`` is known,
+    require ``get_process_start_time(pid) == owner_started_at``. When start
+    time cannot be read, fall back to PID existence only (conservative: treat
+    as alive so we do not steal from a living-but-opaque owner).
+    """
     try:
         pid = int(owner_pid or 0)
     except (TypeError, ValueError):
@@ -491,19 +501,46 @@ def _owner_pid_is_alive(owner_pid: Optional[int]) -> bool:
     if pid <= 0:
         return False
     try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        # Exists but not signalable — treat as alive so we don't steal it.
-        return True
+        from gateway.status import _pid_exists, get_process_start_time
     except Exception:
+        # Status helpers unavailable — best-effort kill(0).
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except Exception:
+            return False
+    if not _pid_exists(pid):
         return False
+    if owner_started_at is None:
+        return True
+    try:
+        live_start = get_process_start_time(pid)
+    except Exception:
+        live_start = None
+    if live_start is None:
+        # Cannot disambiguate PID reuse — keep conservative "alive".
+        return True
+    try:
+        return int(live_start) == int(owner_started_at)
+    except (TypeError, ValueError):
+        return True
+
+
+# Back-compat alias used by older tests / call sites.
+def _owner_pid_is_alive(
+    owner_pid: Optional[int],
+    owner_started_at: Optional[int] = None,
+) -> bool:
+    return _owner_process_is_alive(owner_pid, owner_started_at)
 
 
 def local_process_should_enqueue_delegation(
     owner_pid: Optional[int],
+    owner_started_at: Optional[int] = None,
     *,
     local_pid: Optional[int] = None,
 ) -> bool:
@@ -513,7 +550,7 @@ def local_process_should_enqueue_delegation(
     ``completion_queue``. Enqueuing a foreign-owned event poisons the wrong
     poller: it cannot prove ownership and historically *dropped* the payload
     (#28). Only the living owner process (or any process when the owner is
-    dead / unknown) may enqueue.
+    dead / unknown / PID-reused) may enqueue.
     """
     me = int(local_pid if local_pid is not None else os.getpid())
     try:
@@ -524,7 +561,7 @@ def local_process_should_enqueue_delegation(
         return True
     if pid == me:
         return True
-    return not _owner_pid_is_alive(pid)
+    return not _owner_process_is_alive(pid, owner_started_at)
 
 
 # delegation_id → monotonic last requeue time (flood control for #28 reinject)
@@ -537,9 +574,15 @@ def requeue_local_pending_async_completions(target_queue) -> int:
 
     Covers the #28 gap where another process reclaimed durable state to
     ``completed/pending`` but enqueued (or dropped) the event on the *wrong*
-    completion queue. Owner process then never saw a queue event. Safe to call
-    from drain loops: per-id cooldown prevents busy-loop floods; consumers
-    still must prove ownership before injection.
+    completion queue. Owner process then never saw a queue event.
+
+    Must be called from **idle watchers** (TUI notification poller timeout,
+    gateway async-completion loop) as well as ``drain_notifications`` —
+    otherwise a parent that is only blocked on an empty in-memory queue will
+    never wake after a foreign reclaim (#28 review finding).
+
+    Per-id cooldown prevents busy-loop floods; consumers still must prove
+    ownership before injection.
     """
     if target_queue is None:
         return 0
@@ -548,14 +591,17 @@ def requeue_local_pending_async_completions(target_queue) -> int:
     enqueued = 0
     with _DB_LOCK, _transaction() as conn:
         rows = conn.execute(
-            """SELECT delegation_id, owner_pid, event_json FROM async_delegations
+            """SELECT delegation_id, owner_pid, owner_started_at, event_json
+               FROM async_delegations
                WHERE state NOT IN ('running','finalizing')
                  AND delivery_state='pending'
                  AND event_json IS NOT NULL
                ORDER BY completed_at, delegation_id"""
         ).fetchall()
-    for delegation_id, owner_pid, payload in rows:
-        if not local_process_should_enqueue_delegation(owner_pid, local_pid=me):
+    for delegation_id, owner_pid, owner_started_at, payload in rows:
+        if not local_process_should_enqueue_delegation(
+            owner_pid, owner_started_at, local_pid=me
+        ):
             continue
         last = _local_pending_requeue_at.get(delegation_id, 0.0)
         if (now - last) < _LOCAL_PENDING_REQUEUE_COOLDOWN_S:
@@ -589,25 +635,52 @@ def requeue_local_pending_async_completions(target_queue) -> int:
     return enqueued
 
 
+def poll_owner_local_async_completions(target_queue=None) -> int:
+    """Idle-watcher helper: reclaim orphans + reinject owner-local pending.
+
+    Safe to call on a timer from TUI/gateway loops that otherwise only block
+    on the in-memory completion queue. Returns total events enqueued by the
+    reclaim path + local requeue path (best-effort).
+    """
+    try:
+        from tools.process_registry import process_registry as _pr
+    except Exception:
+        _pr = None
+    if target_queue is None:
+        target_queue = getattr(_pr, "completion_queue", None) if _pr is not None else None
+    if target_queue is None:
+        return 0
+    n = 0
+    try:
+        n += int(reclaim_orphaned_completed_delegations(target_queue, enqueue=True) or 0)
+    except Exception:
+        logger.debug("poll_owner_local reclaim failed", exc_info=True)
+    try:
+        n += int(requeue_local_pending_async_completions(target_queue) or 0)
+    except Exception:
+        logger.debug("poll_owner_local requeue failed", exc_info=True)
+    return n
+
+
 def reclaim_orphaned_completed_delegations(
     target_queue=None, *, enqueue: bool = True
 ) -> int:
     """Reclaim durable running/finalizing rows whose live transcripts are terminal.
 
-    Covers the owner-alive zombie case: child work finished and wrote a live
+    Covers the case where a child finished and wrote a completed live
     manifest/log, but ``_persist_completion`` never landed (process race,
     finalize crash, etc.). Owner-dead rows remain ``recover_abandoned_delegations``'s
     job; this path only acts when live evidence proves terminal completion.
 
     Durable state is updated on any process that observes live terminal evidence.
     Queue publication is restricted to the living owner process (or any process
-    when the owner is dead) so multi-TUI hosts do not poison foreign queues (#28).
+    when the owner is dead / PID-reused) so multi-TUI hosts do not poison foreign
+    queues (#28).
     """
     try:
         from tools.process_registry import process_registry as _pr
     except Exception:
         _pr = None
-
     if target_queue is None and enqueue:
         target_queue = getattr(_pr, "completion_queue", None) if _pr is not None else None
 
@@ -619,20 +692,24 @@ def reclaim_orphaned_completed_delegations(
             """SELECT delegation_id, origin_session, origin_ui_session_id,
                       parent_session_id, dispatched_at, owner_pid,
                       owner_started_at, task_json, origin_session_id, delivery_state
-               FROM async_delegations WHERE state IN ('running','finalizing')"""
+               FROM async_delegations
+               WHERE state IN ('running','finalizing')
+               ORDER BY dispatched_at, delegation_id"""
         ).fetchall()
-
     events_to_enqueue: List[Dict[str, Any]] = []
     for row in rows:
         (delegation_id, session_key, origin_ui, parent_id, dispatched_at,
-         owner_pid, _started, task_json, origin_session_id, delivery_state) = row
+         owner_pid, owner_started_at, task_json, origin_session_id, delivery_state) = row
         # Already-delivered rows should not be re-enqueued even if state lagging.
         if delivery_state == "delivered":
             continue
         live = inspect_live_completion_evidence(delegation_id)
         if not live:
             continue
-        task = json.loads(task_json or "{}")
+        try:
+            task = json.loads(task_json or "{}")
+        except Exception:
+            task = {}
         status = str(live.get("status") or "completed")
         summary = live.get("summary")
         completed_at = now
@@ -660,6 +737,7 @@ def reclaim_orphaned_completed_delegations(
             "reclaimed_from_live": True,
             "live_evidence": live.get("evidence"),
             "owner_pid": owner_pid,
+            "owner_started_at": owner_started_at,
         }
         result = {
             "status": status,
@@ -684,7 +762,9 @@ def reclaim_orphaned_completed_delegations(
             reclaimed += 1
             # Only the living owner (or any process if owner is dead) may put
             # this on a local completion queue (#28 cross-process poison).
-            if local_process_should_enqueue_delegation(owner_pid, local_pid=me):
+            if local_process_should_enqueue_delegation(
+                owner_pid, owner_started_at, local_pid=me
+            ):
                 events_to_enqueue.append(event)
             else:
                 logger.info(

@@ -50,6 +50,14 @@ def _make_session(agent, history):
     }
 
 
+class _TurnWorker:
+    def __init__(self, alive: bool):
+        self._alive = alive
+
+    def is_alive(self) -> bool:
+        return self._alive
+
+
 def test_compress_session_history_raises_on_lock_skip():
     """When _compression_skipped_due_to_lock is set on the agent,
     _compress_session_history must raise CompressionLockHeld with
@@ -104,6 +112,93 @@ def test_session_compress_rpc_returns_lock_held_payload():
     assert "Compression already in progress" in result["message"]
     assert "pid=4242" in result["message"]
     assert "No changes from compression" not in result["message"]
+
+
+def test_stale_running_marker_allows_session_compress():
+    """A dead worker must not leave manual compression permanently bricked."""
+    from tui_gateway import server
+
+    agent = _make_lock_skip_agent("pid=stale")
+    session = _make_session(agent, _make_history())
+    session["running"] = True
+    session["_run_thread"] = _TurnWorker(alive=False)
+    sid = "sid-stale-compress"
+    server._sessions[sid] = session
+    try:
+        with (
+            patch.object(server, "_sess", return_value=(session, None)),
+            patch.object(server, "_session_uses_compute_host", return_value=False),
+            patch.object(server, "_status_update"),
+            patch(
+                "agent.model_metadata.estimate_request_tokens_rough",
+                return_value=100,
+            ),
+        ):
+            response = server._methods["session.compress"]("stale", {"session_id": sid})
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert response["result"]["lock_held"] is True
+    assert session["running"] is False
+    assert session["inflight_turn"] is None
+
+
+def test_live_running_turn_still_blocks_compress_with_real_interrupt_help():
+    from tui_gateway import server
+
+    session = _make_session(_make_lock_skip_agent("pid=live"), _make_history())
+    session["running"] = True
+    session["_run_thread"] = _TurnWorker(alive=True)
+    sid = "sid-live-compress"
+    server._sessions[sid] = session
+    try:
+        with (
+            patch.object(server, "_sess", return_value=(session, None)),
+            patch.object(server, "_session_uses_compute_host", return_value=False),
+        ):
+            response = server._methods["session.compress"]("live", {"session_id": sid})
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert response["error"]["code"] == 4009
+    assert response["error"]["message"] == (
+        "session busy — press Escape or Ctrl+C, or run /interrupt before /compress"
+    )
+    assert session["running"] is True
+
+
+@pytest.mark.parametrize("route", ["command.dispatch", "mirror"])
+def test_stale_running_marker_allows_every_tui_compress_route(route):
+    """The slash worker and live mirror must not reintroduce the stale block."""
+    from tui_gateway import server
+
+    agent = _make_lock_skip_agent(f"pid={route}")
+    session = _make_session(agent, _make_history())
+    session["running"] = True
+    session["_run_thread"] = _TurnWorker(alive=False)
+    sid = f"sid-stale-{route}"
+    server._sessions[sid] = session
+    try:
+        with (
+            patch.object(server, "_session_uses_compute_host", return_value=False),
+            patch(
+                "agent.model_metadata.estimate_request_tokens_rough",
+                return_value=100,
+            ),
+        ):
+            if route == "command.dispatch":
+                response = server._methods["command.dispatch"](
+                    "stale-dispatch",
+                    {"name": "compress", "arg": "", "session_id": sid},
+                )
+                assert response["result"]["type"] == "exec"
+            else:
+                response = server._mirror_slash_side_effects(sid, session, "/compress")
+                assert "Compression already in progress" in response
+    finally:
+        server._sessions.pop(sid, None)
+
+    assert session["running"] is False
 
 
 # ── Consumer 2: command.dispatch compress branch ───────────────────────

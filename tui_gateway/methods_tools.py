@@ -962,6 +962,7 @@ def _(rid, params: dict) -> dict:
     if name in {"compress", "compact"}:
         if not session:
             return _err(rid, 4001, "no active session to compress")
+        _clear_stale_running_for_compress(session)
         if session.get("running"):
             return _err(
                 rid, 4009, "session busy — /interrupt the current turn before /compress"

@@ -2365,6 +2365,7 @@ def _(rid, params: dict) -> dict:
     session, err = _sess(params, rid)
     if err:
         return err
+    _clear_stale_running_for_compress(session)
     if session.get("running"):
         return _err(
             rid, 4009, "session busy — /interrupt the current turn before /compress"

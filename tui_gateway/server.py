@@ -11983,8 +11983,13 @@ def _notification_poller_loop(
         # What reaches here is not owned by another LIVE session. Addressed
         # events still require positive proof before injection: exact UI origin,
         # direct durable key, or compression lineage. If none proves ownership,
-        # the event is orphaned and must not be adopted by this chat. Truly
-        # ownerless ordinary notifications retain legacy global delivery.
+        # the event is orphaned for *this* chat and must not be adopted.
+        #
+        # #28: for async_delegation we still drop from *this* process queue when
+        # no live session here can claim it — re-queue would spin forever among
+        # foreign pollers. Durable delivery_state stays pending; the owner
+        # process reinjects via requeue_local_pending_async_completions, and
+        # reclaim only enqueues on the living owner process.
         requires_owner = _notification_event_requires_owner(evt)
         if requires_owner and not _session_owns_notification_event(sid, session, evt):
             log = (

@@ -3854,7 +3854,7 @@ def test_completion_ownership_lineage_lookup_failure_fails_closed(monkeypatch):
 def test_notification_poller_live_loop_drops_addressed_orphan(
     monkeypatch, routing
 ):
-    """A live poll never injects an addressed event whose owner is gone."""
+    """A live poll never injects an ordinary addressed event whose owner is gone."""
     import queue as _queue_mod
 
     from tools.process_registry import process_registry
@@ -3894,6 +3894,57 @@ def test_notification_poller_live_loop_drops_addressed_orphan(
     finally:
         server._sessions.pop("sid-live-orphan", None)
         process_registry._completion_consumed.discard(event["session_id"])
+        while not isolated_queue.empty():
+            isolated_queue.get_nowait()
+
+
+def test_notification_poller_drops_unowned_async_without_local_owner(monkeypatch):
+    """#28: foreign process must not keep async_delegation spinning on its queue.
+
+    Durable state stays pending; the living owner process reinjects via
+    requeue_local_pending_async_completions. This process drops the unowned
+    queue copy so multi-TUI hosts do not busy-loop.
+    """
+    import queue as _queue_mod
+
+    from tools.process_registry import process_registry
+
+    delivered = []
+    emitted = []
+    session = _session(session_key="unrelated-live-key")
+    event = {
+        "type": "async_delegation",
+        "delegation_id": "deleg-orphan-async",
+        "session_key": "missing-owner-key",
+        "origin_ui_session_id": "missing-owner-sid",
+        "goal": "secret",
+        "status": "completed",
+        "summary": "SECRET RESULT",
+        "dispatched_at": 1.0,
+        "completed_at": 2.0,
+    }
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    isolated_queue.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_emit", lambda *args, **_kwargs: emitted.append(args))
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda _rid, _sid, _session, text, **_kwargs: delivered.append(text),
+    )
+    server._sessions["sid-live-orphan"] = session
+
+    try:
+        server._notification_poller_loop(
+            _StopAfterOneNotificationPoll(), "sid-live-orphan", session
+        )
+
+        assert delivered == []
+        assert emitted == []
+        assert isolated_queue.empty()
+    finally:
+        server._sessions.pop("sid-live-orphan", None)
         while not isolated_queue.empty():
             isolated_queue.get_nowait()
 

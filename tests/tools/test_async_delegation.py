@@ -1254,6 +1254,113 @@ def test_reclaim_orphaned_completed_when_owner_alive(tmp_path, monkeypatch):
     assert q.empty()
 
 
+def test_reclaim_does_not_enqueue_on_foreign_alive_owner(tmp_path, monkeypatch):
+    """Cross-process reclaim must update durable state but not poison this queue (#28)."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    import os
+
+    delegation_id = "deleg_foreign_owner"
+    foreign_pid = os.getpid() + 50_000  # not this process
+    # Pretend foreign pid is alive.
+    monkeypatch.setattr(ad, "_owner_pid_is_alive", lambda pid: int(pid) == foreign_pid)
+    record = {
+        "delegation_id": delegation_id,
+        "session_key": "owner-session",
+        "origin_ui_session_id": "ui-foreign",
+        "parent_session_id": "parent-1",
+        "origin_session_id": "",
+        "dispatched_at": 1.0,
+        "goal": "do the work",
+        "context": "ctx",
+        "toolsets": ["terminal"],
+        "role": "leaf",
+        "model": "m",
+    }
+    ad._persist_dispatch(record)
+    with ad._DB_LOCK, ad._connect() as conn:
+        conn.execute(
+            "UPDATE async_delegations SET owner_pid=?, owner_started_at=NULL WHERE delegation_id=?",
+            (foreign_pid, delegation_id),
+        )
+    _write_live_manifest(tmp_path, delegation_id, status="completed")
+
+    q = queue.Queue()
+    assert ad.reclaim_orphaned_completed_delegations(q, enqueue=True) == 1
+    durable = ad.get_durable_delegation(delegation_id)
+    assert durable["state"] == "completed"
+    assert durable["delivery_state"] == "pending"
+    # Critical: must NOT land on this process's completion queue.
+    assert q.empty()
+
+
+def test_requeue_local_pending_only_for_this_owner(tmp_path, monkeypatch):
+    """Owner process reinjects durable pending completions onto its local queue."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    import os
+
+    ad._local_pending_requeue_at.clear()
+    mine = "deleg_local_pending"
+    foreign = "deleg_foreign_pending"
+    me = os.getpid()
+    foreign_pid = me + 77_000
+    monkeypatch.setattr(ad, "_owner_pid_is_alive", lambda pid: int(pid) == foreign_pid)
+
+    for did, pid, key in (
+        (mine, me, "mine-key"),
+        (foreign, foreign_pid, "foreign-key"),
+    ):
+        rec = {
+            "delegation_id": did,
+            "session_key": key,
+            "origin_ui_session_id": "ui",
+            "parent_session_id": key,
+            "origin_session_id": "",
+            "dispatched_at": 1.0,
+            "goal": "g",
+        }
+        ad._persist_dispatch(rec)
+        evt = {
+            "type": "async_delegation",
+            "delegation_id": did,
+            "session_key": key,
+            "origin_ui_session_id": "ui",
+            "status": "completed",
+            "summary": "done",
+            "dispatched_at": 1.0,
+            "completed_at": 2.0,
+        }
+        ad._persist_completion(evt, {"summary": "done", "status": "completed"})
+        with ad._DB_LOCK, ad._connect() as conn:
+            conn.execute(
+                "UPDATE async_delegations SET owner_pid=? WHERE delegation_id=?",
+                (pid, did),
+            )
+
+    q = queue.Queue()
+    n = ad.requeue_local_pending_async_completions(q)
+    assert n == 1
+    got = q.get_nowait()
+    assert got["delegation_id"] == mine
+    assert got.get("restored") is True
+    assert q.empty()
+
+    # Cooldown: immediate second call must not flood.
+    assert ad.requeue_local_pending_async_completions(q) == 0
+    assert q.empty()
+
+
+def test_local_process_should_enqueue_rules(monkeypatch):
+    monkeypatch.setattr(ad, "_owner_pid_is_alive", lambda pid: int(pid) == 42)
+    assert ad.local_process_should_enqueue_delegation(None, local_pid=1) is True
+    assert ad.local_process_should_enqueue_delegation(0, local_pid=1) is True
+    assert ad.local_process_should_enqueue_delegation(1, local_pid=1) is True
+    assert ad.local_process_should_enqueue_delegation(42, local_pid=1) is False
+    # Dead foreign owner → any process may enqueue.
+    monkeypatch.setattr(ad, "_owner_pid_is_alive", lambda pid: False)
+    assert ad.local_process_should_enqueue_delegation(42, local_pid=1) is True
+
+
+
 def test_reclaim_skips_after_delivery_delivered(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     import os

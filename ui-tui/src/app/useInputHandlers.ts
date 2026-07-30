@@ -350,7 +350,7 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
         sys: actions.sys
       })
 
-    if (isCtrl(key, ch, 'c') && live.sid && (live.busy || live.gatewayTurnRunning)) {
+    if ((key.escape || isCtrl(key, ch, 'c')) && live.sid && (live.busy || live.gatewayTurnRunning)) {
       return interruptCurrentTurn(live.sid)
     }
 
@@ -374,8 +374,8 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
     if (isBlocked) {
       // When approval/clarify/confirm overlays are active, their own useInput
       // handlers must receive keystrokes (arrow keys, numbers, Enter).  Only
-      // intercept Ctrl+C here so the user can deny/dismiss — all other keys
-      // fall through to the component-level handlers.
+      // intercept active-turn interrupt keys above, before blocked-overlay
+      // routing. All other keys fall through to the component-level handlers.
       //
       // Scroll inputs (wheel / PageUp / PageDown / Shift+↑↓) are special:
       // they must reach the transcript scroll handlers below even with a
@@ -540,10 +540,6 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
     // actually toggles recording in those UI states.
     if (key.escape && isVoiceToggleKey(key, ch, voice.recordKey)) {
       return voiceRecordToggle()
-    }
-
-    if (key.escape && live.sid && (live.busy || live.gatewayTurnRunning)) {
-      return interruptCurrentTurn(live.sid)
     }
 
     // Queue-edit cancel beats selection-clear for plain Esc: the queue header

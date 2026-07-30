@@ -40,6 +40,7 @@ import json
 import logging
 import os
 import sqlite3
+import sys
 import threading
 import time
 import uuid
@@ -503,16 +504,26 @@ def _owner_process_is_alive(
     try:
         from gateway.status import _pid_exists, get_process_start_time
     except Exception:
-        # Status helpers unavailable — best-effort kill(0).
+        # Status helpers unavailable — psutil is safe across platforms.
         try:
-            os.kill(pid, 0)
-            return True
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            return True
+            import psutil  # type: ignore
+
+            return bool(psutil.pid_exists(pid))
         except Exception:
-            return False
+            pass
+        # os.kill(pid, 0) sends CTRL_C_EVENT on Windows (bpo-14484). Without
+        # a safe liveness helper, preserve ownership rather than signal it.
+        if sys.platform != "win32":
+            try:
+                os.kill(pid, 0)  # windows-footgun: ok — explicit non-Windows branch
+                return True
+            except ProcessLookupError:
+                return False
+            except PermissionError:
+                return True
+            except OSError:
+                return False
+        return True
     if not _pid_exists(pid):
         return False
     if owner_started_at is None:

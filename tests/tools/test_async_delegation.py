@@ -1081,6 +1081,42 @@ def test_local_process_should_enqueue_rules(monkeypatch):
     assert ad.local_process_should_enqueue_delegation(42, 100, local_pid=1) is True
 
 
+def test_owner_liveness_uses_psutil_when_status_helpers_are_unavailable(monkeypatch):
+    import builtins
+    from types import SimpleNamespace
+
+    real_import = builtins.__import__
+
+    def blocked_status_import(name, *args, **kwargs):
+        if name == "gateway.status":
+            raise ImportError("status helpers unavailable")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", blocked_status_import)
+    monkeypatch.setitem(sys.modules, "psutil", SimpleNamespace(pid_exists=lambda pid: pid == 42))
+    monkeypatch.setattr(ad.os, "kill", lambda *_: pytest.fail("must not use os.kill"))
+
+    assert ad._owner_process_is_alive(42) is True
+    assert ad._owner_process_is_alive(43) is False
+
+
+def test_owner_liveness_windows_without_helpers_never_signals(monkeypatch):
+    import builtins
+
+    real_import = builtins.__import__
+
+    def blocked_helper_import(name, *args, **kwargs):
+        if name in {"gateway.status", "psutil"}:
+            raise ImportError(f"{name} unavailable")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", blocked_helper_import)
+    monkeypatch.setattr(ad.sys, "platform", "win32")
+    monkeypatch.setattr(ad.os, "kill", lambda *_: pytest.fail("must not use os.kill on Windows"))
+
+    assert ad._owner_process_is_alive(42) is True
+
+
 def test_poll_owner_local_reinjects_pending_for_idle_owner(tmp_path, monkeypatch):
     """Idle watcher helper reinjects owner-local durable pending without user prompt."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))

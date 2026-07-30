@@ -51,6 +51,29 @@ from hermes_cli.config import get_hermes_home
 logger = logging.getLogger(__name__)
 
 
+def _auto_background_wait_threshold() -> Optional[int]:
+    """Return the configured non-blocking wait threshold, if enabled."""
+    try:
+        from hermes_cli.config import apply_terminal_config_to_env
+
+        apply_terminal_config_to_env(env=None, override=False)
+    except Exception:
+        logger.debug("terminal wait policy config bridge failed", exc_info=True)
+
+    if os.getenv("TERMINAL_AUTO_BACKGROUND_LONG_TIMEOUT", "").lower() not in {
+        "true",
+        "1",
+        "yes",
+    }:
+        return None
+    try:
+        return max(
+            0, int(os.getenv("TERMINAL_AUTO_BACKGROUND_TIMEOUT_THRESHOLD", "600"))
+        )
+    except (TypeError, ValueError):
+        return 600
+
+
 # Checkpoint file for crash recovery (gateway only)
 CHECKPOINT_PATH = get_hermes_home() / "processes.json"
 
@@ -1612,6 +1635,20 @@ class ProcessRegistry:
         session = self.get(session_id)
         if session is None:
             return {"status": "not_found", "error": f"No process with ID {session_id}"}
+
+        auto_background_threshold = _auto_background_wait_threshold()
+        if (
+            auto_background_threshold is not None
+            and effective_timeout > auto_background_threshold
+            and not session.exited
+        ):
+            result = self.poll(session_id)
+            result["wait_skipped"] = (
+                f"Requested wait would block for up to {effective_timeout}s, above "
+                f"terminal.auto_background_timeout_threshold="
+                f"{auto_background_threshold}s; returned current status immediately."
+            )
+            return result
 
         deadline = time.monotonic() + effective_timeout
 

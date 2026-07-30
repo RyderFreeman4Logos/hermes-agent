@@ -106,6 +106,21 @@ class TestGetAndPoll:
         assert result["exit_code"] == 0
 
 
+def test_long_wait_returns_immediately_under_auto_background_policy(
+    monkeypatch, registry
+):
+    session = _make_session(sid="proc_nonblocking", output="still working")
+    registry._running[session.id] = session
+    monkeypatch.setattr(
+        "tools.process_registry._auto_background_wait_threshold", lambda: 19
+    )
+
+    result = registry.wait(session.id, timeout=60)
+
+    assert result["status"] == "running"
+    assert "threshold=19s" in result["wait_skipped"]
+
+
 def test_request_close_terminal_invokes_sink_without_killing(registry):
     """With a sink wired, close routes (session, process_id) to the UI and leaves
     the process running — close is a view drop, not a kill."""
@@ -1328,6 +1343,7 @@ class TestReaderLoopOrphanedPipe:
             except (ProcessLookupError, PermissionError):
                 pass
 
+
     def test_reader_exit_fires_notify_on_complete(self, registry):
         """The autonomous completion notification must not depend on a
         poll()/wait() call when an orphan holds the pipe."""
@@ -1368,4 +1384,3 @@ class TestReaderLoopOrphanedPipe:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
                 pass
-

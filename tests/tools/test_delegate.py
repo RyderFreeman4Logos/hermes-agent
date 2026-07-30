@@ -1141,6 +1141,61 @@ class TestDispatchDelegateTask(unittest.TestCase):
         self.assertNotIn("acp_command", captured["tasks"][0])
         self.assertNotIn("acp_args", captured["tasks"][0])
 
+    def test_force_background_never_falls_back_inline_at_capacity(self):
+        """Nested delegation returns immediately when the async pool is full."""
+        import tools.delegate_tool as dt
+
+        parent = _make_mock_parent(depth=1)
+        parent.session_id = "parent-session"
+        child = MagicMock()
+        child._delegate_role = "leaf"
+        child._subagent_id = "child-1"
+        run_child = MagicMock()
+        credentials = {
+            "model": "m",
+            "provider": None,
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+            "request_overrides": {},
+            "max_output_tokens": None,
+            "command": None,
+            "args": None,
+        }
+
+        with patch.object(
+            dt,
+            "_load_config",
+            return_value={
+                "force_background": True,
+                "max_spawn_depth": 2,
+                "max_concurrent_children": 1,
+            },
+        ), patch.object(
+            dt, "_resolve_delegation_credentials", return_value=credentials
+        ), patch.object(
+            dt, "_build_child_agent", return_value=child
+        ), patch.object(
+            dt, "_run_single_child", run_child
+        ), patch(
+            "tools.async_delegation.dispatch_async_delegation_batch",
+            return_value={
+                "status": "rejected",
+                "error": "Async delegation capacity reached (1 running).",
+            },
+        ):
+            result = json.loads(
+                dt.delegate_task(
+                    goal="nested work",
+                    background=False,
+                    parent_agent=parent,
+                )
+            )
+
+        self.assertIn("force_background=true", result["error"])
+        run_child.assert_not_called()
+        child.close.assert_called_once()
+
 class TestDelegateEventEnum(unittest.TestCase):
     """Tests for DelegateEvent enum and back-compat aliases."""
 

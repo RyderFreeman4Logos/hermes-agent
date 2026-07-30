@@ -177,6 +177,37 @@ class TestForegroundTimeoutCap:
         assert call_kwargs[1]["timeout"] == FOREGROUND_MAX_TIMEOUT
         assert "error" not in result or result["error"] is None
 
+    def test_configured_long_timeout_is_auto_backgrounded_with_notification(self):
+        """The opt-in threshold policy promotes the effective timeout."""
+        from tools.process_registry import process_registry
+        from tools.terminal_tool import terminal_tool
+
+        config = _make_env_config(
+            timeout=180,
+            auto_background_long_timeout=True,
+            auto_background_timeout_threshold=19,
+            default_notify_on_background=True,
+        )
+        mock_env = MagicMock()
+        mock_env.env = {}
+        proc = MagicMock()
+        proc.id = "proc_auto"
+        proc.pid = 123
+        proc.watcher_platform = ""
+
+        with patch("tools.terminal_tool._get_env_config", return_value=config), \
+             patch("tools.terminal_tool._start_cleanup_thread"), \
+             patch("tools.terminal_tool._active_environments", {"default": mock_env}), \
+             patch("tools.terminal_tool._last_activity", {"default": 0}), \
+             patch("tools.terminal_tool._check_all_guards", return_value={"approved": True}), \
+             patch.object(process_registry, "spawn_local", return_value=proc):
+            result = json.loads(terminal_tool(command="sleep 60", timeout=60))
+
+        assert result["auto_backgrounded"] is True
+        assert result["auto_background_threshold"] == 19
+        assert result["notify_on_complete"] is True
+        mock_env.execute.assert_not_called()
+
 
 class TestForegroundMaxTimeoutConstant:
     """Verify the FOREGROUND_MAX_TIMEOUT constant and schema."""

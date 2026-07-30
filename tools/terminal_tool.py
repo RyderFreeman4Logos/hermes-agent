@@ -2738,6 +2738,9 @@ def terminal_tool(
                     "exit_code": 0,
                     "error": None,
                 }
+                if auto_promoted:
+                    result_data["auto_backgrounded"] = True
+                    result_data["auto_background_threshold"] = auto_bg_threshold
                 # Background spawns detached and returns exit_code 0 immediately;
                 # it never inline-polls is_interrupted(), so the stale-bit kill
                 # cannot occur here and this note never co-occurs with rc=130.

@@ -3267,6 +3267,14 @@ def delegate_task(
 
         if not _async_ok:
             if force_background:
+                for _, _, _c in children:
+                    try:
+                        _c.close()
+                    except Exception:
+                        logger.debug(
+                            "Failed to close undispatched child agent",
+                            exc_info=True,
+                        )
                 return json.dumps(
                     {
                         "status": "rejected",
@@ -3461,13 +3469,38 @@ def delegate_task(
         # never accepted, so re-attaching isn't needed). The force contract
         # rejects instead of taking the historical inline fallback.
         if force_background:
+            error = dispatch.get("error", "rejected")
+            rejected_results = []
+            for _idx, _, _c in children:
+                entry = {
+                    "task_index": _idx,
+                    "status": "not_started",
+                    "error": error,
+                }
+                rejected_results.append(entry)
+                if _idx < len(live_writers) and live_writers[_idx] is not None:
+                    try:
+                        live_writers[_idx].finalize(entry)
+                    except Exception:
+                        logger.debug(
+                            "Live transcript finalize failed",
+                            exc_info=True,
+                        )
+                try:
+                    _c.close()
+                except Exception:
+                    logger.debug(
+                        "Failed to close undispatched child agent",
+                        exc_info=True,
+                    )
+            update_manifest_statuses(live_deleg_id, rejected_results)
             return json.dumps(
                 {
                     "status": "rejected",
                     "mode": "background",
                     "error": (
                         "delegation.force_background=true did not start work because "
-                        f"the async delegation pool rejected it: {dispatch.get('error', 'rejected')}"
+                        f"the async delegation pool rejected it: {error}"
                     ),
                     "note": (
                         "The child was not started, so the orchestrator/main agent "

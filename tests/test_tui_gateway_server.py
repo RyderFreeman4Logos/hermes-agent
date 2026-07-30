@@ -9212,7 +9212,10 @@ def test_session_undo_allowed_when_idle():
 
 
 def test_session_compress_rejects_while_running(monkeypatch):
-    server._sessions["sid"] = _session(running=True)
+    server._sessions["sid"] = _session(
+        running=True,
+        _run_thread=threading.current_thread(),
+    )
     try:
         resp = server.handle_request(
             {"id": "1", "method": "session.compress", "params": {"session_id": "sid"}}
@@ -9221,6 +9224,65 @@ def test_session_compress_rejects_while_running(monkeypatch):
         assert resp["error"]["code"] == 4009
     finally:
         server._sessions.pop("sid", None)
+
+
+def test_session_compress_preserves_prompt_accepted_before_worker_start(monkeypatch):
+    """Compression must not clear a prompt accepted before its worker starts."""
+    accepted = threading.Event()
+    release_start = threading.Event()
+    turn_ran = threading.Event()
+    response = {}
+    session = _session(agent=types.SimpleNamespace())
+    server._sessions["sid"] = session
+
+    def pause_after_accept(_session):
+        accepted.set()
+        assert release_start.wait(2), "test did not release prompt startup"
+
+    def finish_turn(_rid, _sid, current, _text):
+        turn_ran.set()
+        with current["history_lock"]:
+            current["running"] = False
+            server._clear_inflight_turn(current)
+
+    monkeypatch.setattr(server, "_ensure_session_db_row", pause_after_accept)
+    monkeypatch.setattr(server, "_persist_branch_seed", lambda _session: None)
+    monkeypatch.setattr(server, "_start_agent_build", lambda _sid, _session: None)
+    monkeypatch.setattr(server, "_run_prompt_submit", finish_turn)
+
+    submitter = threading.Thread(
+        target=lambda: response.update(
+            server.handle_request(
+                {
+                    "id": "prompt",
+                    "method": "prompt.submit",
+                    "params": {"session_id": "sid", "text": "keep this prompt"},
+                }
+            )
+        )
+    )
+    submitter.start()
+    try:
+        assert accepted.wait(2), "prompt did not reach the pre-worker window"
+        compressed = server.handle_request(
+            {
+                "id": "compress",
+                "method": "session.compress",
+                "params": {"session_id": "sid"},
+            }
+        )
+
+        assert compressed["error"]["code"] == 4009
+        assert session["running"] is True
+        assert session["inflight_turn"]["user"] == "keep this prompt"
+    finally:
+        release_start.set()
+        submitter.join(timeout=2)
+        server._sessions.pop("sid", None)
+
+    assert not submitter.is_alive()
+    assert response["result"]["status"] == "streaming"
+    assert turn_ran.wait(2)
 
 
 def test_rollback_restore_rejects_full_history_while_running(monkeypatch):

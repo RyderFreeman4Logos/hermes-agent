@@ -7067,8 +7067,10 @@ def _turn_worker_is_alive(worker: Any) -> bool:
 
 
 def _clear_stale_running_for_compress(session: dict) -> bool:
-    """Clear a stranded running marker only when no turn worker is alive."""
+    """Clear a stranded marker only when no worker start or worker is live."""
     if not session.get("running"):
+        return False
+    if session.get("_turn_worker_start_pending"):
         return False
     if _turn_worker_is_alive(session.get("_run_thread")) or _turn_worker_is_alive(
         session.get("_agent_build_thread")
@@ -7076,6 +7078,8 @@ def _clear_stale_running_for_compress(session: dict) -> bool:
         return False
     with session["history_lock"]:
         if not session.get("running"):
+            return False
+        if session.get("_turn_worker_start_pending"):
             return False
         if _turn_worker_is_alive(session.get("_run_thread")) or _turn_worker_is_alive(
             session.get("_agent_build_thread")

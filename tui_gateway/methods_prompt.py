@@ -218,13 +218,21 @@ def _(rid, params: dict) -> dict:
                 except Exception as exc:
                     print(f"[tui_gateway] prompt.submit: replace_messages failed: {exc}", file=sys.stderr)
         session["running"] = True
+        session["_turn_worker_start_pending"] = True
         session["_turn_cancel_requested"] = False
         session["last_active"] = time.time()
         _start_inflight_turn(session, text)
 
     if turn_isolation:
-        isolated_response = _submit_prompt_to_compute_host(rid, sid, session, text)
+        try:
+            isolated_response = _submit_prompt_to_compute_host(rid, sid, session, text)
+        except Exception:
+            with session["history_lock"]:
+                session["_turn_worker_start_pending"] = False
+            raise
         if not isolated_response.get("error"):
+            with session["history_lock"]:
+                session["_turn_worker_start_pending"] = False
             return isolated_response
         logger.warning(
             "compute-host dispatch failed for session %s; falling back inline: %s",
@@ -233,11 +241,16 @@ def _(rid, params: dict) -> dict:
         )
 
     # Persist the DB row lazily, now that the user has actually sent a message.
-    _ensure_session_db_row(session)
-    # A branch becomes real here: copy its parent's transcript into the row so it
-    # resumes with full context (the agent won't persist the seed itself).
-    _persist_branch_seed(session)
-    _start_agent_build(sid, session)
+    try:
+        _ensure_session_db_row(session)
+        # A branch becomes real here: copy its parent's transcript into the row
+        # so it resumes with full context.
+        _persist_branch_seed(session)
+        _start_agent_build(sid, session)
+    except Exception:
+        with session["history_lock"]:
+            session["_turn_worker_start_pending"] = False
+        raise
 
     def run_after_agent_ready() -> None:
         # Patient wait (#63078): the user's message is already the accepted
@@ -282,11 +295,15 @@ def _(rid, params: dict) -> dict:
                 return
         _run_prompt_submit(rid, sid, session, text)
 
-    run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
-    # Keep a handle so session.interrupt can tell a live turn from a stuck
-    # `running` flag (a turn that died without clearing it) and recover the latter.
-    session["_run_thread"] = run_thread
-    run_thread.start()
+    try:
+        run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
+        # Keep a handle so session.interrupt can distinguish a live turn from
+        # a stale running flag.
+        session["_run_thread"] = run_thread
+        run_thread.start()
+    finally:
+        with session["history_lock"]:
+            session["_turn_worker_start_pending"] = False
     return _ok(rid, {"status": "streaming"})
 
 

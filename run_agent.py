@@ -613,12 +613,12 @@ class AIAgent:
             logger.debug("SessionDB unavailable for recall", exc_info=True)
             return None
 
-    def _ensure_db_session(self) -> None:
+    def _ensure_db_session(self) -> bool:
         """Create session DB row on first use. Disables _session_db on failure."""
         if getattr(self, "_persist_disabled", False):
-            return
+            return True
         if self._session_db_created or not self._session_db:
-            return
+            return True
         source = _session_source_for_agent(self.platform)
         try:
             try:
@@ -640,12 +640,15 @@ class AIAgent:
                 profile_name=_profile_for_session,
             )
             self._session_db_created = True
+            return True
         except Exception as e:
             # Transient failure (e.g. SQLite lock). Keep _session_db alive —
             # _session_db_created stays False so next run_conversation() retries.
             logger.warning(
                 "Session DB creation failed (will retry next turn): %s", e
             )
+            self._last_session_persistence_error = str(e)
+            return False
 
     def _transition_context_engine_session(
         self,
@@ -1839,24 +1842,26 @@ class AIAgent:
 
         persist_lock = getattr(self, "_session_persist_lock", None)
 
-        def _persist_and_drain() -> None:
+        def _persist_and_drain() -> bool:
             self._drop_trailing_empty_response_scaffolding(messages)
             self._session_messages = messages
             self._save_session_log(messages)
-            self._flush_messages_to_session_db(messages, conversation_history)
+            persisted = self._flush_messages_to_session_db(
+                messages, conversation_history
+            )
             # Drain async token-accounting deltas at every persist point (turn
             # finalize + error exits) so a crash after this line loses at most
             # the in-flight API call's delta. Cheap no-op when nothing queued.
             if self._session_db is not None:
                 self._session_db.flush_token_counts()
             note_turn_persisted(self)
+            return persisted is not False
 
         if persist_lock is None:
-            _persist_and_drain()
-            return
+            return _persist_and_drain()
 
         with persist_lock:
-            _persist_and_drain()
+            return _persist_and_drain()
 
     def _drop_trailing_empty_response_scaffolding(self, messages: List[Dict]) -> None:
         """Remove private empty-response retry/failure scaffolding from transcript tails.
@@ -2191,6 +2196,7 @@ class AIAgent:
             # leaves messages with mixed dispositions.
             self._db_flush_scan_prefix = None
             logger.warning("Session DB append_message failed: %s", e)
+            self._last_session_persistence_error = str(e)
             return False
 
     def _get_messages_up_to_last_assistant(self, messages: List[Dict]) -> List[Dict]:

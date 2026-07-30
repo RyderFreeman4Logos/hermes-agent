@@ -1223,9 +1223,33 @@ def build_turn_context(
     # Keep row creation and the marker-based append in the same per-agent
     # critical section as CLI close persistence, and retry the row create if
     # the pre-compression attempt above failed transiently.
+    def _turn_start_persistence_error() -> str:
+        db = getattr(agent, "_session_db", None)
+        db_path = getattr(db, "db_path", "state.db")
+        detail = getattr(agent, "_last_session_persistence_error", "database is busy")
+        budget = getattr(agent, "_persistence_budget_s", None)
+        budget_text = f" within the {budget:.0f}s budget" if budget else ""
+        return (
+            f"state DB persistence failed{budget_text} before the first model "
+            f"call ({db_path}): "
+            f"{detail}. No tools were run. Retry when the DB is available, use an "
+            "isolated HERMES_HOME, or pass --no-session-persistence for an "
+            "explicitly stateless run."
+        )
+
     def _ensure_and_persist() -> None:
-        agent._ensure_db_session()
-        agent._persist_session(messages, conversation_history)
+        session_ready = agent._ensure_db_session()
+        if (
+            session_ready is False
+            and getattr(agent, "_fail_on_turn_start_persistence", False)
+        ):
+            raise RuntimeError(_turn_start_persistence_error())
+        persisted = agent._persist_session(messages, conversation_history)
+        if (
+            persisted is False
+            and getattr(agent, "_fail_on_turn_start_persistence", False)
+        ):
+            raise RuntimeError(_turn_start_persistence_error())
 
     try:
         if persist_lock is None:
@@ -1239,6 +1263,8 @@ def build_turn_context(
             agent.session_id or "none",
             exc_info=True,
         )
+        if getattr(agent, "_fail_on_turn_start_persistence", False):
+            raise
     finally:
         # Keep an unmarked staged input available to a later close retry if the
         # normal persistence attempt failed. Once the marker is present, the

@@ -23,13 +23,17 @@ from __future__ import annotations
 
 import logging
 import os
+import sqlite3
 import sys
+import time
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Optional
 
 from gateway.session_context import declare_stateless_channel
 from hermes_cli.fallback_config import get_fallback_chain
+
+_PERSISTENCE_BUDGET_S = 10.0
 
 
 def _normalize_toolsets(toolsets: object = None) -> list[str] | None:
@@ -173,6 +177,7 @@ def run_oneshot(
     provider: Optional[str] = None,
     toolsets: object = None,
     usage_file: Optional[str] = None,
+    no_session_persistence: bool = False,
 ) -> int:
     """Execute a single prompt and print only the final content block.
 
@@ -187,6 +192,8 @@ def run_oneshot(
             cost, token counts, model, api_calls) is written there after the
             run — even when the run fails — so pipelines can account for
             spend per invocation.
+        no_session_persistence: Do not open or write state.db. Session recall
+            is unavailable and the run cannot be resumed.
 
     Returns the exit code.  The caller owns process termination.
     """
@@ -248,6 +255,7 @@ def run_oneshot(
                     provider=provider,
                     toolsets=explicit_toolsets,
                     use_config_toolsets=use_config_toolsets,
+                    no_session_persistence=no_session_persistence,
                 )
             except BaseException as exc:  # noqa: BLE001
                 # Capture anything that escapes the agent (including OSError
@@ -277,6 +285,16 @@ def run_oneshot(
 
     _write_usage_file(usage_file, result)
 
+    if result.get("turn_exit_reason") == "session_persistence_failed":
+        real_stderr.write(
+            "hermes -z: session persistence failed; stopping before further "
+            "tool side effects. "
+            "Retry when state.db is available, use an isolated HERMES_HOME, "
+            "or pass --no-session-persistence for an explicitly stateless run.\n"
+        )
+        real_stderr.flush()
+        return 2
+
     if response:
         real_stdout.write(response)
         if not response.endswith("\n"):
@@ -284,6 +302,10 @@ def run_oneshot(
         real_stdout.flush()
 
     if (result.get("failed") or result.get("partial")) and not (response or "").strip():
+        reason = result.get("error") or result.get("turn_exit_reason")
+        if reason:
+            real_stderr.write(f"hermes -z: {reason}\n")
+            real_stderr.flush()
         return 2
 
     if not (response or "").strip():
@@ -295,7 +317,7 @@ def run_oneshot(
 
 
 def _create_session_db_for_oneshot():
-    """Best-effort SessionDB for ``hermes -z`` / oneshot mode.
+    """Budgeted SessionDB for ``hermes -z`` / oneshot mode.
 
     Oneshot bypasses ``HermesCLI._init_agent()``, so it must wire the SQLite
     session store itself. Without this, the ``session_search``/recall tool is
@@ -304,10 +326,46 @@ def _create_session_db_for_oneshot():
     try:
         from hermes_state import SessionDB
 
-        return SessionDB()
+        class _BudgetedSessionDB(SessionDB):
+            _WRITE_PATIENCE_S = _PERSISTENCE_BUDGET_S
+            _TRANSCRIPT_WRITE_PATIENCE_S = _PERSISTENCE_BUDGET_S
+
+            def __init__(self):
+                self._oneshot_persistence_deadline = (
+                    time.monotonic() + _PERSISTENCE_BUDGET_S
+                )
+                self._oneshot_persistence_exhausted = False
+                super().__init__()
+
+            def _execute_write(self, fn, patience_s=None):
+                if self._oneshot_persistence_exhausted:
+                    raise sqlite3.OperationalError(
+                        "database is locked (one-shot persistence budget exhausted)"
+                    )
+                remaining = max(
+                    0.0, self._oneshot_persistence_deadline - time.monotonic()
+                )
+                if patience_s is None:
+                    patience_s = self._WRITE_PATIENCE_S
+                try:
+                    return super()._execute_write(
+                        fn, patience_s=min(patience_s, remaining)
+                    )
+                except sqlite3.OperationalError as exc:
+                    error = str(exc).lower()
+                    if "locked" in error or "busy" in error:
+                        self._oneshot_persistence_exhausted = True
+                    raise
+
+        return _BudgetedSessionDB()
     except Exception as exc:
-        logging.debug("SQLite session store not available for oneshot mode: %s", exc)
-        return None
+        raise RuntimeError(
+            f"state DB persistence unavailable within the "
+            f"{_PERSISTENCE_BUDGET_S:.0f}s one-shot budget: {exc}. "
+            "No model call or tools were run. Retry when the DB is available, "
+            "use an isolated HERMES_HOME, or pass --no-session-persistence for "
+            "an explicitly stateless run."
+        ) from exc
 
 
 def _run_agent(
@@ -316,6 +374,7 @@ def _run_agent(
     provider: Optional[str] = None,
     toolsets: object = None,
     use_config_toolsets: bool = True,
+    no_session_persistence: bool = False,
 ) -> tuple[str, dict]:
     """Build an AIAgent exactly like a normal CLI chat turn would, then
     run a single conversation.  Returns ``(final_response, run_result)``."""
@@ -395,7 +454,7 @@ def _run_agent(
     if toolsets_list is None and use_config_toolsets:
         toolsets_list = sorted(_get_platform_tools(cfg, "cli"))
 
-    session_db = _create_session_db_for_oneshot()
+    session_db = None if no_session_persistence else _create_session_db_for_oneshot()
     # The try spans agent construction (not just ``chat``) so the SQLite store
     # opened above is always closed — including when ``AIAgent(...)`` itself
     # raises on a provider/config error. The one-shot exit path hard-exits via
@@ -415,6 +474,7 @@ def _run_agent(
             api_mode=runtime.get("api_mode"),
             model=effective_model,
             enabled_toolsets=toolsets_list,
+            disabled_toolsets=["session_search"] if no_session_persistence else None,
             quiet_mode=True,
             platform="cli",
             session_db=session_db,
@@ -439,6 +499,10 @@ def _run_agent(
         agent.suppress_status_output = True
         agent.stream_delta_callback = None
         agent.tool_gen_callback = None
+        agent._fail_on_turn_start_persistence = not no_session_persistence
+        agent._persistence_budget_s = _PERSISTENCE_BUDGET_S
+        if no_session_persistence:
+            agent._persist_disabled = True
 
         result = agent.run_conversation(prompt)
         return (result.get("final_response") or "", result)

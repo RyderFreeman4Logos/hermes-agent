@@ -309,6 +309,20 @@ def test_ensure_db_session_runs_after_system_prompt_restore():
     assert agent._cached_system_prompt == "REBUILT-SYSTEM"
 
 
+def test_oneshot_turn_start_persistence_failure_propagates_before_model():
+    agent = _FakeAgent()
+    agent._fail_on_turn_start_persistence = True
+    agent._persistence_budget_s = 10.0
+    agent._session_db = types.SimpleNamespace(db_path="/tmp/state.db")
+    agent._last_session_persistence_error = "database is locked"
+    agent._ensure_db_session = lambda: False
+
+    with pytest.raises(RuntimeError, match="10s budget.*No tools were run"):
+        _build(agent)
+
+    assert agent._persist_calls == 0
+
+
 # ── Between-turns MCP refresh (cache-safe late-binding) ──────────────────────
 #
 # A slow MCP server that connects after the agent's build-time tool snapshot
@@ -331,7 +345,6 @@ def test_between_turns_refresh_adds_late_tool_when_servers_registered():
 
     assert "mcp_x_tool" in agent.valid_tool_names
     assert any(t["function"]["name"] == "mcp_x_tool" for t in agent.tools)
-
 
 
 

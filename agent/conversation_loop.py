@@ -1004,8 +1004,9 @@ def run_conversation(
         persist_user_message = user_message
 
     # A heartbeat warm turn is a deliberately ephemeral cache exercise. Defer
-    # the crash-resilience write until the finalizer can distinguish a visible
-    # response from its allowed silent no-op result.
+    # the crash-resilience write and every pre-provider compaction boundary
+    # until the finalizer can distinguish a visible response from its allowed
+    # silent no-op result.
     _defer_heartbeat_warm_persistence = (
         turn_origin == "heartbeat_warm" and allow_silent_noop is True
     )
@@ -1726,7 +1727,8 @@ def run_conversation(
             _compressor, "get_active_compression_failure_cooldown", lambda: None
         )()
         if (
-            agent.compression_enabled
+            not _defer_heartbeat_warm_persistence
+            and agent.compression_enabled
             and len(messages) > 1
             and compression_attempts < max_compression_attempts
             and not _preflight_compression_blocked

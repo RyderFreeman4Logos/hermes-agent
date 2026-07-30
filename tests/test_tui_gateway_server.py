@@ -3592,6 +3592,51 @@ def test_notification_poller_heartbeat_alive_idle_warms_cache(monkeypatch):
         server._sessions.pop(sid, None)
 
 
+def test_notification_poller_shutdown_drain_routes_heartbeat_to_special_handler(monkeypatch):
+    """Shutdown drain must preserve a heartbeat instead of dropping its None formatter result."""
+    import queue as _queue_mod
+
+    from tools import process_registry as process_registry_module
+    from tools.process_registry import process_registry
+
+    sid = "heartbeat-shutdown-sid"
+    session = _session(session_key="heartbeat-owner")
+    event = _heartbeat_event()
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    isolated_queue.put(event)
+    handled = []
+    formatted = []
+
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(
+        server,
+        "_handle_heartbeat_event",
+        lambda handled_sid, handled_session, handled_event: handled.append(
+            (handled_sid, handled_session, handled_event)
+        ),
+    )
+    monkeypatch.setattr(
+        process_registry_module,
+        "format_process_notification",
+        lambda formatted_event: formatted.append(formatted_event),
+    )
+    server._sessions[sid] = session
+    stop = threading.Event()
+    stop.set()
+
+    try:
+        server._notification_poller_loop(stop, sid, session)
+
+        assert handled == [(sid, session, event)]
+        assert formatted == []
+        assert isolated_queue.empty()
+    finally:
+        server._sessions.pop(sid, None)
+        while not isolated_queue.empty():
+            isolated_queue.get_nowait()
+
+
 def test_heartbeat_alive_while_running_emits_status_without_warm_turn(monkeypatch):
     """A busy agent is already warm, so a heartbeat only updates TUI status."""
     session = _session(session_key="heartbeat-owner", running=True)

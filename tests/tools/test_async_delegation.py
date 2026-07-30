@@ -65,6 +65,16 @@ def _drain_for(delegation_id, timeout=5.0):
     return None
 
 
+def _durable_task(delegation_id):
+    with ad._DB_LOCK, ad._transaction() as conn:
+        row = conn.execute(
+            "SELECT task_json FROM async_delegations WHERE delegation_id=?",
+            (delegation_id,),
+        ).fetchone()
+    assert row is not None
+    return json.loads(row[0])
+
+
 def test_dispatch_returns_immediately_without_blocking():
     gate = threading.Event()
 
@@ -96,6 +106,7 @@ def test_async_dispatch_rearms_heartbeat_while_completion_delivery_is_pending(mo
     from tools.runtime_heartbeat import runtime_heartbeat
 
     armed, cancelled = [], []
+    monkeypatch.setattr("tools.runtime_heartbeat.get_current_provider", lambda: "custom:test-provider")
     monkeypatch.setattr(runtime_heartbeat, "arm", lambda *args, **kwargs: armed.append((args, kwargs)) or True)
     monkeypatch.setattr(runtime_heartbeat, "cancel", lambda target_id: cancelled.append(target_id) or True)
     gate = threading.Event()
@@ -109,14 +120,69 @@ def test_async_dispatch_rearms_heartbeat_while_completion_delivery_is_pending(mo
         session_key="caller", runner=runner,
         max_async_children=1,
     )
-    assert armed[0][0] == (result["delegation_id"],)
-    assert armed[0][1]["caller_id"] == "caller"
+    running_arm = next(
+        call
+        for call in armed
+        if call[0] == (result["delegation_id"],)
+        and call[1]["kind"] == "delegation"
+    )
+    assert running_arm[1]["caller_id"] == "caller"
+    assert running_arm[1]["provider"] == "custom:test-provider"
+    assert _durable_task(result["delegation_id"])["provider"] == "custom:test-provider"
     gate.set()
     assert _drain_for(result["delegation_id"]) is not None
     assert cancelled == [result["delegation_id"]]
-    assert armed[1][0] == (result["delegation_id"],)
-    assert armed[1][1]["caller_id"] == "caller"
-    assert armed[1][1]["kind"] == "async_delivery"
+    delivery_arm = next(
+        call
+        for call in armed
+        if call[0] == (result["delegation_id"],)
+        and call[1]["kind"] == "async_delivery"
+    )
+    assert delivery_arm[1]["caller_id"] == "caller"
+    assert delivery_arm[1]["provider"] == "custom:test-provider"
+
+
+def test_async_batch_persists_provider_for_delivery_heartbeat(monkeypatch):
+    from tools.runtime_heartbeat import runtime_heartbeat
+
+    armed = []
+    monkeypatch.setattr("tools.runtime_heartbeat.get_current_provider", lambda: "custom:batch-provider")
+    monkeypatch.setattr(runtime_heartbeat, "arm", lambda *args, **kwargs: armed.append((args, kwargs)) or True)
+    monkeypatch.setattr(runtime_heartbeat, "cancel", lambda _target_id: True)
+    gate = threading.Event()
+
+    def runner():
+        gate.wait(2)
+        return {"results": [{"status": "completed", "summary": "done"}]}
+
+    result = ad.dispatch_async_delegation_batch(
+        goals=["heartbeat batch"],
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="caller",
+        runner=runner,
+        max_async_children=1,
+    )
+    running_arm = next(
+        call
+        for call in armed
+        if call[0] == (result["delegation_id"],)
+        and call[1]["kind"] == "delegation"
+    )
+    assert running_arm[1]["provider"] == "custom:batch-provider"
+    assert _durable_task(result["delegation_id"])["provider"] == "custom:batch-provider"
+
+    gate.set()
+    assert _drain_for(result["delegation_id"]) is not None
+    delivery_arm = next(
+        call
+        for call in armed
+        if call[0] == (result["delegation_id"],)
+        and call[1]["kind"] == "async_delivery"
+    )
+    assert delivery_arm[1]["provider"] == "custom:batch-provider"
 
 
 def test_async_executor_workers_are_daemon_threads():

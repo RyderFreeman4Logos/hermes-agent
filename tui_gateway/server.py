@@ -6623,13 +6623,17 @@ def _turn_worker_is_alive(worker: Any) -> bool:
 def _clear_stale_running_for_compress(session: dict) -> bool:
     """Clear a stranded ``running`` marker when no turn can still use history.
 
-    ``prompt.submit`` installs either ``_agent_build_thread`` or ``_run_thread``
-    before it returns.  A session that reports running with neither live is
-    therefore a completed/crashed turn whose cleanup was skipped, not a turn
-    that compression could safely interrupt.  Clear only that stale state;
-    genuine live workers keep the 4009 guard below.
+    ``prompt.submit`` marks the worker-start phase pending atomically with
+    ``running=True``, then installs either ``_agent_build_thread`` or
+    ``_run_thread`` before it returns.  A session that reports running with no
+    pending start and neither worker live is therefore a completed/crashed turn
+    whose cleanup was skipped, not a turn that compression could safely
+    interrupt.  Clear only that stale state; genuine live or accepted-pending
+    workers keep the 4009 guard below.
     """
     if not session.get("running"):
+        return False
+    if session.get("_turn_worker_start_pending"):
         return False
     if _turn_worker_is_alive(session.get("_run_thread")) or _turn_worker_is_alive(
         session.get("_agent_build_thread")
@@ -6638,6 +6642,8 @@ def _clear_stale_running_for_compress(session: dict) -> bool:
 
     with session["history_lock"]:
         if not session.get("running"):
+            return False
+        if session.get("_turn_worker_start_pending"):
             return False
         if _turn_worker_is_alive(session.get("_run_thread")) or _turn_worker_is_alive(
             session.get("_agent_build_thread")
@@ -11109,13 +11115,23 @@ def _(rid, params: dict) -> dict:
                 except Exception as exc:
                     print(f"[tui_gateway] prompt.submit: replace_messages failed: {exc}", file=sys.stderr)
         session["running"] = True
+        session["_turn_worker_start_pending"] = True
         session["_turn_cancel_requested"] = False
         session["last_active"] = time.time()
         _start_inflight_turn(session, text)
 
     if turn_isolation:
-        isolated_response = _submit_prompt_to_compute_host(rid, sid, session, text)
+        try:
+            isolated_response = _submit_prompt_to_compute_host(
+                rid, sid, session, text
+            )
+        except Exception:
+            with session["history_lock"]:
+                session["_turn_worker_start_pending"] = False
+            raise
         if not isolated_response.get("error"):
+            with session["history_lock"]:
+                session["_turn_worker_start_pending"] = False
             return isolated_response
         logger.warning(
             "compute-host dispatch failed for session %s; falling back inline: %s",
@@ -11124,11 +11140,17 @@ def _(rid, params: dict) -> dict:
         )
 
     # Persist the DB row lazily, now that the user has actually sent a message.
-    _ensure_session_db_row(session)
-    # A branch becomes real here: copy its parent's transcript into the row so it
-    # resumes with full context (the agent won't persist the seed itself).
-    _persist_branch_seed(session)
-    _start_agent_build(sid, session)
+    try:
+        _ensure_session_db_row(session)
+        # A branch becomes real here: copy its parent's transcript into the row
+        # so it resumes with full context (the agent won't persist the seed
+        # itself).
+        _persist_branch_seed(session)
+        _start_agent_build(sid, session)
+    except Exception:
+        with session["history_lock"]:
+            session["_turn_worker_start_pending"] = False
+        raise
 
     def run_after_agent_ready() -> None:
         # Patient wait (#63078): the user's message is already the accepted
@@ -11173,11 +11195,16 @@ def _(rid, params: dict) -> dict:
                 return
         _run_prompt_submit(rid, sid, session, text)
 
-    run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
-    # Keep a handle so session.interrupt can tell a live turn from a stuck
-    # `running` flag (a turn that died without clearing it) and recover the latter.
-    session["_run_thread"] = run_thread
-    run_thread.start()
+    try:
+        run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
+        # Keep a handle so session.interrupt can tell a live turn from a stuck
+        # `running` flag (a turn that died without clearing it) and recover the
+        # latter.
+        session["_run_thread"] = run_thread
+        run_thread.start()
+    finally:
+        with session["history_lock"]:
+            session["_turn_worker_start_pending"] = False
     return _ok(rid, {"status": "streaming"})
 
 

@@ -25,6 +25,7 @@ def _persist_pending_with_missing_event_routing(tmp_path, monkeypatch):
         "origin_session_id": "",
         "dispatched_at": 1.0,
         "goal": "finish the background task",
+        "provider": "custom:test-provider",
     }
     ad._persist_dispatch(record)
     # Simulate the residual #28 payload: the durable row has routing, but the
@@ -103,6 +104,7 @@ def test_pending_delivery_heartbeat_wakes_only_the_rightful_parent(tmp_path, mon
     assert armed[0][0] == (delegation_id,)
     assert armed[0][1]["caller_id"] == "parent-key"
     assert armed[0][1]["kind"] == "async_delivery"
+    assert armed[0][1]["provider"] == "custom:test-provider"
 
     owner = {
         "session_key": "parent-key",

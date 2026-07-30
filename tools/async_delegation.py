@@ -1313,6 +1313,9 @@ def dispatch_async_delegation(
     """
     delegation_id = _new_delegation_id()
     dispatched_at = time.time()
+    from tools.runtime_heartbeat import get_current_provider
+
+    provider = get_current_provider()
     record: Dict[str, Any] = {
         "delegation_id": delegation_id,
         "goal": goal,
@@ -1320,6 +1323,7 @@ def dispatch_async_delegation(
         "toolsets": list(toolsets) if toolsets else None,
         "role": role,
         "model": model,
+        "provider": provider,
         "session_key": session_key,
         "origin_ui_session_id": origin_ui_session_id,
         "origin_session_id": origin_session_id,
@@ -1387,7 +1391,6 @@ def dispatch_async_delegation(
     # Async delegations use the same per-target lifecycle as managed
     # terminal work. Completion cancels this ID only (in _finalize).
     from tools.runtime_heartbeat import (
-        get_current_provider,
         inspect_delegation,
         runtime_heartbeat,
     )
@@ -1395,7 +1398,7 @@ def dispatch_async_delegation(
         delegation_id,
         caller_id=session_key,
         kind="delegation",
-        provider=get_current_provider(),
+        provider=provider,
         inspect=lambda _id=delegation_id: inspect_delegation(_id),
     )
 
@@ -1548,6 +1551,9 @@ def dispatch_async_delegation_batch(
     """
     delegation_id = delegation_id or _new_delegation_id()
     dispatched_at = time.time()
+    from tools.runtime_heartbeat import get_current_provider
+
+    provider = get_current_provider()
     n = len(goals)
     # A combined goal label for status listings / the completion header.
     combined_goal = (
@@ -1561,6 +1567,7 @@ def dispatch_async_delegation_batch(
         "toolsets": list(toolsets) if toolsets else None,
         "role": role,
         "model": model,
+        "provider": provider,
         "session_key": session_key,
         "origin_ui_session_id": origin_ui_session_id,
         "origin_session_id": origin_session_id,
@@ -1632,7 +1639,6 @@ def dispatch_async_delegation_batch(
         }
 
     from tools.runtime_heartbeat import (
-        get_current_provider,
         inspect_delegation,
         runtime_heartbeat,
     )
@@ -1640,7 +1646,7 @@ def dispatch_async_delegation_batch(
         delegation_id,
         caller_id=session_key,
         kind="delegation",
-        provider=get_current_provider(),
+        provider=provider,
         inspect=lambda _id=delegation_id: inspect_delegation(_id),
     )
 

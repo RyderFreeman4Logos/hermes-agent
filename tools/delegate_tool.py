@@ -3677,6 +3677,12 @@ def _resolve_delegation_credentials(
     precedence over the global delegation fields (back-compatible: an unknown
     profile name is ignored and the global config is used).
 
+    ``model_profile`` is optional in the model-facing schema. When omitted
+    (or ``None``), this function first falls back to
+    ``delegation.default_profile`` (if set to a known profile name) before
+    degrading to the global / parent delegation model/provider. That keeps
+    empty-pool and upstream-style configs working without forcing a profile.
+
     If ``delegation.base_url`` is configured, subagents use that direct
     OpenAI-compatible endpoint. ``delegation.api_key`` overrides the key; when
     omitted, ``api_key`` is returned as ``None`` so ``_build_child_agent``
@@ -3696,6 +3702,8 @@ def _resolve_delegation_credentials(
     Raises ValueError with a user-friendly message on credential failure.
     """
     # Named model-pool profile overlays the global delegation config.
+    # model_profile is optional: fall back to configured default_profile,
+    # then to global/parent delegation credentials when neither is set.
     if not model_profile:
         default_profile = str(cfg.get("default_profile") or "").strip()
         if default_profile:
@@ -4153,15 +4161,35 @@ def _build_dynamic_schema_overrides() -> dict:
     # first (the outer copy above is shallow) so we don't mutate the static
     # schema's nested dict. When no profiles exist, leave the field free-form
     # so an explicit profile name still reaches the (graceful) fallback path.
+    #
+    # model_profile is always optional: empty pool inherits parent/global
+    # delegation credentials (upstream-compatible); non-empty pool may still
+    # omit it and fall back to default_profile / global config.
     _profile_names = _available_model_profile_names()
+    _mp_prop = dict(overrides_params["properties"]["model_profile"])
     if _profile_names:
-        _mp_prop = dict(overrides_params["properties"]["model_profile"])
         _mp_prop["enum"] = _profile_names
         _mp_prop["description"] = (
-            "Select a model-pool profile to run this subagent on. "
-            f"Available profiles: {', '.join(_profile_names)}."
+            "Optional model-pool profile for this subagent. "
+            f"Available profiles: {', '.join(_profile_names)}. "
+            "Omit to use delegation.default_profile when set, otherwise the "
+            "global/parent delegation model/provider."
         )
-        overrides_params["properties"]["model_profile"] = _mp_prop
+    else:
+        _mp_prop["description"] = (
+            "Optional model-pool profile name. No profiles are configured "
+            "(delegation.model_pool is empty), so omit this field to inherit "
+            "the parent/global delegation model and provider. An unknown name "
+            "also falls back gracefully."
+        )
+    overrides_params["properties"]["model_profile"] = _mp_prop
+    # Never require model_profile — empty pool must stay upstream-compatible,
+    # and non-empty pool uses default_profile / global fallback when omitted.
+    overrides_params["required"] = [
+        item
+        for item in (overrides_params.get("required") or [])
+        if item != "model_profile"
+    ]
 
     return {
         "description": _build_top_level_description(),
@@ -4241,15 +4269,17 @@ DELEGATE_TASK_SCHEMA = {
             "model_profile": {
                 "type": "string",
                 "description": (
-                    "Name of a preconfigured model-pool profile (from "
-                    "delegation.model_pool in config.yaml) to run this "
-                    "subagent on, instead of the global delegation "
+                    "Optional name of a preconfigured model-pool profile "
+                    "(from delegation.model_pool in config.yaml) to run this "
+                    "subagent on, instead of the global/parent delegation "
                     "model/provider. Each profile pins a provider/model pair "
                     "(and optionally reasoning_effort + fallback_chain). "
-                    "REQUIRED: specify model_profile for every delegate_task "
-                    "call. Per-task model_profile overrides this. An "
-                    "unknown profile name silently falls back to the global "
-                    "delegation config."
+                    "Omit to use delegation.default_profile when configured, "
+                    "otherwise inherit the global/parent delegation "
+                    "credentials (upstream-compatible when model_pool is "
+                    "empty). Per-task model_profile in the tasks array "
+                    "overrides this top-level value. An unknown profile name "
+                    "silently falls back to the global delegation config."
                 ),
             },
             "background": {
@@ -4265,7 +4295,10 @@ DELEGATE_TASK_SCHEMA = {
                 ),
             },
         },
-        "required": ["model_profile"],
+        # model_profile is intentionally optional: empty model_pool inherits
+        # parent/global credentials; non-empty pool may omit and use
+        # default_profile / global fallback.
+        "required": [],
     },
 }
 

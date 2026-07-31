@@ -1577,6 +1577,46 @@ class TestReaderLoopOrphanedPipe:
         registry._move_to_finished(s)
         assert registry.completion_queue.empty()
 
+    def test_buffered_and_delayed_tail_finish_with_external_writer_open(self, registry):
+        read_fd, write_fd = os.pipe()
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "print('prefetched-tail', flush=True)"],
+            stdout=write_fd,
+            stderr=write_fd,
+        )
+        stdout = os.fdopen(read_fd, "r", encoding="utf-8")
+        proc.stdout = stdout
+        proc.wait()
+        assert stdout.buffer.peek(1), "expected a real BufferedReader tail"
+        s = _make_session(sid="proc_external_writer")
+        s.process = proc
+        s.pid = proc.pid
+        s.notify_on_complete = True
+        registry._running[s.id] = s
+
+        delayed = threading.Thread(
+            target=lambda: (time.sleep(0.3), os.write(write_fd, b"delayed-tail\n")),
+            daemon=True,
+        )
+        done = threading.Event()
+        reader = threading.Thread(
+            target=lambda: (registry._reader_loop(s), done.set()), daemon=True
+        )
+        delayed.start()
+        reader.start()
+        try:
+            assert done.wait(timeout=3)
+            assert s.output_buffer == "prefetched-tail\ndelayed-tail\n"
+            event = registry.completion_queue.get_nowait()
+            assert event["exit_code"] == 0
+            registry._move_to_finished(s)
+            assert registry.completion_queue.empty()
+        finally:
+            delayed.join(timeout=1)
+            os.close(write_fd)
+            reader.join(timeout=1)
+            stdout.close()
+
     def test_known_launcher_exit_is_kept_until_descendant_settles(self, registry):
         proc = subprocess.Popen(
             [

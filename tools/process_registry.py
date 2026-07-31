@@ -1120,6 +1120,7 @@ class ProcessRegistry:
             if fd is not None:
                 import select as _select
 
+                idle_after_exit = 0
                 while True:
                     self._remember_local_descendants(session)
                     try:
@@ -1131,16 +1132,29 @@ class ProcessRegistry:
                         if not raw:
                             break  # true EOF — all writers closed
                         _append_chunk(raw.decode("utf-8", errors="replace"))
+                        idle_after_exit = 0
                     elif proc.poll() is not None and self._local_descendants_settled(session):
                         # select() cannot see bytes already held by BufferedReader.
-                        # With all owned writers closed, read1() drains them to EOF
-                        # without blocking.
-                        while True:
-                            raw = raw_read(4096)
-                            if not raw:
-                                break
-                            _append_chunk(raw.decode("utf-8", errors="replace"))
-                        break
+                        # Drain that tail without waiting forever on an untracked
+                        # writer that still holds the pipe open.
+                        drained = False
+                        was_blocking = os.get_blocking(fd)
+                        os.set_blocking(fd, False)
+                        try:
+                            while True:
+                                try:
+                                    raw = raw_read(4096)
+                                except BlockingIOError:
+                                    break
+                                if not raw:
+                                    break
+                                drained = True
+                                _append_chunk(raw.decode("utf-8", errors="replace"))
+                        finally:
+                            os.set_blocking(fd, was_blocking)
+                        idle_after_exit = 0 if drained else idle_after_exit + 1
+                        if idle_after_exit >= 3:
+                            break
             else:
                 while True:
                     if raw_read is not None:

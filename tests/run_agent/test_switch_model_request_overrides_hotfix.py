@@ -185,6 +185,77 @@ def test_primary_restore_uses_deep_copied_switched_overrides():
     assert agent._primary_runtime["request_overrides"] == primary_overrides
 
 
+def test_real_fallback_activation_rebuilds_and_restores_request_overrides():
+    config = {"custom_providers": _configs()}
+    fallbacks = [
+        {
+            "provider": "openai-codex",
+            "model": "gpt-5.4-mini",
+            "base_url": CODEX_URL,
+            "api_key": "codex-key",
+        },
+        {
+            "provider": "custom:pm",
+            "model": "gpt-5.4-mini",
+            "base_url": PM_URL,
+            "api_key": "pm-key",
+        },
+    ]
+    clients = []
+    for base_url, api_key in ((CODEX_URL, "codex-key"), (PM_URL, "pm-key")):
+        client = MagicMock(base_url=base_url, api_key=api_key)
+        client._custom_headers = {}
+        client.default_headers = {}
+        clients.append(client)
+
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+        patch("hermes_cli.config.load_config", return_value=config),
+        patch("hermes_cli.config.load_config_readonly", return_value=config),
+        patch(
+            "hermes_cli.config.get_compatible_custom_providers",
+            return_value=_configs(),
+        ),
+        patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            side_effect=[(clients[0], "gpt-5.4-mini"), (clients[1], "gpt-5.4-mini")],
+        ),
+        patch("agent.credential_pool.load_pool", return_value=None),
+        patch("hermes_cli.timeouts.get_provider_request_timeout", return_value=None),
+    ):
+        agent = AIAgent(
+            api_key="glm-key",
+            base_url=GLM_URL,
+            provider="custom:glm",
+            model="glm-5.2",
+            request_overrides=CALLER_OVERRIDES,
+            fallback_model=fallbacks,
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        primary = copy.deepcopy(agent._primary_runtime["request_overrides"])
+        assert primary["extra_body"] == {"thinking": {"type": "enabled"}, "caller_flag": True}
+
+        assert agent._try_activate_fallback() is True
+        assert agent.request_overrides == CALLER_OVERRIDES
+
+        assert agent._try_activate_fallback() is True
+        assert agent.request_overrides == {
+            "extra_headers": {"X-Caller": "keep"},
+            "extra_body": {"pm_target": True, "caller_flag": True},
+        }
+        agent.request_overrides["extra_body"]["caller_flag"] = False
+        assert agent._caller_request_overrides == CALLER_OVERRIDES
+        assert agent._primary_runtime["request_overrides"] == primary
+
+        assert agent._restore_primary_runtime() is True
+
+    assert agent.request_overrides == primary
+
+
 def test_constructor_snapshots_explicit_caller_overrides():
     explicit = {"extra_body": {"caller_flag": {"nested": True}}}
     with (

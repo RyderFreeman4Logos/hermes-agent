@@ -2858,18 +2858,6 @@ def delegate_task(
         )
     effective_max_iter = default_max_iter
 
-    # Resolve delegation credentials (provider:model pair).
-    # When delegation.provider is configured, this resolves the full credential
-    # bundle (base_url, api_key, api_mode) via the same runtime provider system
-    # used by CLI/gateway startup.  When unconfigured, returns None values so
-    # children inherit from the parent.
-    try:
-        creds = _resolve_delegation_credentials(
-            cfg, parent_agent, model_profile=model_profile
-        )
-    except ValueError as exc:
-        return tool_error(str(exc))
-
     # Normalize to task list
     max_children = _get_max_concurrent_children()
     recovered_tasks, tasks_error = _recover_tasks_from_json_string(tasks)
@@ -2904,6 +2892,33 @@ def delegate_task(
             )
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
+
+    # Validate every selected profile before resolving credentials or building
+    # any child. A malformed later task must not leave earlier children alive.
+    task_profiles = [
+        task.get("model_profile")
+        if task.get("model_profile") not in (None, "")
+        else model_profile
+        for task in task_list
+    ]
+    default_profile = cfg.get("default_profile")
+    if default_profile is not None and not isinstance(default_profile, str):
+        return tool_error("Invalid delegation.default_profile: expected a string.")
+    try:
+        for selected in task_profiles:
+            if selected is not None and not isinstance(selected, str):
+                raise ValueError("Invalid delegation model profile name: expected a string.")
+            name = selected or (default_profile.strip() if default_profile else None)
+            if name and _resolve_model_profile(cfg, name) is None:
+                raise ValueError(
+                    f"Unknown or invalid delegation model profile '{name}'."
+                )
+        task_credentials = [
+            _resolve_delegation_credentials(cfg, parent_agent, model_profile=selected)
+            for selected in task_profiles
+        ]
+    except ValueError as exc:
+        return tool_error(str(exc))
 
     overall_start = time.monotonic()
     results = []
@@ -2949,16 +2964,7 @@ def delegate_task(
         # Per-task role beats top-level; normalise again so unknown
         # per-task values warn and degrade to leaf uniformly.
         effective_role = _normalize_role(t.get("role") or top_role)
-        task_profile = t.get("model_profile") or model_profile
-        if task_profile and task_profile != model_profile:
-            try:
-                task_creds = _resolve_delegation_credentials(
-                    cfg, parent_agent, model_profile=task_profile
-                )
-            except ValueError as exc:
-                return tool_error(str(exc))
-        else:
-            task_creds = creds
+        task_creds = task_credentials[i]
         child = _build_child_preserving_parent_tools(
             task_index=i,
             goal=t["goal"],
@@ -3506,13 +3512,50 @@ def _resolve_model_profile(cfg: dict, model_profile: Optional[str]) -> Optional[
         return None
 
     merged: Dict[str, Any] = dict(cfg)
-    for key in (
-        "provider", "model", "base_url", "api_key", "api_mode",
-        "reasoning_effort",
-    ):
+    for key in ("provider", "model", "base_url", "api_key"):
         value = profile.get(key)
+        if value is not None and not isinstance(value, str):
+            raise ValueError(
+                f"Invalid delegation model profile '{name}': {key} must be a string."
+            )
         if value is not None and value != "":
+            if key == "base_url":
+                parsed = urlsplit(value.strip())
+                if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                    raise ValueError(
+                        f"Invalid delegation model profile '{name}': invalid base_url."
+                    )
             merged[key] = value
+
+    api_mode = profile.get("api_mode")
+    if api_mode is not None:
+        if not isinstance(api_mode, str) or (
+            api_mode.strip()
+            and api_mode.strip().lower()
+            not in {
+                "chat_completions", "codex_responses", "anthropic_messages",
+                "bedrock_converse", "codex_app_server",
+            }
+        ):
+            raise ValueError(
+                f"Invalid delegation model profile '{name}': unsupported api_mode."
+            )
+        if api_mode.strip():
+            merged["api_mode"] = api_mode.strip().lower()
+
+    reasoning_effort = profile.get("reasoning_effort")
+    if reasoning_effort is not None:
+        from hermes_constants import parse_reasoning_effort
+
+        if not isinstance(reasoning_effort, (str, bool)) or (
+            reasoning_effort is True
+            or (reasoning_effort != "" and parse_reasoning_effort(reasoning_effort) is None)
+        ):
+            raise ValueError(
+                f"Invalid delegation model profile '{name}': unsupported reasoning_effort."
+            )
+        if reasoning_effort != "":
+            merged["reasoning_effort"] = reasoning_effort
 
     if "fallback_chain" not in profile:
         return merged
@@ -3529,18 +3572,67 @@ def _resolve_model_profile(cfg: dict, model_profile: Optional[str]) -> Optional[
                 f"Invalid delegation model profile '{name}': "
                 f"fallback_chain[{index}] must be a mapping."
             )
-        provider = str(entry.get("provider") or "").strip()
-        model = str(entry.get("model") or "").strip()
+        provider = entry.get("provider")
+        model = entry.get("model")
+        if not isinstance(provider, str) or not isinstance(model, str):
+            raise ValueError(
+                f"Invalid delegation model profile '{name}': "
+                f"fallback_chain[{index}] provider and model must be strings."
+            )
+        provider = provider.strip()
+        model = model.strip()
         if not provider or not model:
             raise ValueError(
                 f"Invalid delegation model profile '{name}': "
                 f"fallback_chain[{index}] requires provider and model."
             )
         fallback: Dict[str, Any] = {"provider": provider, "model": model}
-        for key in ("base_url", "api_key", "api_mode", "reasoning_effort"):
+        for key in ("base_url", "api_key"):
             value = entry.get(key)
-            if value is not None and str(value).strip():
+            if value is not None and not isinstance(value, str):
+                raise ValueError(
+                    f"Invalid delegation model profile '{name}': "
+                    f"fallback_chain[{index}].{key} must be a string."
+                )
+            if value is not None and value.strip():
+                if key == "base_url":
+                    parsed = urlsplit(value.strip())
+                    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                        raise ValueError(
+                            f"Invalid delegation model profile '{name}': "
+                            f"fallback_chain[{index}] has invalid base_url."
+                        )
                 fallback[key] = value
+        fallback_mode = entry.get("api_mode")
+        if fallback_mode is not None:
+            if not isinstance(fallback_mode, str) or (
+                fallback_mode.strip()
+                and fallback_mode.strip().lower()
+                not in {
+                    "chat_completions", "codex_responses", "anthropic_messages",
+                    "bedrock_converse", "codex_app_server",
+                }
+            ):
+                raise ValueError(
+                    f"Invalid delegation model profile '{name}': "
+                    f"fallback_chain[{index}] has unsupported api_mode."
+                )
+            if fallback_mode.strip():
+                fallback["api_mode"] = fallback_mode.strip().lower()
+        fallback_effort = entry.get("reasoning_effort")
+        if fallback_effort is not None:
+            from hermes_constants import parse_reasoning_effort
+
+            if not isinstance(fallback_effort, (str, bool)) or (
+                fallback_effort is True
+                or (fallback_effort != "" and parse_reasoning_effort(fallback_effort) is None)
+            ):
+                raise ValueError(
+                    f"Invalid delegation model profile '{name}': "
+                    f"fallback_chain[{index}] has unsupported reasoning_effort."
+                )
+            if fallback_effort != "":
+                fallback["reasoning_effort"] = fallback_effort
         chain.append(fallback)
     merged["_profile_fallback_chain"] = chain
     return merged
@@ -3553,11 +3645,8 @@ def _resolve_delegation_credentials(
 
     If ``delegation.base_url`` is configured, subagents use that direct
     OpenAI-compatible endpoint. ``delegation.api_key`` overrides the key; when
-    omitted, ``api_key`` is returned as ``None`` so ``_build_child_agent``
-    inherits the parent agent's key (``effective_api_key = override_api_key or
-    parent_api_key``). This lets providers that store their key outside
-    ``OPENAI_API_KEY`` (e.g. ``MINIMAX_API_KEY``, ``DASHSCOPE_API_KEY``) work
-    without a duplicate config entry.
+    omitted, compatible global delegation config can still inherit the parent
+    key. A named profile that changes backend must provide its own key instead.
 
     Otherwise, if ``delegation.provider`` is configured, the full credential
     bundle (base_url, api_key, api_mode, provider) is resolved via the runtime
@@ -3569,10 +3658,19 @@ def _resolve_delegation_credentials(
 
     Raises ValueError with a user-friendly message on credential failure.
     """
+    if model_profile is not None and not isinstance(model_profile, str):
+        raise ValueError("Invalid delegation model profile name: expected a string.")
     if not model_profile:
-        model_profile = str(cfg.get("default_profile") or "").strip() or None
+        default_profile = cfg.get("default_profile")
+        if default_profile is not None and not isinstance(default_profile, str):
+            raise ValueError("Invalid delegation.default_profile: expected a string.")
+        model_profile = (default_profile or "").strip() or None
     profile_effort: Optional[Any] = None
     profile_fallback_chain: Optional[List[Dict[str, Any]]] = None
+    selected_profile = None
+    pool = cfg.get("model_pool")
+    if model_profile and isinstance(pool, dict):
+        selected_profile = pool.get(model_profile)
     merged = _resolve_model_profile(cfg, model_profile)
     if model_profile and merged is None:
         raise ValueError(
@@ -3608,6 +3706,26 @@ def _resolve_delegation_credentials(
         # (e.g. MINIMAX_API_KEY, DASHSCOPE_API_KEY) work without requiring
         # callers to duplicate the key under delegation.api_key.
         api_key = configured_api_key  # None → inherited from parent in _build_child_agent
+        if isinstance(selected_profile, dict):
+            parent_url = _normalized_runtime_url(
+                _inherit_parent_base_url(
+                    parent_agent, getattr(parent_agent, "base_url", None)
+                )
+            )
+            target_url = _normalized_runtime_url(configured_base_url)
+            profile_url = _normalized_runtime_url(selected_profile.get("base_url"))
+            profile_provider = str(selected_profile.get("provider") or "").strip().lower()
+            parent_provider = str(getattr(parent_agent, "provider", "") or "").strip().lower()
+            profile_api_key = str(selected_profile.get("api_key") or "").strip()
+            profile_changes_backend = (
+                bool(profile_url and profile_url != parent_url)
+                or bool(profile_provider and profile_provider != parent_provider)
+            )
+            if profile_changes_backend and target_url != parent_url and not profile_api_key:
+                raise ValueError(
+                    f"Delegation model profile '{model_profile}' selects a different "
+                    "backend but has no API key; refusing to inherit the parent credential."
+                )
 
         # Use the shared URL-based api_mode detector (same path the main agent's
         # runtime resolver uses) so Anthropic-compatible direct endpoints with a
@@ -3845,7 +3963,9 @@ def _build_top_level_description() -> str:
         f"Orchestrators are bounded by max_spawn_depth={max_depth} for this "
         f"user and can be disabled globally via "
         "delegation.orchestrator_enabled=false.\n"
-        "- Subagent model is NOT selectable per call: children inherit the parent model (plus its fallback chain) unless you pin all subagents to a model via delegation.provider / delegation.model in config.yaml.\n"
+        "- Select a configured delegation.model_pool entry with model_profile. "
+        "In a batch, each tasks[] item can override model_profile independently. "
+        "Omit it to use delegation.default_profile or the global/parent routing.\n"
         "- Each subagent gets its own terminal session (separate working directory and state).\n"
         "- Results are always returned as an array, one entry per task."
     )
@@ -3929,24 +4049,27 @@ def refresh_model_pool_schema_after_compression(agent: Any) -> bool:
     """Publish a changed model-profile enum at a completed cache boundary."""
     global _MODEL_POOL_SCHEMA_NAMES
     names = _read_model_profile_names()
+    names_changed = False
     with _MODEL_POOL_SCHEMA_LOCK:
         if _MODEL_POOL_SCHEMA_NAMES is None:
             _MODEL_POOL_SCHEMA_NAMES = names
-            return False
-        if _MODEL_POOL_SCHEMA_NAMES == names:
-            return False
-        _MODEL_POOL_SCHEMA_NAMES = names
+        elif _MODEL_POOL_SCHEMA_NAMES != names:
+            _MODEL_POOL_SCHEMA_NAMES = names
+            names_changed = True
 
-    try:
-        from model_tools import _clear_tool_defs_cache
+    if names_changed:
+        try:
+            from model_tools import _clear_tool_defs_cache
 
-        _clear_tool_defs_cache()
-    except Exception:
-        logger.debug("Could not clear cached tool definitions after compression", exc_info=True)
+            _clear_tool_defs_cache()
+        except Exception:
+            logger.debug(
+                "Could not clear cached tool definitions after compression", exc_info=True
+            )
 
     tools = getattr(agent, "tools", None)
     if not isinstance(tools, list):
-        return True
+        return names_changed
     fresh_property = dict(
         _build_dynamic_schema_overrides()["parameters"]["properties"]["model_profile"]
     )
@@ -3962,7 +4085,7 @@ def refresh_model_pool_schema_after_compression(agent: Any) -> bool:
         ):
             continue
         if properties["model_profile"] == fresh_property:
-            return True
+            return names_changed
         refreshed_tool = dict(tool)
         refreshed_function = dict(function)
         refreshed_parameters = dict(parameters)
@@ -3974,8 +4097,8 @@ def refresh_model_pool_schema_after_compression(agent: Any) -> bool:
         refreshed_tools = list(tools)
         refreshed_tools[index] = refreshed_tool
         agent.tools = refreshed_tools
-        break
-    return True
+        return True
+    return names_changed
 
 
 def _build_dynamic_schema_overrides() -> dict:

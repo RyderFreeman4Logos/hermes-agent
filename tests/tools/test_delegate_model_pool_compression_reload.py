@@ -65,3 +65,21 @@ def test_unchanged_model_pool_is_a_noop_after_compression(
 
     assert delegate_tool.refresh_model_pool_schema_after_compression(agent) is False
     assert agent.tools is tools
+
+
+def test_each_live_agent_refreshes_at_its_compression_boundary(
+    monkeypatch, model_pool_snapshot
+):
+    config = {"model_pool": {"old": {}}}
+    monkeypatch.setattr(delegate_tool, "_load_config", lambda: config)
+    first = SimpleNamespace(tools=[_delegate_definition()])
+    second = SimpleNamespace(tools=[_delegate_definition()])
+    clears = []
+    monkeypatch.setattr("model_tools._clear_tool_defs_cache", lambda: clears.append(1))
+
+    config["model_pool"] = {"new": {}}
+    assert delegate_tool.refresh_model_pool_schema_after_compression(first) is True
+    assert delegate_tool.refresh_model_pool_schema_after_compression(second) is True
+    assert _profile_enum(first.tools[0]) == ["new"]
+    assert _profile_enum(second.tools[0]) == ["new"]
+    assert clears == [1]

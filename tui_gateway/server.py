@@ -8927,6 +8927,8 @@ def _try_steer_busy_notification(
     receipt is invoked only when the agent actually applies it at a tool
     boundary; acceptance alone remains pending for idle fallback.
     ``"claimed_elsewhere"`` means another consumer owns its durable claim.
+    ``"requeued"`` means an ordinary claimed event was released back to the
+    process queue by the delivery ledger.
     ``False`` means the session is busy but must use the legacy requeue path;
     ``None`` means the session was idle and should dispatch a new turn as
     before.
@@ -8960,11 +8962,17 @@ def _try_steer_busy_notification(
         renewal_stop = start_event_delivery_renewal([(evt, claim)])
     except Exception:
         logger.warning("TUI busy-steer renewal start failed", exc_info=True)
+        released = False
         try:
             release_event_delivery(evt, claim, consume_attempt=False)
+            released = True
         except Exception:
             logger.warning("TUI busy-steer claim release failed", exc_info=True)
-        return False
+        return (
+            "requeued"
+            if released and evt.get("type") != "async_delegation"
+            else False
+        )
     receipt.update(evt=evt, text=text, claim=claim, renewal_stop=renewal_stop)
     # An AIAgent calls its receipt at a later tool boundary. Third-party agents
     # may apply synchronously, so do not transfer ownership until steer()
@@ -8994,14 +9002,20 @@ def _try_steer_busy_notification(
         accepted = False
     if not accepted:
         receipt["renewal_stop"].set()
+        released = False
         try:
             release_event_delivery(evt, claim, consume_attempt=False)
+            released = True
         except Exception:
             logger.warning(
                 "TUI rejected-steer completion claim release failed",
                 exc_info=True,
             )
-        return False
+        return (
+            "requeued"
+            if released and evt.get("type") != "async_delegation"
+            else False
+        )
 
     with session["history_lock"]:
         session["last_active"] = time.time()
@@ -9172,18 +9186,20 @@ def _dispatch_idle_completion_batch(
 
         excess = entries[_COMPLETION_IDLE_BATCH_MAX:]
         for evt, _text in excess:
+            released = False
             for claimed_evt, claim in list(preclaimed or []):
                 if evt is claimed_evt:
                     try:
                         release_event_delivery(
                             evt, claim, consume_attempt=False
                         )
+                        released = True
                     except Exception:
                         logger.warning(
                             "TUI excess steer claim release failed",
                             exc_info=True,
                         )
-            if evt.get("type") == "async_delegation":
+            if not released or evt.get("type") == "async_delegation":
                 process_registry.completion_queue.put(evt)
         entries = entries[:_COMPLETION_IDLE_BATCH_MAX]
         preclaimed = [
@@ -9549,9 +9565,10 @@ def _notification_poller_loop(
         if steer_result == "claimed_elsewhere":
             continue
 
-        _requeued = steer_result is False
+        _requeued = steer_result is False or steer_result == "requeued"
         if _requeued:
-            process_registry.completion_queue.put(evt)
+            if steer_result is False:
+                process_registry.completion_queue.put(evt)
         else:
             with session["history_lock"]:
                 if session.get("running"):
@@ -9585,6 +9602,15 @@ def _notification_poller_loop(
     # Return steered-but-unconsumed events to the shared queue if this poller
     # stops before it gets an idle retry. Release each held claim before
     # returning the event so another live poller or later session can deliver.
+    # Detach the finite shutdown batch before any claim release. Ordinary
+    # release_event_delivery() requeues by design; consuming that fresh retry
+    # in this same drain would steer/release it forever.
+    shutdown_events: list = []
+    while not process_registry.completion_queue.empty():
+        try:
+            shutdown_events.append(process_registry.completion_queue.get_nowait())
+        except Exception:
+            break
     deferred: list = []
     for receipt in _steered_pending:
         if receipt.get("applied"):
@@ -9600,12 +9626,9 @@ def _notification_poller_loop(
             logger.warning(
                 "TUI shutdown steer claim release failed", exc_info=True
             )
-        deferred.append(receipt["evt"])
-    while not process_registry.completion_queue.empty():
-        try:
-            evt = process_registry.completion_queue.get_nowait()
-        except Exception:
-            break
+        if receipt["evt"].get("type") == "async_delegation":
+            deferred.append(receipt["evt"])
+    for evt in shutdown_events:
         if _notification_event_belongs_elsewhere(sid, session, evt):
             deferred.append(evt)
             continue
@@ -9660,12 +9683,14 @@ def _notification_poller_loop(
                     "TUI shutdown accepted-steer claim release failed",
                     exc_info=True,
                 )
-            deferred.append(evt)
+            if evt.get("type") == "async_delegation":
+                deferred.append(evt)
             continue
         if steer_result == "claimed_elsewhere":
             continue
-        if steer_result is False:
-            process_registry.completion_queue.put(evt)
+        if steer_result is False or steer_result == "requeued":
+            if steer_result is False:
+                process_registry.completion_queue.put(evt)
             break
         with session["history_lock"]:
             if session.get("running"):

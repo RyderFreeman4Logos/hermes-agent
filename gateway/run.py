@@ -17053,18 +17053,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # owned by the dedicated _async_delegation_watcher (started at
             # boot), which covers both the idle and post-turn cases with a
             # single consumer — so we leave them on the queue here.
-            try:
-                from tools.process_registry import process_registry as _pr
-                _watch_events = _drain_gateway_watch_events(_pr.completion_queue)
-                for evt in _watch_events:
-                    synth_text = _format_gateway_process_notification(evt)
-                    if synth_text:
-                        try:
-                            await self._inject_watch_notification(synth_text, evt)
-                        except Exception as e2:
-                            logger.error("Watch notification injection error: %s", e2)
-            except Exception as e:
-                logger.debug("Watch queue drain error: %s", e)
+            await self._drain_post_turn_watch_notifications()
 
             # NOTE: Dangerous command approvals are now handled inline by the
             # blocking gateway approval mechanism in tools/approval.py.  The agent
@@ -20948,6 +20937,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         turn_origin: str | None = None,
         allow_silent_noop: bool = False,
         delivery_claims: Optional[list[tuple[dict, str]]] = None,
+        delivery_renewal_stop: Any = None,
     ) -> Optional[bool]:
         """Inject a watch/completion notification as a synthetic message event.
 
@@ -20997,6 +20987,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             adapter, text=synth_text, session_id=raw_sid
                         )
                         settle_claims_after_self_post(result)
+                        if delivery_renewal_stop is not None:
+                            delivery_renewal_stop.set()
                         return True
                     except Exception as e:
                         logger.warning(
@@ -21043,6 +21035,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter, text=synth_text, session_id=raw_sid
                 )
                 settle_claims_after_self_post(result)
+                if delivery_renewal_stop is not None:
+                    delivery_renewal_stop.set()
                 return True
             except Exception as e:
                 logger.warning(
@@ -21061,6 +21055,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 metadata["allow_silent_noop"] = bool(allow_silent_noop)
             if delivery_claims:
                 metadata["delivery_claims"] = delivery_claims
+            if delivery_renewal_stop is not None:
+                metadata["delivery_renewal_stops"] = [delivery_renewal_stop]
             synth_event = MessageEvent(
                 text=synth_text,
                 message_type=MessageType.TEXT,
@@ -21075,11 +21071,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 source.chat_id,
                 source.thread_id,
             )
-            await adapter.handle_message(synth_event)
+            scheduled = await adapter.handle_message(synth_event)
+            if scheduled is False:
+                return False
             return True
         except Exception as e:
             logger.error("Watch notification injection error: %s", e)
             return False
+
+    async def _drain_post_turn_watch_notifications(self) -> None:
+        """Deliver legacy watch rows through the claimed completion lifecycle."""
+        try:
+            from tools.process_registry import process_registry
+
+            events = _drain_gateway_watch_events(process_registry.completion_queue)
+        except Exception as exc:
+            logger.debug("Watch queue drain error: %s", exc)
+            return
+        for evt in events:
+            synth_text = _format_gateway_process_notification(evt)
+            if synth_text:
+                try:
+                    await self._deliver_completion_notification(synth_text, evt)
+                except Exception as exc:
+                    logger.error("Watch notification injection error: %s", exc)
 
     async def _classify_completion_target(self, parent_session_id: str) -> str:
         """Classify an async-completion delivery target before adapter acceptance.
@@ -21208,6 +21223,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 synth_text,
                 evt,
                 delivery_claims=claims or None,
+                delivery_renewal_stop=renewal_stop,
             )
             if injection_result is None:
                 drop_event_delivery(evt, claim)
@@ -21216,6 +21232,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if injection_result is not True:
                 return injection_result
             accepted = True
+            # Push adapters schedule the real turn asynchronously. Its event
+            # metadata now owns the same renewal through busy/coalesced waits.
+            renewal_stop = None
             return True
         finally:
             if renewal_stop is not None:

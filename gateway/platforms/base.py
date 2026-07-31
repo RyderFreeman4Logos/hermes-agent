@@ -2452,12 +2452,16 @@ def merge_pending_message_event(
     """
     existing = pending_messages.get(session_key)
     if existing:
-        incoming_claims = (getattr(event, "metadata", None) or {}).get(
-            "delivery_claims"
-        )
+        incoming_metadata = getattr(event, "metadata", None) or {}
+        incoming_claims = incoming_metadata.get("delivery_claims")
         if incoming_claims:
             existing.metadata.setdefault("delivery_claims", []).extend(
                 incoming_claims
+            )
+        incoming_renewals = incoming_metadata.get("delivery_renewal_stops")
+        if incoming_renewals:
+            existing.metadata.setdefault("delivery_renewal_stops", []).extend(
+                incoming_renewals
             )
         existing_is_photo = getattr(existing, "message_type", None) == MessageType.PHOTO
         incoming_is_photo = event.message_type == MessageType.PHOTO
@@ -5539,7 +5543,7 @@ class BasePlatformAdapter(ABC):
 
         await self._drain_pending_after_session_command(session_key, command_guard)
 
-    async def handle_message(self, event: MessageEvent) -> None:
+    async def handle_message(self, event: MessageEvent) -> Optional[bool]:
         """
         Process an incoming message.
         
@@ -5548,7 +5552,7 @@ class BasePlatformAdapter(ABC):
         enabling interruption support.
         """
         if not self._message_handler:
-            return
+            return False
 
         coerce_plaintext_gateway_command(event)
 
@@ -5737,7 +5741,7 @@ class BasePlatformAdapter(ABC):
         # pattern — set the guard synchronously, not inside the task.)
         # _start_session_processing installs the guard AND the owner-task
         # mapping atomically so stale-lock detection works.
-        self._start_session_processing(event, session_key)
+        return self._start_session_processing(event, session_key)
     
     @staticmethod
     def _get_human_delay() -> float:
@@ -6356,16 +6360,22 @@ class BasePlatformAdapter(ABC):
             # A durable completion claim stays on the event until the gateway
             # transfers it into a real model turn. Any earlier return,
             # cancellation, or handler error must make it retryable.
-            delivery_claims = (getattr(event, "metadata", None) or {}).pop(
-                "delivery_claims", []
+            delivery_metadata = getattr(event, "metadata", None) or {}
+            delivery_claims = delivery_metadata.pop("delivery_claims", [])
+            delivery_renewal_stops = delivery_metadata.pop(
+                "delivery_renewal_stops", []
             )
-            if delivery_claims:
-                from tools.async_delegation import settle_event_deliveries
+            try:
+                if delivery_claims:
+                    from tools.async_delegation import settle_event_deliveries
 
-                settle_event_deliveries(
-                    delivery_claims,
-                    log_context="Gateway adapter",
-                )
+                    settle_event_deliveries(
+                        delivery_claims,
+                        log_context="Gateway adapter",
+                    )
+            finally:
+                for renewal_stop in delivery_renewal_stops:
+                    renewal_stop.set()
             # Stop typing before any deferred callback work.  Post-delivery
             # callbacks may perform platform I/O; a stuck callback must not
             # leave the typing refresh task running indefinitely.

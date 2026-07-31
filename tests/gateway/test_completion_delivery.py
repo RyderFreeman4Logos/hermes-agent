@@ -439,43 +439,109 @@ def test_concurrent_claims_share_the_same_narrow_delivery_seam():
     adapter.handle_message.assert_awaited_once()
 
 
-def test_long_gateway_delivery_renews_claim_until_turn_owns_it(monkeypatch):
+def test_async_push_adapter_renews_busy_coalesced_claim_through_real_turn(monkeypatch):
     from tools import async_delegation as ad
 
-    event = _async_event("deleg_long_delivery")
+    event = _async_event("deleg_async_push_busy")
     _persist_pending_completion(event)
-    entered = asyncio.Event()
-    finish = asyncio.Event()
-    renewals = []
-    original_renew = ad.renew_completion_delivery
+    first_started = asyncio.Event()
+    finish_first = asyncio.Event()
+    real_turn_started = asyncio.Event()
+    finish_real_turn = asyncio.Event()
 
-    async def held_injection(_event):
-        entered.set()
-        await finish.wait()
+    class _Adapter(BasePlatformAdapter):
+        async def connect(self, *, is_reconnect=False):
+            return True
 
-    def observed_renew(delegation_id, claim):
-        renewed = original_renew(delegation_id, claim)
-        renewals.append((delegation_id, claim, renewed))
-        return renewed
+        async def disconnect(self):
+            return None
+
+        async def send(self, chat_id, content, reply_to=None, metadata=None):
+            return SendResult(success=True)
+
+        async def get_chat_info(self, chat_id):
+            return {"id": chat_id}
+
+    adapter = _Adapter(
+        PlatformConfig(enabled=True, token="fake", typing_indicator=False),
+        Platform.TELEGRAM,
+    )
+    calls = 0
+
+    async def handle(adapter_event):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            first_started.set()
+            await finish_first.wait()
+            return None
+        claims = adapter_event.metadata.pop("delivery_claims")
+        real_turn_started.set()
+        await finish_real_turn.wait()
+        ad.settle_event_deliveries(claims, {"api_calls": 1})
+        return None
+
+    adapter._message_handler = handle
+    runner = _runner(adapter)
+    source = runner.session_store._entries[event["session_key"]].origin
 
     monkeypatch.setattr(ad, "_DELIVERY_CLAIM_LEASE_SECONDS", 0.2)
     monkeypatch.setattr(ad, "_DELIVERY_CLAIM_RENEW_INTERVAL_SECONDS", 0.02)
-    monkeypatch.setattr(ad, "renew_completion_delivery", observed_renew)
-    runner = _runner(SimpleNamespace(handle_message=held_injection))
 
     async def exercise():
-        task = asyncio.create_task(
-            runner._deliver_completion_notification("completion", event)
-        )
-        await entered.wait()
+        await adapter.handle_message(MessageEvent(text="first", source=source))
+        await first_started.wait()
+        session_key = next(iter(adapter._active_sessions))
+        await adapter.handle_message(MessageEvent(text="queued user text", source=source))
+
+        assert await runner._deliver_completion_notification("completion", event) is True
+        pending = adapter._pending_messages[session_key]
+        assert pending.text == "queued user text\ncompletion"
+        assert pending.metadata["delivery_claims"][0][0] is event
+
         await asyncio.sleep(0.25)
-        assert len(renewals) >= 2
-        assert renewals[-1][2] is True
-        assert ad.claim_event_delivery(event, "foreign") is None
-        finish.set()
-        assert await task is True
+        assert ad.claim_event_delivery(event, "foreign-before-turn") is None
+        assert ad.get_durable_delegation(event["delegation_id"])["delivery_state"] == "pending"
+
+        finish_first.set()
+        await real_turn_started.wait()
+        await asyncio.sleep(0.25)
+        assert ad.claim_event_delivery(event, "foreign-during-turn") is None
+
+        finish_real_turn.set()
+        while session_key in adapter._active_sessions:
+            await asyncio.sleep(0)
+
+        durable = ad.get_durable_delegation(event["delegation_id"])
+        assert durable["delivery_state"] == "delivered"
+        assert durable["delivery_attempts"] == 1
 
     asyncio.run(exercise())
+
+
+def test_gateway_post_turn_legacy_watch_drain_uses_claimed_delivery(
+    monkeypatch, isolated_registry,
+):
+    isolated = queue.Queue()
+    events = [
+        {"type": "watch_match", "session_id": "proc-watch", "pattern": "READY"},
+        {"type": "watch_disabled", "session_id": "proc-watch", "message": "disabled"},
+    ]
+    for event in events:
+        isolated.put(event)
+    monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
+    runner = _runner(SimpleNamespace(handle_message=AsyncMock()))
+    runner._deliver_completion_notification = AsyncMock(
+        side_effect=[RuntimeError("first delivery failed"), True]
+    )
+    runner._inject_watch_notification = AsyncMock(
+        side_effect=AssertionError("legacy drain bypassed claimed delivery")
+    )
+
+    asyncio.run(runner._drain_post_turn_watch_notifications())
+
+    assert [call.args[1] for call in runner._deliver_completion_notification.await_args_list] == events
+    runner._inject_watch_notification.assert_not_awaited()
 
 
 def test_failed_long_gateway_delivery_stops_renewal_and_releases_claim(
@@ -563,9 +629,13 @@ def test_gateway_schedule_only_transfers_claim_without_acknowledging():
     durable = ad.get_durable_delegation(event["delegation_id"])
     assert durable["delivery_state"] == "pending"
     assert durable["delivery_attempts"] == 1
+    synth_event.metadata["delivery_renewal_stops"][0].set()
+    ad.release_event_delivery(event, claims[0][1])
 
 
-def test_ordinary_process_schedule_only_stays_claimed_until_real_turn():
+def test_ordinary_process_schedule_only_stays_claimed_until_real_turn(
+    isolated_registry,
+):
     event = _completion_event(
         started_at=2000.0,
         session_id="proc-schedule-only",
@@ -581,7 +651,10 @@ def test_ordinary_process_schedule_only_stays_claimed_until_real_turn():
     ) is None
 
     synth_event = adapter.handle_message.await_args.args[0]
-    assert synth_event.metadata["delivery_claims"][0][0] is event
+    claim = synth_event.metadata["delivery_claims"][0]
+    assert claim[0] is event
+    synth_event.metadata["delivery_renewal_stops"][0].set()
+    isolated_registry.release_notification_delivery(*claim)
     adapter.handle_message.assert_awaited_once()
 
 
@@ -629,7 +702,10 @@ def test_busy_gateway_merge_preserves_transferred_claim():
         text="completion",
         source=source,
         internal=True,
-        metadata={"delivery_claims": [(claimed_event, "claim-1")]},
+        metadata={
+            "delivery_claims": [(claimed_event, "claim-1")],
+            "delivery_renewal_stops": ["renewal-1"],
+        },
     )
     pending = {"session": pending_event}
 
@@ -640,6 +716,57 @@ def test_busy_gateway_merge_preserves_transferred_claim():
     assert pending_event.metadata["delivery_claims"] == [
         (claimed_event, "claim-1")
     ]
+    assert pending_event.metadata["delivery_renewal_stops"] == ["renewal-1"]
+
+
+def test_gateway_adapter_zero_call_releases_claim_and_stops_renewal():
+    from tools import async_delegation as ad
+
+    event_data = _async_event("deleg_adapter_zero_call")
+    _persist_pending_completion(event_data)
+    claim = ad.claim_event_delivery(event_data, "gateway-scheduled")
+    assert claim
+
+    class _Adapter(BasePlatformAdapter):
+        async def connect(self, *, is_reconnect=False):
+            return True
+
+        async def disconnect(self):
+            return None
+
+        async def send(self, chat_id, content, reply_to=None, metadata=None):
+            return SendResult(success=True)
+
+        async def get_chat_info(self, chat_id):
+            return {"id": chat_id}
+
+    adapter = _Adapter(
+        PlatformConfig(enabled=True, token="fake", typing_indicator=False),
+        Platform.TELEGRAM,
+    )
+    adapter._message_handler = AsyncMock(return_value=None)
+    renewal_stopped = MagicMock()
+    event = MessageEvent(
+        text="completion",
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="12345",
+            chat_type="dm",
+            user_id="678",
+        ),
+        internal=True,
+        metadata={
+            "delivery_claims": [(event_data, claim)],
+            "delivery_renewal_stops": [renewal_stopped],
+        },
+    )
+
+    asyncio.run(adapter._process_message_background(event, event_data["session_key"]))
+
+    renewal_stopped.set.assert_called_once_with()
+    retry_claim = ad.claim_event_delivery(event_data, "retry")
+    assert retry_claim
+    ad.release_event_delivery(event_data, retry_claim)
 
 
 @pytest.mark.asyncio
@@ -671,6 +798,7 @@ async def test_gateway_adapter_cancellation_releases_untransferred_claim():
         Platform.TELEGRAM,
     )
     adapter._message_handler = AsyncMock(side_effect=asyncio.CancelledError())
+    renewal_stopped = MagicMock()
     event = MessageEvent(
         text="completion",
         source=SessionSource(
@@ -680,7 +808,10 @@ async def test_gateway_adapter_cancellation_releases_untransferred_claim():
             user_id="678",
         ),
         internal=True,
-        metadata={"delivery_claims": [(event_data, claim)]},
+        metadata={
+            "delivery_claims": [(event_data, claim)],
+            "delivery_renewal_stops": [renewal_stopped],
+        },
     )
     session_key = event_data["session_key"]
     adapter._active_sessions[session_key] = asyncio.Event()
@@ -691,6 +822,7 @@ async def test_gateway_adapter_cancellation_releases_untransferred_claim():
     durable = ad.get_durable_delegation(event_data["delegation_id"])
     assert durable["delivery_state"] == "pending"
     assert durable["delivery_attempts"] == 1
+    renewal_stopped.set.assert_called_once_with()
 
 
 @pytest.mark.parametrize("exc", [RuntimeError("failed"), asyncio.CancelledError()])

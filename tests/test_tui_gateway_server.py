@@ -4730,11 +4730,12 @@ def test_notification_poller_delivers_owned_events(
 
     isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
     monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
-    process_registry._completion_consumed.discard("proc_mine")
+    event_id = f"proc_mine:{routing.get('origin_ui_session_id') or routing['session_key']}"
+    process_registry._completion_consumed.discard(event_id)
     isolated_queue.put(
             {
                 "type": "completion",
-                "session_id": "proc_mine",
+                "session_id": event_id,
                 "command": "echo mine",
             "exit_code": 0,
             "output": "mine",
@@ -13916,6 +13917,7 @@ def test_notification_poller_delivers_completion(monkeypatch):
     import queue as _queue_mod
 
     from tools.process_registry import process_registry
+    from tools import async_delegation as ad
 
     turns = []
     turn_kwargs = []
@@ -13940,15 +13942,14 @@ def test_notification_poller_delivers_completion(monkeypatch):
                 "messages": [{"role": "assistant", "content": "ok"}],
             }
 
-    class _ImmediateThread:
-        def __init__(self, target=None, daemon=None):
-            self._target = target
-        def start(self):
-            self._target()
-
     sess = _session(agent=_Agent())
     server._sessions["sid_poll"] = sess
-    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+
+    def run_turn(_rid, _sid, session, text, **kwargs):
+        result = session["agent"].run_conversation(text, **kwargs)
+        ad.settle_event_deliveries(kwargs["delivery_claims"], result)
+
+    monkeypatch.setattr(server, "_run_prompt_submit", run_turn)
     monkeypatch.setattr(server, "_emit", lambda *a, **kw: emitted.append(a))
     monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
     monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
@@ -14347,16 +14348,13 @@ def test_notification_poller_falls_back_when_accepted_steer_never_drains(
 
     def release(evt, token, *, consume_attempt=True):
         assert evt is event
-        if token == "claim-tui-poller-steer":
-            assert consume_attempt is False
-        else:
-            assert token == "claim-tui-poller-idle-batch"
+        assert token == "claim-tui-poller-steer"
         delivery["held"] = False
         releases.append(token)
 
     def complete(evt, token):
         assert evt is event
-        assert token == "claim-tui-poller-idle-batch"
+        assert token == "claim-tui-poller-steer"
         delivery["held"] = False
         delivery["delivered"] = True
 
@@ -14383,14 +14381,11 @@ def test_notification_poller_falls_back_when_accepted_steer_never_drains(
     server._notification_poller_loop(stop_event, "sid_steer_retry", session)
 
     assert steers == ["child completed"]
-    assert claims == ["tui-poller-steer", "tui-poller-idle-batch"]
+    assert claims == ["tui-poller-steer"]
     assert observed_in_turn == [{"held": True, "delivered": False}]
     assert delivery["delivered"] is expected_delivered
     assert delivery["held"] is False
-    assert releases == [
-        "claim-tui-poller-steer",
-        *([] if expected_delivered else ["claim-tui-poller-idle-batch"]),
-    ]
+    assert releases == ([] if expected_delivered else ["claim-tui-poller-steer"])
 
 
 def test_notification_poller_shutdown_drain_transfers_delivery_claim(monkeypatch):
@@ -14653,8 +14648,8 @@ def test_notification_poller_emits_distinct_watch_matches_once(monkeypatch):
         status_text = "\n".join(call[2]["text"] for call in status_calls)
         assert "READY on port 8000" in status_text
         assert "READY on port 9000" in status_text
-        assert len(turns) == 3
-        assert turn_origins == ["idle_completion"] * 3
+        assert len(turns) == 2
+        assert turn_origins == ["idle_completion"] * 2
     finally:
         server._sessions.pop("sid_watch_dedup", None)
         while not process_registry.completion_queue.empty():
@@ -15035,6 +15030,92 @@ def test_idle_completion_batch_keeps_interrupted_async_child_visible(monkeypatch
     assert server._completion_event_requires_visible_response(interrupted) is True
     assert len(dispatched) == 1
     assert dispatched[0][1]["allow_silent_noop"] is False
+
+
+def test_idle_completion_batch_requeues_every_mixed_excess_once(monkeypatch):
+    """>32 mixed completions keep FIFO order and each enters one model batch."""
+    import queue
+
+    from tools import async_delegation as ad
+    from tools.process_registry import process_registry
+
+    isolated = queue.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated)
+    events = [
+        (
+            {
+                "type": "async_delegation" if index % 2 else "completion",
+                "delegation_id": f"deleg-{index}" if index % 2 else None,
+                "session_id": f"event-{index}",
+            },
+            f"completion {index}",
+        )
+        for index in range(server._COMPLETION_IDLE_BATCH_MAX + 5)
+    ]
+    submitted = []
+    released = []
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda _rid, _sid, _session, payload, **kwargs: submitted.append(
+            (payload, kwargs["delivery_claims"])
+        ),
+    )
+    monkeypatch.setattr(
+        ad,
+        "claim_event_delivery",
+        lambda evt, consumer: f"{consumer}:{evt['session_id']}",
+    )
+
+    def release(evt, claim, consume_attempt=False):
+        released.append((evt["session_id"], claim, consume_attempt))
+        if evt.get("type") != "async_delegation":
+            isolated.put(evt)
+
+    monkeypatch.setattr(
+        ad,
+        "release_event_delivery",
+        release,
+    )
+    preclaimed = [(evt, f"steer:{evt['session_id']}") for evt, _text in events]
+
+    assert server._dispatch_idle_completion_batch(
+        "rid-first",
+        "sid-mixed",
+        _session(running=True),
+        events,
+        consumer="mixed-first",
+        preclaimed=preclaimed,
+    )
+    excess = []
+    while not isolated.empty():
+        evt = isolated.get_nowait()
+        index = evt["session_id"].split("-")[-1]
+        excess.append((evt, f"completion {index}"))
+    expected_excess = events[server._COMPLETION_IDLE_BATCH_MAX:]
+    assert [evt["session_id"] for evt, _text in excess] == [
+        evt["session_id"] for evt, _text in expected_excess
+    ]
+    assert [item[0] for item in released] == [
+        evt["session_id"] for evt, _text in expected_excess
+    ]
+    assert all(item[2] is False for item in released)
+
+    assert server._dispatch_idle_completion_batch(
+        "rid-second",
+        "sid-mixed",
+        _session(running=True),
+        excess,
+        consumer="mixed-second",
+    )
+    delivered_ids = [
+        evt["session_id"]
+        for _payload, claims in submitted
+        for evt, _claim in claims
+    ]
+    assert delivered_ids == [evt["session_id"] for evt, _text in events]
+    assert len(delivered_ids) == len(set(delivered_ids))
+    assert isolated.empty()
 
 
 def test_idle_completion_clean_process_preserves_silent_noop(monkeypatch):

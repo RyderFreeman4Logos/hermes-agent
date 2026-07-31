@@ -4000,6 +4000,15 @@ class AIAgent:
         except Exception:
             pass
 
+        # Return pages released by the teardown above on Linux/glibc. This is
+        # a safe no-op on unsupported platforms and does not mutate history.
+        try:
+            from hermes_cli.mem_trim import trim_memory
+
+            trim_memory(force=True, reason="agent close")
+        except Exception:
+            pass
+
         # 8. Finalize the owned SQLite session row unless this agent is only a
         # temporary helper that deliberately handed session ownership forward
         # (manual compression helpers that rotate to a continuation session_id,

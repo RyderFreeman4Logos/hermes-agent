@@ -13954,6 +13954,33 @@ def test_reap_idle_sessions_closes_only_evictable(monkeypatch):
         server._sessions.clear()
 
 
+def test_reap_idle_sessions_calls_periodic_trim(monkeypatch):
+    import hermes_cli.mem_trim as mem_trim
+
+    calls = []
+    monkeypatch.setattr(server, "_enforce_session_cap", lambda: None)
+    monkeypatch.setattr(server, "_reclaim_orphaned_leases", lambda: None)
+    monkeypatch.setattr(
+        mem_trim, "trim_memory", lambda **kwargs: calls.append(kwargs) or True
+    )
+    server._sessions.clear()
+    try:
+        server._reap_idle_sessions()
+    finally:
+        server._sessions.clear()
+
+    assert calls == [{"reason": "idle reaper periodic trim"}]
+
+
+def test_turn_trim_wiring_preserves_prompt_and_history_references():
+    import inspect
+
+    source = inspect.getsource(server._run_prompt_submit)
+    assert 'trim_memory(reason="tui turn completion")' in source
+    assert "history.clear()" not in source
+    assert "run_kwargs.clear()" not in source
+
+
 def test_session_create_records_ui_model_as_session_override(monkeypatch):
     """The desktop composer owns its model as plain UI state and ships it on
     session.create. The gateway must record it as a PER-SESSION override (built

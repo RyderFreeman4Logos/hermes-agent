@@ -398,6 +398,7 @@ def test_foreground_command_does_not_emit_hint(monkeypatch, tmp_path):
             tt.terminal_tool(
                 command="echo hello",
                 background=False,
+                timeout=19,
             )
         )
     finally:

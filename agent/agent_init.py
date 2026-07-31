@@ -19,6 +19,7 @@ preserved.
 
 from __future__ import annotations
 
+import copy as _copy
 import logging
 import os
 import re
@@ -820,7 +821,8 @@ def init_agent(
     agent.max_tokens = max_tokens  # None = use model default
     agent.reasoning_config = reasoning_config  # None = use default (medium for OpenRouter)
     agent.service_tier = service_tier
-    agent.request_overrides = dict(request_overrides or {})
+    agent._caller_request_overrides = _copy.deepcopy(request_overrides or {})
+    agent.request_overrides = _copy.deepcopy(agent._caller_request_overrides)
     agent.prefill_messages = prefill_messages or []  # Prefilled conversation turns
     agent._force_ascii_payload = False
     
@@ -2684,6 +2686,7 @@ def init_agent(
         "api_mode": agent.api_mode,
         "api_key": getattr(agent, "api_key", ""),
         "client_kwargs": dict(agent._client_kwargs),
+        "request_overrides": _copy.deepcopy(agent.request_overrides),
         "use_prompt_caching": agent._use_prompt_caching,
         "use_native_cache_layout": agent._use_native_cache_layout,
         # Context engine state that _try_activate_fallback() overwrites.

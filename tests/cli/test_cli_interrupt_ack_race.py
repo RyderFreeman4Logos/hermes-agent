@@ -154,6 +154,42 @@ def test_unacknowledged_interrupt_message_is_requeued_not_dropped():
     assert agent.clear_calls >= 1
 
 
+def test_completion_delivery_chat_stages_ephemeral_user_message():
+    cli = _make_cli()
+
+    class CompletionAgent(_StubAgent):
+        def run_conversation(self, **kwargs):
+            assert self._pending_cli_user_message == {
+                "role": "user",
+                "content": "completion prompt",
+                "_completion_delivery_synthetic": True,
+            }
+            return {
+                "final_response": "Build finished successfully",
+                "messages": [
+                    {"role": "assistant", "content": "Build finished successfully"}
+                ],
+                "api_calls": 1,
+                "completed": True,
+                "partial": True,
+                "response_previewed": True,
+            }
+
+    cli.agent = CompletionAgent(cli.session_id, turn_seconds=0)
+    cli._interrupt_queue = queue.Queue()
+    cli._pending_input = queue.Queue()
+
+    with patch.object(cli, "_ensure_runtime_credentials", return_value=True), patch.object(
+        cli,
+        "_resolve_turn_agent_config",
+        return_value={
+            "signature": cli._active_agent_route_signature,
+            "model": None,
+            "runtime": None,
+            "request_overrides": None,
+        },
+    ), patch.object(cli, "_init_agent", return_value=True):
+        cli.chat("completion prompt", completion_delivery=True)
 
 
 def test_chat_persists_clean_input_when_a_queued_note_changes_api_message():

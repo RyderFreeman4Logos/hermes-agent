@@ -42,28 +42,11 @@ def _is_pure_tool_call_tail(msg: dict) -> bool:
     return not flatten_message_text(msg.get("content")).strip()
 
 
-# Verification continuation scaffolding flags: verify-on-stop / pre_verify
-# inject a synthetic user nudge to keep the agent going one more turn.
-# These nudges must be stripped from returned/live history to avoid
-# role-alternation breaks and poisoning the resumed transcript. The
-# assistant response is real content and is not flagged. (#65919 §7)
-_VERIFICATION_CONTINUATION_FLAGS = (
-    "_verification_stop_synthetic",
-    "_pre_verify_synthetic",
-)
+def _drop_ephemeral_scaffolding(messages) -> None:
+    """Remove model-only scaffolding while preserving every real message."""
+    from run_agent import _is_ephemeral_scaffolding
 
-
-def _drop_verification_continuation_scaffolding(messages) -> None:
-    """Remove verification-continuation nudge messages from *messages* in place.
-
-    Only the synthetic nudges carry these flags, so this strips just the
-    nudges while preserving the real attempted-final-answer that was
-    persisted to state.db.
-    """
-    messages[:] = [
-        m for m in messages
-        if not (isinstance(m, dict) and any(m.get(f) for f in _VERIFICATION_CONTINUATION_FLAGS))
-    ]
+    messages[:] = [m for m in messages if not _is_ephemeral_scaffolding(m)]
 
 
 def finalize_turn(
@@ -266,11 +249,10 @@ def finalize_turn(
     try:
         agent._drop_trailing_empty_response_scaffolding(messages)
 
-        # Drop verification-continuation nudges (synthetic user messages)
-        # from the live history before the tail-assistant check — only the
-        # nudges need stripping; the assistant candidate persists in
-        # state.db. (#65919 §7)
-        _drop_verification_continuation_scaffolding(messages)
+        # Drop all model-only nudges from returned/live history. The shared
+        # persistence predicate owns the complete flag list; real assistant
+        # responses are deliberately unflagged and remain durable.
+        _drop_ephemeral_scaffolding(messages)
 
         # When the turn was interrupted and the last message is a tool
         # result, append a synthetic assistant message to close the

@@ -2,7 +2,7 @@
 
 import queue
 
-from cli import HermesCLI
+from cli import HermesCLI, _CompletionDeliveryMessage
 
 
 def test_cli_completion_drain_uses_visible_session_identity(monkeypatch):
@@ -74,3 +74,52 @@ def test_cli_completion_ownership_accepts_compression_lineage():
             "session_key": "pre-compression-session",
         }
     )
+
+
+def test_cli_numeric_completion_queues_model_nudge_and_none_queues_nothing(
+    monkeypatch,
+):
+    from tools.process_registry import ProcessRegistry
+
+    cli = HermesCLI.__new__(HermesCLI)
+    cli.session_id = "visible-session"
+    cli._pending_input = queue.Queue()
+    cli._session_db = None
+    registry = ProcessRegistry()
+    monkeypatch.setattr("tools.process_registry.process_registry", registry)
+    monkeypatch.setattr(
+        "tools.async_delegation.claim_event_delivery",
+        lambda _event, _consumer: "claim-token",
+    )
+    monkeypatch.setattr(
+        "tools.async_delegation.complete_event_delivery", lambda *_args: None
+    )
+
+    registry.completion_queue.put(
+        {
+            "type": "completion",
+            "session_id": "proc-done",
+            "session_key": "visible-session",
+            "command": "echo done",
+            "exit_code": 0,
+            "output": "done",
+        }
+    )
+    registry.completion_queue.put(
+        {
+            "type": "completion",
+            "session_id": "proc-running",
+            "session_key": "visible-session",
+            "command": "sleep 1",
+            "exit_code": None,
+            "output": "still running",
+        }
+    )
+
+    cli._drain_process_notifications("cli-idle")
+
+    prompt = cli._pending_input.get_nowait()
+    assert isinstance(prompt, _CompletionDeliveryMessage)
+    assert "Background process proc-done completed normally" in prompt
+    assert "If no user-visible action is needed, emit no response." in prompt
+    assert cli._pending_input.empty()

@@ -1329,7 +1329,7 @@ class TestReaderLoopOrphanedPipe:
         registry._move_to_finished(s)
         assert registry.completion_queue.empty()
 
-    def test_none_exit_and_zombie_are_not_terminal(self, registry):
+    def test_known_launcher_exit_is_kept_until_descendant_settles(self, registry):
         proc = subprocess.Popen(
             [
                 sys.executable,
@@ -1354,9 +1354,16 @@ class TestReaderLoopOrphanedPipe:
         assert s.exit_code is None
         registry._move_to_finished(s)
         assert s.exited is False
+        assert s.exit_code == 4
+        assert s.id in registry._running
+        assert s.id not in registry._finished
+        assert registry.poll(s.id)["status"] == "running"
+        assert s.exit_code == 4
         assert registry.completion_queue.empty()
         assert _wait_until(lambda: not registry.completion_queue.empty(), timeout=5)
         assert s.exited is True
+        assert s.id not in registry._running
+        assert s.id in registry._finished
         item = registry.completion_queue.get_nowait()
         assert item["exit_code"] == 4
         assert registry.completion_queue.empty()

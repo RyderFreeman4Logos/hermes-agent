@@ -634,8 +634,8 @@ class ProcessRegistry:
                 if ready:
                     with session._lock:
                         session.exited = True
+                        session.exit_code = rc
                         if session.completion_reason != "killed":
-                            session.exit_code = rc
                             session.completion_reason = "exited"
                     self._move_to_finished(session)
                     return
@@ -1120,7 +1120,6 @@ class ProcessRegistry:
             if fd is not None:
                 import select as _select
 
-                idle_after_exit = 0
                 while True:
                     self._remember_local_descendants(session)
                     try:
@@ -1132,13 +1131,16 @@ class ProcessRegistry:
                         if not raw:
                             break  # true EOF — all writers closed
                         _append_chunk(raw.decode("utf-8", errors="replace"))
-                        idle_after_exit = 0
                     elif proc.poll() is not None and self._local_descendants_settled(session):
-                        # All owned work is gone. Give buffered tail output a
-                        # few more cycles before declaring final completion.
-                        idle_after_exit += 1
-                        if idle_after_exit >= 3:
-                            break
+                        # select() cannot see bytes already held by BufferedReader.
+                        # With all owned writers closed, read1() drains them to EOF
+                        # without blocking.
+                        while True:
+                            raw = raw_read(4096)
+                            if not raw:
+                                break
+                            _append_chunk(raw.decode("utf-8", errors="replace"))
+                        break
             else:
                 while True:
                     if raw_read is not None:
@@ -1162,10 +1164,11 @@ class ProcessRegistry:
                 session.process.wait(timeout=5)
             except Exception as e:
                 logger.debug("Process wait timed out or failed: %s", e)
-            session.exited = True
-            if session.completion_reason != "killed":
+            with session._lock:
+                session.exited = True
                 session.exit_code = session.process.returncode
-                session.completion_reason = "exited"
+                if session.completion_reason != "killed":
+                    session.completion_reason = "exited"
             self._move_to_finished(session)
 
     def _env_poller_loop(
@@ -1254,10 +1257,11 @@ class ProcessRegistry:
             pty.wait()
         except Exception as e:
             logger.debug("PTY wait timed out or failed: %s", e)
-        session.exited = True
-        if session.completion_reason != "killed":
+        with session._lock:
+            session.exited = True
             session.exit_code = pty.exitstatus if hasattr(pty, 'exitstatus') else -1
-            session.completion_reason = "exited"
+            if session.completion_reason != "killed":
+                session.completion_reason = "exited"
         self._move_to_finished(session)
 
     def _move_to_finished(self, session: ProcessSession):
@@ -1272,13 +1276,14 @@ class ProcessRegistry:
             if not ready:
                 with session._lock:
                     session.exited = False
-                    if session.completion_reason != "killed" and isinstance(rc, int):
+                    if isinstance(rc, int):
                         session.exit_code = rc
                 self._ensure_local_completion_supervisor(session)
                 return
-            if session.completion_reason != "killed":
+            with session._lock:
                 session.exit_code = rc
-                session.completion_reason = "exited"
+                if session.completion_reason != "killed":
+                    session.completion_reason = "exited"
 
         with self._lock:
             was_running = self._running.pop(session.id, None) is not None
@@ -1516,8 +1521,8 @@ class ProcessRegistry:
                 if len(session.output_buffer) > session.max_output_chars:
                     session.output_buffer = session.output_buffer[-session.max_output_chars:]
             session.exited = True
+            session.exit_code = rc
             if session.completion_reason != "killed":
-                session.exit_code = rc
                 session.completion_reason = "exited"
         logger.info(
             "Reconciled session %s: direct child exited with code %s but reader "
@@ -1713,20 +1718,61 @@ class ProcessRegistry:
         if session is None:
             return {"status": "not_found", "error": f"No process with ID {session_id}"}
 
-        if session.exited:
-            with session._lock:
+        can_kill = bool(
+            session._pty
+            or session.process
+            or (session.env_ref and session.pid)
+            or (session.detached and session.pid_scope == "host" and session.pid)
+        )
+        detached_already_exited = bool(
+            can_kill
+            and not session._pty
+            and session.process is None
+            and session.env_ref is None
+            and not self._host_pid_is_ours(session.pid, session.host_start_time)
+        )
+
+        with session._lock:
+            output = strip_ansi(session.output_buffer[-2000:])
+            if session.exited:
                 result = {
                     "status": "already_exited",
                     "command": session.command,
                     "exit_code": session.exit_code,
                     "completion_reason": session.completion_reason,
                     "termination_source": session.termination_source,
-                    "output": strip_ansi(session.output_buffer[-2000:]),
+                    "output": output,
                 }
-            # Only suppress the autonomous turn after its output is present in
-            # the explicit kill result, matching wait/log consumption.
-            if consume_output:
+            elif not can_kill:
+                result = {
+                    "status": "error",
+                    "error": (
+                        "Recovered process cannot be killed after restart because "
+                        "its original runtime handle is no longer available"
+                    ),
+                }
+            elif detached_already_exited:
+                session.exited = True
+                session.exit_code = None
+                result = {
+                    "status": "already_exited",
+                    "exit_code": None,
+                    "output": output,
+                }
+            else:
+                # Completion readers may observe the numeric return code while
+                # tree termination is still waiting, so kill intent comes first.
+                session.completion_reason = "killed"
+                session.termination_source = source
+                result = None
+            if consume_output and (
+                result is None or result["status"] == "already_exited"
+            ):
                 self._completion_consumed.add(session_id)
+
+        if result is not None:
+            if detached_already_exited and result["status"] == "already_exited":
+                self._move_to_finished(session)
             return result
 
         # Kill via PTY, Popen (local), or env execute (non-local)
@@ -1747,42 +1793,14 @@ class ProcessRegistry:
                 # Non-local -- kill inside sandbox
                 session.env_ref.execute(f"kill {session.pid} 2>/dev/null", timeout=5)
             elif session.detached and session.pid_scope == "host" and session.pid:
-                # Identity check, not bare liveness: if the PID is gone OR was
-                # recycled onto an unrelated process, treat our process as
-                # exited and never tree-kill the stranger.
-                if not self._host_pid_is_ours(session.pid, session.host_start_time):
-                    with session._lock:
-                        session.exited = True
-                        session.exit_code = None
-                        output = strip_ansi(session.output_buffer[-2000:])
-                    if consume_output:
-                        self._completion_consumed.add(session_id)
-                    self._move_to_finished(session)
-                    return {
-                        "status": "already_exited",
-                        "exit_code": session.exit_code,
-                        "output": output,
-                    }
                 self._terminate_host_pid(session.pid, session.host_start_time)
-            else:
-                return {
-                    "status": "error",
-                    "error": (
-                        "Recovered process cannot be killed after restart because "
-                        "its original runtime handle is no longer available"
-                    ),
-                }
-            # Capture output before marking consumed, then mark consumed before
-            # exposing ``exited`` to watcher tasks. This closes the delayed
-            # notification race without discarding the terminal transcript.
+            # Capture output after termination; kill intent and consumption were
+            # published before signaling so completion cannot race ahead of them.
             with session._lock:
                 output = strip_ansi(session.output_buffer[-2000:])
-                if consume_output:
-                    self._completion_consumed.add(session_id)
                 session.exited = True
-                session.exit_code = -15  # SIGTERM
-                session.completion_reason = "killed"
-                session.termination_source = source
+                if session.process is None:
+                    session.exit_code = -15  # SIGTERM
             self._move_to_finished(session)
             self._write_checkpoint()
             return {

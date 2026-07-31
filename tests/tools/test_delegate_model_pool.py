@@ -106,6 +106,36 @@ class TestResolveModelProfile(unittest.TestCase):
         self.assertEqual(merged["provider"], "custom:localrouter")
         self.assertEqual(merged["model"], "global-model")
 
+    def test_malformed_profile_field_types_fail_closed(self):
+        invalid = {
+            "provider": [],
+            "model": 7,
+            "base_url": {},
+            "api_key": ["secret"],
+            "api_mode": [],
+            "reasoning_effort": {"effort": "high"},
+        }
+        for field, value in invalid.items():
+            profile = {"model": "m"}
+            profile[field] = value
+            cfg = {"model_pool": {"bad": profile}}
+            with self.subTest(field=field), self.assertRaisesRegex(
+                ValueError, field
+            ):
+                _resolve_model_profile(cfg, "bad")
+
+    def test_invalid_profile_values_fail_closed(self):
+        for field, value in (
+            ("api_mode", "not-a-wire"),
+            ("reasoning_effort", "instant"),
+            ("base_url", "not-a-url"),
+        ):
+            cfg = {"model_pool": {"bad": {field: value, "model": "m"}}}
+            with self.subTest(field=field), self.assertRaisesRegex(
+                ValueError, field
+            ):
+                _resolve_model_profile(cfg, "bad")
+
 
 # =========================================================================
 # _resolve_delegation_credentials with model_profile
@@ -202,6 +232,43 @@ class TestResolveDelegationCredentialsModelProfile(unittest.TestCase):
         self.assertEqual(creds["provider"], "custom:pm")
         self.assertEqual(creds["api_key"], "pm-key")
         self.assertEqual(creds["reasoning_effort"], "high")
+
+    def test_cross_endpoint_profile_never_inherits_parent_secret(self):
+        parent = _make_mock_parent()
+        parent.api_key = "parent-secret"
+        cfg = {
+            "api_key": "global-secret",
+            "model_pool": {
+                "other": {
+                    "provider": "custom",
+                    "model": "m",
+                    "base_url": "https://other.invalid/v1",
+                }
+            }
+        }
+        with (
+            patch("tools.delegate_tool._load_config", return_value=cfg),
+            patch("run_agent.AIAgent") as MockAgent,
+        ):
+            result = delegate_task(
+                goal="do not run", model_profile="other", parent_agent=parent
+            )
+        self.assertIn("refusing to inherit", result)
+        MockAgent.assert_not_called()
+
+    def test_same_endpoint_profile_can_inherit_parent_secret(self):
+        parent = _make_mock_parent()
+        cfg = {
+            "model_pool": {
+                "same": {
+                    "provider": "custom",
+                    "model": "m",
+                    "base_url": parent.base_url,
+                }
+            }
+        }
+        creds = _resolve_delegation_credentials(cfg, parent, model_profile="same")
+        self.assertIsNone(creds["api_key"])
 
 
 # =========================================================================
@@ -306,7 +373,10 @@ class TestDelegateTaskModelProfile(unittest.TestCase):
     @patch("tools.delegate_tool._load_config")
     @patch("tools.delegate_tool._resolve_delegation_credentials")
     def test_top_level_profile_reaches_child(self, mock_creds, mock_cfg):
-        mock_cfg.return_value = {"max_iterations": 45, "model_pool": {"fast": {}}}
+        mock_cfg.return_value = {
+            "max_iterations": 45,
+            "model_pool": {"fast": {"model": "grok-4.5"}},
+        }
         mock_creds.return_value = {
             "model": "grok-4.5",
             "provider": "custom",
@@ -342,19 +412,14 @@ class TestDelegateTaskModelProfile(unittest.TestCase):
     @patch("tools.delegate_tool._resolve_delegation_credentials")
     def test_per_task_profile_overrides_top_level(self, mock_creds, mock_cfg):
         """A per-task model_profile beats the top-level one in a batch."""
-        mock_cfg.return_value = {"max_iterations": 45}
-
-        # _resolve_delegation_credentials is called once at the top level
-        # (model_profile=None here) plus once per task that sets its own
-        # profile. With 2 per-task profiles that's 3 calls total.
-        base_creds = {
-            "model": "base-model",
-            "provider": "openrouter",
-            "base_url": "https://openrouter.ai/api/v1",
-            "api_key": "base-key",
-            "api_mode": "chat_completions",
-            "reasoning_effort": None,
+        mock_cfg.return_value = {
+            "max_iterations": 45,
+            "model_pool": {
+                "fast": {"model": "grok-4.5"},
+                "smart": {"model": "gpt-5.6-terra"},
+            },
         }
+
         fast_creds = {
             "model": "grok-4.5",
             "provider": "custom",
@@ -371,7 +436,7 @@ class TestDelegateTaskModelProfile(unittest.TestCase):
             "api_mode": "chat_completions",
             "reasoning_effort": "high",
         }
-        mock_creds.side_effect = [base_creds, fast_creds, smart_creds]
+        mock_creds.side_effect = [fast_creds, smart_creds]
 
         parent = _make_mock_parent(depth=0)
 
@@ -392,18 +457,40 @@ class TestDelegateTaskModelProfile(unittest.TestCase):
                 parent_agent=parent,
             )
 
-            # Three credential resolutions: top-level (no profile) + 2 per-task.
-            self.assertEqual(mock_creds.call_count, 3)
+            self.assertEqual(mock_creds.call_count, 2)
             # The first per-task call used "fast"
-            first_task_kwargs = mock_creds.call_args_list[1][1]
+            first_task_kwargs = mock_creds.call_args_list[0][1]
             self.assertEqual(first_task_kwargs.get("model_profile"), "fast")
             # The second per-task call used "smart"
-            second_task_kwargs = mock_creds.call_args_list[2][1]
+            second_task_kwargs = mock_creds.call_args_list[1][1]
             self.assertEqual(second_task_kwargs.get("model_profile"), "smart")
             # The last child built got the smart profile's model
             _, last_child_kwargs = MockAgent.call_args
             self.assertEqual(last_child_kwargs["model"], "gpt-5.6-terra")
             self.assertEqual(last_child_kwargs["api_key"], "smart-key")
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("run_agent.AIAgent")
+    def test_batch_prevalidates_all_profiles_before_spawning(self, MockAgent, mock_cfg):
+        mock_cfg.return_value = {
+            "model_pool": {
+                "valid": {
+                    "model": "m",
+                    "base_url": "https://valid.invalid/v1",
+                    "api_key": "valid-key",
+                },
+                "invalid": {"provider": ["not", "a", "string"], "model": "m"},
+            }
+        }
+        result = delegate_task(
+            tasks=[
+                {"goal": "first", "model_profile": "valid"},
+                {"goal": "second", "model_profile": "invalid"},
+            ],
+            parent_agent=_make_mock_parent(),
+        )
+        self.assertIn("provider must be a string", result)
+        MockAgent.assert_not_called()
 
 
 # =========================================================================
@@ -491,6 +578,17 @@ class TestModelProfileSchemaEnum(unittest.TestCase):
             DELEGATE_TASK_SCHEMA["parameters"].get("required", []),
         )
 
+    @patch("tools.delegate_tool._load_config")
+    def test_schema_prose_matches_top_level_and_per_task_parameters(self, mock_cfg):
+        mock_cfg.return_value = {"model_pool": {"fast": {"model": "m"}}}
+        overrides = _build_dynamic_schema_overrides()
+        properties = overrides["parameters"]["properties"]
+        task_properties = properties["tasks"]["items"]["properties"]
+        self.assertEqual(properties["model_profile"]["type"], "string")
+        self.assertEqual(task_properties["model_profile"]["type"], "string")
+        self.assertIn("model_profile", overrides["description"])
+        self.assertIn("tasks[]", overrides["description"])
+
 
 # =========================================================================
 # Per-profile fallback_chain
@@ -542,6 +640,40 @@ class TestResolveModelProfileFallbackChain(unittest.TestCase):
             ):
                 _resolve_model_profile(cfg, "fast")
 
+    def test_malformed_fallback_fields_fail_closed(self):
+        invalid = {
+            "provider": 123,
+            "model": ["m"],
+            "base_url": {},
+            "api_key": ["secret"],
+            "api_mode": "not-a-wire",
+            "reasoning_effort": 7,
+        }
+        for field, value in invalid.items():
+            entry = {"provider": "p", "model": "m", field: value}
+            cfg = {
+                "model_pool": {
+                    "fast": {"model": "m", "fallback_chain": [entry]}
+                }
+            }
+            with self.subTest(field=field), self.assertRaisesRegex(
+                ValueError, r"fallback_chain\[0\]"
+            ):
+                _resolve_model_profile(cfg, "fast")
+
+        cfg = {
+            "model_pool": {
+                "fast": {
+                    "model": "m",
+                    "fallback_chain": [
+                        {"provider": "p", "model": "m", "base_url": "not-a-url"}
+                    ],
+                }
+            }
+        }
+        with self.assertRaisesRegex(ValueError, r"fallback_chain\[0\].*base_url"):
+            _resolve_model_profile(cfg, "fast")
+
     def test_non_list_fallback_chain_fails_closed(self):
         cfg = {
             "model_pool": {
@@ -567,6 +699,7 @@ class TestResolveCredentialsFallbackChain(unittest.TestCase):
                 "fast": {
                     "provider": "custom:localrouter",
                     "model": "grok-4.5",
+                    "api_key": "fast-key",
                     "fallback_chain": [
                         {"provider": "openai-codex", "model": "gpt-5.6-terra"},
                     ],
@@ -581,7 +714,9 @@ class TestResolveCredentialsFallbackChain(unittest.TestCase):
     def test_missing_fallback_chain_keeps_inheritance_signal(self):
         cfg = {
             "base_url": "http://localhost:8000/v1",
-            "model_pool": {"fast": {"provider": "x", "model": "m"}},
+            "model_pool": {
+                "fast": {"provider": "x", "model": "m", "api_key": "fast-key"}
+            },
         }
         parent = _make_mock_parent()
         creds = _resolve_delegation_credentials(cfg, parent, model_profile="fast")
@@ -596,6 +731,7 @@ class TestResolveCredentialsFallbackChain(unittest.TestCase):
                 "fast": {
                     "provider": "custom:localrouter",
                     "model": "grok-4.5",
+                    "api_key": "fast-key",
                     "fallback_chain": [
                         {"provider": "openai-codex", "model": "gpt-5.6-terra"},
                     ],
@@ -722,7 +858,10 @@ class TestDelegateTaskFallbackChainIntegration(unittest.TestCase):
         self, MockAgent, mock_creds, mock_cfg
     ):
         """The profile's fallback_chain reaches _build_child_agent."""
-        mock_cfg.return_value = {"max_iterations": 45, "model_pool": {"fast": {}}}
+        mock_cfg.return_value = {
+            "max_iterations": 45,
+            "model_pool": {"fast": {"model": "grok-4.5"}},
+        }
         chain = [{"provider": "openai-codex", "model": "gpt-5.6-terra"}]
         mock_creds.return_value = {
             "model": "grok-4.5",
@@ -758,19 +897,16 @@ class TestDelegateTaskFallbackChainIntegration(unittest.TestCase):
         self, MockAgent, mock_creds, mock_cfg
     ):
         """Each per-task profile carries its own fallback_chain."""
-        mock_cfg.return_value = {"max_iterations": 45}
+        mock_cfg.return_value = {
+            "max_iterations": 45,
+            "model_pool": {
+                "fast": {"model": "grok-4.5"},
+                "smart": {"model": "gpt-5.6-terra"},
+            },
+        }
         fast_chain = [{"provider": "openai-codex", "model": "gpt-5.6-terra"}]
         smart_chain = [{"provider": "nous", "model": "hermes-4"}]
         mock_creds.side_effect = [
-            {  # top-level (no profile)
-                "model": "base-model",
-                "provider": "openrouter",
-                "base_url": "https://openrouter.ai/api/v1",
-                "api_key": "base-key",
-                "api_mode": "chat_completions",
-                "reasoning_effort": None,
-                "fallback_chain": [],
-            },
             {  # fast task
                 "model": "grok-4.5",
                 "provider": "custom",

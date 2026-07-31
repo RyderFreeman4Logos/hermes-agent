@@ -305,6 +305,21 @@ class TestBuildChildAgentCredentialInheritance(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "different delegation backend"):
             _build_child_agent(
                 **common,
+                override_provider="custom",
+                override_base_url="https://profile.invalid/v1",
+                inherit_parent_api_key=True,
+            )
+        with self.assertRaisesRegex(ValueError, "different delegation backend"):
+            _build_child_agent(
+                **common,
+                override_provider="custom",
+                inherit_parent_api_key=True,
+            )
+        MockAgent.assert_not_called()
+
+        with self.assertRaisesRegex(ValueError, "different delegation backend"):
+            _build_child_agent(
+                **common,
                 override_base_url=parent.base_url,
                 inherit_parent_api_key=False,
             )
@@ -329,6 +344,66 @@ class TestBuildChildAgentCredentialInheritance(unittest.TestCase):
         MockAgent.reset_mock()
         _build_child_agent(**common)
         self.assertEqual(MockAgent.call_args.kwargs["api_key"], "parent-secret")
+
+        MockAgent.reset_mock()
+        _build_child_agent(
+            **common,
+            override_provider="custom",
+            override_base_url="https://profile.invalid/v1",
+            override_api_key="",
+            inherit_parent_api_key=False,
+        )
+        self.assertEqual(MockAgent.call_args.kwargs["api_key"], "")
+
+    @patch("tools.delegation_live_log.create_live_transcripts", return_value=(None, [], []))
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    @patch("tools.delegate_tool._load_config")
+    @patch("run_agent.AIAgent")
+    def test_all_named_profile_paths_recheck_inheritance_at_builder(
+        self, MockAgent, mock_cfg, mock_creds, _mock_live
+    ):
+        cfg = {
+            "max_spawn_depth": 3,
+            "orchestrator_enabled": True,
+            "model_pool": {"other": {"model": "m"}},
+        }
+        mock_cfg.return_value = cfg
+        mock_creds.return_value = {
+            "model": "m",
+            "provider": "custom",
+            "base_url": "https://other.invalid/v1",
+            "api_key": None,
+            "inherit_parent_api_key": True,
+            "api_mode": "chat_completions",
+        }
+        cases = (
+            ("sync", {"goal": "sync", "model_profile": "other"}, 0),
+            (
+                "background",
+                {"goal": "background", "model_profile": "other", "background": True},
+                0,
+            ),
+            (
+                "batch",
+                {
+                    "tasks": [{"goal": "one"}, {"goal": "two"}],
+                    "model_profile": "other",
+                },
+                0,
+            ),
+            (
+                "orchestrator",
+                {"goal": "nested", "model_profile": "other", "role": "orchestrator"},
+                1,
+            ),
+        )
+
+        for name, kwargs, depth in cases:
+            with self.subTest(path=name), self.assertRaisesRegex(
+                ValueError, "different delegation backend"
+            ):
+                delegate_task(parent_agent=_make_mock_parent(depth=depth), **kwargs)
+        MockAgent.assert_not_called()
 
 
 # =========================================================================

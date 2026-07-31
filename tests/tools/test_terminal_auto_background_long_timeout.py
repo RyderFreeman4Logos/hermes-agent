@@ -123,15 +123,19 @@ def _run_foreground(command: str, **tool_kwargs):
 
 
 class TestConfigDefaults:
-    def test_default_config_timeout_is_3300(self):
+    def test_default_config_timeout_is_foreground_180_warm_kv_3300(self):
         from hermes_cli.config import DEFAULT_CONFIG
 
         term = DEFAULT_CONFIG["terminal"]
-        assert term["timeout"] == 3300
-        assert term["auto_background_timeout_threshold"] == 19
+        # Foreground default is short; long waits auto-promote to background.
+        assert term["timeout"] == 180
         assert term["auto_background_timeout"] == 3300
-        assert term["auto_background_long_timeout"] is True
-        assert term["default_notify_on_background"] is True
+        assert term["auto_background_timeout_threshold"] == 19
+        wkv = (DEFAULT_CONFIG.get("runtime") or {}).get("warm_kv_timeout") or {}
+        assert wkv.get("default") == 3300
+        hb = (DEFAULT_CONFIG.get("runtime") or {}).get("heartbeat") or {}
+        assert hb.get("safety_ratio") == 1.0
+
 
     def test_get_env_config_defaults(self, monkeypatch):
         import tools.terminal_tool as tt

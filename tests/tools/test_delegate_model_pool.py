@@ -5,11 +5,11 @@ Covers the model_pool feature added in
 ``feat(delegation): named model pool for per-subagent model selection``:
 
   1. Profile present  → child uses the profile's provider/model.
-  2. Profile absent   → falls back to the global delegation config.
+  2. Profile omitted  → falls back to the global delegation config.
   3. Per-task model_profile in a batch fans out across profiles.
   4. Profile-level reasoning_effort overrides the global level.
   5. Profile provider resolves through resolve_runtime_provider (custom:).
-  6. Fallback chain: a missing/unknown profile degrades gracefully.
+  6. Unknown profiles and malformed fallback chains fail closed.
 
 Uses mock AIAgent instances — no real LLM calls.
 """
@@ -138,29 +138,23 @@ class TestResolveDelegationCredentialsModelProfile(unittest.TestCase):
         self.assertEqual(creds["api_key"], "fast-key")
         self.assertEqual(creds["reasoning_effort"], "high")
 
-    def test_unknown_profile_falls_back_to_global(self):
-        """Unknown profile name → global delegation config is used (back-compat)."""
+    def test_unknown_explicit_profile_fails_closed(self):
         parent = _make_mock_parent()
         cfg = {
             "model": "global-model",
             "provider": "openrouter",
             "model_pool": {"fast": {"provider": "x", "model": "m"}},
         }
-        with patch(
-            "hermes_cli.runtime_provider.resolve_runtime_provider"
-        ) as mock_rt:
-            mock_rt.return_value = {
-                "provider": "openrouter",
-                "api_mode": "chat_completions",
-                "base_url": "https://openrouter.ai/api/v1",
-                "api_key": "or-key",
-                "model": "global-model",
-            }
-            creds = _resolve_delegation_credentials(cfg, parent, model_profile="nope")
-        self.assertEqual(creds["model"], "global-model")
-        self.assertEqual(creds["provider"], "openrouter")
-        # reasoning_effort not set globally → None
-        self.assertIsNone(creds["reasoning_effort"])
+        with self.assertRaisesRegex(ValueError, "Unknown or invalid.*nope"):
+            _resolve_delegation_credentials(cfg, parent, model_profile="nope")
+
+    def test_unknown_default_profile_fails_closed(self):
+        cfg = {
+            "default_profile": "missing",
+            "model_pool": {"fast": {"provider": "x", "model": "m"}},
+        }
+        with self.assertRaisesRegex(ValueError, "Unknown or invalid.*missing"):
+            _resolve_delegation_credentials(cfg, _make_mock_parent())
 
     def test_no_profile_uses_global(self):
         parent = _make_mock_parent()
@@ -298,6 +292,16 @@ class TestBuildChildAgentProfileReasoningEffort(unittest.TestCase):
 
 class TestDelegateTaskModelProfile(unittest.TestCase):
     """Integration: model_profile reaches the child agent via delegate_task."""
+
+    @patch("tools.delegate_tool._load_config")
+    def test_unknown_profile_returns_tool_error(self, mock_cfg):
+        mock_cfg.return_value = {
+            "model_pool": {"fast": {"provider": "x", "model": "m"}}
+        }
+        result = delegate_task(
+            goal="Do not run", model_profile="missing", parent_agent=_make_mock_parent()
+        )
+        self.assertIn("Unknown or invalid delegation model profile 'missing'", result)
 
     @patch("tools.delegate_tool._load_config")
     @patch("tools.delegate_tool._resolve_delegation_credentials")
@@ -518,32 +522,39 @@ class TestResolveModelProfileFallbackChain(unittest.TestCase):
         self.assertEqual(chain[0]["model"], "gpt-5.6-terra")
         self.assertEqual(chain[1]["provider"], "nous")
 
-    def test_fallback_chain_drops_invalid_entries(self):
-        """Entries missing provider/model are dropped; reasoning_effort kept."""
-        cfg = {
-            "model_pool": {
-                "fast": {
-                    "provider": "x",
-                    "model": "m",
-                    "fallback_chain": [
-                        {"provider": "ok", "model": "m1", "reasoning_effort": "low"},
-                        {"provider": "", "model": "no-provider"},  # dropped
-                        {"provider": "no-model", "model": ""},  # dropped
-                        "not-a-dict",  # dropped
-                    ],
+    def test_malformed_fallback_chain_entries_fail_closed(self):
+        for entry in (
+            {"provider": "", "model": "no-provider"},
+            {"provider": "no-model", "model": ""},
+            "not-a-dict",
+        ):
+            cfg = {
+                "model_pool": {
+                    "fast": {
+                        "provider": "x",
+                        "model": "m",
+                        "fallback_chain": [entry],
+                    }
                 }
             }
-        }
-        merged = _resolve_model_profile(cfg, "fast")
-        chain = merged["_profile_fallback_chain"]
-        self.assertEqual(len(chain), 1)
-        self.assertEqual(chain[0]["provider"], "ok")
-        self.assertEqual(chain[0]["reasoning_effort"], "low")
+            with self.subTest(entry=entry), self.assertRaisesRegex(
+                ValueError, r"fallback_chain\[0\]"
+            ):
+                _resolve_model_profile(cfg, "fast")
 
-    def test_no_fallback_chain_yields_empty_list(self):
+    def test_non_list_fallback_chain_fails_closed(self):
+        cfg = {
+            "model_pool": {
+                "fast": {"provider": "x", "model": "m", "fallback_chain": {}}
+            }
+        }
+        with self.assertRaisesRegex(ValueError, "fallback_chain must be a list"):
+            _resolve_model_profile(cfg, "fast")
+
+    def test_no_fallback_chain_is_absent(self):
         cfg = {"model_pool": {"fast": {"provider": "x", "model": "m"}}}
         merged = _resolve_model_profile(cfg, "fast")
-        self.assertEqual(merged["_profile_fallback_chain"], [])
+        self.assertNotIn("_profile_fallback_chain", merged)
 
 
 class TestResolveCredentialsFallbackChain(unittest.TestCase):
@@ -567,14 +578,14 @@ class TestResolveCredentialsFallbackChain(unittest.TestCase):
         self.assertEqual(creds["fallback_chain"][0]["provider"], "openai-codex")
         self.assertEqual(creds["fallback_chain"][0]["model"], "gpt-5.6-terra")
 
-    def test_empty_fallback_chain_when_no_chain_configured(self):
+    def test_missing_fallback_chain_keeps_inheritance_signal(self):
         cfg = {
             "base_url": "http://localhost:8000/v1",
             "model_pool": {"fast": {"provider": "x", "model": "m"}},
         }
         parent = _make_mock_parent()
         creds = _resolve_delegation_credentials(cfg, parent, model_profile="fast")
-        self.assertEqual(creds["fallback_chain"], [])
+        self.assertIsNone(creds["fallback_chain"])
 
     def test_default_profile_used_when_model_profile_none(self):
         """Internal path (model_profile=None) falls back to default_profile."""
@@ -615,7 +626,7 @@ class TestResolveCredentialsFallbackChain(unittest.TestCase):
             }
             creds = _resolve_delegation_credentials(cfg, parent, model_profile=None)
         # No profile → no chain, global provider resolved.
-        self.assertEqual(creds["fallback_chain"], [])
+        self.assertIsNone(creds["fallback_chain"])
         self.assertIsNotNone(creds["provider"])
 
 
@@ -680,8 +691,7 @@ class TestBuildChildAgentFallbackChain(unittest.TestCase):
 
     @patch("tools.delegate_tool._load_config")
     @patch("run_agent.AIAgent")
-    def test_empty_profile_chain_inherits_parent_chain(self, MockAgent, mock_cfg):
-        """An empty list (no profile chain) still inherits the parent chain."""
+    def test_empty_profile_chain_disables_parent_chain(self, MockAgent, mock_cfg):
         mock_cfg.return_value = {"max_iterations": 50}
         MockAgent.return_value = MagicMock()
         parent = _make_mock_parent()
@@ -696,10 +706,10 @@ class TestBuildChildAgentFallbackChain(unittest.TestCase):
             max_iterations=50,
             task_count=1,
             parent_agent=parent,
-            override_fallback_chain=[],  # empty → inherit parent
+            override_fallback_chain=[],
         )
         call_kwargs = MockAgent.call_args[1]
-        self.assertEqual(call_kwargs["fallback_model"], parent._fallback_chain)
+        self.assertEqual(call_kwargs["fallback_model"], [])
 
 
 class TestDelegateTaskFallbackChainIntegration(unittest.TestCase):

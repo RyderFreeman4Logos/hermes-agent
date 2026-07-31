@@ -800,6 +800,38 @@ def test_normal_delivery_releases_still_drop_at_attempt_budget(tmp_path, monkeyp
     assert not ad.claim_completion_delivery(delegation_id, "idle-drain")
 
 
+def test_expired_eighth_claim_is_terminal_and_cannot_be_claimed_ninth_time(
+    tmp_path, monkeypatch
+):
+    """A consumer crash cannot bypass the durable delivery-attempt bound."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    now = [1_000.0]
+    monkeypatch.setattr(ad.time, "time", lambda: now[0])
+    delegation_id = "deleg_expired_eighth_claim"
+    ad._persist_dispatch({
+        "delegation_id": delegation_id,
+        "session_key": "owner",
+        "dispatched_at": 1.0,
+    })
+    ad._persist_completion(
+        {"delegation_id": delegation_id, "status": "completed", "completed_at": 2.0},
+        {"status": "completed", "summary": "done"},
+    )
+
+    for attempt in range(ad._MAX_DELIVERY_ATTEMPTS - 1):
+        claim_id = f"failed-{attempt}"
+        assert ad.claim_completion_delivery(delegation_id, claim_id)
+        assert ad.release_completion_delivery(delegation_id, claim_id)
+
+    assert ad.claim_completion_delivery(delegation_id, "crashed-eighth")
+    now[0] += ad._DELIVERY_CLAIM_LEASE_SECONDS + 1
+    assert not ad.claim_completion_delivery(delegation_id, "forbidden-ninth")
+
+    durable = ad.get_durable_delegation(delegation_id)
+    assert durable["delivery_state"] == "dropped"
+    assert durable["delivery_attempts"] == ad._MAX_DELIVERY_ATTEMPTS
+
+
 # ---------------------------------------------------------------------------
 # Integration: delegate_task(background=True) routing
 # ---------------------------------------------------------------------------

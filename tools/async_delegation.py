@@ -1173,16 +1173,33 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
         ).fetchone()
         if row is None:
             return True  # legacy event created before durable dispatch
+        capped = conn.execute(
+            """UPDATE async_delegations SET delivery_state='dropped',
+                      delivery_claim=NULL, delivery_claimed_at=NULL, updated_at=?
+               WHERE delegation_id=? AND delivery_state='pending'
+                 AND delivery_attempts>=?
+                 AND (delivery_claim IS NULL OR delivery_claimed_at < ?)""",
+            (
+                now,
+                delegation_id,
+                _MAX_DELIVERY_ATTEMPTS,
+                now - _DELIVERY_CLAIM_LEASE_SECONDS,
+            ),
+        )
+        if capped.rowcount == 1:
+            return False
         cur = conn.execute(
             """UPDATE async_delegations SET delivery_claim=?, delivery_claimed_at=?,
                       delivery_attempts=delivery_attempts+1, updated_at=?
                WHERE delegation_id=? AND delivery_state='pending'
+                 AND delivery_attempts < ?
                  AND (delivery_claim IS NULL OR delivery_claimed_at < ?)""",
             (
                 claim_id,
                 now,
                 now,
                 delegation_id,
+                _MAX_DELIVERY_ATTEMPTS,
                 now - _DELIVERY_CLAIM_LEASE_SECONDS,
             ),
         )

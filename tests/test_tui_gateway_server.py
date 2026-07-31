@@ -12434,7 +12434,19 @@ def test_prompt_submit_heartbeat_silent_noop_keeps_live_history_clean(monkeypatc
     prior_history = [{"role": "assistant", "content": "previous visible answer"}]
 
     class _Agent:
-        def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **kwargs):
+        def run_conversation(
+            self,
+            prompt,
+            conversation_history=None,
+            stream_callback=None,
+            turn_origin=None,
+            allow_silent_noop=None,
+            **kwargs,
+        ):
+            kwargs.update(
+                turn_origin=turn_origin,
+                allow_silent_noop=allow_silent_noop,
+            )
             calls.append((prompt, kwargs))
             return {
                 "final_response": None,
@@ -14446,7 +14458,7 @@ def test_notification_poller_shutdown_drain_transfers_delivery_claim(monkeypatch
 
 
 def test_notification_poller_shutdown_requeues_untouched_suffix_once(monkeypatch):
-    """An early busy retry preserves the detached shutdown batch in FIFO order."""
+    """A busy shutdown preserves FIFO for one later nonblocking idle drain."""
     import queue as _queue_mod
 
     import tools.async_delegation as async_delegation
@@ -14456,7 +14468,7 @@ def test_notification_poller_shutdown_requeues_untouched_suffix_once(monkeypatch
     sid = "sid-shutdown-suffix"
     events = [
         {"type": "completion", "session_id": "busy"},
-        {"type": "watch_match", "session_id": "ordinary"},
+        {"type": "completion", "session_id": "ordinary"},
         {
             "type": "async_delegation",
             "delegation_id": "async-suffix",
@@ -14515,18 +14527,21 @@ def test_notification_poller_shutdown_requeues_untouched_suffix_once(monkeypatch
 
     for event in restored:
         isolated_queue.put(event)
-    delivered = []
+    scheduled = []
+    drain_stop = threading.Event()
 
     def submit(_rid, _sid, submitted_session, _text, **kwargs):
-        delivered.extend(event for event, _claim in kwargs["delivery_claims"])
-        submitted_session["running"] = False
+        scheduled.extend(event for event, _claim in kwargs["delivery_claims"])
+        assert submitted_session["running"] is True
+        drain_stop.set()
 
     monkeypatch.setattr(server, "_run_prompt_submit", submit)
     session["running"] = False
-    server._notification_poller_loop(stop, sid, session)
+    server._notification_poller_loop(drain_stop, sid, session)
 
-    assert delivered == events
-    assert len({id(event) for event in delivered}) == len(events)
+    assert session["running"] is True
+    assert scheduled == events
+    assert len({id(event) for event in scheduled}) == len(events)
     assert isolated_queue.empty()
 
 

@@ -24949,6 +24949,19 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
             except Exception as e:
                 logger.debug("Auto-archive tick error: %s", e)
 
+        # The shared helper owns its config gate and cooldown, so the normal
+        # 60-second housekeeping cadence is safe on every platform.
+        try:
+            from hermes_cli.mem_trim import trim_memory
+
+            trim_memory(reason="messaging gateway housekeeping")
+        except Exception as exc:
+            logger.warning(
+                "gateway housekeeping memory trim failed: %s: %s",
+                type(exc).__name__,
+                exc,
+            )
+
         stop_event.wait(timeout=interval)
     logger.info("Gateway housekeeping stopped")
 

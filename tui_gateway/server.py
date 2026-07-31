@@ -1018,6 +1018,14 @@ def _reap_idle_sessions() -> None:
         _close_session_by_id(sid, end_reason="idle_timeout")
     _enforce_session_cap()
     _reclaim_orphaned_leases()
+    try:
+        from hermes_cli.mem_trim import trim_memory
+
+        trim_memory(reason="idle reaper periodic trim")
+    except Exception as exc:
+        logger.warning(
+            "idle reaper memory trim failed: %s: %s", type(exc).__name__, exc
+        )
 
 
 def _reclaim_orphaned_leases() -> None:
@@ -9623,6 +9631,14 @@ def _run_prompt_submit(
                     reset_current_session_key(approval_token)
             except Exception:
                 pass
+            # Resolve config while the resumed profile's HERMES_HOME override
+            # remains active. Do not clear or replace prompt/history objects.
+            try:
+                from hermes_cli.mem_trim import trim_memory
+
+                trim_memory(reason="tui turn completion")
+            except Exception:
+                logger.debug("post-turn memory trim failed", exc_info=True)
             if home_token is not None:
                 reset_hermes_home_override(home_token)
             if secret_token is not None:

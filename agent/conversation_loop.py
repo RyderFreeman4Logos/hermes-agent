@@ -1384,6 +1384,10 @@ def run_conversation(
     # (early failure / interrupt) so the hook receives None rather than a
     # stale prior turn's usage.
     agent._last_turn_usage = None
+    # The first call is separately retained for TUI cache-health reporting:
+    # it tells us whether this turn's inherited prefix hit the prior turn's
+    # cache, before later calls naturally reuse the cache written by call #1.
+    agent._first_turn_usage = None
 
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
     # turn to the codex app-server subprocess (terminal/file ops/patching
@@ -3278,6 +3282,8 @@ def run_conversation(
                     # of interest is the cost/size of the latest assembled
                     # request, so we keep the most recent call's usage.
                     agent._last_turn_usage = dict(usage_dict)
+                    if api_call_count == 1:
+                        agent._first_turn_usage = dict(usage_dict)
                 elif getattr(
                     agent.context_compressor,
                     "awaiting_real_usage_after_compression",
@@ -3311,6 +3317,36 @@ def run_conversation(
                     agent.session_cache_read_tokens += canonical_usage.cache_read_tokens
                     agent.session_cache_write_tokens += canonical_usage.cache_write_tokens
                     agent.session_reasoning_tokens += canonical_usage.reasoning_tokens
+
+                    # The first provider call is the useful cache-health
+                    # signal: later calls mostly hit because this turn just
+                    # populated the cache.
+                    if api_call_count == 1:
+                        cache_callback = getattr(agent, "_tui_cache_callback", None)
+                        if callable(cache_callback):
+                            cache_read = canonical_usage.cache_read_tokens or 0
+                            cache_write = canonical_usage.cache_write_tokens or 0
+                            if cache_read > 0:
+                                cache_state = "hit"
+                                cache_pct = (
+                                    round(100 * cache_read / prompt_tokens)
+                                    if prompt_tokens
+                                    else 0
+                                )
+                            elif cache_write > 0:
+                                cache_state = "cold_write"
+                                cache_pct = 0
+                            else:
+                                cache_state = "unknown"
+                                cache_pct = 0
+                            try:
+                                cache_callback(
+                                    cache_state, cache_pct, cache_read, prompt_tokens
+                                )
+                            except Exception:
+                                logger.debug(
+                                    "TUI first-call cache callback failed", exc_info=True
+                                )
 
                     # Log API call details for debugging/observability
                     _cache_pct = ""

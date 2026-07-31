@@ -1534,6 +1534,12 @@ def _event_frame(event: str, sid: str, payload: dict | None = None) -> dict:
 
 
 def _emit(event: str, sid: str, payload: dict | None = None):
+    # This is the authoritative moment a terminal turn frame leaves the
+    # gateway. Keep it on the frame (rather than a client-side Date.now()) so
+    # the TUI can distinguish a delayed delivery from an agent that just
+    # stopped. Copy rather than mutate because some callers reuse payloads.
+    if event == "message.complete":
+        payload = {**(payload or {}), "completed_at": time.time()}
     write_json(_event_frame(event, sid, payload))
 
 
@@ -4892,6 +4898,50 @@ def _get_usage(agent) -> dict:
     return usage
 
 
+def _cache_info_from_usage(usage: Any) -> dict[str, int | str] | None:
+    if not isinstance(usage, dict):
+        return None
+
+    read_keys = ("cache_read_tokens",)
+    write_keys = (
+        "cache_write_tokens",
+        "cache_creation_tokens",
+        "cache_creation_input_tokens",
+    )
+    if not any(key in usage for key in (*read_keys, *write_keys)):
+        return None
+
+    def tokens(*keys: str) -> int:
+        for key in keys:
+            value = usage.get(key)
+            if value is not None:
+                try:
+                    return max(0, int(float(value)))
+                except (TypeError, ValueError):
+                    pass
+        return 0
+
+    read_tokens = tokens(*read_keys)
+    write_tokens = tokens(*write_keys)
+    prompt_tokens = tokens("prompt_tokens")
+    pct = round(100 * read_tokens / prompt_tokens) if prompt_tokens else 0
+    state = (
+        "hit"
+        if read_tokens
+        else "cold_write"
+        if write_tokens
+        else "unknown"
+        if prompt_tokens < 1024
+        else "miss"
+    )
+    return {
+        "read_tokens": read_tokens,
+        "prompt_tokens": prompt_tokens,
+        "pct": pct,
+        "state": state,
+    }
+
+
 def _probe_credentials(agent) -> str:
     """Light credential check at session creation — returns warning or ''.
 
@@ -5690,6 +5740,16 @@ def _agent_cbs(sid: str) -> dict:
     return callbacks
 
 
+def _attach_tui_cache_callback(agent, sid: str):
+    """Attach the first-provider-call cache signal to a live TUI agent."""
+    def emit_cache_state(state: str, pct: int, _read: int, _prompt: int) -> None:
+        text = f"cache {pct}%" if state == "hit" else f"cache {state.upper()}"
+        _emit("status.update", sid, {"kind": "cache_hit", "text": text})
+
+    agent._tui_cache_callback = emit_cache_state
+    return agent
+
+
 def _apply_project_workspace(task_id: str, path: str, _name: str = "") -> None:
     """Intentional workspace move from the project_* tools: re-anchor the live
     session's cwd to the chosen project's folder and push session.info so the
@@ -6294,7 +6354,7 @@ def _make_agent(
 
     synthetic = maybe_build_synthetic_agent(session_id or key, model_override)
     if synthetic is not None:
-        return synthetic
+        return _attach_tui_cache_callback(synthetic, sid)
 
     from run_agent import AIAgent
 
@@ -6414,7 +6474,7 @@ def _make_agent(
                 raise RuntimeError("Auth fallback resolved without a model")
             model = resolution.selected_model
     _pr = _load_provider_routing()
-    return AIAgent(
+    agent = AIAgent(
         model=model,
         max_iterations=_cfg_max_turns(cfg, 500),
         provider=runtime.get("provider"),
@@ -6461,6 +6521,7 @@ def _make_agent(
         fallback_model=_load_fallback_model(),
         **_agent_cbs(sid),
     )
+    return _attach_tui_cache_callback(agent, sid)
 
 
 def _init_session(
@@ -9818,6 +9879,14 @@ def _run_prompt_submit(
                 status = "complete"
 
             payload = {"text": raw, "usage": _get_usage(agent), "status": status}
+            turn_usage = getattr(agent, "_first_turn_usage", None)
+            if turn_usage is None:
+                turn_usage = result.get("usage") if isinstance(result, dict) else None
+            if turn_usage is None:
+                turn_usage = getattr(agent, "_last_turn_usage", None)
+            cache_info = _cache_info_from_usage(turn_usage)
+            if cache_info is not None:
+                payload["cache_info"] = cache_info
             if last_reasoning:
                 payload["reasoning"] = last_reasoning
             if status_note:

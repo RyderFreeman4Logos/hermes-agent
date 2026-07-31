@@ -140,6 +140,32 @@ def test_run_conversation_empty_exhausted_surfaces_explanation():
     assert "No reply:" in result["final_response"]
 
 
+def test_first_api_call_reports_cache_hit_to_tui_callback():
+    agent = _make_agent(max_iterations=10)
+    response = _mock_response(content="Done.", finish_reason="stop")
+    response.usage = SimpleNamespace(
+        prompt_tokens=2_000,
+        completion_tokens=10,
+        total_tokens=2_010,
+        prompt_tokens_details=SimpleNamespace(cached_tokens=1_740),
+    )
+    agent.client.chat.completions.create.side_effect = [response]
+    cache_events = []
+    agent._tui_cache_callback = lambda state, pct, read, prompt: cache_events.append(
+        (state, pct, read, prompt)
+    )
+
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("do something")
+
+    assert result["final_response"] == "Done."
+    assert cache_events == [("hit", 87, 1_740, 2_000)]
+
+
 def test_run_conversation_partial_stream_recovery_surfaces_explanation():
     """A long recovered partial stream still needs the visible footer.
 
@@ -169,5 +195,4 @@ def test_run_conversation_partial_stream_recovery_surfaces_explanation():
     assert result["final_response"].startswith(recovered)
     assert "No reply:" in result["final_response"]
     assert result["response_previewed"] is False
-
 

@@ -50,6 +50,7 @@ from functools import wraps
 import logging
 import os
 import re
+import secrets
 import sqlite3
 import sys
 import time
@@ -91,6 +92,7 @@ from gateway.platforms.base import (
 )
 from agent.redact import redact_sensitive_text
 from gateway.readiness import collect_runtime_readiness
+from gateway.wake import INTERNAL_COMPLETION_DELIVERY_HEADER
 
 logger = logging.getLogger(__name__)
 
@@ -1197,6 +1199,7 @@ class APIServerAdapter(BasePlatformAdapter):
             raw_port = os.getenv("API_SERVER_PORT", str(DEFAULT_PORT))
         self._port: int = _coerce_port(raw_port, DEFAULT_PORT)
         self._api_key: str = extra.get("key", os.getenv("API_SERVER_KEY", ""))
+        self._completion_delivery_token = secrets.token_urlsafe(32)
         self._cors_origins: tuple[str, ...] = self._parse_cors_origins(
             extra.get("cors_origins", os.getenv("API_SERVER_CORS_ORIGINS", "")),
         )
@@ -3726,6 +3729,10 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         stream = _coerce_request_bool(body.get("stream"), default=False)
+        internal_completion_delivery = hmac.compare_digest(
+            request.headers.get(INTERNAL_COMPLETION_DELIVERY_HEADER, "").encode(),
+            self._completion_delivery_token.encode(),
+        )
 
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
         system_prompt = None
@@ -3937,6 +3944,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 **agent_overrides,
                 route=route,
+                completion_delivery_synthetic=internal_completion_delivery,
             ))
             # Ensure SSE drain loops can terminate without relying on polling
             # agent_task.done(), which can race with queue timeout checks.
@@ -3958,6 +3966,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 gateway_session_key=gateway_session_key,
                 **agent_overrides,
                 route=route,
+                completion_delivery_synthetic=internal_completion_delivery,
             )
 
         idempotency_key = request.headers.get("Idempotency-Key")
@@ -5774,6 +5783,7 @@ class APIServerAdapter(BasePlatformAdapter):
         requested_runtime: Optional[Dict[str, Any]] = None,
         route_source: str = "global",
         confirmed_runtime_lock: bool = False,
+        completion_delivery_synthetic: bool = False,
     ) -> tuple:
         """
         Create an agent and run a conversation in a thread executor.
@@ -5833,6 +5843,12 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                     if agent_ref is not None:
                         agent_ref[0] = agent
+                    if completion_delivery_synthetic:
+                        agent._pending_cli_user_message = {
+                            "role": "user",
+                            "content": user_message,
+                            "_completion_delivery_synthetic": True,
+                        }
                     effective_task_id = session_id or str(uuid.uuid4())
                     result = agent.run_conversation(
                         user_message=user_message,

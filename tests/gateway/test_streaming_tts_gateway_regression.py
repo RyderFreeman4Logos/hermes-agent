@@ -201,6 +201,15 @@ def test_run_agent_voice_turn_no_name_error(monkeypatch, tmp_path):
             "pending",
         ),
         (
+            {
+                "final_response": "",
+                "messages": [],
+                "api_calls": 1,
+                "error": "provider unavailable",
+            },
+            "pending",
+        ),
+        (
             UserDict(
                 {
                     "final_response": "",
@@ -213,7 +222,7 @@ def test_run_agent_voice_turn_no_name_error(monkeypatch, tmp_path):
         ),
     ],
 )
-def test_gateway_turn_start_acknowledges_completion_delivery_only_after_model_turn(
+def test_gateway_transferred_claim_settles_only_after_model_turn(
     monkeypatch, tmp_path, turn_result, expected_delivery_state
 ):
     from tools import async_delegation as ad
@@ -259,15 +268,18 @@ def test_gateway_turn_start_acknowledges_completion_delivery_only_after_model_tu
             "UPDATE async_delegations SET owner_pid=? WHERE delegation_id=?",
             (os.getpid(), delegation_id),
         )
+    claim = ad.claim_event_delivery(event, "gateway-scheduled")
+    assert claim
 
     async def _run():
         return await runner._run_agent(
-            message="What is the status?",
+            message="background review passed",
             context_prompt="",
             history=[],
             source=_make_voice_source(),
             session_id="session-1",
             session_key=session_key,
+            delivery_claims=[(event, claim)],
         )
 
     asyncio.new_event_loop().run_until_complete(_run())

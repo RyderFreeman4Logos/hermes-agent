@@ -4957,6 +4957,9 @@ class TurnRunner:
         # message so stale guidance never replays as user-authored text.
         _persist_user_message_override: Optional[Any] = ctx.persist_user_message
         _persist_user_timestamp_override: Optional[float] = ctx.persist_user_timestamp
+        _transferred_completions = [
+            (evt, claim, "") for evt, claim in ctx.delivery_claims
+        ]
         _turn_start_completions: list[tuple[dict, str, str]] = []
         if ctx.turn_origin is None and isinstance(ctx.message, str):
             try:
@@ -5121,11 +5124,6 @@ class TurnRunner:
         register_gateway_notify(_approval_session_key, _approval_notify_sync)
         _delivery_renewal_stop = None
         try:
-            from tools.async_delegation import start_event_delivery_renewal
-
-            _delivery_renewal_stop = start_event_delivery_renewal(
-                [(evt, claim) for evt, claim, _text in _turn_start_completions]
-            )
             # If _prepare_inbound_message_text buffered image paths for native
             # attachment, wrap the user turn as an OpenAI-style multimodal
             # content list. Consume-and-clear so subsequent turns on the same
@@ -5176,18 +5174,30 @@ class TurnRunner:
             if ctx.turn_origin == "heartbeat_warm":
                 _conversation_kwargs["turn_origin"] = ctx.turn_origin
                 _conversation_kwargs["allow_silent_noop"] = ctx.allow_silent_noop
+            _claimed_completions = (
+                _transferred_completions + _turn_start_completions
+            )
+            from tools.async_delegation import start_event_delivery_renewal
+
+            _delivery_renewal_stop = start_event_delivery_renewal(
+                [(evt, claim) for evt, claim, _text in _claimed_completions]
+            )
+            # The model turn now owns every transferred claim. Clearing the
+            # caller's list prevents the outer pre-model cleanup from settling
+            # the same claim a second time.
+            ctx.delivery_claims.clear()
             try:
                 result = agent.run_conversation(
                     _api_run_message, **_conversation_kwargs
                 )
-            except Exception:
+            except BaseException:
                 self._settle_turn_start_async_completions(
-                    _turn_start_completions
+                    _claimed_completions
                 )
                 raise
             else:
                 self._settle_turn_start_async_completions(
-                    _turn_start_completions, result
+                    _claimed_completions, result
                 )
         finally:
             if _delivery_renewal_stop is not None:
@@ -8465,6 +8475,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return (enriched_text or text).strip()
 
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
+        # Internal completions carry durable claims into the next real model
+        # turn. Let the adapter queue them without auth, drain notices, or
+        # steer/interrupt handling; its per-event cleanup releases any claim
+        # that never reaches that turn.
+        if getattr(event, "internal", False):
+            return False
+
         # --- Authorization gate (#17775) ---
         # The cold path (_handle_message) checks _is_user_authorized before
         # creating a session.  The busy path must enforce the same check;
@@ -8588,20 +8605,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         adapter = self._adapter_for_source(event.source)
         if not adapter:
             return False  # let default path handle it
-
-        # --- Internal synthetic events must never interrupt/steer ---
-        # Async-delegation completions (delegate_task(background=true)) and
-        # background-process completions (terminal notify_on_complete) re-enter
-        # the originating session as internal MessageEvents. When the session
-        # is busy, treating them like a user TEXT message means interrupt-mode
-        # (the default busy_text_mode) aborts the active turn AND sends a "⚡
-        # Interrupting current task" ack — exactly the opposite of the design
-        # invariant that a completion surfaces as a NEW turn only when idle and
-        # never splices into a running turn. Fall through to the base adapter,
-        # which queues internal events silently (no interrupt, no ack) so they
-        # cascade after the current turn finishes.
-        if getattr(event, "internal", False):
-            return False
 
         _busy_state = self._peek_session_state(session_key)
         running_agent = _busy_state.turn.agent if _busy_state else None
@@ -16773,6 +16776,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _event_metadata = getattr(event, "metadata", None)
             turn_origin = None
             allow_silent_noop = False
+            delivery_claims = []
+            if getattr(event, "internal", False) and isinstance(
+                _event_metadata, dict
+            ):
+                delivery_claims = list(
+                    _event_metadata.pop("delivery_claims", []) or []
+                )
             if (
                 getattr(event, "internal", False)
                 and isinstance(_event_metadata, dict)
@@ -16796,6 +16806,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message_type=event.message_type,
                 turn_origin=turn_origin,
                 allow_silent_noop=allow_silent_noop,
+                delivery_claims=delivery_claims,
             )
 
             # Stop persistent typing indicator now that the agent is done.
@@ -20953,6 +20964,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         *,
         turn_origin: str | None = None,
         allow_silent_noop: bool = False,
+        delivery_claims: Optional[list[tuple[dict, str]]] = None,
     ) -> Optional[bool]:
         """Inject a watch/completion notification as a synthetic message event.
 
@@ -20963,6 +20975,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         is not a transactional boundary: a process crash after adapter
         acceptance can still cause durable at-least-once replay.
         """
+        def release_claims_before_self_post() -> bool:
+            if not delivery_claims:
+                return True
+            from tools.async_delegation import release_event_delivery
+
+            try:
+                for delivery_event, claim in delivery_claims:
+                    release_event_delivery(
+                        delivery_event, claim, consume_attempt=False
+                    )
+            except Exception:
+                logger.warning(
+                    "Could not release completion claim before gateway self-post",
+                    exc_info=True,
+                )
+                return False
+            delivery_claims.clear()
+            return True
+
         source = self._build_process_event_source(evt)
         if not source:
             # API-server-originated sessions bind a RAW session key (the
@@ -20981,6 +21012,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 adapter = self.adapters.get(Platform.API_SERVER)
                 from gateway.wake import adapter_supports_push, deliver_wake
                 if adapter is not None and not adapter_supports_push(adapter):
+                    if not release_claims_before_self_post():
+                        return False
                     try:
                         logger.info(
                             "Watch pattern notification — waking api_server "
@@ -21024,6 +21057,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # the raw X-Hermes-Session-Id session — self-post instead.
             from gateway.wake import deliver_wake
             raw_sid = str(evt.get("origin_session_id") or "").strip() or str(source.chat_id or "")
+            if not release_claims_before_self_post():
+                return False
             try:
                 logger.info(
                     "Watch pattern notification — waking api_server session "
@@ -21047,6 +21082,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if turn_origin is not None:
                 metadata["turn_origin"] = turn_origin
                 metadata["allow_silent_noop"] = bool(allow_silent_noop)
+            if delivery_claims:
+                metadata["delivery_claims"] = delivery_claims
             synth_event = MessageEvent(
                 text=synth_text,
                 message_type=MessageType.TEXT,
@@ -21155,12 +21192,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         identity = self._completion_delivery_identity(evt)
         durable_claim_id = ""
         durable_delegation_id = ""
+        durable_authoritative = False
         if evt.get("type") == "async_delegation":
             durable_delegation_id = str(evt.get("delegation_id") or "")
             if durable_delegation_id:
                 try:
-                    from tools.async_delegation import claim_completion_delivery
+                    from tools.async_delegation import (
+                        claim_completion_delivery,
+                        get_durable_delegation,
+                    )
 
+                    durable_authoritative = (
+                        get_durable_delegation(durable_delegation_id) is not None
+                    )
                     durable_claim_id = f"gateway:{id(self)}:{__import__('uuid').uuid4().hex}"
                     if not claim_completion_delivery(
                         durable_delegation_id, durable_claim_id,
@@ -21215,6 +21259,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 exc_info=True,
                             )
                     return False
+        if durable_authoritative:
+            # SQLite owns contention and replay until the real model result
+            # settles the transferred claim. Keep the in-memory ledger only
+            # for legacy/non-durable producer events.
+            identity = None
         if identity is not None:
             with self._completion_delivery_lock:
                 if (
@@ -21226,7 +21275,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         accepted = False
         try:
-            injection_result = await self._inject_watch_notification(synth_text, evt)
+            injection_result = await self._inject_watch_notification(
+                synth_text,
+                evt,
+                delivery_claims=(
+                    [(evt, durable_claim_id)] if durable_authoritative else None
+                ),
+            )
             if injection_result is not True:
                 return injection_result
             accepted = True
@@ -21241,21 +21296,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     ):
                         self._completion_deliveries_delivered.popitem(last=False)
 
-            # If the durable async-delegation producer branch is present, its
-            # SQLite row remains the authoritative replay state. Acknowledge it
-            # after adapter acceptance; this gateway keeps no parallel ledger.
-            if durable_claim_id:
-                try:
-                    from tools.async_delegation import complete_completion_delivery
-
-                    complete_completion_delivery(
-                        durable_delegation_id, durable_claim_id,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "Could not acknowledge durable async completion %s: %s",
-                        durable_delegation_id, exc,
-                    )
             return True
         finally:
             if identity is not None and not accepted:
@@ -23271,6 +23311,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         message_type: Optional[str] = None,
         turn_origin: Optional[str] = None,
         allow_silent_noop: bool = False,
+        delivery_claims: Optional[list[tuple[dict, str]]] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -23281,32 +23322,54 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         multiplexing is off this is a transparent pass-through — zero behavior
         change for single-profile gateways.
         """
-        if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
-            return await self._run_agent_inner(
-                message, context_prompt, history, source, session_id,
-                session_key=session_key, run_generation=run_generation,
-                _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
-                channel_prompt=channel_prompt, moa_config=moa_config,
-                persist_user_message=persist_user_message,
-                persist_user_timestamp=persist_user_timestamp,
-                message_type=message_type,
-                turn_origin=turn_origin,
-                allow_silent_noop=allow_silent_noop,
+        transferred = list(delivery_claims or [])
+        try:
+            if not getattr(
+                getattr(self, "config", None), "multiplex_profiles", False
+            ):
+                result = await self._run_agent_inner(
+                    message, context_prompt, history, source, session_id,
+                    session_key=session_key, run_generation=run_generation,
+                    _interrupt_depth=_interrupt_depth,
+                    event_message_id=event_message_id,
+                    channel_prompt=channel_prompt, moa_config=moa_config,
+                    persist_user_message=persist_user_message,
+                    persist_user_timestamp=persist_user_timestamp,
+                    message_type=message_type,
+                    turn_origin=turn_origin,
+                    allow_silent_noop=allow_silent_noop,
+                    delivery_claims=transferred,
+                )
+            else:
+                profile_home = self._resolve_profile_home_for_source(source)
+                with _profile_runtime_scope(profile_home):
+                    result = await self._run_agent_inner(
+                        message, context_prompt, history, source, session_id,
+                        session_key=session_key, run_generation=run_generation,
+                        _interrupt_depth=_interrupt_depth,
+                        event_message_id=event_message_id,
+                        channel_prompt=channel_prompt, moa_config=moa_config,
+                        persist_user_message=persist_user_message,
+                        persist_user_timestamp=persist_user_timestamp,
+                        message_type=message_type,
+                        turn_origin=turn_origin,
+                        allow_silent_noop=allow_silent_noop,
+                        delivery_claims=transferred,
+                    )
+        except BaseException:
+            TurnRunner._settle_turn_start_async_completions(
+                [(evt, claim, "") for evt, claim in transferred]
             )
-
-        profile_home = self._resolve_profile_home_for_source(source)
-        with _profile_runtime_scope(profile_home):
-            return await self._run_agent_inner(
-                message, context_prompt, history, source, session_id,
-                session_key=session_key, run_generation=run_generation,
-                _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
-                channel_prompt=channel_prompt, moa_config=moa_config,
-                persist_user_message=persist_user_message,
-                persist_user_timestamp=persist_user_timestamp,
-                message_type=message_type,
-                turn_origin=turn_origin,
-                allow_silent_noop=allow_silent_noop,
-            )
+            raise
+        else:
+            # Normal local turns clear ``transferred`` when TurnRunner takes
+            # ownership at the model-call boundary. Proxy/early-return paths
+            # settle here from their own result.
+            if transferred:
+                TurnRunner._settle_turn_start_async_completions(
+                    [(evt, claim, "") for evt, claim in transferred], result
+                )
+            return result
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
         """Resolve the profile name for an inbound source via configured routes.
@@ -23430,6 +23493,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         message_type: Optional[str] = None,
         turn_origin: Optional[str] = None,
         allow_silent_noop: bool = False,
+        delivery_claims: Optional[list[tuple[dict, str]]] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -23716,6 +23780,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             persist_user_timestamp=persist_user_timestamp,
             turn_origin=turn_origin,
             allow_silent_noop=allow_silent_noop,
+            delivery_claims=delivery_claims or [],
         )
         turn_runner = TurnRunner(self, turn_ctx)
         # Callback invoked by agent on tool lifecycle events — extracted to

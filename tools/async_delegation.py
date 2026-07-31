@@ -307,14 +307,6 @@ def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
         raise last_exc
 
 
-def _note_delivery_attempt(delegation_id: str) -> None:
-    with _DB_LOCK, _transaction() as conn:
-        conn.execute(
-            "UPDATE async_delegations SET delivery_attempts=delivery_attempts+1, updated_at=? WHERE delegation_id=?",
-            (time.time(), delegation_id),
-        )
-
-
 def recover_abandoned_delegations() -> int:
     """Classify records whose owning process disappeared as outcome unknown."""
     try:
@@ -688,7 +680,6 @@ def requeue_local_pending_async_completions(target_queue) -> int:
                 delegation_id, exc,
             )
             continue
-        _note_delivery_attempt(delegation_id)
         _local_pending_requeue_at[delegation_id] = now
         enqueued += 1
     # Cap bookkeeping growth

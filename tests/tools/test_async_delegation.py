@@ -1229,11 +1229,28 @@ def test_requeue_local_pending_only_for_this_owner(tmp_path, monkeypatch):
     got = q.get_nowait()
     assert got["delegation_id"] == mine
     assert got.get("restored") is True
+    assert ad.get_durable_delegation(mine)["delivery_attempts"] == 0
     assert q.empty()
 
     # Cooldown: immediate second call must not flood.
     assert ad.requeue_local_pending_async_completions(q) == 0
     assert q.empty()
+
+    # Repeated owner-local wakeups are queue maintenance, not delivery
+    # attempts. Only the real consumer claim spends the retry budget.
+    for _ in range(ad._MAX_DELIVERY_ATTEMPTS + 1):
+        ad._local_pending_requeue_at.clear()
+        assert ad.requeue_local_pending_async_completions(q) == 1
+        q.get_nowait()
+    assert ad.get_durable_delegation(mine)["delivery_attempts"] == 0
+
+    event = dict(got)
+    claim = ad.claim_event_delivery(event, "first-real-turn")
+    assert claim
+    ad.release_event_delivery(event, claim)
+    durable = ad.get_durable_delegation(mine)
+    assert durable["delivery_state"] == "pending"
+    assert durable["delivery_attempts"] == 1
 
 
 def test_local_process_should_enqueue_rules(monkeypatch):
@@ -1330,7 +1347,7 @@ def test_poll_owner_local_reinjects_pending_for_idle_owner(tmp_path, monkeypatch
     got = q.get_nowait()
     assert got["delegation_id"] == did
     assert got.get("restored") is True
-    assert ad.get_durable_delegation(did)["delivery_attempts"] == 1
+    assert ad.get_durable_delegation(did)["delivery_attempts"] == 0
 
 
 def test_turn_start_claims_only_matching_owner_local_pending(tmp_path, monkeypatch):

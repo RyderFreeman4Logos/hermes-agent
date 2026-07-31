@@ -19,7 +19,12 @@ import pytest
 
 import gateway.run as gateway_run
 from gateway.config import GatewayConfig, Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    MessageEvent,
+    SendResult,
+    merge_pending_message_event,
+)
 from gateway.run import GatewayRunner
 from gateway.session import SessionEntry, SessionSource
 from tools.process_registry import ProcessRegistry, ProcessSession
@@ -440,7 +445,7 @@ def test_concurrent_claims_share_the_same_narrow_delivery_seam():
     adapter.handle_message.assert_awaited_once()
 
 
-def test_failed_async_injection_is_retried_and_only_success_is_acked(
+def test_failed_async_injection_is_retried_without_schedule_time_ack(
     monkeypatch, isolated_registry,
 ):
     isolated = queue.Queue()
@@ -453,20 +458,9 @@ def test_failed_async_injection_is_retried_and_only_success_is_acked(
     runner = _runner(adapter)
     _stop_after_sleeps(monkeypatch, runner, count=3)
 
-    from tools import async_delegation
-
-    acknowledgements = []
-    monkeypatch.setattr(
-        async_delegation,
-        "complete_completion_delivery",
-        lambda delegation_id, _claim_id: acknowledgements.append(delegation_id) or True,
-        raising=False,
-    )
-
     asyncio.run(runner._async_delegation_watcher(interval=0))
 
     assert adapter.handle_message.await_count == 2
-    assert acknowledgements == ["deleg_duplicate"]
 
 
 def _persist_pending_completion(event):
@@ -483,6 +477,132 @@ def _persist_pending_completion(event):
         "status": "completed",
         "summary": event["summary"],
     })
+
+
+def test_gateway_schedule_only_transfers_claim_without_acknowledging():
+    from tools import async_delegation as ad
+
+    event = _async_event("deleg_schedule_only")
+    _persist_pending_completion(event)
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+
+    assert asyncio.run(
+        runner._deliver_completion_notification("completion", event)
+    ) is True
+
+    synth_event = adapter.handle_message.await_args.args[0]
+    claims = synth_event.metadata["delivery_claims"]
+    assert claims[0][0] is event
+    durable = ad.get_durable_delegation(event["delegation_id"])
+    assert durable["delivery_state"] == "pending"
+    assert durable["delivery_attempts"] == 1
+
+
+def test_busy_gateway_merge_preserves_transferred_claim():
+    source = SessionSource(
+        platform=Platform.TELEGRAM, chat_id="12345", chat_type="dm"
+    )
+    pending_event = MessageEvent(text="first", source=source)
+    claimed_event = _async_event("deleg_busy_merge")
+    incoming = MessageEvent(
+        text="completion",
+        source=source,
+        internal=True,
+        metadata={"delivery_claims": [(claimed_event, "claim-1")]},
+    )
+    pending = {"session": pending_event}
+
+    merge_pending_message_event(
+        pending, "session", incoming, merge_text=True
+    )
+
+    assert pending_event.metadata["delivery_claims"] == [
+        (claimed_event, "claim-1")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_gateway_adapter_cancellation_releases_untransferred_claim():
+    from tools import async_delegation as ad
+
+    event_data = _async_event("deleg_adapter_cancel")
+    _persist_pending_completion(event_data)
+    claim = ad.claim_event_delivery(event_data, "gateway-scheduled")
+    assert claim
+
+    class _Adapter(BasePlatformAdapter):
+        async def connect(self, *, is_reconnect=False):
+            return True
+
+        async def disconnect(self):
+            return None
+
+        async def send(self, chat_id, content, reply_to=None, metadata=None):
+            return SendResult(success=True)
+
+        async def get_chat_info(self, chat_id):
+            return {"id": chat_id}
+
+    adapter = _Adapter(
+        PlatformConfig(
+            enabled=True, token="fake-token", typing_indicator=False
+        ),
+        Platform.TELEGRAM,
+    )
+    adapter._message_handler = AsyncMock(side_effect=asyncio.CancelledError())
+    event = MessageEvent(
+        text="completion",
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="12345",
+            chat_type="dm",
+            user_id="678",
+        ),
+        internal=True,
+        metadata={"delivery_claims": [(event_data, claim)]},
+    )
+    session_key = event_data["session_key"]
+    adapter._active_sessions[session_key] = asyncio.Event()
+
+    with pytest.raises(asyncio.CancelledError):
+        await adapter._process_message_background(event, session_key)
+
+    durable = ad.get_durable_delegation(event_data["delegation_id"])
+    assert durable["delivery_state"] == "pending"
+    assert durable["delivery_attempts"] == 1
+
+
+@pytest.mark.parametrize("exc", [RuntimeError("failed"), asyncio.CancelledError()])
+def test_gateway_transferred_claim_released_when_turn_raises(exc):
+    from tools import async_delegation as ad
+
+    event = _async_event(f"deleg_{type(exc).__name__}")
+    _persist_pending_completion(event)
+    claim = ad.claim_event_delivery(event, "gateway-turn")
+    assert claim
+
+    runner = _runner(SimpleNamespace(handle_message=AsyncMock()))
+    runner.config = SimpleNamespace(multiplex_profiles=False)
+    runner._run_agent_inner = AsyncMock(side_effect=exc)
+    source = runner.session_store._entries[event["session_key"]].origin
+
+    async def run():
+        return await runner._run_agent(
+            "completion",
+            "",
+            [],
+            source,
+            "session-1",
+            delivery_claims=[(event, claim)],
+        )
+
+    with pytest.raises(type(exc)):
+        asyncio.run(run())
+
+    durable = ad.get_durable_delegation(event["delegation_id"])
+    assert durable["delivery_state"] == "pending"
+    assert durable["delivery_attempts"] == 1
 
 
 def test_explicit_kill_returns_output_before_consuming_notification(monkeypatch):

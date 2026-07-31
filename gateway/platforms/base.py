@@ -2452,6 +2452,13 @@ def merge_pending_message_event(
     """
     existing = pending_messages.get(session_key)
     if existing:
+        incoming_claims = (getattr(event, "metadata", None) or {}).get(
+            "delivery_claims"
+        )
+        if incoming_claims:
+            existing.metadata.setdefault("delivery_claims", []).extend(
+                incoming_claims
+            )
         existing_is_photo = getattr(existing, "message_type", None) == MessageType.PHOTO
         incoming_is_photo = event.message_type == MessageType.PHOTO
         existing_has_media = bool(existing.media_urls)
@@ -6346,6 +6353,23 @@ class BasePlatformAdapter(ABC):
                     self.name, notify_err, exc_info=True,
                 )  # Last resort — don't let error reporting crash the handler
         finally:
+            # A durable completion claim stays on the event until the gateway
+            # transfers it into a real model turn. Any earlier return,
+            # cancellation, or handler error must make it retryable.
+            delivery_claims = (getattr(event, "metadata", None) or {}).pop(
+                "delivery_claims", []
+            )
+            if delivery_claims:
+                from tools.async_delegation import release_event_delivery
+
+                for delivery_event, claim in delivery_claims:
+                    try:
+                        release_event_delivery(delivery_event, claim)
+                    except Exception:
+                        logger.warning(
+                            "Gateway adapter delivery claim release failed",
+                            exc_info=True,
+                        )
             # Stop typing before any deferred callback work.  Post-delivery
             # callbacks may perform platform I/O; a stuck callback must not
             # leave the typing refresh task running indefinitely.

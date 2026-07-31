@@ -91,6 +91,7 @@ class TurnContext:
     persist_user_timestamp: Optional[float] = None
     turn_origin: Optional[str] = None
     allow_silent_noop: bool = False
+    delivery_claims: list[tuple[dict, str]] = field(default_factory=list)
     user_config: Any = None
     enabled_toolsets: Any = None
     disabled_toolsets: Any = None

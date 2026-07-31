@@ -101,6 +101,7 @@ class ProcessSession:
     cwd: Optional[str] = None                   # Working directory
     started_at: float = 0.0                     # time.time() of spawn (wall clock)
     host_start_time: Optional[int] = None       # kernel start ticks (/proc/<pid>/stat f22) — PID-reuse guard
+    process_group_id: Optional[int] = None      # POSIX group created for local background work
     exited: bool = False                        # Whether the process has finished
     exit_code: Optional[int] = None             # Exit code (None if still running)
     completion_reason: str = "exited"           # exited|killed|lost|failed_start|already_exited
@@ -138,6 +139,8 @@ class ProcessSession:
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (when use_pty=True)
+    _tracked_descendants: Dict[int, Optional[int]] = field(default_factory=dict, repr=False)
+    _completion_supervisor_started: bool = field(default=False, repr=False)
 
 
 class ProcessRegistry:
@@ -526,6 +529,108 @@ class ProcessRegistry:
         except Exception:
             return False
 
+    def _remember_local_descendants(self, session: ProcessSession) -> None:
+        """Remember descendants that may later detach from the launcher's group."""
+        proc = session.process
+        if _IS_WINDOWS or proc is None:
+            return
+        try:
+            import psutil
+
+            descendants = psutil.Process(proc.pid).children(recursive=True)
+        except Exception:
+            return
+        for child in descendants:
+            if not self._proc_alive(child):
+                continue
+            session._tracked_descendants[child.pid] = self._safe_host_start_time(child.pid)
+
+    @classmethod
+    def _host_process_is_live(cls, pid: int, expected_start: Optional[int]) -> bool:
+        """Return whether the same host process is alive and not a zombie."""
+        if expected_start is not None and cls._safe_host_start_time(pid) != expected_start:
+            return False
+        try:
+            import psutil
+
+            return cls._proc_alive(psutil.Process(pid))
+        except Exception:
+            return cls._host_pid_is_ours(pid, expected_start)
+
+    def _local_descendants_settled(self, session: ProcessSession) -> bool:
+        """True when no tracked descendant or live process-group member remains."""
+        if _IS_WINDOWS or session.process is None:
+            return True
+
+        self._remember_local_descendants(session)
+        for pid, started_at in list(session._tracked_descendants.items()):
+            if self._host_process_is_live(pid, started_at):
+                return False
+            session._tracked_descendants.pop(pid, None)
+
+        pgid = session.process_group_id
+        if pgid is None:
+            return True
+        try:
+            import psutil
+
+            for proc in psutil.process_iter(["pid"]):
+                if proc.pid == session.pid or not self._proc_alive(proc):
+                    continue
+                try:
+                    if os.getpgid(proc.pid) == pgid:
+                        return False
+                except (ProcessLookupError, PermissionError, OSError):
+                    continue
+        except Exception:
+            # Unknown is non-terminal: a premature model turn is worse than a
+            # delayed completion when the host process table cannot be read.
+            return False
+        return True
+
+    def _local_completion_state(self, session: ProcessSession) -> tuple[bool, Optional[int]]:
+        """Return an authoritative local exit only after all owned work settles."""
+        proc = session.process
+        if proc is None:
+            return True, session.exit_code
+        self._remember_local_descendants(session)
+        try:
+            rc = proc.poll()
+        except Exception:
+            return False, None
+        if not isinstance(rc, int) or not self._local_descendants_settled(session):
+            return False, rc if isinstance(rc, int) else None
+        return True, rc
+
+    def _ensure_local_completion_supervisor(self, session: ProcessSession) -> None:
+        """Keep a refused premature completion under autonomous supervision."""
+        with session._lock:
+            if session._completion_supervisor_started:
+                return
+            session._completion_supervisor_started = True
+
+        def _supervise() -> None:
+            while True:
+                ready, rc = self._local_completion_state(session)
+                if ready:
+                    with session._lock:
+                        session.exited = True
+                        if session.completion_reason != "killed":
+                            session.exit_code = rc
+                            session.completion_reason = "exited"
+                    self._move_to_finished(session)
+                    return
+                with self._lock:
+                    if session.id in self._finished:
+                        return
+                time.sleep(0.1)
+
+        threading.Thread(
+            target=_supervise,
+            daemon=True,
+            name=f"proc-supervisor-{session.id}",
+        ).start()
+
     @staticmethod
     def _daemon_term_grace_seconds() -> float:
         """Grace window (s) between SIGTERM and escalated SIGKILL.
@@ -795,6 +900,8 @@ class ProcessRegistry:
         session.process = proc
         session.pid = proc.pid
         session.host_start_time = self._safe_host_start_time(session.pid)
+        if not _IS_WINDOWS:
+            session.process_group_id = proc.pid  # start_new_session=True makes pid == pgid
 
         try:
             # Start output reader thread
@@ -945,20 +1052,11 @@ class ProcessRegistry:
         in one burst at process exit. ``buffer.read1(4096)`` yields incremental
         chunks as bytes become available, then we decode to text.
 
-        Orphaned-pipe guard (issue #68915): when the user's command backgrounds
-        a long-lived process (``node server.js &``, ``sleep 300 &``), that
-        grandchild inherits the write end of our stdout pipe via ``fork()``.
-        The direct ``bash`` child exits promptly, but the pipe never reaches
-        EOF while the grandchild lives — so a blocking read would park this
-        thread forever, ``session.exited`` would never flip, and
-        ``notify_on_complete`` would never fire (``_reconcile_local_exit``
-        only runs lazily from poll()/wait(), which an autonomous notification
-        can't rely on). On POSIX we therefore ``select()`` with a short poll
-        interval and stop draining shortly after the direct child exits, even
-        if the pipe hasn't EOF'd — mirroring the foreground fix in
-        ``tools/environments/base.py::_wait_for_process`` (#8340). Windows
-        pipes don't support select(); the blocking path is kept there and the
-        lazy reconcile in poll()/wait() remains the safety net.
+        When the launcher backgrounds descendants, they inherit this pipe and
+        may outlive the launcher. On POSIX, ``select()`` keeps output live while
+        also supervising the owned process group. Completion is published only
+        after the launcher has a numeric exit and all tracked work has settled.
+        Windows pipes do not support select, so the blocking path remains there.
         """
         first_chunk = True
         # Incremental decoder: raw pipe reads can split a multibyte UTF-8
@@ -1008,6 +1106,7 @@ class ProcessRegistry:
 
                 idle_after_exit = 0
                 while True:
+                    self._remember_local_descendants(session)
                     try:
                         ready, _, _ = _select.select([fd], [], [], 0.2)
                     except (ValueError, OSError):
@@ -1020,12 +1119,9 @@ class ProcessRegistry:
                         if chunk:
                             _append_chunk(chunk)
                         idle_after_exit = 0
-                    elif proc.poll() is not None:
-                        # Direct child is gone and the pipe was idle for
-                        # ~200ms. Give it a few more cycles to catch any
-                        # buffered tail, then stop — otherwise we would wait
-                        # forever on a pipe held open by an orphaned
-                        # grandchild (issue #68915).
+                    elif proc.poll() is not None and self._local_descendants_settled(session):
+                        # All owned work is gone. Give buffered tail output a
+                        # few more cycles before declaring final completion.
                         idle_after_exit += 1
                         if idle_after_exit >= 3:
                             break
@@ -1185,16 +1281,30 @@ class ProcessRegistry:
         with the reader thread), the second call is a no-op — no duplicate
         completion notification is enqueued.
         """
+        if session.process is not None:
+            ready, rc = self._local_completion_state(session)
+            if not ready:
+                with session._lock:
+                    session.exited = False
+                    session.exit_code = None
+                self._ensure_local_completion_supervisor(session)
+                return
+            if session.completion_reason != "killed":
+                session.exit_code = rc
+                session.completion_reason = "exited"
+
         with self._lock:
             was_running = self._running.pop(session.id, None) is not None
             self._finished[session.id] = session
+        if not was_running:
+            return
         session._completion_event.set()
         self._write_checkpoint()
 
         # Only enqueue completion notification on the FIRST move.  Without
         # this guard, kill_process() and the reader thread can both call
         # _move_to_finished(), producing duplicate [IMPORTANT: ...] messages.
-        if was_running and session.notify_on_complete:
+        if session.notify_on_complete:
             from tools.ansi_strip import strip_ansi
             output_tail = strip_ansi(session.output_buffer[-2000:]) if session.output_buffer else ""
             self.completion_queue.put({
@@ -1367,19 +1477,10 @@ class ProcessRegistry:
     def _reconcile_local_exit(self, session: "ProcessSession") -> None:
         """Reconcile session.exited against the real child process state.
 
-        The reader thread (`_reader_loop`) sets `session.exited = True` only
-        in its `finally` block, which runs when `stdout.read()` returns EOF.
-        If the direct `Popen` child has exited but a descendant process (e.g.
-        a daemon spawned by `hermes update` restarting the gateway) is still
-        holding the stdout pipe open, the reader blocks forever and poll()
-        keeps returning "running" indefinitely (issue #17327 — 74 polls over
-        7 minutes on Feishu).
-
-        This helper closes that window: when `session.exited` is still False
-        but the direct child's `Popen.poll()` reports an exit code, drain any
-        readable bytes non-blocking and flip `session.exited`. The orphaned
-        reader thread remains stuck on its blocking `read()` but is a daemon
-        thread and will be reaped with the process.
+        A numeric launcher exit is necessary but not sufficient: backgrounded
+        descendants remain part of the managed job. Reconcile only after the
+        launcher exit is authoritative and all tracked work has settled, then
+        drain any bytes the reader has not consumed yet.
 
         Safe no-op on sessions without a local `Popen` (env/PTY), already-
         exited sessions, and detached-recovered sessions.
@@ -1393,8 +1494,8 @@ class ProcessRegistry:
             rc = proc.poll()
         except Exception:
             return
-        if rc is None:
-            return  # Direct child still running — reader block is legitimate.
+        if rc is None or not self._local_descendants_settled(session):
+            return  # Launcher or owned descendants are still running.
 
         # Direct child exited. Try to drain any bytes the reader hasn't
         # consumed yet. This is best-effort: if the pipe is held open by a

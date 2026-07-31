@@ -157,6 +157,26 @@ def test_concurrent_claims_share_the_same_narrow_delivery_seam():
     adapter.handle_message.assert_awaited_once()
 
 
+def test_numeric_completion_gets_nudge_and_none_gets_no_turn(monkeypatch):
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    injected = AsyncMock(return_value=True)
+    monkeypatch.setattr(runner, "_inject_watch_notification", injected)
+
+    event = _completion_event(started_at=1.0)
+    assert asyncio.run(runner._deliver_completion_notification("payload", event)) is True
+    prompt = injected.await_args.args[0]
+    assert prompt.startswith("payload")
+    assert "If no user-visible action is needed, emit no response." in prompt
+
+    none_event = _completion_event(started_at=2.0)
+    none_event["exit_code"] = None
+    assert asyncio.run(
+        runner._deliver_completion_notification("not complete", none_event)
+    ) is None
+    assert injected.await_count == 1
+
+
 def test_failed_async_injection_is_retried_and_only_success_is_acked(
     monkeypatch, isolated_registry,
 ):

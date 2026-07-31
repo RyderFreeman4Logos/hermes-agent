@@ -646,7 +646,11 @@ def build_turn_context(
         # create and the late crash-persist below — doesn't leave a stale
         # _pending_cli_user_message that the next turn would mistake for a
         # fresh staged input.
-        if not isinstance(pending_cli_message, dict) or pending_cli_message.get("_db_persisted"):
+        if (
+            not isinstance(pending_cli_message, dict)
+            or pending_cli_message.get("_db_persisted")
+            or pending_cli_message.get("_completion_delivery_synthetic")
+        ):
             agent._pending_cli_user_message = None
 
     # ── Idle-triggered compaction (opt-in; ``idle_compact_after_seconds``) ──
@@ -1243,7 +1247,11 @@ def build_turn_context(
         # Keep an unmarked staged input available to a later close retry if the
         # normal persistence attempt failed. Once the marker is present, the
         # close path must no longer treat it as a pre-worker UI input.
-        if not isinstance(pending_cli_message, dict) or pending_cli_message.get("_db_persisted"):
+        if (
+            not isinstance(pending_cli_message, dict)
+            or pending_cli_message.get("_db_persisted")
+            or pending_cli_message.get("_completion_delivery_synthetic")
+        ):
             agent._pending_cli_user_message = None
 
     return TurnContext(

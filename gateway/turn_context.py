@@ -89,6 +89,7 @@ class TurnContext:
     moa_config: Optional[dict] = None
     persist_user_message: Optional[Any] = None
     persist_user_timestamp: Optional[float] = None
+    completion_delivery_synthetic: bool = False
     user_config: Any = None
     enabled_toolsets: Any = None
     disabled_toolsets: Any = None

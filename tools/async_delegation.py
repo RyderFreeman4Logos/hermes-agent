@@ -682,6 +682,7 @@ def requeue_local_pending_async_completions(target_queue) -> int:
                 delegation_id, exc,
             )
             continue
+        _note_delivery_attempt(delegation_id)
         _local_pending_requeue_at[delegation_id] = now
         enqueued += 1
     # Cap bookkeeping growth
@@ -691,6 +692,104 @@ def requeue_local_pending_async_completions(target_queue) -> int:
         for k in stale:
             _local_pending_requeue_at.pop(k, None)
     return enqueued
+
+
+def async_event_matches_session(
+    evt: Dict[str, Any],
+    session_ids,
+    resolve_session_id: Optional[Callable[[str], str]] = None,
+) -> bool:
+    """Fail-closed match of delegation routing against one session lineage."""
+    current = {str(value or "") for value in session_ids}
+    current.discard("")
+    event_ids = {
+        str(evt.get("session_key") or ""),
+        str(evt.get("origin_session") or ""),
+        str(evt.get("origin_session_id") or ""),
+        str(evt.get("parent_session_id") or ""),
+    }
+    event_ids.discard("")
+    if not current or not event_ids:
+        return False
+    if current & event_ids:
+        return True
+    if resolve_session_id is None:
+        return False
+
+    def resolved(values):
+        out = set(values)
+        for value in values:
+            try:
+                out.add(str(resolve_session_id(value) or value))
+            except Exception:
+                continue
+        out.discard("")
+        return out
+
+    return bool(resolved(current) & resolved(event_ids))
+
+
+def claim_owner_local_pending_completions(
+    owns_event: Callable[[Dict[str, Any]], bool],
+    consumer: str,
+    *,
+    limit: int = 32,
+) -> List[tuple[Dict[str, Any], str]]:
+    """Claim terminal pending rows owned by this process and this session."""
+    me = os.getpid()
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(
+            """SELECT delegation_id, owner_pid, owner_started_at, event_json,
+                      origin_session, origin_ui_session_id, parent_session_id,
+                      origin_session_id
+               FROM async_delegations
+               WHERE state NOT IN ('running','finalizing')
+                 AND delivery_state='pending'
+                 AND event_json IS NOT NULL
+               ORDER BY completed_at, delegation_id"""
+        ).fetchall()
+
+    claimed: List[tuple[Dict[str, Any], str]] = []
+    for (
+        delegation_id,
+        owner_pid,
+        owner_started_at,
+        payload,
+        origin_session,
+        origin_ui_session_id,
+        parent_session_id,
+        origin_session_id,
+    ) in rows:
+        if len(claimed) >= max(1, int(limit)):
+            break
+        if not local_process_should_enqueue_delegation(
+            owner_pid, owner_started_at, local_pid=me
+        ):
+            continue
+        try:
+            evt = json.loads(payload)
+        except Exception:
+            continue
+        if not isinstance(evt, dict):
+            continue
+        evt = dict(evt)
+        _restore_durable_event_routing(
+            evt,
+            origin_session=origin_session,
+            origin_ui_session_id=origin_ui_session_id,
+            parent_session_id=parent_session_id,
+            origin_session_id=origin_session_id,
+        )
+        evt["delegation_id"] = delegation_id
+        try:
+            if not owns_event(evt):
+                continue
+        except Exception:
+            continue
+        claim = claim_event_delivery(evt, consumer)
+        if claim is not None:
+            claimed.append((evt, claim))
+    return claimed
 
 
 def _arm_pending_delivery_heartbeat(
@@ -1203,7 +1302,7 @@ def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
         row = conn.execute(
             """SELECT origin_session, state, dispatched_at, completed_at,
                       result_json, delivery_state, delivery_attempts,
-                      origin_session_id
+                      origin_session_id, origin_ui_session_id, parent_session_id
                FROM async_delegations WHERE delegation_id=?""", (delegation_id,),
         ).fetchone()
     if row is None:
@@ -1214,6 +1313,8 @@ def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
         "result": json.loads(row[4]) if row[4] else None,
         "delivery_state": row[5], "delivery_attempts": row[6],
         "origin_session_id": row[7] or "",
+        "origin_ui_session_id": row[8] or "",
+        "parent_session_id": row[9] or "",
     }
 
 

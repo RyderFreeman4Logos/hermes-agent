@@ -16860,6 +16860,98 @@ def test_prompt_submit_passes_persist_user_message_to_agent(monkeypatch):
         server._sessions.pop("sid", None)
 
 
+def test_user_prompt_claims_owner_pending_async_completion_without_interrupt(
+    monkeypatch, tmp_path
+):
+    """A normal user turn force-injects its completed child before the model call."""
+    import tools.async_delegation as async_delegation
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    delegation_id = "deleg-turn-start"
+    durable_id = "20260624_143447_f60046"
+    async_delegation._persist_dispatch(
+        {
+            "delegation_id": delegation_id,
+            "session_key": durable_id,
+            "origin_ui_session_id": "stale-ui-session",
+            "parent_session_id": durable_id,
+            "origin_session_id": "",
+            "dispatched_at": 1.0,
+            "goal": "review",
+        }
+    )
+    async_delegation._persist_completion(
+        {
+            "type": "async_delegation",
+            "delegation_id": delegation_id,
+            "session_key": durable_id,
+            "origin_ui_session_id": "stale-ui-session",
+            "status": "completed",
+            "summary": "PASS review #392",
+            "dispatched_at": 1.0,
+            "completed_at": 2.0,
+        },
+        {"summary": "PASS review #392", "status": "completed"},
+    )
+    with async_delegation._DB_LOCK, async_delegation._connect() as conn:
+        conn.execute(
+            "UPDATE async_delegations SET owner_pid=? WHERE delegation_id=?",
+            (os.getpid(), delegation_id),
+        )
+
+    captured = {}
+
+    class _Agent:
+        session_id = durable_id
+
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None, **kwargs
+        ):
+            captured["prompt"] = prompt
+            captured["persist_user_message"] = kwargs.get("persist_user_message")
+            return {
+                "final_response": "reply",
+                "messages": [{"role": "assistant", "content": "reply"}],
+            }
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    server._sessions["resumed-sid"] = _session(
+        agent=_Agent(), session_key=durable_id
+    )
+    try:
+        monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+        monkeypatch.setattr(server, "_get_usage", lambda _a: {})
+        monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
+        monkeypatch.setattr(server, "_emit", lambda *a: None)
+
+        response = server.handle_request(
+            {
+                "id": "turn",
+                "method": "prompt.submit",
+                "params": {
+                    "session_id": "resumed-sid",
+                    "text": "现在什么情况了?",
+                },
+            }
+        )
+
+        assert response.get("result")
+        assert "PASS review #392" in captured["prompt"]
+        assert "现在什么情况了?" in captured["prompt"]
+        assert captured["persist_user_message"] == "现在什么情况了?"
+        durable = async_delegation.get_durable_delegation(delegation_id)
+        assert durable["delivery_state"] == "delivered"
+        assert durable["delivery_attempts"] >= 1
+    finally:
+        server._sessions.pop("resumed-sid", None)
+
+
 def test_tool_complete_attaches_active_background_timer_snapshot(monkeypatch):
     emitted: list[tuple[str, str, dict]] = []
 

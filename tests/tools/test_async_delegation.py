@@ -1250,6 +1250,55 @@ def test_poll_owner_local_reinjects_pending_for_idle_owner(tmp_path, monkeypatch
     got = q.get_nowait()
     assert got["delegation_id"] == did
     assert got.get("restored") is True
+    assert ad.get_durable_delegation(did)["delivery_attempts"] == 1
+
+
+def test_turn_start_claims_only_matching_owner_local_pending(tmp_path, monkeypatch):
+    """A user-turn claimant cannot take another session's durable completion."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    me = os.getpid()
+
+    def seed(delegation_id, session_key):
+        record = {
+            "delegation_id": delegation_id,
+            "session_key": session_key,
+            "origin_ui_session_id": "stale-ui",
+            "parent_session_id": session_key,
+            "origin_session_id": "",
+            "dispatched_at": 1.0,
+            "goal": "g",
+        }
+        ad._persist_dispatch(record)
+        ad._persist_completion(
+            {
+                "type": "async_delegation",
+                "delegation_id": delegation_id,
+                "session_key": session_key,
+                "origin_ui_session_id": "stale-ui",
+                "status": "completed",
+                "summary": delegation_id,
+                "dispatched_at": 1.0,
+                "completed_at": 2.0,
+            },
+            {"summary": delegation_id, "status": "completed"},
+        )
+        with ad._DB_LOCK, ad._connect() as conn:
+            conn.execute(
+                "UPDATE async_delegations SET owner_pid=? WHERE delegation_id=?",
+                (me, delegation_id),
+            )
+
+    seed("deleg-mine", "durable-session")
+    seed("deleg-foreign", "foreign-session")
+
+    claims = ad.claim_owner_local_pending_completions(
+        lambda evt: ad.async_event_matches_session(evt, {"durable-session"}),
+        "test-turn-start",
+    )
+
+    assert [evt["delegation_id"] for evt, _claim in claims] == ["deleg-mine"]
+    assert ad.get_durable_delegation("deleg-mine")["delivery_attempts"] == 1
+    assert ad.get_durable_delegation("deleg-foreign")["delivery_attempts"] == 0
 
 
 

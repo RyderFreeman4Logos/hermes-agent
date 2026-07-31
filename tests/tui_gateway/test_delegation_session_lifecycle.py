@@ -67,6 +67,46 @@ class TestSessionOwnsNotificationEvent:
         with patch("tui_gateway.server._get_db", return_value=db):
             assert _session_owns_notification_event("tabX", self._session("child_key"), evt) is True
 
+    def test_resumed_session_owns_by_agent_id_when_ui_is_stale(self, monkeypatch):
+        """The durable conversation id survives a TUI sid/key rotation."""
+        evt = {
+            "type": "async_delegation",
+            "delegation_id": "deleg-resumed",
+            "origin_ui_session_id": "stale-tab",
+            "session_key": "",
+        }
+        session = self._session("")
+        session["agent"] = MagicMock(session_id="20260624_143447_f60046")
+        monkeypatch.setattr(
+            ad,
+            "get_durable_delegation",
+            lambda _delegation_id: {
+                "origin_session": "20260624_143447_f60046",
+                "origin_session_id": "",
+            },
+        )
+
+        assert _session_owns_notification_event("new-tab", session, evt) is True
+        foreign = self._session("foreign")
+        foreign["agent"] = MagicMock(session_id="foreign")
+        assert _session_owns_notification_event("foreign-tab", foreign, evt) is False
+
+    def test_lineage_is_resolved_on_both_sides(self):
+        evt = {
+            "type": "async_delegation",
+            "origin_ui_session_id": "",
+            "session_key": "old-parent",
+        }
+        db = MagicMock()
+        db.resolve_resume_session_id.side_effect = lambda key: {
+            "old-parent": "live-tip",
+            "old-alias": "live-tip",
+        }.get(key, key)
+        with patch("tui_gateway.server._get_db", return_value=db):
+            assert _session_owns_notification_event(
+                "new-tab", self._session("old-alias"), evt
+            ) is True
+
 
 class TestInterruptForSession:
     def _seed_record(self, delegation_id, session_key="", origin_ui_session_id="", status="running"):

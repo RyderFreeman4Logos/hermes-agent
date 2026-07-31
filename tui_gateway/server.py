@@ -8640,23 +8640,67 @@ def _session_owns_notification_event(sid: str, session: dict, evt: dict) -> bool
         return False
     if str(evt.get("origin_ui_session_id") or "") == str(sid or ""):
         return True
-    evt_key = str(evt.get("session_key") or "")
-    if not evt_key:
-        return False
     current_keys = {
         str(session.get("session_key") or ""),
         _session_lookup_key(session, fallback=sid),
+        str(session.get("session_id") or ""),
+        str(getattr(session.get("agent"), "session_id", "") or ""),
     }
-    if evt_key in current_keys:
-        return True
+    routed_evt = dict(evt)
+    if evt.get("type") == "async_delegation" and evt.get("delegation_id"):
+        try:
+            from tools.async_delegation import get_durable_delegation
+
+            durable = get_durable_delegation(str(evt["delegation_id"]))
+            if durable:
+                for key in (
+                    "origin_session",
+                    "origin_session_id",
+                    "origin_ui_session_id",
+                    "parent_session_id",
+                ):
+                    routed_evt.setdefault(key, durable.get(key))
+        except Exception:
+            logger.debug("Async delegation durable ownership lookup failed", exc_info=True)
     try:
         db = _get_db()
-        resolved_key = (
-            db.resolve_resume_session_id(evt_key) if db is not None else evt_key
-        ) or evt_key
+        resolver = db.resolve_resume_session_id if db is not None else None
     except Exception:
-        resolved_key = evt_key
-    return resolved_key in current_keys
+        resolver = None
+    from tools.async_delegation import async_event_matches_session
+
+    return async_event_matches_session(routed_evt, current_keys, resolver)
+
+
+def _claim_turn_start_async_completions(
+    sid: str, session: dict
+) -> list[tuple[dict, str, str]]:
+    """Claim this resumed session's owner-local completions before its user turn."""
+    from tools.async_delegation import (
+        claim_owner_local_pending_completions,
+        poll_owner_local_async_completions,
+    )
+    from tools.process_registry import (
+        format_process_notification,
+        process_registry,
+    )
+
+    poll_owner_local_async_completions(process_registry.completion_queue)
+    claimed = claim_owner_local_pending_completions(
+        lambda evt: _session_owns_notification_event(sid, session, evt),
+        "tui-turn-start",
+        limit=_COMPLETION_IDLE_BATCH_MAX,
+    )
+    formatted = []
+    for evt, claim in claimed:
+        text = format_process_notification(evt)
+        if text:
+            formatted.append((evt, claim, text))
+            continue
+        from tools.async_delegation import release_event_delivery
+
+        release_event_delivery(evt, claim, consume_attempt=False)
+    return formatted
 
 
 def _notification_event_requires_owner(evt: dict) -> bool:
@@ -9726,6 +9770,16 @@ def _run_prompt_submit(
         if not isinstance(inflight, dict) or inflight.get("status") == "error":
             _start_inflight_turn(session, text)
     agent = session["agent"]
+    turn_start_completions: list[tuple[dict, str, str]] = []
+    if turn_origin is None and isinstance(text, str):
+        try:
+            turn_start_completions = _claim_turn_start_async_completions(
+                sid, session
+            )
+        except Exception:
+            logger.warning(
+                "TUI turn-start async completion claim failed", exc_info=True
+            )
     if hasattr(agent, "clear_interrupt"):
         try:
             agent.clear_interrupt()
@@ -9799,6 +9853,17 @@ def _run_prompt_submit(
             cols = session.get("cols", 80)
             streamer = make_stream_renderer(cols)
             prompt = text
+            if turn_start_completions:
+                completion_note = _format_idle_completion_batch(
+                    [
+                        (evt, completion_text)
+                        for evt, _claim, completion_text in turn_start_completions
+                    ]
+                )
+                prompt = (
+                    f"{completion_note}\n\n"
+                    f"[CURRENT USER MESSAGE]\n{text}"
+                )
 
             if isinstance(prompt, str) and "@" in prompt:
                 from agent.context_references import preprocess_context_references
@@ -9984,7 +10049,9 @@ def _run_prompt_submit(
                 "conversation_history": list(history),
                 "stream_callback": _stream,
                 "persist_user_message": (
-                    _build_persist_user_message(prompt, images, run_message) if images else prompt
+                    _build_persist_user_message(text, images, run_message)
+                    if images
+                    else text
                 ),
             }
             # Type a synthesized turn at turn START so the crash persist writes
@@ -10010,7 +10077,19 @@ def _run_prompt_submit(
             if display_kind and "persist_user_display_kind" in _run_params:
                 run_kwargs["persist_user_display_kind"] = display_kind
                 run_kwargs["persist_user_display_metadata"] = display_metadata
-            result = agent.run_conversation(run_message, **run_kwargs)
+            try:
+                result = agent.run_conversation(run_message, **run_kwargs)
+            except Exception:
+                from tools.async_delegation import release_event_delivery
+
+                for evt, claim, _completion_text in turn_start_completions:
+                    release_event_delivery(evt, claim)
+                raise
+            else:
+                from tools.async_delegation import complete_event_delivery
+
+                for evt, claim, _completion_text in turn_start_completions:
+                    complete_event_delivery(evt, claim)
             heartbeat_silent_noop = (
                 turn_origin == "heartbeat_warm"
                 and isinstance(result, dict)

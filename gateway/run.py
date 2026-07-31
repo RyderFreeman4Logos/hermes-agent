@@ -4067,6 +4067,45 @@ class TurnRunner:
                     ctx._cleanup_msg_ids.append(str(mid))
             _fut.add_done_callback(_track_status_id)
 
+    def _claim_turn_start_async_completions(
+        self, agent
+    ) -> list[tuple[dict, str, str]]:
+        """Claim only this gateway session's pending children before its user turn."""
+        ctx = self._ctx
+        from tools.async_delegation import (
+            async_event_matches_session,
+            claim_owner_local_pending_completions,
+            poll_owner_local_async_completions,
+            release_event_delivery,
+        )
+        from tools.process_registry import process_registry
+
+        poll_owner_local_async_completions(process_registry.completion_queue)
+        session_ids = {
+            str(ctx.session_key or ""),
+            str(ctx.session_id or ""),
+            str(getattr(agent, "session_id", "") or ""),
+        }
+        resolver = None
+        try:
+            resolver = self._runner._session_db._db.resolve_resume_session_id
+        except Exception:
+            pass
+        claimed = claim_owner_local_pending_completions(
+            lambda evt: async_event_matches_session(
+                evt, session_ids, resolver
+            ),
+            "gateway-turn-start",
+        )
+        formatted = []
+        for evt, claim in claimed:
+            text = _format_gateway_process_notification(evt)
+            if text:
+                formatted.append((evt, claim, text))
+            else:
+                release_event_delivery(evt, claim, consume_attempt=False)
+        return formatted
+
     def run_sync(self):
         ctx = self._ctx
         # Historical note: as a nested closure this body declared
@@ -4896,6 +4935,27 @@ class TurnRunner:
         # message so stale guidance never replays as user-authored text.
         _persist_user_message_override: Optional[Any] = ctx.persist_user_message
         _persist_user_timestamp_override: Optional[float] = ctx.persist_user_timestamp
+        _turn_start_completions: list[tuple[dict, str, str]] = []
+        if ctx.turn_origin is None and isinstance(ctx.message, str):
+            try:
+                _turn_start_completions = (
+                    self._claim_turn_start_async_completions(agent)
+                )
+            except Exception:
+                logger.warning(
+                    "Gateway turn-start async completion claim failed",
+                    exc_info=True,
+                )
+            if _turn_start_completions:
+                if _persist_user_message_override is None:
+                    _persist_user_message_override = ctx.message
+                completion_note = "\n\n".join(
+                    text for _evt, _claim, text in _turn_start_completions
+                )
+                ctx.message = (
+                    f"[BACKGROUND COMPLETIONS FINISHED]\n{completion_note}\n\n"
+                    f"[CURRENT USER MESSAGE]\n{ctx.message}"
+                )
 
         # Prepend pending model switch note so the model knows about the switch
         _pending_notes = getattr(self._runner, '_pending_model_notes', {})
@@ -5088,7 +5148,21 @@ class TurnRunner:
             if ctx.turn_origin == "heartbeat_warm":
                 _conversation_kwargs["turn_origin"] = ctx.turn_origin
                 _conversation_kwargs["allow_silent_noop"] = ctx.allow_silent_noop
-            result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+            try:
+                result = agent.run_conversation(
+                    _api_run_message, **_conversation_kwargs
+                )
+            except Exception:
+                from tools.async_delegation import release_event_delivery
+
+                for evt, claim, _text in _turn_start_completions:
+                    release_event_delivery(evt, claim)
+                raise
+            else:
+                from tools.async_delegation import complete_event_delivery
+
+                for evt, claim, _text in _turn_start_completions:
+                    complete_event_delivery(evt, claim)
         finally:
             unregister_gateway_notify(_approval_session_key)
             # Cancel any pending clarify entries so blocked agent

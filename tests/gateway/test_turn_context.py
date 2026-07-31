@@ -9,7 +9,9 @@ itself (that's covered by test_run_progress_topics.py et al.).
 """
 
 import asyncio
+import os
 import queue as queue_mod
+from types import SimpleNamespace
 
 import pytest
 
@@ -64,3 +66,61 @@ class TestTurnRunner:
         ctx = TurnContext(progress_queue=queue_mod.Queue())
         runner = _make_runner(ctx)  # stub adapter resolver returns None
         assert asyncio.run(runner.send_progress_messages()) is None
+
+    def test_gateway_turn_start_claims_only_its_pending_completion(
+        self, monkeypatch, tmp_path
+    ):
+        from gateway.run import TurnRunner
+        from tools import async_delegation as ad
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        delegation_id = "deleg-gateway-turn-start"
+        session_key = "agent:main:telegram:dm:123"
+        ad._persist_dispatch(
+            {
+                "delegation_id": delegation_id,
+                "session_key": session_key,
+                "origin_ui_session_id": "",
+                "parent_session_id": "gateway-session-id",
+                "origin_session_id": "",
+                "dispatched_at": 1.0,
+                "goal": "gateway child",
+            }
+        )
+        ad._persist_completion(
+            {
+                "type": "async_delegation",
+                "delegation_id": delegation_id,
+                "session_key": session_key,
+                "status": "completed",
+                "summary": "gateway child done",
+                "dispatched_at": 1.0,
+                "completed_at": 2.0,
+            },
+            {"summary": "gateway child done", "status": "completed"},
+        )
+        with ad._DB_LOCK, ad._connect() as conn:
+            conn.execute(
+                "UPDATE async_delegations SET owner_pid=? WHERE delegation_id=?",
+                (os.getpid(), delegation_id),
+            )
+
+        class _Gateway:
+            _session_db = SimpleNamespace(
+                _db=SimpleNamespace(resolve_resume_session_id=lambda value: value)
+            )
+
+        ctx = TurnContext(
+            session_key=session_key,
+            session_id="gateway-session-id",
+        )
+        runner = TurnRunner(_Gateway(), ctx)
+        claimed = runner._claim_turn_start_async_completions(
+            SimpleNamespace(session_id="gateway-session-id")
+        )
+
+        assert len(claimed) == 1
+        assert claimed[0][0]["delegation_id"] == delegation_id
+        assert "gateway child done" in claimed[0][2]
+        assert ad.get_durable_delegation(delegation_id)["delivery_attempts"] >= 1
+        ad.complete_event_delivery(claimed[0][0], claimed[0][1])

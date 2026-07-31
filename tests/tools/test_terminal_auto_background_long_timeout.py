@@ -1,8 +1,8 @@
 """TDD: long timeouts auto-background and return handles immediately.
 
 Authoritative contract (P0, 2026-07-24):
-- Explicit background=false is respected unless timeout > auto_background_timeout,
-  which force-promotes the command when the master switch is on.
+- An effective timeout above the threshold force-promotes even explicit
+  background=false when the master switch is on.
 - Explicit notify_on_complete=false is always respected.
 - Defaults apply only when params are omitted (None / absent).
 - Omitted background + an effective timeout > threshold → background=true; if notify omitted
@@ -292,19 +292,21 @@ class TestAutoBackgroundLongTimeout:
         mock_registry.kill_process.assert_not_called()
         mock_env.execute.assert_not_called()
 
-    def test_timeout_201_explicit_background_false_stays_foreground(self):
-        """Explicit background=False is respected even when timeout > 200."""
-        result, mock_env = _run_foreground(
+    def test_timeout_60_explicit_background_false_promotes(self):
+        """Explicit background=False cannot block above the threshold."""
+        result, mock_proc, mock_env, mock_registry = _run_promoted(
             "echo hello",
-            timeout=201,
+            timeout=60,
             background=False,
+            config=_base_config(auto_background_timeout_threshold=19),
+            async_delivery_supported=True,
         )
 
-        call_kwargs = mock_env.execute.call_args
-        assert call_kwargs is not None
-        assert call_kwargs[1]["timeout"] == 201
-        assert "error" not in result or result["error"] is None
-        assert "session_id" not in result
+        assert result.get("session_id") == mock_proc.id
+        assert result.get("notify_on_complete") is True
+        mock_registry.spawn_local.assert_called_once()
+        mock_registry.wait.assert_not_called()
+        mock_env.execute.assert_not_called()
 
     def test_timeout_200_stays_foreground(self):
         """Boundary: timeout == threshold stays foreground (not strictly greater)."""
@@ -396,7 +398,10 @@ class TestAutoBackgroundLongTimeout:
             "echo hello",
             timeout=300,
             background=False,
-            config=_base_config(auto_background_timeout=300),
+            config=_base_config(
+                auto_background_timeout=300,
+                auto_background_timeout_threshold=300,
+            ),
         )
 
         call_kwargs = mock_env.execute.call_args

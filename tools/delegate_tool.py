@@ -1465,7 +1465,7 @@ def _build_child_agent(
     # agent does.  _fallback_chain is a list accepted by AIAgent's
     # fallback_model parameter (which handles both list and dict forms).
     parent_fallback = getattr(parent_agent, "_fallback_chain", None) or None
-    if override_fallback_chain:
+    if override_fallback_chain is not None:
         parent_fallback = list(override_fallback_chain)
 
     # Inherit the parent's OpenRouter provider-preference filters by default
@@ -2978,7 +2978,7 @@ def delegate_task(
             override_request_overrides=task_creds.get("request_overrides"),
             override_max_tokens=task_creds.get("max_output_tokens"),
             override_reasoning_effort=task_creds.get("reasoning_effort"),
-            override_fallback_chain=task_creds.get("fallback_chain") or None,
+            override_fallback_chain=task_creds.get("fallback_chain"),
             override_acp_command=task_creds.get("command"),
             override_acp_args=task_creds.get("args"),
             role=effective_role,
@@ -3514,14 +3514,28 @@ def _resolve_model_profile(cfg: dict, model_profile: Optional[str]) -> Optional[
         if value is not None and value != "":
             merged[key] = value
 
+    if "fallback_chain" not in profile:
+        return merged
+
+    raw_chain = profile["fallback_chain"]
+    if not isinstance(raw_chain, list):
+        raise ValueError(
+            f"Invalid delegation model profile '{name}': fallback_chain must be a list."
+        )
     chain: List[Dict[str, Any]] = []
-    for entry in profile.get("fallback_chain") or []:
+    for index, entry in enumerate(raw_chain):
         if not isinstance(entry, dict):
-            continue
+            raise ValueError(
+                f"Invalid delegation model profile '{name}': "
+                f"fallback_chain[{index}] must be a mapping."
+            )
         provider = str(entry.get("provider") or "").strip()
         model = str(entry.get("model") or "").strip()
         if not provider or not model:
-            continue
+            raise ValueError(
+                f"Invalid delegation model profile '{name}': "
+                f"fallback_chain[{index}] requires provider and model."
+            )
         fallback: Dict[str, Any] = {"provider": provider, "model": model}
         for key in ("base_url", "api_key", "api_mode", "reasoning_effort"):
             value = entry.get(key)
@@ -3558,12 +3572,17 @@ def _resolve_delegation_credentials(
     if not model_profile:
         model_profile = str(cfg.get("default_profile") or "").strip() or None
     profile_effort: Optional[Any] = None
-    profile_fallback_chain: List[Dict[str, Any]] = []
+    profile_fallback_chain: Optional[List[Dict[str, Any]]] = None
     merged = _resolve_model_profile(cfg, model_profile)
+    if model_profile and merged is None:
+        raise ValueError(
+            f"Unknown or invalid delegation model profile '{model_profile}'."
+        )
     if merged is not None:
         cfg = merged
         profile_effort = merged.get("reasoning_effort")
-        profile_fallback_chain = list(merged.get("_profile_fallback_chain") or [])
+        if "_profile_fallback_chain" in merged:
+            profile_fallback_chain = list(merged["_profile_fallback_chain"])
 
     configured_model = str(cfg.get("model") or "").strip() or None
     configured_provider = str(cfg.get("provider") or "").strip() or None

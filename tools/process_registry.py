@@ -1272,7 +1272,8 @@ class ProcessRegistry:
             if not ready:
                 with session._lock:
                     session.exited = False
-                    session.exit_code = None
+                    if session.completion_reason != "killed" and isinstance(rc, int):
+                        session.exit_code = rc
                 self._ensure_local_completion_supervisor(session)
                 return
             if session.completion_reason != "killed":

@@ -1319,6 +1319,13 @@ class ProcessRegistry:
             self._notification_delivery_claims[key] = (claim_id, evt)
             return True
 
+    def restore_after_claim_failure(self, evt: dict) -> bool:
+        """Requeue a dequeued ordinary event; durable delegations self-restore."""
+        if evt.get("type") == "async_delegation":
+            return False
+        self.completion_queue.put(evt)
+        return True
+
     def renew_notification_delivery(self, evt: dict, claim_id: str) -> bool:
         """Confirm that this process still owns an ordinary notification claim."""
         key = self._notification_delivery_key(evt)

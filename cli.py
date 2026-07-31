@@ -10363,6 +10363,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     "Classic CLI process-notification claim failed",
                     exc_info=True,
                 )
+                process_registry.restore_after_claim_failure(event)
                 continue
             if claim is None:
                 continue

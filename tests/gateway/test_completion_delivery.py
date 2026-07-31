@@ -569,6 +569,64 @@ def test_gateway_post_turn_legacy_watch_drain_uses_claimed_delivery(
     runner._inject_watch_notification.assert_not_awaited()
 
 
+def test_gateway_post_turn_claim_exception_restores_event_and_attempts_sibling(
+    monkeypatch, isolated_registry,
+):
+    from tools import async_delegation as ad
+
+    isolated = queue.Queue()
+    monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
+    events = [
+        {
+            "type": "watch_match",
+            "session_id": "proc-watch",
+            "session_key": "agent:main:telegram:dm:12345:678",
+            "platform": "telegram",
+            "chat_type": "dm",
+            "chat_id": "12345",
+            "pattern": "FIRST",
+            "finished_at": 1.0,
+            "delivery_attempts": 2,
+        },
+        {
+            "type": "watch_disabled",
+            "session_id": "proc-watch",
+            "session_key": "agent:main:telegram:dm:12345:678",
+            "platform": "telegram",
+            "chat_type": "dm",
+            "chat_id": "12345",
+            "message": "later",
+            "finished_at": 2.0,
+            "delivery_attempts": 5,
+        },
+    ]
+    for event in events:
+        isolated.put(event)
+    attempted = []
+
+    def claim(event, _consumer):
+        attempted.append(event)
+        if event is events[0]:
+            raise OSError("claim store unavailable")
+        return "claim-later"
+
+    monkeypatch.setattr(ad, "claim_event_delivery", claim)
+    monkeypatch.setattr(
+        ad, "start_event_delivery_renewal", lambda _claims: __import__("threading").Event()
+    )
+    runner = _runner(SimpleNamespace(handle_message=AsyncMock()))
+
+    asyncio.run(runner._drain_post_turn_watch_notifications())
+
+    assert attempted == events
+    assert runner.adapters[Platform.TELEGRAM].handle_message.await_count == 1
+    delivered = runner.adapters[Platform.TELEGRAM].handle_message.await_args.args[0]
+    delivered.metadata["delivery_renewal_stops"][0].set()
+    assert isolated.get_nowait() is events[0]
+    assert isolated.empty()
+    assert [event["delivery_attempts"] for event in events] == [2, 5]
+
+
 def test_failed_long_gateway_delivery_stops_renewal_and_releases_claim(
     monkeypatch,
 ):
@@ -618,6 +676,43 @@ def test_failed_async_injection_is_retried_without_schedule_time_ack(
     asyncio.run(runner._async_delegation_watcher(interval=0))
 
     assert adapter.handle_message.await_count == 2
+
+
+def test_idle_async_claim_exception_requeues_once_and_attempts_later_sibling(
+    monkeypatch, isolated_registry,
+):
+    from tools import async_delegation as ad
+
+    isolated = queue.Queue()
+    monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
+    events = [_async_event("deleg-claim-failed"), _async_event("deleg-later")]
+    for index, event in enumerate(events):
+        event["delivery_attempts"] = index + 4
+        isolated.put(event)
+    attempted = []
+
+    def claim(event, _consumer):
+        attempted.append(event)
+        if event is events[0]:
+            raise OSError("claim store unavailable")
+        return "claim-later"
+
+    monkeypatch.setattr(ad, "claim_event_delivery", claim)
+    monkeypatch.setattr(
+        ad, "start_event_delivery_renewal", lambda _claims: __import__("threading").Event()
+    )
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    assert attempted == events
+    delivered = adapter.handle_message.await_args.args[0]
+    delivered.metadata["delivery_renewal_stops"][0].set()
+    assert isolated.get_nowait() is events[0]
+    assert isolated.empty()
+    assert [event["delivery_attempts"] for event in events] == [4, 5]
 
 
 def _persist_pending_completion(event):

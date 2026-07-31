@@ -21092,7 +21092,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             synth_text = _format_gateway_process_notification(evt)
             if synth_text:
                 try:
-                    await self._deliver_completion_notification(synth_text, evt)
+                    await self._deliver_completion_notification(
+                        synth_text, evt, restore_after_claim_failure=True
+                    )
                 except Exception as exc:
                     logger.error("Watch notification injection error: %s", exc)
 
@@ -21150,7 +21152,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return "deliver"
 
     async def _deliver_completion_notification(
-        self, synth_text: str, evt: dict,
+        self,
+        synth_text: str,
+        evt: dict,
+        *,
+        restore_after_claim_failure: bool = False,
     ) -> Optional[bool]:
         """Deliver once per live gateway, or return False for a retry.
 
@@ -21170,6 +21176,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             claim = claim_event_delivery(evt, f"gateway:{id(self)}")
         except Exception as exc:
             logger.warning("Could not claim completion delivery: %s", exc)
+            if restore_after_claim_failure:
+                from tools.process_registry import process_registry
+
+                process_registry.restore_after_claim_failure(evt)
             return False
         if claim is None:
             return None

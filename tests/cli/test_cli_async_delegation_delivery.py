@@ -57,6 +57,65 @@ def test_cli_completion_drain_uses_visible_session_identity(monkeypatch):
     pending.renewal_stop.set()
 
 
+def test_cli_claim_exception_restores_exact_event_and_continues_fifo(
+    tmp_path, monkeypatch
+):
+    from tools import async_delegation as ad
+    from tools.process_registry import process_registry
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    isolated = queue.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated)
+    events = [
+        {
+            "type": "completion",
+            "session_id": "proc-claim-failed",
+            "session_key": "visible-session",
+            "started_at": 1.0,
+            "command": "first",
+            "exit_code": 0,
+            "delivery_attempts": 3,
+        },
+        {
+            "type": "completion",
+            "session_id": "proc-later",
+            "session_key": "visible-session",
+            "started_at": 2.0,
+            "command": "second",
+            "exit_code": 0,
+            "delivery_attempts": 7,
+        },
+    ]
+    for event in events:
+        isolated.put(event)
+    cli = HermesCLI.__new__(HermesCLI)
+    cli.session_id = "visible-session"
+    cli._session_db = None
+    cli._pending_input = queue.Queue()
+    attempted = []
+
+    def claim(event, _consumer):
+        attempted.append(event)
+        if event is events[0]:
+            raise OSError("claim store unavailable")
+        return "claim-later"
+
+    monkeypatch.setattr(ad, "claim_event_delivery", claim)
+    monkeypatch.setattr(
+        ad, "start_event_delivery_renewal", lambda _claims: __import__("threading").Event()
+    )
+
+    cli._drain_process_notifications("cli-idle")
+
+    pending = cli._pending_input.get_nowait()
+    assert attempted == events
+    assert pending.event is events[1]
+    assert isolated.get_nowait() is events[0]
+    assert isolated.empty()
+    assert [event["delivery_attempts"] for event in events] == [3, 7]
+    pending.renewal_stop.set()
+
+
 def test_cli_claim_renews_while_queued_past_lease(tmp_path, monkeypatch):
     from tools import async_delegation as ad
 

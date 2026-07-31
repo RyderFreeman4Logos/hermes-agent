@@ -14286,6 +14286,35 @@ def test_busy_steer_rejection_release_error_does_not_break_poller(monkeypatch):
     assert server._try_steer_busy_notification(session, evt, "done") is False
 
 
+def test_busy_steer_claim_exception_restores_ordinary_event_once(monkeypatch):
+    import queue as _queue_mod
+    import tools.async_delegation as async_delegation
+    from tools.process_registry import process_registry
+
+    isolated = _queue_mod.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated)
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+    monkeypatch.setattr(
+        async_delegation,
+        "claim_event_delivery",
+        lambda *_args: (_ for _ in ()).throw(OSError("claim store unavailable")),
+    )
+    event = {
+        "type": "completion",
+        "session_id": "proc-busy-claim-failed",
+        "delivery_attempts": 6,
+    }
+    session = _session(
+        agent=types.SimpleNamespace(steer=lambda *_args, **_kwargs: True),
+        running=True,
+    )
+
+    assert server._try_steer_busy_notification(session, event, "done") == "requeued"
+    assert isolated.get_nowait() is event
+    assert isolated.empty()
+    assert event["delivery_attempts"] == 6
+
+
 @pytest.mark.parametrize(
     ("turn_result", "expected_delivered"),
     [
@@ -15096,6 +15125,58 @@ def test_idle_completion_dispatch_failure_releases_every_claim_and_cleans_runnin
     assert released == [event["delegation_id"] for event in events]
     assert session["running"] is False
     assert "delivery claim release failed" in caplog.text
+
+
+def test_idle_completion_claim_exception_restores_fifo_and_attempts_later(
+    monkeypatch,
+):
+    import queue as _queue_mod
+    from tools import async_delegation as ad
+    from tools.process_registry import process_registry
+
+    isolated = _queue_mod.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated)
+    events = [
+        {"type": "completion", "session_id": "first", "delivery_attempts": 1},
+        {"type": "completion", "session_id": "second", "delivery_attempts": 5},
+        {"type": "completion", "session_id": "later", "delivery_attempts": 9},
+    ]
+    attempted = []
+    submitted = []
+
+    def claim(event, _consumer):
+        attempted.append(event)
+        if event is not events[-1]:
+            raise OSError("claim store unavailable")
+        return "claim-later"
+
+    monkeypatch.setattr(ad, "claim_event_delivery", claim)
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda _rid, _sid, _session, _text, **kwargs: submitted.extend(
+            kwargs["delivery_claims"]
+        ),
+    )
+
+    assert server._dispatch_idle_completion_batch(
+        "rid-claim-failure",
+        "sid-claim-failure",
+        _session(running=True),
+        [
+            (events[0], "first completion"),
+            (events[1], "second completion"),
+            (events[2], "later completion"),
+        ],
+        consumer="claim-failure-test",
+    )
+
+    assert attempted == events
+    assert submitted == [(events[2], "claim-later")]
+    assert isolated.get_nowait() is events[0]
+    assert isolated.get_nowait() is events[1]
+    assert isolated.empty()
+    assert [event["delivery_attempts"] for event in events] == [1, 5, 9]
 
 
 def test_idle_completion_batch_keeps_interrupted_async_child_visible(monkeypatch):

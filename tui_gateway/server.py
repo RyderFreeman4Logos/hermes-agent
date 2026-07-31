@@ -8956,7 +8956,13 @@ def _try_steer_busy_notification(
         claim = claim_event_delivery(evt, "tui-poller-steer")
     except Exception:
         logger.warning("TUI busy-steer completion claim failed", exc_info=True)
-        return False
+        from tools.process_registry import process_registry
+
+        return (
+            "requeued"
+            if process_registry.restore_after_claim_failure(evt)
+            else False
+        )
     if claim is None:
         return "claimed_elsewhere"
     receipt = receipt if receipt is not None else {}
@@ -9225,6 +9231,9 @@ def _dispatch_idle_completion_batch(
                 "TUI idle completion claim failed",
                 exc_info=True,
             )
+            from tools.process_registry import process_registry
+
+            process_registry.restore_after_claim_failure(evt)
             continue
         if claim is not None:
             claims.append((evt, claim))

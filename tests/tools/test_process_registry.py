@@ -863,6 +863,17 @@ def test_notification_delivery_claim_requeues_until_model_ack(registry):
     assert not registry.claim_notification_delivery(dict(event), "replay")
 
 
+def test_claim_failure_restore_keeps_ordinary_event_but_not_durable_replay(registry):
+    ordinary = {"type": "watch_match", "session_id": "proc", "delivery_attempts": 4}
+    durable = {"type": "async_delegation", "delegation_id": "deleg-durable"}
+
+    assert registry.restore_after_claim_failure(ordinary)
+    assert not registry.restore_after_claim_failure(durable)
+    assert registry.completion_queue.get_nowait() is ordinary
+    assert registry.completion_queue.empty()
+    assert ordinary["delivery_attempts"] == 4
+
+
 def test_drain_notifications_filters_async_delegation_by_session_key():
     """Async-delegation events should only be consumed by the matching session's drain.
 

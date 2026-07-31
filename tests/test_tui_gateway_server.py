@@ -12268,7 +12268,17 @@ def test_prompt_submit_marks_idle_completion_silent_noop(monkeypatch):
     emitted = []
 
     class _Agent:
-        def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **kwargs):
+        def run_conversation(
+            self,
+            prompt,
+            conversation_history=None,
+            stream_callback=None,
+            turn_origin=None,
+            allow_silent_noop=None,
+            **kwargs,
+        ):
+            kwargs["turn_origin"] = turn_origin
+            kwargs["allow_silent_noop"] = allow_silent_noop
             calls.append((prompt, kwargs))
             return {
                 "final_response": None,
@@ -13809,7 +13819,17 @@ def test_notification_poller_delivers_completion(monkeypatch):
     emitted = []
 
     class _Agent:
-        def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **kwargs):
+        def run_conversation(
+            self,
+            prompt,
+            conversation_history=None,
+            stream_callback=None,
+            turn_origin=None,
+            allow_silent_noop=None,
+            **kwargs,
+        ):
+            kwargs["turn_origin"] = turn_origin
+            kwargs["allow_silent_noop"] = allow_silent_noop
             turns.append(prompt)
             turn_kwargs.append(kwargs)
             return {
@@ -14078,7 +14098,33 @@ def test_busy_steer_acceptance_releases_durable_claim_for_idle_retry(monkeypatch
     assert async_delegation.claim_event_delivery(evt, "tui-idle-drain") == "claim-tui-idle-drain"
 
 
-def test_notification_poller_falls_back_when_accepted_steer_never_drains(monkeypatch):
+@pytest.mark.parametrize(
+    ("turn_result", "expected_delivered"),
+    [
+        (
+            {
+                "final_response": "completion handled",
+                "messages": [
+                    {"role": "assistant", "content": "completion handled"}
+                ],
+                "api_calls": 1,
+            },
+            True,
+        ),
+        (
+            {
+                "final_response": "",
+                "messages": [],
+                "api_calls": 0,
+                "failed": True,
+            },
+            False,
+        ),
+    ],
+)
+def test_notification_poller_falls_back_when_accepted_steer_never_drains(
+    monkeypatch, tmp_path, turn_result, expected_delivered
+):
     """A merely accepted steer is retried through one idle turn if its turn ends."""
     import queue as _queue_mod
     import tools.async_delegation as async_delegation
@@ -14114,7 +14160,7 @@ def test_notification_poller_falls_back_when_accepted_steer_never_drains(monkeyp
     claims = []
     releases = []
     steers = []
-    submitted = []
+    observed_in_turn = []
 
     def claim(evt, consumer):
         assert evt is event
@@ -14126,8 +14172,10 @@ def test_notification_poller_falls_back_when_accepted_steer_never_drains(monkeyp
 
     def release(evt, token, *, consume_attempt=True):
         assert evt is event
-        assert token == "claim-tui-poller-steer"
-        assert consume_attempt is False
+        if token == "claim-tui-poller-steer":
+            assert consume_attempt is False
+        else:
+            assert token == "claim-tui-poller-idle-batch"
         delivery["held"] = False
         releases.append(token)
 
@@ -14150,23 +14198,137 @@ def test_notification_poller_falls_back_when_accepted_steer_never_drains(monkeyp
                 session["running"] = False
             return True
 
+        def run_conversation(self, *_args, **_kwargs):
+            observed_in_turn.append(dict(delivery))
+            return turn_result
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
     session = _session(agent=_EndsBeforeDrainAgent(), running=True)
+
+    server._notification_poller_loop(stop_event, "sid_steer_retry", session)
+
+    assert steers == ["child completed"]
+    assert claims == ["tui-poller-steer", "tui-poller-idle-batch"]
+    assert observed_in_turn == [{"held": True, "delivered": False}]
+    assert delivery["delivered"] is expected_delivered
+    assert delivery["held"] is False
+    assert releases == [
+        "claim-tui-poller-steer",
+        *([] if expected_delivered else ["claim-tui-poller-idle-batch"]),
+    ]
+
+
+def test_notification_poller_shutdown_drain_transfers_delivery_claim(monkeypatch):
+    """Shutdown scheduling leaves the claim owned by the spawned model turn."""
+    import queue as _queue_mod
+
+    import tools.async_delegation as async_delegation
+    import tools.process_registry as process_registry_module
+    from tools.process_registry import process_registry
+
+    event = {
+        "type": "async_delegation",
+        "delegation_id": "delegation-shutdown-drain",
+        "origin_ui_session_id": "sid-shutdown-drain",
+    }
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    isolated_queue.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(
+        process_registry_module,
+        "format_process_notification",
+        lambda _evt: "child completed during shutdown",
+    )
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        async_delegation,
+        "claim_event_delivery",
+        lambda evt, consumer: (
+            "shutdown-claim"
+            if evt is event and consumer == "tui-poller"
+            else None
+        ),
+    )
+    monkeypatch.setattr(
+        async_delegation,
+        "complete_event_delivery",
+        lambda *_args, **_kwargs: pytest.fail("completed while merely scheduled"),
+    )
+    monkeypatch.setattr(
+        async_delegation,
+        "release_event_delivery",
+        lambda *_args, **_kwargs: pytest.fail("released after successful scheduling"),
+    )
+    submitted = []
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
         lambda *args, **kwargs: submitted.append((args, kwargs)),
     )
 
-    server._notification_poller_loop(stop_event, "sid_steer_retry", session)
+    stop = threading.Event()
+    stop.set()
+    server._notification_poller_loop(stop, "sid-shutdown-drain", _session())
 
-    assert steers == ["child completed"]
-    assert claims == ["tui-poller-steer", "tui-poller-idle-batch"]
-    assert releases == ["claim-tui-poller-steer"]
-    assert delivery["delivered"] is True
     assert len(submitted) == 1
-    assert submitted[0][0][1] == "sid_steer_retry"
-    assert submitted[0][0][3] == "child completed"
+    assert submitted[0][1]["delivery_claims"] == [(event, "shutdown-claim")]
     assert submitted[0][1]["turn_origin"] == "idle_completion"
+
+
+@pytest.mark.parametrize("exit_path", ["blocked_context", "dispatcher_exception"])
+def test_run_prompt_submit_releases_transferred_claim_before_model_call(
+    monkeypatch, tmp_path, exit_path
+):
+    """Every pre-model exit returns a transferred claim to durable pending."""
+    import agent.context_references as context_references
+    import tools.async_delegation as async_delegation
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    event = {"type": "async_delegation", "delegation_id": f"deleg-{exit_path}"}
+    released = []
+    monkeypatch.setattr(
+        async_delegation,
+        "release_event_delivery",
+        lambda evt, claim: released.append((evt, claim)),
+    )
+    monkeypatch.setattr(
+        async_delegation,
+        "complete_event_delivery",
+        lambda *_args, **_kwargs: pytest.fail("pre-model exit completed delivery"),
+    )
+
+    class _Agent:
+        def run_conversation(self, *_args, **_kwargs):
+            pytest.fail("pre-model exit reached run_conversation")
+
+    text = "ordinary prompt"
+    if exit_path == "blocked_context":
+        text = "@outside-root"
+        monkeypatch.setattr(
+            context_references,
+            "preprocess_context_references",
+            lambda *_args, **_kwargs: types.SimpleNamespace(
+                blocked=True,
+                warnings=["outside allowed root"],
+                message="",
+            ),
+        )
+    else:
+        monkeypatch.setattr(
+            server,
+            "_wire_callbacks",
+            lambda _sid: (_ for _ in ()).throw(RuntimeError("setup failed")),
+        )
+
+    server._run_prompt_submit(
+        "rid-pre-model",
+        "sid-pre-model",
+        _session(agent=_Agent(), running=True),
+        text,
+        delivery_claims=[(event, "transferred-claim")],
+    )
+
+    assert released == [(event, "transferred-claim")]
 
 
 def test_session_save_writes_under_hermes_home_with_system_prompt(monkeypatch, tmp_path):
@@ -14520,9 +14682,16 @@ def test_notification_poller_batches_unapplied_steers_and_completes_durable_once
         assert all(event["delegation_id"] in text for event in events)
         assert kwargs["turn_origin"] == "idle_completion"
         assert kwargs["allow_silent_noop"] is True
-        assert len(delivery["completed"]) == 7
-        # A recreated/restarted consumer cannot claim a record already
-        # completed by the one batch.
+        assert kwargs["delivery_claims"] == [
+            (event, f"tui-poller-idle-batch:{event['delegation_id']}")
+            for event in events
+        ]
+        assert delivery["completed"] == []
+        assert delivery["held"] == {
+            event["delegation_id"] for event in events
+        }
+        # The scheduled turn owns every claim, so a second consumer cannot
+        # race it before the model result settles delivery.
         assert all(claim(event, "restart") is None for event in events)
         assert isolated_queue.empty()
     finally:

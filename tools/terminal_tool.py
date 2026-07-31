@@ -3365,7 +3365,7 @@ TERMINAL_SCHEMA = {
             },
             "timeout": {
                 "type": "integer",
-                "description": f"Max seconds for the command budget (default: 3300). When auto_background_long_timeout is enabled, an effective timeout above the threshold creates a managed background process even if background=false and rewrites its budget to auto_background_timeout (3300 by default); omitting timeout remains foreground only when the configured default is at or below the threshold. An effective timeout strictly above auto_background_timeout remains a stronger force-promotion guard. Default/explicit notify_on_complete=true returns a handle immediately (completion via notify); explicit false detaches. FOREGROUND_MAX_TIMEOUT={FOREGROUND_MAX_TIMEOUT}s remains the hard cap for true foreground.",
+                "description": f"Max seconds for the command budget (default: 180). When auto_background_long_timeout is enabled, an effective timeout above the threshold creates a managed background process even if background=false and rewrites its budget to auto_background_timeout (3300 by default); omitting timeout remains foreground only when the configured default is at or below the threshold. An effective timeout strictly above auto_background_timeout remains a stronger force-promotion guard. Default/explicit notify_on_complete=true returns a handle immediately (completion via notify); explicit false detaches. FOREGROUND_MAX_TIMEOUT={FOREGROUND_MAX_TIMEOUT}s remains the hard cap for true foreground.",
                 "minimum": 1
             },
             "workdir": {

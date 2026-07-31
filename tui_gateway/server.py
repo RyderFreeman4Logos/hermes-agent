@@ -9601,39 +9601,13 @@ def _notification_poller_loop(
                 break
             session["running"] = True
 
-        rid = f"__notif__{int(time.time() * 1000)}"
-        from tools.async_delegation import (
-            claim_event_delivery, complete_event_delivery, release_event_delivery,
+        _dispatch_idle_completion_batch(
+            f"__notif__{int(time.time() * 1000)}",
+            sid,
+            session,
+            [(evt, text)],
+            consumer="tui-poller",
         )
-        _claim = claim_event_delivery(evt, "tui-poller")
-        if _claim is None:
-            continue
-        try:
-            _emit("message.start", sid)
-            if evt.get("type") == "async_delegation":
-                _run_prompt_submit(
-                    rid,
-                    sid,
-                    session,
-                    text,
-                    display_kind="async_delegation_complete",
-                    display_metadata=_async_delegation_display_metadata(evt),
-                    turn_origin="idle_completion",
-                )
-            else:
-                _run_prompt_submit(
-                    rid, sid, session, text, turn_origin="idle_completion"
-                )
-            complete_event_delivery(evt, _claim)
-        except Exception as exc:
-            release_event_delivery(evt, _claim)
-            print(
-                f"[tui_gateway] notification poller dispatch failed: "
-                f"{type(exc).__name__}: {exc}",
-                file=sys.stderr,
-            )
-            with session["history_lock"]:
-                session["running"] = False
 
     # Hand any other sessions' events back to the shared queue.
     for evt in deferred:
@@ -10077,26 +10051,20 @@ def _run_prompt_submit(
             if display_kind and "persist_user_display_kind" in _run_params:
                 run_kwargs["persist_user_display_kind"] = display_kind
                 run_kwargs["persist_user_display_metadata"] = display_metadata
-            try:
-                result = agent.run_conversation(run_message, **run_kwargs)
-            except Exception:
-                from tools.async_delegation import release_event_delivery
+            result = agent.run_conversation(run_message, **run_kwargs)
+            from tools.async_delegation import (
+                complete_event_delivery,
+                release_event_delivery,
+                turn_result_acknowledges_delivery,
+            )
 
-                for evt, claim in claimed_deliveries:
+            while claimed_deliveries:
+                evt, claim = claimed_deliveries[-1]
+                if turn_result_acknowledges_delivery(result):
+                    complete_event_delivery(evt, claim)
+                else:
                     release_event_delivery(evt, claim)
-                raise
-            else:
-                from tools.async_delegation import (
-                    complete_event_delivery,
-                    release_event_delivery,
-                    turn_result_acknowledges_delivery,
-                )
-
-                for evt, claim in claimed_deliveries:
-                    if turn_result_acknowledges_delivery(result):
-                        complete_event_delivery(evt, claim)
-                    else:
-                        release_event_delivery(evt, claim)
+                claimed_deliveries.pop()
             heartbeat_silent_noop = (
                 turn_origin == "heartbeat_warm"
                 and isinstance(result, dict)
@@ -10466,6 +10434,12 @@ def _run_prompt_submit(
                 )
                 _emit("error", sid, {"message": str(e)})
         finally:
+            if claimed_deliveries:
+                from tools.async_delegation import release_event_delivery
+
+                for evt, claim in claimed_deliveries:
+                    release_event_delivery(evt, claim)
+                claimed_deliveries.clear()
             if thinking_started:
                 # Kill the ambient thinking sound the moment the turn ends —
                 # error and success paths both land here.

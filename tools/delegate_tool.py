@@ -1207,6 +1207,8 @@ def _build_child_agent(
     override_api_mode: Optional[str] = None,
     override_request_overrides: Optional[Dict[str, Any]] = None,
     override_max_tokens: Optional[int] = None,
+    override_reasoning_effort: Optional[Any] = None,
+    override_fallback_chain: Optional[List[Dict[str, Any]]] = None,
     # ACP transport overrides from trusted delegation config.
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
@@ -1434,14 +1436,16 @@ def _build_child_agent(
         effective_provider = "copilot-acp"
         effective_api_mode = "chat_completions"
 
-    # Resolve reasoning config: delegation override > parent inherit
+    # Resolve reasoning config: profile override > delegation override > parent inherit
     parent_reasoning = getattr(parent_agent, "reasoning_config", None)
     child_reasoning = parent_reasoning
     try:
         # Keep the raw value — ``str(x or "")`` would coerce a YAML boolean
         # False (``reasoning_effort: false``) to "" and inherit the parent
         # instead of disabling thinking for children.
-        delegation_effort = delegation_cfg.get("reasoning_effort")
+        delegation_effort = override_reasoning_effort
+        if delegation_effort is None:
+            delegation_effort = delegation_cfg.get("reasoning_effort")
         if delegation_effort or delegation_effort is False:
             from hermes_constants import parse_reasoning_effort
 
@@ -1450,17 +1454,19 @@ def _build_child_agent(
                 child_reasoning = parsed
             else:
                 logger.warning(
-                    "Unknown delegation.reasoning_effort '%s', inheriting parent level",
+                    "Unknown reasoning_effort '%s', inheriting parent level",
                     delegation_effort,
                 )
     except Exception as exc:
-        logger.debug("Could not load delegation reasoning_effort: %s", exc)
+        logger.debug("Could not load reasoning_effort: %s", exc)
 
     # Inherit the parent's fallback provider chain so subagents can recover
     # from rate-limits and credential exhaustion exactly like the top-level
     # agent does.  _fallback_chain is a list accepted by AIAgent's
     # fallback_model parameter (which handles both list and dict forms).
     parent_fallback = getattr(parent_agent, "_fallback_chain", None) or None
+    if override_fallback_chain:
+        parent_fallback = list(override_fallback_chain)
 
     # Inherit the parent's OpenRouter provider-preference filters by default
     # (so subagents routed to the same provider honour the same routing
@@ -2783,6 +2789,7 @@ def delegate_task(
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
     background: Optional[bool] = None,
+    model_profile: Optional[str] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -2858,7 +2865,9 @@ def delegate_task(
     # used by CLI/gateway startup.  When unconfigured, returns None values so
     # children inherit from the parent.
     try:
-        creds = _resolve_delegation_credentials(cfg, parent_agent)
+        creds = _resolve_delegation_credentials(
+            cfg, parent_agent, model_profile=model_profile
+        )
     except ValueError as exc:
         return tool_error(str(exc))
 
@@ -2941,6 +2950,16 @@ def delegate_task(
         # Per-task role beats top-level; normalise again so unknown
         # per-task values warn and degrade to leaf uniformly.
         effective_role = _normalize_role(t.get("role") or top_role)
+        task_profile = t.get("model_profile") or model_profile
+        if task_profile and task_profile != model_profile:
+            try:
+                task_creds = _resolve_delegation_credentials(
+                    cfg, parent_agent, model_profile=task_profile
+                )
+            except ValueError as exc:
+                return tool_error(str(exc))
+        else:
+            task_creds = creds
         child = _build_child_preserving_parent_tools(
             task_index=i,
             goal=t["goal"],
@@ -2948,18 +2967,20 @@ def delegate_task(
             # Subagents always inherit the parent's toolsets; the model
             # cannot choose or narrow them (no model-facing toolsets arg).
             toolsets=None,
-            model=creds["model"],
+            model=task_creds["model"],
             max_iterations=effective_max_iter,
             task_count=n_tasks,
             parent_agent=parent_agent,
-            override_provider=creds["provider"],
-            override_base_url=creds["base_url"],
-            override_api_key=creds["api_key"],
-            override_api_mode=creds["api_mode"],
-            override_request_overrides=creds.get("request_overrides"),
-            override_max_tokens=creds.get("max_output_tokens"),
-            override_acp_command=creds.get("command"),
-            override_acp_args=creds.get("args"),
+            override_provider=task_creds["provider"],
+            override_base_url=task_creds["base_url"],
+            override_api_key=task_creds["api_key"],
+            override_api_mode=task_creds["api_mode"],
+            override_request_overrides=task_creds.get("request_overrides"),
+            override_max_tokens=task_creds.get("max_output_tokens"),
+            override_reasoning_effort=task_creds.get("reasoning_effort"),
+            override_fallback_chain=task_creds.get("fallback_chain") or None,
+            override_acp_command=task_creds.get("command"),
+            override_acp_args=task_creds.get("args"),
             role=effective_role,
         )
         # Tee the child's progress events into its live transcript log.
@@ -3476,7 +3497,44 @@ def _resolve_child_credential_pool(
     return None
 
 
-def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
+def _resolve_model_profile(cfg: dict, model_profile: Optional[str]) -> Optional[dict]:
+    """Overlay a named delegation model-pool profile on global settings."""
+    name = str(model_profile or "").strip()
+    pool = cfg.get("model_pool") or {}
+    profile = pool.get(name) if name and isinstance(pool, dict) else None
+    if not isinstance(profile, dict) or not profile:
+        return None
+
+    merged: Dict[str, Any] = dict(cfg)
+    for key in (
+        "provider", "model", "base_url", "api_key", "api_mode",
+        "reasoning_effort",
+    ):
+        value = profile.get(key)
+        if value is not None and value != "":
+            merged[key] = value
+
+    chain: List[Dict[str, Any]] = []
+    for entry in profile.get("fallback_chain") or []:
+        if not isinstance(entry, dict):
+            continue
+        provider = str(entry.get("provider") or "").strip()
+        model = str(entry.get("model") or "").strip()
+        if not provider or not model:
+            continue
+        fallback: Dict[str, Any] = {"provider": provider, "model": model}
+        for key in ("base_url", "api_key", "api_mode", "reasoning_effort"):
+            value = entry.get(key)
+            if value is not None and str(value).strip():
+                fallback[key] = value
+        chain.append(fallback)
+    merged["_profile_fallback_chain"] = chain
+    return merged
+
+
+def _resolve_delegation_credentials(
+    cfg: dict, parent_agent, model_profile: Optional[str] = None
+) -> dict:
     """Resolve credentials for subagent delegation.
 
     If ``delegation.base_url`` is configured, subagents use that direct
@@ -3497,6 +3555,16 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
 
     Raises ValueError with a user-friendly message on credential failure.
     """
+    if not model_profile:
+        model_profile = str(cfg.get("default_profile") or "").strip() or None
+    profile_effort: Optional[Any] = None
+    profile_fallback_chain: List[Dict[str, Any]] = []
+    merged = _resolve_model_profile(cfg, model_profile)
+    if merged is not None:
+        cfg = merged
+        profile_effort = merged.get("reasoning_effort")
+        profile_fallback_chain = list(merged.get("_profile_fallback_chain") or [])
+
     configured_model = str(cfg.get("model") or "").strip() or None
     configured_provider = str(cfg.get("provider") or "").strip() or None
     configured_base_url = str(cfg.get("base_url") or "").strip() or None
@@ -3557,6 +3625,8 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
             "base_url": configured_base_url,
             "api_key": api_key,
             "api_mode": api_mode,
+            "reasoning_effort": profile_effort,
+            "fallback_chain": profile_fallback_chain,
         }
 
     if not configured_provider:
@@ -3569,6 +3639,8 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
             "api_mode": None,
             "request_overrides": None,
             "max_output_tokens": None,
+            "reasoning_effort": profile_effort,
+            "fallback_chain": profile_fallback_chain,
         }
 
     # Provider is configured — resolve full credentials
@@ -3601,6 +3673,8 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         "max_output_tokens": runtime.get("max_output_tokens"),
         "command": runtime.get("command"),
         "args": list(runtime.get("args") or []),
+        "reasoning_effort": profile_effort,
+        "fallback_chain": profile_fallback_chain,
     }
 
 
@@ -3747,6 +3821,82 @@ def _build_role_param_description() -> str:
     )
 
 
+_MODEL_POOL_SCHEMA_NAMES: Optional[tuple[str, ...]] = None
+_MODEL_POOL_SCHEMA_LOCK = threading.Lock()
+
+
+def _read_model_profile_names() -> tuple[str, ...]:
+    try:
+        pool = _load_config().get("model_pool")
+    except Exception:
+        return ()
+    if not isinstance(pool, dict):
+        return ()
+    return tuple(sorted(str(name) for name in pool))
+
+
+def _available_model_profile_names() -> list:
+    """Return the cache-stable model-pool names published in the schema."""
+    global _MODEL_POOL_SCHEMA_NAMES
+    with _MODEL_POOL_SCHEMA_LOCK:
+        if _MODEL_POOL_SCHEMA_NAMES is None:
+            _MODEL_POOL_SCHEMA_NAMES = _read_model_profile_names()
+        return list(_MODEL_POOL_SCHEMA_NAMES)
+
+
+def refresh_model_pool_schema_after_compression(agent: Any) -> bool:
+    """Publish a changed model-profile enum at a completed cache boundary."""
+    global _MODEL_POOL_SCHEMA_NAMES
+    names = _read_model_profile_names()
+    with _MODEL_POOL_SCHEMA_LOCK:
+        if _MODEL_POOL_SCHEMA_NAMES is None:
+            _MODEL_POOL_SCHEMA_NAMES = names
+            return False
+        if _MODEL_POOL_SCHEMA_NAMES == names:
+            return False
+        _MODEL_POOL_SCHEMA_NAMES = names
+
+    try:
+        from model_tools import _clear_tool_defs_cache
+
+        _clear_tool_defs_cache()
+    except Exception:
+        logger.debug("Could not clear cached tool definitions after compression", exc_info=True)
+
+    tools = getattr(agent, "tools", None)
+    if not isinstance(tools, list):
+        return True
+    fresh_property = dict(
+        _build_dynamic_schema_overrides()["parameters"]["properties"]["model_profile"]
+    )
+    for index, tool in enumerate(tools):
+        function = tool.get("function") if isinstance(tool, dict) else None
+        parameters = function.get("parameters") if isinstance(function, dict) else None
+        properties = parameters.get("properties") if isinstance(parameters, dict) else None
+        if (
+            not isinstance(function, dict)
+            or function.get("name") != "delegate_task"
+            or not isinstance(properties, dict)
+            or "model_profile" not in properties
+        ):
+            continue
+        if properties["model_profile"] == fresh_property:
+            return True
+        refreshed_tool = dict(tool)
+        refreshed_function = dict(function)
+        refreshed_parameters = dict(parameters)
+        refreshed_properties = dict(properties)
+        refreshed_properties["model_profile"] = fresh_property
+        refreshed_parameters["properties"] = refreshed_properties
+        refreshed_function["parameters"] = refreshed_parameters
+        refreshed_tool["function"] = refreshed_function
+        refreshed_tools = list(tools)
+        refreshed_tools[index] = refreshed_tool
+        agent.tools = refreshed_tools
+        break
+    return True
+
+
 def _build_dynamic_schema_overrides() -> dict:
     """Return per-call schema overrides reflecting current config.
 
@@ -3763,6 +3913,22 @@ def _build_dynamic_schema_overrides() -> dict:
     }
     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
     overrides_params["properties"]["role"]["description"] = _build_role_param_description()
+    profile_names = _available_model_profile_names()
+    profile_property = dict(overrides_params["properties"]["model_profile"])
+    if profile_names:
+        profile_property["enum"] = profile_names
+        profile_property["description"] = (
+            "Optional model-pool profile for this subagent. "
+            f"Available profiles: {', '.join(profile_names)}. "
+            "Omit to use delegation.default_profile when set, otherwise the "
+            "global/parent delegation model/provider."
+        )
+    else:
+        profile_property["description"] = (
+            "Optional model-pool profile name. No profiles are configured; "
+            "omit this field to inherit the parent/global delegation model and provider."
+        )
+    overrides_params["properties"]["model_profile"] = profile_property
 
     return {
         "description": _build_top_level_description(),
@@ -3819,6 +3985,10 @@ DELEGATE_TASK_SCHEMA = {
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
                         },
+                        "model_profile": {
+                            "type": "string",
+                            "description": "Per-task model-pool profile override.",
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -3831,6 +4001,13 @@ DELEGATE_TASK_SCHEMA = {
                 "type": "string",
                 "enum": ["leaf", "orchestrator"],
                 "description": "(rebuilt at get_definitions() time)",
+            },
+            "model_profile": {
+                "type": "string",
+                "description": (
+                    "Optional name from delegation.model_pool. Omit to use "
+                    "delegation.default_profile or inherit global/parent credentials."
+                ),
             },
             "background": {
                 "type": "boolean",
@@ -3903,6 +4080,7 @@ registry.register(
         tasks=_strip_model_hidden_task_fields(args.get("tasks")),
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
+        model_profile=args.get("model_profile"),
         background=_model_background_value(args, kw.get("parent_agent")),
         parent_agent=kw.get("parent_agent"),
     ),

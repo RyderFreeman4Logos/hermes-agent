@@ -4218,6 +4218,7 @@ def _call_fallback_candidate_sync(
     effective_timeout: float,
     effective_extra_body: dict,
     reasoning_config: Optional[dict],
+    refresh_auth: bool = True,
 ) -> Optional[Any]:
     """Call one fallback candidate with stale-credential recovery.
 
@@ -4258,7 +4259,7 @@ def _call_fallback_candidate_sync(
         return _validate_llm_response(
             _relay_sync_completion(fb_client, fb_kwargs, provider=fb_label), task)
     except Exception as fb_err:
-        if not _is_auth_error(fb_err):
+        if not _is_auth_error(fb_err) or not refresh_auth:
             raise
         fb_provider = _auth_refresh_provider_for_route(fb_label, fb_base)
         if fb_provider not in {"auto", "", None} and _refresh_provider_credentials(fb_provider):
@@ -4309,6 +4310,7 @@ async def _call_fallback_candidate_async(
     effective_timeout: float,
     effective_extra_body: dict,
     reasoning_config: Optional[dict],
+    refresh_auth: bool = True,
 ) -> Optional[Any]:
     """Async mirror of :func:`_call_fallback_candidate_sync`."""
     fb_timeout = _fallback_entry_timeout(task, fb_label)
@@ -4336,7 +4338,7 @@ async def _call_fallback_candidate_async(
             task,
         )
     except Exception as fb_err:
-        if not _is_auth_error(fb_err):
+        if not _is_auth_error(fb_err) or not refresh_auth:
             raise
         fb_provider = _auth_refresh_provider_for_route(fb_label, fb_base)
         if fb_provider not in {"auto", "", None} and _refresh_provider_credentials(fb_provider):
@@ -4595,6 +4597,7 @@ def _try_configured_fallback_chain(
     failed_provider: str,
     reason: str = "error",
     failed_model: Optional[str] = None,
+    start_index: int = 0,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Try user-configured fallback_chain for a specific auxiliary task.
 
@@ -4653,7 +4656,7 @@ def _try_configured_fallback_chain(
     tried = []
     min_ctx = _task_minimum_context_length(task)
 
-    for i, entry in enumerate(chain):
+    for i, entry in enumerate(chain[start_index:], start=start_index):
         if not isinstance(entry, dict):
             continue
         fb_provider = str(entry.get("provider", "")).strip()
@@ -4707,6 +4710,100 @@ def _try_configured_fallback_chain(
             task, ", ".join(tried),
         )
     return None, None, ""
+
+
+def _configured_fallback_allows(task_config: Dict[str, Any], exc: Exception) -> bool:
+    fallback_on = task_config.get("fallback_on")
+    if fallback_on is None:
+        return True
+    body = getattr(exc, "body", None)
+    layers = (body, body.get("error")) if isinstance(body, dict) else ()
+    return "quota_exhausted" in fallback_on and any(
+        isinstance(layer, dict)
+        and any(
+            str(layer.get(field, "")).lower()
+            in {"insufficient_quota", "quota_exhausted", "usage_limit_reached"}
+            for field in ("code", "type", "reason")
+        )
+        for layer in layers
+    )
+
+
+def _try_configured_fallbacks_sync(
+    task: Optional[str],
+    *,
+    messages: list,
+    temperature: Optional[float],
+    max_tokens: Optional[int],
+    tools: Optional[list],
+    effective_timeout: float,
+    effective_extra_body: dict,
+    reasoning_config: Optional[dict],
+) -> Optional[Any]:
+    start_index = 0
+    while True:
+        client, model, label = _try_configured_fallback_chain(
+            task, "", reason="request failure", start_index=start_index,
+        )
+        if client is None:
+            return None
+        start_index = int(re.match(r"fallback_chain\[(\d+)\]", label).group(1)) + 1
+        for _ in range(3):
+            try:
+                response = _call_fallback_candidate_sync(
+                    client, model, label,
+                    task=task, messages=messages, temperature=temperature,
+                    max_tokens=max_tokens, tools=tools,
+                    effective_timeout=effective_timeout,
+                    effective_extra_body=effective_extra_body,
+                    reasoning_config=reasoning_config,
+                    refresh_auth=False,
+                )
+                if response is not None:
+                    return response
+                break
+            except Exception:
+                pass
+
+
+async def _try_configured_fallbacks_async(
+    task: Optional[str],
+    *,
+    messages: list,
+    temperature: Optional[float],
+    max_tokens: Optional[int],
+    tools: Optional[list],
+    effective_timeout: float,
+    effective_extra_body: dict,
+    reasoning_config: Optional[dict],
+) -> Optional[Any]:
+    start_index = 0
+    while True:
+        client, model, label = _try_configured_fallback_chain(
+            task, "", reason="request failure", start_index=start_index,
+        )
+        if client is None:
+            return None
+        start_index = int(re.match(r"fallback_chain\[(\d+)\]", label).group(1)) + 1
+        client, model = _to_async_client(
+            client, model or "", is_vision=(task == "vision"),
+        )
+        for _ in range(3):
+            try:
+                response = await _call_fallback_candidate_async(
+                    client, model, label,
+                    task=task, messages=messages, temperature=temperature,
+                    max_tokens=max_tokens, tools=tools,
+                    effective_timeout=effective_timeout,
+                    effective_extra_body=effective_extra_body,
+                    reasoning_config=reasoning_config,
+                    refresh_auth=False,
+                )
+                if response is not None:
+                    return response
+                break
+            except Exception:
+                pass
 
 
 def _try_configured_fallback_for_unavailable_client(
@@ -7974,6 +8071,8 @@ def call_llm(
     # concurrent /model switch produce a key for one runtime and a client for
     # another.
     main_runtime = _normalize_main_runtime(main_runtime)
+    task_config = _get_auxiliary_task_config(task or "")
+    configured_chain = task_config.get("fallback_chain")
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
     if api_mode:
@@ -8102,6 +8201,7 @@ def call_llm(
 
     # Handle unsupported temperature, max_tokens vs max_completion_tokens retry,
     # then payment fallback.
+    original_primary_err = None
     try:
         # Retry on the same provider for a transient transport blip
         # (connection reset / streaming-close / incomplete chunked read / 5xx /
@@ -8138,7 +8238,8 @@ def call_llm(
                 task,
                 provider=resolved_provider, base_url=_base_info)
         except Exception as transient_err:
-            if not _is_transient_transport_error(transient_err):
+            original_primary_err = transient_err
+            if not configured_chain and not _is_transient_transport_error(transient_err):
                 raise
             # Compression is on the critical preflight path: a user cannot
             # continue or resume an oversized session until it compacts. A
@@ -8148,14 +8249,15 @@ def call_llm(
             # same-provider retry for compression on a full-budget timeout and
             # fall straight through to provider/model fallback; fast blips (a
             # streaming-close or a 5xx) still retry, since those are cheap.
-            if task == "compression" and _is_timeout_error(transient_err):
+            if (not configured_chain and task == "compression"
+                    and _is_timeout_error(transient_err)):
                 logger.info(
                     "Auxiliary compression: timeout on the critical path; "
                     "skipping same-provider retry and falling back: %s",
                     transient_err,
                 )
                 raise
-            _max_transient_retries = _transient_retry_count()
+            _max_transient_retries = 2 if configured_chain else _transient_retry_count()
             _last_transient = transient_err
             for _attempt in range(1, _max_transient_retries + 1):
                 _backoff = min(_TRANSIENT_RETRY_BACKOFF_BASE * (2.0 ** (_attempt - 1)), 8.0)
@@ -8185,12 +8287,26 @@ def call_llm(
                         ),
                         task)
                 except Exception as retry_transient:
-                    if not _is_transient_transport_error(retry_transient):
+                    if not configured_chain and not _is_transient_transport_error(retry_transient):
                         raise
                     _last_transient = retry_transient
             # Retries exhausted — fall through to first_err fallback handling.
             raise _last_transient
     except Exception as first_err:
+        if configured_chain:
+            original_primary_err = original_primary_err or first_err
+            if _configured_fallback_allows(task_config, original_primary_err):
+                response = _try_configured_fallbacks_sync(
+                    task,
+                    messages=messages, temperature=temperature,
+                    max_tokens=max_tokens, tools=tools,
+                    effective_timeout=effective_timeout,
+                    effective_extra_body=effective_extra_body,
+                    reasoning_config=reasoning_config,
+                )
+                if response is not None:
+                    return response
+            raise original_primary_err
         if "temperature" in kwargs and _is_unsupported_temperature_error(first_err):
             retry_kwargs = dict(kwargs)
             retry_kwargs.pop("temperature", None)
@@ -8691,6 +8807,8 @@ async def async_call_llm(
     # Keep every async phase on the same runtime identity, even if another
     # session switches models while this task is awaiting network I/O.
     main_runtime = _normalize_main_runtime(main_runtime)
+    task_config = _get_auxiliary_task_config(task or "")
+    configured_chain = task_config.get("fallback_chain")
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
     effective_extra_body = _get_task_extra_body(task)
@@ -8780,6 +8898,7 @@ async def async_call_llm(
     if _is_anthropic_compat_endpoint(resolved_provider, _client_base):
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
 
+    original_primary_err = None
     try:
         # Retry ONCE on the same provider for a transient transport blip
         # before the except-chain escalates to fallback — see call_llm()
@@ -8812,33 +8931,53 @@ async def async_call_llm(
                 task,
                 provider=resolved_provider, base_url=_client_base)
         except Exception as transient_err:
-            if not _is_transient_transport_error(transient_err):
+            original_primary_err = transient_err
+            if not configured_chain and not _is_transient_transport_error(transient_err):
                 raise
             # See call_llm(): compression is on the critical preflight path,
             # so skip the same-provider retry on a full-budget timeout and
             # fall straight through to fallback (issue #54465).
-            if task == "compression" and _is_timeout_error(transient_err):
+            if (not configured_chain and task == "compression"
+                    and _is_timeout_error(transient_err)):
                 logger.info(
                     "Auxiliary compression (async): timeout on the critical "
                     "path; skipping same-provider retry and falling back: %s",
                     transient_err,
                 )
                 raise
-            logger.info(
-                "Auxiliary %s (async): transient transport error; retrying "
-                "once on the same provider before fallback: %s",
-                task or "call", transient_err,
-            )
-            return _validate_llm_response(
-                await _relay_async_completion(
-                    client,
-                    kwargs,
-                    provider=resolved_provider,
-                    api_mode=resolved_api_mode,
-                    create=_acreate,
-                ),
-                task)
+            attempts = 2 if configured_chain else 1
+            last_err = transient_err
+            for _ in range(attempts):
+                try:
+                    return _validate_llm_response(
+                        await _relay_async_completion(
+                            client,
+                            kwargs,
+                            provider=resolved_provider,
+                            api_mode=resolved_api_mode,
+                            create=_acreate,
+                        ),
+                        task)
+                except Exception as retry_err:
+                    if not configured_chain and not _is_transient_transport_error(retry_err):
+                        raise
+                    last_err = retry_err
+            raise last_err
     except Exception as first_err:
+        if configured_chain:
+            original_primary_err = original_primary_err or first_err
+            if _configured_fallback_allows(task_config, original_primary_err):
+                response = await _try_configured_fallbacks_async(
+                    task,
+                    messages=messages, temperature=temperature,
+                    max_tokens=max_tokens, tools=tools,
+                    effective_timeout=effective_timeout,
+                    effective_extra_body=effective_extra_body,
+                    reasoning_config=reasoning_config,
+                )
+                if response is not None:
+                    return response
+            raise original_primary_err
         if "temperature" in kwargs and _is_unsupported_temperature_error(first_err):
             retry_kwargs = dict(kwargs)
             retry_kwargs.pop("temperature", None)

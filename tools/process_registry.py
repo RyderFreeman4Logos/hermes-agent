@@ -37,6 +37,7 @@ import platform
 import shlex
 import signal
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -50,6 +51,18 @@ from typing import Any, Dict, List, Optional
 from hermes_cli.config import get_hermes_home
 
 logger = logging.getLogger(__name__)
+
+
+def _supervised_local_argv(argv: list[str]) -> list[str]:
+    """Use a per-command subreaper where the kernel provides one."""
+    if _IS_WINDOWS or not sys.platform.startswith("linux"):
+        return argv
+    return [
+        sys.executable,
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "process_subreaper.py"),
+        "--",
+        *argv,
+    ]
 
 
 # Checkpoint file for crash recovery (gateway only)
@@ -141,6 +154,7 @@ class ProcessSession:
     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (when use_pty=True)
     _tracked_descendants: Dict[int, Optional[int]] = field(default_factory=dict, repr=False)
     _completion_supervisor_started: bool = field(default=False, repr=False)
+    _subreaper_managed: bool = field(default=False, repr=False)
 
 
 class ProcessRegistry:
@@ -532,7 +546,7 @@ class ProcessRegistry:
     def _remember_local_descendants(self, session: ProcessSession) -> None:
         """Remember descendants that may later detach from the launcher's group."""
         proc = session.process
-        if _IS_WINDOWS or proc is None:
+        if _IS_WINDOWS or proc is None or session._subreaper_managed:
             return
         try:
             import psutil
@@ -559,7 +573,7 @@ class ProcessRegistry:
 
     def _local_descendants_settled(self, session: ProcessSession) -> bool:
         """True when no tracked descendant or live process-group member remains."""
-        if _IS_WINDOWS or session.process is None:
+        if _IS_WINDOWS or session.process is None or session._subreaper_managed:
             return True
 
         self._remember_local_descendants(session)
@@ -593,6 +607,12 @@ class ProcessRegistry:
         proc = session.process
         if proc is None:
             return True, session.exit_code
+        if session._subreaper_managed:
+            try:
+                rc = proc.poll()
+            except Exception:
+                return False, None
+            return isinstance(rc, int), rc if isinstance(rc, int) else None
         self._remember_local_descendants(session)
         try:
             rc = proc.poll()
@@ -884,7 +904,9 @@ class ProcessRegistry:
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
 
         proc = subprocess.Popen(
-            [user_shell, "-lic", f"set +m; {safe_command}"],
+            _supervised_local_argv(
+                [user_shell, "-lic", f"set +m; {safe_command}"]
+            ),
             text=True,
             cwd=session.cwd,
             env=bg_env,
@@ -902,6 +924,9 @@ class ProcessRegistry:
         session.host_start_time = self._safe_host_start_time(session.pid)
         if not _IS_WINDOWS:
             session.process_group_id = proc.pid  # start_new_session=True makes pid == pgid
+            session._subreaper_managed = (
+                not _IS_WINDOWS and sys.platform.startswith("linux")
+            )
 
         try:
             # Start output reader thread

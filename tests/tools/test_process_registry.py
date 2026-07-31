@@ -2,6 +2,7 @@
 
 import json
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -780,7 +781,7 @@ class TestSpawnRewriteCompoundBackground:
         assert len(captured_cmd) == 1
         shell_cmd = captured_cmd[0]
         # The command passed to Popen should be the REWRITTEN version
-        assert "&& { node server.js &>/tmp/srv.log & }" in shell_cmd[2]
+        assert "&& { node server.js &>/tmp/srv.log & }" in shell_cmd[-1]
 
     def test_simple_background_preserved(self, registry):
         """Simple cmd & (no &&) must NOT be rewritten — no subshell bug."""
@@ -803,7 +804,7 @@ class TestSpawnRewriteCompoundBackground:
             registry.spawn_local("sleep 5 &", cwd="/tmp")
 
         assert len(captured_cmd) == 1
-        shell_cmd = captured_cmd[0][2]
+        shell_cmd = captured_cmd[0][-1]
         # Simple background must remain as-is
         assert "sleep 5 &" in shell_cmd
 
@@ -1410,6 +1411,47 @@ class TestHandleProcessRedaction:
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only: select() on pipes")
 class TestReaderLoopOrphanedPipe:
     """The reader supervises the complete owned process group."""
+
+    @pytest.mark.skipif(
+        not sys.platform.startswith("linux"),
+        reason="Linux-only: requires PR_SET_CHILD_SUBREAPER",
+    )
+    def test_spawn_waits_for_setsid_worker_before_one_completion(
+        self, registry, tmp_path
+    ):
+        done = tmp_path / "worker.done"
+        code = (
+            "import os,time; pid=os.fork(); "
+            "(os.setsid(), print('worker-start', flush=True), os.close(1), "
+            f"os.close(2), time.sleep(.8), open({str(done)!r}, 'w').close(), "
+            "os._exit(0)) "
+            "if pid == 0 else os._exit(23)"
+        )
+        command = f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}"
+        session = registry.spawn_local(command, cwd=str(tmp_path))
+        session.notify_on_complete = True
+
+        try:
+            assert _wait_until(lambda: "worker-start" in session.output_buffer)
+            assert registry.poll(session.id)["status"] == "running"
+            assert session.id in registry._running
+            assert registry.completion_queue.empty()
+            assert not done.exists()
+
+            assert _wait_until(done.exists)
+            assert _wait_until(
+                lambda: registry.poll(session.id)["status"] == "exited"
+            )
+            assert _wait_until(lambda: not registry.completion_queue.empty())
+            event = registry.completion_queue.get_nowait()
+            assert event["session_id"] == session.id
+            assert event["exit_code"] == 23
+            assert event["output"] == "worker-start\n"
+            registry._move_to_finished(session)
+            assert registry.completion_queue.empty()
+        finally:
+            if not session.exited:
+                registry.kill_process(session.id)
 
     def test_final_notify_waits_for_child_and_is_exactly_once(self, registry):
         proc = subprocess.Popen(

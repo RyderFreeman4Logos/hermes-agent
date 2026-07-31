@@ -161,12 +161,8 @@ class TestQueueConsumptionAfterCompletion:
         # Q2 is positioned to run next.
         returned = runner._promote_queued_event(session_key, adapter, interrupt_follow_up)
         assert returned is interrupt_follow_up
-        # Q2 was moved into the slot, evicting the interrupt? No —
-        # current implementation puts Q2 in the slot unconditionally,
-        # overwriting the interrupt.  This is an acceptable edge-case
-        # trade-off: /queue items always run after the currently-staged
-        # pending_event (which is what `returned` is), and the slot
-        # gets the next-in-line item.
+        # The helper stages the overflow item for the recursion after the
+        # returned event.
         assert adapter._pending_messages[session_key].text == "Q2"
 
 
@@ -218,5 +214,4 @@ class TestBusyInputModeQueueFifo:
             "five",
         ]
         assert runner._queue_depth(session_key, adapter=adapter) == len(texts)
-
 

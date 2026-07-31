@@ -202,3 +202,174 @@ async def test_recursive_queued_followup_transfers_delivery_claim(monkeypatch, t
     assert result["final_response"] == "done-2"
     assert completed == [(claimed_event, "claim-1")]
     renewal_stop.set.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_recursion_cap_requeues_before_staged_fifo_head_with_metadata(
+    monkeypatch, tmp_path
+):
+    CaptureQueuedNativeImageAgent.calls = []
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = CaptureQueuedNativeImageAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+
+    adapter = CaptureAdapter()
+    runner = _make_runner(adapter)
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="123", chat_type="dm")
+    session_key = "agent:main:telegram:dm:123"
+    claim = ({"type": "completion", "session_id": "first"}, "claim-first")
+    renewal_stop = MagicMock()
+    first = MessageEvent(
+        text="first",
+        source=source,
+        internal=True,
+        metadata={
+            "delivery_claims": [claim],
+            "delivery_renewal_stops": [renewal_stop],
+            "marker": object(),
+        },
+    )
+    second = MessageEvent(text="second", source=source, metadata={"marker": object()})
+    runner._enqueue_fifo(session_key, first, adapter)
+    runner._enqueue_fifo(session_key, second, adapter)
+
+    await runner._run_agent(
+        message="current",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-recursion-cap",
+        session_key=session_key,
+        _interrupt_depth=runner._MAX_INTERRUPT_DEPTH,
+    )
+
+    assert adapter._pending_messages[session_key] is first
+    assert runner._queued_events[session_key] == [second]
+    assert first.metadata["delivery_claims"] == [claim]
+    assert first.metadata["delivery_renewal_stops"] == [renewal_stop]
+
+
+@pytest.mark.asyncio
+async def test_shutdown_after_dequeue_stops_renewal_and_releases_exact_claim(
+    monkeypatch, tmp_path
+):
+    CaptureQueuedNativeImageAgent.calls = []
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = CaptureQueuedNativeImageAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+    released = []
+    monkeypatch.setattr(
+        "tools.async_delegation.release_event_delivery",
+        lambda event, claim: released.append((event, claim)),
+    )
+
+    adapter = CaptureAdapter()
+    runner = _make_runner(adapter)
+    runner._draining = True
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="123", chat_type="dm")
+    session_key = "agent:main:telegram:dm:123"
+    claimed_event = {"type": "completion", "session_id": "abandoned"}
+    renewal_stop = MagicMock()
+    adapter._pending_messages[session_key] = MessageEvent(
+        text="completion",
+        source=source,
+        internal=True,
+        metadata={
+            "delivery_claims": [(claimed_event, "claim-abandoned")],
+            "delivery_renewal_stops": [renewal_stop],
+        },
+    )
+
+    await runner._run_agent(
+        message="current",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-shutdown",
+        session_key=session_key,
+    )
+
+    renewal_stop.set.assert_called_once_with()
+    assert released == [(claimed_event, "claim-abandoned")]
+
+
+@pytest.mark.asyncio
+async def test_shutdown_claim_cleanup_continues_after_each_failure(monkeypatch, tmp_path):
+    CaptureQueuedNativeImageAgent.calls = []
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = CaptureQueuedNativeImageAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+    releases = []
+
+    def release(event, claim):
+        releases.append((event, claim))
+        if claim == "claim-first":
+            raise RuntimeError("release failed")
+
+    monkeypatch.setattr("tools.async_delegation.release_event_delivery", release)
+
+    adapter = CaptureAdapter()
+    runner = _make_runner(adapter)
+    runner._draining = True
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="123", chat_type="dm")
+    session_key = "agent:main:telegram:dm:123"
+    first_event = {"type": "completion", "session_id": "first"}
+    second_event = {"type": "completion", "session_id": "second"}
+    first_stop = MagicMock()
+    first_stop.set.side_effect = RuntimeError("stop failed")
+    second_stop = MagicMock()
+    adapter._pending_messages[session_key] = MessageEvent(
+        text="completions",
+        source=source,
+        internal=True,
+        metadata={
+            "delivery_claims": [
+                (first_event, "claim-first"),
+                (second_event, "claim-second"),
+            ],
+            "delivery_renewal_stops": [first_stop, second_stop],
+        },
+    )
+
+    await runner._run_agent(
+        message="current",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-shutdown-failure",
+        session_key=session_key,
+    )
+
+    first_stop.set.assert_called_once_with()
+    second_stop.set.assert_called_once_with()
+    assert releases == [
+        (first_event, "claim-first"),
+        (second_event, "claim-second"),
+    ]

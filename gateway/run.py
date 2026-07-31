@@ -24573,6 +24573,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     session_key or "?",
                     self._status_action_label(),
                 )
+                if pending_event is not None:
+                    _abandoned_metadata = getattr(pending_event, "metadata", None)
+                    if getattr(pending_event, "internal", False) and isinstance(
+                        _abandoned_metadata, dict
+                    ):
+                        for renewal_stop in list(
+                            _abandoned_metadata.pop("delivery_renewal_stops", []) or []
+                        ):
+                            try:
+                                renewal_stop.set()
+                            except Exception:
+                                logger.warning(
+                                    "Gateway shutdown delivery renewal stop failed",
+                                    exc_info=True,
+                                )
+                        from tools.async_delegation import settle_event_deliveries
+
+                        settle_event_deliveries(
+                            list(
+                                _abandoned_metadata.pop("delivery_claims", []) or []
+                            ),
+                            log_context="Gateway shutdown",
+                        )
                 pending_event = None
                 pending = None
 
@@ -24595,7 +24618,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     adapter = self._adapter_for_source(source)
                     if adapter and pending_event:
-                        merge_pending_message_event(adapter._pending_messages, session_key, pending_event)
+                        staged = adapter._pending_messages.pop(session_key, None)
+                        if staged is not None:
+                            self._session_state(
+                                session_key
+                            ).conversation.queued_events.insert(0, staged)
+                        adapter._pending_messages[session_key] = pending_event
                     elif adapter and hasattr(adapter, 'queue_message'):
                         adapter.queue_message(session_key, pending)
                     return result_holder[0] or {"final_response": response, "messages": history}

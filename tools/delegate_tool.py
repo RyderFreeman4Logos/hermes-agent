@@ -1374,26 +1374,42 @@ def _build_child_agent(
     effective_base_url = override_base_url or parent_agent.base_url
     if not override_base_url:
         effective_base_url = _inherit_parent_base_url(parent_agent, effective_base_url)
+    if override_api_key is not None and not isinstance(override_api_key, str):
+        raise ValueError("Invalid delegation API key override: expected a string.")
+    if inherit_parent_api_key is not None and not isinstance(
+        inherit_parent_api_key, bool
+    ):
+        raise ValueError("Invalid parent API key inheritance flag: expected a boolean.")
+    parent_base_url = _inherit_parent_base_url(
+        parent_agent, getattr(parent_agent, "base_url", None)
+    )
+    backend_compatible = (
+        _normalized_runtime_url(effective_base_url)
+        == _normalized_runtime_url(parent_base_url)
+        and (
+            bool(override_base_url)
+            or not override_provider
+            or (effective_provider or "").strip().lower()
+            == (getattr(parent_agent, "provider", None) or "").strip().lower()
+        )
+    )
     if inherit_parent_api_key is None:
-        parent_base_url = _inherit_parent_base_url(
-            parent_agent, getattr(parent_agent, "base_url", None)
-        )
-        inherit_parent_api_key = (
-            _normalized_runtime_url(effective_base_url)
-            == _normalized_runtime_url(parent_base_url)
-            and (
-                bool(override_base_url)
-                or not override_provider
-                or effective_provider == getattr(parent_agent, "provider", None)
-            )
-        )
-    if not override_api_key and parent_api_key and not inherit_parent_api_key:
+        inherit_parent_api_key = backend_compatible
+    elif inherit_parent_api_key and not backend_compatible:
         raise ValueError(
             "Refusing to inherit the parent API key across a different "
             "delegation backend."
         )
-    effective_api_key = override_api_key or (
-        parent_api_key if inherit_parent_api_key else None
+    has_api_key_override = override_api_key is not None
+    if not has_api_key_override and parent_api_key and not inherit_parent_api_key:
+        raise ValueError(
+            "Refusing to inherit the parent API key across a different "
+            "delegation backend."
+        )
+    effective_api_key = (
+        override_api_key
+        if has_api_key_override
+        else parent_api_key if inherit_parent_api_key else None
     )
     # Bug #20558 / PR #20563: api_mode must NOT be inherited when the child uses a
     # different provider than the parent — each provider has its own API surface
@@ -3364,6 +3380,12 @@ def delegate_task(
             return tuple(parts), in_tool
 
         _goals = [t["goal"] for t in task_list]
+        _models = [c["model"] or getattr(parent_agent, "model", None) for c in task_credentials]
+        _batch_model = (
+            _models[0]
+            if _models and all(model == _models[0] for model in _models[1:])
+            else None
+        )
         dispatch = dispatch_async_delegation_batch(
             goals=_goals,
             context=context,
@@ -3371,7 +3393,7 @@ def delegate_task(
             # parent's toolsets (no model-facing toolsets arg).
             toolsets=None,
             role=top_role,
-            model=creds["model"],
+            model=_batch_model,
             session_key=_session_key,
             origin_ui_session_id=_origin_ui_session_id,
             origin_session_id=_wake_sid,

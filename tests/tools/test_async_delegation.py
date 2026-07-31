@@ -591,6 +591,83 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     assert "the real task" in text
 
 
+@pytest.mark.parametrize(
+    ("profile_models", "expected_model"),
+    [({"fast": "m1", "smart": "m1"}, "m1"), ({"fast": "m1", "smart": "m2"}, None)],
+)
+def test_background_batch_completion_reports_only_uniform_model(
+    monkeypatch, profile_models, expected_model
+):
+    from unittest.mock import MagicMock
+    import tools.delegate_tool as dt
+
+    parent = MagicMock()
+    parent._delegate_depth = 0
+    parent.model = "parent-model"
+    parent.session_id = "sess"
+    parent._interrupt_requested = False
+    parent._active_children = []
+    parent._active_children_lock = None
+
+    def build_child(**kwargs):
+        child = MagicMock()
+        child.model = kwargs["model"] or parent.model
+        child._delegate_role = "leaf"
+        child._subagent_id = f"s{kwargs['task_index']}"
+        return child
+
+    monkeypatch.setattr(
+        dt,
+        "_load_config",
+        lambda: {
+            "model_pool": {
+                name: {"model": model} for name, model in profile_models.items()
+            }
+        },
+    )
+    monkeypatch.setattr(dt, "_build_child_agent", build_child)
+    monkeypatch.setattr(
+        dt,
+        "_resolve_delegation_credentials",
+        lambda _cfg, _parent, model_profile=None: {
+            "model": profile_models[model_profile],
+            "provider": None,
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+        },
+    )
+    monkeypatch.setattr(
+        dt,
+        "_run_single_child",
+        lambda task_index, goal, child=None, **_kwargs: {
+            "task_index": task_index,
+            "status": "completed",
+            "summary": f"done: {goal}",
+            "api_calls": 1,
+            "duration_seconds": 0.1,
+            "model": child.model,
+        },
+    )
+
+    parsed = json.loads(
+        dt.delegate_task(
+            tasks=[
+                {"goal": "one", "model_profile": "fast"},
+                {"goal": "two", "model_profile": "smart"},
+            ],
+            background=True,
+            parent_agent=parent,
+        )
+    )
+    evt = _drain_for(parsed["delegation_id"])
+
+    assert evt["model"] == expected_model
+    assert [result["model"] for result in evt["results"]] == list(
+        profile_models.values()
+    )
+
+
 def test_delegate_task_background_uses_live_tui_agent_session_id(monkeypatch):
     """TUI async delegation must route to the live/compressed agent id.
 
@@ -728,4 +805,3 @@ def test_gateway_cli_origin_event_left_unrouted():
     evt = _make_async_evt(session_key="")
     runner._enrich_async_delegation_routing(evt)
     assert "platform" not in evt
-

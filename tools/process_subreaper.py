@@ -58,8 +58,19 @@ def main(argv: list[str] | None = None) -> int:
 
     if launcher_exit < 0:
         signum = -launcher_exit
-        signal.signal(signum, signal.SIG_DFL)
+        # Mirroring SIGSTOP would suspend this wrapper forever.  Match the
+        # conventional shell encoding instead; terminating signals still reach
+        # the parent as a negative Popen return code.
+        if signum == getattr(signal, "SIGSTOP", None):
+            return 128 + signum
+        try:
+            signal.signal(signum, signal.SIG_DFL)
+        except (OSError, ValueError):
+            # SIGKILL cannot have a handler, but can still terminate us.
+            if signum != getattr(signal, "SIGKILL", None):
+                return 128 + signum
         os.kill(os.getpid(), signum)
+        return 128 + signum
     return launcher_exit
 
 

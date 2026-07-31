@@ -8732,6 +8732,7 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
             evt.get("output", ""),
             evt.get("suppressed", 0),
             evt.get("message_id", ""),
+            evt.get("finished_at"),
         )
     if evt_type.startswith("watch_overflow_") or evt_type == "watch_disabled":
         return (
@@ -8740,6 +8741,7 @@ def _notification_event_dedup_key(evt: dict) -> tuple:
             evt.get("command", ""),
             evt.get("message", ""),
             evt.get("suppressed", 0),
+            evt.get("finished_at"),
         )
     if evt_type == "async_delegation":
         # Async-delegation completions have no process session_id; without

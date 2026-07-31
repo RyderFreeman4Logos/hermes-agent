@@ -84,6 +84,23 @@ class TestCheckWatchPatterns:
         assert evt["pattern"] == "ERROR"
         assert "disk full" in evt["output"]
         assert evt["session_id"] == "proc_test_watch"
+        assert evt["finished_at"] > 0
+
+    def test_identical_occurrences_deliver_once_each_but_replay_dedups(self, registry):
+        session = _make_session(watch_patterns=["READY"])
+        with patch("tools.process_registry.time.time", side_effect=[100.0, 101.0]):
+            registry._check_watch_patterns(session, "READY\n")
+            session._watch_cooldown_until = 0
+            registry._check_watch_patterns(session, "READY\n")
+
+        first = registry.completion_queue.get_nowait()
+        second = registry.completion_queue.get_nowait()
+        assert first["finished_at"] != second["finished_at"]
+
+        assert registry.claim_notification_delivery(first, "first")
+        assert registry.complete_notification_delivery(first, "first")
+        assert not registry.claim_notification_delivery(dict(first), "replay")
+        assert registry.claim_notification_delivery(second, "second")
 
 
     def test_output_truncation(self, registry):

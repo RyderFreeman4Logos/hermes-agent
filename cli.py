@@ -4198,12 +4198,13 @@ class _VoiceInputMessage:
 class _ClaimedProcessNotification:
     """Synthetic CLI input carrying its durable delivery claim into the turn."""
 
-    __slots__ = ("text", "event", "claim")
+    __slots__ = ("text", "event", "claim", "renewal_stop")
 
-    def __init__(self, text: str, event: dict, claim: str):
+    def __init__(self, text: str, event: dict, claim: str, renewal_stop=None):
         self.text = text
         self.event = event
         self.claim = claim
+        self.renewal_stop = renewal_stop
 
 
 class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
@@ -10365,9 +10366,22 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 continue
             if claim is None:
                 continue
-            self._pending_input.put(
-                _ClaimedProcessNotification(synthetic_message, event, claim)
-            )
+            from tools.async_delegation import start_event_delivery_renewal
+
+            claims = [(event, claim)]
+            renewal_stop = None
+            try:
+                renewal_stop = start_event_delivery_renewal(claims)
+                self._pending_input.put(
+                    _ClaimedProcessNotification(
+                        synthetic_message, event, claim, renewal_stop
+                    )
+                )
+            except BaseException:
+                if renewal_stop is not None:
+                    renewal_stop.set()
+                self._settle_delivery_claims(claims)
+                raise
 
     @staticmethod
     def _settle_delivery_claims(
@@ -13354,6 +13368,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         images: list = None,
         voice_input: bool = False,
         delivery_claims: Optional[list[tuple[dict, str]]] = None,
+        delivery_renewal_stop=None,
     ) -> Optional[str]:
         """
         Send a message to the agent and get a response.
@@ -13373,6 +13388,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 (gates the concise voice-response prefix, #65827)
             delivery_claims: Durable process-notification claims transferred
                 with this synthetic input.
+            delivery_renewal_stop: Existing renewal ownership acquired before
+                the synthetic input was queued.
             
         Returns:
             The agent's response, or None on error
@@ -13523,8 +13540,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             with persist_lock:
                 _stage_user_message()
 
-        delivery_renewal_stop = None
-        if delivery_claims:
+        if delivery_claims and delivery_renewal_stop is None:
             from tools.async_delegation import start_event_delivery_renewal
 
             delivery_renewal_stop = start_event_delivery_renewal(delivery_claims)
@@ -16869,6 +16885,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         def process_loop():
             while not self._should_exit:
                 delivery_claims = []
+                delivery_renewal_stop = None
                 try:
                     # Check for pending input with timeout
                     try:
@@ -16887,6 +16904,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
                     if isinstance(user_input, _ClaimedProcessNotification):
                         delivery_claims.append((user_input.event, user_input.claim))
+                        delivery_renewal_stop = user_input.renewal_stop
                         user_input = user_input.text
 
                     # Voice-transcribed messages arrive wrapped in a sentinel
@@ -17008,6 +17026,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             images=submit_images or None,
                             voice_input=is_voice_input,
                             delivery_claims=delivery_claims,
+                            delivery_renewal_stop=delivery_renewal_stop,
                         )
                     finally:
                         if delivery_claims:
@@ -17089,6 +17108,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     if delivery_claims:
                         self._settle_delivery_claims(delivery_claims)
                     logger.warning("process_loop unhandled error (msg may be lost): %s", e)
+                finally:
+                    if delivery_renewal_stop is not None:
+                        delivery_renewal_stop.set()
         
         # Start processing thread
         process_thread = threading.Thread(target=process_loop, daemon=True)

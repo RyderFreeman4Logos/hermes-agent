@@ -3,6 +3,7 @@ import importlib
 import sys
 import types
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -149,3 +150,55 @@ async def test_queued_followup_uses_pending_event_session_key_for_native_images(
     assert queued_message[0]["type"] == "text"
     assert queued_message[0]["text"].startswith("describe this")
     assert any(part.get("type") == "image_url" for part in queued_message)
+
+
+@pytest.mark.asyncio
+async def test_recursive_queued_followup_transfers_delivery_claim(monkeypatch, tmp_path):
+    CaptureQueuedNativeImageAgent.calls = []
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = CaptureQueuedNativeImageAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+
+    adapter = CaptureAdapter()
+    runner = _make_runner(adapter)
+    source = SessionSource(
+        platform=Platform.TELEGRAM, chat_id="123", chat_type="dm"
+    )
+    claimed_event = {"type": "completion", "session_id": "proc-queued-claim"}
+    renewal_stop = MagicMock()
+    completed = []
+    monkeypatch.setattr(
+        "tools.async_delegation.complete_event_delivery",
+        lambda event, claim: completed.append((event, claim)),
+    )
+    adapter._pending_messages["agent:main:telegram:dm:123"] = MessageEvent(
+        text="completion plus user text",
+        source=source,
+        internal=True,
+        metadata={
+            "delivery_claims": [(claimed_event, "claim-1")],
+            "delivery_renewal_stops": [renewal_stop],
+        },
+    )
+
+    result = await runner._run_agent(
+        message="first turn",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-queued-claim",
+        session_key="agent:main:telegram:dm:123",
+    )
+
+    assert result["final_response"] == "done-2"
+    assert completed == [(claimed_event, "claim-1")]
+    renewal_stop.set.assert_called_once_with()

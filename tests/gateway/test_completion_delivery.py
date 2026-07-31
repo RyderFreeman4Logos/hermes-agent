@@ -439,7 +439,10 @@ def test_concurrent_claims_share_the_same_narrow_delivery_seam():
     adapter.handle_message.assert_awaited_once()
 
 
-def test_async_push_adapter_renews_busy_coalesced_claim_through_real_turn(monkeypatch):
+@pytest.mark.parametrize("api_calls", [1, 0])
+def test_async_push_adapter_routes_busy_coalesced_claim_through_real_turn(
+    monkeypatch, api_calls
+):
     from tools import async_delegation as ad
 
     event = _async_event("deleg_async_push_busy")
@@ -468,6 +471,17 @@ def test_async_push_adapter_renews_busy_coalesced_claim_through_real_turn(monkey
     )
     calls = 0
 
+    runner = _runner(adapter)
+    runner.config = SimpleNamespace(multiplex_profiles=False)
+    source = runner.session_store._entries[event["session_key"]].origin
+
+    async def run_agent_inner(*_args, **_kwargs):
+        real_turn_started.set()
+        await finish_real_turn.wait()
+        return {"api_calls": api_calls, "final_response": "handled"}
+
+    runner._run_agent_inner = run_agent_inner
+
     async def handle(adapter_event):
         nonlocal calls
         calls += 1
@@ -475,15 +489,19 @@ def test_async_push_adapter_renews_busy_coalesced_claim_through_real_turn(monkey
             first_started.set()
             await finish_first.wait()
             return None
-        claims = adapter_event.metadata.pop("delivery_claims")
-        real_turn_started.set()
-        await finish_real_turn.wait()
-        ad.settle_event_deliveries(claims, {"api_calls": 1})
+        metadata = adapter_event.metadata
+        claims = list(metadata.pop("delivery_claims", []) or []) if adapter_event.internal else []
+        await runner._run_agent(
+            adapter_event.text,
+            "",
+            [],
+            adapter_event.source,
+            "session-1",
+            delivery_claims=claims,
+        )
         return None
 
     adapter._message_handler = handle
-    runner = _runner(adapter)
-    source = runner.session_store._entries[event["session_key"]].origin
 
     monkeypatch.setattr(ad, "_DELIVERY_CLAIM_LEASE_SECONDS", 0.2)
     monkeypatch.setattr(ad, "_DELIVERY_CLAIM_RENEW_INTERVAL_SECONDS", 0.02)
@@ -497,6 +515,7 @@ def test_async_push_adapter_renews_busy_coalesced_claim_through_real_turn(monkey
         assert await runner._deliver_completion_notification("completion", event) is True
         pending = adapter._pending_messages[session_key]
         assert pending.text == "queued user text\ncompletion"
+        assert pending.internal is True
         assert pending.metadata["delivery_claims"][0][0] is event
 
         await asyncio.sleep(0.25)
@@ -513,8 +532,14 @@ def test_async_push_adapter_renews_busy_coalesced_claim_through_real_turn(monkey
             await asyncio.sleep(0)
 
         durable = ad.get_durable_delegation(event["delegation_id"])
-        assert durable["delivery_state"] == "delivered"
+        assert durable["delivery_state"] == (
+            "delivered" if api_calls else "pending"
+        )
         assert durable["delivery_attempts"] == 1
+        if not api_calls:
+            retry = ad.claim_event_delivery(event, "retry-after-zero-call")
+            assert retry
+            ad.release_event_delivery(event, retry)
 
     asyncio.run(exercise())
 
@@ -717,6 +742,24 @@ def test_busy_gateway_merge_preserves_transferred_claim():
         (claimed_event, "claim-1")
     ]
     assert pending_event.metadata["delivery_renewal_stops"] == ["renewal-1"]
+    assert pending_event.internal is True
+
+
+def test_busy_gateway_merge_does_not_internalize_unclaimed_user_event():
+    source = SessionSource(
+        platform=Platform.TELEGRAM, chat_id="12345", chat_type="dm"
+    )
+    pending_event = MessageEvent(text="first", source=source)
+
+    merge_pending_message_event(
+        {"session": pending_event},
+        "session",
+        MessageEvent(text="second", source=source),
+        merge_text=True,
+    )
+
+    assert pending_event.text == "first\nsecond"
+    assert pending_event.internal is False
 
 
 def test_gateway_adapter_zero_call_releases_claim_and_stops_renewal():

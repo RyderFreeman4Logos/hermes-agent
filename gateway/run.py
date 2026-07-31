@@ -24698,6 +24698,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 next_message_id = None
                 next_channel_prompt = None
                 next_session_key = session_key
+                next_delivery_claims = []
+                next_delivery_renewal_stops = []
                 # #60671 — carry the pending event's message_type into the
                 # recursive call so queued voice turns can stream TTS and
                 # re-mark the generation for the final delivered turn.
@@ -24777,19 +24779,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # what the follow-up's guard will consult.  Fail-safe in helper.
                 await self._refresh_agent_cache_message_count(session_key, session_id)
 
-                followup_result = await self._run_agent(
-                    message=next_message,
-                    context_prompt=context_prompt,
-                    history=updated_history,
-                    source=next_source,
-                    session_id=session_id,
-                    session_key=next_session_key,
-                    run_generation=run_generation,
-                    _interrupt_depth=_interrupt_depth + 1,
-                    event_message_id=next_message_id,
-                    channel_prompt=next_channel_prompt,
-                    message_type=next_message_type,
-                )
+                if pending_event is not None:
+                    _next_metadata = getattr(pending_event, "metadata", None)
+                    if getattr(pending_event, "internal", False) and isinstance(
+                        _next_metadata, dict
+                    ):
+                        next_delivery_claims = list(
+                            _next_metadata.pop("delivery_claims", []) or []
+                        )
+                        next_delivery_renewal_stops = list(
+                            _next_metadata.pop("delivery_renewal_stops", []) or []
+                        )
+                try:
+                    followup_result = await self._run_agent(
+                        message=next_message,
+                        context_prompt=context_prompt,
+                        history=updated_history,
+                        source=next_source,
+                        session_id=session_id,
+                        session_key=next_session_key,
+                        run_generation=run_generation,
+                        _interrupt_depth=_interrupt_depth + 1,
+                        event_message_id=next_message_id,
+                        channel_prompt=next_channel_prompt,
+                        message_type=next_message_type,
+                        delivery_claims=next_delivery_claims,
+                    )
+                finally:
+                    for renewal_stop in next_delivery_renewal_stops:
+                        renewal_stop.set()
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
             # Stop progress sender, interrupt monitor, and notification task

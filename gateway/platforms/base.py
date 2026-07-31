@@ -2458,6 +2458,9 @@ def merge_pending_message_event(
             existing.metadata.setdefault("delivery_claims", []).extend(
                 incoming_claims
             )
+            # The pending user text now owns an internal completion delivery.
+            # Route the combined event through the completion turn lifecycle.
+            existing.internal = True
         incoming_renewals = incoming_metadata.get("delivery_renewal_stops")
         if incoming_renewals:
             existing.metadata.setdefault("delivery_renewal_stops", []).extend(

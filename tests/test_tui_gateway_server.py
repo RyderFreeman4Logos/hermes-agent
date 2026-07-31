@@ -14690,16 +14690,19 @@ def test_notification_event_dedup_key_preserves_distinct_watch_matches():
         "pattern": "READY",
         "output": "READY on port 8000",
         "suppressed": 0,
+        "finished_at": 100.0,
     }
 
     identical = dict(base)
     distinct_output = {**base, "output": "READY on port 9000"}
     distinct_pattern = {**base, "pattern": "MIGRATION_DONE"}
+    later_identical = {**base, "finished_at": 101.0}
 
     base_key = server._notification_event_dedup_key(base)
     assert server._notification_event_dedup_key(identical) == base_key
     assert server._notification_event_dedup_key(distinct_output) != base_key
     assert server._notification_event_dedup_key(distinct_pattern) != base_key
+    assert server._notification_event_dedup_key(later_identical) != base_key
 
 
 def test_notification_poller_emits_distinct_watch_matches_once(monkeypatch):
@@ -14733,9 +14736,10 @@ def test_notification_poller_emits_distinct_watch_matches_once(monkeypatch):
         "pattern": "READY",
         "output": "READY on port 8000",
         "suppressed": 0,
+        "finished_at": 100.0,
     }
     isolated_queue.put(base)
-    isolated_queue.put({**base, "output": "READY on port 9000"})
+    isolated_queue.put({**base, "finished_at": 101.0})
     isolated_queue.put(dict(base))
 
     stop = threading.Event()
@@ -14747,7 +14751,6 @@ def test_notification_poller_emits_distinct_watch_matches_once(monkeypatch):
         assert len(status_calls) == 2
         status_text = "\n".join(call[2]["text"] for call in status_calls)
         assert "READY on port 8000" in status_text
-        assert "READY on port 9000" in status_text
         assert len(turns) == 2
         assert turn_origins == ["idle_completion"] * 2
     finally:

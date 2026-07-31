@@ -152,6 +152,7 @@ def test_classic_cli_settles_transferred_claim_from_model_turn(
     cli._pending_input = queue.Queue()
     event = {"type": "async_delegation", "delegation_id": "deleg-cli-turn"}
     claims = [(event, "claim-cli-turn")]
+    renewal_stop = threading.Event()
     renewed = []
     completed = []
     released = []
@@ -179,9 +180,14 @@ def test_classic_cli_settles_transferred_claim_from_model_turn(
             "request_overrides": None,
         },
     ), patch.object(cli, "_init_agent", return_value=True):
-        cli.chat("completion payload", delivery_claims=claims)
+        cli.chat(
+            "completion payload",
+            delivery_claims=claims,
+            delivery_renewal_stop=renewal_stop,
+        )
 
-    assert renewed == [[(event, "claim-cli-turn")]]
+    assert renewed == []
+    assert renewal_stop.is_set()
     assert claims == []
     assert completed == (
         [(event, "claim-cli-turn")] if settled_as == "complete" else []

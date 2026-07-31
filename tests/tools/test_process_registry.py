@@ -924,6 +924,59 @@ class TestKillProcess:
         finally:
             registry._running.pop(s.id, None)
 
+    def test_kill_intent_wins_completion_race(self, registry, monkeypatch):
+        class FakeProcess:
+            pid = 424242
+            returncode = None
+            stdout = None
+            stdin = None
+
+            def poll(self):
+                return self.returncode
+
+        proc = FakeProcess()
+        s = _make_session(sid="proc_kill_race")
+        s.process = proc
+        s.pid = proc.pid
+        s.notify_on_complete = True
+        s._subreaper_managed = True
+        registry._running[s.id] = s
+        registry._move_to_finished(s)
+
+        terminate_entered = threading.Event()
+        release_terminate = threading.Event()
+        result = {}
+
+        def terminate(*_args):
+            terminate_entered.set()
+            assert release_terminate.wait(5)
+
+        monkeypatch.setattr(registry, "_terminate_host_pid", terminate)
+        thread = threading.Thread(
+            target=lambda: result.update(registry.kill_process(s.id))
+        )
+        thread.start()
+        try:
+            assert terminate_entered.wait(2)
+            proc.returncode = -15
+            assert _wait_until(lambda: not registry.completion_queue.empty())
+
+            event = registry.completion_queue.get_nowait()
+            assert event["completion_reason"] == "killed"
+            assert event["exit_code"] == -15
+            assert registry.completion_queue.empty()
+        finally:
+            release_terminate.set()
+            thread.join(5)
+
+        assert not thread.is_alive()
+        assert result["status"] == "killed"
+        assert s.completion_reason == "killed"
+        assert s.exit_code == -15
+        assert registry.is_completion_consumed(s.id)
+        registry._move_to_finished(s)
+        assert registry.completion_queue.empty()
+
 
 # =========================================================================
 # Tool handler
@@ -1491,6 +1544,36 @@ class TestReaderLoopOrphanedPipe:
         assert item["session_id"] == s.id
         assert item["exit_code"] == 9
         assert item["output"] == "launcher\nchild-final\n"
+        registry._move_to_finished(s)
+        assert registry.completion_queue.empty()
+
+    def test_final_buffered_tail_is_complete_and_notified_once(self, registry):
+        payload = "".join(f"tail-{i:05d}:abcdefghij\n" for i in range(1200))
+        payload += "TAIL-SUFFIX-IS-PRESENT\n"
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import sys; sys.stdout.write(sys.argv[1])", payload],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            start_new_session=True,
+        )
+        assert proc.stdout.buffer.peek(1), "expected a real BufferedReader tail"
+        s = _make_session(sid="proc_buffered_tail")
+        s.process = proc
+        s.pid = proc.pid
+        s.process_group_id = proc.pid
+        s.notify_on_complete = True
+        s.max_output_chars = len(payload) + 1
+        registry._running[s.id] = s
+
+        registry._reader_loop(s)
+
+        assert s.output_buffer == payload
+        event = registry.completion_queue.get_nowait()
+        assert event["exit_code"] == 0
+        assert event["output"].endswith("TAIL-SUFFIX-IS-PRESENT\n")
         registry._move_to_finished(s)
         assert registry.completion_queue.empty()
 

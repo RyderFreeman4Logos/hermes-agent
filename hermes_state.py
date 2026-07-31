@@ -1717,12 +1717,59 @@ def quarantine_zeroed_state_db(path: Path) -> Optional[Path]:
             handle.close()
 
 
+def session_db_write_lock_path(db_path: Path) -> Path:
+    """Return the cross-process advisory writer lock for *db_path*."""
+    return Path(str(db_path) + ".write.lock")
+
+
+def _try_acquire_exclusive_file_lock(handle) -> bool:
+    """Try to acquire an exclusive advisory lock without blocking."""
+    import platform
+
+    if platform.system() == "Windows":
+        import msvcrt
+
+        try:
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError:
+            return False
+
+    import fcntl
+
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except (BlockingIOError, OSError):
+        return False
+
+
+def _release_exclusive_file_lock(handle) -> None:
+    """Release an advisory lock, best-effort."""
+    import platform
+
+    try:
+        if platform.system() == "Windows":
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except (OSError, AttributeError):
+        pass
+
+
 class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin):
     """
     SQLite-backed session storage with FTS5 search.
 
     Thread-safe for the common gateway pattern (multiple reader threads,
-    single writer via WAL mode). Each method opens its own cursor.
+    single writer via WAL mode). Cross-process writers are serialized with a
+    sidecar advisory lock. Each method opens its own cursor.
     """
 
     # ── Write-contention tuning ──
@@ -1794,6 +1841,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self.read_only = read_only
 
         self._lock = threading.Lock()
+        self._write_lock_path = (
+            None if read_only else session_db_write_lock_path(self.db_path)
+        )
+        self._write_lock_handle = None
+        self._write_lock_held = False
         # Read-path split (WAL only): recall/browse queries run on per-thread
         # read-only connections so they never queue behind writer flushes on
         # self._lock. See _read_ctx().
@@ -2078,6 +2130,32 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     # ── Core write helper ──
 
+    def _acquire_advisory_write_lock(self) -> bool:
+        if self.read_only:
+            return False
+        if self._write_lock_handle is None:
+            assert self._write_lock_path is not None
+            self._write_lock_path.parent.mkdir(parents=True, exist_ok=True)
+            self._write_lock_handle = self._write_lock_path.open("a+b")
+        if _try_acquire_exclusive_file_lock(self._write_lock_handle):
+            self._write_lock_held = True
+            return True
+        return False
+
+    def _release_advisory_write_lock(self) -> None:
+        if self._write_lock_held and self._write_lock_handle is not None:
+            _release_exclusive_file_lock(self._write_lock_handle)
+        self._write_lock_held = False
+
+    def _close_advisory_write_lock(self) -> None:
+        self._release_advisory_write_lock()
+        handle, self._write_lock_handle = self._write_lock_handle, None
+        if handle is not None:
+            try:
+                handle.close()
+            except OSError:
+                pass
+
     @staticmethod
     def _is_fts5_unavailable_error(exc: sqlite3.OperationalError) -> bool:
         err = str(exc).lower()
@@ -2357,34 +2435,41 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         while True:
             try:
                 with self._lock:
-                    remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
-                    previous_busy_timeout_ms = int(
-                        self._conn.execute("PRAGMA busy_timeout").fetchone()[0]
-                    )
-                    self._conn.execute(
-                        f"PRAGMA busy_timeout={min(previous_busy_timeout_ms, remaining_ms)}"
-                    )
+                    if not self._acquire_advisory_write_lock():
+                        raise sqlite3.OperationalError("database is locked")
                     try:
-                        self._conn.execute("BEGIN IMMEDIATE")
+                        remaining_ms = max(
+                            0, int((deadline - time.monotonic()) * 1000)
+                        )
+                        previous_busy_timeout_ms = int(
+                            self._conn.execute("PRAGMA busy_timeout").fetchone()[0]
+                        )
+                        self._conn.execute(
+                            f"PRAGMA busy_timeout={min(previous_busy_timeout_ms, remaining_ms)}"
+                        )
                         try:
-                            result = fn(self._conn)
-                            self._conn.commit()
-                        except BaseException:
+                            self._conn.execute("BEGIN IMMEDIATE")
                             try:
-                                self._conn.rollback()
-                            except Exception:
-                                pass
-                            raise
+                                result = fn(self._conn)
+                                self._conn.commit()
+                            except BaseException:
+                                try:
+                                    self._conn.rollback()
+                                except Exception:
+                                    pass
+                                raise
+                        finally:
+                            try:
+                                self._conn.execute(
+                                    f"PRAGMA busy_timeout={previous_busy_timeout_ms}"
+                                )
+                            except sqlite3.Error:
+                                logger.debug(
+                                    "failed to restore SQLite busy timeout",
+                                    exc_info=True,
+                                )
                     finally:
-                        try:
-                            self._conn.execute(
-                                f"PRAGMA busy_timeout={previous_busy_timeout_ms}"
-                            )
-                        except sqlite3.Error:
-                            logger.debug(
-                                "failed to restore SQLite busy timeout",
-                                exc_info=True,
-                            )
+                        self._release_advisory_write_lock()
                 # Success — periodic best-effort checkpoint + FTS merge.
                 self._write_count += 1
                 if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
@@ -2570,6 +2655,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     logger.debug("WAL checkpoint (TRUNCATE) at close failed: %s", exc)
                 self._conn.close()
                 self._conn = None
+            self._close_advisory_write_lock()
 
     # ── Chunked FTS rebuild engine (v23 opt-in optimize) ──
     #

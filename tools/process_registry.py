@@ -2563,6 +2563,18 @@ def format_process_notification(evt: dict) -> "str | None":
     )
 
 
+def completion_delivery_prompt(evt: dict, payload: str) -> "str | None":
+    """Add the model-only instruction for a true process completion."""
+    if evt.get("type", "completion") != "completion":
+        return payload
+    if not isinstance(evt.get("exit_code"), int):
+        return None
+    return (
+        f"{payload}\n\nInspect the completion payload above. Surface or act on "
+        "important information. If no user-visible action is needed, emit no response."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Registry -- the "process" tool schema + handler
 # ---------------------------------------------------------------------------

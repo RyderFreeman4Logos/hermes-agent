@@ -5305,6 +5305,16 @@ class TurnRunner:
                 "conversation_history": agent_history,
                 "task_id": ctx.session_id,
             }
+            if ctx.completion_delivery_synthetic:
+                agent._pending_cli_user_message = {
+                    "role": "user",
+                    "content": (
+                        _persist_user_message_override
+                        if _persist_user_message_override is not None
+                        else _api_run_message
+                    ),
+                    "_completion_delivery_synthetic": True,
+                }
             if _persist_user_message_override is not None:
                 _conversation_kwargs["persist_user_message"] = _persist_user_message_override
             elif observed_group_context:
@@ -16153,6 +16163,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _msg_preview = (event.text or "")[:80].replace("\n", " ")
         _reply_id = getattr(event, "reply_to_message_id", None)
         _reply_txt = (getattr(event, "reply_to_text", None) or "")[:80].replace("\n", " ")
+        _completion_delivery_synthetic = bool(
+            (getattr(event, "metadata", None) or {}).get(
+                "_completion_delivery_synthetic"
+            )
+        )
         logger.info(
             "inbound message: platform=%s user=%s chat=%s msg=%r reply_to_id=%s reply_to_text=%r",
             _platform_name, source.user_name or source.user_id or "unknown",
@@ -17396,6 +17411,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=event.message_type,
+                completion_delivery_synthetic=_completion_delivery_synthetic,
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -17818,7 +17834,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # entries that were stripped before the agent saw them.
             if is_context_overflow_failure:
                 pass  # handled above — skip all transcript writes
-            elif agent_failed_early or hidden_reasoning_incomplete:
+            elif (
+                agent_failed_early or hidden_reasoning_incomplete
+            ) and not _completion_delivery_synthetic:
                 # Transient failure (429/timeout/5xx): persist only the user
                 # message so the next message can load a transcript that
                 # reflects what was said.  Skip the assistant error text since
@@ -17868,26 +17886,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                 # If no new messages found (edge case), fall back to simple user/assistant
                 if not new_messages:
-                    _user_entry = {
-                        "role": "user",
-                        "content": (
-                            persist_user_message
-                            if persist_user_message is not None
-                            else message_text
-                        ),
-                        "timestamp": (
-                            persist_user_timestamp
-                            if persist_user_timestamp is not None
-                            else ts
-                        ),
-                    }
-                    if event.message_id:
-                        _user_entry["message_id"] = str(event.message_id)
-                    await self.async_session_store.append_to_transcript(
-                        session_entry.session_id,
-                        _user_entry,
-                        skip_db=agent_persisted,
-                    )
+                    if not _completion_delivery_synthetic:
+                        _user_entry = {
+                            "role": "user",
+                            "content": (
+                                persist_user_message
+                                if persist_user_message is not None
+                                else message_text
+                            ),
+                            "timestamp": (
+                                persist_user_timestamp
+                                if persist_user_timestamp is not None
+                                else ts
+                            ),
+                        }
+                        if event.message_id:
+                            _user_entry["message_id"] = str(event.message_id)
+                        await self.async_session_store.append_to_transcript(
+                            session_entry.session_id,
+                            _user_entry,
+                            skip_db=agent_persisted,
+                        )
                     if response:
                         await self.async_session_store.append_to_transcript(
                             session_entry.session_id,
@@ -17903,6 +17922,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     for msg in new_messages:
                         # Skip system messages (they're rebuilt each run)
                         if msg.get("role") == "system":
+                            continue
+                        if _completion_delivery_synthetic and msg.get("role") == "user":
+                            continue
+                        from run_agent import _is_ephemeral_scaffolding
+
+                        if _is_ephemeral_scaffolding(msg):
                             continue
                         # Add timestamp to each message for debugging
                         entry = {**msg, "timestamp": ts}
@@ -18040,7 +18065,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # agent already reached its early turn-start persistence, the latest
             # transcript user row will match and we skip the duplicate.
             try:
-                if 'message_text' in locals() and message_text is not None and session_entry is not None:
+                if (
+                    not _completion_delivery_synthetic
+                    and 'message_text' in locals()
+                    and message_text is not None
+                    and session_entry is not None
+                ):
                     _already_persisted = False
                     try:
                         _recent_transcript = await self.async_session_store.load_transcript(session_entry.session_id)
@@ -21749,7 +21779,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 source=source,
                 internal=True,
                 message_id=str(evt.get("message_id") or "").strip() or None,
-                metadata=metadata,
+                metadata={
+                    **metadata,
+                    "_completion_delivery_synthetic": evt.get("type") == "completion",
+                },
             )
             logger.info(
                 "Watch pattern notification — injecting for %s chat=%s thread=%s",
@@ -21848,6 +21881,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         event or the event has no gateway route. No cross-process exactly-once
         guarantee is claimed.
         """
+        from tools.process_registry import completion_delivery_prompt
+
+        synth_text = completion_delivery_prompt(evt, synth_text)
+        if synth_text is None:
+            return None
         identity = self._completion_delivery_identity(evt)
         durable_claim_id = ""
         durable_delegation_id = ""
@@ -23869,6 +23907,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        completion_delivery_synthetic: bool = False,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -23888,6 +23927,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
+                completion_delivery_synthetic=completion_delivery_synthetic,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -23900,6 +23940,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
+                completion_delivery_synthetic=completion_delivery_synthetic,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -24022,6 +24063,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        completion_delivery_synthetic: bool = False,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -24306,6 +24348,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             moa_config=moa_config,
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
+            completion_delivery_synthetic=completion_delivery_synthetic,
         )
         turn_runner = TurnRunner(self, turn_ctx)
         # Callback invoked by agent on tool lifecycle events — extracted to

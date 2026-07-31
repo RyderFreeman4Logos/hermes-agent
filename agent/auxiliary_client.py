@@ -8306,6 +8306,14 @@ def call_llm(
                 )
                 if response is not None:
                     return response
+            if _is_connection_error(original_primary_err):
+                try:
+                    _evict_cached_client_instance(client)
+                except Exception:
+                    logger.debug(
+                        "Auxiliary: cache eviction after connection error failed",
+                        exc_info=True,
+                    )
             raise original_primary_err
         if "temperature" in kwargs and _is_unsupported_temperature_error(first_err):
             retry_kwargs = dict(kwargs)
@@ -8977,6 +8985,14 @@ async def async_call_llm(
                 )
                 if response is not None:
                     return response
+            if _is_connection_error(original_primary_err):
+                try:
+                    _evict_cached_client_instance(client)
+                except Exception:
+                    logger.debug(
+                        "Auxiliary (async): cache eviction after connection error failed",
+                        exc_info=True,
+                    )
             raise original_primary_err
         if "temperature" in kwargs and _is_unsupported_temperature_error(first_err):
             retry_kwargs = dict(kwargs)

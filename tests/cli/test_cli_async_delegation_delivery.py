@@ -190,14 +190,18 @@ def test_cli_enqueue_failure_stops_renewal_and_releases(monkeypatch):
     monkeypatch.setattr(
         cli,
         "_settle_delivery_claims",
-        lambda claims, result=None: settled.append((list(claims), result)),
+        lambda claims, result=None, **kwargs: settled.append(
+            (list(claims), result, kwargs)
+        ),
     )
 
     with pytest.raises(RuntimeError, match="queue closed"):
         cli._drain_process_notifications("cli-idle")
 
     renewal_stop.set.assert_called_once_with()
-    assert settled == [([(event, "claim")], None)]
+    assert settled == [
+        ([(event, "claim")], None, {"consume_attempt": False})
+    ]
 
 
 def test_cli_renewal_start_failure_releases_claim(monkeypatch):
@@ -222,14 +226,18 @@ def test_cli_renewal_start_failure_releases_claim(monkeypatch):
     monkeypatch.setattr(
         cli,
         "_settle_delivery_claims",
-        lambda claims, result=None: settled.append((list(claims), result)),
+        lambda claims, result=None, **kwargs: settled.append(
+            (list(claims), result, kwargs)
+        ),
     )
 
     with pytest.raises(RuntimeError, match="thread unavailable"):
         cli._drain_process_notifications("cli-idle")
 
     cli._pending_input.put.assert_not_called()
-    assert settled == [([(event, "claim")], None)]
+    assert settled == [
+        ([(event, "claim")], None, {"consume_attempt": False})
+    ]
 
 
 def test_cli_completion_ownership_rejects_foreign_session():

@@ -1427,6 +1427,7 @@ def settle_event_deliveries(
     result: Any = None,
     *,
     log_context: str = "Async",
+    consume_attempt: bool = True,
 ) -> None:
     """Settle every claim independently after the owning model turn."""
     acknowledged = turn_result_acknowledges_delivery(result)
@@ -1436,8 +1437,12 @@ def settle_event_deliveries(
         try:
             if acknowledged:
                 complete_event_delivery(evt, claim_id)
-            else:
+            elif consume_attempt:
                 release_event_delivery(evt, claim_id)
+            else:
+                release_event_delivery(
+                    evt, claim_id, consume_attempt=False
+                )
         except Exception:
             logger.warning(
                 "%s delivery claim %s failed",
@@ -1461,7 +1466,9 @@ def release_event_delivery(
             return
     from tools.process_registry import process_registry
 
-    process_registry.release_notification_delivery(evt, claim_id)
+    process_registry.release_notification_delivery(
+        evt, claim_id, consume_attempt=consume_attempt
+    )
 
 
 def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:

@@ -855,21 +855,38 @@ def test_notification_delivery_claim_requeues_until_model_ack(registry):
 
     assert registry.claim_notification_delivery(event, "first")
     assert not registry.claim_notification_delivery(dict(event), "racer")
-    assert registry.release_notification_delivery(event, "first")
+    assert registry.release_notification_delivery(
+        event, "first", consume_attempt=False
+    )
     assert registry.completion_queue.get_nowait() is event
+    assert "delivery_attempts" not in event
 
     assert registry.claim_notification_delivery(event, "second")
-    assert registry.complete_notification_delivery(event, "second")
+    assert registry.release_notification_delivery(event, "second")
+    assert registry.completion_queue.get_nowait() is event
+    assert event["delivery_attempts"] == 1
+
+    assert registry.claim_notification_delivery(event, "third")
+    assert registry.complete_notification_delivery(event, "third")
     assert not registry.claim_notification_delivery(dict(event), "replay")
 
 
-def test_claim_failure_restore_keeps_ordinary_event_but_not_durable_replay(registry):
+def test_claim_failure_restore_keeps_ordinary_and_legacy_async_but_not_durable_replay(
+    registry, monkeypatch, tmp_path
+):
+    from tools import async_delegation as ad
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._persist_dispatch({"delegation_id": "deleg-durable", "dispatched_at": 1.0})
     ordinary = {"type": "watch_match", "session_id": "proc", "delivery_attempts": 4}
+    legacy = {"type": "async_delegation", "delegation_id": "deleg-legacy"}
     durable = {"type": "async_delegation", "delegation_id": "deleg-durable"}
 
     assert registry.restore_after_claim_failure(ordinary)
+    assert registry.restore_after_claim_failure(legacy)
     assert not registry.restore_after_claim_failure(durable)
     assert registry.completion_queue.get_nowait() is ordinary
+    assert registry.completion_queue.get_nowait() is legacy
     assert registry.completion_queue.empty()
     assert ordinary["delivery_attempts"] == 4
 

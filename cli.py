@@ -10381,17 +10381,25 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             except BaseException:
                 if renewal_stop is not None:
                     renewal_stop.set()
-                self._settle_delivery_claims(claims)
+                self._settle_delivery_claims(claims, consume_attempt=False)
                 raise
 
     @staticmethod
     def _settle_delivery_claims(
-        claims: list[tuple[dict, str]], result: Optional[dict] = None
+        claims: list[tuple[dict, str]],
+        result: Optional[dict] = None,
+        *,
+        consume_attempt: bool = True,
     ) -> None:
         """Settle every classic CLI claim independently after its model turn."""
         from tools.async_delegation import settle_event_deliveries
 
-        settle_event_deliveries(claims, result, log_context="Classic CLI")
+        settle_event_deliveries(
+            claims,
+            result,
+            log_context="Classic CLI",
+            consume_attempt=consume_attempt,
+        )
 
     def _drain_interrupt_queue_to_pending_input(self) -> None:
         """Move stray messages from ``_interrupt_queue`` into ``_pending_input``.

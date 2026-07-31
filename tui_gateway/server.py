@@ -9275,6 +9275,7 @@ def _dispatch_idle_completion_batch(
         settle_event_deliveries(
             claims,
             log_context="TUI idle completion",
+            consume_attempt=False,
         )
         with session["history_lock"]:
             session["running"] = False

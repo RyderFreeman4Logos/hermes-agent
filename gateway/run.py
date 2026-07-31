@@ -21214,7 +21214,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if verdict == "retry":
                     if claim:
                         try:
-                            release_event_delivery(evt, claim)
+                            release_event_delivery(
+                                evt, claim, consume_attempt=False
+                            )
                         except Exception:
                             logger.debug(
                                 "Could not release completion claim",
@@ -21251,7 +21253,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 renewal_stop.set()
             if claim and not accepted:
                 try:
-                    release_event_delivery(evt, claim)
+                    release_event_delivery(evt, claim, consume_attempt=False)
                 except Exception:
                     logger.debug(
                         "Could not release completion claim", exc_info=True
@@ -24605,6 +24607,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 _abandoned_metadata.pop("delivery_claims", []) or []
                             ),
                             log_context="Gateway shutdown",
+                            consume_attempt=False,
                         )
                 pending_event = None
                 pending = None

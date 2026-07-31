@@ -4807,7 +4807,103 @@ class _RecordingAgent:
 
     def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
         self._turns.append(prompt)
-        return {"final_response": "", "messages": []}
+        return {"final_response": "", "messages": [], "api_calls": 1}
+
+
+def test_zero_api_ordinary_delivery_is_bounded_without_recursive_replay(
+    monkeypatch, tmp_path
+):
+    import queue as _queue_mod
+
+    from tools.process_registry import (
+        NOTIFICATION_DELIVERY_MAX_ATTEMPTS,
+        process_registry,
+    )
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    turns = []
+
+    class _ZeroApiDeliveryAgent(_RecordingAgent):
+        def run_conversation(self, prompt, **_kwargs):
+            turns.append(prompt)
+            return {
+                "final_response": "",
+                "messages": [],
+                "api_calls": 1 if prompt == "user turn" else 0,
+            }
+
+    event = {
+        "type": "completion",
+        "session_id": "proc-zero-api-bounded",
+        "session_key": "session-a",
+        "exit_code": 0,
+        "output": "done",
+    }
+    isolated: _queue_mod.Queue = _queue_mod.Queue()
+    isolated.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated)
+    session = _session(
+        session_key="session-a",
+        agent=_ZeroApiDeliveryAgent(turns),
+        running=True,
+    )
+
+    server._run_prompt_submit("rid", "sid", session, "user turn")
+
+    assert len(turns) == 1 + NOTIFICATION_DELIVERY_MAX_ATTEMPTS
+    assert event["delivery_attempts"] == NOTIFICATION_DELIVERY_MAX_ATTEMPTS
+    key = process_registry._notification_delivery_key(event)
+    assert process_registry._notification_delivery_outcomes[key] == "dropped"
+    assert isolated.empty()
+    assert session["running"] is False
+
+
+def test_ordinary_delivery_succeeds_once_after_allowed_retry(monkeypatch, tmp_path):
+    import queue as _queue_mod
+
+    from tools.process_registry import process_registry
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    turns = []
+    delivery_calls = 0
+
+    class _RetryThenSuccessAgent(_RecordingAgent):
+        def run_conversation(self, prompt, **_kwargs):
+            nonlocal delivery_calls
+            turns.append(prompt)
+            if prompt == "user turn":
+                return {"final_response": "", "messages": [], "api_calls": 1}
+            delivery_calls += 1
+            return {
+                "final_response": "",
+                "messages": [],
+                "api_calls": 0 if delivery_calls == 1 else 1,
+            }
+
+    event = {
+        "type": "completion",
+        "session_id": "proc-retry-success",
+        "session_key": "session-b",
+        "exit_code": 0,
+        "output": "done",
+    }
+    isolated: _queue_mod.Queue = _queue_mod.Queue()
+    isolated.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated)
+    session = _session(
+        session_key="session-b",
+        agent=_RetryThenSuccessAgent(turns),
+        running=True,
+    )
+
+    server._run_prompt_submit("rid", "sid", session, "user turn")
+
+    assert delivery_calls == 2
+    assert event["delivery_attempts"] == 1
+    key = process_registry._notification_delivery_key(event)
+    assert process_registry._notification_delivery_outcomes[key] == "delivered"
+    assert not process_registry.claim_notification_delivery(event, "replay")
+    assert isolated.empty()
 
 
 @pytest.mark.parametrize("exit_code", [0, 7])
@@ -15107,8 +15203,8 @@ def test_idle_completion_dispatch_failure_releases_every_claim_and_cleans_runnin
         ),
     )
 
-    def release(evt, _claim):
-        released.append(evt["delegation_id"])
+    def release(evt, _claim, *, consume_attempt=True):
+        released.append((evt["delegation_id"], consume_attempt))
         if len(released) == 1:
             raise sqlite3.OperationalError("database is locked")
 
@@ -15122,13 +15218,15 @@ def test_idle_completion_dispatch_failure_releases_every_claim_and_cleans_runnin
         consumer="dispatch-failure-test",
     )
 
-    assert released == [event["delegation_id"] for event in events]
+    assert released == [
+        (event["delegation_id"], False) for event in events
+    ]
     assert session["running"] is False
     assert "delivery claim release failed" in caplog.text
 
 
 def test_idle_completion_claim_exception_restores_fifo_and_attempts_later(
-    monkeypatch,
+    monkeypatch, tmp_path
 ):
     import queue as _queue_mod
     from tools import async_delegation as ad
@@ -15136,9 +15234,21 @@ def test_idle_completion_claim_exception_restores_fifo_and_attempts_later(
 
     isolated = _queue_mod.Queue()
     monkeypatch.setattr(process_registry, "completion_queue", isolated)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._persist_dispatch(
+        {"delegation_id": "durable-claim-failure", "dispatched_at": 1.0}
+    )
     events = [
-        {"type": "completion", "session_id": "first", "delivery_attempts": 1},
-        {"type": "completion", "session_id": "second", "delivery_attempts": 5},
+        {
+            "type": "async_delegation",
+            "delegation_id": "legacy-claim-failure",
+            "delivery_attempts": 1,
+        },
+        {
+            "type": "async_delegation",
+            "delegation_id": "durable-claim-failure",
+            "delivery_attempts": 5,
+        },
         {"type": "completion", "session_id": "later", "delivery_attempts": 9},
     ]
     attempted = []
@@ -15174,7 +15284,6 @@ def test_idle_completion_claim_exception_restores_fifo_and_attempts_later(
     assert attempted == events
     assert submitted == [(events[2], "claim-later")]
     assert isolated.get_nowait() is events[0]
-    assert isolated.get_nowait() is events[1]
     assert isolated.empty()
     assert [event["delivery_attempts"] for event in events] == [1, 5, 9]
 

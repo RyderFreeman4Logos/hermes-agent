@@ -99,6 +99,7 @@ WATCH_GLOBAL_MAX_PER_WINDOW = 15
 WATCH_GLOBAL_WINDOW_SECONDS = 10
 WATCH_GLOBAL_COOLDOWN_SECONDS = 30
 NOTIFICATION_DELIVERY_RETENTION = 2048
+NOTIFICATION_DELIVERY_MAX_ATTEMPTS = 8
 
 
 def format_uptime_short(seconds: int) -> str:
@@ -278,7 +279,7 @@ class ProcessRegistry:
         # their claim lifecycle beside the queue so schedule/adapter acceptance
         # cannot consume them before a real model turn acknowledges delivery.
         self._notification_delivery_claims: Dict[tuple, tuple[str, dict]] = {}
-        self._notification_deliveries_delivered: "OrderedDict[tuple, None]" = (
+        self._notification_delivery_outcomes: "OrderedDict[tuple, str]" = (
             OrderedDict()
         )
 
@@ -1313,7 +1314,7 @@ class ProcessRegistry:
         with self._lock:
             if (
                 key in self._notification_delivery_claims
-                or key in self._notification_deliveries_delivered
+                or key in self._notification_delivery_outcomes
             ):
                 return False
             self._notification_delivery_claims[key] = (claim_id, evt)
@@ -1322,7 +1323,16 @@ class ProcessRegistry:
     def restore_after_claim_failure(self, evt: dict) -> bool:
         """Requeue a dequeued ordinary event; durable delegations self-restore."""
         if evt.get("type") == "async_delegation":
-            return False
+            try:
+                from tools.async_delegation import get_durable_delegation
+
+                if (
+                    get_durable_delegation(str(evt.get("delegation_id") or ""))
+                    is not None
+                ):
+                    return False
+            except Exception:
+                return False
         self.completion_queue.put(evt)
         return True
 
@@ -1333,7 +1343,9 @@ class ProcessRegistry:
             held = self._notification_delivery_claims.get(key)
             return held is not None and held[0] == claim_id
 
-    def release_notification_delivery(self, evt: dict, claim_id: str) -> bool:
+    def release_notification_delivery(
+        self, evt: dict, claim_id: str, consume_attempt: bool = True
+    ) -> bool:
         """Release and requeue an ordinary notification for a later real turn."""
         key = self._notification_delivery_key(evt)
         with self._lock:
@@ -1341,8 +1353,23 @@ class ProcessRegistry:
             if held is None or held[0] != claim_id:
                 return False
             self._notification_delivery_claims.pop(key, None)
+            if consume_attempt:
+                evt["delivery_attempts"] = (
+                    int(evt.get("delivery_attempts", 0) or 0) + 1
+                )
+                if evt["delivery_attempts"] >= NOTIFICATION_DELIVERY_MAX_ATTEMPTS:
+                    self._record_notification_delivery_outcome(key, "dropped")
+                    return True
         self.completion_queue.put(held[1])
         return True
+
+    def _record_notification_delivery_outcome(self, key: tuple, outcome: str) -> None:
+        self._notification_delivery_outcomes[key] = outcome
+        while (
+            len(self._notification_delivery_outcomes)
+            > NOTIFICATION_DELIVERY_RETENTION
+        ):
+            self._notification_delivery_outcomes.popitem(last=False)
 
     def complete_notification_delivery(self, evt: dict, claim_id: str) -> bool:
         """Mark an ordinary notification delivered after a real model turn."""
@@ -1352,12 +1379,7 @@ class ProcessRegistry:
             if held is None or held[0] != claim_id:
                 return False
             self._notification_delivery_claims.pop(key, None)
-            self._notification_deliveries_delivered[key] = None
-            while (
-                len(self._notification_deliveries_delivered)
-                > NOTIFICATION_DELIVERY_RETENTION
-            ):
-                self._notification_deliveries_delivered.popitem(last=False)
+            self._record_notification_delivery_outcome(key, "delivered")
         return True
 
     def drop_notification_delivery(self, evt: dict, claim_id: str) -> bool:
@@ -1368,12 +1390,7 @@ class ProcessRegistry:
             if held is None or held[0] != claim_id:
                 return False
             self._notification_delivery_claims.pop(key, None)
-            self._notification_deliveries_delivered[key] = None
-            while (
-                len(self._notification_deliveries_delivered)
-                > NOTIFICATION_DELIVERY_RETENTION
-            ):
-                self._notification_deliveries_delivered.popitem(last=False)
+            self._record_notification_delivery_outcome(key, "dropped")
         return True
 
     def is_session_waiting(self, session_id: str) -> bool:

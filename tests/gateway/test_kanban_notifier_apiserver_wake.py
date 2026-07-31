@@ -113,7 +113,7 @@ def test_apiserver_sub_wakes_real_session_via_self_post(tmp_path, monkeypatch):
 
     posts = []
 
-    async def fake_self_post(adapter, *, text, session_id):
+    async def fake_self_post(adapter, *, text, session_id, **_kwargs):
         posts.append({"text": text, "session_id": session_id})
 
     import gateway.wake as wake_mod
@@ -134,5 +134,4 @@ def test_apiserver_sub_wakes_real_session_via_self_post(tmp_path, monkeypatch):
     # fallback is attempted for stateless api_server subs) — cursor advances
     # once the wake succeeds.
     assert _unseen_terminal_events(tid, "api_server", "raw-sid-123") == []
-
 

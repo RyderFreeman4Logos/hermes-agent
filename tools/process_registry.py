@@ -1314,7 +1314,9 @@ class ProcessRegistry:
 
             text = format_process_notification(evt)
             if text:
-                results.append((evt, text))
+                text = completion_delivery_prompt(evt, text)
+                if text is not None:
+                    results.append((evt, text))
         for evt in requeue:
             self.completion_queue.put(evt)
         return results

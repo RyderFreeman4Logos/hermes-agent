@@ -2051,6 +2051,18 @@ def compress_context(
             new_system_prompt = agent._build_system_prompt(system_message)
             agent._cached_system_prompt = new_system_prompt
 
+        # Compression publishes rebuilt transcripts directly, bypassing the
+        # normal SQLite/JSON flush filters. Build this view after todo/anchor
+        # preservation has finalized ``compressed``, but keep the live list
+        # intact so a current completion nudge still reaches the model.
+        from run_agent import _is_ephemeral_scaffolding
+
+        persisted_compressed = [
+            message
+            for message in compressed
+            if not _is_ephemeral_scaffolding(message)
+        ]
+
         _session_commit_succeeded = False
         split_status = "not_applicable"
         if agent._session_db:
@@ -2081,7 +2093,9 @@ def compress_context(
                     # for search/recovery (Teknium review — keep one durable id
                     # WITHOUT destroying history, unlike a hard replace_messages).
                     # See #38763.
-                    agent._session_db.archive_and_compact(agent.session_id, compressed)
+                    agent._session_db.archive_and_compact(
+                        agent.session_id, persisted_compressed
+                    )
                     split_status = "in_place_committed"
                     # Reset the flush identity set so the next turn's appends are
                     # diffed against the COMPACTED transcript: the compacted dicts
@@ -2152,7 +2166,7 @@ def compress_context(
                         model=agent.model,
                         model_config=agent._session_init_model_config,
                         system_prompt=new_system_prompt,
-                        messages=compressed,
+                        messages=persisted_compressed,
                         cwd=getattr(agent, "working_directory", None),
                         profile_name=_profile_for_child,
                         compression_lock_holder=_lock_holder,

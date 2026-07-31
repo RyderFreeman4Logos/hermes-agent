@@ -752,3 +752,37 @@ class TestMicroCompaction:
         assert not unstamped, (
             "splice must not strip _db_persisted from surviving messages"
         )
+
+    def test_db_sync_keeps_completion_nudge_live_but_not_durable(self, tmp_path):
+        from agent.context_compressor import _DB_PERSISTED_MARKER
+        from hermes_state import SessionDB
+
+        db_path = tmp_path / "state.db"
+        db = SessionDB(db_path=db_path)
+        db.create_session("micro-completion", "cli", model="test/model")
+        cc = _compressor()
+        cc._session_db = db
+        cc._session_id = "micro-completion"
+        nudge = {
+            "role": "user",
+            "content": "completion payload and model-only instruction",
+            "_completion_delivery_synthetic": True,
+        }
+        messages = [
+            {"role": "user", "content": "start the build"},
+            nudge,
+            {"role": "assistant", "content": "Build finished successfully"},
+        ]
+
+        cc._sync_micro_compact_to_db(messages)
+
+        assert nudge in messages
+        assert not nudge.get(_DB_PERSISTED_MARKER)
+        db.close()
+        resumed_db = SessionDB(db_path=db_path)
+        resumed = resumed_db.get_messages_as_conversation("micro-completion")
+        assert [message["content"] for message in resumed] == [
+            "start the build",
+            "Build finished successfully",
+        ]
+        resumed_db.close()

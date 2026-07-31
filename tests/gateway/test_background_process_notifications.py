@@ -289,8 +289,8 @@ async def test_inject_watch_notification_raw_session_key_self_posts(monkeypatch,
 
     posts = []
 
-    async def fake_self_post(adapter, *, text, session_id):
-        posts.append({"text": text, "session_id": session_id})
+    async def fake_self_post(adapter, *, text, session_id, **kwargs):
+        posts.append({"text": text, "session_id": session_id, **kwargs})
 
     import gateway.wake as wake_mod
     monkeypatch.setattr(wake_mod, "_self_post_chat_completion", fake_self_post)
@@ -304,7 +304,11 @@ async def test_inject_watch_notification_raw_session_key_self_posts(monkeypatch,
     assert result is True
     api_adapter.handle_message.assert_not_awaited()
     assert posts == [
-        {"text": "[SYSTEM: subagent finished]", "session_id": "raw-hq-session-id"}
+        {
+            "text": "[SYSTEM: subagent finished]",
+            "session_id": "raw-hq-session-id",
+            "completion_delivery": False,
+        }
     ]
 
 
@@ -322,7 +326,7 @@ async def test_inject_watch_notification_origin_session_id_wins(monkeypatch, tmp
 
     posts = []
 
-    async def fake_self_post(adapter, *, text, session_id):
+    async def fake_self_post(adapter, *, text, session_id, **_kwargs):
         posts.append(session_id)
 
     import gateway.wake as wake_mod

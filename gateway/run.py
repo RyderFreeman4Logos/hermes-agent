@@ -20919,7 +20919,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "session %s via self-post",
                             raw_sid,
                         )
-                        await deliver_wake(adapter, text=synth_text, session_id=raw_sid)
+                        await deliver_wake(
+                            adapter,
+                            text=synth_text,
+                            session_id=raw_sid,
+                            completion_delivery=evt.get("type") == "completion",
+                        )
                         return True
                     except Exception as e:
                         logger.warning(
@@ -20962,7 +20967,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "%s via self-post",
                     raw_sid,
                 )
-                await deliver_wake(adapter, text=synth_text, session_id=raw_sid)
+                await deliver_wake(
+                    adapter,
+                    text=synth_text,
+                    session_id=raw_sid,
+                    completion_delivery=evt.get("type") == "completion",
+                )
                 return True
             except Exception as e:
                 logger.warning(

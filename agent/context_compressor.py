@@ -5616,8 +5616,15 @@ This compaction should PRIORITISE preserving all information related to the focu
         if not session_db or not session_id:
             return
         try:
-            session_db.archive_and_compact(session_id, compacted_messages)
-            for msg in compacted_messages:
+            from run_agent import _is_ephemeral_scaffolding
+
+            durable_messages = [
+                msg
+                for msg in compacted_messages
+                if not _is_ephemeral_scaffolding(msg)
+            ]
+            session_db.archive_and_compact(session_id, durable_messages)
+            for msg in durable_messages:
                 if isinstance(msg, dict):
                     msg[_DB_PERSISTED_MARKER] = True
         except Exception:

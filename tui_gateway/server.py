@@ -8625,7 +8625,11 @@ def _notification_poller_loop(
     same way (status.update + agent turn) — the delivery path
     tools/kanban_tools.py documents for platform="tui" rows (issue #59890).
     """
-    from tools.process_registry import process_registry, format_process_notification
+    from tools.process_registry import (
+        completion_delivery_prompt,
+        format_process_notification,
+        process_registry,
+    )
 
     _emitted = set()  # dedup re-queued events so same completion isn't emitted 50 times while session is busy
     _last_kanban_poll = 0.0
@@ -8713,6 +8717,9 @@ def _notification_poller_loop(
         text = format_process_notification(evt)
         if not text:
             continue
+        model_text = completion_delivery_prompt(evt, text)
+        if model_text is None:
+            continue
 
         # Only emit the same notification identity to TUI once — re-queued
         # completions get re-emitted every 0.5s otherwise when session is busy,
@@ -8756,7 +8763,17 @@ def _notification_poller_loop(
                     display_metadata=_async_delegation_display_metadata(evt),
                 )
             else:
-                _run_prompt_submit(rid, sid, session, text)
+                _run_prompt_submit(
+                    rid,
+                    sid,
+                    session,
+                    model_text,
+                    **(
+                        {"completion_delivery": True}
+                        if evt.get("type", "completion") == "completion"
+                        else {}
+                    ),
+                )
             complete_event_delivery(evt, _claim)
         except Exception as exc:
             release_event_delivery(evt, _claim)
@@ -8803,6 +8820,9 @@ def _notification_poller_loop(
         text = format_process_notification(evt)
         if not text:
             continue
+        model_text = completion_delivery_prompt(evt, text)
+        if model_text is None:
+            continue
 
         _dedup_key = _notification_event_dedup_key(evt)
         if _dedup_key not in _emitted:
@@ -8834,7 +8854,17 @@ def _notification_poller_loop(
                     display_metadata=_async_delegation_display_metadata(evt),
                 )
             else:
-                _run_prompt_submit(rid, sid, session, text)
+                _run_prompt_submit(
+                    rid,
+                    sid,
+                    session,
+                    model_text,
+                    **(
+                        {"completion_delivery": True}
+                        if evt.get("type", "completion") == "completion"
+                        else {}
+                    ),
+                )
             complete_event_delivery(evt, _claim)
         except Exception as exc:
             release_event_delivery(evt, _claim)
@@ -8961,7 +8991,7 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
 
 def _run_prompt_submit(
     rid, sid: str, session: dict, text: Any, *, display_kind: str | None = None,
-    display_metadata: dict | None = None,
+    display_metadata: dict | None = None, completion_delivery: bool = False,
 ) -> None:
     with session["history_lock"]:
         history = list(session["history"])
@@ -9235,6 +9265,12 @@ def _run_prompt_submit(
                     _build_persist_user_message(prompt, images, run_message) if images else prompt
                 ),
             }
+            if completion_delivery:
+                agent._pending_cli_user_message = {
+                    "role": "user",
+                    "content": prompt,
+                    "_completion_delivery_synthetic": True,
+                }
             # Type a synthesized turn at turn START so the crash persist writes
             # its row as a timeline event, instead of leaving a raw user bubble
             # until the turn ends — and forever if it never does, which is
@@ -9705,6 +9741,11 @@ def _run_prompt_submit(
                 skip_poll_observed=False,
             )
             for index, (_evt, synth) in enumerate(drained):
+                from tools.process_registry import completion_delivery_prompt
+
+                model_synth = completion_delivery_prompt(_evt, synth)
+                if model_synth is None:
+                    continue
                 with session["history_lock"]:
                     if session.get("running"):
                         for pending_evt, _pending_synth in drained[index:]:
@@ -9719,7 +9760,17 @@ def _run_prompt_submit(
                     continue
                 try:
                     _emit("message.start", sid)
-                    _run_prompt_submit(rid, sid, session, synth)
+                    _run_prompt_submit(
+                        rid,
+                        sid,
+                        session,
+                        model_synth,
+                        **(
+                            {"completion_delivery": True}
+                            if _evt.get("type", "completion") == "completion"
+                            else {}
+                        ),
+                    )
                     complete_event_delivery(_evt, _claim)
                 except Exception as _n_exc:
                     release_event_delivery(_evt, _claim)

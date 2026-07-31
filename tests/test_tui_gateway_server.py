@@ -4246,8 +4246,9 @@ def test_notification_poller_live_loop_requeues_foreign_completion_for_owner(
     monkeypatch.setattr(server, "_get_db", lambda: None)
     monkeypatch.setattr(server, "_emit", lambda *args, **_kwargs: emitted.append(args))
 
-    def _deliver(_rid, sid, session, text):
+    def _deliver(_rid, sid, session, text, **kwargs):
         delivered["a" if sid == "sid-a-live-handoff" else "b"].append(text)
+        delivered.setdefault("kwargs", []).append(kwargs)
         session["running"] = False
 
     monkeypatch.setattr(server, "_run_prompt_submit", _deliver)
@@ -4275,6 +4276,8 @@ def test_notification_poller_live_loop_requeues_foreign_completion_for_owner(
 
         assert len(delivered["a"]) == 1
         assert "proc-live-handoff completed normally" in delivered["a"][0]
+        assert "If no user-visible action is needed, emit no response." in delivered["a"][0]
+        assert delivered["kwargs"] == [{"completion_delivery": True}]
         assert delivered["b"] == []
         assert isolated_queue.empty()
     finally:
@@ -4355,7 +4358,7 @@ def test_notification_poller_live_loop_drops_addressed_orphan(
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda _rid, _sid, _session, text: delivered.append(text),
+        lambda _rid, _sid, _session, text, **_kwargs: delivered.append(text),
     )
     server._sessions["sid-live-orphan"] = session
     process_registry._completion_consumed.discard(event["session_id"])
@@ -4396,7 +4399,7 @@ def test_notification_poller_drops_orphaned_events(monkeypatch, routing):
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda _rid, _sid, _session, text: delivered.append(text),
+        lambda _rid, _sid, _session, text, **_kwargs: delivered.append(text),
     )
     monkeypatch.setattr(server, "_get_db", lambda: None)
 
@@ -4462,7 +4465,7 @@ def test_notification_poller_delivers_owned_events(
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda _rid, _sid, _session, text: delivered.append(text),
+        lambda _rid, _sid, _session, text, **_kwargs: delivered.append(text),
     )
     monkeypatch.setattr(server, "_get_db", lambda: _CompressionDB())
 
@@ -12968,6 +12971,11 @@ def test_notification_poller_delivers_completion(monkeypatch):
     class _Agent:
         def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
             turns.append(prompt)
+            assert self._pending_cli_user_message == {
+                "role": "user",
+                "content": prompt,
+                "_completion_delivery_synthetic": True,
+            }
             return {
                 "final_response": "ok",
                 "messages": [{"role": "assistant", "content": "ok"}],
@@ -13022,10 +13030,47 @@ def test_notification_poller_delivers_completion(monkeypatch):
         # Should have triggered an agent turn
         assert len(turns) == 1
         assert "[IMPORTANT: Background process proc_poller_test completed normally" in turns[0]
+        assert "If no user-visible action is needed, emit no response." in turns[0]
     finally:
         server._sessions.pop("sid_poll", None)
         while not process_registry.completion_queue.empty():
             process_registry.completion_queue.get_nowait()
+
+
+def test_notification_poller_ignores_nonterminal_none_completion(monkeypatch):
+    """A producer's transient exit_code=None cannot create a model turn."""
+    import queue as _queue_mod
+
+    from tools.process_registry import process_registry
+
+    delivered = []
+    emitted = []
+    sess = _session()
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    isolated_queue.put({
+        "type": "completion",
+        "session_id": "proc_not_done",
+        "command": "sleep 1",
+        "exit_code": None,
+        "output": "still running",
+    })
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *_args, **_kwargs: delivered.append(True),
+    )
+
+    stop = threading.Event()
+    stop.set()
+    server._sessions["sid_none_completion"] = sess
+    try:
+        server._notification_poller_loop(stop, "sid_none_completion", sess)
+        assert delivered == []
+        assert emitted == []
+    finally:
+        server._sessions.pop("sid_none_completion", None)
 
 
 def test_notification_poller_skips_consumed(monkeypatch):

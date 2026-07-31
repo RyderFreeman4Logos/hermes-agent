@@ -1981,4 +1981,48 @@ describe('createGatewayEventHandler', () => {
       expect(appended).toHaveLength(0)
     })
   })
+
+  it('adds the local completion time after the assistant response', () => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+    const formatTime = vi.spyOn(Date.prototype, 'toLocaleTimeString').mockReturnValue('14:23:05')
+
+    try {
+      onEvent({
+        payload: { completed_at: 1_700_000_000.25, text: 'final answer' },
+        type: 'message.complete'
+      } as any)
+
+      expect(appended).toEqual([
+        { role: 'assistant', text: 'final answer' },
+        { kind: 'event', role: 'system', text: '完成 14:23:05' }
+      ])
+      expect(formatTime).toHaveBeenCalledWith('en-GB', {
+        hour: '2-digit',
+        hour12: false,
+        minute: '2-digit',
+        second: '2-digit'
+      })
+    } finally {
+      formatTime.mockRestore()
+    }
+  })
+
+  it('adds the first-call cache hit after the assistant response', () => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+    onEvent({
+      payload: {
+        cache_info: { pct: 87, prompt_tokens: 2_000, read_tokens: 1_740, state: 'hit' },
+        text: 'final answer'
+      },
+      type: 'message.complete'
+    } as any)
+
+    expect(appended).toEqual([
+      { role: 'assistant', text: 'final answer' },
+      { kind: 'event', role: 'system', text: 'cache 87%' }
+    ])
+  })
 })

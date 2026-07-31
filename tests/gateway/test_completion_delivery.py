@@ -366,6 +366,18 @@ def test_gateway_post_turn_drain_requeues_heartbeat_for_warm_watcher():
     assert isolated.get_nowait() is event
 
 
+def test_gateway_post_turn_drain_requeues_ordinary_process_completion():
+    """A failed real turn must not lose its requeued process completion."""
+    from gateway.run import _drain_gateway_watch_events
+
+    isolated = queue.Queue()
+    event = _completion_event(started_at=1999.0)
+    isolated.put(event)
+
+    assert _drain_gateway_watch_events(isolated) == []
+    assert isolated.get_nowait() is event
+
+
 def _stop_after_sleeps(monkeypatch, runner, count):
     sleep_calls = 0
 
@@ -810,6 +822,184 @@ def test_ordinary_process_claim_completes_only_after_real_gateway_turn(
     )
 
     assert not isolated_registry.claim_notification_delivery(event, "replay")
+
+
+@pytest.mark.asyncio
+async def test_ordinary_zero_call_release_is_automatically_retried_and_acked_once(
+    monkeypatch, isolated_registry,
+):
+    session = ProcessSession(
+        id="proc-zero-call-retry",
+        command="echo done",
+        started_at=2002.0,
+        exited=True,
+        exit_code=0,
+        output_buffer="done\n",
+        notify_on_complete=True,
+    )
+    isolated_registry._finished[session.id] = session
+    runner = _runner(None)
+    runner.config = SimpleNamespace(multiplex_profiles=False)
+    runner._load_background_notifications_mode = lambda: "all"
+    turn_results = [
+        {"api_calls": 0, "final_response": ""},
+        {"api_calls": 1, "final_response": "handled"},
+    ]
+    tasks = []
+    delivered_events = []
+    acknowledgements = []
+    complete = isolated_registry.complete_notification_delivery
+
+    def record_complete(evt, claim):
+        acknowledgements.append((evt, claim))
+        return complete(evt, claim)
+
+    monkeypatch.setattr(
+        isolated_registry, "complete_notification_delivery", record_complete
+    )
+
+    async def run_agent_inner(*_args, **_kwargs):
+        return turn_results.pop(0)
+
+    runner._run_agent_inner = run_agent_inner
+
+    async def accept_and_schedule(adapter_event):
+        claims = list(adapter_event.metadata.pop("delivery_claims", []) or [])
+        delivered_events.extend(evt for evt, _claim in claims)
+        tasks.append(asyncio.create_task(runner._run_agent(
+            adapter_event.text,
+            "",
+            [],
+            adapter_event.source,
+            "session-1",
+            delivery_claims=claims,
+        )))
+
+    adapter = SimpleNamespace(handle_message=AsyncMock(side_effect=accept_and_schedule))
+    runner.adapters = {Platform.TELEGRAM: adapter}
+
+    real_sleep = asyncio.sleep
+
+    async def instant_sleep(_delay):
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", instant_sleep)
+    await runner._run_process_watcher({
+        "session_id": session.id,
+        "check_interval": 0,
+        "session_key": "agent:main:telegram:dm:123",
+        "platform": "telegram",
+        "chat_type": "dm",
+        "chat_id": "123",
+        "notify_on_complete": True,
+    })
+    event = delivered_events[0]
+    assert not tasks[0].done()
+    await tasks[0]
+    assert isolated_registry.completion_queue.qsize() == 1
+    assert event["delivery_attempts"] == 1
+
+    async def stop_after_retry(_delay):
+        await real_sleep(0)
+        if len(tasks) == 2 and tasks[1].done():
+            runner._running = False
+
+    monkeypatch.setattr(asyncio, "sleep", stop_after_retry)
+    await runner._async_delegation_watcher(interval=0)
+    await tasks[1]
+
+    assert adapter.handle_message.await_count == 2
+    assert len(acknowledgements) == 1
+    assert acknowledgements[0][0] is event
+    assert isolated_registry.completion_queue.empty()
+    assert not isolated_registry.claim_notification_delivery(event, "replay")
+
+
+@pytest.mark.asyncio
+async def test_ordinary_automatic_retry_stops_after_eight_real_failures(
+    monkeypatch, isolated_registry,
+):
+    event = _completion_event(
+        started_at=2003.0,
+        session_id="proc-eight-failures",
+    )
+    isolated_registry.completion_queue.put(event)
+    runner = _runner(None)
+    runner.config = SimpleNamespace(multiplex_profiles=False)
+    tasks = []
+
+    async def run_agent_inner(*_args, **_kwargs):
+        return {"api_calls": 0, "final_response": ""}
+
+    runner._run_agent_inner = run_agent_inner
+
+    async def accept_and_schedule(adapter_event):
+        claims = list(adapter_event.metadata.pop("delivery_claims", []) or [])
+        tasks.append(asyncio.create_task(runner._run_agent(
+            adapter_event.text,
+            "",
+            [],
+            adapter_event.source,
+            "session-1",
+            delivery_claims=claims,
+        )))
+
+    adapter = SimpleNamespace(handle_message=AsyncMock(side_effect=accept_and_schedule))
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    real_sleep = asyncio.sleep
+
+    async def stop_after_terminal_drop(_delay):
+        await real_sleep(0)
+        if (
+            event.get("delivery_attempts") == 8
+            and isolated_registry.completion_queue.empty()
+        ):
+            runner._running = False
+
+    monkeypatch.setattr(asyncio, "sleep", stop_after_terminal_drop)
+    await runner._async_delegation_watcher(interval=0)
+    await asyncio.gather(*tasks)
+
+    assert adapter.handle_message.await_count == 8
+    assert event["delivery_attempts"] == 8
+    assert isolated_registry.completion_queue.empty()
+    assert not isolated_registry.claim_notification_delivery(event, "ninth")
+
+
+@pytest.mark.asyncio
+async def test_ordinary_retry_does_not_duplicate_while_claim_renewal_is_held(
+    monkeypatch, isolated_registry,
+):
+    event = _completion_event(
+        started_at=2004.0,
+        session_id="proc-held-claim",
+    )
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+
+    assert await runner._deliver_completion_notification("completion", event) is True
+    delivered = adapter.handle_message.await_args.args[0]
+    claimed_event, claim = delivered.metadata["delivery_claims"][0]
+    assert isolated_registry.renew_notification_delivery(claimed_event, claim)
+    isolated_registry.completion_queue.put(dict(event))
+
+    real_sleep = asyncio.sleep
+    sleeps = 0
+
+    async def stop_after_one_drain(_delay):
+        nonlocal sleeps
+        sleeps += 1
+        await real_sleep(0)
+        if sleeps == 2:
+            runner._running = False
+
+    monkeypatch.setattr(asyncio, "sleep", stop_after_one_drain)
+    await runner._async_delegation_watcher(interval=0)
+
+    adapter.handle_message.assert_awaited_once()
+    assert isolated_registry.completion_queue.empty()
+    delivered.metadata["delivery_renewal_stops"][0].set()
+    assert isolated_registry.complete_notification_delivery(claimed_event, claim)
 
 
 def test_busy_gateway_merge_preserves_transferred_claim():

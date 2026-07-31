@@ -3082,7 +3082,7 @@ def _format_gateway_process_notification(evt: dict) -> "str | None":
         text += "]"
         return text
 
-    if evt_type == "async_delegation":
+    if evt_type in {"async_delegation", "completion"}:
         # Reuse the shared rich formatter (self-contained task-source block).
         from tools.process_registry import format_process_notification
         return format_process_notification(evt)
@@ -3110,9 +3110,8 @@ def _drain_gateway_watch_events(completion_queue) -> "list[dict]":
         evt_type = evt.get("type", "completion")
         if evt_type in {"watch_match", "watch_disabled"}:
             watch_events.append(evt)
-        elif evt_type in {"async_delegation", "heartbeat"}:
+        elif evt_type in {"async_delegation", "completion", "heartbeat"}:
             requeue.append(evt)
-        # else: process completion events are handled by the watcher task
     for evt in requeue:
         completion_queue.put(evt)
     return watch_events
@@ -21398,7 +21397,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.warning("Heartbeat warm check-in injection failed for %s", target_id)
 
     async def _async_delegation_watcher(self, interval: float = 2.0) -> None:
-        """Drain async completions and runtime heartbeats as new turns.
+        """Drain queued completions and runtime heartbeats as new turns.
 
         Background subagents (``delegate_task(background=true)``) run on the
         async-delegation daemon executor — they have no per-process watcher
@@ -21407,9 +21406,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         subagent finishes while no agent turn is running, its result still
         re-enters the originating session promptly.
 
-        Mirrors the CLI's idle ``process_loop`` drain. Stays silent when the
-        queue has nothing for us; ignores non-async event types (those are
-        handled by ``_run_process_watcher`` / the post-turn drain).
+        Mirrors the CLI's idle ``process_loop`` drain. Ordinary process
+        completions enter this queue when a scheduled real turn releases its
+        claim, so this existing watcher also owns their automatic retry.
         """
         await asyncio.sleep(3)  # let platforms finish connecting
         from tools.process_registry import process_registry as _pr
@@ -21434,33 +21433,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "owner-local async pending poll failed",
                             exc_info=True,
                         )
-                # Peek the queue for async-delegation and heartbeat events. We
-                # must NOT consume watch/completion events here (other drains own
-                # them), so requeue anything that isn't ours.
+                # Detach the queued completions and heartbeats this watcher owns;
+                # legacy watch-pattern rows stay with the post-turn drain.
                 requeue = []
-                async_events = []
+                completion_events = []
                 heartbeat_events = []
                 while not _pr.completion_queue.empty():
                     try:
                         evt = _pr.completion_queue.get_nowait()
                     except Exception:
                         break
-                    if evt.get("type") == "async_delegation":
-                        async_events.append(evt)
+                    if evt.get("type") in {"async_delegation", "completion"}:
+                        completion_events.append(evt)
                     elif evt.get("type") == "heartbeat":
                         heartbeat_events.append(evt)
                     else:
                         requeue.append(evt)
                 for evt in requeue:
                     _pr.completion_queue.put(evt)
-                for evt in async_events:
+                for evt in completion_events:
                     self._enrich_async_delegation_routing(evt)
                     synth_text = _format_gateway_process_notification(evt)
                     if not synth_text:
                         continue
                     try:
-                        delivered = await self._deliver_completion_notification(synth_text, evt)
-                        if delivered is False:
+                        is_async = evt.get("type") == "async_delegation"
+                        delivered = await self._deliver_completion_notification(
+                            synth_text,
+                            evt,
+                            restore_after_claim_failure=not is_async,
+                        )
+                        if delivered is False and is_async:
                             _pr.completion_queue.put(evt)
                     except Exception as e:
                         _pr.completion_queue.put(evt)

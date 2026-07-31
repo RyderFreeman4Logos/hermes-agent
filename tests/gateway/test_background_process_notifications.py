@@ -440,7 +440,7 @@ async def test_api_self_post_renews_through_http_and_always_stops(
     monkeypatch.setattr(
         ad,
         "release_event_delivery",
-        lambda _evt, _claim: lifecycle.append("release"),
+        lambda _evt, _claim, **_kwargs: lifecycle.append("release"),
     )
 
     result = await runner._deliver_completion_notification(

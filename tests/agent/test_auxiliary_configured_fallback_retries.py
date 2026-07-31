@@ -177,17 +177,20 @@ async def test_quota_only_does_not_advance_on_unrelated_failure(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("async_mode", [False, True])
 async def test_exhaustion_raises_original_primary_error(monkeypatch, async_mode):
-    original = RuntimeError("original primary")
+    original = TimeoutError("original primary")
     primary, fallbacks = _install(
         monkeypatch,
         async_mode,
         [original, RuntimeError("later primary"), RuntimeError("last primary")],
         [[ValueError("fallback one")] * 3, [OSError("fallback two")] * 3],
     )
+    evict = MagicMock()
+    monkeypatch.setattr(auxiliary_client, "_evict_cached_client_instance", evict)
 
-    with pytest.raises(RuntimeError) as raised:
+    with pytest.raises(TimeoutError) as raised:
         await _call(async_mode)
 
     assert raised.value is original
+    evict.assert_called_once_with(primary)
     assert primary.chat.completions.create.call_count == 3
     assert [client.chat.completions.create.call_count for client in fallbacks] == [3, 3]

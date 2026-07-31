@@ -3325,6 +3325,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         turns_to_summarize: List[Dict[str, Any]],
         focus_topic: Optional[str] = None,
         memory_context: str = "",
+        _configured_chain_attempted: bool = False,
     ) -> Optional[str]:
         """Generate a structured summary of conversation turns.
 
@@ -3619,6 +3620,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         try:
             call_kwargs = {
                 "task": "compression",
+                "_allow_configured_fallback": not _configured_chain_attempted,
                 "main_runtime": {
                     "model": self.model,
                     "provider": self.provider,
@@ -3835,6 +3837,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                     turns_to_summarize,
                     focus_topic=focus_topic,
                     memory_context=memory_context,
+                    _configured_chain_attempted=True,
                 )  # retry immediately
 
             # Unknown-error best-effort retry on main model.  Losing N turns of
@@ -3856,6 +3859,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                     turns_to_summarize,
                     focus_topic=focus_topic,
                     memory_context=memory_context,
+                    _configured_chain_attempted=True,
                 )
 
             # Transient errors (timeout, rate limit, network, JSON decode,

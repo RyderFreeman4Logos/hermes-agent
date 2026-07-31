@@ -134,20 +134,17 @@ class TestCreateWithProgress:
         # 1 dispatch tick + 1 per chunk
         assert len(ticks) >= len(chunks) + 1
 
-    def test_streaming_rejected_falls_back_to_plain_call(self):
+    def test_streaming_rejection_is_one_physical_request(self):
         client = _FakeClient(
             response=_COMPLETE,
             stream_error=RuntimeError("stream is not supported by this model"),
         )
-        with aux_progress_hook(lambda: None):
-            result = _create_with_progress(
-                client, {"model": "m1", "messages": []},
-            )
-        assert result is _COMPLETE
-        # streamed attempt + non-streaming fallback
-        assert len(client.calls) == 2
+        with aux_progress_hook(lambda: None), pytest.raises(
+            RuntimeError, match="not supported"
+        ):
+            _create_with_progress(client, {"model": "m1", "messages": []})
+        assert len(client.calls) == 1
         assert client.calls[0].get("stream") is True
-        assert "stream" not in client.calls[1]
 
 
 

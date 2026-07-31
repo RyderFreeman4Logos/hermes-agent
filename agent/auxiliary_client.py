@@ -7123,9 +7123,28 @@ def _fallback_client_matches_entry(client: Any, entry: Dict[str, Any]) -> bool:
     expected_base = str(entry.get("base_url") or "").strip()
     if expected_base:
         actual_base = str(getattr(client, "base_url", "") or "")
-        if base_url_hostname(actual_base) != base_url_hostname(expected_base):
+        try:
+            endpoint_matches = (
+                _base_url_identity(actual_base) == _base_url_identity(expected_base)
+            )
+        except ValueError:
+            endpoint_matches = False
+        if not endpoint_matches:
             return False
     return True
+
+
+def _base_url_identity(value: str) -> Tuple[str, str, Optional[int], str]:
+    parsed = urlparse(value)
+    port = parsed.port
+    if port is None:
+        port = {"http": 80, "https": 443}.get(parsed.scheme.lower())
+    return (
+        parsed.scheme.lower(),
+        (parsed.hostname or "").lower().rstrip("."),
+        port,
+        parsed.path.rstrip("/") or "/",
+    )
 
 
 def _try_configured_candidates_sync(
@@ -7931,10 +7950,8 @@ def _create_with_progress(
     rather than as a total budget, and outer liveness watchdogs see tokens
     moving. ``force_stream=True`` (stream-only providers such as Tencent
     Copilot — credit @kudi88, PR #60686) takes the same streamed path even
-    without a hook. Providers that reject the streamed request fall back to
-    the plain non-streaming call — except under ``force_stream``, where a
-    stream-only provider rejects the plain call by definition, so the
-    original error is surfaced to the normal recovery chains instead.
+    without a hook. Failures are surfaced to the outer retry and fallback
+    chains so each attempt issues exactly one physical request.
     """
     _notify_aux_progress()  # request dispatched counts as progress
     if (not _aux_progress_active() and not force_stream) or _client_streams_internally(client):
@@ -7944,30 +7961,7 @@ def _create_with_progress(
     stream_kwargs = dict(kwargs)
     stream_kwargs["stream"] = True
     stream_kwargs["stream_options"] = {"include_usage": True}
-    try:
-        chunks = client.chat.completions.create(**stream_kwargs)
-    except Exception as exc:
-        # Genuine provider failures (auth, credit, rate limit, network) are
-        # not streaming's fault — surface them unchanged so the existing
-        # recovery chains (credential refresh, pool rotation, provider
-        # fallback) see the same error they would on a plain call.
-        if (
-            force_stream
-            or _is_transient_transport_error(exc)
-            or _is_auth_error(exc)
-            or _is_payment_error(exc)
-            or _is_rate_limit_error(exc)
-        ):
-            raise
-        # Anything else may be a streaming-specific rejection (explicit
-        # "stream not supported", stream_options 400, or an idiosyncratic
-        # 4xx). Retry non-streaming once; if the request itself is bad the
-        # plain call reproduces the real error for the normal except-chains.
-        logger.debug(
-            "Auxiliary %s: streamed request failed (%s); retrying "
-            "non-streaming", task or "call", exc,
-        )
-        return client.chat.completions.create(**kwargs)
+    chunks = client.chat.completions.create(**stream_kwargs)
 
     # Some shims (MoA virtual provider under quiet mode, defensive adapters)
     # return a complete response even when stream=True was requested.
@@ -8179,6 +8173,7 @@ def call_llm(
     api_mode: str = None,
     stream: bool = False,
     stream_options: dict = None,
+    _allow_configured_fallback: bool = True,
 ) -> Any:
     """Centralized synchronous LLM call.
 
@@ -8223,7 +8218,10 @@ def call_llm(
     # concurrent /model switch produce a key for one runtime and a client for
     # another.
     main_runtime = _normalize_main_runtime(main_runtime)
-    configured_chain, fallback_on = _capture_configured_fallback_chain(task)
+    configured_chain, fallback_on = (
+        _capture_configured_fallback_chain(task)
+        if _allow_configured_fallback else ((), None)
+    )
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
     if api_mode:
@@ -8412,6 +8410,7 @@ def call_llm(
                     transient_err,
                 )
                 raise
+            _first_primary_err = transient_err
             _max_transient_retries = 2 if configured_retry else _transient_retry_count()
             _last_transient = transient_err
             for _attempt in range(1, _max_transient_retries + 1):
@@ -8449,7 +8448,7 @@ def call_llm(
                         raise
                     _last_transient = retry_transient
             # Retries exhausted — fall through to first_err fallback handling.
-            raise _last_transient
+            raise _first_primary_err
     except Exception as first_err:
         if configured_chain:
             if _configured_fallback_allows(first_err, fallback_on):
@@ -8956,6 +8955,7 @@ async def async_call_llm(
     timeout: float = None,
     extra_body: dict = None,
     reasoning_config: Optional[dict] = None,
+    _allow_configured_fallback: bool = True,
 ) -> Any:
     """Centralized asynchronous LLM call.
 
@@ -8964,7 +8964,10 @@ async def async_call_llm(
     # Keep every async phase on the same runtime identity, even if another
     # session switches models while this task is awaiting network I/O.
     main_runtime = _normalize_main_runtime(main_runtime)
-    configured_chain, fallback_on = _capture_configured_fallback_chain(task)
+    configured_chain, fallback_on = (
+        _capture_configured_fallback_chain(task)
+        if _allow_configured_fallback else ((), None)
+    )
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
     effective_extra_body = _get_task_extra_body(task)
@@ -9115,7 +9118,7 @@ async def async_call_llm(
                         create=_acreate,
                     ),
                     task)
-            last_transient = transient_err
+            first_primary_err = transient_err
             for attempt in range(2):
                 await asyncio.sleep(min(
                     _TRANSIENT_RETRY_BACKOFF_BASE * (2.0 ** attempt), 8.0
@@ -9136,8 +9139,7 @@ async def async_call_llm(
                             raise
                     elif not _is_transient_transport_error(retry_transient):
                         raise
-                    last_transient = retry_transient
-            raise last_transient
+            raise first_primary_err
     except Exception as first_err:
         if configured_chain:
             if _configured_fallback_allows(first_err, fallback_on):

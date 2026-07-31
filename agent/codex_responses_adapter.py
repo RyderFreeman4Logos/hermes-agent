@@ -23,6 +23,10 @@ from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
 
 logger = logging.getLogger(__name__)
 
+_FOREIGN_EXTRA_BODY_KEYS = frozenset(
+    {"thinking", "enable_thinking", "chat_template_kwargs"}
+)
+
 
 def _classify_responses_issuer(
     *,
@@ -1003,14 +1007,15 @@ def _preflight_codex_api_kwargs(
     if extra_body is not None:
         if not isinstance(extra_body, dict):
             raise ValueError("Codex Responses request 'extra_body' must be an object.")
-        # Pass extra_body through verbatim — used by xAI Responses to
-        # carry `prompt_cache_key` as a body-level field (the documented
-        # cache-routing surface on /v1/responses). The openai SDK
-        # serializes extra_body into the JSON body without per-field
-        # type checks, so it survives Responses.stream() kwarg-signature
-        # changes that would otherwise raise TypeError before the wire.
-        if extra_body:
-            normalized["extra_body"] = dict(extra_body)
+        # Preserve endpoint extensions, but not thinking controls owned by
+        # providers with a different request contract.
+        compatible_extra_body = {
+            key: value
+            for key, value in extra_body.items()
+            if key not in _FOREIGN_EXTRA_BODY_KEYS
+        }
+        if compatible_extra_body:
+            normalized["extra_body"] = compatible_extra_body
 
     if allow_stream:
         stream = api_kwargs.get("stream")

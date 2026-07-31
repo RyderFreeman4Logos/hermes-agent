@@ -2055,7 +2055,7 @@ def compress_context(
         # normal SQLite/JSON flush filters. Build this view after todo/anchor
         # preservation has finalized ``compressed``, but keep the live list
         # intact so a current completion nudge still reaches the model.
-        from run_agent import _is_ephemeral_scaffolding
+        from agent.message_sanitization import _is_ephemeral_scaffolding
 
         persisted_compressed = [
             message

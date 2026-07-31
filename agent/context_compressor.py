@@ -5616,7 +5616,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         if not session_db or not session_id:
             return
         try:
-            from run_agent import _is_ephemeral_scaffolding
+            from agent.message_sanitization import _is_ephemeral_scaffolding
 
             durable_messages = [
                 msg

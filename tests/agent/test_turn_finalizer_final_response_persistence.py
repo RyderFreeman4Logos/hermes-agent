@@ -1,9 +1,33 @@
+import subprocess
+import sys
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from agent.turn_finalizer import finalize_turn
+
+
+def test_scaffolding_filter_does_not_import_run_agent():
+    code = """
+import sys
+from agent.message_sanitization import _EPHEMERAL_SCAFFOLDING_FLAGS
+from agent.turn_finalizer import _drop_ephemeral_scaffolding
+
+assert "run_agent" not in sys.modules
+real_messages = [
+    {"role": "user", "content": "real"},
+    {"role": "assistant", "content": "done"},
+]
+messages = real_messages + [
+    {"role": "user", "content": flag, flag: True}
+    for flag in _EPHEMERAL_SCAFFOLDING_FLAGS
+]
+_drop_ephemeral_scaffolding(messages)
+assert messages == real_messages
+assert "run_agent" not in sys.modules
+"""
+    subprocess.run([sys.executable, "-c", code], check=True)
 
 
 class FakeAgent:
@@ -221,9 +245,6 @@ def test_completion_nudge_is_removed_from_finalized_live_history(
     assert (assistant_text in [m["content"] for m in result["messages"]]) is bool(
         assistant_text
     )
-
-
-
 
 def test_final_response_fill_invalidates_flush_scan_cursor():
     """The fill's marker pop must invalidate the bounded flush-scan cursor.

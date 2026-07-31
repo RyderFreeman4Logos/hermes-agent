@@ -17925,7 +17925,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             continue
                         if _completion_delivery_synthetic and msg.get("role") == "user":
                             continue
-                        from run_agent import _is_ephemeral_scaffolding
+                        from agent.message_sanitization import _is_ephemeral_scaffolding
 
                         if _is_ephemeral_scaffolding(msg):
                             continue

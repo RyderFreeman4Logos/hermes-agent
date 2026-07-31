@@ -174,6 +174,8 @@ from agent.prompt_builder import (  # noqa: F401  # re-exported via _ra() / mock
 )
 from agent.process_bootstrap import _get_proxy_from_env  # noqa: F401
 from agent.message_sanitization import (  # noqa: F401
+    _EPHEMERAL_SCAFFOLDING_FLAGS,
+    _is_ephemeral_scaffolding,
     _SURROGATE_RE,
     _sanitize_surrogates,
     _sanitize_structure_surrogates,
@@ -221,47 +223,6 @@ from agent.tool_dispatch_helpers import (
     _trajectory_normalize_msg,  # noqa: F401  # re-exported for tests that `from run_agent import _trajectory_normalize_msg`
 )
 from utils import atomic_json_write, base_url_host_matches, base_url_hostname, env_float, is_truthy_value, model_forces_max_completion_tokens
-
-
-# Internal flags that mark a message as ephemeral empty-response/prefill
-# recovery scaffolding: the synthetic assistant "(empty)" turn and user nudge
-# injected after an empty response, the terminal "(empty)" sentinel, and the
-# thinking-only prefill placeholder. These exist only to drive the next API
-# retry; the in-memory loop pops them before appending the real response.
-# Persistence must mirror that, otherwise an append-only flush can commit them
-# to the session store and a resumed session replays synthetic "(empty)"/nudge
-# turns as if they were genuine context.
-_EPHEMERAL_SCAFFOLDING_FLAGS = (
-    "_empty_recovery_synthetic",
-    "_empty_terminal_sentinel",
-    "_thinking_prefill",
-    # verify-on-stop and pre_verify nudges append a synthetic user nudge to
-    # keep the agent going one more turn before it can claim completion.
-    # The nudge exists only to drive the verification loop; persisting it
-    # poisons the resumed transcript and breaks prompt-prefix cache reuse
-    # on later turns. The assistant candidate is NOT synthetic — it is
-    # persisted and emitted as an interim message (#65919).
-    "_verification_stop_synthetic",
-    "_pre_verify_synthetic",
-    # kanban worker stop-guard: narrated exit without kanban_complete/block
-    "_kanban_stop_synthetic",
-    # model-only nudge appended to an ordinary background-process completion
-    "_completion_delivery_synthetic",
-    # dropped tool-call re-prompt pair (finish_reason=tool_calls with an
-    # empty tool_calls array): the interim narration-only assistant turn
-    # and the "issue the actual tool call now" user nudge exist only to
-    # drive the bounded retry. Persisting them would replay the internal
-    # retry instruction as user-authored context on resume.
-    "_dropped_toolcall_nudge",
-)
-
-
-def _is_ephemeral_scaffolding(msg: Any) -> bool:
-    """Return True when ``msg`` is internal recovery scaffolding that must never
-    be persisted to the durable transcript (SQLite session store or JSON log)."""
-    return isinstance(msg, dict) and any(
-        msg.get(flag) for flag in _EPHEMERAL_SCAFFOLDING_FLAGS
-    )
 
 
 _MAX_TOOL_WORKERS = 8

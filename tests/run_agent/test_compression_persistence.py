@@ -19,7 +19,9 @@ Bug scenario (pre-fix):
 import os
 import tempfile
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 
 
@@ -321,6 +323,67 @@ class TestFlushAfterCompression:
                 f"_db_persisted marker propagation bug (#57491)."
             )
             db.close()
+
+    @pytest.mark.parametrize("in_place", [True, False])
+    def test_completion_nudge_is_removed_before_compression_publish_and_reload(
+        self, in_place
+    ):
+        """Both compression publishers keep the real result, never its nudge."""
+        from agent.conversation_compression import compress_context
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            db = SessionDB(db_path=db_path)
+            agent = self._make_agent(db)
+            agent.compression_in_place = in_place
+            agent._ensure_db_session()
+
+            nudge = {
+                "role": "user",
+                "content": "completion payload and model-only instruction",
+                "_completion_delivery_synthetic": True,
+            }
+            compressor = MagicMock()
+            compressor.compress.return_value = [
+                {"role": "user", "content": "[summary] earlier work"},
+                {"role": "assistant", "content": "summary acknowledged"},
+                {"role": "user", "content": "start the build"},
+                nudge,
+                {"role": "assistant", "content": "Build finished successfully"},
+            ]
+            compressor.compression_count = 1
+            compressor.last_prompt_tokens = 0
+            compressor.last_completion_tokens = 0
+            compressor._last_summary_error = None
+            compressor._last_compress_aborted = False
+            compressor._last_compression_made_progress = True
+            compressor._last_summary_fallback_used = False
+            agent.context_compressor = compressor
+
+            returned, _ = compress_context(
+                agent,
+                [
+                    {"role": "user", "content": "old request"},
+                    {"role": "assistant", "content": "old response"},
+                    nudge,
+                    {"role": "assistant", "content": "Build finished successfully"},
+                ],
+                "system",
+                approx_tokens=100_000,
+            )
+            session_id = agent.session_id
+            # The current nudge remains live through compression so the model
+            # can inspect it; finalization removes it after the response.
+            assert nudge in returned
+            assert returned[-1]["content"] == "Build finished successfully"
+
+            db.close()
+            resumed_db = SessionDB(db_path=db_path)
+            resumed = resumed_db.get_messages_as_conversation(session_id)
+            assert nudge["content"] not in [message["content"] for message in resumed]
+            assert resumed[-1]["content"] == "Build finished successfully"
+            resumed_db.close()
 
 
 

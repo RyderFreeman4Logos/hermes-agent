@@ -40,6 +40,7 @@ WAKE_TURN_TIMEOUT_SECONDS = 600.0
 # turns on one session are last-writer-wins — but it DOES enforce a global
 # max_concurrent_runs cap via HTTP 429, which is worth waiting out.
 _RETRY_DELAYS_SECONDS = (2.0, 5.0, 10.0)
+INTERNAL_COMPLETION_DELIVERY_HEADER = "X-Hermes-Internal-Completion-Delivery"
 
 
 def adapter_supports_push(adapter: Any) -> bool:
@@ -59,6 +60,7 @@ async def deliver_wake(
     text: str,
     session_id: str = "",
     source: Any = None,
+    completion_delivery: bool = False,
 ) -> None:
     """Deliver a wake turn to the session behind ``adapter``.
 
@@ -91,11 +93,16 @@ async def deliver_wake(
             "deliver_wake: non-push adapter (supports_async_delivery=False) "
             "requires the raw session id to self-post the wake turn"
         )
-    await _self_post_chat_completion(adapter, text=text, session_id=session_id)
+    await _self_post_chat_completion(
+        adapter,
+        text=text,
+        session_id=session_id,
+        completion_delivery=completion_delivery,
+    )
 
 
 async def _self_post_chat_completion(
-    adapter: Any, *, text: str, session_id: str
+    adapter: Any, *, text: str, session_id: str, completion_delivery: bool = False
 ) -> None:
     """POST the wake text to the in-pod API server as a normal session turn.
 
@@ -127,6 +134,11 @@ async def _self_post_chat_completion(
         "Authorization": f"Bearer {api_key}",
         "X-Hermes-Session-Id": session_id,
     }
+    if completion_delivery:
+        token = str(getattr(adapter, "_completion_delivery_token", "") or "")
+        if not token:
+            raise RuntimeError("wake self-post completion marker is unavailable")
+        headers[INTERNAL_COMPLETION_DELIVERY_HEADER] = token
     payload = {
         "model": str(getattr(adapter, "_model_name", "") or "hermes-agent"),
         "messages": [{"role": "user", "content": text}],

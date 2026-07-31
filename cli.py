@@ -4202,6 +4202,10 @@ class _VoiceInputMessage:
         return self.text
 
 
+class _CompletionDeliveryMessage(str):
+    """Trusted model-only completion turn queued by the process registry."""
+
+
 class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     """
     Interactive CLI for the Hermes Agent.
@@ -10622,7 +10626,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             claim = claim_event_delivery(event, consumer)
             if claim is None:
                 continue
-            self._pending_input.put(synthetic_message)
+            queued_message = (
+                _CompletionDeliveryMessage(synthetic_message)
+                if event.get("type", "completion") == "completion"
+                else synthetic_message
+            )
+            self._pending_input.put(queued_message)
             complete_event_delivery(event, claim)
 
     def _drain_interrupt_queue_to_pending_input(self) -> None:
@@ -13631,7 +13640,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             except Exception:
                 pass
 
-    def chat(self, message, images: list = None, voice_input: bool = False) -> Optional[str]:
+    def chat(
+        self,
+        message,
+        images: list = None,
+        voice_input: bool = False,
+        completion_delivery: bool = False,
+    ) -> Optional[str]:
         """
         Send a message to the agent and get a response.
         
@@ -13789,6 +13804,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             agent._persist_user_message_override = None
             agent._persist_user_message_timestamp = None
             staged_user_message = {"role": "user", "content": message}
+            if completion_delivery:
+                staged_user_message["_completion_delivery_synthetic"] = True
             agent._pending_cli_user_message = staged_user_message
             self.conversation_history.append(staged_user_message)
 
@@ -17322,6 +17339,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     is_voice_input = isinstance(user_input, _VoiceInputMessage)
                     if is_voice_input:
                         user_input = user_input.text
+                    is_completion_delivery = isinstance(
+                        user_input, _CompletionDeliveryMessage
+                    )
 
                     if not user_input:
                         continue
@@ -17437,7 +17457,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     app.invalidate()  # Refresh status line
 
                     try:
-                        self.chat(user_input, images=submit_images or None, voice_input=is_voice_input)
+                        self.chat(
+                            user_input,
+                            images=submit_images or None,
+                            voice_input=is_voice_input,
+                            completion_delivery=is_completion_delivery,
+                        )
                     finally:
                         self._agent_running = False
                         self._spinner_text = ""

@@ -10258,11 +10258,6 @@ def _run_prompt_submit(
                 skip_poll_observed=False,
             )
             for index, (_evt, synth) in enumerate(drained):
-                from tools.process_registry import completion_delivery_prompt
-
-                model_synth = completion_delivery_prompt(_evt, synth)
-                if model_synth is None:
-                    continue
                 with session["history_lock"]:
                     if session.get("running"):
                         for pending_evt, _pending_synth in drained[index:]:
@@ -10281,7 +10276,7 @@ def _run_prompt_submit(
                         rid,
                         sid,
                         session,
-                        model_synth,
+                        synth,
                         **(
                             {"completion_delivery": True}
                             if _evt.get("type", "completion") == "completion"

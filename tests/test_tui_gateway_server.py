@@ -14445,6 +14445,91 @@ def test_notification_poller_shutdown_drain_transfers_delivery_claim(monkeypatch
     assert submitted[0][1]["turn_origin"] == "idle_completion"
 
 
+def test_notification_poller_shutdown_requeues_untouched_suffix_once(monkeypatch):
+    """An early busy retry preserves the detached shutdown batch in FIFO order."""
+    import queue as _queue_mod
+
+    import tools.async_delegation as async_delegation
+    import tools.process_registry as process_registry_module
+    from tools.process_registry import process_registry
+
+    sid = "sid-shutdown-suffix"
+    events = [
+        {"type": "completion", "session_id": "busy"},
+        {"type": "watch_match", "session_id": "ordinary"},
+        {
+            "type": "async_delegation",
+            "delegation_id": "async-suffix",
+            "origin_ui_session_id": sid,
+        },
+        {"type": "completion", "session_id": "ordinary-last"},
+    ]
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    for event in events:
+        isolated_queue.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(
+        process_registry_module,
+        "format_process_notification",
+        lambda event: event.get("session_id") or event["delegation_id"],
+    )
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+    monkeypatch.setattr(
+        async_delegation,
+        "start_event_delivery_renewal",
+        lambda _claims: threading.Event(),
+    )
+    claims = []
+    releases = []
+
+    def claim(event, consumer):
+        claim_id = f"{consumer}:{len(claims)}"
+        claims.append((event, claim_id))
+        return claim_id
+
+    def release(event, claim_id, *, consume_attempt=True):
+        releases.append((event, claim_id, consume_attempt))
+        if event.get("type") != "async_delegation":
+            isolated_queue.put(event)
+
+    monkeypatch.setattr(async_delegation, "claim_event_delivery", claim)
+    monkeypatch.setattr(async_delegation, "release_event_delivery", release)
+
+    session = _session(
+        agent=types.SimpleNamespace(steer=lambda _text, **_kwargs: False),
+        running=True,
+    )
+    stop = threading.Event()
+    stop.set()
+
+    server._notification_poller_loop(stop, sid, session)
+
+    restored = []
+    while not isolated_queue.empty():
+        restored.append(isolated_queue.get_nowait())
+    assert restored == events
+    assert len({id(event) for event in restored}) == len(events)
+    assert claims == [(events[0], "tui-poller-steer:0")]
+    assert releases == [(events[0], "tui-poller-steer:0", False)]
+
+    for event in restored:
+        isolated_queue.put(event)
+    delivered = []
+
+    def submit(_rid, _sid, submitted_session, _text, **kwargs):
+        delivered.extend(event for event, _claim in kwargs["delivery_claims"])
+        submitted_session["running"] = False
+
+    monkeypatch.setattr(server, "_run_prompt_submit", submit)
+    session["running"] = False
+    server._notification_poller_loop(stop, sid, session)
+
+    assert delivered == events
+    assert len({id(event) for event in delivered}) == len(events)
+    assert isolated_queue.empty()
+
+
 @pytest.mark.parametrize("exit_path", ["blocked_context", "dispatcher_exception"])
 def test_run_prompt_submit_releases_transferred_claim_before_model_call(
     monkeypatch, tmp_path, exit_path

@@ -9628,7 +9628,7 @@ def _notification_poller_loop(
             )
         if receipt["evt"].get("type") == "async_delegation":
             deferred.append(receipt["evt"])
-    for evt in shutdown_events:
+    for index, evt in enumerate(shutdown_events):
         if _notification_event_belongs_elsewhere(sid, session, evt):
             deferred.append(evt)
             continue
@@ -9691,10 +9691,12 @@ def _notification_poller_loop(
         if steer_result is False or steer_result == "requeued":
             if steer_result is False:
                 process_registry.completion_queue.put(evt)
+            deferred.extend(shutdown_events[index + 1:])
             break
         with session["history_lock"]:
             if session.get("running"):
                 process_registry.completion_queue.put(evt)
+                deferred.extend(shutdown_events[index + 1:])
                 break
             session["running"] = True
 

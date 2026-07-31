@@ -26,6 +26,7 @@ import os
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.message_content import flatten_message_text
+from agent.message_sanitization import _is_ephemeral_scaffolding
 
 
 def _is_pure_tool_call_tail(msg: dict) -> bool:
@@ -44,8 +45,6 @@ def _is_pure_tool_call_tail(msg: dict) -> bool:
 
 def _drop_ephemeral_scaffolding(messages) -> None:
     """Remove model-only scaffolding while preserving every real message."""
-    from run_agent import _is_ephemeral_scaffolding
-
     messages[:] = [m for m in messages if not _is_ephemeral_scaffolding(m)]
 
 

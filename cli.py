@@ -4195,6 +4195,17 @@ class _VoiceInputMessage:
         return self.text
 
 
+class _ClaimedProcessNotification:
+    """Synthetic CLI input carrying its durable delivery claim into the turn."""
+
+    __slots__ = ("text", "event", "claim")
+
+    def __init__(self, text: str, event: dict, claim: str):
+        self.text = text
+        self.event = event
+        self.claim = claim
+
+
 class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     """
     Interactive CLI for the Hermes Agent.
@@ -10337,10 +10348,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         delivered a completion that belongs to this one.
         """
         from tools.process_registry import process_registry
-        from tools.async_delegation import (
-            claim_event_delivery,
-            complete_event_delivery,
-        )
+        from tools.async_delegation import claim_event_delivery
 
         session_key = getattr(self, "session_id", "") or ""
         for event, synthetic_message in process_registry.drain_notifications(
@@ -10350,8 +10358,35 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             claim = claim_event_delivery(event, consumer)
             if claim is None:
                 continue
-            self._pending_input.put(synthetic_message)
-            complete_event_delivery(event, claim)
+            self._pending_input.put(
+                _ClaimedProcessNotification(synthetic_message, event, claim)
+            )
+
+    @staticmethod
+    def _settle_delivery_claims(
+        claims: list[tuple[dict, str]], result: Optional[dict] = None
+    ) -> None:
+        """Settle every classic CLI claim independently after its model turn."""
+        from tools.async_delegation import (
+            complete_event_delivery,
+            release_event_delivery,
+            turn_result_acknowledges_delivery,
+        )
+
+        acknowledged = turn_result_acknowledges_delivery(result)
+        while claims:
+            event, claim = claims.pop()
+            try:
+                if acknowledged:
+                    complete_event_delivery(event, claim)
+                else:
+                    release_event_delivery(event, claim)
+            except Exception:
+                logger.warning(
+                    "Classic CLI delivery claim %s failed",
+                    "completion" if acknowledged else "release",
+                    exc_info=True,
+                )
 
     def _drain_interrupt_queue_to_pending_input(self) -> None:
         """Move stray messages from ``_interrupt_queue`` into ``_pending_input``.
@@ -13323,7 +13358,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             except Exception:
                 pass
 
-    def chat(self, message, images: list = None, voice_input: bool = False) -> Optional[str]:
+    def chat(
+        self,
+        message,
+        images: list = None,
+        voice_input: bool = False,
+        delivery_claims: Optional[list[tuple[dict, str]]] = None,
+    ) -> Optional[str]:
         """
         Send a message to the agent and get a response.
         
@@ -13340,6 +13381,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             images: Optional list of Path objects for attached images
             voice_input: True when the message came from voice transcription
                 (gates the concise voice-response prefix, #65827)
+            delivery_claims: Durable process-notification claims transferred
+                with this synthetic input.
             
         Returns:
             The agent's response, or None on error
@@ -13489,6 +13532,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         else:
             with persist_lock:
                 _stage_user_message()
+
+        delivery_renewal_stop = None
+        if delivery_claims:
+            from tools.async_delegation import start_event_delivery_renewal
+
+            delivery_renewal_stop = start_event_delivery_renewal(delivery_claims)
 
         ChatConsole().print(f"[{_accent_hex()}]{'─' * 40}[/]")
         print(flush=True)
@@ -13688,6 +13737,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         "error": _summary,
                     }
                 finally:
+                    if delivery_claims:
+                        self._settle_delivery_claims(delivery_claims, result)
                     if _one_turn_model_restore:
                         self._restore_model_runtime_snapshot(_one_turn_model_restore)
                     # Surface any credit notices queued during the turn (cold-start
@@ -14150,6 +14201,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             print(f"Error: {e}")
             return None
         finally:
+            if delivery_renewal_stop is not None:
+                delivery_renewal_stop.set()
+            if delivery_claims:
+                self._settle_delivery_claims(delivery_claims)
             # Stop the ambient thinking sound the moment the turn ends —
             # every exit path (normal, error, interrupt) lands here.
             if _thinking_started:
@@ -16823,6 +16878,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Background thread to process inputs and run agent
         def process_loop():
             while not self._should_exit:
+                delivery_claims = []
                 try:
                     # Check for pending input with timeout
                     try:
@@ -16839,6 +16895,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                                 pass
                         continue
 
+                    if isinstance(user_input, _ClaimedProcessNotification):
+                        delivery_claims.append((user_input.event, user_input.claim))
+                        user_input = user_input.text
+
                     # Voice-transcribed messages arrive wrapped in a sentinel
                     # so only genuine STT output gets the voice prefix (#65827).
                     is_voice_input = isinstance(user_input, _VoiceInputMessage)
@@ -16846,6 +16906,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         user_input = user_input.text
 
                     if not user_input:
+                        self._settle_delivery_claims(delivery_claims)
                         continue
 
                     # The user has typed and submitted something, so any
@@ -16869,6 +16930,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     # already stop-checked at the transcription points, so this
                     # only intercepts typed input.
                     if not is_voice_input and self._typed_voice_stop(user_input):
+                        self._settle_delivery_claims(delivery_claims)
                         continue
                     
                     # Check for commands — but detect dragged/pasted file paths first.
@@ -16897,6 +16959,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         and isinstance(user_input, str)
                         and self._consume_pending_resume_selection(user_input)
                     ):
+                        self._settle_delivery_claims(delivery_claims)
                         continue
 
                     if not _file_drop and isinstance(user_input, str) and _looks_like_slash_command(user_input):
@@ -16914,6 +16977,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             # session. Without this guard a KeyboardInterrupt unwinds
                             # to the outer prompt_toolkit loop and the session dies.
                             _cprint("\n[dim]Command interrupted.[/dim]")
+                            self._settle_delivery_claims(delivery_claims)
                             continue
                         # A slash handler may set a one-shot pending seed (e.g.
                         # /blueprint <name>) to be run as the next agent turn.
@@ -16924,6 +16988,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             self._pending_agent_seed = None
                             user_input = _seed
                         else:
+                            self._settle_delivery_claims(delivery_claims)
                             continue
                     
                     # Expand paste references back to full content
@@ -16948,8 +17013,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     app.invalidate()  # Refresh status line
 
                     try:
-                        self.chat(user_input, images=submit_images or None, voice_input=is_voice_input)
+                        self.chat(
+                            user_input,
+                            images=submit_images or None,
+                            voice_input=is_voice_input,
+                            delivery_claims=delivery_claims,
+                        )
                     finally:
+                        if delivery_claims:
+                            self._settle_delivery_claims(delivery_claims)
                         self._agent_running = False
                         self._spinner_text = ""
                         self._tool_start_time = 0.0
@@ -17024,6 +17096,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             pass  # Non-fatal — don't break the main loop
 
                 except Exception as e:
+                    if delivery_claims:
+                        self._settle_delivery_claims(delivery_claims)
                     logger.warning("process_loop unhandled error (msg may be lost): %s", e)
         
         # Start processing thread

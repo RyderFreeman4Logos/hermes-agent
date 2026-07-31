@@ -31,6 +31,8 @@ import time
 import types
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 
 def _make_cli():
     """Build a HermesCLI with prompt_toolkit stubbed (same pattern as
@@ -119,6 +121,74 @@ class _StubAgent:
         self.clear_calls += 1
         self._interrupt_requested = False
         self._interrupt_message = None
+
+
+@pytest.mark.parametrize(
+    ("turn_result", "settled_as"),
+    [
+        ({"api_calls": 1}, "complete"),
+        ({"api_calls": 1, "failed": True}, "release"),
+        ({"api_calls": 0}, "release"),
+    ],
+    ids=["success", "failure", "zero-api"],
+)
+def test_classic_cli_settles_transferred_claim_from_model_turn(
+    monkeypatch, turn_result, settled_as
+):
+    cli = _make_cli()
+
+    class _DeliveryAgent(_StubAgent):
+        def run_conversation(self, **_kwargs):
+            return {
+                "final_response": "handled",
+                "messages": [],
+                "response_previewed": True,
+                "partial": True,
+                **turn_result,
+            }
+
+    cli.agent = _DeliveryAgent(cli.session_id, turn_seconds=0)
+    cli._interrupt_queue = queue.Queue()
+    cli._pending_input = queue.Queue()
+    event = {"type": "async_delegation", "delegation_id": "deleg-cli-turn"}
+    claims = [(event, "claim-cli-turn")]
+    renewed = []
+    completed = []
+    released = []
+
+    monkeypatch.setattr(
+        "tools.async_delegation.start_event_delivery_renewal",
+        lambda held: renewed.append(list(held)) or threading.Event(),
+    )
+    monkeypatch.setattr(
+        "tools.async_delegation.complete_event_delivery",
+        lambda evt, claim: completed.append((evt, claim)),
+    )
+    monkeypatch.setattr(
+        "tools.async_delegation.release_event_delivery",
+        lambda evt, claim: released.append((evt, claim)),
+    )
+
+    with patch.object(cli, "_ensure_runtime_credentials", return_value=True), patch.object(
+        cli,
+        "_resolve_turn_agent_config",
+        return_value={
+            "signature": cli._active_agent_route_signature,
+            "model": None,
+            "runtime": None,
+            "request_overrides": None,
+        },
+    ), patch.object(cli, "_init_agent", return_value=True):
+        cli.chat("completion payload", delivery_claims=claims)
+
+    assert renewed == [[(event, "claim-cli-turn")]]
+    assert claims == []
+    assert completed == (
+        [(event, "claim-cli-turn")] if settled_as == "complete" else []
+    )
+    assert released == (
+        [(event, "claim-cli-turn")] if settled_as == "release" else []
+    )
 
 
 def test_unacknowledged_interrupt_message_is_requeued_not_dropped():

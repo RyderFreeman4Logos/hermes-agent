@@ -14808,6 +14808,53 @@ def test_idle_completion_failure_disables_silent_noop_and_stays_traceable(monkey
     assert event["exit_code"] == 7
 
 
+def test_idle_completion_dispatch_failure_releases_every_claim_and_cleans_running(
+    monkeypatch, caplog
+):
+    import sqlite3
+
+    from tools import async_delegation as ad
+
+    session = _session(running=True)
+    events = [
+        _async_completion_event(201),
+        _async_completion_event(202),
+    ]
+    released = []
+
+    monkeypatch.setattr(
+        ad,
+        "claim_event_delivery",
+        lambda evt, _consumer: f"claim-{evt['delegation_id']}",
+    )
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("synchronous dispatch failed")
+        ),
+    )
+
+    def release(evt, _claim):
+        released.append(evt["delegation_id"])
+        if len(released) == 1:
+            raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(ad, "release_event_delivery", release)
+
+    assert not server._dispatch_idle_completion_batch(
+        "rid-dispatch-failure",
+        "sid-dispatch-failure",
+        session,
+        [(event, f"completion {index}") for index, event in enumerate(events)],
+        consumer="dispatch-failure-test",
+    )
+
+    assert released == [event["delegation_id"] for event in events]
+    assert session["running"] is False
+    assert "delivery claim release failed" in caplog.text
+
+
 def test_idle_completion_batch_keeps_interrupted_async_child_visible(monkeypatch):
     """One interrupted child prevents a mixed idle batch from becoming a noop."""
     dispatched = []

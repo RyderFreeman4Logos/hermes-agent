@@ -4103,6 +4103,31 @@ class TurnRunner:
                 release_event_delivery(evt, claim, consume_attempt=False)
         return formatted
 
+    @staticmethod
+    def _settle_turn_start_async_completions(
+        completions: list[tuple[dict, str, str]], result: Optional[dict] = None
+    ) -> None:
+        """Settle each gateway turn-start delivery claim independently."""
+        from tools.async_delegation import (
+            complete_event_delivery,
+            release_event_delivery,
+            turn_result_acknowledges_delivery,
+        )
+
+        acknowledged = turn_result_acknowledges_delivery(result)
+        for evt, claim, _text in completions:
+            try:
+                if acknowledged:
+                    complete_event_delivery(evt, claim)
+                else:
+                    release_event_delivery(evt, claim)
+            except Exception:
+                logger.warning(
+                    "Gateway delivery claim %s failed",
+                    "completion" if acknowledged else "release",
+                    exc_info=True,
+                )
+
     def run_sync(self):
         ctx = self._ctx
         # Historical note: as a nested closure this body declared
@@ -5156,23 +5181,14 @@ class TurnRunner:
                     _api_run_message, **_conversation_kwargs
                 )
             except Exception:
-                from tools.async_delegation import release_event_delivery
-
-                for evt, claim, _text in _turn_start_completions:
-                    release_event_delivery(evt, claim)
+                self._settle_turn_start_async_completions(
+                    _turn_start_completions
+                )
                 raise
             else:
-                from tools.async_delegation import (
-                    complete_event_delivery,
-                    release_event_delivery,
-                    turn_result_acknowledges_delivery,
+                self._settle_turn_start_async_completions(
+                    _turn_start_completions, result
                 )
-
-                for evt, claim, _text in _turn_start_completions:
-                    if turn_result_acknowledges_delivery(result):
-                        complete_event_delivery(evt, claim)
-                    else:
-                        release_event_delivery(evt, claim)
         finally:
             if _delivery_renewal_stop is not None:
                 _delivery_renewal_stop.set()

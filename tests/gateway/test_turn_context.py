@@ -124,3 +124,43 @@ class TestTurnRunner:
         assert "gateway child done" in claimed[0][2]
         assert ad.get_durable_delegation(delegation_id)["delivery_attempts"] >= 1
         ad.complete_event_delivery(claimed[0][0], claimed[0][1])
+
+    @pytest.mark.parametrize(
+        ("result", "operation"),
+        [
+            ({"api_calls": 1}, "completion"),
+            ({"api_calls": 0}, "release"),
+        ],
+    )
+    def test_gateway_settles_later_claims_after_one_store_failure(
+        self, monkeypatch, caplog, result, operation
+    ):
+        from tools import async_delegation as ad
+
+        runner = _make_runner(TurnContext())
+        completions = [
+            (
+                {"type": "async_delegation", "delegation_id": "deleg-first"},
+                "claim-first",
+                "first",
+            ),
+            (
+                {"type": "async_delegation", "delegation_id": "deleg-second"},
+                "claim-second",
+                "second",
+            ),
+        ]
+        attempted = []
+
+        def settle(evt, _claim):
+            attempted.append(evt["delegation_id"])
+            if len(attempted) == 1:
+                raise RuntimeError("store unavailable")
+
+        monkeypatch.setattr(ad, "complete_event_delivery", settle)
+        monkeypatch.setattr(ad, "release_event_delivery", settle)
+
+        runner._settle_turn_start_async_completions(completions, result)
+
+        assert attempted == ["deleg-first", "deleg-second"]
+        assert f"delivery claim {operation} failed" in caplog.text

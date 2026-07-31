@@ -9211,7 +9211,13 @@ def _dispatch_idle_completion_batch(
         from tools.async_delegation import release_event_delivery
 
         for evt, claim in claims:
-            release_event_delivery(evt, claim)
+            try:
+                release_event_delivery(evt, claim)
+            except Exception:
+                logger.warning(
+                    "TUI idle completion delivery claim release failed",
+                    exc_info=True,
+                )
         with session["history_lock"]:
             session["running"] = False
         logger.warning("Idle completion batch dispatch failed", exc_info=True)

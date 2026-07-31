@@ -2,6 +2,8 @@
 
 import queue
 
+import pytest
+
 from cli import HermesCLI
 
 
@@ -24,8 +26,6 @@ def test_cli_completion_drain_uses_visible_session_identity(monkeypatch):
             return [(event, "completion payload")]
 
     claimed = []
-    completed = []
-
     monkeypatch.setattr(
         "tools.process_registry.process_registry",
         FakeRegistry(),
@@ -36,15 +36,17 @@ def test_cli_completion_drain_uses_visible_session_identity(monkeypatch):
     )
     monkeypatch.setattr(
         "tools.async_delegation.complete_event_delivery",
-        lambda evt, token: completed.append((evt, token)),
+        lambda *_args: pytest.fail("queued input completed delivery"),
     )
 
     cli._drain_process_notifications("cli-idle")
 
     assert calls == [("visible-session", True)]
-    assert cli._pending_input.get_nowait() == "completion payload"
+    pending = cli._pending_input.get_nowait()
+    assert pending.text == "completion payload"
+    assert pending.event is event
+    assert pending.claim == "claim-token"
     assert claimed == [(event, "cli-idle")]
-    assert completed == [(event, "claim-token")]
 
 
 def test_cli_completion_ownership_rejects_foreign_session():

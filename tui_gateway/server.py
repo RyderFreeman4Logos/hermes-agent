@@ -8919,7 +8919,7 @@ def _completion_notify_steer_when_busy() -> bool:
 
 
 def _try_steer_busy_notification(
-    session: dict, evt: dict, text: str, *, on_applied=None
+    session: dict, evt: dict, text: str, *, on_applied=None, receipt: dict | None = None
 ) -> str | bool | None:
     """Deliver a completion to a running steer-capable agent when allowed.
 
@@ -8942,7 +8942,11 @@ def _try_steer_busy_notification(
     if not callable(steer):
         return False
 
-    from tools.async_delegation import claim_event_delivery, release_event_delivery
+    from tools.async_delegation import (
+        claim_event_delivery,
+        release_event_delivery,
+        start_event_delivery_renewal,
+    )
 
     try:
         claim = claim_event_delivery(evt, "tui-poller-steer")
@@ -8951,20 +8955,29 @@ def _try_steer_busy_notification(
         return False
     if claim is None:
         return "claimed_elsewhere"
-    # An AIAgent calls its receipt at a later tool boundary.  Third-party
-    # agents may apply synchronously, though, so gate the acknowledgement until
-    # this function has released the first (best-effort) durable claim.  Without
-    # that gate a synchronous callback sees its own temporary claim and marks a
-    # receipt applied without ever recording ``delivered``.
+    receipt = receipt if receipt is not None else {}
+    try:
+        renewal_stop = start_event_delivery_renewal([(evt, claim)])
+    except Exception:
+        logger.warning("TUI busy-steer renewal start failed", exc_info=True)
+        try:
+            release_event_delivery(evt, claim, consume_attempt=False)
+        except Exception:
+            logger.warning("TUI busy-steer claim release failed", exc_info=True)
+        return False
+    receipt.update(evt=evt, text=text, claim=claim, renewal_stop=renewal_stop)
+    # An AIAgent calls its receipt at a later tool boundary. Third-party agents
+    # may apply synchronously, so do not transfer ownership until steer()
+    # confirms that it accepted the text.
     receipt_lock = threading.Lock()
-    release_finished = False
-    applied_before_release = False
+    acceptance_finished = False
+    applied_before_acceptance = False
 
     def applied_receipt() -> None:
-        nonlocal applied_before_release
+        nonlocal applied_before_acceptance
         with receipt_lock:
-            if not release_finished:
-                applied_before_release = True
+            if not acceptance_finished:
+                applied_before_acceptance = True
                 return
         if callable(on_applied):
             on_applied()
@@ -8980,6 +8993,7 @@ def _try_steer_busy_notification(
     except Exception:
         accepted = False
     if not accepted:
+        receipt["renewal_stop"].set()
         try:
             release_event_delivery(evt, claim, consume_attempt=False)
         except Exception:
@@ -8991,22 +9005,11 @@ def _try_steer_busy_notification(
 
     with session["history_lock"]:
         session["last_active"] = time.time()
-    try:
-        # steer() only appends to the agent's pending-steer buffer. The turn may
-        # end before consuming that buffer, so leave the durable completion
-        # pending for a later idle drain instead of marking it delivered here.
-        release_event_delivery(evt, claim, consume_attempt=False)
-        with receipt_lock:
-            release_finished = True
-            apply_now = applied_before_release
-        if apply_now and callable(on_applied):
-            on_applied()
-    except Exception as exc:
-        logger.warning(
-            "TUI busy-steer completion claim release failed: %s: %s",
-            type(exc).__name__,
-            exc,
-        )
+    with receipt_lock:
+        acceptance_finished = True
+        apply_now = applied_before_acceptance
+    if apply_now and callable(on_applied):
+        on_applied()
     return "steered"
 
 
@@ -9093,30 +9096,17 @@ def _format_idle_completion_batch(entries: list[tuple[dict, str]]) -> str:
     return "\n".join(lines)
 
 
-def _complete_steered_notification(evt: dict, receipt: dict) -> None:
-    """Durably acknowledge a steer only after its marker reached a tool result."""
-    from tools.async_delegation import (
-        claim_event_delivery,
-        complete_event_delivery,
-        release_event_delivery,
-    )
-
-    try:
-        claim = claim_event_delivery(evt, "tui-poller-steer-applied")
-        if claim is None:
-            # The model did receive the result.  Another valid consumer may
-            # have won the durable race, but this poller must not manufacture a
-            # second idle model turn for an already-applied steer.
-            receipt["applied"] = True
+def _complete_steered_notification(
+    session: dict, evt: dict, receipt: dict
+) -> None:
+    """Transfer an applied steer claim to the real turn that must acknowledge it."""
+    with session["history_lock"]:
+        claims = session.get("_active_delivery_claims")
+        if not isinstance(claims, list):
             return
-        try:
-            complete_event_delivery(evt, claim)
-        except Exception:
-            release_event_delivery(evt, claim, consume_attempt=False)
-            raise
+        claims.append((evt, receipt["claim"]))
         receipt["applied"] = True
-    except Exception:
-        logger.warning("Failed to acknowledge applied completion steer", exc_info=True)
+    receipt["renewal_stop"].set()
 
 
 def _drain_idle_completion_backlog(
@@ -9170,24 +9160,46 @@ def _drain_idle_completion_backlog(
 
 
 def _dispatch_idle_completion_batch(
-    rid: str, sid: str, session: dict, entries: list[tuple[dict, str]], *, consumer: str
+    rid: str, sid: str, session: dict, entries: list[tuple[dict, str]], *,
+    consumer: str, preclaimed: list[tuple[dict, str]] | None = None,
 ) -> bool:
     """Claim each event, then inject one idle turn without merging durability."""
     if len(entries) > _COMPLETION_IDLE_BATCH_MAX:
         # Batch size caps model input only. The excess events remain queued and
         # retain their individual durable delivery records for the next batch.
+        from tools.async_delegation import release_event_delivery
         from tools.process_registry import process_registry
 
-        for evt, _text in entries[_COMPLETION_IDLE_BATCH_MAX:]:
-            process_registry.completion_queue.put(evt)
+        excess = entries[_COMPLETION_IDLE_BATCH_MAX:]
+        for evt, _text in excess:
+            for claimed_evt, claim in list(preclaimed or []):
+                if evt is claimed_evt:
+                    try:
+                        release_event_delivery(
+                            evt, claim, consume_attempt=False
+                        )
+                    except Exception:
+                        logger.warning(
+                            "TUI excess steer claim release failed",
+                            exc_info=True,
+                        )
+            if evt.get("type") == "async_delegation":
+                process_registry.completion_queue.put(evt)
         entries = entries[:_COMPLETION_IDLE_BATCH_MAX]
+        preclaimed = [
+            (evt, claim)
+            for evt, claim in preclaimed or []
+            if any(evt is kept_evt for kept_evt, _text in entries)
+        ]
     from tools.async_delegation import (
         claim_event_delivery,
         release_event_delivery,
     )
 
-    claims: list[tuple[dict, str]] = []
+    claims: list[tuple[dict, str]] = list(preclaimed or [])
     for evt, _text in entries:
+        if any(evt is claimed_evt for claimed_evt, _claim in claims):
+            continue
         try:
             claim = claim_event_delivery(evt, consumer)
         except Exception:
@@ -9437,13 +9449,19 @@ def _notification_poller_loop(
                 if idle:
                     session["running"] = True
             if idle:
-                entries = [(receipt["evt"], receipt["text"]) for receipt in _steered_pending]
+                receipts = list(_steered_pending)
+                entries = [(receipt["evt"], receipt["text"]) for receipt in receipts]
                 _steered_pending.clear()
                 entries.extend(_drain_idle_completion_backlog(sid, session, _emitted, process_registry))
                 _dispatch_idle_completion_batch(
                     f"__notif__{int(time.time() * 1000)}", sid, session, entries,
                     consumer="tui-poller-idle-batch",
+                    preclaimed=[
+                        (receipt["evt"], receipt["claim"]) for receipt in receipts
+                    ],
                 )
+                for receipt in receipts:
+                    receipt["renewal_stop"].set()
                 continue
         try:
             # Pending receipts need a shorter wakeup so a turn-end fallback is
@@ -9521,8 +9539,9 @@ def _notification_poller_loop(
             evt,
             text,
             on_applied=lambda evt=evt, receipt=receipt: _complete_steered_notification(
-                evt, receipt
+                session, evt, receipt
             ),
+            receipt=receipt,
         )
         if steer_result == "steered":
             _steered_pending.append(receipt)
@@ -9564,11 +9583,24 @@ def _notification_poller_loop(
     # live sessions are set aside and re-queued so their poller still sees them.
     # Orphaned events (owner gone) are dropped — same guard as the main loop.
     # Return steered-but-unconsumed events to the shared queue if this poller
-    # stops before it gets an idle retry. Their durable claim was released, so
-    # another live poller or a later session can still deliver them.
-    deferred: list = [
-        receipt["evt"] for receipt in _steered_pending if not receipt.get("applied")
-    ]
+    # stops before it gets an idle retry. Release each held claim before
+    # returning the event so another live poller or later session can deliver.
+    deferred: list = []
+    for receipt in _steered_pending:
+        if receipt.get("applied"):
+            continue
+        receipt["renewal_stop"].set()
+        try:
+            from tools.async_delegation import release_event_delivery
+
+            release_event_delivery(
+                receipt["evt"], receipt["claim"], consume_attempt=False
+            )
+        except Exception:
+            logger.warning(
+                "TUI shutdown steer claim release failed", exc_info=True
+            )
+        deferred.append(receipt["evt"])
     while not process_registry.completion_queue.empty():
         try:
             evt = process_registry.completion_queue.get_nowait()
@@ -9611,8 +9643,23 @@ def _notification_poller_loop(
             _emit("status.update", sid, {"kind": "process", "text": text})
             _emitted.add(_dedup_key)
 
-        steer_result = _try_steer_busy_notification(session, evt, text)
+        shutdown_receipt = {"evt": evt, "text": text, "applied": False}
+        steer_result = _try_steer_busy_notification(
+            session, evt, text, receipt=shutdown_receipt
+        )
         if steer_result == "steered":
+            shutdown_receipt["renewal_stop"].set()
+            try:
+                from tools.async_delegation import release_event_delivery
+
+                release_event_delivery(
+                    evt, shutdown_receipt["claim"], consume_attempt=False
+                )
+            except Exception:
+                logger.warning(
+                    "TUI shutdown accepted-steer claim release failed",
+                    exc_info=True,
+                )
             deferred.append(evt)
             continue
         if steer_result == "claimed_elsewhere":
@@ -9822,6 +9869,8 @@ def _run_prompt_submit(
             delivery_renewal_stop = start_event_delivery_renewal(
                 claimed_deliveries
             )
+            with session["history_lock"]:
+                session["_active_delivery_claims"] = claimed_deliveries
             approval_token = set_current_session_key(session["session_key"])
             session_tokens = _set_session_context(
                 session["session_key"],
@@ -10082,6 +10131,9 @@ def _run_prompt_submit(
                 run_kwargs["persist_user_display_kind"] = display_kind
                 run_kwargs["persist_user_display_metadata"] = display_metadata
             result = agent.run_conversation(run_message, **run_kwargs)
+            with session["history_lock"]:
+                if session.get("_active_delivery_claims") is claimed_deliveries:
+                    session.pop("_active_delivery_claims", None)
             from tools.async_delegation import settle_event_deliveries
 
             settle_event_deliveries(
@@ -10458,6 +10510,9 @@ def _run_prompt_submit(
                 )
                 _emit("error", sid, {"message": str(e)})
         finally:
+            with session["history_lock"]:
+                if session.get("_active_delivery_claims") is claimed_deliveries:
+                    session.pop("_active_delivery_claims", None)
             if delivery_renewal_stop is not None:
                 delivery_renewal_stop.set()
             if claimed_deliveries:

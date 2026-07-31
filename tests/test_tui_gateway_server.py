@@ -4732,10 +4732,10 @@ def test_notification_poller_delivers_owned_events(
     monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
     process_registry._completion_consumed.discard("proc_mine")
     isolated_queue.put(
-        {
-            "type": "completion",
-            "session_id": "proc_mine",
-            "command": "echo mine",
+            {
+                "type": "completion",
+                "session_id": "proc_mine",
+                "command": "echo mine",
             "exit_code": 0,
             "output": "mine",
             **routing,
@@ -14159,8 +14159,22 @@ def test_notification_poller_steers_busy_completion_when_enabled(monkeypatch, sh
             process_registry.completion_queue.get_nowait()
 
 
-def test_busy_steer_acceptance_releases_durable_claim_for_idle_retry(monkeypatch):
-    """Buffering a steer is not proof that the model consumed the completion."""
+@pytest.mark.parametrize(
+    ("turn_result", "expected"),
+    [
+        ({"api_calls": 1}, "complete"),
+        ({"api_calls": 0}, "release"),
+        ({"api_calls": 1, "failed": True}, "release"),
+        ({"api_calls": 1, "interrupted": True}, "release"),
+        ({"api_calls": 1, "error": "provider"}, "release"),
+        ({"api_calls": 1, "exception": "boom"}, "release"),
+        ({"api_calls": 1, "cancelled": True}, "release"),
+    ],
+)
+def test_busy_steer_acceptance_keeps_exact_claim_for_real_turn(
+    monkeypatch, turn_result, expected
+):
+    """Buffering and applying a marker transfer, but never acknowledge, its claim."""
     import tools.async_delegation as async_delegation
 
     delivery = {"held": False, "delivered": False}
@@ -14175,9 +14189,8 @@ def test_busy_steer_acceptance_releases_durable_claim_for_idle_retry(monkeypatch
 
     def release(evt, token, *, consume_attempt=True):
         assert token == "claim-tui-poller-steer"
-        assert consume_attempt is False
         delivery["held"] = False
-        released.append((evt, token))
+        released.append((evt, token, consume_attempt))
 
     def complete(evt, token):
         delivery["held"] = False
@@ -14188,17 +14201,51 @@ def test_busy_steer_acceptance_releases_durable_claim_for_idle_retry(monkeypatch
     monkeypatch.setattr(async_delegation, "claim_event_delivery", claim)
     monkeypatch.setattr(async_delegation, "release_event_delivery", release)
     monkeypatch.setattr(async_delegation, "complete_event_delivery", complete)
-
-    evt = {"type": "async_delegation", "delegation_id": "delegation-steer-retry"}
-    session = _session(
-        agent=types.SimpleNamespace(steer=lambda text: True),
-        running=True,
+    monkeypatch.setattr(
+        async_delegation,
+        "start_event_delivery_renewal",
+        lambda _claims: threading.Event(),
     )
 
-    assert server._try_steer_busy_notification(session, evt, "child completed") == "steered"
-    assert released == [(evt, "claim-tui-poller-steer")]
+    evt = {"type": "async_delegation", "delegation_id": "delegation-steer-retry"}
+    callbacks = []
+    session = _session(
+        agent=types.SimpleNamespace(
+            steer=lambda _text, *, on_applied=None: callbacks.append(on_applied) or True
+        ),
+        running=True,
+    )
+    active_claims = []
+    session["_active_delivery_claims"] = active_claims
+    receipt = {"applied": False}
+
+    assert server._try_steer_busy_notification(
+        session,
+        evt,
+        "child completed",
+        receipt=receipt,
+        on_applied=lambda: server._complete_steered_notification(
+            session, evt, receipt
+        ),
+    ) == "steered"
+    assert released == []
     assert completed == []
-    assert async_delegation.claim_event_delivery(evt, "tui-idle-drain") == "claim-tui-idle-drain"
+    assert async_delegation.claim_event_delivery(evt, "tui-idle-drain") is None
+
+    callbacks[0]()
+
+    assert receipt["applied"] is True
+    assert active_claims == [(evt, "claim-tui-poller-steer")]
+    assert completed == []
+
+    async_delegation.settle_event_deliveries(active_claims, turn_result)
+
+    if expected == "complete":
+        assert completed == [(evt, "claim-tui-poller-steer")]
+        assert released == []
+    else:
+        assert completed == []
+        assert released == [(evt, "claim-tui-poller-steer", True)]
 
 
 def test_busy_steer_rejection_release_error_does_not_break_poller(monkeypatch):
@@ -14684,6 +14731,8 @@ def test_notification_poller_steers_burst_without_hol_or_idle_duplicates(monkeyp
     session = _session(
         agent=agent, running=True, session_key="completion-owner"
     )
+    active_claims = []
+    session["_active_delivery_claims"] = active_claims
     stop = threading.Event()
     events = [
         _async_completion_event(index, origin_ui_session_id="sid-burst-steer")
@@ -14699,6 +14748,11 @@ def test_notification_poller_steers_burst_without_hol_or_idle_duplicates(monkeyp
     monkeypatch.setattr(async_delegation, "claim_event_delivery", claim)
     monkeypatch.setattr(async_delegation, "release_event_delivery", release)
     monkeypatch.setattr(async_delegation, "complete_event_delivery", complete)
+    monkeypatch.setattr(
+        async_delegation,
+        "start_event_delivery_renewal",
+        lambda _claims: threading.Event(),
+    )
     server._sessions["sid-burst-steer"] = session
 
     worker = threading.Thread(
@@ -14714,6 +14768,10 @@ def test_notification_poller_steers_burst_without_hol_or_idle_duplicates(monkeyp
 
         assert not worker.is_alive()
         assert len(agent.texts) == 7
+        assert delivery["completed"] == []
+        async_delegation.settle_event_deliveries(
+            active_claims, {"api_calls": 1}
+        )
         assert len(delivery["completed"]) == 7
         assert delivery["delivered"] == {event["delegation_id"] for event in events}
         assert isolated_queue.empty()
@@ -14783,6 +14841,11 @@ def test_notification_poller_batches_unapplied_steers_and_completes_durable_once
     monkeypatch.setattr(async_delegation, "claim_event_delivery", claim)
     monkeypatch.setattr(async_delegation, "release_event_delivery", release)
     monkeypatch.setattr(async_delegation, "complete_event_delivery", complete)
+    monkeypatch.setattr(
+        async_delegation,
+        "start_event_delivery_renewal",
+        lambda _claims: threading.Event(),
+    )
 
     def submit(_rid, _sid, _session, text, **kwargs):
         idle_turns.append((text, kwargs))
@@ -14811,7 +14874,7 @@ def test_notification_poller_batches_unapplied_steers_and_completes_durable_once
         assert kwargs["turn_origin"] == "idle_completion"
         assert kwargs["allow_silent_noop"] is True
         assert kwargs["delivery_claims"] == [
-            (event, f"tui-poller-idle-batch:{event['delegation_id']}")
+            (event, f"tui-poller-steer:{event['delegation_id']}")
             for event in events
         ]
         assert delivery["completed"] == []

@@ -389,3 +389,67 @@ async def test_api_self_post_settles_claim_from_real_turn_result(
 
     assert result is True
     assert settled == [expected]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("self_post_result", "expected"),
+    [
+        ({"api_calls": 1}, "complete"),
+        (asyncio.TimeoutError(), "release"),
+    ],
+)
+async def test_api_self_post_renews_through_http_and_always_stops(
+    monkeypatch, tmp_path, self_post_result, expected
+):
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    runner.adapters[Platform.API_SERVER] = SimpleNamespace(
+        supports_async_delivery=False,
+        _host="127.0.0.1",
+        _port=8642,
+        _api_key="k",
+        _model_name="m",
+    )
+    lifecycle = []
+    stop = SimpleNamespace(set=lambda: lifecycle.append("stop"))
+
+    async def fake_self_post(_adapter, *, text, session_id):
+        assert text == "[SYSTEM: done]"
+        assert session_id == "raw-api-session"
+        if isinstance(self_post_result, BaseException):
+            raise self_post_result
+        return self_post_result
+
+    import gateway.wake as wake_mod
+    from tools import async_delegation as ad
+
+    monkeypatch.setattr(wake_mod, "_self_post_chat_completion", fake_self_post)
+    monkeypatch.setattr(
+        ad, "claim_event_delivery", lambda _evt, _consumer: "claim-api"
+    )
+    monkeypatch.setattr(
+        ad,
+        "start_event_delivery_renewal",
+        lambda claims: lifecycle.append(("renew", list(claims))) or stop,
+    )
+    monkeypatch.setattr(
+        ad,
+        "complete_event_delivery",
+        lambda _evt, _claim: lifecycle.append("complete"),
+    )
+    monkeypatch.setattr(
+        ad,
+        "release_event_delivery",
+        lambda _evt, _claim: lifecycle.append("release"),
+    )
+
+    result = await runner._deliver_completion_notification(
+        "[SYSTEM: done]",
+        {"type": "completion", "session_key": "raw-api-session"},
+    )
+
+    assert result is (expected == "complete")
+    assert lifecycle[0][0] == "renew"
+    assert lifecycle[1:] == (
+        ["complete", "stop"] if expected == "complete" else ["stop", "release"]
+    )

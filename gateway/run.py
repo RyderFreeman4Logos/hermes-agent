@@ -21198,7 +21198,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return False
 
         accepted = False
+        renewal_stop = None
         try:
+            if claims:
+                from tools.async_delegation import start_event_delivery_renewal
+
+                renewal_stop = start_event_delivery_renewal(claims)
             injection_result = await self._inject_watch_notification(
                 synth_text,
                 evt,
@@ -21213,6 +21218,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             accepted = True
             return True
         finally:
+            if renewal_stop is not None:
+                renewal_stop.set()
             if claim and not accepted:
                 try:
                     release_event_delivery(evt, claim)

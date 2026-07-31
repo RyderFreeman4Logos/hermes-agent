@@ -439,6 +439,78 @@ def test_concurrent_claims_share_the_same_narrow_delivery_seam():
     adapter.handle_message.assert_awaited_once()
 
 
+def test_long_gateway_delivery_renews_claim_until_turn_owns_it(monkeypatch):
+    from tools import async_delegation as ad
+
+    event = _async_event("deleg_long_delivery")
+    _persist_pending_completion(event)
+    entered = asyncio.Event()
+    finish = asyncio.Event()
+    renewals = []
+    original_renew = ad.renew_completion_delivery
+
+    async def held_injection(_event):
+        entered.set()
+        await finish.wait()
+
+    def observed_renew(delegation_id, claim):
+        renewed = original_renew(delegation_id, claim)
+        renewals.append((delegation_id, claim, renewed))
+        return renewed
+
+    monkeypatch.setattr(ad, "_DELIVERY_CLAIM_LEASE_SECONDS", 0.2)
+    monkeypatch.setattr(ad, "_DELIVERY_CLAIM_RENEW_INTERVAL_SECONDS", 0.02)
+    monkeypatch.setattr(ad, "renew_completion_delivery", observed_renew)
+    runner = _runner(SimpleNamespace(handle_message=held_injection))
+
+    async def exercise():
+        task = asyncio.create_task(
+            runner._deliver_completion_notification("completion", event)
+        )
+        await entered.wait()
+        await asyncio.sleep(0.25)
+        assert len(renewals) >= 2
+        assert renewals[-1][2] is True
+        assert ad.claim_event_delivery(event, "foreign") is None
+        finish.set()
+        assert await task is True
+
+    asyncio.run(exercise())
+
+
+def test_failed_long_gateway_delivery_stops_renewal_and_releases_claim(
+    monkeypatch,
+):
+    from tools import async_delegation as ad
+
+    event = _async_event("deleg_long_delivery_timeout")
+    _persist_pending_completion(event)
+    renewal_attempts = []
+
+    def failed_renew(_evt, _claim):
+        renewal_attempts.append(1)
+        raise OSError("renew store unavailable")
+
+    async def timeout(_event):
+        await asyncio.sleep(0.03)
+        raise asyncio.TimeoutError()
+
+    monkeypatch.setattr(ad, "_DELIVERY_CLAIM_RENEW_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(ad, "renew_event_delivery", failed_renew)
+    runner = _runner(SimpleNamespace(handle_message=timeout))
+
+    assert asyncio.run(
+        runner._deliver_completion_notification("completion", event)
+    ) is False
+    attempts_after_return = len(renewal_attempts)
+    asyncio.run(asyncio.sleep(0.03))
+
+    assert len(renewal_attempts) == attempts_after_return
+    retry_claim = ad.claim_event_delivery(event, "retry")
+    assert retry_claim
+    ad.release_event_delivery(event, retry_claim)
+
+
 def test_failed_async_injection_is_retried_without_schedule_time_ack(
     monkeypatch, isolated_registry,
 ):

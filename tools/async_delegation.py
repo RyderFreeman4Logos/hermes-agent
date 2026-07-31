@@ -1286,6 +1286,18 @@ def complete_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
         complete_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
 
 
+def turn_result_acknowledges_delivery(result: Any) -> bool:
+    """True only when a completion reached a successful real model turn."""
+    if not isinstance(result, dict):
+        return False
+    if result.get("failed") or result.get("interrupted") or result.get("error"):
+        return False
+    try:
+        return int(result.get("api_calls", 0) or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
 def release_event_delivery(
     evt: Dict[str, Any], claim_id: str, consume_attempt: bool = True
 ) -> None:

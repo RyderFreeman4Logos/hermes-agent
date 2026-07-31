@@ -8676,16 +8676,11 @@ def _claim_turn_start_async_completions(
     sid: str, session: dict
 ) -> list[tuple[dict, str, str]]:
     """Claim this resumed session's owner-local completions before its user turn."""
-    from tools.async_delegation import (
-        claim_owner_local_pending_completions,
-        poll_owner_local_async_completions,
-    )
+    from tools.async_delegation import claim_owner_local_pending_completions
     from tools.process_registry import (
         format_process_notification,
-        process_registry,
     )
 
-    poll_owner_local_async_completions(process_registry.completion_queue)
     claimed = claim_owner_local_pending_completions(
         lambda evt: _session_owns_notification_event(sid, session, evt),
         "tui-turn-start",
@@ -9172,7 +9167,6 @@ def _dispatch_idle_completion_batch(
         entries = entries[:_COMPLETION_IDLE_BATCH_MAX]
     from tools.async_delegation import (
         claim_event_delivery,
-        complete_event_delivery,
         release_event_delivery,
     )
 
@@ -9210,11 +9204,12 @@ def _dispatch_idle_completion_batch(
             display_metadata=display_metadata,
             turn_origin="idle_completion",
             allow_silent_noop=allow_silent_noop,
+            delivery_claims=claims,
         )
-        for evt, claim in claims:
-            complete_event_delivery(evt, claim)
         return True
     except Exception:
+        from tools.async_delegation import release_event_delivery
+
         for evt, claim in claims:
             release_event_delivery(evt, claim)
         with session["history_lock"]:
@@ -9758,6 +9753,7 @@ def _run_prompt_submit(
     display_metadata: dict | None = None,
     turn_origin: str | None = None,
     allow_silent_noop: bool | None = None,
+    delivery_claims: list[tuple[dict, str]] | None = None,
 ) -> None:
     with session["history_lock"]:
         history = list(session["history"])
@@ -9771,6 +9767,7 @@ def _run_prompt_submit(
             _start_inflight_turn(session, text)
     agent = session["agent"]
     turn_start_completions: list[tuple[dict, str, str]] = []
+    claimed_deliveries = list(delivery_claims or [])
     if turn_origin is None and isinstance(text, str):
         try:
             turn_start_completions = _claim_turn_start_async_completions(
@@ -9780,6 +9777,9 @@ def _run_prompt_submit(
             logger.warning(
                 "TUI turn-start async completion claim failed", exc_info=True
             )
+        claimed_deliveries.extend(
+            (evt, claim) for evt, claim, _text in turn_start_completions
+        )
     if hasattr(agent, "clear_interrupt"):
         try:
             agent.clear_interrupt()
@@ -10082,14 +10082,21 @@ def _run_prompt_submit(
             except Exception:
                 from tools.async_delegation import release_event_delivery
 
-                for evt, claim, _completion_text in turn_start_completions:
+                for evt, claim in claimed_deliveries:
                     release_event_delivery(evt, claim)
                 raise
             else:
-                from tools.async_delegation import complete_event_delivery
+                from tools.async_delegation import (
+                    complete_event_delivery,
+                    release_event_delivery,
+                    turn_result_acknowledges_delivery,
+                )
 
-                for evt, claim, _completion_text in turn_start_completions:
-                    complete_event_delivery(evt, claim)
+                for evt, claim in claimed_deliveries:
+                    if turn_result_acknowledges_delivery(result):
+                        complete_event_delivery(evt, claim)
+                    else:
+                        release_event_delivery(evt, claim)
             heartbeat_silent_noop = (
                 turn_origin == "heartbeat_warm"
                 and isinstance(result, dict)

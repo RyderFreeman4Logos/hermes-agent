@@ -4075,12 +4075,9 @@ class TurnRunner:
         from tools.async_delegation import (
             async_event_matches_session,
             claim_owner_local_pending_completions,
-            poll_owner_local_async_completions,
             release_event_delivery,
         )
-        from tools.process_registry import process_registry
 
-        poll_owner_local_async_completions(process_registry.completion_queue)
         session_ids = {
             str(ctx.session_key or ""),
             str(ctx.session_id or ""),
@@ -5159,10 +5156,17 @@ class TurnRunner:
                     release_event_delivery(evt, claim)
                 raise
             else:
-                from tools.async_delegation import complete_event_delivery
+                from tools.async_delegation import (
+                    complete_event_delivery,
+                    release_event_delivery,
+                    turn_result_acknowledges_delivery,
+                )
 
                 for evt, claim, _text in _turn_start_completions:
-                    complete_event_delivery(evt, claim)
+                    if turn_result_acknowledges_delivery(result):
+                        complete_event_delivery(evt, claim)
+                    else:
+                        release_event_delivery(evt, claim)
         finally:
             unregister_gateway_notify(_approval_session_key)
             # Cancel any pending clarify entries so blocked agent

@@ -14,6 +14,8 @@ finishes, and the outer finalisation code runs — proving no NameError.
 """
 
 import asyncio
+from collections import UserDict
+import os
 import sys
 import threading
 import types
@@ -31,6 +33,9 @@ from gateway.session import SessionSource
 class _NoopAgent:
     """Minimal agent stub that returns immediately without tool calls."""
 
+    turn_result = None
+    last_prompt = None
+
     def __init__(self, *args, **kwargs):
         self.tools = []
         self.model = kwargs.get("model", "test-model")
@@ -42,7 +47,8 @@ class _NoopAgent:
     def run_conversation(self, user_message, conversation_history=None,
                          task_id=None, persist_user_message=None,
                          persist_user_timestamp=None):
-        return {
+        type(self).last_prompt = user_message
+        return type(self).turn_result or {
             "final_response": "Hello from the agent.",
             "messages": [],
             "api_calls": 1,
@@ -155,3 +161,118 @@ def test_run_agent_voice_turn_no_name_error(monkeypatch, tmp_path):
     assert result["final_response"] == "Hello from the agent."
 
 
+@pytest.mark.parametrize(
+    ("turn_result", "expected_delivery_state"),
+    [
+        (
+            {
+                "final_response": "Completion received.",
+                "messages": [{"role": "assistant", "content": "Completion received."}],
+                "api_calls": 1,
+                "failed": False,
+            },
+            "delivered",
+        ),
+        (
+            {
+                "final_response": "",
+                "messages": [],
+                "api_calls": 1,
+                "failed": True,
+            },
+            "pending",
+        ),
+        (
+            {
+                "final_response": "",
+                "messages": [],
+                "api_calls": 1,
+                "interrupted": True,
+            },
+            "pending",
+        ),
+        (
+            {
+                "final_response": "",
+                "messages": [],
+                "api_calls": 0,
+                "failed": False,
+            },
+            "pending",
+        ),
+        (
+            UserDict(
+                {
+                    "final_response": "",
+                    "messages": [],
+                    "api_calls": 1,
+                    "failed": False,
+                }
+            ),
+            "pending",
+        ),
+    ],
+)
+def test_gateway_turn_start_acknowledges_completion_delivery_only_after_model_turn(
+    monkeypatch, tmp_path, turn_result, expected_delivery_state
+):
+    from tools import async_delegation as ad
+
+    _setup_monkeypatches(monkeypatch, tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(_NoopAgent, "turn_result", turn_result)
+    monkeypatch.setattr(_NoopAgent, "last_prompt", None)
+    runner = _make_runner()
+    monkeypatch.setattr(
+        gateway_run.GatewayRunner,
+        "_adapter_for_source",
+        lambda self, source: None,
+    )
+
+    delegation_id = "deleg-gateway-turn-ack"
+    session_key = "agent:main:telegram:dm:12345"
+    event = {
+        "type": "async_delegation",
+        "delegation_id": delegation_id,
+        "session_key": session_key,
+        "parent_session_id": "session-1",
+        "status": "completed",
+        "summary": "background review passed",
+        "dispatched_at": 1.0,
+        "completed_at": 2.0,
+    }
+    ad._persist_dispatch(
+        {
+            "delegation_id": delegation_id,
+            "session_key": session_key,
+            "parent_session_id": "session-1",
+            "dispatched_at": 1.0,
+            "goal": "review",
+        }
+    )
+    ad._persist_completion(
+        event,
+        {"status": "completed", "summary": "background review passed"},
+    )
+    with ad._DB_LOCK, ad._connect() as conn:
+        conn.execute(
+            "UPDATE async_delegations SET owner_pid=? WHERE delegation_id=?",
+            (os.getpid(), delegation_id),
+        )
+
+    async def _run():
+        return await runner._run_agent(
+            message="What is the status?",
+            context_prompt="",
+            history=[],
+            source=_make_voice_source(),
+            session_id="session-1",
+            session_key=session_key,
+        )
+
+    asyncio.new_event_loop().run_until_complete(_run())
+
+    assert "background review passed" in _NoopAgent.last_prompt
+    durable = ad.get_durable_delegation(delegation_id)
+    assert durable["delivery_state"] == expected_delivery_state
+    assert durable["delivery_attempts"] >= 1

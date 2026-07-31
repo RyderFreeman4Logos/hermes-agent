@@ -75,6 +75,23 @@ def _durable_task(delegation_id):
     return json.loads(row[0])
 
 
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        ({"api_calls": 1}, True),
+        ({"api_calls": 1, "failed": True}, False),
+        ({"api_calls": 1, "interrupted": True}, False),
+        ({"api_calls": 1, "error": "provider unavailable"}, False),
+        ({"api_calls": 0}, False),
+        ("not-a-result", False),
+    ],
+)
+def test_turn_result_acknowledges_delivery_only_after_successful_model_call(
+    result, expected
+):
+    assert ad.turn_result_acknowledges_delivery(result) is expected
+
+
 def test_dispatch_returns_immediately_without_blocking():
     gate = threading.Event()
 

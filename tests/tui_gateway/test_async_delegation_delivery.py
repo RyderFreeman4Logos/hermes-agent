@@ -75,7 +75,11 @@ def test_owner_idle_requeue_backfills_routing_and_starts_parent_delivery_turn(tm
     assert server._session_owns_notification_event("foreign-tab", foreign, event) is False
 
     submitted = []
-    with patch.object(server, "_run_prompt_submit", side_effect=lambda *args, **kwargs: submitted.append((args, kwargs))):
+    with patch.object(
+        server,
+        "_run_prompt_submit",
+        side_effect=lambda *args, **kwargs: submitted.append((args, kwargs)),
+    ):
         assert server._dispatch_idle_completion_batch(
             "delivery-rid",
             "owner-tab",
@@ -85,9 +89,12 @@ def test_owner_idle_requeue_backfills_routing_and_starts_parent_delivery_turn(tm
         ) is True
 
     assert submitted, "the owner poller did not start the parent delivery turn"
+    assert submitted[0][1]["delivery_claims"][0][0] is event
     durable = ad.get_durable_delegation(delegation_id)
     assert durable is not None
-    assert durable["delivery_state"] == "delivered"
+    # Scheduling is not delivery: the turn thread owns the claim until its
+    # run_conversation result proves that a real model call accepted it.
+    assert durable["delivery_state"] == "pending"
     assert durable["delivery_attempts"] >= 1
 
 

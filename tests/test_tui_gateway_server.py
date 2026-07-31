@@ -16860,8 +16860,49 @@ def test_prompt_submit_passes_persist_user_message_to_agent(monkeypatch):
         server._sessions.pop("sid", None)
 
 
-def test_user_prompt_claims_owner_pending_async_completion_without_interrupt(
-    monkeypatch, tmp_path
+@pytest.mark.parametrize(
+    ("turn_result", "expected_delivery_state"),
+    [
+        (
+            {
+                "final_response": "reply",
+                "messages": [{"role": "assistant", "content": "reply"}],
+                "api_calls": 1,
+            },
+            "delivered",
+        ),
+        (
+            {
+                "final_response": "",
+                "messages": [],
+                "api_calls": 1,
+                "failed": True,
+            },
+            "pending",
+        ),
+        (
+            {
+                "final_response": "",
+                "messages": [],
+                "api_calls": 1,
+                "interrupted": True,
+            },
+            "pending",
+        ),
+        (
+            {
+                "final_response": "",
+                "messages": [],
+                "api_calls": 0,
+                "failed": False,
+            },
+            "pending",
+        ),
+        ("not-a-result", "pending"),
+    ],
+)
+def test_user_prompt_acknowledges_pending_completion_only_after_model_turn(
+    monkeypatch, tmp_path, turn_result, expected_delivery_state
 ):
     """A normal user turn force-injects its completed child before the model call."""
     import tools.async_delegation as async_delegation
@@ -16899,7 +16940,7 @@ def test_user_prompt_claims_owner_pending_async_completion_without_interrupt(
             (os.getpid(), delegation_id),
         )
 
-    captured = {}
+    captured = {"prompts": [], "persist_user_messages": []}
 
     class _Agent:
         session_id = durable_id
@@ -16907,12 +16948,11 @@ def test_user_prompt_claims_owner_pending_async_completion_without_interrupt(
         def run_conversation(
             self, prompt, conversation_history=None, stream_callback=None, **kwargs
         ):
-            captured["prompt"] = prompt
-            captured["persist_user_message"] = kwargs.get("persist_user_message")
-            return {
-                "final_response": "reply",
-                "messages": [{"role": "assistant", "content": "reply"}],
-            }
+            captured["prompts"].append(prompt)
+            captured["persist_user_messages"].append(
+                kwargs.get("persist_user_message")
+            )
+            return turn_result
 
     class _ImmediateThread:
         def __init__(self, target=None, daemon=None):
@@ -16929,6 +16969,18 @@ def test_user_prompt_claims_owner_pending_async_completion_without_interrupt(
         monkeypatch.setattr(server, "_get_usage", lambda _a: {})
         monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
         monkeypatch.setattr(server, "_emit", lambda *a: None)
+        monkeypatch.setattr(
+            async_delegation,
+            "poll_owner_local_async_completions",
+            lambda *_a, **_k: 0,
+        )
+        from tools.process_registry import process_registry
+
+        monkeypatch.setattr(
+            process_registry,
+            "drain_notifications",
+            lambda *args, **kwargs: [],
+        )
 
         response = server.handle_request(
             {
@@ -16942,11 +16994,11 @@ def test_user_prompt_claims_owner_pending_async_completion_without_interrupt(
         )
 
         assert response.get("result")
-        assert "PASS review #392" in captured["prompt"]
-        assert "现在什么情况了?" in captured["prompt"]
-        assert captured["persist_user_message"] == "现在什么情况了?"
+        assert "PASS review #392" in captured["prompts"][0]
+        assert "现在什么情况了?" in captured["prompts"][0]
+        assert captured["persist_user_messages"][0] == "现在什么情况了?"
         durable = async_delegation.get_durable_delegation(delegation_id)
-        assert durable["delivery_state"] == "delivered"
+        assert durable["delivery_state"] == expected_delivery_state
         assert durable["delivery_attempts"] >= 1
     finally:
         server._sessions.pop("resumed-sid", None)

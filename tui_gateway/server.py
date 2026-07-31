@@ -9770,6 +9770,7 @@ def _run_prompt_submit(
         result = None  # turn outcome; read after the finally for leftover /steer
         tts_queue = None  # streaming-TTS feed for this turn (voice mode)
         thinking_started = False  # ambient thinking sound armed for this turn
+        delivery_renewal_stop = None
         one_turn_restore = session.pop("one_turn_model_restore", None)
         # True once a failed turn's snapshot was retained for resume replay —
         # tells the finally below to skip the normal inflight clear.
@@ -9787,11 +9788,15 @@ def _run_prompt_submit(
         if isinstance(marker_text, str) and marker_text.strip():
             record_turn_start(marker_home, marker_key, marker_text, attempts=marker_attempt)
         try:
+            from tools.async_delegation import start_event_delivery_renewal
             from tools.approval import (
                 reset_current_session_key,
                 set_current_session_key,
             )
 
+            delivery_renewal_stop = start_event_delivery_renewal(
+                claimed_deliveries
+            )
             approval_token = set_current_session_key(session["session_key"])
             session_tokens = _set_session_context(
                 session["session_key"],
@@ -10434,12 +10439,20 @@ def _run_prompt_submit(
                 )
                 _emit("error", sid, {"message": str(e)})
         finally:
+            if delivery_renewal_stop is not None:
+                delivery_renewal_stop.set()
             if claimed_deliveries:
                 from tools.async_delegation import release_event_delivery
 
-                for evt, claim in claimed_deliveries:
-                    release_event_delivery(evt, claim)
-                claimed_deliveries.clear()
+                while claimed_deliveries:
+                    evt, claim = claimed_deliveries.pop()
+                    try:
+                        release_event_delivery(evt, claim)
+                    except Exception:
+                        logger.warning(
+                            "TUI delivery claim release failed",
+                            exc_info=True,
+                        )
             if thinking_started:
                 # Kill the ambient thinking sound the moment the turn ends —
                 # error and success paths both land here.

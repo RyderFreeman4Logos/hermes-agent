@@ -12064,6 +12064,52 @@ class _ImmediateThread:
         self._target()
 
 
+def test_delivery_release_failure_does_not_leave_session_running(monkeypatch):
+    from tools import async_delegation as ad
+
+    class _Agent:
+        def run_conversation(self, *args, **kwargs):
+            return {
+                "final_response": None,
+                "messages": [],
+                "api_calls": 0,
+            }
+
+    session = _session(agent=_Agent(), running=True)
+    released = []
+
+    def fail_release(evt, claim):
+        released.append(evt["delegation_id"])
+        raise sqlite3.OperationalError("database is locked")
+
+    import sqlite3
+
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
+    monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(
+        ad, "start_event_delivery_renewal", lambda claims: threading.Event()
+    )
+    monkeypatch.setattr(ad, "release_event_delivery", fail_release)
+
+    server._run_prompt_submit(
+        "release-failure",
+        "sid",
+        session,
+        "completion",
+        turn_origin="idle_completion",
+        delivery_claims=[
+            ({"type": "async_delegation", "delegation_id": "one"}, "claim-one"),
+            ({"type": "async_delegation", "delegation_id": "two"}, "claim-two"),
+        ],
+    )
+
+    assert {"one", "two"} <= set(released)
+    assert session["running"] is False
+
+
 def test_prompt_submit_auto_titles_session_on_complete(monkeypatch):
     """maybe_auto_title is called after a successful (complete) prompt."""
 

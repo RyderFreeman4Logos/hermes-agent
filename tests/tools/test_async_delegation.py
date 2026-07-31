@@ -707,6 +707,69 @@ def test_busy_steer_release_does_not_consume_delivery_attempt_budget(tmp_path, m
     assert ad.get_durable_delegation(delegation_id)["delivery_state"] == "delivered"
 
 
+def test_renewed_delivery_claim_is_not_stolen_or_requeued(tmp_path, monkeypatch):
+    """A held turn may outlive the original five-minute claim lease."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ad._local_pending_requeue_at.clear()
+    now = [1_000.0]
+    monkeypatch.setattr(ad.time, "time", lambda: now[0])
+    delegation_id = "deleg_renewed_claim"
+    event = {
+        "type": "async_delegation",
+        "delegation_id": delegation_id,
+        "session_key": "owner",
+        "status": "completed",
+        "completed_at": 2.0,
+    }
+    ad._persist_dispatch(
+        {
+            "delegation_id": delegation_id,
+            "session_key": "owner",
+            "dispatched_at": 1.0,
+        }
+    )
+    ad._persist_completion(event, {"status": "completed", "summary": "done"})
+
+    assert ad.claim_completion_delivery(delegation_id, "held-claim")
+    assert not ad.renew_completion_delivery(delegation_id, "foreign-claim")
+
+    captured = {}
+
+    class _CapturedThread:
+        def __init__(self, *, target, **_kwargs):
+            captured["target"] = target
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(ad, "_DELIVERY_CLAIM_THREAD", _CapturedThread)
+    monkeypatch.setattr(ad, "_DELIVERY_CLAIM_RENEW_INTERVAL_SECONDS", 0)
+    stop = ad.start_event_delivery_renewal([(event, "held-claim")])
+
+    now[0] = 1_290.0
+    renewed = threading.Event()
+    original_renew = ad.renew_event_delivery
+
+    def renew_and_stop(evt, claim):
+        result = original_renew(evt, claim)
+        stop.set()
+        renewed.set()
+        return result
+
+    monkeypatch.setattr(ad, "renew_event_delivery", renew_and_stop)
+    worker = threading.Thread(target=captured["target"])
+    worker.start()
+    assert renewed.wait(1)
+    worker.join(timeout=1)
+    assert not worker.is_alive()
+
+    now[0] = 1_310.0  # original claim is stale; renewed claim is still active
+    q = queue.Queue()
+    assert ad.requeue_local_pending_async_completions(q) == 0
+    assert q.empty()
+    assert not ad.claim_completion_delivery(delegation_id, "claim-thief")
+
+
 def test_normal_delivery_releases_still_drop_at_attempt_budget(tmp_path, monkeypatch):
     """The normal retry cap remains terminal after repeated failures."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))

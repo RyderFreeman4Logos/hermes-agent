@@ -86,6 +86,9 @@ _MAX_DURABLE_PENDING = 1000
 # attempts so an unroutable row converges to a terminal 'dropped' state
 # instead of replaying on every restart forever.
 _MAX_DELIVERY_ATTEMPTS = 8
+_DELIVERY_CLAIM_LEASE_SECONDS = 300.0
+_DELIVERY_CLAIM_RENEW_INTERVAL_SECONDS = 60.0
+_DELIVERY_CLAIM_THREAD = threading.Thread
 _DB_LOCK = threading.Lock()
 
 # ---------------------------------------------------------------------------
@@ -638,7 +641,10 @@ def requeue_local_pending_async_completions(target_queue) -> int:
                WHERE state NOT IN ('running','finalizing')
                  AND delivery_state='pending'
                  AND event_json IS NOT NULL
-               ORDER BY completed_at, delegation_id"""
+                 AND (delivery_claim IS NULL OR delivery_claimed_at IS NULL
+                      OR delivery_claimed_at < ?)
+               ORDER BY completed_at, delegation_id""",
+            (now - _DELIVERY_CLAIM_LEASE_SECONDS,),
         ).fetchall()
     for (
         delegation_id,
@@ -1173,7 +1179,26 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
                       delivery_attempts=delivery_attempts+1, updated_at=?
                WHERE delegation_id=? AND delivery_state='pending'
                  AND (delivery_claim IS NULL OR delivery_claimed_at < ?)""",
-            (claim_id, now, now, delegation_id, now - 300),
+            (
+                claim_id,
+                now,
+                now,
+                delegation_id,
+                now - _DELIVERY_CLAIM_LEASE_SECONDS,
+            ),
+        )
+        return cur.rowcount == 1
+
+
+def renew_completion_delivery(delegation_id: str, claim_id: str) -> bool:
+    """Refresh the lease for the consumer that still owns this claim."""
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE async_delegations SET delivery_claimed_at=?, updated_at=?
+               WHERE delegation_id=? AND delivery_state='pending'
+                 AND delivery_claim=?""",
+            (now, now, delegation_id, claim_id),
         )
         return cur.rowcount == 1
 
@@ -1187,6 +1212,42 @@ def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
         return ""
     claim_id = f"{consumer}:{__import__('os').getpid()}:{uuid.uuid4().hex}"
     return claim_id if claim_completion_delivery(delegation_id, claim_id) else None
+
+
+def renew_event_delivery(evt: Dict[str, Any], claim_id: str) -> bool:
+    if not claim_id or evt.get("type") != "async_delegation":
+        return True
+    delegation_id = str(evt.get("delegation_id") or "")
+    return bool(delegation_id) and renew_completion_delivery(delegation_id, claim_id)
+
+
+def start_event_delivery_renewal(
+    claimed_deliveries: List[tuple[Dict[str, Any], str]],
+) -> threading.Event:
+    """Keep held delivery claims alive until the owning turn settles."""
+    stop = threading.Event()
+    if not claimed_deliveries:
+        return stop
+
+    def renew_all() -> None:
+        for evt, claim_id in list(claimed_deliveries):
+            try:
+                renew_event_delivery(evt, claim_id)
+            except Exception:
+                logger.warning("Async delivery claim renewal failed", exc_info=True)
+
+    renew_all()
+
+    def run() -> None:
+        while not stop.wait(_DELIVERY_CLAIM_RENEW_INTERVAL_SECONDS):
+            renew_all()
+
+    _DELIVERY_CLAIM_THREAD(
+        target=run,
+        name="async-delivery-claim-renewal",
+        daemon=True,
+    ).start()
+    return stop
 
 
 def release_completion_delivery(

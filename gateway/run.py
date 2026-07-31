@@ -5094,7 +5094,13 @@ class TurnRunner:
         _approval_session_key = ctx.session_key or ""
         _approval_session_token = set_current_session_key(_approval_session_key)
         register_gateway_notify(_approval_session_key, _approval_notify_sync)
+        _delivery_renewal_stop = None
         try:
+            from tools.async_delegation import start_event_delivery_renewal
+
+            _delivery_renewal_stop = start_event_delivery_renewal(
+                [(evt, claim) for evt, claim, _text in _turn_start_completions]
+            )
             # If _prepare_inbound_message_text buffered image paths for native
             # attachment, wrap the user turn as an OpenAI-style multimodal
             # content list. Consume-and-clear so subsequent turns on the same
@@ -5168,6 +5174,8 @@ class TurnRunner:
                     else:
                         release_event_delivery(evt, claim)
         finally:
+            if _delivery_renewal_stop is not None:
+                _delivery_renewal_stop.set()
             unregister_gateway_notify(_approval_session_key)
             # Cancel any pending clarify entries so blocked agent
             # threads don't hang past the end of the run (interrupt,

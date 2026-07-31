@@ -14,8 +14,12 @@ import agent.auxiliary_client as auxiliary_client
 
 _MISSING = object()
 _CHAIN = [
-    {"provider": "nous", "model": "fallback-one"},
-    {"provider": "openai", "model": "fallback-two"},
+    {"provider": "nous", "model": "fallback-one", "api_key": "first-key"},
+    {
+        "provider": "openrouter",
+        "model": "fallback-two",
+        "api_key": "second-key",
+    },
 ]
 
 
@@ -102,7 +106,7 @@ class _PublicHarness:
 
     def _resolve(self, entry):
         self.resolve_order.append(entry["model"])
-        selected = self.resolutions.pop(0)
+        selected = self.resolutions.pop(0) if self.resolutions else None
         if selected is None:
             return None, None
         return self.candidates[selected], entry["model"]
@@ -221,7 +225,11 @@ async def test_all_candidates_fail_reraises_same_primary_object(mode, caplog):
 
 @pytest.mark.asyncio
 async def test_duplicate_entries_are_each_attempted_once():
-    duplicate = {"provider": "nous", "model": "same-model"}
+    duplicate = {
+        "provider": "nous",
+        "model": "same-model",
+        "api_key": "same-key",
+    }
     harness = _PublicHarness(
         "sync",
         _quota_error(),
@@ -260,7 +268,7 @@ async def test_exact_structured_quota_markers_trigger(field, envelope, status):
 
 def _nonquota_error(case):
     if case == "message-only":
-        return _PrimaryError("quota_exhausted")
+        return _PrimaryError("quota exceeded: quota_exhausted")
     if case == "bare-429":
         error = _PrimaryError("rate limited")
         error.status_code = 429
@@ -332,7 +340,9 @@ async def test_nonquota_signals_never_leave_primary_route(mode, case):
         getattr(primary, "response").json.assert_not_called()
 
 
-_VALID_CHAIN = [{"provider": "nous", "model": "fallback-model"}]
+_VALID_CHAIN = [
+    {"provider": "nous", "model": "fallback-model", "api_key": "fallback-key"}
+]
 _INVALID_CONFIGS = [
     ("sync", {"fallback_on": "quota_exhausted", "fallback_chain": _VALID_CHAIN}),
     ("async", {"fallback_on": ["other"], "fallback_chain": _VALID_CHAIN}),
@@ -369,6 +379,22 @@ _INVALID_CONFIGS = [
         {
             "fallback_on": ["quota_exhausted"],
             "fallback_chain": [{"provider": "main", "model": "m"}],
+        },
+    ),
+    (
+        "sync",
+        {
+            "fallback_on": ["quota_exhausted"],
+            "fallback_chain": [{"provider": "custom", "model": "m"}],
+        },
+    ),
+    (
+        "async",
+        {
+            "fallback_on": ["quota_exhausted"],
+            "fallback_chain": [
+                {"provider": "custom:backup", "model": "m"}
+            ],
         },
     ),
     (
@@ -605,3 +631,62 @@ async def test_stale_candidate_warning_redacts_exception_body(mode, caplog):
     assert sentinel not in caplog.text
     assert "_PrimaryError" in caplog.text
     harness.assert_no_implicit_routes()
+
+
+def test_chain_resolution_snapshots_entry_credential_and_timeout(monkeypatch):
+    entry = {
+        "provider": "custom",
+        "model": "snapshot-model",
+        "base_url": "https://fallback.example/v1",
+        "key_env": "SNAPSHOT_FALLBACK_KEY",
+        "timeout": 37,
+    }
+    client = MagicMock()
+    client.chat.completions.create.return_value = _response("snapshot fallback")
+    monkeypatch.setenv("SNAPSHOT_FALLBACK_KEY", "entry-key")
+    with (
+        patch.object(
+            auxiliary_client,
+            "_get_auxiliary_task_config",
+            return_value=_config(chain=[entry]),
+        ),
+        patch.object(
+            auxiliary_client,
+            "resolve_provider_client",
+            return_value=(client, "snapshot-model"),
+        ) as resolve,
+    ):
+        chain = auxiliary_client._capture_explicit_quota_fallback_chain(
+            "title_generation"
+        )
+
+    entry["model"] = "mutated-model"
+    monkeypatch.setenv("SNAPSHOT_FALLBACK_KEY", "mutated-key")
+    frozen = chain[0]
+    assert (frozen["model"], frozen["api_key"], frozen["timeout"]) == (
+        "snapshot-model",
+        "entry-key",
+        37,
+    )
+    resolve.assert_not_called()
+
+    with patch.object(
+        auxiliary_client,
+        "resolve_provider_client",
+        return_value=(client, "snapshot-model"),
+    ) as resolve:
+        result = auxiliary_client._try_explicit_quota_fallback_sync(
+            "title_generation",
+            chain,
+            messages=[{"role": "user", "content": "title"}],
+            temperature=None,
+            max_tokens=None,
+            tools=None,
+            effective_timeout=10,
+            effective_extra_body={},
+            reasoning_config=None,
+        )
+
+    assert result.choices[0].message.content == "snapshot fallback"
+    assert resolve.call_args.kwargs["explicit_api_key"] == "entry-key"
+    assert client.chat.completions.create.call_args.kwargs["timeout"] == 37

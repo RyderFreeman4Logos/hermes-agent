@@ -322,17 +322,17 @@ auxiliary:
     model: google/gemini-3-flash-preview
     fallback_on: [quota_exhausted]
     fallback_chain:
-      - provider: nous
-        model: anthropic/claude-sonnet-4
-      - provider: openai
+      - provider: custom
         model: gpt-4o-mini
+        base_url: https://api.openai.com/v1
+        key_env: OPENAI_API_KEY
 ```
 
 This opt-in accepts only the exact structured values `insufficient_quota`, `quota_exhausted`, or `usage_limit_reached` in the primary exception body's `code`, `type`, or `reason` field, either directly or inside one `error` object. If the exception includes a status code, it must be integer `402` or `429`; a bare status code or quota-looking message is not enough.
 
-After the primary provider's existing retries finish, Hermes tries each configured entry once, in order. An unavailable or failed entry is skipped. The first valid response wins; if the chain is exhausted, Hermes re-raises the original primary error. This mode does not append the main agent, top-level `fallback_providers`, `auto` discovery, or other implicit routes.
+Before the primary request, Hermes captures each entry and its declared credential in a request-local snapshot. It does not resolve any fallback unless the primary request ends with a qualifying quota error. Hermes then tries each captured entry once, in order. An unavailable or failed entry is skipped. The first valid response wins; if the chain is exhausted, Hermes re-raises the original primary error. This mode does not append the main agent, top-level `fallback_providers`, `auto` discovery, or other implicit routes, and it does not re-read credentials or candidate timeouts while walking the chain.
 
-The opt-in is validated before the primary request. It requires a non-empty chain whose entries have explicit, non-empty `provider` and `model` strings; `auto` and `main` are not valid candidate providers. Synchronous streaming calls are not supported in this mode.
+The opt-in is validated before the primary request. It requires a non-empty chain whose entries have explicit, non-empty `provider` and `model` strings plus their own `api_key`, `key_env`, or `api_key_env`; `auto`, `main`, and named custom-provider lookup are not valid candidate providers. A `custom` entry must also declare `base_url`. Synchronous streaming calls are not supported in this mode.
 
 If `fallback_on` is omitted, the legacy capacity-error behavior described below is unchanged.
 

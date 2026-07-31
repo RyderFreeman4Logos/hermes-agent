@@ -53,7 +53,7 @@ import threading
 import time
 import uuid
 from pathlib import Path  # noqa: F401 — used by test mocks
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Tuple, TYPE_CHECKING
 from urllib.parse import urlparse, parse_qs, urlunparse
 
@@ -4200,6 +4200,12 @@ def _fallback_entry_timeout(task: Optional[str], fb_label: str) -> Optional[floa
         raw = entry.get("timeout") if isinstance(entry, dict) else None
     except Exception:
         return None
+    return _fallback_entry_timeout_value({"timeout": raw})
+
+
+def _fallback_entry_timeout_value(entry: Any) -> Optional[float]:
+    """Return a validated timeout from an already captured chain entry."""
+    raw = entry.get("timeout") if hasattr(entry, "get") else None
     if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw > 0:
         return float(raw)
     return None
@@ -4218,6 +4224,8 @@ def _call_fallback_candidate_sync(
     effective_timeout: float,
     effective_extra_body: dict,
     reasoning_config: Optional[dict],
+    fallback_timeout: Optional[float] = None,
+    allow_credential_refresh: bool = True,
 ) -> Optional[Any]:
     """Call one fallback candidate with stale-credential recovery.
 
@@ -4239,7 +4247,11 @@ def _call_fallback_candidate_sync(
     fallback tuned differently from the primary is allowed its own budget
     (#62452).
     """
-    fb_timeout = _fallback_entry_timeout(task, fb_label)
+    fb_timeout = (
+        fallback_timeout
+        if not allow_credential_refresh
+        else fallback_timeout or _fallback_entry_timeout(task, fb_label)
+    )
     if fb_timeout is not None and fb_timeout != effective_timeout:
         logger.info(
             "Auxiliary %s: %s using its configured timeout %.0fs "
@@ -4260,6 +4272,13 @@ def _call_fallback_candidate_sync(
     except Exception as fb_err:
         if not _is_auth_error(fb_err):
             raise
+        if not allow_credential_refresh:
+            logger.warning(
+                "Auxiliary %s: frozen fallback candidate %s rejected its "
+                "credential (%s) — skipping",
+                task or "call", fb_label, type(fb_err).__name__,
+            )
+            return None
         fb_provider = _auth_refresh_provider_for_route(fb_label, fb_base)
         if fb_provider not in {"auto", "", None} and _refresh_provider_credentials(fb_provider):
             retry_client, retry_model = _get_cached_client(fb_provider, fb_model)
@@ -4309,9 +4328,15 @@ async def _call_fallback_candidate_async(
     effective_timeout: float,
     effective_extra_body: dict,
     reasoning_config: Optional[dict],
+    fallback_timeout: Optional[float] = None,
+    allow_credential_refresh: bool = True,
 ) -> Optional[Any]:
     """Async mirror of :func:`_call_fallback_candidate_sync`."""
-    fb_timeout = _fallback_entry_timeout(task, fb_label)
+    fb_timeout = (
+        fallback_timeout
+        if not allow_credential_refresh
+        else fallback_timeout or _fallback_entry_timeout(task, fb_label)
+    )
     if fb_timeout is not None and fb_timeout != effective_timeout:
         logger.info(
             "Auxiliary %s: %s using its configured timeout %.0fs "
@@ -4338,6 +4363,13 @@ async def _call_fallback_candidate_async(
     except Exception as fb_err:
         if not _is_auth_error(fb_err):
             raise
+        if not allow_credential_refresh:
+            logger.warning(
+                "Auxiliary %s (async): frozen fallback candidate %s rejected "
+                "its credential (%s) — skipping",
+                task or "call", fb_label, type(fb_err).__name__,
+            )
+            return None
         fb_provider = _auth_refresh_provider_for_route(fb_label, fb_base)
         if fb_provider not in {"auto", "", None} and _refresh_provider_credentials(fb_provider):
             retry_client, retry_model = _get_cached_client(
@@ -7028,6 +7060,7 @@ def _capture_explicit_quota_fallback_chain(
         raise ValueError(
             f"auxiliary.{task}.fallback_chain must be a non-empty list or tuple"
         )
+    captured = []
     for index, entry in enumerate(chain):
         if entry.__class__ is not dict:
             raise ValueError(
@@ -7047,7 +7080,31 @@ def _capture_explicit_quota_fallback_chain(
             raise ValueError(
                 f"auxiliary.{task}.fallback_chain[{index}].provider must be explicit"
             )
-    return tuple(chain)
+        frozen_entry = dict(entry)
+        normalized_provider = provider.strip().lower()
+        if not any(str(entry.get(field) or "").strip() for field in (
+            "api_key", "key_env", "api_key_env",
+        )):
+            raise ValueError(
+                f"auxiliary.{task}.fallback_chain[{index}] must declare its own credential"
+            )
+        if normalized_provider == "custom":
+            if not str(entry.get("base_url") or "").strip():
+                raise ValueError(
+                    f"auxiliary.{task}.fallback_chain[{index}].base_url is required for custom"
+                )
+        elif normalized_provider.startswith("custom:"):
+            raise ValueError(
+                f"auxiliary.{task}.fallback_chain[{index}].provider must not use ambient custom-provider lookup"
+            )
+
+        key_env = str(entry.get("key_env") or entry.get("api_key_env") or "").strip()
+        if key_env:
+            frozen_entry["api_key"] = os.getenv(key_env, "").strip()
+            frozen_entry.pop("key_env", None)
+            frozen_entry.pop("api_key_env", None)
+        captured.append(MappingProxyType(frozen_entry))
+    return tuple(captured)
 
 
 def _is_explicit_aux_quota_error(exc: BaseException) -> bool:
@@ -7090,7 +7147,10 @@ def _try_explicit_quota_fallback_sync(
         provider = entry["provider"].strip()
         model = entry["model"].strip()
         try:
-            client, resolved_model = _resolve_fallback_entry(entry)
+            if not _fallback_entry_api_key(entry):
+                client, resolved_model = None, None
+            else:
+                client, resolved_model = _resolve_fallback_entry(entry)
         except Exception as exc:
             logger.info(
                 "Auxiliary %s: quota fallback[%d] %s/%s resolve failed (%s)",
@@ -7112,6 +7172,8 @@ def _try_explicit_quota_fallback_sync(
                 effective_timeout=effective_timeout,
                 effective_extra_body=effective_extra_body,
                 reasoning_config=reasoning_config,
+                fallback_timeout=_fallback_entry_timeout_value(entry),
+                allow_credential_refresh=False,
             )
         except Exception as exc:
             logger.info(
@@ -7141,7 +7203,10 @@ async def _try_explicit_quota_fallback_async(
         provider = entry["provider"].strip()
         model = entry["model"].strip()
         try:
-            client, resolved_model = _resolve_fallback_entry(entry)
+            if not _fallback_entry_api_key(entry):
+                client, resolved_model = None, None
+            else:
+                client, resolved_model = _resolve_fallback_entry(entry)
             if client is not None:
                 client, resolved_model = _to_async_client(
                     client, resolved_model or model, is_vision=(task == "vision")
@@ -7167,6 +7232,8 @@ async def _try_explicit_quota_fallback_async(
                 effective_timeout=effective_timeout,
                 effective_extra_body=effective_extra_body,
                 reasoning_config=reasoning_config,
+                fallback_timeout=_fallback_entry_timeout_value(entry),
+                allow_credential_refresh=False,
             )
         except Exception as exc:
             logger.info(

@@ -1204,6 +1204,7 @@ def _build_child_agent(
     override_provider: Optional[str] = None,
     override_base_url: Optional[str] = None,
     override_api_key: Optional[str] = None,
+    inherit_parent_api_key: Optional[bool] = None,
     override_api_mode: Optional[str] = None,
     override_request_overrides: Optional[Dict[str, Any]] = None,
     override_max_tokens: Optional[int] = None,
@@ -1375,7 +1376,27 @@ def _build_child_agent(
     effective_base_url = override_base_url or parent_agent.base_url
     if not override_base_url:
         effective_base_url = _inherit_parent_base_url(parent_agent, effective_base_url)
-    effective_api_key = override_api_key or parent_api_key
+    if inherit_parent_api_key is None:
+        parent_base_url = _inherit_parent_base_url(
+            parent_agent, getattr(parent_agent, "base_url", None)
+        )
+        inherit_parent_api_key = (
+            _normalized_runtime_url(effective_base_url)
+            == _normalized_runtime_url(parent_base_url)
+            and (
+                bool(override_base_url)
+                or not override_provider
+                or effective_provider == getattr(parent_agent, "provider", None)
+            )
+        )
+    if not override_api_key and parent_api_key and not inherit_parent_api_key:
+        raise ValueError(
+            "Refusing to inherit the parent API key across a different "
+            "delegation backend."
+        )
+    effective_api_key = override_api_key or (
+        parent_api_key if inherit_parent_api_key else None
+    )
     # Bug #20558 / PR #20563: api_mode must NOT be inherited when the child uses a
     # different provider than the parent — each provider has its own API surface
     # (e.g. MiniMax uses anthropic_messages, DeepSeek uses chat_completions).
@@ -2980,6 +3001,7 @@ def delegate_task(
             override_provider=task_creds["provider"],
             override_base_url=task_creds["base_url"],
             override_api_key=task_creds["api_key"],
+            inherit_parent_api_key=task_creds.get("inherit_parent_api_key"),
             override_api_mode=task_creds["api_mode"],
             override_request_overrides=task_creds.get("request_overrides"),
             override_max_tokens=task_creds.get("max_output_tokens"),
@@ -3761,6 +3783,11 @@ def _resolve_delegation_credentials(
             "provider": provider,
             "base_url": configured_base_url,
             "api_key": api_key,
+            "inherit_parent_api_key": (
+                _normalized_runtime_url(configured_base_url) == parent_url
+                if model_profile
+                else None
+            ),
             "api_mode": api_mode,
             "reasoning_effort": profile_effort,
             "fallback_chain": profile_fallback_chain,
@@ -3773,6 +3800,7 @@ def _resolve_delegation_credentials(
             "provider": None,
             "base_url": None,
             "api_key": None,
+            "inherit_parent_api_key": True if model_profile else None,
             "api_mode": None,
             "request_overrides": None,
             "max_output_tokens": None,
@@ -3805,6 +3833,7 @@ def _resolve_delegation_credentials(
         "provider": configured_provider if runtime.get("provider") == _RUNTIME_PROVIDER_CUSTOM else runtime.get("provider"),
         "base_url": runtime.get("base_url"),
         "api_key": api_key,
+        "inherit_parent_api_key": False if model_profile else None,
         "api_mode": runtime.get("api_mode"),
         "request_overrides": dict(runtime.get("request_overrides") or {}),
         "max_output_tokens": runtime.get("max_output_tokens"),

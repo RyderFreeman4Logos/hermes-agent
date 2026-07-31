@@ -166,6 +166,7 @@ class TestResolveDelegationCredentialsModelProfile(unittest.TestCase):
         self.assertEqual(creds["provider"], "custom")
         self.assertEqual(creds["base_url"], "http://localhost:8000/v1")
         self.assertEqual(creds["api_key"], "fast-key")
+        self.assertFalse(creds["inherit_parent_api_key"])
         self.assertEqual(creds["reasoning_effort"], "high")
 
     def test_unknown_explicit_profile_fails_closed(self):
@@ -198,6 +199,7 @@ class TestResolveDelegationCredentialsModelProfile(unittest.TestCase):
         self.assertEqual(creds["model"], "qwen2.5-coder")
         self.assertEqual(creds["provider"], "custom")
         self.assertEqual(creds["api_key"], "local-key")
+        self.assertIsNone(creds["inherit_parent_api_key"])
         # No profile → no reasoning_effort surfaced
         self.assertIsNone(creds["reasoning_effort"])
 
@@ -269,6 +271,64 @@ class TestResolveDelegationCredentialsModelProfile(unittest.TestCase):
         }
         creds = _resolve_delegation_credentials(cfg, parent, model_profile="same")
         self.assertIsNone(creds["api_key"])
+        self.assertTrue(creds["inherit_parent_api_key"])
+
+
+class TestBuildChildAgentCredentialInheritance(unittest.TestCase):
+    @patch("tools.delegate_tool._load_config", return_value={})
+    @patch("run_agent.AIAgent")
+    def test_backend_boundary_fails_closed_but_compatible_calls_inherit(
+        self, MockAgent, _mock_cfg
+    ):
+        MockAgent.return_value = MagicMock()
+        parent = _make_mock_parent()
+        parent.api_key = "parent-secret"
+
+        common = {
+            "task_index": 0,
+            "goal": "test",
+            "context": None,
+            "toolsets": None,
+            "model": None,
+            "max_iterations": 1,
+            "task_count": 1,
+            "parent_agent": parent,
+        }
+        with self.assertRaisesRegex(ValueError, "different delegation backend"):
+            _build_child_agent(
+                **common,
+                override_provider="custom",
+                override_base_url="https://profile.invalid/v1",
+            )
+        MockAgent.assert_not_called()
+
+        with self.assertRaisesRegex(ValueError, "different delegation backend"):
+            _build_child_agent(
+                **common,
+                override_base_url=parent.base_url,
+                inherit_parent_api_key=False,
+            )
+        MockAgent.assert_not_called()
+
+        _build_child_agent(
+            **common,
+            override_provider="custom",
+            override_base_url=parent.base_url,
+            inherit_parent_api_key=True,
+        )
+        self.assertEqual(MockAgent.call_args.kwargs["api_key"], "parent-secret")
+
+        MockAgent.reset_mock()
+        _build_child_agent(
+            **common,
+            override_provider="custom",
+            override_base_url=parent.base_url,
+        )
+        self.assertEqual(MockAgent.call_args.kwargs["api_key"], "parent-secret")
+
+        MockAgent.reset_mock()
+        _build_child_agent(**common)
+        self.assertEqual(MockAgent.call_args.kwargs["api_key"], "parent-secret")
 
 
 # =========================================================================
@@ -382,6 +442,7 @@ class TestDelegateTaskModelProfile(unittest.TestCase):
             "provider": "custom",
             "base_url": "http://localhost:8000/v1",
             "api_key": "fast-key",
+            "inherit_parent_api_key": False,
             "api_mode": "chat_completions",
             "reasoning_effort": "high",
         }
@@ -407,6 +468,7 @@ class TestDelegateTaskModelProfile(unittest.TestCase):
             _, child_kwargs = MockAgent.call_args
             self.assertEqual(child_kwargs["model"], "grok-4.5")
             self.assertEqual(child_kwargs["provider"], "custom")
+            self.assertEqual(child_kwargs["api_key"], "fast-key")
 
     @patch("tools.delegate_tool._load_config")
     @patch("tools.delegate_tool._resolve_delegation_credentials")
@@ -425,6 +487,7 @@ class TestDelegateTaskModelProfile(unittest.TestCase):
             "provider": "custom",
             "base_url": "http://localhost:8000/v1",
             "api_key": "fast-key",
+            "inherit_parent_api_key": False,
             "api_mode": "chat_completions",
             "reasoning_effort": "high",
         }
@@ -433,6 +496,7 @@ class TestDelegateTaskModelProfile(unittest.TestCase):
             "provider": "custom",
             "base_url": "http://pm.example.com/v1",
             "api_key": "smart-key",
+            "inherit_parent_api_key": False,
             "api_mode": "chat_completions",
             "reasoning_effort": "high",
         }

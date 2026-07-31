@@ -40,6 +40,7 @@ Payment / credit exhaustion fallback:
   their OpenRouter balance but has Codex OAuth or another provider available.
 """
 
+import asyncio
 import contextlib
 import contextvars
 import functools
@@ -4218,6 +4219,7 @@ def _call_fallback_candidate_sync(
     effective_timeout: float,
     effective_extra_body: dict,
     reasoning_config: Optional[dict],
+    allow_credential_refresh: bool = True,
 ) -> Optional[Any]:
     """Call one fallback candidate with stale-credential recovery.
 
@@ -4259,6 +4261,8 @@ def _call_fallback_candidate_sync(
             _relay_sync_completion(fb_client, fb_kwargs, provider=fb_label), task)
     except Exception as fb_err:
         if not _is_auth_error(fb_err):
+            raise
+        if not allow_credential_refresh:
             raise
         fb_provider = _auth_refresh_provider_for_route(fb_label, fb_base)
         if fb_provider not in {"auto", "", None} and _refresh_provider_credentials(fb_provider):
@@ -4309,6 +4313,7 @@ async def _call_fallback_candidate_async(
     effective_timeout: float,
     effective_extra_body: dict,
     reasoning_config: Optional[dict],
+    allow_credential_refresh: bool = True,
 ) -> Optional[Any]:
     """Async mirror of :func:`_call_fallback_candidate_sync`."""
     fb_timeout = _fallback_entry_timeout(task, fb_label)
@@ -4337,6 +4342,8 @@ async def _call_fallback_candidate_async(
         )
     except Exception as fb_err:
         if not _is_auth_error(fb_err):
+            raise
+        if not allow_credential_refresh:
             raise
         fb_provider = _auth_refresh_provider_for_route(fb_label, fb_base)
         if fb_provider not in {"auto", "", None} and _refresh_provider_credentials(fb_provider):
@@ -7015,6 +7022,232 @@ def _get_auxiliary_task_config(task: str) -> Dict[str, Any]:
     return task_config
 
 
+_EXPLICIT_QUOTA_MARKERS = frozenset({
+    "insufficient_quota",
+    "quota_exhausted",
+    "usage_limit_reached",
+})
+
+
+def _capture_configured_fallback_chain(
+    task: Optional[str],
+) -> Tuple[Tuple[Dict[str, Any], ...], Optional[Tuple[str, ...]]]:
+    """Capture a configured chain without borrowing ambient credentials."""
+    task_config = _get_auxiliary_task_config(task or "")
+    chain = task_config.get("fallback_chain")
+    if not isinstance(chain, (list, tuple)) or not chain:
+        return (), None
+
+    fallback_on = None
+    if "fallback_on" in task_config:
+        raw = task_config.get("fallback_on")
+        if not isinstance(raw, (list, tuple)) or not raw or not all(
+            isinstance(value, str) and value.strip() for value in raw
+        ):
+            raise ValueError(
+                f"auxiliary.{task}.fallback_on must be a non-empty list"
+            )
+        fallback_on = tuple(value.strip().lower() for value in raw)
+        if set(fallback_on) - {"quota_exhausted"}:
+            raise ValueError(
+                f"auxiliary.{task}.fallback_on contains an unsupported condition"
+            )
+
+    captured = []
+    for index, entry in enumerate(chain):
+        if not isinstance(entry, dict):
+            raise ValueError(
+                f"auxiliary.{task}.fallback_chain[{index}] must be a mapping"
+            )
+        provider = str(entry.get("provider") or "").strip()
+        model = str(entry.get("model") or "").strip()
+        if not provider or provider.lower() in {"auto", "main"} or not model:
+            raise ValueError(
+                f"auxiliary.{task}.fallback_chain[{index}] requires explicit provider and model"
+            )
+        if provider.lower().startswith("custom") and not str(
+            entry.get("base_url") or ""
+        ).strip():
+            raise ValueError(
+                f"auxiliary.{task}.fallback_chain[{index}] requires base_url for custom provider"
+            )
+        frozen = dict(entry)
+        frozen["provider"] = provider
+        frozen["model"] = model
+        frozen["api_key"] = _fallback_entry_api_key(entry) or ""
+        frozen.pop("key_env", None)
+        frozen.pop("api_key_env", None)
+        captured.append(frozen)
+    return tuple(captured), fallback_on
+
+
+def _is_explicit_aux_quota_error(exc: BaseException) -> bool:
+    """Match exact structured quota markers, never exception text."""
+    body = getattr(exc, "body", None)
+    if type(body) is not dict:
+        return False
+    status = getattr(exc, "status_code", None)
+    if status is not None and (type(status) is not int or status not in {402, 429}):
+        return False
+    layers = [body]
+    if type(body.get("error")) is dict:
+        layers.append(body["error"])
+    return any(
+        isinstance(layer.get(field), str)
+        and layer[field].strip().lower() in _EXPLICIT_QUOTA_MARKERS
+        for layer in layers
+        for field in ("code", "type", "reason")
+    )
+
+
+def _configured_fallback_allows(
+    exc: BaseException,
+    fallback_on: Optional[Tuple[str, ...]],
+) -> bool:
+    if fallback_on is None:
+        return True
+    return (
+        "quota_exhausted" in fallback_on
+        and _is_explicit_aux_quota_error(exc)
+    )
+
+
+def _fallback_client_matches_entry(client: Any, entry: Dict[str, Any]) -> bool:
+    """Reject a resolver result that substituted ambient route credentials."""
+    actual_key = getattr(client, "api_key", None)
+    get_secret = getattr(actual_key, "get_secret_value", None)
+    if callable(get_secret):
+        actual_key = get_secret()
+    if callable(actual_key) or str(actual_key or "") != entry["api_key"]:
+        return False
+    expected_base = str(entry.get("base_url") or "").strip()
+    if expected_base:
+        actual_base = str(getattr(client, "base_url", "") or "")
+        if base_url_hostname(actual_base) != base_url_hostname(expected_base):
+            return False
+    return True
+
+
+def _try_configured_candidates_sync(
+    task: Optional[str],
+    chain: Tuple[Dict[str, Any], ...],
+    *,
+    messages: list,
+    temperature: Optional[float],
+    max_tokens: Optional[int],
+    tools: Optional[list],
+    effective_timeout: float,
+    effective_extra_body: dict,
+    reasoning_config: Optional[dict],
+) -> Optional[Any]:
+    """Walk a captured chain in order, with three attempts per entry."""
+    for index, entry in enumerate(chain):
+        if not entry["api_key"]:
+            logger.warning(
+                "Auxiliary %s: fallback_chain[%d](%s) has no entry credential; skipping",
+                task or "call", index, entry["provider"],
+            )
+            continue
+        try:
+            client, model = _resolve_fallback_entry(entry)
+        except Exception as exc:
+            logger.info(
+                "Auxiliary %s: fallback_chain[%d](%s) resolution failed (%s)",
+                task or "call", index, entry["provider"], type(exc).__name__,
+            )
+            continue
+        if client is None or not _fallback_client_matches_entry(client, entry):
+            if client is not None:
+                logger.warning(
+                    "Auxiliary %s: %s resolved outside its configured credential/endpoint; skipping",
+                    task or "call", f"fallback_chain[{index}]({entry['provider']})",
+                )
+            continue
+        label = f"fallback_chain[{index}]({entry['provider']})"
+        for attempt in range(3):
+            try:
+                return _call_fallback_candidate_sync(
+                    client, model or entry["model"], label,
+                    task=task, messages=messages, temperature=temperature,
+                    max_tokens=max_tokens, tools=tools,
+                    effective_timeout=effective_timeout,
+                    effective_extra_body=effective_extra_body,
+                    reasoning_config=reasoning_config,
+                    allow_credential_refresh=False,
+                )
+            except Exception as exc:
+                logger.info(
+                    "Auxiliary %s: %s failed attempt %d/3 (%s)",
+                    task or "call", label, attempt + 1, type(exc).__name__,
+                )
+                if attempt < 2:
+                    time.sleep(min(_TRANSIENT_RETRY_BACKOFF_BASE * (2.0 ** attempt), 8.0))
+    return None
+
+
+async def _try_configured_candidates_async(
+    task: Optional[str],
+    chain: Tuple[Dict[str, Any], ...],
+    *,
+    messages: list,
+    temperature: Optional[float],
+    max_tokens: Optional[int],
+    tools: Optional[list],
+    effective_timeout: float,
+    effective_extra_body: dict,
+    reasoning_config: Optional[dict],
+) -> Optional[Any]:
+    """Async mirror of :func:`_try_configured_candidates_sync`."""
+    for index, entry in enumerate(chain):
+        if not entry["api_key"]:
+            logger.warning(
+                "Auxiliary %s (async): fallback_chain[%d](%s) has no entry credential; skipping",
+                task or "call", index, entry["provider"],
+            )
+            continue
+        try:
+            client, model = _resolve_fallback_entry(entry)
+            if client is not None and _fallback_client_matches_entry(client, entry):
+                client, model = _to_async_client(
+                    client, model or entry["model"], is_vision=(task == "vision")
+                )
+            elif client is not None:
+                logger.warning(
+                    "Auxiliary %s (async): fallback_chain[%d](%s) resolved "
+                    "outside its configured credential/endpoint; skipping",
+                    task or "call", index, entry["provider"],
+                )
+                client = None
+        except Exception as exc:
+            logger.info(
+                "Auxiliary %s (async): fallback_chain[%d](%s) resolution failed (%s)",
+                task or "call", index, entry["provider"], type(exc).__name__,
+            )
+            continue
+        if client is None:
+            continue
+        label = f"fallback_chain[{index}]({entry['provider']})"
+        for attempt in range(3):
+            try:
+                return await _call_fallback_candidate_async(
+                    client, model or entry["model"], label,
+                    task=task, messages=messages, temperature=temperature,
+                    max_tokens=max_tokens, tools=tools,
+                    effective_timeout=effective_timeout,
+                    effective_extra_body=effective_extra_body,
+                    reasoning_config=reasoning_config,
+                    allow_credential_refresh=False,
+                )
+            except Exception as exc:
+                logger.info(
+                    "Auxiliary %s (async): %s failed attempt %d/3 (%s)",
+                    task or "call", label, attempt + 1, type(exc).__name__,
+                )
+                if attempt < 2:
+                    await asyncio.sleep(min(_TRANSIENT_RETRY_BACKOFF_BASE * (2.0 ** attempt), 8.0))
+    return None
+
+
 def _get_task_timeout(task: str, default: float = _DEFAULT_AUX_TIMEOUT) -> float:
     """Read timeout from auxiliary.{task}.timeout in config, falling back to *default*."""
     if not task:
@@ -7990,6 +8223,7 @@ def call_llm(
     # concurrent /model switch produce a key for one runtime and a client for
     # another.
     main_runtime = _normalize_main_runtime(main_runtime)
+    configured_chain, fallback_on = _capture_configured_fallback_chain(task)
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
     if api_mode:
@@ -8006,7 +8240,8 @@ def call_llm(
             async_mode=False,
             main_runtime=main_runtime,
         )
-        if client is None and resolved_provider != "auto" and not resolved_base_url:
+        if (not configured_chain and client is None
+                and resolved_provider != "auto" and not resolved_base_url):
             logger.warning(
                 "Vision provider %s unavailable, falling back to auto vision backends",
                 resolved_provider,
@@ -8039,7 +8274,8 @@ def call_llm(
             # tasks because fallback entries may use OAuth / credential-pool
             # auth (for example openai-codex).
             _explicit = (resolved_provider or "").strip().lower()
-            if _explicit and _explicit not in {"auto", "openrouter", "custom"}:
+            if (not configured_chain and _explicit
+                    and _explicit not in {"auto", "openrouter", "custom"}):
                 fb_client, fb_model, fb_label = _try_configured_fallback_for_unavailable_client(
                     task, _explicit,
                 )
@@ -8057,7 +8293,7 @@ def call_llm(
             # Pass model=None so each provider uses its own default —
             # resolved_model may be an OpenRouter-format slug that doesn't
             # work on other providers.
-            if client is None and not resolved_base_url:
+            if not configured_chain and client is None and not resolved_base_url:
                 logger.info("Auxiliary %s: provider %s unavailable, trying auto-detection chain",
                             task or "call", resolved_provider)
                 client, final_model = _get_cached_client("auto", main_runtime=main_runtime, task=task)
@@ -8154,7 +8390,11 @@ def call_llm(
                 task,
                 provider=resolved_provider, base_url=_base_info)
         except Exception as transient_err:
-            if not _is_transient_transport_error(transient_err):
+            configured_retry = (
+                bool(configured_chain)
+                and _configured_fallback_allows(transient_err, fallback_on)
+            )
+            if not configured_retry and not _is_transient_transport_error(transient_err):
                 raise
             # Compression is on the critical preflight path: a user cannot
             # continue or resume an oversized session until it compacts. A
@@ -8164,14 +8404,15 @@ def call_llm(
             # same-provider retry for compression on a full-budget timeout and
             # fall straight through to provider/model fallback; fast blips (a
             # streaming-close or a 5xx) still retry, since those are cheap.
-            if task == "compression" and _is_timeout_error(transient_err):
+            if (not configured_retry and task == "compression"
+                    and _is_timeout_error(transient_err)):
                 logger.info(
                     "Auxiliary compression: timeout on the critical path; "
                     "skipping same-provider retry and falling back: %s",
                     transient_err,
                 )
                 raise
-            _max_transient_retries = _transient_retry_count()
+            _max_transient_retries = 2 if configured_retry else _transient_retry_count()
             _last_transient = transient_err
             for _attempt in range(1, _max_transient_retries + 1):
                 _backoff = min(_TRANSIENT_RETRY_BACKOFF_BASE * (2.0 ** (_attempt - 1)), 8.0)
@@ -8201,12 +8442,28 @@ def call_llm(
                         ),
                         task)
                 except Exception as retry_transient:
-                    if not _is_transient_transport_error(retry_transient):
+                    if configured_chain:
+                        if not _configured_fallback_allows(retry_transient, fallback_on):
+                            raise
+                    elif not _is_transient_transport_error(retry_transient):
                         raise
                     _last_transient = retry_transient
             # Retries exhausted — fall through to first_err fallback handling.
             raise _last_transient
     except Exception as first_err:
+        if configured_chain:
+            if _configured_fallback_allows(first_err, fallback_on):
+                response = _try_configured_candidates_sync(
+                    task, configured_chain,
+                    messages=messages, temperature=temperature,
+                    max_tokens=max_tokens, tools=tools,
+                    effective_timeout=effective_timeout,
+                    effective_extra_body=effective_extra_body,
+                    reasoning_config=reasoning_config,
+                )
+                if response is not None:
+                    return response
+            raise
         if "temperature" in kwargs and _is_unsupported_temperature_error(first_err):
             retry_kwargs = dict(kwargs)
             retry_kwargs.pop("temperature", None)
@@ -8707,6 +8964,7 @@ async def async_call_llm(
     # Keep every async phase on the same runtime identity, even if another
     # session switches models while this task is awaiting network I/O.
     main_runtime = _normalize_main_runtime(main_runtime)
+    configured_chain, fallback_on = _capture_configured_fallback_chain(task)
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
     effective_extra_body = _get_task_extra_body(task)
@@ -8721,7 +8979,8 @@ async def async_call_llm(
             async_mode=True,
             main_runtime=main_runtime,
         )
-        if client is None and resolved_provider != "auto" and not resolved_base_url:
+        if (not configured_chain and client is None
+                and resolved_provider != "auto" and not resolved_base_url):
             logger.warning(
                 "Vision provider %s unavailable, falling back to auto vision backends",
                 resolved_provider,
@@ -8750,7 +9009,8 @@ async def async_call_llm(
         )
         if client is None:
             _explicit = (resolved_provider or "").strip().lower()
-            if _explicit and _explicit not in {"auto", "openrouter", "custom"}:
+            if (not configured_chain and _explicit
+                    and _explicit not in {"auto", "openrouter", "custom"}):
                 fb_client, fb_model, fb_label = _try_configured_fallback_for_unavailable_client(
                     task, _explicit,
                 )
@@ -8765,7 +9025,7 @@ async def async_call_llm(
                         f"was found. Set the {_explicit.upper()}_API_KEY environment "
                         f"variable, or switch to a different provider with `hermes model`."
                     )
-            if client is None and not resolved_base_url:
+            if not configured_chain and client is None and not resolved_base_url:
                 logger.info("Auxiliary %s: provider %s unavailable, trying auto-detection chain",
                             task or "call", resolved_provider)
                 client, final_model = _get_cached_client("auto", async_mode=True, main_runtime=main_runtime, task=task)
@@ -8828,33 +9088,70 @@ async def async_call_llm(
                 task,
                 provider=resolved_provider, base_url=_client_base)
         except Exception as transient_err:
-            if not _is_transient_transport_error(transient_err):
+            configured_retry = (
+                bool(configured_chain)
+                and _configured_fallback_allows(transient_err, fallback_on)
+            )
+            if not configured_retry and not _is_transient_transport_error(transient_err):
                 raise
             # See call_llm(): compression is on the critical preflight path,
             # so skip the same-provider retry on a full-budget timeout and
             # fall straight through to fallback (issue #54465).
-            if task == "compression" and _is_timeout_error(transient_err):
+            if (not configured_retry and task == "compression"
+                    and _is_timeout_error(transient_err)):
                 logger.info(
                     "Auxiliary compression (async): timeout on the critical "
                     "path; skipping same-provider retry and falling back: %s",
                     transient_err,
                 )
                 raise
-            logger.info(
-                "Auxiliary %s (async): transient transport error; retrying "
-                "once on the same provider before fallback: %s",
-                task or "call", transient_err,
-            )
-            return _validate_llm_response(
-                await _relay_async_completion(
-                    client,
-                    kwargs,
-                    provider=resolved_provider,
-                    api_mode=resolved_api_mode,
-                    create=_acreate,
-                ),
-                task)
+            if not configured_retry:
+                return _validate_llm_response(
+                    await _relay_async_completion(
+                        client,
+                        kwargs,
+                        provider=resolved_provider,
+                        api_mode=resolved_api_mode,
+                        create=_acreate,
+                    ),
+                    task)
+            last_transient = transient_err
+            for attempt in range(2):
+                await asyncio.sleep(min(
+                    _TRANSIENT_RETRY_BACKOFF_BASE * (2.0 ** attempt), 8.0
+                ))
+                try:
+                    return _validate_llm_response(
+                        await _relay_async_completion(
+                            client,
+                            kwargs,
+                            provider=resolved_provider,
+                            api_mode=resolved_api_mode,
+                            create=_acreate,
+                        ),
+                        task)
+                except Exception as retry_transient:
+                    if configured_chain:
+                        if not _configured_fallback_allows(retry_transient, fallback_on):
+                            raise
+                    elif not _is_transient_transport_error(retry_transient):
+                        raise
+                    last_transient = retry_transient
+            raise last_transient
     except Exception as first_err:
+        if configured_chain:
+            if _configured_fallback_allows(first_err, fallback_on):
+                response = await _try_configured_candidates_async(
+                    task, configured_chain,
+                    messages=messages, temperature=temperature,
+                    max_tokens=max_tokens, tools=tools,
+                    effective_timeout=effective_timeout,
+                    effective_extra_body=effective_extra_body,
+                    reasoning_config=reasoning_config,
+                )
+                if response is not None:
+                    return response
+            raise
         if "temperature" in kwargs and _is_unsupported_temperature_error(first_err):
             retry_kwargs = dict(kwargs)
             retry_kwargs.pop("temperature", None)

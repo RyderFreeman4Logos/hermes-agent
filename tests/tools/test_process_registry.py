@@ -176,92 +176,63 @@ def test_reader_loop_streams_incremental_chunks_from_read1(registry, monkeypatch
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only: uses setsid/fcntl")
 class TestOrphanedPipeReconciliation:
-    """Regression tests for issue #17327.
+    """A launcher exit is non-terminal while its owned process group is live."""
 
-    `hermes update` in Feishu spawned a background subprocess that restarted
-    the gateway; the direct child exited quickly but a descendant daemon
-    held the stdout pipe open. `_reader_loop.finally` never ran, so
-    `session.exited` stayed False and the agent polled 74 times over 7
-    minutes, all returning `status: running`.
-
-    The fix is `_reconcile_local_exit()`: poll() and wait() now check the
-    direct `Popen.poll()` before trusting `session.exited`.
-    """
-
-    def test_reconcile_flips_exited_when_direct_child_done(self, registry):
-        """Direct child exited but reader thread is blocked on orphaned pipe."""
-        # Simulate the orphaned-pipe scenario: direct child exited, but a
-        # descendant holds stdout open so the reader never sees EOF.
-        # Approach: spawn `sh -c 'sleep 10 &'` with setsid — sh forks the
-        # sleep into a new session group, exits immediately, but sleep
-        # inherits the stdout pipe and keeps it open.
+    def test_reconcile_waits_for_detached_child(self, registry):
         proc = subprocess.Popen(
-            ["sh", "-c", "exec 1>&2; ( sleep 30 ) & disown; exit 0"],
+            [
+                sys.executable,
+                "-c",
+                "import os,time; pid=os.fork(); "
+                "time.sleep(.8) if pid == 0 else os._exit(7)",
+            ],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            preexec_fn=os.setsid,
+            start_new_session=True,
         )
 
         s = _make_session(sid="proc_orphan_test")
         s.process = proc
         s.pid = proc.pid
+        s.process_group_id = proc.pid
         registry._running[s.id] = s
 
-        # Wait for the direct child to exit. We don't start a reader thread,
-        # so session.exited stays False (mimicking the stuck-reader state).
         assert _wait_until(lambda: proc.poll() is not None, timeout=5.0), (
-            "Direct child should exit quickly (sh exits, sleep descendant "
-            "holds the pipe open)"
+            "launcher should exit before its detached child"
         )
+        assert s.exit_code is None
+        assert registry.poll(s.id)["status"] == "running"
+        assert _wait_until(lambda: registry.poll(s.id)["status"] == "exited")
+        assert registry.poll(s.id)["exit_code"] == 7
 
-        # Before the fix: poll would return "running" forever.
-        # After the fix: poll reconciles against proc.poll() and flips.
-        assert s.exited is False  # Precondition: reader hasn't updated it.
-        result = registry.poll(s.id)
-        assert result["status"] == "exited", (
-            f"Expected reconciled 'exited' status; got {result!r}. "
-            "This is issue #17327 — reader is blocked on orphaned pipe."
-        )
-        assert result["exit_code"] == 0
-        assert s.exited is True
-        assert s.id in registry._finished
-        assert s.id not in registry._running
-
-        # Clean up the orphaned descendant.
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
-
-    def test_wait_returns_when_reader_blocked(self, registry):
-        """wait() must also reconcile — not just poll()."""
+    def test_wait_blocks_until_descendant_settles(self, registry):
         proc = subprocess.Popen(
-            ["sh", "-c", "( sleep 30 ) & disown; exit 0"],
+            [
+                sys.executable,
+                "-c",
+                "import os,time; pid=os.fork(); "
+                "time.sleep(.6) if pid == 0 else os._exit(0)",
+            ],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            preexec_fn=os.setsid,
+            start_new_session=True,
         )
 
         s = _make_session(sid="proc_wait_orphan")
         s.process = proc
         s.pid = proc.pid
+        s.process_group_id = proc.pid
         registry._running[s.id] = s
 
         assert _wait_until(lambda: proc.poll() is not None, timeout=5.0)
 
         start = time.monotonic()
-        result = registry.wait(s.id, timeout=10)
+        result = registry.wait(s.id, timeout=5)
         elapsed = time.monotonic() - start
 
         assert result["status"] == "exited", result
-        assert elapsed < 5.0, (
-            f"wait() should return ~immediately via reconcile; took {elapsed:.1f}s"
-        )
-
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
+        assert result["exit_code"] == 0
+        assert elapsed >= 0.2
 
     def test_wait_wakes_when_session_moves_to_finished(self, registry):
         """wait() should not sleep for the old 1s polling tick after exit."""
@@ -1273,99 +1244,77 @@ class TestHandleProcessRedaction:
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only: select() on pipes")
 class TestReaderLoopOrphanedPipe:
-    """Regression tests for issue #68915.
+    """The reader supervises the complete owned process group."""
 
-    When an agent command backgrounds a long-lived process (``node server.js
-    &``), the grandchild inherits the write end of the reader's stdout pipe.
-    The direct bash child exits, but the pipe never EOFs — the old blocking
-    ``read1()`` parked the reader thread forever, ``session.exited`` never
-    flipped on its own, and ``notify_on_complete`` never fired. The reader
-    must instead terminate shortly after the direct child exits, even while
-    a descendant still holds the pipe open.
-    """
-
-    def test_reader_exits_when_orphan_holds_pipe(self, registry):
-        """Reader loop must return promptly after the direct child exits,
-        even though a backgrounded descendant keeps the pipe open."""
+    def test_final_notify_waits_for_child_and_is_exactly_once(self, registry):
         proc = subprocess.Popen(
-            ["sh", "-c", "echo started; sleep 30 & exit 0"],
+            [
+                sys.executable,
+                "-c",
+                "import os,time; print('launcher', flush=True); pid=os.fork(); "
+                "(time.sleep(.8), print('child-final', flush=True), os._exit(0)) "
+                "if pid == 0 else os._exit(9)",
+            ],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             encoding="utf-8",
             errors="replace",
-            preexec_fn=os.setsid,
-        )
-        s = _make_session(sid="proc_orphan_reader")
-        s.process = proc
-        s.pid = proc.pid
-        registry._running[s.id] = s
-
-        done = threading.Event()
-
-        def _run():
-            registry._reader_loop(s)
-            done.set()
-
-        t = threading.Thread(target=_run, daemon=True)
-        t.start()
-        try:
-            # The direct child exits immediately; the reader must notice and
-            # return well before the 30s descendant releases the pipe.
-            assert done.wait(timeout=10.0), (
-                "_reader_loop is still blocked on the orphan-held pipe "
-                "(issue #68915) — session.exited would never flip and "
-                "notify_on_complete would never fire"
-            )
-            assert s.exited is True
-            assert s.exit_code == 0
-            assert s.completion_reason == "exited"
-            assert "started" in s.output_buffer
-            assert s.id in registry._finished
-        finally:
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
-
-    def test_reader_exit_fires_notify_on_complete(self, registry):
-        """The autonomous completion notification must not depend on a
-        poll()/wait() call when an orphan holds the pipe."""
-        proc = subprocess.Popen(
-            ["sh", "-c", "sleep 30 & echo bg-started"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            preexec_fn=os.setsid,
+            start_new_session=True,
         )
         s = _make_session(sid="proc_orphan_notify")
         s.process = proc
         s.pid = proc.pid
+        s.process_group_id = proc.pid
         s.notify_on_complete = True
         registry._running[s.id] = s
 
         done = threading.Event()
-
-        def _run():
-            registry._reader_loop(s)
-            done.set()
-
-        t = threading.Thread(target=_run, daemon=True)
+        t = threading.Thread(
+            target=lambda: (registry._reader_loop(s), done.set()), daemon=True
+        )
         t.start()
-        try:
-            assert done.wait(timeout=10.0), (
-                "_reader_loop blocked — completion notification lost (#68915)"
-            )
-            # Exactly one completion event must have been queued.
-            item = registry.completion_queue.get_nowait()
-            assert item["type"] == "completion"
-            assert item["session_id"] == s.id
-            assert item["exit_code"] == 0
-        finally:
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
+        assert _wait_until(lambda: proc.poll() is not None)
+        assert not done.wait(timeout=0.2)
+        assert registry.completion_queue.empty()
+        assert done.wait(timeout=5)
 
+        item = registry.completion_queue.get_nowait()
+        assert item["type"] == "completion"
+        assert item["session_id"] == s.id
+        assert item["exit_code"] == 9
+        assert item["output"] == "launcher\nchild-final\n"
+        registry._move_to_finished(s)
+        assert registry.completion_queue.empty()
+
+    def test_none_exit_and_zombie_are_not_terminal(self, registry):
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import os,time; pid=os.fork(); "
+                "time.sleep(.7) if pid == 0 else os._exit(4)",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        s = _make_session(sid="proc_zombie_notify", exited=True)
+        s.process = proc
+        s.pid = proc.pid
+        s.process_group_id = proc.pid
+        s.notify_on_complete = True
+        registry._running[s.id] = s
+
+        import psutil
+
+        assert _wait_until(lambda: psutil.Process(proc.pid).status() == psutil.STATUS_ZOMBIE)
+        assert s.exit_code is None
+        registry._move_to_finished(s)
+        assert s.exited is False
+        assert registry.completion_queue.empty()
+        assert _wait_until(lambda: not registry.completion_queue.empty(), timeout=5)
+        assert s.exited is True
+        item = registry.completion_queue.get_nowait()
+        assert item["exit_code"] == 4
+        assert registry.completion_queue.empty()

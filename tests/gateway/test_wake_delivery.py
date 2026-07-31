@@ -79,23 +79,29 @@ def test_deliver_wake_non_push_self_posts_raw_session_id(monkeypatch):
         seen["session_id"] = request.headers.get("X-Hermes-Session-Id")
         seen["auth"] = request.headers.get("Authorization")
         seen["body"] = await request.json()
-        return web.json_response({"choices": [{"message": {"content": "ok"}}]})
+        return web.json_response(
+            {"choices": [{"message": {"content": "ok"}}]},
+            headers={"X-Hermes-Delivery-Acknowledged": "true"},
+        )
 
     async def run():
         runner, port = await _serve(handler)
         try:
             adapter = ApiServerLikeAdapter(host="0.0.0.0", port=port, key="sekrit")
-            await deliver_wake(adapter, text="task done — wake", session_id="raw-sid-42")
+            return await deliver_wake(
+                adapter, text="task done — wake", session_id="raw-sid-42"
+            )
         finally:
             await runner.cleanup()
 
-    asyncio.run(run())
+    result = asyncio.run(run())
     assert seen["session_id"] == "raw-sid-42"
     assert seen["auth"] == "Bearer sekrit"
     assert seen["body"]["stream"] is False
     assert seen["body"]["messages"] == [
         {"role": "user", "content": "task done — wake"}
     ]
+    assert result == {"api_calls": 1}
 
 
 def test_deliver_wake_retries_429_then_succeeds(monkeypatch):
@@ -123,5 +129,4 @@ def test_deliver_wake_retries_429_then_succeeds(monkeypatch):
 
     asyncio.run(run())
     assert calls["n"] == 2
-
 

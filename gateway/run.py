@@ -4100,7 +4100,15 @@ class TurnRunner:
             if text:
                 formatted.append((evt, claim, text))
             else:
-                release_event_delivery(evt, claim, consume_attempt=False)
+                try:
+                    release_event_delivery(
+                        evt, claim, consume_attempt=False
+                    )
+                except Exception:
+                    logger.warning(
+                        "Gateway turn-start unformatted claim release failed",
+                        exc_info=True,
+                    )
         return formatted
 
     @staticmethod
@@ -4108,25 +4116,10 @@ class TurnRunner:
         completions: list[tuple[dict, str, str]], result: Optional[dict] = None
     ) -> None:
         """Settle each gateway turn-start delivery claim independently."""
-        from tools.async_delegation import (
-            complete_event_delivery,
-            release_event_delivery,
-            turn_result_acknowledges_delivery,
-        )
+        from tools.async_delegation import settle_event_deliveries
 
-        acknowledged = turn_result_acknowledges_delivery(result)
-        for evt, claim, _text in completions:
-            try:
-                if acknowledged:
-                    complete_event_delivery(evt, claim)
-                else:
-                    release_event_delivery(evt, claim)
-            except Exception:
-                logger.warning(
-                    "Gateway delivery claim %s failed",
-                    "completion" if acknowledged else "release",
-                    exc_info=True,
-                )
+        claims = [(evt, claim) for evt, claim, _text in completions]
+        settle_event_deliveries(claims, result, log_context="Gateway")
 
     def run_sync(self):
         ctx = self._ctx
@@ -5812,16 +5805,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # cannot grow unbounded over a long-running gateway lifetime.
         self._session_sources: "OrderedDict[str, SessionSource]" = OrderedDict()
         self._session_sources_max = 512
-        # Completion delivery is intentionally lifecycle-scoped. This closes
-        # duplicate queue/watcher races inside one gateway without pretending
-        # the adapter call and a persistence write can be exactly-once across
-        # a process crash. Any durable async-delegation replay state remains
-        # owned by tools.async_delegation, not a parallel gateway ledger.
-        self._completion_delivery_lock = threading.Lock()
-        self._completion_deliveries_inflight: set[tuple[str, str, object]] = set()
-        self._completion_deliveries_delivered: "OrderedDict[tuple[str, str, object], None]" = OrderedDict()
-        self._completion_delivery_retention = 2048
-
         # Cache AIAgent instances per session to preserve prompt caching.
         # Without this, a new AIAgent is created per message, rebuilding the
         # system prompt (including memory) every turn — breaking prefix cache
@@ -20975,24 +20958,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         is not a transactional boundary: a process crash after adapter
         acceptance can still cause durable at-least-once replay.
         """
-        def release_claims_before_self_post() -> bool:
+        def settle_claims_after_self_post(result: dict) -> None:
             if not delivery_claims:
-                return True
-            from tools.async_delegation import release_event_delivery
+                return
+            from tools.async_delegation import settle_event_deliveries
 
-            try:
-                for delivery_event, claim in delivery_claims:
-                    release_event_delivery(
-                        delivery_event, claim, consume_attempt=False
-                    )
-            except Exception:
-                logger.warning(
-                    "Could not release completion claim before gateway self-post",
-                    exc_info=True,
-                )
-                return False
-            delivery_claims.clear()
-            return True
+            settle_event_deliveries(
+                delivery_claims,
+                result,
+                log_context="Gateway self-post",
+            )
 
         source = self._build_process_event_source(evt)
         if not source:
@@ -21012,15 +20987,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 adapter = self.adapters.get(Platform.API_SERVER)
                 from gateway.wake import adapter_supports_push, deliver_wake
                 if adapter is not None and not adapter_supports_push(adapter):
-                    if not release_claims_before_self_post():
-                        return False
                     try:
                         logger.info(
                             "Watch pattern notification — waking api_server "
                             "session %s via self-post",
                             raw_sid,
                         )
-                        await deliver_wake(adapter, text=synth_text, session_id=raw_sid)
+                        result = await deliver_wake(
+                            adapter, text=synth_text, session_id=raw_sid
+                        )
+                        settle_claims_after_self_post(result)
                         return True
                     except Exception as e:
                         logger.warning(
@@ -21057,15 +21033,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # the raw X-Hermes-Session-Id session — self-post instead.
             from gateway.wake import deliver_wake
             raw_sid = str(evt.get("origin_session_id") or "").strip() or str(source.chat_id or "")
-            if not release_claims_before_self_post():
-                return False
             try:
                 logger.info(
                     "Watch pattern notification — waking api_server session "
                     "%s via self-post",
                     raw_sid,
                 )
-                await deliver_wake(adapter, text=synth_text, session_id=raw_sid)
+                result = await deliver_wake(
+                    adapter, text=synth_text, session_id=raw_sid
+                )
+                settle_claims_after_self_post(result)
                 return True
             except Exception as e:
                 logger.warning(
@@ -21103,27 +21080,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as e:
             logger.error("Watch notification injection error: %s", e)
             return False
-
-    @staticmethod
-    def _completion_delivery_identity(evt: dict) -> Optional[tuple[str, str, object]]:
-        """Return a producer-stable identity when one is available.
-
-        Delegation UUIDs identify one producer completion. Process session IDs
-        are normally unique too, but include the persisted spawn epoch so an
-        explicitly reused ID represents a distinct process incarnation. Legacy
-        process events without ``started_at`` are delivered without deduplication
-        rather than risking suppression of a real completion.
-        """
-        evt_type = str(evt.get("type") or "")
-        if evt_type == "async_delegation":
-            producer_id = str(evt.get("delegation_id") or "")
-            return (evt_type, producer_id, "") if producer_id else None
-        if evt_type == "completion":
-            producer_id = str(evt.get("session_id") or "")
-            started_at = evt.get("started_at")
-            if producer_id and started_at is not None:
-                return (evt_type, producer_id, started_at)
-        return None
 
     async def _classify_completion_target(self, parent_session_id: str) -> str:
         """Classify an async-completion delivery target before adapter acceptance.
@@ -21189,33 +21145,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         event or the event has no gateway route. No cross-process exactly-once
         guarantee is claimed.
         """
-        identity = self._completion_delivery_identity(evt)
-        durable_claim_id = ""
-        durable_delegation_id = ""
-        durable_authoritative = False
-        if evt.get("type") == "async_delegation":
-            durable_delegation_id = str(evt.get("delegation_id") or "")
-            if durable_delegation_id:
-                try:
-                    from tools.async_delegation import (
-                        claim_completion_delivery,
-                        get_durable_delegation,
-                    )
+        from tools.async_delegation import (
+            claim_event_delivery,
+            drop_event_delivery,
+            release_event_delivery,
+        )
 
-                    durable_authoritative = (
-                        get_durable_delegation(durable_delegation_id) is not None
-                    )
-                    durable_claim_id = f"gateway:{id(self)}:{__import__('uuid').uuid4().hex}"
-                    if not claim_completion_delivery(
-                        durable_delegation_id, durable_claim_id,
-                    ):
-                        return None
-                except Exception as exc:
-                    logger.warning(
-                        "Could not claim durable async completion %s: %s",
-                        durable_delegation_id, exc,
-                    )
-                    return False
+        try:
+            claim = claim_event_delivery(evt, f"gateway:{id(self)}")
+        except Exception as exc:
+            logger.warning("Could not claim completion delivery: %s", exc)
+            return False
+        if claim is None:
+            return None
+        claims = [(evt, claim)] if claim else []
+        durable_delegation_id = str(evt.get("delegation_id") or "")
+        if evt.get("type") == "async_delegation":
             parent_session_id = str(evt.get("parent_session_id") or "").strip()
             if parent_session_id:
                 # Pre-flight (#65838-class): adapter acceptance is NOT proof of
@@ -21232,84 +21177,49 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "delegation records).",
                         durable_delegation_id or "<legacy>", parent_session_id,
                     )
-                    if durable_claim_id:
+                    if claim:
                         try:
-                            from tools.async_delegation import drop_completion_delivery
-
-                            drop_completion_delivery(
-                                durable_delegation_id, durable_claim_id,
-                            )
+                            drop_event_delivery(evt, claim)
                         except Exception:
                             logger.debug(
-                                "Could not drop durable completion claim",
+                                "Could not drop completion claim",
                                 exc_info=True,
                             )
                     return None
                 if verdict == "retry":
-                    if durable_claim_id:
+                    if claim:
                         try:
-                            from tools.async_delegation import release_completion_delivery
-
-                            release_completion_delivery(
-                                durable_delegation_id, durable_claim_id,
-                            )
+                            release_event_delivery(evt, claim)
                         except Exception:
                             logger.debug(
-                                "Could not release durable completion claim",
+                                "Could not release completion claim",
                                 exc_info=True,
                             )
                     return False
-        if durable_authoritative:
-            # SQLite owns contention and replay until the real model result
-            # settles the transferred claim. Keep the in-memory ledger only
-            # for legacy/non-durable producer events.
-            identity = None
-        if identity is not None:
-            with self._completion_delivery_lock:
-                if (
-                    identity in self._completion_deliveries_inflight
-                    or identity in self._completion_deliveries_delivered
-                ):
-                    return None
-                self._completion_deliveries_inflight.add(identity)
 
         accepted = False
         try:
             injection_result = await self._inject_watch_notification(
                 synth_text,
                 evt,
-                delivery_claims=(
-                    [(evt, durable_claim_id)] if durable_authoritative else None
-                ),
+                delivery_claims=claims or None,
             )
+            if injection_result is None:
+                drop_event_delivery(evt, claim)
+                accepted = True
+                return None
             if injection_result is not True:
                 return injection_result
             accepted = True
-
-            if identity is not None:
-                with self._completion_delivery_lock:
-                    self._completion_deliveries_inflight.discard(identity)
-                    self._completion_deliveries_delivered[identity] = None
-                    while (
-                        len(self._completion_deliveries_delivered)
-                        > self._completion_delivery_retention
-                    ):
-                        self._completion_deliveries_delivered.popitem(last=False)
-
             return True
         finally:
-            if identity is not None and not accepted:
-                with self._completion_delivery_lock:
-                    self._completion_deliveries_inflight.discard(identity)
-            if durable_claim_id and not accepted:
+            if claim and not accepted:
                 try:
-                    from tools.async_delegation import release_completion_delivery
-
-                    release_completion_delivery(
-                        durable_delegation_id, durable_claim_id,
-                    )
+                    release_event_delivery(evt, claim)
                 except Exception:
-                    logger.debug("Could not release durable completion claim", exc_info=True)
+                    logger.debug(
+                        "Could not release completion claim", exc_info=True
+                    )
 
     def _enrich_async_delegation_routing(self, evt: dict) -> None:
         """Fill platform/chat_id/thread_id/chat_type on an async-delegation event.

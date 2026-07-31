@@ -10355,7 +10355,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             session_key=session_key,
             owns_event=self._owns_process_notification,
         ):
-            claim = claim_event_delivery(event, consumer)
+            try:
+                claim = claim_event_delivery(event, consumer)
+            except Exception:
+                logger.warning(
+                    "Classic CLI process-notification claim failed",
+                    exc_info=True,
+                )
+                continue
             if claim is None:
                 continue
             self._pending_input.put(
@@ -10367,26 +10374,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         claims: list[tuple[dict, str]], result: Optional[dict] = None
     ) -> None:
         """Settle every classic CLI claim independently after its model turn."""
-        from tools.async_delegation import (
-            complete_event_delivery,
-            release_event_delivery,
-            turn_result_acknowledges_delivery,
-        )
+        from tools.async_delegation import settle_event_deliveries
 
-        acknowledged = turn_result_acknowledges_delivery(result)
-        while claims:
-            event, claim = claims.pop()
-            try:
-                if acknowledged:
-                    complete_event_delivery(event, claim)
-                else:
-                    release_event_delivery(event, claim)
-            except Exception:
-                logger.warning(
-                    "Classic CLI delivery claim %s failed",
-                    "completion" if acknowledged else "release",
-                    exc_info=True,
-                )
+        settle_event_deliveries(claims, result, log_context="Classic CLI")
 
     def _drain_interrupt_queue_to_pending_input(self) -> None:
         """Move stray messages from ``_interrupt_queue`` into ``_pending_input``.

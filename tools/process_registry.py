@@ -39,6 +39,7 @@ import subprocess
 import threading
 import time
 import uuid
+from collections import OrderedDict
 
 _IS_WINDOWS = platform.system() == "Windows"
 from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
@@ -97,6 +98,7 @@ WATCH_STRIKE_LIMIT = 3            # Strikes in a row → disable watch + promote
 WATCH_GLOBAL_MAX_PER_WINDOW = 15
 WATCH_GLOBAL_WINDOW_SECONDS = 10
 WATCH_GLOBAL_COOLDOWN_SECONDS = 30
+NOTIFICATION_DELIVERY_RETENTION = 2048
 
 
 def format_uptime_short(seconds: int) -> str:
@@ -272,6 +274,13 @@ class ProcessRegistry:
         # injection (the bug #8228 originally fixed).  drain_notifications()
         # consults this set; the gateway/tui watchers deliberately do NOT.
         self._poll_observed: set = set()
+        # Ordinary process notifications have no SQLite delivery row. Keep
+        # their claim lifecycle beside the queue so schedule/adapter acceptance
+        # cannot consume them before a real model turn acknowledges delivery.
+        self._notification_delivery_claims: Dict[tuple, tuple[str, dict]] = {}
+        self._notification_deliveries_delivered: "OrderedDict[tuple, None]" = (
+            OrderedDict()
+        )
 
         # Global watch-match circuit breaker — across all sessions.
         # Prevents sibling processes from collectively flooding the user even
@@ -1276,6 +1285,87 @@ class ProcessRegistry:
     def is_completion_consumed(self, session_id: str) -> bool:
         """Check if a completion notification was already consumed via wait/log."""
         return session_id in self._completion_consumed
+
+    @staticmethod
+    def _notification_delivery_key(evt: dict) -> tuple:
+        """Return a producer-stable identity for one ordinary notification."""
+        evt_type = str(evt.get("type") or "completion")
+        session_id = str(evt.get("session_id") or "")
+        if evt_type == "async_delegation":
+            return (evt_type, str(evt.get("delegation_id") or ""))
+        if evt_type == "completion":
+            return (evt_type, session_id, evt.get("started_at"))
+        return (
+            evt_type,
+            session_id,
+            str(evt.get("message_id") or ""),
+            str(evt.get("pattern") or ""),
+            str(evt.get("output") or ""),
+            str(evt.get("message") or ""),
+            evt.get("finished_at"),
+        )
+
+    def claim_notification_delivery(self, evt: dict, claim_id: str) -> bool:
+        """Claim an ordinary queued notification until its model turn settles."""
+        key = self._notification_delivery_key(evt)
+        with self._lock:
+            if (
+                key in self._notification_delivery_claims
+                or key in self._notification_deliveries_delivered
+            ):
+                return False
+            self._notification_delivery_claims[key] = (claim_id, evt)
+            return True
+
+    def renew_notification_delivery(self, evt: dict, claim_id: str) -> bool:
+        """Confirm that this process still owns an ordinary notification claim."""
+        key = self._notification_delivery_key(evt)
+        with self._lock:
+            held = self._notification_delivery_claims.get(key)
+            return held is not None and held[0] == claim_id
+
+    def release_notification_delivery(self, evt: dict, claim_id: str) -> bool:
+        """Release and requeue an ordinary notification for a later real turn."""
+        key = self._notification_delivery_key(evt)
+        with self._lock:
+            held = self._notification_delivery_claims.get(key)
+            if held is None or held[0] != claim_id:
+                return False
+            self._notification_delivery_claims.pop(key, None)
+        self.completion_queue.put(held[1])
+        return True
+
+    def complete_notification_delivery(self, evt: dict, claim_id: str) -> bool:
+        """Mark an ordinary notification delivered after a real model turn."""
+        key = self._notification_delivery_key(evt)
+        with self._lock:
+            held = self._notification_delivery_claims.get(key)
+            if held is None or held[0] != claim_id:
+                return False
+            self._notification_delivery_claims.pop(key, None)
+            self._notification_deliveries_delivered[key] = None
+            while (
+                len(self._notification_deliveries_delivered)
+                > NOTIFICATION_DELIVERY_RETENTION
+            ):
+                self._notification_deliveries_delivered.popitem(last=False)
+        return True
+
+    def drop_notification_delivery(self, evt: dict, claim_id: str) -> bool:
+        """Forget a claimed notification whose delivery target is gone."""
+        key = self._notification_delivery_key(evt)
+        with self._lock:
+            held = self._notification_delivery_claims.get(key)
+            if held is None or held[0] != claim_id:
+                return False
+            self._notification_delivery_claims.pop(key, None)
+            self._notification_deliveries_delivered[key] = None
+            while (
+                len(self._notification_deliveries_delivered)
+                > NOTIFICATION_DELIVERY_RETENTION
+            ):
+                self._notification_deliveries_delivered.popitem(last=False)
+        return True
 
     def is_session_waiting(self, session_id: str) -> bool:
         """Whether a goal loop parked on this session should still be parked.

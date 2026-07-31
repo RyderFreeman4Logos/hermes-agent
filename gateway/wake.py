@@ -59,7 +59,7 @@ async def deliver_wake(
     text: str,
     session_id: str = "",
     source: Any = None,
-) -> None:
+) -> Any:
     """Deliver a wake turn to the session behind ``adapter``.
 
     ``session_id`` is the RAW session id (the ``X-Hermes-Session-Id`` value /
@@ -84,19 +84,21 @@ async def deliver_wake(
             internal=True,
         )
         await adapter.handle_message(synth_event)
-        return
+        return None
 
     if not session_id:
         raise ValueError(
             "deliver_wake: non-push adapter (supports_async_delivery=False) "
             "requires the raw session id to self-post the wake turn"
         )
-    await _self_post_chat_completion(adapter, text=text, session_id=session_id)
+    return await _self_post_chat_completion(
+        adapter, text=text, session_id=session_id
+    )
 
 
 async def _self_post_chat_completion(
     adapter: Any, *, text: str, session_id: str
-) -> None:
+) -> dict:
     """POST the wake text to the in-pod API server as a normal session turn.
 
     Uses the adapter's own bind host/port/key (``ApiServerAdapter.__init__``).
@@ -161,12 +163,18 @@ async def _self_post_chat_completion(
                             f"HTTP {resp.status}: {body}"
                         )
                     await resp.read()
+                    acknowledged = (
+                        resp.headers.get(
+                            "X-Hermes-Delivery-Acknowledged", ""
+                        ).lower()
+                        == "true"
+                    )
                     logger.info(
                         "wake self-post delivered for session %s (attempt %d)",
                         session_id,
                         attempt + 1,
                     )
-                    return
+                    return {"api_calls": 1 if acknowledged else 0}
         except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
             last_err = exc
             logger.warning(

@@ -336,3 +336,56 @@ async def test_inject_watch_notification_origin_session_id_wins(monkeypatch, tmp
     result = await runner._inject_watch_notification("[SYSTEM: done]", evt)
     assert result is True
     assert posts == ["raw-origin-sid"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("turn_result", "expected"),
+    [
+        ({"api_calls": 1}, "complete"),
+        ({"api_calls": 0}, "release"),
+    ],
+)
+async def test_api_self_post_settles_claim_from_real_turn_result(
+    monkeypatch, tmp_path, turn_result, expected
+):
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    runner.adapters[Platform.API_SERVER] = SimpleNamespace(
+        supports_async_delivery=False,
+        _host="127.0.0.1",
+        _port=8642,
+        _api_key="k",
+        _model_name="m",
+    )
+    settled = []
+
+    async def fake_self_post(_adapter, *, text, session_id):
+        assert text == "[SYSTEM: done]"
+        assert session_id == "raw-api-session"
+        return turn_result
+
+    import gateway.wake as wake_mod
+    from tools import async_delegation as ad
+
+    monkeypatch.setattr(wake_mod, "_self_post_chat_completion", fake_self_post)
+    monkeypatch.setattr(
+        ad,
+        "complete_event_delivery",
+        lambda _evt, _claim: settled.append("complete"),
+    )
+    monkeypatch.setattr(
+        ad,
+        "release_event_delivery",
+        lambda _evt, _claim: settled.append("release"),
+    )
+
+    result = await runner._inject_watch_notification(
+        "[SYSTEM: done]",
+        {"type": "completion", "session_key": "raw-api-session"},
+        delivery_claims=[
+            ({"type": "completion", "session_id": "proc-api"}, "claim-api")
+        ],
+    )
+
+    assert result is True
+    assert settled == [expected]

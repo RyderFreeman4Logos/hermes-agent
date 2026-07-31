@@ -743,6 +743,33 @@ class TestChatCompletionsEndpoint:
             data = await resp.json()
             assert "messages" in data["error"]["message"]
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("result", "expected"),
+        [
+            ({"final_response": "ok", "api_calls": 1}, "true"),
+            ({"final_response": "failed", "api_calls": 0, "failed": True}, "false"),
+        ],
+    )
+    async def test_nonstream_response_reports_delivery_ack(
+        self, adapter, result, expected
+    ):
+        usage = {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2}
+        app = _create_app(adapter)
+        async with TestClient(TestServer(app)) as cli:
+            with patch.object(
+                adapter, "_run_agent", return_value=(result, usage)
+            ):
+                resp = await cli.post(
+                    "/v1/chat/completions",
+                    json={
+                        "model": "test",
+                        "messages": [{"role": "user", "content": "hi"}],
+                    },
+                )
+
+        assert resp.headers["X-Hermes-Delivery-Acknowledged"] == expected
+
 
     @pytest.mark.asyncio
     async def test_chat_completions_stream_passes_request_model_provider_options(self, adapter):
@@ -2616,5 +2643,4 @@ class TestCreateAgentModelRecovery:
         )
         adapter._create_agent(session_id="another-session", gateway_session_key="stable-chan-1")
         assert captured[1]["model"] == "minimax/minimax-m3"
-
 

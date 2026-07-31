@@ -845,6 +845,24 @@ def test_drain_notifications_completion_callback_exception_fails_closed(registry
     assert registry.completion_queue.empty()
 
 
+def test_notification_delivery_claim_requeues_until_model_ack(registry):
+    event = {
+        "type": "completion",
+        "session_id": "proc-delivery-ledger",
+        "started_at": 123.0,
+        "output": "done",
+    }
+
+    assert registry.claim_notification_delivery(event, "first")
+    assert not registry.claim_notification_delivery(dict(event), "racer")
+    assert registry.release_notification_delivery(event, "first")
+    assert registry.completion_queue.get_nowait() is event
+
+    assert registry.claim_notification_delivery(event, "second")
+    assert registry.complete_notification_delivery(event, "second")
+    assert not registry.claim_notification_delivery(dict(event), "replay")
+
+
 def test_drain_notifications_filters_async_delegation_by_session_key():
     """Async-delegation events should only be consumed by the matching session's drain.
 

@@ -4004,6 +4004,11 @@ class APIServerAdapter(BasePlatformAdapter):
         response_headers = {
             "X-Hermes-Session-Id": result.get("session_id", session_id),
         }
+        from tools.async_delegation import turn_result_acknowledges_delivery
+
+        response_headers["X-Hermes-Delivery-Acknowledged"] = (
+            "true" if turn_result_acknowledges_delivery(result) else "false"
+        )
         if gateway_session_key:
             response_headers["X-Hermes-Session-Key"] = gateway_session_key
 

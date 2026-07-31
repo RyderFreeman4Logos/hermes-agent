@@ -24,12 +24,12 @@ from tools.process_registry import ProcessRegistry, ProcessSession
 # Helpers
 # ---------------------------------------------------------------------------
 
-class _FakeRegistry:
+class _FakeRegistry(ProcessRegistry):
     """Return pre-canned sessions, then None once exhausted."""
 
     def __init__(self, sessions):
+        super().__init__()
         self._sessions = list(sessions)
-        self._completion_consumed: set = set()
 
     def get(self, session_id):
         if self._sessions:
@@ -211,5 +211,4 @@ async def test_none_user_id_does_not_generate_pairing_code(monkeypatch, tmp_path
     assert not generate_called, (
         "Pairing code should NOT be generated for messages with user_id=None"
     )
-
 

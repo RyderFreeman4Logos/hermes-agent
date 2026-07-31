@@ -12110,6 +12110,63 @@ def test_delivery_release_failure_does_not_leave_session_running(monkeypatch):
     assert session["running"] is False
 
 
+def test_successful_turn_settles_later_claims_after_first_write_fails(
+    monkeypatch, caplog
+):
+    from tools import async_delegation as ad
+
+    class _Agent:
+        def run_conversation(self, *args, **kwargs):
+            return {
+                "final_response": "handled",
+                "messages": [],
+                "api_calls": 1,
+            }
+
+    session = _session(agent=_Agent(), running=True)
+    completed = []
+    released = []
+
+    def complete(evt, _claim):
+        completed.append(evt["delegation_id"])
+        if len(completed) == 1:
+            raise sqlite3.OperationalError("database is locked")
+
+    import sqlite3
+
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
+    monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(
+        ad, "start_event_delivery_renewal", lambda claims: threading.Event()
+    )
+    monkeypatch.setattr(ad, "complete_event_delivery", complete)
+    monkeypatch.setattr(
+        ad,
+        "release_event_delivery",
+        lambda evt, _claim: released.append(evt["delegation_id"]),
+    )
+
+    server._run_prompt_submit(
+        "completion-write-failure",
+        "sid",
+        session,
+        "completion",
+        turn_origin="idle_completion",
+        delivery_claims=[
+            ({"type": "async_delegation", "delegation_id": "one"}, "claim-one"),
+            ({"type": "async_delegation", "delegation_id": "two"}, "claim-two"),
+        ],
+    )
+
+    assert completed == ["one", "two"]
+    assert released == []
+    assert session["running"] is False
+    assert "TUI delivery claim completion failed" in caplog.text
+
+
 def test_prompt_submit_auto_titles_session_on_complete(monkeypatch):
     """maybe_auto_title is called after a successful (complete) prompt."""
 
@@ -14142,6 +14199,31 @@ def test_busy_steer_acceptance_releases_durable_claim_for_idle_retry(monkeypatch
     assert released == [(evt, "claim-tui-poller-steer")]
     assert completed == []
     assert async_delegation.claim_event_delivery(evt, "tui-idle-drain") == "claim-tui-idle-drain"
+
+
+def test_busy_steer_rejection_release_error_does_not_break_poller(monkeypatch):
+    """A persistence failure during rejected-steer cleanup stays isolated."""
+    import tools.async_delegation as async_delegation
+
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+    monkeypatch.setattr(
+        async_delegation,
+        "claim_event_delivery",
+        lambda evt, consumer: "claim-rejected",
+    )
+    monkeypatch.setattr(
+        async_delegation,
+        "release_event_delivery",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("store down")),
+    )
+
+    evt = {"type": "completion", "session_id": "proc-rejected"}
+    session = _session(
+        agent=types.SimpleNamespace(steer=lambda text, **kwargs: False),
+        running=True,
+    )
+
+    assert server._try_steer_busy_notification(session, evt, "done") is False
 
 
 @pytest.mark.parametrize(

@@ -6360,16 +6360,12 @@ class BasePlatformAdapter(ABC):
                 "delivery_claims", []
             )
             if delivery_claims:
-                from tools.async_delegation import release_event_delivery
+                from tools.async_delegation import settle_event_deliveries
 
-                for delivery_event, claim in delivery_claims:
-                    try:
-                        release_event_delivery(delivery_event, claim)
-                    except Exception:
-                        logger.warning(
-                            "Gateway adapter delivery claim release failed",
-                            exc_info=True,
-                        )
+                settle_event_deliveries(
+                    delivery_claims,
+                    log_context="Gateway adapter",
+                )
             # Stop typing before any deferred callback work.  Post-delivery
             # callbacks may perform platform I/O; a stuck callback must not
             # leave the typing refresh task running indefinitely.

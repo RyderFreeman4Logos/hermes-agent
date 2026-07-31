@@ -8694,7 +8694,13 @@ def _claim_turn_start_async_completions(
             continue
         from tools.async_delegation import release_event_delivery
 
-        release_event_delivery(evt, claim, consume_attempt=False)
+        try:
+            release_event_delivery(evt, claim, consume_attempt=False)
+        except Exception:
+            logger.warning(
+                "TUI turn-start unformatted claim release failed",
+                exc_info=True,
+            )
     return formatted
 
 
@@ -8938,7 +8944,11 @@ def _try_steer_busy_notification(
 
     from tools.async_delegation import claim_event_delivery, release_event_delivery
 
-    claim = claim_event_delivery(evt, "tui-poller-steer")
+    try:
+        claim = claim_event_delivery(evt, "tui-poller-steer")
+    except Exception:
+        logger.warning("TUI busy-steer completion claim failed", exc_info=True)
+        return False
     if claim is None:
         return "claimed_elsewhere"
     # An AIAgent calls its receipt at a later tool boundary.  Third-party
@@ -8970,7 +8980,13 @@ def _try_steer_busy_notification(
     except Exception:
         accepted = False
     if not accepted:
-        release_event_delivery(evt, claim, consume_attempt=False)
+        try:
+            release_event_delivery(evt, claim, consume_attempt=False)
+        except Exception:
+            logger.warning(
+                "TUI rejected-steer completion claim release failed",
+                exc_info=True,
+            )
         return False
 
     with session["history_lock"]:
@@ -9172,7 +9188,14 @@ def _dispatch_idle_completion_batch(
 
     claims: list[tuple[dict, str]] = []
     for evt, _text in entries:
-        claim = claim_event_delivery(evt, consumer)
+        try:
+            claim = claim_event_delivery(evt, consumer)
+        except Exception:
+            logger.warning(
+                "TUI idle completion claim failed",
+                exc_info=True,
+            )
+            continue
         if claim is not None:
             claims.append((evt, claim))
     if not claims:
@@ -9208,16 +9231,12 @@ def _dispatch_idle_completion_batch(
         )
         return True
     except Exception:
-        from tools.async_delegation import release_event_delivery
+        from tools.async_delegation import settle_event_deliveries
 
-        for evt, claim in claims:
-            try:
-                release_event_delivery(evt, claim)
-            except Exception:
-                logger.warning(
-                    "TUI idle completion delivery claim release failed",
-                    exc_info=True,
-                )
+        settle_event_deliveries(
+            claims,
+            log_context="TUI idle completion",
+        )
         with session["history_lock"]:
             session["running"] = False
         logger.warning("Idle completion batch dispatch failed", exc_info=True)
@@ -10063,19 +10082,13 @@ def _run_prompt_submit(
                 run_kwargs["persist_user_display_kind"] = display_kind
                 run_kwargs["persist_user_display_metadata"] = display_metadata
             result = agent.run_conversation(run_message, **run_kwargs)
-            from tools.async_delegation import (
-                complete_event_delivery,
-                release_event_delivery,
-                turn_result_acknowledges_delivery,
-            )
+            from tools.async_delegation import settle_event_deliveries
 
-            while claimed_deliveries:
-                evt, claim = claimed_deliveries[-1]
-                if turn_result_acknowledges_delivery(result):
-                    complete_event_delivery(evt, claim)
-                else:
-                    release_event_delivery(evt, claim)
-                claimed_deliveries.pop()
+            settle_event_deliveries(
+                claimed_deliveries,
+                result,
+                log_context="TUI",
+            )
             heartbeat_silent_noop = (
                 turn_origin == "heartbeat_warm"
                 and isinstance(result, dict)
@@ -10448,17 +10461,12 @@ def _run_prompt_submit(
             if delivery_renewal_stop is not None:
                 delivery_renewal_stop.set()
             if claimed_deliveries:
-                from tools.async_delegation import release_event_delivery
+                from tools.async_delegation import settle_event_deliveries
 
-                while claimed_deliveries:
-                    evt, claim = claimed_deliveries.pop()
-                    try:
-                        release_event_delivery(evt, claim)
-                    except Exception:
-                        logger.warning(
-                            "TUI delivery claim release failed",
-                            exc_info=True,
-                        )
+                settle_event_deliveries(
+                    claimed_deliveries,
+                    log_context="TUI",
+                )
             if thinking_started:
                 # Kill the ambient thinking sound the moment the turn ends —
                 # error and success paths both land here.

@@ -1,16 +1,14 @@
-"""Lifecycle-scoped gateway delivery regressions for terminal completions.
+"""Gateway delivery regressions for terminal completions.
 
-The gateway contract here is deliberately narrower than exactly-once: one live
-GatewayRunner suppresses concurrent/replayed copies after successful adapter
-injection, failed injection remains retryable, and durable async-delegation
-state (when available) is acknowledged through its authoritative SQLite API.
+Claims remain pending through adapter scheduling and settle only after a real
+model turn acknowledges them. Async delegation uses SQLite; ordinary process
+notifications use the process registry's bounded delivery ledger.
 """
 
 import asyncio
 import json
 import logging
 import queue
-from collections import OrderedDict
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -62,10 +60,6 @@ def _runner(adapter, *, origins=None):
         _entries=origins,
     )
     runner._session_source_cache = {}
-    runner._completion_delivery_lock = __import__("threading").Lock()
-    runner._completion_deliveries_inflight = set()
-    runner._completion_deliveries_delivered = OrderedDict()
-    runner._completion_delivery_retention = 2048
     return runner
 
 
@@ -497,6 +491,60 @@ def test_gateway_schedule_only_transfers_claim_without_acknowledging():
     durable = ad.get_durable_delegation(event["delegation_id"])
     assert durable["delivery_state"] == "pending"
     assert durable["delivery_attempts"] == 1
+
+
+def test_ordinary_process_schedule_only_stays_claimed_until_real_turn():
+    event = _completion_event(
+        started_at=2000.0,
+        session_id="proc-schedule-only",
+    )
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+
+    assert asyncio.run(
+        runner._deliver_completion_notification("completion", event)
+    ) is True
+    assert asyncio.run(
+        runner._deliver_completion_notification("completion", dict(event))
+    ) is None
+
+    synth_event = adapter.handle_message.await_args.args[0]
+    assert synth_event.metadata["delivery_claims"][0][0] is event
+    adapter.handle_message.assert_awaited_once()
+
+
+def test_ordinary_process_claim_completes_only_after_real_gateway_turn(
+    isolated_registry,
+):
+    event = _completion_event(
+        started_at=2001.0,
+        session_id="proc-real-turn",
+    )
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+
+    assert asyncio.run(
+        runner._deliver_completion_notification("completion", event)
+    ) is True
+    synth_event = adapter.handle_message.await_args.args[0]
+    claims = synth_event.metadata["delivery_claims"]
+    runner.config = SimpleNamespace(multiplex_profiles=False)
+    runner._run_agent_inner = AsyncMock(
+        return_value={"api_calls": 1, "final_response": "handled"}
+    )
+
+    asyncio.run(
+        runner._run_agent(
+            "completion",
+            "",
+            [],
+            synth_event.source,
+            "session-1",
+            delivery_claims=claims,
+        )
+    )
+
+    assert not isolated_registry.claim_notification_delivery(event, "replay")
 
 
 def test_busy_gateway_merge_preserves_transferred_claim():

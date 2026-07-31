@@ -783,7 +783,15 @@ def claim_owner_local_pending_completions(
                 continue
         except Exception:
             continue
-        claim = claim_event_delivery(evt, consumer)
+        try:
+            claim = claim_event_delivery(evt, consumer)
+        except Exception:
+            logger.warning(
+                "Async completion claim failed for %s",
+                delegation_id,
+                exc_info=True,
+            )
+            continue
         if claim is not None:
             claimed.append((evt, claim))
     return claimed
@@ -1195,21 +1203,38 @@ def renew_completion_delivery(delegation_id: str, claim_id: str) -> bool:
 
 
 def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
-    """Claim a durable delegation event; non-durable events need no token."""
-    if evt.get("type") != "async_delegation":
-        return ""
-    delegation_id = str(evt.get("delegation_id") or "")
-    if not delegation_id:
-        return ""
     claim_id = f"{consumer}:{__import__('os').getpid()}:{uuid.uuid4().hex}"
-    return claim_id if claim_completion_delivery(delegation_id, claim_id) else None
+    if evt.get("type") == "async_delegation":
+        delegation_id = str(evt.get("delegation_id") or "")
+        if not delegation_id:
+            return ""
+        if get_durable_delegation(delegation_id) is not None:
+            return (
+                claim_id
+                if claim_completion_delivery(delegation_id, claim_id)
+                else None
+            )
+    from tools.process_registry import process_registry
+
+    return (
+        claim_id
+        if process_registry.claim_notification_delivery(evt, claim_id)
+        else None
+    )
 
 
 def renew_event_delivery(evt: Dict[str, Any], claim_id: str) -> bool:
-    if not claim_id or evt.get("type") != "async_delegation":
+    if not claim_id:
         return True
-    delegation_id = str(evt.get("delegation_id") or "")
-    return bool(delegation_id) and renew_completion_delivery(delegation_id, claim_id)
+    if evt.get("type") == "async_delegation":
+        delegation_id = str(evt.get("delegation_id") or "")
+        if bool(delegation_id) and renew_completion_delivery(
+            delegation_id, claim_id
+        ):
+            return True
+    from tools.process_registry import process_registry
+
+    return process_registry.renew_notification_delivery(evt, claim_id)
 
 
 def start_event_delivery_renewal(
@@ -1334,15 +1359,45 @@ def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
 
 
 def complete_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
-    if claim_id and evt.get("type") == "async_delegation":
-        complete_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
+    if not claim_id:
+        return
+    if evt.get("type") == "async_delegation":
+        if complete_completion_delivery(
+            str(evt.get("delegation_id") or ""), claim_id
+        ):
+            return
+    from tools.process_registry import process_registry
+
+    process_registry.complete_notification_delivery(evt, claim_id)
+
+
+def drop_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
+    """Terminally drop a claimed event whose target cannot accept it."""
+    if not claim_id:
+        return
+    if evt.get("type") == "async_delegation":
+        if drop_completion_delivery(
+            str(evt.get("delegation_id") or ""), claim_id
+        ):
+            return
+    from tools.process_registry import process_registry
+
+    process_registry.drop_notification_delivery(evt, claim_id)
 
 
 def turn_result_acknowledges_delivery(result: Any) -> bool:
     """True only when a completion reached a successful real model turn."""
     if not isinstance(result, dict):
         return False
-    if result.get("failed") or result.get("interrupted") or result.get("error"):
+    if (
+        result.get("failed")
+        or result.get("interrupted")
+        or result.get("cancelled")
+        or result.get("canceled")
+        or result.get("error")
+        or result.get("exception")
+        or result.get("completed") is False
+    ):
         return False
     try:
         return int(result.get("api_calls", 0) or 0) > 0
@@ -1350,15 +1405,46 @@ def turn_result_acknowledges_delivery(result: Any) -> bool:
         return False
 
 
+def settle_event_deliveries(
+    claimed_deliveries: List[tuple[Dict[str, Any], str]],
+    result: Any = None,
+    *,
+    log_context: str = "Async",
+) -> None:
+    """Settle every claim independently after the owning model turn."""
+    acknowledged = turn_result_acknowledges_delivery(result)
+    pending = list(claimed_deliveries)
+    claimed_deliveries.clear()
+    for evt, claim_id in pending:
+        try:
+            if acknowledged:
+                complete_event_delivery(evt, claim_id)
+            else:
+                release_event_delivery(evt, claim_id)
+        except Exception:
+            logger.warning(
+                "%s delivery claim %s failed",
+                log_context,
+                "completion" if acknowledged else "release",
+                exc_info=True,
+            )
+
+
 def release_event_delivery(
     evt: Dict[str, Any], claim_id: str, consume_attempt: bool = True
 ) -> None:
-    if claim_id and evt.get("type") == "async_delegation":
-        release_completion_delivery(
+    if not claim_id:
+        return
+    if evt.get("type") == "async_delegation":
+        if release_completion_delivery(
             str(evt.get("delegation_id") or ""),
             claim_id,
             consume_attempt=consume_attempt,
-        )
+        ):
+            return
+    from tools.process_registry import process_registry
+
+    process_registry.release_notification_delivery(evt, claim_id)
 
 
 def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:

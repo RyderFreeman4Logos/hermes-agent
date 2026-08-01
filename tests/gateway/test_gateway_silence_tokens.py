@@ -200,6 +200,13 @@ async def test_unhealthy_heartbeat_is_visible_without_starting_auto_title(
     monkeypatch, tmp_path
 ):
     runner = _runner(monkeypatch, tmp_path)
+    runner._should_send_voice_reply = (
+        gateway_run.GatewayRunner._should_send_voice_reply.__get__(
+            runner, gateway_run.GatewayRunner
+        )
+    )
+    runner._send_voice_reply = AsyncMock()
+    runner._voice_mode[runner._voice_key(Platform.TELEGRAM, "-1001")] = "all"
     history = [
         {"role": "user", "content": "real question"},
         {"role": "assistant", "content": "real answer"},
@@ -235,3 +242,4 @@ async def test_unhealthy_heartbeat_is_visible_without_starting_auto_title(
 
     assert response == "Target is STUCK: no CPU or output progress."
     auto_title.assert_not_called()
+    runner._send_voice_reply.assert_not_awaited()

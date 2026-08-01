@@ -257,6 +257,123 @@ def test_unhealthy_heartbeat_skips_user_voice_and_title_state():
     auto_title.assert_not_called()
 
 
+@pytest.mark.parametrize("heartbeat_warm", [True, False], ids=["heartbeat", "user-control"])
+def test_process_loop_heartbeat_skips_user_turn_automation(
+    heartbeat_warm, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setenv("HERMES_DEFER_AGENT_STARTUP", "1")
+    cli = _make_cli()
+    cli_globals = type(cli).run.__globals__
+    forbidden: list[str] = []
+    chat_seen = threading.Event()
+    post_turn = threading.Event()
+
+    app = MagicMock()
+    app.is_running = True
+
+    def run_app():
+        cli._voice_mode = True
+        cli._voice_continuous = True
+        cli._voice_recording = False
+        cli._voice_tts = False
+        cli._pending_input.put(
+            cli_globals["_HeartbeatWarmMessage"](
+                "[HEARTBEAT] target remains STUCK"
+            )
+            if heartbeat_warm
+            else "normal user turn"
+        )
+        assert post_turn.wait(5), "classic process loop did not finish heartbeat turn"
+
+    app.run.side_effect = run_app
+
+    def chat(*_args, **kwargs):
+        assert kwargs["heartbeat_warm"] is heartbeat_warm
+        chat_seen.set()
+
+    def drain_notifications(stage):
+        if stage == "cli-post-turn":
+            cli._should_exit = True
+            post_turn.set()
+
+    def record_microphone_start():
+        forbidden.append("microphone")
+
+    real_thread = threading.Thread
+
+    def make_thread(*args, **kwargs):
+        target = kwargs.get("target")
+        if getattr(target, "__name__", "") == "_restart_recording":
+            immediate = MagicMock()
+            immediate.start.side_effect = target
+            return immediate
+        return real_thread(*args, **kwargs)
+
+    threading_proxy = MagicMock(wraps=threading)
+    threading_proxy.Thread.side_effect = make_thread
+    monkeypatch.setitem(cli_globals, "threading", threading_proxy)
+
+    for name in (
+        "prewarm_picker_cache_async",
+        "maybe_run_curator",
+        "maybe_pull_skills",
+        "maybe_pull_org_skills",
+        "_apply_bracketed_paste_timeout_patch",
+        "_disable_prompt_toolkit_cpr_warning",
+        "_mark_tui_input_modes_active",
+        "_run_cleanup",
+    ):
+        monkeypatch.setitem(cli_globals, name, lambda *_args, **_kwargs: None)
+    monkeypatch.setitem(cli_globals, "detect_openclaw_residue", lambda: False)
+    monkeypatch.setitem(
+        cli_globals, "get_plugin_manager", MagicMock(return_value=MagicMock())
+    )
+    monkeypatch.setitem(
+        cli_globals, "_select_classic_cli_pt_output", lambda _stdout: None
+    )
+    monkeypatch.setitem(cli_globals, "Application", MagicMock(return_value=app))
+
+    for name in (
+        "show_banner",
+        "_show_security_advisories",
+        "_preload_resumed_session",
+        "_display_resumed_history",
+        "_console_print",
+        "_install_tool_callbacks",
+        "_ensure_tirith_security",
+        "_check_config_mcp_changes",
+        "_print_user_message_preview",
+        "_turn_summary_begin",
+        "_turn_summary_emit",
+        "_recover_terminal_after_interrupt",
+        "_drain_interrupt_queue_to_pending_input",
+        "_maybe_start_wake_word",
+        "_pet_start_anim",
+        "_pet_stop_anim",
+        "_persist_active_session_before_close",
+        "_print_exit_summary",
+        "_release_active_session",
+    ):
+        monkeypatch.setattr(cli, name, lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cli, "_claim_active_session", lambda _surface: True)
+    monkeypatch.setattr(cli, "_typed_voice_stop", lambda _text: False)
+    monkeypatch.setattr(cli, "chat", chat)
+    monkeypatch.setattr(cli, "_drain_process_notifications", drain_notifications)
+    monkeypatch.setattr(cli, "_pet_react_turn_end", lambda: forbidden.append("pet"))
+    monkeypatch.setattr(
+        cli,
+        "_maybe_continue_goal_after_turn",
+        lambda: forbidden.append("goal"),
+    )
+    monkeypatch.setattr(cli, "_voice_start_recording", record_microphone_start)
+
+    cli.run()
+
+    assert chat_seen.is_set()
+    assert forbidden == ([] if heartbeat_warm else ["pet", "goal", "microphone"])
+
+
 def test_completion_delivery_chat_stages_ephemeral_user_message():
     cli = _make_cli()
 

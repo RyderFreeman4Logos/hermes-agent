@@ -17016,7 +17016,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         self._pending_tool_info.clear()
                         self._last_scrollback_tool = ""
                         self._pet_reasoning = False
-                        self._pet_react_turn_end()
+                        if not is_heartbeat_warm:
+                            self._pet_react_turn_end()
                         # Post-turn accounting line (display.turn_summary).
                         # Emitted after the response box, before the prompt
                         # returns, so it reads as a footer for the turn.
@@ -17052,16 +17053,22 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         # continuation prompt back into _pending_input so the
                         # next loop iteration picks it up naturally (and any
                         # user input that arrives in between still preempts).
-                        try:
-                            self._maybe_continue_goal_after_turn()
-                        except Exception as _goal_exc:
-                            logging.debug("goal continuation hook failed: %s", _goal_exc)
+                        if not is_heartbeat_warm:
+                            try:
+                                self._maybe_continue_goal_after_turn()
+                            except Exception as _goal_exc:
+                                logging.debug("goal continuation hook failed: %s", _goal_exc)
 
                         # Continuous voice: auto-restart recording after agent responds.
                         # Dispatch to a daemon thread so play_beep (sd.wait) and
                         # AudioRecorder.start (lock acquire) never block process_loop —
                         # otherwise queued user input would stall silently.
-                        if self._voice_mode and self._voice_continuous and not self._voice_recording:
+                        if (
+                            not is_heartbeat_warm
+                            and self._voice_mode
+                            and self._voice_continuous
+                            and not self._voice_recording
+                        ):
                             def _restart_recording():
                                 try:
                                     if self._voice_tts:

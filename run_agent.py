@@ -3927,6 +3927,11 @@ class AIAgent:
         Safe to call multiple times (idempotent).  Each cleanup step is
         independently guarded so a failure in one does not prevent the rest.
         """
+        with self._active_children_lock:
+            if getattr(self, "_closed", False):
+                return
+            self._closed = True
+
         task_id = getattr(self, "session_id", None) or ""
 
         # 1. Kill background processes for this task
@@ -4005,7 +4010,7 @@ class AIAgent:
         try:
             from hermes_cli.mem_trim import trim_memory
 
-            trim_memory(force=True, reason="agent close")
+            trim_memory(reason="agent close")
         except Exception:
             pass
 

@@ -13972,13 +13972,66 @@ def test_reap_idle_sessions_calls_periodic_trim(monkeypatch):
     assert calls == [{"reason": "idle reaper periodic trim"}]
 
 
-def test_turn_trim_wiring_preserves_prompt_and_history_references():
-    import inspect
+def test_turn_completion_trims_with_profile_and_preserves_inputs(monkeypatch):
+    import hermes_cli.mem_trim as mem_trim
 
-    source = inspect.getsource(server._run_prompt_submit)
-    assert 'trim_memory(reason="tui turn completion")' in source
-    assert "history.clear()" not in source
-    assert "run_kwargs.clear()" not in source
+    events = []
+    observed = {}
+
+    class _Agent:
+        def run_conversation(self, prompt, **kwargs):
+            observed["prompt"] = prompt
+            observed["history"] = kwargs["conversation_history"]
+            return {"final_response": "", "messages": kwargs["conversation_history"]}
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    history = [{"role": "user", "content": "still live"}]
+    session = _session(
+        agent=_Agent(),
+        history=history,
+        running=True,
+        profile_home="/tmp/test-profile",
+    )
+    server._sessions["sid-trim"] = session
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "_get_usage", lambda _agent: {})
+    monkeypatch.setattr(server, "render_message", lambda _text, _cols: "")
+    monkeypatch.setattr(server, "record_turn_start", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "_retire_turn_marker", lambda *args: None)
+    monkeypatch.setattr(server, "_emit_settled_session_info", lambda *args: None)
+    monkeypatch.setattr(server, "_drain_queued_prompt", lambda *args: False)
+    monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
+    monkeypatch.setattr(server, "set_hermes_home_override", lambda _home: "token")
+    monkeypatch.setattr(
+        server,
+        "reset_hermes_home_override",
+        lambda _token: events.append("reset_home"),
+    )
+    monkeypatch.setattr(server, "_set_session_context", lambda *args, **kwargs: [])
+    monkeypatch.setattr(server, "_clear_session_context", lambda _tokens: None)
+    monkeypatch.setattr(
+        mem_trim,
+        "trim_memory",
+        lambda **kwargs: events.append(("trim", kwargs)) or True,
+    )
+
+    try:
+        server._run_prompt_submit("1", "sid-trim", session, "keep me")
+    finally:
+        server._sessions.pop("sid-trim", None)
+
+    assert observed == {"prompt": "keep me", "history": history}
+    assert events == [
+        ("trim", {"reason": "tui turn completion"}),
+        "reset_home",
+    ]
 
 
 def test_session_create_records_ui_model_as_session_override(monkeypatch):

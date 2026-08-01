@@ -13,14 +13,25 @@ def _reset_trim_state(monkeypatch):
     monkeypatch.setattr(mem_trim, "_probe_done", True)
     monkeypatch.setattr(mem_trim, "_malloc_trim", None)
     monkeypatch.setattr(mem_trim, "_trim_call_count", 0)
+    monkeypatch.setattr(mem_trim, "_process_exit_trim_attempted", False)
 
 
-def test_unsupported_allocator_is_noop_without_gc(monkeypatch):
+@pytest.mark.parametrize(
+    ("system", "libc"),
+    [("darwin", ("", "")), ("linux", ("musl", "1.2"))],
+)
+def test_unsupported_allocator_is_noop_without_gc(monkeypatch, system, libc):
     collect = Mock()
+    load_libc = Mock()
+    monkeypatch.setattr(mem_trim, "_probe_done", False)
+    monkeypatch.setattr(mem_trim.sys, "platform", system)
+    monkeypatch.setattr(mem_trim.platform, "libc_ver", lambda: libc)
+    monkeypatch.setattr(mem_trim.ctypes, "CDLL", load_libc)
     monkeypatch.setattr(mem_trim.gc, "collect", collect)
 
-    assert mem_trim.trim_memory(force=True, reason="test") is False
+    assert mem_trim.trim_memory(reason="test") is False
     collect.assert_not_called()
+    load_libc.assert_not_called()
 
 
 def test_disabled_config_is_noop_in_isolated_hermes_home(monkeypatch, tmp_path):
@@ -38,7 +49,7 @@ def test_disabled_config_is_noop_in_isolated_hermes_home(monkeypatch, tmp_path):
     monkeypatch.setattr(mem_trim.gc, "collect", collect)
     token = set_hermes_home_override(hermes_home)
     try:
-        assert mem_trim.trim_memory(force=True) is False
+        assert mem_trim.trim_memory() is False
     finally:
         reset_hermes_home_override(token)
 
@@ -69,7 +80,7 @@ def test_gc_runs_before_malloc_trim(monkeypatch):
     assert calls == ["gc", ("trim", 0)]
 
 
-def test_cooldown_suppresses_collection_but_force_bypasses_it(monkeypatch):
+def test_cooldown_suppresses_collection(monkeypatch):
     collect = Mock()
     trim = Mock(return_value=1)
     monkeypatch.setattr(mem_trim.gc, "collect", collect)
@@ -80,7 +91,6 @@ def test_cooldown_suppresses_collection_but_force_bypasses_it(monkeypatch):
     assert mem_trim.trim_memory(cooldown_seconds=60) is False
     collect.assert_not_called()
     trim.assert_not_called()
-    assert mem_trim.trim_memory(force=True, cooldown_seconds=60) is True
 
 
 def test_config_cooldown_controls_rate_limit(monkeypatch):
@@ -89,7 +99,7 @@ def test_config_cooldown_controls_rate_limit(monkeypatch):
     monkeypatch.setattr(mem_trim, "_last_trim_monotonic", 1.0)
     monkeypatch.setattr(mem_trim.time, "monotonic", lambda: 100.0)
     monkeypatch.setattr(
-        "hermes_cli.config.load_config",
+        "hermes_cli.config.load_config_readonly",
         lambda: {
             "context": {
                 "memory_trim": {"enabled": True, "cooldown_seconds": 120.0}
@@ -101,7 +111,7 @@ def test_config_cooldown_controls_rate_limit(monkeypatch):
     trim.assert_not_called()
 
 
-def test_force_logs_even_when_sampling_and_delta_would_skip(monkeypatch, caplog):
+def test_process_exit_force_bypasses_cooldown_and_sampling_once(monkeypatch, caplog):
     monkeypatch.setattr(mem_trim.gc, "collect", lambda: None)
     monkeypatch.setattr(mem_trim, "_malloc_trim", lambda _pad: 1)
     monkeypatch.setattr(mem_trim, "_config_settings", lambda: (True, 0.0, 99, 1.0))
@@ -114,11 +124,12 @@ def test_force_logs_even_when_sampling_and_delta_would_skip(monkeypatch, caplog)
 
     with caplog.at_level("INFO", logger="hermes_cli.mem_trim"):
         assert mem_trim.trim_memory(reason="periodic") is True
-        assert mem_trim.trim_memory(force=True, reason="close") is True
+        assert mem_trim._trim_memory_at_process_exit() is True
+        assert mem_trim._trim_memory_at_process_exit() is False
 
     messages = [record.getMessage() for record in caplog.records]
     assert not any("reason=periodic" in message for message in messages)
-    assert any("reason=close" in message for message in messages)
+    assert sum("reason=process exit" in message for message in messages) == 1
 
 
 def test_memory_snapshot_parses_linux_telemetry(monkeypatch):

@@ -1542,6 +1542,10 @@ def _build_child_agent(
     child_optional_kwargs: Dict[str, Any] = {}
     if isinstance(child_max_tokens, int):
         child_optional_kwargs["max_tokens"] = child_max_tokens
+    if not override_provider:
+        child_optional_kwargs["fast_mode_overrides"] = dict(
+            getattr(parent_agent, "request_overrides", {}) or {}
+        )
 
     from agent.delegation_context import delegated_child_context
 
@@ -1580,7 +1584,9 @@ def _build_child_agent(
             request_overrides=(
                 dict(override_request_overrides or {})
                 if override_provider
-                else dict(getattr(parent_agent, "request_overrides", {}) or {})
+                else dict(
+                    getattr(parent_agent, "_caller_request_overrides", {}) or {}
+                )
             ),
             openrouter_min_coding_score=child_openrouter_min_coding_score,
             tool_progress_callback=child_progress_cb,

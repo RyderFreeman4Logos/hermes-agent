@@ -6023,7 +6023,12 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
         "reasoning_config": getattr(agent, "reasoning_config", None)
         or _load_reasoning_config(str(getattr(agent, "model", "") or "")),
         "service_tier": getattr(agent, "service_tier", None) or _load_service_tier(),
-        "request_overrides": dict(getattr(agent, "request_overrides", {}) or {}),
+        "request_overrides": dict(
+            getattr(agent, "_caller_request_overrides", {}) or {}
+        ),
+        "fast_mode_overrides": dict(
+            getattr(agent, "request_overrides", {}) or {}
+        ),
         "platform": "tui",
         "session_db": _get_db(),
         "fallback_model": _agent_fallback_model(agent),

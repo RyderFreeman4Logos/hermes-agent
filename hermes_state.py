@@ -1801,6 +1801,10 @@ def _try_acquire_exclusive_file_lock(handle) -> bool:
         import msvcrt
 
         try:
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"\0")
+                handle.flush()
             handle.seek(0)
             msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
             return True

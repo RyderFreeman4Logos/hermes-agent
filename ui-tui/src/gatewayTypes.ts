@@ -729,6 +729,8 @@ export type GatewayEvent =
       payload?: {
         billing?: BillingBlock
         cache_info?: {
+          attribution?: 'post_compression'
+          level: 'error' | 'info'
           pct: number
           prompt_tokens: number
           read_tokens: number

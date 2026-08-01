@@ -2008,13 +2008,13 @@ describe('createGatewayEventHandler', () => {
     }
   })
 
-  it('adds the first-call cache hit after the assistant response', () => {
+  it('renders a sub-95 first-call cache hit as an error event', () => {
     const appended: Msg[] = []
     const onEvent = createGatewayEventHandler(buildCtx(appended))
 
     onEvent({
       payload: {
-        cache_info: { pct: 87, prompt_tokens: 2_000, read_tokens: 1_740, state: 'hit' },
+        cache_info: { level: 'error', pct: 94, prompt_tokens: 2_000, read_tokens: 1_880, state: 'hit' },
         text: 'final answer'
       },
       type: 'message.complete'
@@ -2022,7 +2022,32 @@ describe('createGatewayEventHandler', () => {
 
     expect(appended).toEqual([
       { role: 'assistant', text: 'final answer' },
-      { kind: 'event', role: 'system', text: 'cache 87%' }
+      { kind: 'event', role: 'system', text: 'cache 94%', tone: 'error' }
+    ])
+  })
+
+  it('keeps an exact-95 cache hit non-error and labels post-compression usage', () => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+    onEvent({
+      payload: {
+        cache_info: {
+          attribution: 'post_compression',
+          level: 'info',
+          pct: 95,
+          prompt_tokens: 2_000,
+          read_tokens: 1_900,
+          state: 'hit'
+        },
+        text: 'final answer'
+      },
+      type: 'message.complete'
+    } as any)
+
+    expect(appended).toEqual([
+      { role: 'assistant', text: 'final answer' },
+      { kind: 'event', role: 'system', text: 'cache 95% · post-compression cold prefix (expected)' }
     ])
   })
 })

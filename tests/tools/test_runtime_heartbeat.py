@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import concurrent.futures
 import queue
+import shlex
+import sys
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -25,6 +28,17 @@ class FakeTimer:
 
     def cancel(self):
         self.cancelled = True
+
+
+def _wait_until(predicate, timeout=10):
+    deadline = time.monotonic() + timeout
+    pause = threading.Event()
+    while time.monotonic() < deadline:
+        value = predicate()
+        if value:
+            return value
+        pause.wait(0.05)
+    return None
 
 
 def _runtime():
@@ -346,24 +360,126 @@ def test_host_process_cpu_includes_identity_checked_descendants(monkeypatch):
     )
     session.process = SimpleNamespace(pid=100)
     session._tracked_descendants[200] = 20
+    session._tracked_descendants[300] = 30
     monkeypatch.setattr(process_registry, "get", lambda _target_id: session)
-    monkeypatch.setattr(process_registry, "_remember_local_descendants", lambda _s: None)
+    monkeypatch.setattr(
+        process_registry, "_remember_local_descendants", lambda _s, **_kwargs: None
+    )
     monkeypatch.setattr(
         process_registry,
         "_safe_host_start_time",
-        lambda pid: {100: 10, 200: 20}[pid],
+        lambda pid: {100: 10, 200: 20, 300: 31}[pid],
     )
     monkeypatch.setattr(
         psutil,
         "Process",
         lambda pid: SimpleNamespace(
-            cpu_times=lambda: SimpleNamespace(user={100: 1.0, 200: 4.0}[pid], system=0.5)
+            cpu_times=lambda: SimpleNamespace(
+                user={100: 1.0, 200: 4.0}[pid], system=0.5
+            )
         ),
     )
 
     snapshot = inspect_process("host")
 
     assert snapshot["cpu_seconds"] == 6.0
+
+    monkeypatch.setattr(
+        process_registry,
+        "_safe_host_start_time",
+        lambda pid: {100: 11, 200: 20, 300: 31}[pid],
+    )
+    assert inspect_process("host")["cpu_seconds"] == 0.0
+
+
+@pytest.mark.skipif(
+    not sys.platform.startswith("linux"),
+    reason="local terminal subreaper lifecycle is Linux-only",
+)
+def test_linux_subreaper_descendant_cpu_keeps_heartbeat_alive(
+    monkeypatch, tmp_path
+):
+    import psutil
+    from tools import process_registry as process_registry_module
+    from tools.process_registry import ProcessRegistry
+    from tools.runtime_heartbeat import RuntimeHeartbeat, inspect_process
+
+    registry = ProcessRegistry()
+    monkeypatch.setattr(process_registry_module, "process_registry", registry)
+    monkeypatch.setattr(
+        process_registry_module, "CHECKPOINT_PATH", tmp_path / "processes.json"
+    )
+    stop = tmp_path / "stop-worker"
+    worker_code = (
+        "import pathlib,sys; stop=pathlib.Path(sys.argv[1]); "
+        'exec("n=0\\nwhile not stop.exists():\\n for _ in range(100000): n += 1")'
+    )
+    command = shlex.join([sys.executable, "-c", worker_code, str(stop)])
+    session = registry.spawn_local(command, cwd=str(tmp_path))
+    events = queue.Queue()
+    FakeTimer.created = []
+    manager = RuntimeHeartbeat(event_queue=events, timer_factory=FakeTimer)
+
+    try:
+        assert session._subreaper_managed is True
+
+        def _worker_process():
+            try:
+                return next(
+                    (
+                        child
+                        for child in psutil.Process(session.pid).children(recursive=True)
+                        if str(stop) in child.cmdline()
+                    ),
+                    None,
+                )
+            except (psutil.Error, OSError):
+                return None
+
+        worker = _wait_until(_worker_process)
+        assert worker is not None, "CPU worker did not enter the subreaper tree"
+        worker_start = registry._safe_host_start_time(worker.pid)
+        assert worker_start is not None
+
+        assert manager.arm(
+            session.id,
+            caller_id="owner",
+            kind="process",
+            interval=1700,
+            inspect=lambda: inspect_process(session.id),
+        )
+        baseline = dict(manager._targets[session.id].baseline)
+
+        def _advanced_worker_cpu():
+            if registry._safe_host_start_time(worker.pid) != worker_start:
+                return None
+            try:
+                cpu = worker.cpu_times()
+            except psutil.Error:
+                return None
+            total = float(cpu.user + cpu.system)
+            return total if total >= 0.25 else None
+
+        worker_cpu = _wait_until(_advanced_worker_cpu)
+        assert worker_cpu is not None, "CPU worker made no measurable progress"
+        assert registry._safe_host_start_time(worker.pid) == worker_start
+        assert baseline["output_size"] == session.output_size == 0
+
+        snapshot = inspect_process(session.id)
+        FakeTimer.created[0].callback()
+        event = events.get_nowait()
+
+        assert event["status"] == "ALIVE"
+        assert "CPU advanced" in event["evidence"]
+        assert snapshot["cpu_seconds"] >= worker_cpu
+    finally:
+        manager.cancel(session.id)
+        stop.touch()
+        if not session._completion_event.wait(10):
+            registry.kill_process(session.id)
+        assert session._completion_event.wait(10)
+        session._reader_thread.join(10)
+        assert not session._reader_thread.is_alive()
 
 
 def test_stalling_delegation_is_stuck_while_finalizing_is_alive(monkeypatch):

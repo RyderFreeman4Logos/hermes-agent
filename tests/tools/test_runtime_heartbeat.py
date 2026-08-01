@@ -512,6 +512,21 @@ def test_linux_subreaper_descendant_cpu_keeps_heartbeat_alive(
         assert not session._reader_thread.is_alive()
 
 
+def test_queued_delegation_is_alive(monkeypatch):
+    from tools.runtime_heartbeat import inspect_delegation
+
+    monkeypatch.setattr(
+        "tools.async_delegation.list_async_delegations",
+        lambda: [{"delegation_id": "d", "status": "queued"}],
+    )
+
+    assert inspect_delegation("d") == {
+        "alive": True,
+        "progress": True,
+        "evidence": "delegation in progress; status=queued",
+    }
+
+
 def test_stalling_delegation_is_stuck_while_finalizing_is_alive(monkeypatch):
     from tools.runtime_heartbeat import RuntimeHeartbeat, inspect_delegation
 

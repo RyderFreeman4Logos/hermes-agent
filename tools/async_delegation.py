@@ -69,6 +69,8 @@ _executor_lock = threading.Lock()
 _executor_max_workers: int = 0
 
 _records_lock = threading.Lock()
+_admission_condition = threading.Condition(_records_lock)
+_admission_cap = 0
 # delegation_id -> record dict. Kept for the lifetime of the run plus a short
 # tail after completion so `list_async_delegations()` can show recent results.
 _records: Dict[str, Dict[str, Any]] = {}
@@ -524,7 +526,7 @@ def _get_executor(max_workers: int) -> ThreadPoolExecutor:
     cap grows between calls we rebuild a larger pool. Existing in-flight
     futures keep running on the old pool until it's garbage collected.
     """
-    global _executor, _executor_max_workers
+    global _admission_cap, _executor, _executor_max_workers
     with _executor_lock:
         if _executor is None or max_workers > _executor_max_workers:
             # Daemon threads: thread_name_prefix aids debugging in stack dumps.
@@ -533,7 +535,29 @@ def _get_executor(max_workers: int) -> ThreadPoolExecutor:
                 thread_name_prefix="async-delegate",
             )
             _executor_max_workers = max_workers
+        with _admission_condition:
+            _admission_cap = max_workers
+            _admission_condition.notify_all()
         return _executor
+
+
+def _admit_worker(delegation_id: str) -> bool:
+    """Wait off-thread until this queued record owns a process-wide slot."""
+    with _admission_condition:
+        while True:
+            record = _records.get(delegation_id)
+            if record is None or record.get("status") != "queued":
+                return False
+            running = sum(
+                1
+                for current in _records.values()
+                if current.get("status") in ("running", "stalling")
+            )
+            if running < _admission_cap:
+                record["status"] = "running"
+                record["_progress_ts"] = time.time()
+                return True
+            _admission_condition.wait()
 
 
 def active_count() -> int:
@@ -764,12 +788,8 @@ def dispatch_async_delegation(
     executor = _get_executor(max_async_children)
 
     def _worker() -> None:
-        with _records_lock:
-            current = _records.get(delegation_id)
-            if current is None or current.get("status") != "queued":
-                return
-            current["status"] = "running"
-            current["_progress_ts"] = time.time()
+        if not _admit_worker(delegation_id):
+            return
         if progress_fn is not None:
             _ensure_stale_monitor()
         result: Dict[str, Any] = {}
@@ -842,6 +862,7 @@ def _begin_finalization(
         record["interrupt_fn"] = None  # drop the closure; child is done
         record["progress_fn"] = None  # stop stale-monitor sampling
         event_record = dict(record)
+        _admission_condition.notify_all()
 
     return event_record, interrupt_fn
 
@@ -995,12 +1016,8 @@ def dispatch_async_delegation_batch(
     executor = _get_executor(max_async_children)
 
     def _worker() -> None:
-        with _records_lock:
-            current = _records.get(delegation_id)
-            if current is None or current.get("status") != "queued":
-                return
-            current["status"] = "running"
-            current["_progress_ts"] = time.time()
+        if not _admit_worker(delegation_id):
+            return
         if progress_fn is not None:
             _ensure_stale_monitor()
         combined: Dict[str, Any] = {}
@@ -1408,6 +1425,7 @@ def interrupt_all(reason: str = "shutdown") -> int:
             r["delegation_id"] for r in _records.values()
             if r.get("status") in ("queued", "running", "stalling")
         ]
+        targets.sort(key=lambda delegation_id: _records[delegation_id]["status"] != "queued")
     for delegation_id in targets:
         count += int(_interrupt_record(delegation_id, reason))
     if count:
@@ -1428,6 +1446,7 @@ def _interrupt_record(delegation_id: str, reason: str) -> bool:
         queued = record.get("status") == "queued"
         if queued:
             record["status"] = "cancelling"
+            _admission_condition.notify_all()
         interrupt_fn = record.get("interrupt_fn")
         is_batch = bool(record.get("is_batch"))
 
@@ -1507,6 +1526,7 @@ def interrupt_for_session(
                 parent_session_id=parent_session_id,
             )
         ]
+        targets.sort(key=lambda delegation_id: _records[delegation_id]["status"] != "queued")
     for delegation_id in targets:
         count += int(_interrupt_record(delegation_id, reason))
     if count:
@@ -1519,7 +1539,7 @@ def interrupt_for_session(
 
 def _reset_for_tests() -> None:
     """Test-only: clear all state and tear down the executor + monitor."""
-    global _executor, _executor_max_workers, _monitor_thread
+    global _admission_cap, _executor, _executor_max_workers, _monitor_thread
     with _executor_lock:
         if _executor is not None:
             _executor.shutdown(wait=False, cancel_futures=True)
@@ -1531,5 +1551,7 @@ def _reset_for_tests() -> None:
         _monitor_thread = None
     if thread is not None and thread.is_alive():
         thread.join(timeout=2)
-    with _records_lock:
+    with _admission_condition:
         _records.clear()
+        _admission_cap = 0
+        _admission_condition.notify_all()

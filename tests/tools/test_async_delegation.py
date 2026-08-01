@@ -130,9 +130,11 @@ def test_fast_completion_cannot_cancel_before_heartbeat_arm(monkeypatch, batch):
 
     arm_entered = threading.Event()
     release_arm = threading.Event()
+    admission_entered = threading.Event()
     worker_finished = threading.Event()
     timers = []
     original_arm = runtime_heartbeat.arm
+    original_admit_worker = ad._admit_worker
 
     class FakeTimer:
         def __init__(self, _interval, _callback):
@@ -151,6 +153,10 @@ def test_fast_completion_cannot_cancel_before_heartbeat_arm(monkeypatch, batch):
         assert release_arm.wait(timeout=5)
         return original_arm(*args, **kwargs)
 
+    def tracked_admit_worker(delegation_id):
+        admission_entered.set()
+        return original_admit_worker(delegation_id)
+
     def runner():
         worker_finished.set()
         if batch:
@@ -162,6 +168,7 @@ def test_fast_completion_cannot_cancel_before_heartbeat_arm(monkeypatch, batch):
     )
     monkeypatch.setattr(runtime_heartbeat, "_timer_factory", FakeTimer)
     monkeypatch.setattr(runtime_heartbeat, "arm", blocked_arm)
+    monkeypatch.setattr(ad, "_admit_worker", tracked_admit_worker)
 
     result_holder = []
 
@@ -184,14 +191,18 @@ def test_fast_completion_cannot_cancel_before_heartbeat_arm(monkeypatch, batch):
 
     dispatch_thread = threading.Thread(target=dispatch)
     dispatch_thread.start()
-    assert arm_entered.wait(timeout=5)
-    assert worker_finished.wait(timeout=5)
-    release_arm.set()
-    dispatch_thread.join(timeout=5)
+    try:
+        assert arm_entered.wait(timeout=5)
+        assert admission_entered.wait(timeout=5)
+        assert not worker_finished.is_set()
+    finally:
+        release_arm.set()
+        dispatch_thread.join(timeout=5)
 
     assert not dispatch_thread.is_alive()
     result = result_holder[0]
     assert result["status"] == "dispatched"
+    assert worker_finished.wait(timeout=5)
     assert _drain_for(result["delegation_id"]) is not None
     assert result["delegation_id"] not in runtime_heartbeat._targets
     assert len(timers) == 1

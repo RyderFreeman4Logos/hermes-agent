@@ -391,7 +391,7 @@ def inspect_delegation(target_id: str) -> Dict[str, Any]:
         None,
     )
     status = str((record or {}).get("status") or "")
-    if status == "running":
+    if status in {"queued", "running"}:
         return {
             "alive": True,
             "progress": True,

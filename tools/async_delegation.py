@@ -68,7 +68,7 @@ _executor: Optional[ThreadPoolExecutor] = None
 _executor_lock = threading.Lock()
 _executor_max_workers: int = 0
 
-_records_lock = threading.Lock()
+_records_lock = threading.RLock()
 _admission_condition = threading.Condition(_records_lock)
 _admission_cap = 0
 # Accepted records that have not yet left the admission backlog. Keep this
@@ -808,11 +808,26 @@ def dispatch_async_delegation(
         finally:
             _finalize(delegation_id, result, status)
 
-    try:
-        # Propagate the dispatching profile so the detached child resolves
-        # get_hermes_home() under the right profile.
-        executor.submit(propagate_context_to_thread(_worker))
-    except Exception as exc:  # pragma: no cover — pool submit failure is rare
+    from tools.runtime_heartbeat import inspect_delegation, runtime_heartbeat
+
+    submit_error = None
+    with _records_lock:
+        try:
+            # Keep heartbeat installation atomic with the worker's terminal
+            # claim. A fast worker may finish before submit() returns, but it
+            # cannot cancel until arm() has installed the target.
+            executor.submit(propagate_context_to_thread(_worker))
+        except Exception as exc:  # pragma: no cover — pool submit failure is rare
+            submit_error = exc
+        else:
+            runtime_heartbeat.arm(
+                delegation_id,
+                caller_id=session_key,
+                kind="delegation",
+                interval=heartbeat_interval,
+                inspect=lambda _id=delegation_id: inspect_delegation(_id),
+            )
+    if submit_error is not None:
         with _records_lock:
             _records.pop(delegation_id, None)
             _pending_admission_ids.discard(delegation_id)
@@ -820,17 +835,8 @@ def dispatch_async_delegation(
         _invoke_not_started(on_not_started, "error")
         return {
             "status": "rejected",
-            "error": f"Failed to schedule async delegation: {exc}",
+            "error": f"Failed to schedule async delegation: {submit_error}",
         }
-    from tools.runtime_heartbeat import inspect_delegation, runtime_heartbeat
-
-    runtime_heartbeat.arm(
-        delegation_id,
-        caller_id=session_key,
-        kind="delegation",
-        interval=heartbeat_interval,
-        inspect=lambda _id=delegation_id: inspect_delegation(_id),
-    )
     if progress_fn is not None:
         _ensure_stale_monitor()
 
@@ -1084,10 +1090,25 @@ def dispatch_async_delegation_batch(
         finally:
             _finalize_batch(delegation_id, combined, status)
 
-    try:
-        # Propagate the dispatching profile to the detached batch children.
-        executor.submit(propagate_context_to_thread(_worker))
-    except Exception as exc:  # pragma: no cover
+    from tools.runtime_heartbeat import inspect_delegation, runtime_heartbeat
+
+    submit_error = None
+    with _records_lock:
+        try:
+            # Match the single-child path: terminal claim cannot race ahead
+            # of heartbeat installation.
+            executor.submit(propagate_context_to_thread(_worker))
+        except Exception as exc:  # pragma: no cover
+            submit_error = exc
+        else:
+            runtime_heartbeat.arm(
+                delegation_id,
+                caller_id=session_key,
+                kind="delegation",
+                interval=heartbeat_interval,
+                inspect=lambda _id=delegation_id: inspect_delegation(_id),
+            )
+    if submit_error is not None:
         with _records_lock:
             _records.pop(delegation_id, None)
             _pending_admission_ids.discard(delegation_id)
@@ -1095,17 +1116,8 @@ def dispatch_async_delegation_batch(
         _invoke_not_started(on_not_started, "error")
         return {
             "status": "rejected",
-            "error": f"Failed to schedule async delegation batch: {exc}",
+            "error": f"Failed to schedule async delegation batch: {submit_error}",
         }
-    from tools.runtime_heartbeat import inspect_delegation, runtime_heartbeat
-
-    runtime_heartbeat.arm(
-        delegation_id,
-        caller_id=session_key,
-        kind="delegation",
-        interval=heartbeat_interval,
-        inspect=lambda _id=delegation_id: inspect_delegation(_id),
-    )
     if progress_fn is not None:
         _ensure_stale_monitor()
 

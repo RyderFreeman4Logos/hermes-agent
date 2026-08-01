@@ -260,9 +260,37 @@ def test_reader_loop_streams_incremental_chunks_from_read1(registry, monkeypatch
 
     assert emitted == ["tick 1\n", "tick 2\n", "tick 3\n"]
     assert session.output_buffer == "tick 1\ntick 2\ntick 3\n"
+    assert session.output_size == len("tick 1\ntick 2\ntick 3\n")
     assert session.exited is True
     assert session.exit_code == 0
     assert moved == ["proc_reader_live"]
+
+
+def test_reader_activity_counter_advances_after_rolling_buffer_saturates(
+    registry, monkeypatch
+):
+    class _Buffer:
+        def __init__(self):
+            self.chunks = [b"abcde", b"fghij", b""]
+
+        def read1(self, _size):
+            return self.chunks.pop(0)
+
+    process = MagicMock()
+    process.stdout.buffer = _Buffer()
+    process.wait.return_value = 0
+    process.returncode = 0
+    session = _make_session(sid="proc-saturated")
+    session.process = process
+    session.max_output_chars = 5
+    monkeypatch.setattr(registry, "_check_watch_patterns", lambda *_args: None)
+    monkeypatch.setattr(registry, "_emit_output", lambda *_args: None)
+    monkeypatch.setattr(registry, "_move_to_finished", lambda *_args: None)
+
+    registry._reader_loop(session)
+
+    assert session.output_buffer == "fghij"
+    assert session.output_size == 10
 
 
 # =========================================================================

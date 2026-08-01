@@ -3520,6 +3520,24 @@ def test_background_agent_kwargs_preserves_full_fallback_chain(monkeypatch):
     assert kwargs["fallback_model"] == chain
 
 
+def test_background_and_preview_agents_preserve_requested_provider(monkeypatch):
+    agent = types.SimpleNamespace(
+        model="gpt-5.4-mini",
+        provider="custom",
+        requested_provider="custom:pm",
+    )
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"max_turns": 25})
+    monkeypatch.setattr(server, "_load_enabled_toolsets", lambda: ["file"])
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+
+    assert server._background_agent_kwargs(agent, "background")[
+        "requested_provider"
+    ] == "custom:pm"
+    assert server._ephemeral_preview_agent_kwargs(agent, "preview")[
+        "requested_provider"
+    ] == "custom:pm"
+
+
 def test_background_agent_kwargs_preserves_empty_fallback_chain(monkeypatch):
     agent = types.SimpleNamespace(
         model="gpt-5.5",
@@ -3635,6 +3653,26 @@ def test_tui_heartbeat_routes_to_idle_owner_as_silent_turn(monkeypatch):
     }
 
 
+@pytest.mark.parametrize("status", ["STUCK", "UNKNOWN"])
+def test_tui_unhealthy_heartbeat_is_not_silent(monkeypatch, status):
+    session = _session(session_key="heartbeat-owner")
+    submitted = []
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *args, **kwargs: submitted.append((args, kwargs)),
+    )
+
+    server._handle_heartbeat_event(
+        "heartbeat-sid", session, _runtime_heartbeat_event(status=status)
+    )
+
+    assert submitted[0][1] == {
+        "turn_origin": "heartbeat_warm",
+        "allow_silent_noop": False,
+    }
+
+
 def test_tui_alive_heartbeat_does_not_duplicate_busy_turn(monkeypatch):
     session = _session(session_key="heartbeat-owner", running=True)
     monkeypatch.setattr(
@@ -3703,7 +3741,11 @@ def test_tui_heartbeat_returned_error_preserves_recovery_state(
     )
 
     assert session.get("inflight_turn") == snapshot
-    assert not any(event[0] == "message.complete" for event in emitted)
+    completed = [event for event in emitted if event[0] == "message.complete"]
+    assert completed
+    assert completed[-1][2]["status"] == "error"
+    assert completed[-1][2]["recoverable"] is True
+    assert "heartbeat provider failed" in completed[-1][2]["error"]
 
 
 @pytest.mark.parametrize("existing_snapshot", [None, {
@@ -3740,7 +3782,11 @@ def test_tui_heartbeat_exception_preserves_recovery_state(
     )
 
     assert session.get("inflight_turn") == snapshot
-    assert not any(event[0] == "message.complete" for event in emitted)
+    completed = [event for event in emitted if event[0] == "message.complete"]
+    assert completed
+    assert completed[-1][2]["status"] == "error"
+    assert completed[-1][2]["recoverable"] is True
+    assert "heartbeat exploded" in completed[-1][2]["error"]
 
 
 def test_tui_heartbeat_preserves_pending_user_only_state(monkeypatch):
@@ -3785,6 +3831,8 @@ def test_tui_heartbeat_preserves_pending_user_only_state(monkeypatch):
         agent=_Agent(),
         moa_one_shot_restore=copy.deepcopy(moa_restore),
         one_turn_model_restore=copy.deepcopy(one_turn_restore),
+        pending_model_switch={"model": "queued-model", "provider": "custom:pm"},
+        pending_title="queued title",
     )
     reaction_notes = Mock(return_value="[The user reacted 👍 to your message]")
     restored = []
@@ -3794,6 +3842,23 @@ def test_tui_heartbeat_preserves_pending_user_only_state(monkeypatch):
     monkeypatch.setattr(server, "render_message", lambda _raw, _cols: None)
     monkeypatch.setattr(server, "_get_db", lambda: None)
     monkeypatch.setattr(server, "_pending_reaction_notes", reaction_notes)
+    pending_switches = []
+    monkeypatch.setattr(
+        server,
+        "_apply_pending_model_switch",
+        lambda *_args: pending_switches.append("applied"),
+    )
+    monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda *_args: None)
+    audio_calls = []
+    monkeypatch.setattr(
+        server, "_tts_stream_begin", lambda: audio_calls.append("tts") or None
+    )
+    monkeypatch.setattr(
+        server, "_arm_full_duplex_listener", lambda: audio_calls.append("duplex")
+    )
+    monkeypatch.setattr(server, "_voice_mode_enabled", lambda: True)
+    monkeypatch.setattr(server, "_voice_cfg_dict", lambda: {"barge_in": True})
+    monkeypatch.setattr(server, "_voice_tts_enabled", lambda: False)
     monkeypatch.setattr(
         server,
         "_apply_model_switch",
@@ -3813,7 +3878,14 @@ def test_tui_heartbeat_preserves_pending_user_only_state(monkeypatch):
 
     assert session["moa_one_shot_restore"] == moa_restore
     assert session["one_turn_model_restore"] == one_turn_restore
+    assert session["pending_model_switch"] == {
+        "model": "queued-model",
+        "provider": "custom:pm",
+    }
+    assert session["pending_title"] == "queued title"
     assert reaction_notes.call_count == 0
+    assert pending_switches == []
+    assert audio_calls == []
 
     server._run_prompt_submit("rid-user", "sid", session, "real user prompt")
 
@@ -15744,6 +15816,73 @@ class TestResolveRuntimeWithFallback:
         assert captured["provider"] == "deepseek"
         assert captured["base_url"] == "https://fallback.invalid/v1"
         assert captured["api_key"] == "fb-tok"
+
+    def test_make_agent_binds_fallback_requested_provider_and_exact_ttl(
+        self, monkeypatch
+    ):
+        from hermes_cli.auth import AuthError
+        from tools.runtime_heartbeat import (
+            bind_agent_provider,
+            get_current_provider,
+            preflight_current_heartbeat,
+            reset_current_provider,
+        )
+
+        captured = {}
+
+        def fake_resolve(**kwargs):
+            requested = kwargs.get("requested")
+            if requested == "custom:bad":
+                raise AuthError("bad primary")
+            assert requested == "custom:pm"
+            return {
+                "provider": "custom",
+                "requested_provider": "custom:pm",
+                "api_key": "fallback-key",
+                "base_url": "https://pm.invalid/v1",
+                "api_mode": "chat_completions",
+            }
+
+        def fake_agent(**kwargs):
+            captured.update(kwargs)
+            return types.SimpleNamespace(**kwargs)
+
+        monkeypatch.setattr(
+            server,
+            "_load_cfg",
+            lambda: {
+                "model": {"default": "bad-model", "provider": "custom:bad"},
+                "fallback_providers": [
+                    {"provider": "custom:pm", "model": "gpt-5.4-mini"}
+                ],
+            },
+        )
+        monkeypatch.setattr(
+            server, "_resolve_startup_runtime", lambda: ("bad-model", "custom:bad")
+        )
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider", fake_resolve
+        )
+        monkeypatch.setattr("run_agent.AIAgent", fake_agent)
+        monkeypatch.setattr(server, "_load_enabled_toolsets", lambda: ["file"])
+        monkeypatch.setattr(server, "_get_db", lambda: None)
+        monkeypatch.setattr(
+            "tools.runtime_heartbeat._runtime_config",
+            lambda: {
+                "heartbeat": {"enabled": True, "mode": "per_target"},
+                "warm_kv_timeout": {"providers": {"custom:pm": 1700}},
+            },
+        )
+
+        agent = server._make_agent("sid", "session-key")
+        token = bind_agent_provider(agent)
+        try:
+            assert captured["provider"] == "custom"
+            assert captured["requested_provider"] == "custom:pm"
+            assert get_current_provider() == "custom:pm"
+            assert preflight_current_heartbeat() == 1700
+        finally:
+            reset_current_provider(token)
 
 
 def test_get_usage_does_not_substitute_cumulative_total_for_context_used():

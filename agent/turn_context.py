@@ -539,11 +539,19 @@ def build_turn_context(
             agent._pending_cli_user_message = None
 
     # Hydrate todo store from conversation history.
-    if conversation_history and not agent._todo_store.has_items():
+    if (
+        not defer_early_persistence
+        and conversation_history
+        and not agent._todo_store.has_items()
+    ):
         agent._hydrate_todo_store(conversation_history)
 
     # Hydrate per-session nudge counters from persisted history (issue #22357).
-    if conversation_history and agent._user_turn_count == 0:
+    if (
+        not defer_early_persistence
+        and conversation_history
+        and agent._user_turn_count == 0
+    ):
         prior_user_turns = sum(
             1 for m in conversation_history if m.get("role") == "user"
         )
@@ -606,7 +614,7 @@ def build_turn_context(
     # and notify the host so it can play hearts. Token-free, never touches the
     # conversation, and never fatal — a purely optional UI beat.
     reaction_callback = getattr(agent, "reaction_callback", None)
-    if reaction_callback is not None:
+    if not defer_early_persistence and reaction_callback is not None:
         try:
             from agent.reactions import detect_reaction
 
@@ -1170,7 +1178,7 @@ def build_turn_context(
         agent._interrupt_thread_signal_pending = False
 
     # Notify memory providers of the new turn (BEFORE prefetch_all).
-    if agent._memory_manager:
+    if not defer_early_persistence and agent._memory_manager:
         try:
             _turn_msg = original_user_message if isinstance(original_user_message, str) else ""
             agent._memory_manager.on_turn_start(agent._user_turn_count, _turn_msg)
@@ -1182,7 +1190,7 @@ def build_turn_context(
     # Skip prefetch on trivial prompts (greetings, acknowledgements) to
     # prevent memory-context injection on turns that carry no semantic signal.
     ext_prefetch_cache = ""
-    if agent._memory_manager:
+    if not defer_early_persistence and agent._memory_manager:
         try:
             _query = original_user_message if isinstance(original_user_message, str) else ""
             if not is_trivial_prompt(_query):

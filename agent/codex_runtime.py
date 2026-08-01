@@ -637,6 +637,7 @@ def run_codex_app_server_turn(
     effective_task_id: str,
     should_review_memory: bool = False,
     turn_origin: str = "user",
+    allow_silent_noop: bool = False,
 ) -> Dict[str, Any]:
     """Codex app-server runtime path. Hands the entire turn to a `codex
     app-server` subprocess and projects its events back into Hermes'
@@ -727,7 +728,7 @@ def run_codex_app_server_turn(
             if _user_interrupted
             else None
         )
-        if _user_interrupted:
+        if _user_interrupted and turn_origin != "heartbeat_warm":
             agent.clear_interrupt()
         return {
             "final_response": (
@@ -756,7 +757,7 @@ def run_codex_app_server_turn(
     _interrupt_message = (
         getattr(agent, "_interrupt_message", None) if _user_interrupted else None
     )
-    if _user_interrupted:
+    if _user_interrupted and turn_origin != "heartbeat_warm":
         agent.clear_interrupt()
 
     # If the turn signalled the underlying client is wedged (deadline
@@ -820,6 +821,23 @@ def run_codex_app_server_turn(
                     getattr(agent, "session_id", None),
                 )
 
+    silent_noop = bool(
+        turn_origin == "heartbeat_warm"
+        and allow_silent_noop
+        and not turn.final_text
+        and not turn.projected_messages
+        and not turn.interrupted
+        and turn.error is None
+    )
+    if silent_noop:
+        if (
+            messages
+            and isinstance(messages[-1], dict)
+            and messages[-1].get("role") == "user"
+            and messages[-1].get("content") == user_message
+        ):
+            messages.pop()
+        agent._session_messages = messages
 
     # Counter ticks for the agent-improvement loop.
     # _turns_since_memory and _user_turn_count are ALREADY incremented
@@ -895,6 +913,7 @@ def run_codex_app_server_turn(
             else {}
         ),
         "error": turn.error,
+        "silent_noop": silent_noop,
         # The codex app-server runtime IS an early-return path that bypasses
         # conversation_loop, but we flush the projected assistant/tool messages
         # ourselves above (see the _flush_messages_to_session_db call after

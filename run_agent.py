@@ -7642,7 +7642,7 @@ class AIAgent:
         task_started = False
         task_finished = False
         relay_outcome = "failed"
-        heartbeat_turn = turn_origin == "heartbeat_warm" and allow_silent_noop is True
+        heartbeat_turn = turn_origin == "heartbeat_warm"
         previous_persistence_defer = getattr(
             self, "_defer_heartbeat_persistence", False
         )
@@ -7727,10 +7727,13 @@ class AIAgent:
                     and message.get("role") in {"assistant", "tool"}
                     for message in new_messages
                 )
-                if result.get("silent_noop") is True or not has_assistant_evidence:
+                if result.get("silent_noop") is True:
                     result["messages"] = history
                     self._session_messages = history
                     result["final_response"] = ""
+                elif not has_assistant_evidence:
+                    result["messages"] = history
+                    self._session_messages = history
                 else:
                     self._defer_heartbeat_persistence = previous_persistence_defer
                     self._persist_session(messages, conversation_history)
@@ -7815,6 +7818,7 @@ class AIAgent:
         effective_task_id: str,
         should_review_memory: bool = False,
         turn_origin: str = "user",
+        allow_silent_noop: bool = False,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.codex_runtime.run_codex_app_server_turn``."""
         from agent.codex_runtime import run_codex_app_server_turn
@@ -7826,6 +7830,7 @@ class AIAgent:
             effective_task_id=effective_task_id,
             should_review_memory=should_review_memory,
             turn_origin=turn_origin,
+            allow_silent_noop=allow_silent_noop,
         )
 
 def main(

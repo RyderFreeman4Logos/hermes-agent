@@ -260,6 +260,69 @@ class TestRunConversationCodexPath:
         memory_sync.assert_not_called()
         review.assert_not_called()
 
+    def test_empty_successful_heartbeat_returns_structured_silent_noop(
+        self, monkeypatch
+    ):
+        def empty_turn(self, user_input: str, **kwargs):
+            return TurnResult(
+                final_text="",
+                projected_messages=[],
+                interrupted=False,
+                error=None,
+                turn_id="turn-empty",
+                thread_id="thread-empty",
+            )
+
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", empty_turn)
+        monkeypatch.setattr(
+            CodexAppServerSession, "ensure_started", lambda self: "thread-empty"
+        )
+        agent = _make_codex_agent()
+        history = [
+            {"role": "user", "content": "real question"},
+            {"role": "assistant", "content": "real answer"},
+        ]
+
+        result = agent.run_conversation(
+            "[HEARTBEAT] target remains ALIVE",
+            conversation_history=history,
+            turn_origin="heartbeat_warm",
+            allow_silent_noop=True,
+        )
+
+        assert result["silent_noop"] is True
+        assert result["final_response"] == ""
+        assert result["messages"] == history
+        assert agent._session_messages == history
+
+    def test_heartbeat_app_server_failure_keeps_visible_recovery_text(
+        self, monkeypatch
+    ):
+        def failed_turn(self, user_input: str, **kwargs):
+            raise RuntimeError("heartbeat app-server failed")
+
+        monkeypatch.setattr(CodexAppServerSession, "run_turn", failed_turn)
+        monkeypatch.setattr(
+            CodexAppServerSession, "ensure_started", lambda self: "thread-error"
+        )
+        agent = _make_codex_agent()
+        history = [
+            {"role": "user", "content": "real question"},
+            {"role": "assistant", "content": "real answer"},
+        ]
+
+        result = agent.run_conversation(
+            "[HEARTBEAT] target inspection",
+            conversation_history=history,
+            turn_origin="heartbeat_warm",
+            allow_silent_noop=True,
+        )
+
+        assert "Codex app-server turn failed" in result["final_response"]
+        assert result["error"] == "heartbeat app-server failed"
+        assert result["messages"] == history
+        assert agent._session_messages == history
+
     def test_user_message_not_duplicated(self, fake_session):
         """Regression guard: the user message must appear exactly once in
         the messages list. The standard run_conversation pre-loop appends

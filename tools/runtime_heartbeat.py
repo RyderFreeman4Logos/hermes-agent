@@ -112,6 +112,7 @@ class _Target:
     generation: int = 0
     timer: Any = None
     baseline: Dict[str, Any] = field(default_factory=dict)
+    publishing: bool = False
 
 
 class RuntimeHeartbeat:
@@ -126,6 +127,7 @@ class RuntimeHeartbeat:
         self._event_queue = event_queue
         self._timer_factory = timer_factory
         self._lock = threading.RLock()
+        self._publication_done = threading.Condition(self._lock)
         self._targets: Dict[str, _Target] = {}
 
     def _queue(self):
@@ -164,10 +166,8 @@ class RuntimeHeartbeat:
             inspect=inspect,
             started_at=time.time(),
         )
+        self.cancel(key)
         with self._lock:
-            old = self._targets.pop(key, None)
-            if old is not None and old.timer is not None:
-                old.timer.cancel()
             self._targets[key] = target
         try:
             baseline = dict(inspect() or {})
@@ -201,6 +201,8 @@ class RuntimeHeartbeat:
                 return False
             if target.timer is not None:
                 target.timer.cancel()
+            while target.publishing:
+                self._publication_done.wait()
             return True
 
     def cancel_for_caller(self, caller_id: str) -> int:
@@ -265,35 +267,49 @@ class RuntimeHeartbeat:
             if target is None or target.generation != generation:
                 return
             target.timer = None
+        inspection_error = None
         try:
             snapshot = dict(target.inspect() or {})
         except Exception as exc:
+            inspection_error = exc
             snapshot = {
-                "alive": False,
+                "alive": True,
                 "evidence": f"heartbeat inspection failed: {type(exc).__name__}: {exc}",
             }
         if snapshot.get("alive") is not True:
             self.cancel(key)
             return
-        status, evidence = self._assess(target, snapshot)
+        if inspection_error is not None:
+            status, evidence = "UNKNOWN", str(snapshot["evidence"])
+        else:
+            status, evidence = self._assess(target, snapshot)
         with self._lock:
             current = self._targets.get(key)
             if current is not target or current.generation != generation:
                 return
-            target.baseline = snapshot
-            self._schedule_locked(key, target)
-        self._queue().put(
-            {
-                "type": "heartbeat",
-                "target_id": target.target_id,
-                "target_kind": target.kind,
-                "session_id": target.target_id if target.kind == "process" else "",
-                "session_key": target.caller_id,
-                "status": status,
-                "evidence": evidence[:500],
-                "elapsed_s": max(0, int(time.time() - target.started_at)),
-            }
-        )
+            if inspection_error is None:
+                target.baseline = snapshot
+                self._schedule_locked(key, target)
+            target.publishing = True
+        try:
+            self._queue().put(
+                {
+                    "type": "heartbeat",
+                    "target_id": target.target_id,
+                    "target_kind": target.kind,
+                    "session_id": target.target_id if target.kind == "process" else "",
+                    "session_key": target.caller_id,
+                    "status": status,
+                    "evidence": evidence[:500],
+                    "elapsed_s": max(0, int(time.time() - target.started_at)),
+                }
+            )
+        finally:
+            with self._lock:
+                target.publishing = False
+                if inspection_error is not None and self._targets.get(key) is target:
+                    self._targets.pop(key, None)
+                self._publication_done.notify_all()
 
 
 def inspect_process(target_id: str) -> Dict[str, Any]:
@@ -304,17 +320,32 @@ def inspect_process(target_id: str) -> Dict[str, Any]:
         return {"alive": False, "evidence": "process is not registered"}
     with session._lock:
         exited = bool(session.exited)
-        output_size = len(session.output_buffer or "")
+        output_size = int(session.output_size)
         pid = session.pid
+        pid_scope = session.pid_scope
+        host_start_time = session.host_start_time
     if exited:
         return {"alive": False, "evidence": "process exited"}
     cpu_seconds = 0.0
-    if pid:
+    if pid and pid_scope == "host":
         try:
             import psutil
 
-            cpu = psutil.Process(pid).cpu_times()
-            cpu_seconds = float(cpu.user + cpu.system)
+            process_registry._remember_local_descendants(session)
+            with session._lock:
+                tracked = dict(session._tracked_descendants)
+            processes = [(pid, host_start_time), *tracked.items()]
+            for process_pid, expected_start in processes:
+                if process_pid != pid and expected_start is None:
+                    continue
+                if (
+                    expected_start is not None
+                    and process_registry._safe_host_start_time(process_pid)
+                    != expected_start
+                ):
+                    continue
+                cpu = psutil.Process(process_pid).cpu_times()
+                cpu_seconds += float(cpu.user + cpu.system)
         except Exception:
             pass
     return {
@@ -336,11 +367,23 @@ def inspect_delegation(target_id: str) -> Dict[str, Any]:
         None,
     )
     status = str((record or {}).get("status") or "")
-    if status in {"running", "stalling", "finalizing"}:
+    if status == "running":
         return {
             "alive": True,
             "progress": True,
             "evidence": f"delegation in progress; status={status}",
+        }
+    if status == "finalizing":
+        return {
+            "alive": True,
+            "progress": True,
+            "evidence": "delegation finalizing",
+        }
+    if status == "stalling":
+        return {
+            "alive": True,
+            "progress": False,
+            "evidence": "delegation interrupt requested; status=stalling",
         }
     return {"alive": False, "evidence": f"delegation status={status or 'missing'}"}
 

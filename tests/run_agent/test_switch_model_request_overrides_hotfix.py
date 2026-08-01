@@ -333,6 +333,37 @@ def test_sibling_agents_preserve_explicit_fast_named_scalars(
     }
 
 
+def test_routed_background_review_provider_overrides_remain_derived(
+    runtime_override_env,
+    monkeypatch,
+):
+    parent = _openai_fast_agent(CALLER_OVERRIDES)
+    parent.enabled_toolsets = ["file"]
+    monkeypatch.setattr(
+        "agent.background_review._resolve_review_runtime",
+        lambda _agent: {
+            "routed": True,
+            "provider": "custom:glm",
+            "model": "glm-5.2",
+            "api_mode": "chat_completions",
+            "base_url": GLM_URL,
+            "api_key": "glm-key",
+            "request_overrides": {"extra_body": GLM_THINKING},
+        },
+    )
+
+    child = AIAgent(
+        **_capture_sibling_kwargs(monkeypatch, parent, "background_review")
+    )
+
+    assert child._caller_request_overrides == {}
+    assert child.request_overrides == {"extra_body": GLM_THINKING}
+
+    _switch(child, provider="openai-codex", base_url=CODEX_URL)
+
+    assert child.request_overrides == {}
+
+
 def test_delegate_differing_model_rebuilds_fast_overrides(runtime_override_env):
     from tools.delegate_tool import _build_child_agent
 
@@ -583,6 +614,25 @@ def test_failed_switch_restores_nested_request_overrides():
     assert agent.request_overrides == original
     agent.request_overrides["extra_body"]["thinking"]["type"] = "mutated"
     assert original["extra_body"]["thinking"]["type"] == "enabled"
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_live_tui_fast_toggle_preserves_explicit_fast_named_scalars(
+    runtime_override_env,
+    monkeypatch,
+    enabled,
+):
+    explicit = {
+        **CALLER_OVERRIDES,
+        "service_tier": "flex",
+        "speed": "fast",
+    }
+    agent = _openai_fast_agent(explicit)
+
+    _set_tui_fast(monkeypatch, agent, enabled=enabled)
+
+    assert agent._caller_request_overrides == explicit
+    assert agent.request_overrides == explicit
 
 
 @pytest.mark.parametrize("initial_fast", [False, True])

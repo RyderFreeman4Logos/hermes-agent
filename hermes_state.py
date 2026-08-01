@@ -2464,6 +2464,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self,
         fn: Callable[[sqlite3.Connection], T],
         patience_s: Optional[float] = None,
+        compression_patience_s: Optional[float] = None,
     ) -> T:
         """Execute a write transaction with BEGIN IMMEDIATE and jitter retry.
 
@@ -2539,11 +2540,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # than left to land a stale turn once a long-running or wedged
                 # compression finally lets go.
                 if compression_deadline is None:
+                    compression_wait_s = (
+                        self._COMPRESSION_BUSY_WAIT_S
+                        if compression_patience_s is None
+                        else max(0.0, compression_patience_s)
+                    )
                     compression_deadline = min(
-                        time.monotonic() + self._COMPRESSION_BUSY_WAIT_S, deadline
+                        time.monotonic() + compression_wait_s, deadline
                     )
                 if self._sleep_before_write_retry(
-                    compression_deadline, self._COMPRESSION_BUSY_WAIT_S
+                    compression_deadline, compression_wait_s
                 ):
                     continue
                 raise
@@ -6210,6 +6216,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         messages: List[Dict[str, Any]],
         compression_lock_holder: Optional[str] = None,
         chunk_rows: Optional[int] = None,
+        compression_patience_s: Optional[float] = None,
     ) -> int:
         """Append multiple messages atomically in ONE write transaction.
 
@@ -6248,6 +6255,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     session_id,
                     messages[start:start + chunk_rows],
                     compression_lock_holder=compression_lock_holder,
+                    compression_patience_s=compression_patience_s,
                 )
             return inserted_total
 
@@ -6274,7 +6282,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         # Same criticality as append_message: this IS the turn's transcript.
         return self._execute_write(
-            _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
+            _do,
+            patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S,
+            compression_patience_s=compression_patience_s,
         )
 
     def set_latest_matching_message_display_kind(

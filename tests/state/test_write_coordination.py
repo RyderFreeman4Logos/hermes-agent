@@ -8,6 +8,7 @@ import sqlite3
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 
 import pytest
@@ -47,13 +48,13 @@ def _hold_sqlite_write(db_path: str, ready, release) -> None:
         conn.close()
 
 
-def _hold_advisory_lock(lock_path: str, ready, release) -> None:
+def _hold_advisory_lock(lock_path: str, ready, release, hold_s: float = 5.0) -> None:
     handle = Path(lock_path).open("a+b")
     try:
         if not _try_acquire_exclusive_file_lock(handle):
             raise RuntimeError("could not acquire advisory lock")
         ready.set()
-        release.wait(5)
+        release.wait(hold_s)
     finally:
         _release_exclusive_file_lock(handle)
         handle.close()
@@ -229,6 +230,67 @@ def test_advisory_lock_timeout_is_bounded(db, process_ctx) -> None:
     elapsed = time.monotonic() - started
     assert holder.exitcode == 0
     assert 0.15 <= elapsed < 1.0
+
+
+def test_waiting_writer_does_not_block_same_instance_public_readers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    process_ctx,
+) -> None:
+    monkeypatch.setattr(hermes_state, "resolve_journal_mode", lambda: "delete")
+    database = SessionDB(db_path=tmp_path / "reader-convoy.db")
+    assert database._conn is not None
+    assert database._conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+    database.create_session("readable", source="test", model="test")
+    database.append_message("readable", "user", "hello")
+    database.set_meta("seed", "value")
+
+    ready, release = process_ctx.Event(), process_ctx.Event()
+    holder = process_ctx.Process(
+        target=_hold_advisory_lock,
+        args=(str(session_db_write_lock_path(database.db_path)), ready, release, 10.0),
+    )
+    writer_waiting = threading.Event()
+    original_try_lock = hermes_state._try_acquire_exclusive_file_lock
+
+    def observe_contention(handle) -> bool:
+        acquired = original_try_lock(handle)
+        if not acquired:
+            writer_waiting.set()
+        return acquired
+
+    executor = ThreadPoolExecutor(max_workers=3)
+    holder.start()
+    try:
+        assert ready.wait(10)
+        monkeypatch.setattr(
+            hermes_state, "_try_acquire_exclusive_file_lock", observe_contention
+        )
+        writer = executor.submit(database.set_meta, "writer", "done")
+        assert writer_waiting.wait(2)
+
+        meta_reader = executor.submit(database.get_meta, "seed")
+        messages_reader = executor.submit(database.get_messages, "readable")
+        wait((meta_reader,), timeout=2)
+        wait((messages_reader,), timeout=2)
+        readers_completed_before_release = meta_reader.done() and messages_reader.done()
+        writer_blocked_before_release = not writer.done()
+    finally:
+        release.set()
+        executor.shutdown(wait=True, cancel_futures=True)
+        holder.join(10)
+        if holder.is_alive():
+            holder.terminate()
+            holder.join(10)
+        writer_value = database.get_meta("writer")
+        database.close()
+
+    assert holder.exitcode == 0
+    assert readers_completed_before_release
+    assert writer_blocked_before_release
+    assert meta_reader.result() == "value"
+    assert [message["content"] for message in messages_reader.result()] == ["hello"]
+    assert writer_value == "done"
 
 
 def test_advisory_lock_is_cleaned_up_after_crash(db, process_ctx) -> None:

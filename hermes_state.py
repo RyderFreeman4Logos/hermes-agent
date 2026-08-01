@@ -1963,6 +1963,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self.read_only = read_only
 
         self._lock = threading.Lock()
+        # Serialize local writers before sidecar waits; readers only take _lock.
+        self._writer_lock = threading.Lock()
         self._write_lock_owner = None
         # Read-path split (WAL only): recall/browse queries run on per-thread
         # read-only connections so they never queue behind writer flushes on
@@ -2282,18 +2284,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             deadline = time.monotonic() + patience_s
         if allow_unsupported is None:
             allow_unsupported = not self._wal_active
-        with self._lock:
+        with self._writer_lock:
             with _session_db_advisory_write_lock(
                 self.db_path,
                 deadline=deadline,
                 patience_s=patience_s,
                 allow_unsupported=allow_unsupported,
             ) as acquired:
-                self._write_lock_owner = owner
-                try:
-                    yield acquired
-                finally:
-                    self._write_lock_owner = None
+                with self._lock:
+                    self._write_lock_owner = owner
+                    try:
+                        yield acquired
+                    finally:
+                        self._write_lock_owner = None
 
     @staticmethod
     def _is_fts5_unavailable_error(exc: sqlite3.OperationalError) -> bool:

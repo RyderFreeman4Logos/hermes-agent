@@ -2776,6 +2776,46 @@ def _finalize_child_results(
                 logger.debug("Subagent cost rollup failed", exc_info=True)
 
 
+def _finalize_unstarted_children(
+    children: List[tuple[int, Dict[str, Any], Any]],
+    parent_agent,
+    status: str,
+) -> None:
+    """Close prebuilt children and balance lifecycle when no runner starts."""
+    with _parent_finalization_lock(parent_agent):
+        try:
+            from hermes_cli.plugins import invoke_hook
+        except Exception:
+            invoke_hook = None
+
+        for _task_index, _task, child in children:
+            child_role = getattr(child, "_delegate_role", None)
+            try:
+                if hasattr(child, "close"):
+                    child.close()
+            except Exception:
+                logger.debug(
+                    "Failed to close unstarted delegation child", exc_info=True
+                )
+
+            if invoke_hook is None:
+                continue
+            try:
+                invoke_hook(
+                    "subagent_stop",
+                    parent_session_id=getattr(parent_agent, "session_id", None),
+                    parent_turn_id=getattr(parent_agent, "_current_turn_id", "") or "",
+                    child_session_id=getattr(child, "session_id", None),
+                    child_role=child_role,
+                    child_summary=None,
+                    child_status=status,
+                    tool_call_history=[],
+                    duration_ms=0,
+                )
+            except Exception:
+                logger.debug("subagent_stop hook invocation failed", exc_info=True)
+
+
 def _run_child_lifecycle(
     task_index: int,
     goal: str,
@@ -3333,6 +3373,17 @@ def delegate_task(
                 except ValueError:
                     pass
 
+        _not_started_lock = threading.Lock()
+        _not_started_finalized = False
+
+        def _finalize_not_started(status: str) -> None:
+            nonlocal _not_started_finalized
+            with _not_started_lock:
+                if _not_started_finalized:
+                    return
+                _not_started_finalized = True
+            _finalize_unstarted_children(children, parent_agent, status)
+
         def _batch_runner():
             # This batch is detached from the foreground turn. Its lifecycle is
             # owned by the async registry and cancelled only via _batch_interrupt.
@@ -3401,6 +3452,7 @@ def delegate_task(
             parent_session_id=_parent_session_id,
             runner=_batch_runner,
             interrupt_fn=_batch_interrupt,
+            on_not_started=_finalize_not_started,
             max_async_children=_get_max_async_children(),
             # Reuse the live-transcript directory's id (when created) so the
             # returned delegation_id matches cache/delegation/live/<id>/.
@@ -3440,12 +3492,7 @@ def delegate_task(
                 )
             return json.dumps(payload, ensure_ascii=False)
 
-        for _c in _child_agents:
-            try:
-                if hasattr(_c, "close"):
-                    _c.close()
-            except Exception:
-                logger.debug("Failed to close rejected delegation child", exc_info=True)
+        _finalize_not_started("error")
         if live_deleg_id:
             shutil.rmtree(live_transcript_root() / live_deleg_id, ignore_errors=True)
 

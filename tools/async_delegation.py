@@ -566,6 +566,8 @@ def _admit_worker(delegation_id: str) -> bool:
                 _pending_admission_ids.discard(delegation_id)
                 record["status"] = "running"
                 record["_progress_ts"] = time.time()
+                # The runner owns cleanup from this point onward.
+                record.pop("_on_not_started", None)
                 return True
             _admission_condition.wait()
 
@@ -585,6 +587,16 @@ def _try_register_queued(record: Dict[str, Any]) -> bool:
         _pending_admission_ids.add(delegation_id)
         _records[delegation_id] = record
         return True
+
+
+def _invoke_not_started(callback: Optional[Callable[[str], None]], status: str) -> None:
+    """Finalize caller-owned resources when no runner took ownership."""
+    if not callable(callback):
+        return
+    try:
+        callback(status)
+    except Exception:
+        logger.exception("Async delegation pre-admission finalization failed")
 
 
 def active_count() -> int:
@@ -689,6 +701,7 @@ def dispatch_async_delegation(
     origin_ui_session_id: str = "",
     origin_session_id: str = "",
     interrupt_fn: Optional[Callable[[], None]] = None,
+    on_not_started: Optional[Callable[[str], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     progress_fn: Optional[Callable[[], tuple]] = None,
 ) -> Dict[str, Any]:
@@ -715,6 +728,10 @@ def dispatch_async_delegation(
     interrupt_fn
         Optional callable to signal the child to stop (used on shutdown /
         explicit cancel).
+    on_not_started
+        Optional callable invoked exactly once with the terminal status when
+        registration, submission, or queued cancellation ends the delegation
+        before its runner owns cleanup.
     progress_fn
         Optional zero-arg callable returning ``(token, in_tool)`` where
         ``token`` is any comparable snapshot of the child's progress (api
@@ -749,6 +766,7 @@ def dispatch_async_delegation(
         "dispatched_at": dispatched_at,
         "completed_at": None,
         "interrupt_fn": interrupt_fn,
+        "_on_not_started": on_not_started,
         "progress_fn": progress_fn,
         # Stale-monitor bookkeeping (see _stale_monitor_loop).
         "_progress_token": None,
@@ -757,6 +775,7 @@ def dispatch_async_delegation(
     }
     executor = _get_executor(max_async_children)
     if not _try_register_queued(record):
+        _invoke_not_started(on_not_started, "error")
         return {
             "status": "rejected",
             "error": _BACKLOG_FULL_ERROR,
@@ -796,6 +815,7 @@ def dispatch_async_delegation(
             _records.pop(delegation_id, None)
             _pending_admission_ids.discard(delegation_id)
         _delete_durable_delegation(delegation_id)
+        _invoke_not_started(on_not_started, "error")
         return {
             "status": "rejected",
             "error": f"Failed to schedule async delegation: {exc}",
@@ -812,15 +832,22 @@ def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
     claimed = _begin_finalization(delegation_id)
     if claimed is None:
         return
-    event_record, _interrupt_fn = claimed
+    event_record, _interrupt_fn, on_not_started = claimed
 
+    _invoke_not_started(on_not_started, status)
     _push_completion_event(event_record, result, status)
     _finish_finalization(delegation_id, status)
 
 
 def _begin_finalization(
     delegation_id: str,
-) -> Optional[tuple[Dict[str, Any], Optional[Callable[[], None]]]]:
+) -> Optional[
+    tuple[
+        Dict[str, Any],
+        Optional[Callable[[], None]],
+        Optional[Callable[[str], None]],
+    ]
+]:
     """Atomically claim terminal delivery while keeping the record active."""
     with _records_lock:
         record = _records.get(delegation_id)
@@ -839,10 +866,11 @@ def _begin_finalization(
         interrupt_fn = record.get("interrupt_fn")
         record["interrupt_fn"] = None  # drop the closure; child is done
         record["progress_fn"] = None  # stop stale-monitor sampling
+        on_not_started = record.pop("_on_not_started", None)
         event_record = dict(record)
         _admission_condition.notify_all()
 
-    return event_record, interrupt_fn
+    return event_record, interrupt_fn, on_not_started
 
 
 def _finish_finalization(delegation_id: str, status: str) -> None:
@@ -935,6 +963,7 @@ def dispatch_async_delegation_batch(
     origin_ui_session_id: str = "",
     origin_session_id: str = "",
     interrupt_fn: Optional[Callable[[], None]] = None,
+    on_not_started: Optional[Callable[[str], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     delegation_id: Optional[str] = None,
     progress_fn: Optional[Callable[[], tuple]] = None,
@@ -957,7 +986,8 @@ def dispatch_async_delegation_batch(
 
     Returns ``{"status": "dispatched", "delegation_id": ...}`` after the
     batch is registered. Excess process-wide backlog is rejected immediately;
-    runner admission remains off the foreground thread.
+    runner admission remains off the foreground thread. If no runner takes
+    ownership, ``on_not_started`` receives the terminal status exactly once.
     """
     delegation_id = delegation_id or _new_delegation_id()
     dispatched_at = time.time()
@@ -982,6 +1012,7 @@ def dispatch_async_delegation_batch(
         "dispatched_at": dispatched_at,
         "completed_at": None,
         "interrupt_fn": interrupt_fn,
+        "_on_not_started": on_not_started,
         "is_batch": True,
         "progress_fn": progress_fn,
         "_progress_token": None,
@@ -990,6 +1021,7 @@ def dispatch_async_delegation_batch(
     }
     executor = _get_executor(max_async_children)
     if not _try_register_queued(record):
+        _invoke_not_started(on_not_started, "error")
         return {
             "status": "rejected",
             "error": _BACKLOG_FULL_ERROR,
@@ -1034,6 +1066,7 @@ def dispatch_async_delegation_batch(
             _records.pop(delegation_id, None)
             _pending_admission_ids.discard(delegation_id)
         _delete_durable_delegation(delegation_id)
+        _invoke_not_started(on_not_started, "error")
         return {
             "status": "rejected",
             "error": f"Failed to schedule async delegation batch: {exc}",
@@ -1052,8 +1085,9 @@ def _finalize_batch(
     claimed = _begin_finalization(delegation_id)
     if claimed is None:
         return
-    event_record, _interrupt_fn = claimed
+    event_record, _interrupt_fn, on_not_started = claimed
 
+    _invoke_not_started(on_not_started, status)
     _push_batch_completion_event(event_record, combined, status)
     _finish_finalization(delegation_id, status)
 
@@ -1239,7 +1273,8 @@ def _finalize_stalled(delegation_id: str) -> None:
     claimed = _begin_finalization(delegation_id)
     if claimed is None:
         return
-    event_record, _interrupt_fn = claimed
+    event_record, _interrupt_fn, on_not_started = claimed
+    _invoke_not_started(on_not_started, "stalled")
 
     completed_at = event_record.get("completed_at") or time.time()
     duration = round(

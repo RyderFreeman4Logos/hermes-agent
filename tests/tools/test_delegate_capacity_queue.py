@@ -414,6 +414,138 @@ def test_public_handler_queues_when_worker_capacity_is_saturated(
     assert len(event["results"]) == expected_count
 
 
+def test_public_handler_queued_cancellation_closes_child_and_balances_lifecycle(
+    monkeypatch,
+):
+    occupied = threading.Event()
+    release_occupied = threading.Event()
+
+    def occupying_runner():
+        occupied.set()
+        assert release_occupied.wait(timeout=60)
+        return {"results": [{"status": "completed", "summary": "occupied done"}]}
+
+    occupier = _dispatch_batch(occupying_runner, 1, session_key="occupier")
+    assert occupied.wait(timeout=5)
+
+    created = []
+    runner_started = threading.Event()
+    lifecycle = []
+
+    class Child:
+        def __init__(self, **kwargs):
+            self.model = kwargs["model"]
+            self.session_id = "queued-child-session"
+            self._session_init_model_config = {}
+            self.close_count = 0
+            self.interrupt_count = 0
+            created.append(self)
+
+        def close(self):
+            self.close_count += 1
+
+        def interrupt(self, _reason):
+            self.interrupt_count += 1
+
+    parent = MagicMock()
+    parent._active_children = []
+    parent._active_children_lock = None
+    parent._client_kwargs = {}
+    parent._current_turn_id = "queued-turn"
+    parent._delegate_depth = 0
+    parent._delegate_spinner = None
+    parent._interrupt_requested = False
+    parent._print_fn = None
+    parent._session_db = None
+    parent.api_key = None
+    parent.api_mode = None
+    parent.base_url = None
+    parent.disabled_toolsets = []
+    parent.enabled_toolsets = []
+    parent.model = "m"
+    parent.provider = None
+    parent.reasoning_config = None
+    parent.session_id = "queued-public-session"
+    credentials = {
+        "model": "m",
+        "provider": None,
+        "base_url": None,
+        "api_key": None,
+        "api_mode": None,
+        "command": None,
+        "args": None,
+    }
+
+    monkeypatch.setattr("run_agent.AIAgent", Child)
+    monkeypatch.setattr("tools.delegate_tool._load_config", lambda: {})
+    monkeypatch.setattr("tools.delegate_tool._get_max_concurrent_children", lambda: 1)
+    monkeypatch.setattr(
+        "tools.delegate_tool._resolve_delegation_credentials",
+        lambda *args, **kwargs: credentials,
+    )
+    monkeypatch.setattr(
+        "tools.delegate_tool._run_single_child",
+        lambda *args, **kwargs: runner_started.set(),
+    )
+    monkeypatch.setattr(
+        "gateway.session_context.async_delivery_supported", lambda: True
+    )
+    monkeypatch.setattr(
+        "hermes_cli.observability.observe_lifecycle", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        "hermes_cli.plugins.invoke_hook",
+        lambda name, **kwargs: lifecycle.append((name, kwargs)) or [],
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as caller:
+        call = caller.submit(
+            AIAgent._dispatch_delegate_task,
+            parent,
+            {"goal": "cancel while queued"},
+        )
+        try:
+            result = json.loads(call.result(timeout=2))
+
+            assert result["status"] == "dispatched"
+            assert len(created) == 1
+            child = created[0]
+            assert parent._active_children == []
+            assert [name for name, _kwargs in lifecycle] == ["subagent_start"]
+            assert (
+                ad.interrupt_for_session(
+                    parent_session_id=parent.session_id, reason="test"
+                )
+                == 1
+            )
+            assert not runner_started.is_set()
+            assert child.interrupt_count == 1
+            assert child.close_count == 1
+            assert [name for name, _kwargs in lifecycle] == [
+                "subagent_start",
+                "subagent_stop",
+            ]
+            assert lifecycle[0][1]["child_session_id"] == child.session_id
+            assert lifecycle[1][1]["child_session_id"] == child.session_id
+            assert lifecycle[1][1]["child_status"] == "interrupted"
+            assert ad.interrupt_for_session(parent_session_id=parent.session_id) == 0
+            assert child.close_count == 1
+        finally:
+            release_occupied.set()
+
+    completed = {
+        process_registry.completion_queue.get(timeout=5)["delegation_id"]
+        for _ in range(2)
+    }
+    assert completed == {occupier["delegation_id"], result["delegation_id"]}
+    assert not runner_started.is_set()
+    assert child.close_count == 1
+    assert [name for name, _kwargs in lifecycle] == [
+        "subagent_start",
+        "subagent_stop",
+    ]
+
+
 @pytest.mark.parametrize("cancel_scope", ["stop", "session"])
 def test_cancel_queued_delegation_completes_once_without_starting_runner(
     monkeypatch, cancel_scope,

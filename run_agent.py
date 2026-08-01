@@ -1793,6 +1793,9 @@ class AIAgent:
         never mutating the live message list used by the API call (#48677 is
         thus closed for every persist caller, not just this one).
         """
+        if getattr(self, "_defer_heartbeat_persistence", False):
+            return
+
         # Scaffolding removal mutates the live list (desired — ephemeral
         # retry/failure sentinels must not survive into the real transcript).
         # Close and turn-start persistence can run on separate CLI threads; the
@@ -7100,6 +7103,12 @@ class AIAgent:
         task_started = False
         task_finished = False
         relay_outcome = "failed"
+        heartbeat_turn = turn_origin == "heartbeat_warm" and allow_silent_noop is True
+        previous_persistence_defer = getattr(
+            self, "_defer_heartbeat_persistence", False
+        )
+        if heartbeat_turn:
+            self._defer_heartbeat_persistence = True
         try:
             relay_lease = relay_runtime.SESSION_COORDINATOR.acquire_conversation(
                 profile_key=relay_runtime.current_profile_key(),
@@ -7154,6 +7163,38 @@ class AIAgent:
                     turn_origin=turn_origin,
                     allow_silent_noop=allow_silent_noop,
                 )
+            if heartbeat_turn and isinstance(result, dict):
+                messages = result.get("messages")
+                history = list(conversation_history or [])
+                heartbeat_user_idx = -1
+                if isinstance(messages, list):
+                    heartbeat_user_idx = next(
+                        (
+                            index
+                            for index in range(len(messages) - 1, -1, -1)
+                            if isinstance(messages[index], dict)
+                            and messages[index].get("role") == "user"
+                            and messages[index].get("content") == user_message
+                        ),
+                        -1,
+                    )
+                new_messages = (
+                    messages[heartbeat_user_idx + 1:]
+                    if heartbeat_user_idx >= 0
+                    else []
+                )
+                has_assistant_evidence = any(
+                    isinstance(message, dict)
+                    and message.get("role") in {"assistant", "tool"}
+                    for message in new_messages
+                )
+                if result.get("silent_noop") is True or not has_assistant_evidence:
+                    result["messages"] = history
+                    self._session_messages = history
+                    result["final_response"] = ""
+                else:
+                    self._defer_heartbeat_persistence = previous_persistence_defer
+                    self._persist_session(messages, conversation_history)
             terminal = result if isinstance(result, dict) else {}
             if terminal.get("interrupted") is True:
                 relay_outcome = "cancelled"
@@ -7204,6 +7245,7 @@ class AIAgent:
                         reset_accounting_context(acct_token)
                     if token is not None:
                         reset_conversation_context(token)
+                    self._defer_heartbeat_persistence = previous_persistence_defer
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """
@@ -7227,10 +7269,19 @@ class AIAgent:
         messages: List[Dict[str, Any]],
         effective_task_id: str,
         should_review_memory: bool = False,
+        turn_origin: str = "user",
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.codex_runtime.run_codex_app_server_turn``."""
         from agent.codex_runtime import run_codex_app_server_turn
-        return run_codex_app_server_turn(self, user_message=user_message, original_user_message=original_user_message, messages=messages, effective_task_id=effective_task_id, should_review_memory=should_review_memory)
+        return run_codex_app_server_turn(
+            self,
+            user_message=user_message,
+            original_user_message=original_user_message,
+            messages=messages,
+            effective_task_id=effective_task_id,
+            should_review_memory=should_review_memory,
+            turn_origin=turn_origin,
+        )
 
 def main(
     query: str = None,

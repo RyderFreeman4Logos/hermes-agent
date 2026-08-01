@@ -87,3 +87,83 @@ def test_blank_and_prose_mentions_are_not_silence():
     assert not is_intentional_silence_response("The reply was [SILENT], intentionally.")
 
 
+@pytest.mark.asyncio
+async def test_heartbeat_silent_noop_skips_warning_and_transcript_fallback(
+    monkeypatch, tmp_path
+):
+    runner = _runner(monkeypatch, tmp_path)
+    history = [
+        {"role": "user", "content": "real question"},
+        {"role": "assistant", "content": "real answer"},
+    ]
+    runner.session_store.load_transcript.return_value = history
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "",
+            "messages": list(history),
+            "history_offset": len(history),
+            "api_calls": 1,
+            "completed": True,
+            "silent_noop": True,
+            "last_prompt_tokens": 0,
+        }
+    )
+    event = MessageEvent(
+        text="[HEARTBEAT] target remains ALIVE",
+        source=_source(),
+        internal=True,
+        metadata={
+            "turn_origin": "heartbeat_warm",
+            "allow_silent_noop": True,
+        },
+    )
+
+    response = await runner._handle_message_with_agent(
+        event,
+        _source(),
+        "agent:main:telegram:group:-1001:12345",
+        1,
+    )
+
+    assert response == ""
+    runner.session_store.append_to_transcript.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_early_error_skips_transcript_fallback(monkeypatch, tmp_path):
+    runner = _runner(monkeypatch, tmp_path)
+    history = [
+        {"role": "user", "content": "real question"},
+        {"role": "assistant", "content": "real answer"},
+    ]
+    runner.session_store.load_transcript.return_value = history
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "provider unavailable",
+            "messages": list(history),
+            "history_offset": len(history),
+            "api_calls": 1,
+            "completed": False,
+            "failed": True,
+            "error": "provider unavailable",
+            "last_prompt_tokens": 0,
+        }
+    )
+    event = MessageEvent(
+        text="[HEARTBEAT] target remains ALIVE",
+        source=_source(),
+        internal=True,
+        metadata={
+            "turn_origin": "heartbeat_warm",
+            "allow_silent_noop": True,
+        },
+    )
+
+    await runner._handle_message_with_agent(
+        event,
+        _source(),
+        "agent:main:telegram:group:-1001:12345",
+        1,
+    )
+
+    runner.session_store.append_to_transcript.assert_not_called()

@@ -5233,14 +5233,23 @@ class TurnRunner:
         _effective_history_offset = (
             0 if (_session_was_split or _compacted_in_place) else len(agent_history)
         )
+        _heartbeat_silent_noop = bool(
+            ctx.turn_origin == "heartbeat_warm"
+            and result.get("silent_noop") is True
+        )
 
         if not final_response:
-            final_response = _normalize_empty_agent_response(
-                result, final_response or "", history_len=len(agent_history),
-            )
-            final_response = _sanitize_gateway_final_response(ctx.source.platform, final_response)
-            if not final_response:
-                final_response = f"⚠️ {result['error']}" if result.get("error") else ""
+            if not _heartbeat_silent_noop:
+                final_response = _normalize_empty_agent_response(
+                    result, final_response or "", history_len=len(agent_history),
+                )
+                final_response = _sanitize_gateway_final_response(
+                    ctx.source.platform, final_response
+                )
+                if not final_response:
+                    final_response = (
+                        f"⚠️ {result['error']}" if result.get("error") else ""
+                    )
             return {
                 "final_response": final_response,
                 "messages": result.get("messages", []),
@@ -5267,6 +5276,7 @@ class TurnRunner:
                 "last_prompt_tokens": _last_prompt_toks,
                 "input_tokens": _input_toks,
                 "output_tokens": _output_toks,
+                "silent_noop": _heartbeat_silent_noop,
                 "model": _resolved_model,
                 "context_length": _context_length,
             }
@@ -5401,6 +5411,7 @@ class TurnRunner:
             "session_id": effective_session_id,
             "response_previewed": result.get("response_previewed", False),
             "response_transformed": result.get("response_transformed", False),
+            "silent_noop": _heartbeat_silent_noop,
             # Pass through the agent_persisted flag so the persistence block
             # above can correctly determine whether the codex app-server path
             # self-persisted (it didn't — see codex_runtime.py).  Default
@@ -16747,13 +16758,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # empty-response handling (and the suppression below) applies.
             if _is_gateway_hidden_reasoning_incomplete_turn(agent_result):
                 response = ""
+            _heartbeat_silent_noop = bool(
+                turn_origin == "heartbeat_warm"
+                and agent_result.get("silent_noop") is True
+            )
             try:
                 from gateway.response_filters import is_intentional_silence_agent_result
-                _intentional_silence = is_intentional_silence_agent_result(
-                    agent_result, response,
+                _intentional_silence = (
+                    _heartbeat_silent_noop
+                    or is_intentional_silence_agent_result(agent_result, response)
                 )
             except Exception:
-                _intentional_silence = False
+                _intentional_silence = _heartbeat_silent_noop
 
             # Convert the agent's internal "(empty)" sentinel into a
             # user-friendly message.  "(empty)" means the model failed to
@@ -16767,6 +16783,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "rephrase your question."
                 )
             agent_messages = agent_result.get("messages", [])
+            _heartbeat_user_idx = -1
+            if turn_origin == "heartbeat_warm" and isinstance(agent_messages, list):
+                _heartbeat_user_idx = next(
+                    (
+                        index
+                        for index in range(len(agent_messages) - 1, -1, -1)
+                        if isinstance(agent_messages[index], dict)
+                        and agent_messages[index].get("role") == "user"
+                        and agent_messages[index].get("content")
+                        in (message_text, persist_user_message)
+                    ),
+                    -1,
+                )
+            _heartbeat_has_evidence = _heartbeat_user_idx >= 0 and any(
+                isinstance(message, dict)
+                and message.get("role") in {"assistant", "tool"}
+                for message in agent_messages[_heartbeat_user_idx + 1:]
+            )
+            _heartbeat_skip_transcript = bool(
+                turn_origin == "heartbeat_warm" and not _heartbeat_has_evidence
+            )
             _response_time = time.time() - _msg_start_time
             _api_calls = agent_result.get("api_calls", 0)
             _resp_len = len(response)
@@ -17086,7 +17123,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # If this is a fresh session (no history), write the full tool
             # definitions as the first entry so the transcript is self-describing
             # -- the same list of dicts sent as tools=[...] in the API request.
-            if is_context_overflow_failure:
+            if is_context_overflow_failure or _heartbeat_skip_transcript:
                 pass  # Skip all transcript writes — don't grow a broken session
             elif not history:
                 tool_defs = agent_result.get("tools", [])
@@ -17117,7 +17154,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Use the filtered history length (history_offset) that was actually
             # passed to the agent, not len(history) which includes session_meta
             # entries that were stripped before the agent saw them.
-            if is_context_overflow_failure:
+            if is_context_overflow_failure or _heartbeat_skip_transcript:
                 pass  # handled above — skip all transcript writes
             elif (
                 agent_failed_early or hidden_reasoning_incomplete

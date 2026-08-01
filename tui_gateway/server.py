@@ -9337,7 +9337,7 @@ def _run_prompt_submit(
             # ("rude!") instead of being oblivious to its own interruption.
             from tools.tts_streaming import SPEECH_INTERRUPTED_NOTE, take_speech_interrupted
 
-            if take_speech_interrupted():
+            if not heartbeat_turn and take_speech_interrupted():
                 if isinstance(run_message, str):
                     run_message = f"{SPEECH_INTERRUPTED_NOTE}\n\n{run_message}"
                 elif isinstance(run_message, list):
@@ -9348,7 +9348,9 @@ def _run_prompt_submit(
             # persist_user_message below stays the clean prompt, so no
             # scaffolding reaches the transcript. Cache-safe: annotating the
             # NEW turn never rewrites an already-sent message.
-            if reaction_notes := _pending_reaction_notes(session):
+            if not heartbeat_turn and (
+                reaction_notes := _pending_reaction_notes(session)
+            ):
                 if isinstance(run_message, str):
                     run_message = f"{reaction_notes}\n\n{run_message}"
                 elif isinstance(run_message, list):
@@ -9439,7 +9441,7 @@ def _run_prompt_submit(
                             if display_metadata:
                                 message["display_metadata"] = display_metadata
                             break
-            if "moa_one_shot_restore" in session:
+            if not heartbeat_turn and "moa_one_shot_restore" in session:
                 _restore = session.pop("moa_one_shot_restore", None)
                 # Restore the model the user was on before the /moa one-shot.
                 # The one-shot did a real in-place agent.switch_model() to MoA
@@ -9582,7 +9584,7 @@ def _run_prompt_submit(
             if rendered:
                 payload["rendered"] = rendered
             with session["history_lock"]:
-                if status == "error":
+                if status == "error" and not heartbeat_turn:
                     # Returned-error result (provider 4xx, budget, etc.): retain
                     # the failed turn for resume replay instead of clearing it.
                     # If this terminal frame is lost to a disconnect, resume's
@@ -9601,7 +9603,9 @@ def _run_prompt_submit(
                 payload["recoverable"] = True
             if not heartbeat_turn:
                 _retire_turn_marker(session, marker_key)
-            if not heartbeat_silent_noop:
+            if not heartbeat_silent_noop and (
+                not heartbeat_turn or status != "error"
+            ):
                 _emit("message.complete", sid, payload)
 
             # ── /goal continuation (Ralph-style loop) ─────────────────
@@ -9767,8 +9771,9 @@ def _run_prompt_submit(
                 # Close the turn with the same terminal error frame shape as
                 # the returned-error path (uniform client handling), retaining
                 # the failed turn for resume replay.
-                _emit_terminal_turn_error(sid, session, e)
-                turn_error_retained = True
+                if not heartbeat_turn:
+                    _emit_terminal_turn_error(sid, session, e)
+                    turn_error_retained = True
             except Exception as emit_exc:
                 print(
                     f"[gateway-turn] terminal error emit failed: "

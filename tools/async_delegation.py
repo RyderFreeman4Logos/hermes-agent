@@ -573,7 +573,7 @@ def _admit_worker(delegation_id: str) -> bool:
 
 
 def _try_register_queued(record: Dict[str, Any]) -> bool:
-    """Atomically reserve one process-wide backlog slot for ``record``."""
+    """Atomically reserve and durably register one backlog slot for ``record``."""
     delegation_id = record["delegation_id"]
     with _records_lock:
         running = sum(
@@ -584,6 +584,7 @@ def _try_register_queued(record: Dict[str, Any]) -> bool:
         available_runner_slots = max(0, _admission_cap - running)
         if len(_pending_admission_ids) >= _admission_cap + available_runner_slots:
             return False
+        _persist_dispatch(record)
         _pending_admission_ids.add(delegation_id)
         _records[delegation_id] = record
         return True
@@ -834,8 +835,6 @@ def dispatch_async_delegation(
             "error": _BACKLOG_FULL_ERROR,
         }
 
-    _persist_dispatch(record)
-
     def _worker() -> None:
         if not _admit_worker(delegation_id):
             return
@@ -1079,8 +1078,6 @@ def dispatch_async_delegation_batch(
             "status": "rejected",
             "error": _BACKLOG_FULL_ERROR,
         }
-
-    _persist_dispatch(record)
 
     def _worker() -> None:
         if not _admit_worker(delegation_id):

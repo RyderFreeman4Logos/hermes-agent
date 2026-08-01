@@ -136,6 +136,28 @@ def test_registration_rejects_when_process_backlog_is_full(dispatch_one):
         process_registry.completion_queue.get(timeout=0.2)
 
 
+@pytest.mark.parametrize(
+    "dispatch_one",
+    [
+        pytest.param(_dispatch_single, id="single"),
+        pytest.param(_dispatch_batch, id="batch"),
+    ],
+)
+def test_persistence_failure_releases_backlog_reservation(monkeypatch, dispatch_one):
+    runner_started = threading.Event()
+    monkeypatch.setattr(
+        ad, "_persist_dispatch", MagicMock(side_effect=RuntimeError("persist failed"))
+    )
+
+    with pytest.raises(RuntimeError, match="persist failed"):
+        dispatch_one(lambda: runner_started.set(), 1)
+
+    assert ad.active_count() == 0
+    assert ad._pending_admission_ids == set()
+    assert not runner_started.is_set()
+    assert _durable_count() == 0
+
+
 def test_backlog_admission_is_atomic_across_sessions():
     release = threading.Event()
     running_started = threading.Event()
@@ -414,7 +436,7 @@ def test_public_handler_queues_when_worker_capacity_is_saturated(
     assert len(event["results"]) == expected_count
 
 
-def test_public_handler_queued_cancellation_closes_child_and_balances_lifecycle(
+def test_queued_cancellation_waits_for_durable_registration_and_completes_once(
     monkeypatch,
 ):
     occupied = threading.Event()
@@ -428,9 +450,35 @@ def test_public_handler_queued_cancellation_closes_child_and_balances_lifecycle(
     occupier = _dispatch_batch(occupying_runner, 1, session_key="occupier")
     assert occupied.wait(timeout=5)
 
+    persist_entered = threading.Event()
+    release_persist = threading.Event()
+    persisted_under_records_lock = []
+    original_persist_dispatch = ad._persist_dispatch
+
+    def blocked_persist_dispatch(record):
+        records_lock_was_free = ad._records_lock.acquire(blocking=False)
+        if records_lock_was_free:
+            ad._records_lock.release()
+        persisted_under_records_lock.append(not records_lock_was_free)
+        persist_entered.set()
+        assert release_persist.wait(timeout=60)
+        original_persist_dispatch(record)
+
     created = []
     runner_started = threading.Event()
     lifecycle = []
+    not_started = []
+    original_dispatch_batch = ad.dispatch_async_delegation_batch
+
+    def tracked_dispatch_batch(**kwargs):
+        callback = kwargs["on_not_started"]
+
+        def tracked_not_started(status):
+            not_started.append(status)
+            callback(status)
+
+        kwargs["on_not_started"] = tracked_not_started
+        return original_dispatch_batch(**kwargs)
 
     class Child:
         def __init__(self, **kwargs):
@@ -497,30 +545,44 @@ def test_public_handler_queued_cancellation_closes_child_and_balances_lifecycle(
         "hermes_cli.plugins.invoke_hook",
         lambda name, **kwargs: lifecycle.append((name, kwargs)) or [],
     )
+    monkeypatch.setattr(ad, "dispatch_async_delegation_batch", tracked_dispatch_batch)
+    monkeypatch.setattr(ad, "_persist_dispatch", blocked_persist_dispatch)
 
-    with ThreadPoolExecutor(max_workers=1) as caller:
-        call = caller.submit(
-            AIAgent._dispatch_delegate_task,
-            parent,
-            {"goal": "cancel while queued"},
-        )
-        try:
-            result = json.loads(call.result(timeout=2))
+    try:
+        with ThreadPoolExecutor(max_workers=2) as caller:
+            call = caller.submit(
+                AIAgent._dispatch_delegate_task,
+                parent,
+                {"goal": "cancel while queued"},
+            )
+            assert persist_entered.wait(timeout=5)
 
+            cancel_started = threading.Event()
+
+            def cancel_queued():
+                cancel_started.set()
+                return ad.interrupt_for_session(
+                    parent_session_id=parent.session_id, reason="test"
+                )
+
+            cancel = caller.submit(cancel_queued)
+            assert cancel_started.wait(timeout=5)
+            # On the broken ordering persistence runs after publication, so
+            # force cancellation to finish before releasing the INSERT.
+            if not persisted_under_records_lock[0]:
+                assert cancel.result(timeout=5) == 1
+            release_persist.set()
+
+            result = json.loads(call.result(timeout=5))
+            assert cancel.result(timeout=5) == 1
             assert result["status"] == "dispatched"
             assert len(created) == 1
             child = created[0]
             assert parent._active_children == []
-            assert [name for name, _kwargs in lifecycle] == ["subagent_start"]
-            assert (
-                ad.interrupt_for_session(
-                    parent_session_id=parent.session_id, reason="test"
-                )
-                == 1
-            )
             assert not runner_started.is_set()
             assert child.interrupt_count == 1
             assert child.close_count == 1
+            assert not_started == ["interrupted"]
             assert [name for name, _kwargs in lifecycle] == [
                 "subagent_start",
                 "subagent_stop",
@@ -530,20 +592,53 @@ def test_public_handler_queued_cancellation_closes_child_and_balances_lifecycle(
             assert lifecycle[1][1]["child_status"] == "interrupted"
             assert ad.interrupt_for_session(parent_session_id=parent.session_id) == 0
             assert child.close_count == 1
-        finally:
-            release_occupied.set()
 
-    completed = {
-        process_registry.completion_queue.get(timeout=5)["delegation_id"]
-        for _ in range(2)
-    }
-    assert completed == {occupier["delegation_id"], result["delegation_id"]}
-    assert not runner_started.is_set()
-    assert child.close_count == 1
-    assert [name for name, _kwargs in lifecycle] == [
-        "subagent_start",
-        "subagent_stop",
-    ]
+        event = process_registry.completion_queue.get(timeout=5)
+        assert event["delegation_id"] == result["delegation_id"]
+        assert event["status"] == "interrupted"
+        with pytest.raises(queue.Empty):
+            process_registry.completion_queue.get(timeout=0.2)
+
+        with ad._transaction() as conn:
+            durable_rows = conn.execute(
+                """SELECT state, delivery_state, completed_at, event_json
+                   FROM async_delegations WHERE delegation_id=?""",
+                (result["delegation_id"],),
+            ).fetchall()
+        assert len(durable_rows) == 1
+        state, delivery_state, completed_at, event_json = durable_rows[0]
+        assert state == "interrupted"
+        assert delivery_state == "pending"
+        assert completed_at is not None
+        assert json.loads(event_json)["status"] == "interrupted"
+
+        release_occupied.set()
+        occupied_event = process_registry.completion_queue.get(timeout=5)
+        assert occupied_event["delegation_id"] == occupier["delegation_id"]
+        assert ad.mark_completion_delivered(result["delegation_id"])
+        assert ad.mark_completion_delivered(occupier["delegation_id"])
+
+        monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: False)
+        assert ad.recover_abandoned_delegations() == 0
+        restored = queue.Queue()
+        assert ad.restore_undelivered_completions(restored) == 0
+        assert restored.empty()
+        with pytest.raises(queue.Empty):
+            process_registry.completion_queue.get(timeout=0.2)
+
+        durable = ad.get_durable_delegation(result["delegation_id"])
+        assert durable is not None
+        assert durable["state"] == "interrupted"
+        assert durable["delivery_state"] == "delivered"
+        assert not runner_started.is_set()
+        assert child.close_count == 1
+        assert [name for name, _kwargs in lifecycle] == [
+            "subagent_start",
+            "subagent_stop",
+        ]
+    finally:
+        release_persist.set()
+        release_occupied.set()
 
 
 @pytest.mark.parametrize("cancel_scope", ["stop", "session"])

@@ -205,6 +205,58 @@ def test_acknowledged_heartbeat_interrupt_is_cleared_before_requeue(api_mode):
     assert cli.conversation_history == []
 
 
+def test_unhealthy_heartbeat_skips_user_voice_and_title_state():
+    cli = _make_cli()
+
+    class HeartbeatAgent(_StubAgent):
+        def run_conversation(self, **kwargs):
+            assert kwargs["turn_origin"] == "heartbeat_warm"
+            return {
+                "final_response": "",
+                "messages": [],
+                "api_calls": 1,
+                "completed": False,
+                "failed": True,
+                "error": "target is stuck",
+                "response_previewed": True,
+            }
+
+    cli.agent = HeartbeatAgent(cli.session_id, turn_seconds=0)
+    cli._interrupt_queue = queue.Queue()
+    cli._pending_input = queue.Queue()
+    cli._voice_mode = True
+    cli._voice_continuous = True
+    cli._voice_tts = True
+    cli._voice_full_duplex_listener = MagicMock()
+    cli._voice_speak_response_async = MagicMock()
+
+    with patch.object(cli, "_ensure_runtime_credentials", return_value=True), patch.object(
+        cli,
+        "_resolve_turn_agent_config",
+        return_value={
+            "signature": cli._active_agent_route_signature,
+            "model": None,
+            "runtime": None,
+            "request_overrides": None,
+        },
+    ), patch.object(cli, "_init_agent", return_value=True), patch(
+        "tools.tts_tool.check_tts_requirements"
+    ) as tts_requirements, patch(
+        "tools.voice_mode.start_thinking_sound"
+    ) as thinking_sound, patch(
+        "agent.title_generator.maybe_auto_title"
+    ) as auto_title:
+        response = cli.chat("[HEARTBEAT] inspect target", heartbeat_warm=True)
+
+    assert response == "Error: target is stuck"
+    assert cli._voice_continuous is True
+    cli._voice_full_duplex_listener.assert_not_called()
+    cli._voice_speak_response_async.assert_not_called()
+    tts_requirements.assert_not_called()
+    thinking_sound.assert_not_called()
+    auto_title.assert_not_called()
+
+
 def test_completion_delivery_chat_stages_ephemeral_user_message():
     cli = _make_cli()
 

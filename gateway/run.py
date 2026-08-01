@@ -5320,7 +5320,11 @@ class TurnRunner:
                 final_response = final_response + "\n" + "\n".join(unique_tags)
 
         # Auto-generate session title after first exchange (non-blocking)
-        if final_response and self._runner._session_db:
+        if (
+            ctx.turn_origin != "heartbeat_warm"
+            and final_response
+            and self._runner._session_db
+        ):
             try:
                 from agent.title_generator import maybe_auto_title
                 all_msgs = ctx.result_holder[0].get("messages", []) if ctx.result_holder[0] else []

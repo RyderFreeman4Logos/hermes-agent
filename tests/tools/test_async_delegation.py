@@ -124,6 +124,80 @@ def test_delegation_arms_after_submit_and_cancels_on_completion(monkeypatch):
     cancel.assert_called_once_with(result["delegation_id"])
 
 
+@pytest.mark.parametrize("batch", [False, True])
+def test_fast_completion_cannot_cancel_before_heartbeat_arm(monkeypatch, batch):
+    from tools.runtime_heartbeat import runtime_heartbeat
+
+    arm_entered = threading.Event()
+    release_arm = threading.Event()
+    worker_finished = threading.Event()
+    timers = []
+    original_arm = runtime_heartbeat.arm
+
+    class FakeTimer:
+        def __init__(self, _interval, _callback):
+            self.daemon = False
+            self.cancelled = False
+            timers.append(self)
+
+        def start(self):
+            pass
+
+        def cancel(self):
+            self.cancelled = True
+
+    def blocked_arm(*args, **kwargs):
+        arm_entered.set()
+        assert release_arm.wait(timeout=5)
+        return original_arm(*args, **kwargs)
+
+    def runner():
+        worker_finished.set()
+        if batch:
+            return {"results": [{"status": "completed"}]}
+        return {"status": "completed"}
+
+    monkeypatch.setattr(
+        "tools.runtime_heartbeat.preflight_current_heartbeat", lambda: 1700
+    )
+    monkeypatch.setattr(runtime_heartbeat, "_timer_factory", FakeTimer)
+    monkeypatch.setattr(runtime_heartbeat, "arm", blocked_arm)
+
+    result_holder = []
+
+    def dispatch():
+        kwargs = {
+            "session_key": "owner",
+            "runner": runner,
+            "max_async_children": 3,
+        }
+        if batch:
+            result_holder.append(ad.dispatch_async_delegation_batch(
+                goals=["g"], context=None, toolsets=None, role="leaf", model="m",
+                **kwargs,
+            ))
+        else:
+            result_holder.append(ad.dispatch_async_delegation(
+                goal="g", context=None, toolsets=None, role="leaf", model="m",
+                **kwargs,
+            ))
+
+    dispatch_thread = threading.Thread(target=dispatch)
+    dispatch_thread.start()
+    assert arm_entered.wait(timeout=5)
+    assert worker_finished.wait(timeout=5)
+    release_arm.set()
+    dispatch_thread.join(timeout=5)
+
+    assert not dispatch_thread.is_alive()
+    result = result_holder[0]
+    assert result["status"] == "dispatched"
+    assert _drain_for(result["delegation_id"]) is not None
+    assert result["delegation_id"] not in runtime_heartbeat._targets
+    assert len(timers) == 1
+    assert timers[0].cancelled is True
+
+
 def test_dispatch_returns_immediately_without_blocking():
     gate = threading.Event()
 

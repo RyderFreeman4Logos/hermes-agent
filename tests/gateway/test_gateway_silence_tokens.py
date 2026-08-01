@@ -1,7 +1,7 @@
 """Gateway intentional-silence token behavior."""
 
 from datetime import datetime
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -193,3 +193,45 @@ async def test_heartbeat_early_error_skips_transcript_fallback(monkeypatch, tmp_
     )
 
     runner.session_store.append_to_transcript.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_unhealthy_heartbeat_is_visible_without_starting_auto_title(
+    monkeypatch, tmp_path
+):
+    runner = _runner(monkeypatch, tmp_path)
+    history = [
+        {"role": "user", "content": "real question"},
+        {"role": "assistant", "content": "real answer"},
+    ]
+    runner.session_store.load_transcript.return_value = history
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "Target is STUCK: no CPU or output progress.",
+            "messages": list(history),
+            "history_offset": len(history),
+            "api_calls": 1,
+            "completed": True,
+            "last_prompt_tokens": 0,
+        }
+    )
+    event = MessageEvent(
+        text="[HEARTBEAT] target remains STUCK",
+        source=_source(),
+        internal=True,
+        metadata={
+            "turn_origin": "heartbeat_warm",
+            "allow_silent_noop": False,
+        },
+    )
+
+    with patch("agent.title_generator.maybe_auto_title") as auto_title:
+        response = await runner._handle_message_with_agent(
+            event,
+            _source(),
+            "agent:main:telegram:group:-1001:12345",
+            1,
+        )
+
+    assert response == "Target is STUCK: no CPU or output progress."
+    auto_title.assert_not_called()

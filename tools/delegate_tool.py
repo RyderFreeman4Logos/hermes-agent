@@ -1371,6 +1371,11 @@ def _build_child_agent(
     # Resolve effective credentials: config override > parent inherit
     effective_model = model or parent_agent.model
     effective_provider = override_provider or getattr(parent_agent, "provider", None)
+    effective_requested_provider = (
+        override_provider
+        or getattr(parent_agent, "requested_provider", None)
+        or effective_provider
+    )
     effective_base_url = override_base_url or parent_agent.base_url
     if not override_base_url:
         effective_base_url = _inherit_parent_base_url(parent_agent, effective_base_url)
@@ -1469,6 +1474,7 @@ def _build_child_agent(
         # If explicitly forcing an ACP transport override, the provider MUST be copilot-acp
         # so run_agent.py initializes the CopilotACPClient.
         effective_provider = "copilot-acp"
+        effective_requested_provider = "copilot-acp"
         effective_api_mode = "chat_completions"
 
     # Resolve reasoning config: profile override > delegation override > parent inherit
@@ -1549,6 +1555,7 @@ def _build_child_agent(
             api_key=effective_api_key,
             model=effective_model,
             provider=effective_provider,
+            requested_provider=effective_requested_provider,
             api_mode=effective_api_mode,
             acp_command=effective_acp_command,
             acp_args=effective_acp_args,

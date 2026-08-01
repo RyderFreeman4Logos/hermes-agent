@@ -1149,7 +1149,7 @@ def run_conversation(
     )
     if _inject_internal_noop_instruction and persist_user_message is None:
         persist_user_message = user_message
-    _defer_heartbeat_warm_persistence = _inject_internal_noop_instruction
+    _defer_heartbeat_warm_persistence = turn_origin == "heartbeat_warm"
 
     # The gateway caches agents across user turns.  Compression state is
     # per-turn: carrying a prior in-place boundary forward would make a later
@@ -1276,10 +1276,15 @@ def run_conversation(
             effective_task_id=effective_task_id,
             should_review_memory=_should_review_memory,
             turn_origin=turn_origin,
+            allow_silent_noop=allow_silent_noop,
         )
 
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
-        _redirect_text = agent._drain_pending_redirect()
+        _redirect_text = (
+            None
+            if _defer_heartbeat_warm_persistence
+            else agent._drain_pending_redirect()
+        )
         if _redirect_text:
             _apply_active_turn_redirect(agent, messages, _redirect_text)
             if isinstance(original_user_message, str):
@@ -1362,7 +1367,11 @@ def run_conversation(
         # iteration, no tools yet), the steer stays pending for the next
         # tool batch — injecting into a user message would break role
         # alternation, and there's no tool output to piggyback on.
-        _pre_api_steer = agent._drain_pending_steer()
+        _pre_api_steer = (
+            None
+            if _defer_heartbeat_warm_persistence
+            else agent._drain_pending_steer()
+        )
         if _pre_api_steer:
             _injected = False
             for _si in range(len(messages) - 1, -1, -1):
@@ -2335,12 +2344,16 @@ def run_conversation(
                             if _model_request_active is not None:
                                 _model_request_active.clear()
                             _redirect_crossed_response = bool(
-                                agent._pending_redirect
+                                not _defer_heartbeat_warm_persistence
+                                and agent._pending_redirect
                             )
                     else:
                         if _model_request_active is not None:
                             _model_request_active.clear()
-                        _redirect_crossed_response = agent._has_pending_redirect()
+                        _redirect_crossed_response = bool(
+                            not _defer_heartbeat_warm_persistence
+                            and agent._has_pending_redirect()
+                        )
                 if _redirect_crossed_response:
                     # The response and redirect can cross on different threads:
                     # redirect() observed the request as active just before this
@@ -2351,7 +2364,10 @@ def run_conversation(
                         thinking_spinner = None
                     if agent.thinking_callback:
                         agent.thinking_callback("")
-                    if agent.clear_interrupt(preserve_redirect=True):
+                    if (
+                        not _defer_heartbeat_warm_persistence
+                        and agent.clear_interrupt(preserve_redirect=True)
+                    ):
                         _retry.restart_with_redirected_messages = True
                     else:
                         interrupted = True
@@ -2601,14 +2617,18 @@ def run_conversation(
                             # users hit when a redirect lands during provider
                             # backoff. Rebuild from the correction instead,
                             # mirroring the InterruptedError handler.
-                            if agent.clear_interrupt(preserve_redirect=True):
+                            if (
+                                not _defer_heartbeat_warm_persistence
+                                and agent.clear_interrupt(preserve_redirect=True)
+                            ):
                                 _retry.restart_with_redirected_messages = True
                                 break
                             agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during retry wait, aborting.", force=True)
                             _interrupt_text = f"Operation interrupted during retry ({_failure_hint}, attempt {retry_count}/{max_retries})."
                             close_interrupted_tool_sequence(messages, _interrupt_text)
                             agent._persist_session(messages, conversation_history)
-                            agent.clear_interrupt()
+                            if not _defer_heartbeat_warm_persistence:
+                                agent.clear_interrupt()
                             return {
                                 "final_response": _interrupt_text,
                                 "messages": messages,
@@ -3404,13 +3424,19 @@ def run_conversation(
                     thinking_spinner = None
                 if agent.thinking_callback:
                     agent.thinking_callback("")
-                if agent._has_pending_redirect():
+                if (
+                    not _defer_heartbeat_warm_persistence
+                    and agent._has_pending_redirect()
+                ):
                     # redirect() deliberately used the interrupt machinery to
                     # cancel only this provider request. Keep its correction
                     # queued, clear the cancellation bit, and let the outer
                     # loop rebuild a clean request tail. Never materialize
                     # incomplete signed/encrypted reasoning items.
-                    if agent.clear_interrupt(preserve_redirect=True):
+                    if (
+                        not _defer_heartbeat_warm_persistence
+                        and agent.clear_interrupt(preserve_redirect=True)
+                    ):
                         _retry.restart_with_redirected_messages = True
                         break
                 api_elapsed = time.time() - api_start_time
@@ -4165,14 +4191,18 @@ def run_conversation(
                     # Preserve a pending redirect (mid-stream correction): the
                     # user is steering, not stopping. Rebuild the turn from the
                     # correction instead of aborting with a dead-end interrupt.
-                    if agent.clear_interrupt(preserve_redirect=True):
+                    if (
+                        not _defer_heartbeat_warm_persistence
+                        and agent.clear_interrupt(preserve_redirect=True)
+                    ):
                         _retry.restart_with_redirected_messages = True
                         break
                     agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during error handling, aborting retries.", force=True)
                     _interrupt_text = f"Operation interrupted: handling API error ({error_type}: {agent._clean_error_message(str(api_error))})."
                     close_interrupted_tool_sequence(messages, _interrupt_text)
                     agent._persist_session(messages, conversation_history)
-                    agent.clear_interrupt()
+                    if not _defer_heartbeat_warm_persistence:
+                        agent.clear_interrupt()
                     return {
                         "final_response": _interrupt_text,
                         "messages": messages,
@@ -5407,14 +5437,18 @@ def run_conversation(
                         # Same preserve-redirect rule as the retry-wait above:
                         # a steering correction must survive backoff, not die
                         # as "Operation interrupted".
-                        if agent.clear_interrupt(preserve_redirect=True):
+                        if (
+                            not _defer_heartbeat_warm_persistence
+                            and agent.clear_interrupt(preserve_redirect=True)
+                        ):
                             _retry.restart_with_redirected_messages = True
                             break
                         agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during retry wait, aborting.", force=True)
                         _interrupt_text = f"Operation interrupted: retrying API call after error (retry {retry_count}/{max_retries})."
                         close_interrupted_tool_sequence(messages, _interrupt_text)
                         agent._persist_session(messages, conversation_history)
-                        agent.clear_interrupt()
+                        if not _defer_heartbeat_warm_persistence:
+                            agent.clear_interrupt()
                         return {
                             "final_response": _interrupt_text,
                             "messages": messages,

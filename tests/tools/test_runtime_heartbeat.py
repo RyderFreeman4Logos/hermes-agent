@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import queue
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -236,3 +237,155 @@ def test_caller_reset_preserves_exact_interval_and_other_owner():
     assert old_a.cancelled is True
     assert old_b.cancelled is False
     assert FakeTimer.created[-1].interval == 1700
+
+
+def test_cancel_waits_for_inflight_publication_before_returning():
+    from tools.runtime_heartbeat import RuntimeHeartbeat
+
+    class BarrierQueue:
+        def __init__(self):
+            self.entered = threading.Event()
+            self.release = threading.Event()
+            self.events = []
+
+        def put(self, event):
+            self.entered.set()
+            assert self.release.wait(timeout=2)
+            self.events.append(event)
+
+    FakeTimer.created = []
+    events = BarrierQueue()
+    manager = RuntimeHeartbeat(event_queue=events, timer_factory=FakeTimer)
+    snapshots = iter([
+        {"alive": True, "output_size": 0, "cpu_seconds": 0.0},
+        {"alive": True, "output_size": 1, "cpu_seconds": 0.0},
+    ])
+    assert manager.arm(
+        "proc", caller_id="owner", kind="process", interval=1700,
+        inspect=lambda: next(snapshots),
+    )
+
+    fire = threading.Thread(target=FakeTimer.created[0].callback)
+    fire.start()
+    assert events.entered.wait(timeout=2)
+    cancelled = []
+    cancel = threading.Thread(target=lambda: cancelled.append(manager.cancel("proc")))
+    cancel.start()
+    cancel.join(timeout=0.05)
+    assert cancel.is_alive(), "cancel returned while heartbeat publication was in flight"
+
+    events.release.set()
+    fire.join(timeout=2)
+    cancel.join(timeout=2)
+    assert not fire.is_alive() and not cancel.is_alive()
+    assert cancelled == [True]
+    published_at_cancel_return = len(events.events)
+    assert published_at_cancel_return == 1
+    assert len(events.events) == published_at_cancel_return
+    assert manager.outstanding_for_caller("owner") == []
+
+
+def test_inspection_failure_publishes_visible_unknown_without_rearming():
+    from tools.runtime_heartbeat import RuntimeHeartbeat
+
+    FakeTimer.created = []
+    events = queue.Queue()
+    calls = 0
+
+    def inspect():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return {"alive": True, "progress": True}
+        raise RuntimeError("backend inspection failed")
+
+    manager = RuntimeHeartbeat(event_queue=events, timer_factory=FakeTimer)
+    assert manager.arm(
+        "delegate", caller_id="owner", kind="delegation", interval=1700,
+        inspect=inspect,
+    )
+
+    FakeTimer.created[0].callback()
+
+    event = events.get_nowait()
+    assert event["status"] == "UNKNOWN"
+    assert "backend inspection failed" in event["evidence"]
+    assert manager.outstanding_for_caller("owner") == []
+    assert len(FakeTimer.created) == 1
+
+
+def test_sandbox_process_never_samples_same_number_host_pid(monkeypatch):
+    import psutil
+    from tools.process_registry import ProcessSession, process_registry
+    from tools.runtime_heartbeat import inspect_process
+
+    session = ProcessSession(
+        id="sandbox", command="work", pid=1234, pid_scope="sandbox"
+    )
+    monkeypatch.setattr(process_registry, "get", lambda _target_id: session)
+    monkeypatch.setattr(
+        psutil,
+        "Process",
+        lambda _pid: pytest.fail("sandbox PID was sampled through host psutil"),
+    )
+
+    snapshot = inspect_process("sandbox")
+
+    assert snapshot["alive"] is True
+    assert snapshot["cpu_seconds"] == 0.0
+
+
+def test_host_process_cpu_includes_identity_checked_descendants(monkeypatch):
+    import psutil
+    from tools.process_registry import ProcessSession, process_registry
+    from tools.runtime_heartbeat import inspect_process
+
+    session = ProcessSession(
+        id="host", command="work", pid=100, pid_scope="host",
+        host_start_time=10,
+    )
+    session.process = SimpleNamespace(pid=100)
+    session._tracked_descendants[200] = 20
+    monkeypatch.setattr(process_registry, "get", lambda _target_id: session)
+    monkeypatch.setattr(process_registry, "_remember_local_descendants", lambda _s: None)
+    monkeypatch.setattr(
+        process_registry,
+        "_safe_host_start_time",
+        lambda pid: {100: 10, 200: 20}[pid],
+    )
+    monkeypatch.setattr(
+        psutil,
+        "Process",
+        lambda pid: SimpleNamespace(
+            cpu_times=lambda: SimpleNamespace(user={100: 1.0, 200: 4.0}[pid], system=0.5)
+        ),
+    )
+
+    snapshot = inspect_process("host")
+
+    assert snapshot["cpu_seconds"] == 6.0
+
+
+def test_stalling_delegation_is_stuck_while_finalizing_is_alive(monkeypatch):
+    from tools.runtime_heartbeat import RuntimeHeartbeat, inspect_delegation
+
+    monkeypatch.setattr(
+        "tools.async_delegation.list_async_delegations",
+        lambda: [{"delegation_id": "d", "status": "stalling"}],
+    )
+    stalled = inspect_delegation("d")
+    assert stalled["alive"] is True
+    assert stalled["progress"] is False
+    target = SimpleNamespace(kind="delegation", baseline={})
+    assert RuntimeHeartbeat._assess(target, stalled)[0] == "STUCK"
+
+    monkeypatch.setattr(
+        "tools.async_delegation.list_async_delegations",
+        lambda: [{"delegation_id": "d", "status": "finalizing"}],
+    )
+    finalizing = inspect_delegation("d")
+    assert finalizing == {
+        "alive": True,
+        "progress": True,
+        "evidence": "delegation finalizing",
+    }

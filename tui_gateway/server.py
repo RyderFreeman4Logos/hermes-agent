@@ -5730,6 +5730,7 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
         "base_url": getattr(agent, "base_url", None) or None,
         "api_key": getattr(agent, "api_key", None) or None,
         "provider": getattr(agent, "provider", None) or None,
+        "requested_provider": getattr(agent, "requested_provider", None) or None,
         "api_mode": getattr(agent, "api_mode", None) or None,
         "acp_command": getattr(agent, "acp_command", None) or None,
         "acp_args": getattr(agent, "acp_args", None) or None,
@@ -6206,7 +6207,7 @@ def _make_agent(
         model=model,
         max_iterations=_cfg_max_turns(cfg, 500),
         provider=runtime.get("provider"),
-        requested_provider=requested_provider,
+        requested_provider=runtime.get("requested_provider") or requested_provider,
         base_url=runtime.get("base_url"),
         api_key=runtime.get("api_key"),
         api_mode=runtime.get("api_mode"),
@@ -7290,20 +7291,24 @@ def _inflight_snapshot(session: dict) -> dict | None:
     return snapshot
 
 
-def _emit_terminal_turn_error(sid: str, session: dict, error: Any) -> None:
+def _emit_terminal_turn_error(
+    sid: str, session: dict, error: Any, *, retain_inflight: bool = True
+) -> None:
     """Close a failed turn with a terminal ``message.complete`` frame.
 
     Emits the same ``status: "error"`` frame shape the returned-error path in
-    ``_run_prompt_submit`` already produces (so TUI/desktop handling is
-    uniform), and retains the failed turn via ``_fail_inflight_turn`` so a
-    client that missed this frame (disconnect window) can recover it from
-    ``session.resume``'s ``inflight`` payload.
+    ``_run_prompt_submit`` already produces. User turns retain the failure for
+    resume; internal heartbeat failures leave any user-owned snapshot intact.
     """
     with session["history_lock"]:
-        _fail_inflight_turn(session, error)
-        turn = session.get("inflight_turn") or {}
-        message = str(turn.get("error") or "turn failed")
-        partial = str(turn.get("assistant") or "")
+        if retain_inflight:
+            _fail_inflight_turn(session, error)
+            turn = session.get("inflight_turn") or {}
+            message = str(turn.get("error") or "turn failed")
+            partial = str(turn.get("assistant") or "")
+        else:
+            message = str(error or "turn failed")
+            partial = ""
         cols = int(session.get("cols", 80))
     text = partial or f"Error: {message}"
     agent = session.get("agent")
@@ -7322,7 +7327,8 @@ def _emit_terminal_turn_error(sid: str, session: dict, error: Any) -> None:
         rendered = ""
     if rendered:
         payload["rendered"] = rendered
-    _retire_turn_marker(session)
+    if retain_inflight:
+        _retire_turn_marker(session)
     _emit("message.complete", sid, payload)
 
 
@@ -8985,7 +8991,7 @@ def _handle_heartbeat_event(sid: str, session: dict, evt: dict) -> None:
             session,
             prompt,
             turn_origin="heartbeat_warm",
-            allow_silent_noop=True,
+            allow_silent_noop=status == "ALIVE",
         )
     except Exception:
         with session["history_lock"]:
@@ -9121,7 +9127,7 @@ def _run_prompt_submit(
         ):
             _start_inflight_turn(session, text)
     agent = session["agent"]
-    if hasattr(agent, "clear_interrupt"):
+    if not heartbeat_turn and hasattr(agent, "clear_interrupt"):
         try:
             agent.clear_interrupt()
         except Exception:
@@ -9187,7 +9193,7 @@ def _run_prompt_submit(
             # once-override back to the config model before the turn runs
             # (#29923 review defect). Any config.yaml change is adopted on
             # the NEXT turn, after the finally-restore below.
-            if not one_turn_restore:
+            if not heartbeat_turn and not one_turn_restore:
                 # A model picked mid-turn was queued (not applied in-place) —
                 # apply it now, on the turn thread before the first model call,
                 # so this turn runs on the model the user chose. Runs before the
@@ -9293,13 +9299,18 @@ def _run_prompt_submit(
             # begin() first — it cuts any still-speaking previous turn, and
             # that cut IS this turn's barge-in, so it must latch before we
             # consume the latch below.
-            tts_queue = _tts_stream_begin()
+            if not heartbeat_turn:
+                tts_queue = _tts_stream_begin()
 
             # Full-duplex agent-turn listener: armed at utterance-submit so
             # the user can interject DURING generation, not just during
             # playback. _tts_stream_begin arms it too when a pipeline
             # starts; this covers voice mode without working TTS.
-            if _voice_mode_enabled() and _voice_cfg_dict().get("barge_in", True):
+            if (
+                not heartbeat_turn
+                and _voice_mode_enabled()
+                and _voice_cfg_dict().get("barge_in", True)
+            ):
                 _arm_full_duplex_listener()
 
             # Ambient "thinking" sound (voice mode only): calm bubble blips
@@ -9309,7 +9320,7 @@ def _run_prompt_submit(
             # stopped in the finally the instant the turn ends.
             # voice.thinking_sound config-gates it; macOS TCC handled inside.
             thinking_started = False
-            if _voice_mode_enabled():
+            if not heartbeat_turn and _voice_mode_enabled():
                 try:
                     from tools.voice_mode import (
                         is_audio_output_active,
@@ -9371,7 +9382,7 @@ def _run_prompt_submit(
             # nudge) so the desktop can seal it as its own segment instead of
             # losing it when message.complete replaces the streaming buffer.
             # Gated on display.interim_assistant_messages (default true).
-            if _load_interim_assistant_messages():
+            if not heartbeat_turn and _load_interim_assistant_messages():
                 def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
                     _emit("message.interim", sid, {
                         "text": text,
@@ -9379,7 +9390,7 @@ def _run_prompt_submit(
                     })
 
                 agent.interim_assistant_callback = _interim_assistant_cb
-            else:
+            elif not heartbeat_turn:
                 agent.interim_assistant_callback = None
 
             run_kwargs = {
@@ -9603,9 +9614,7 @@ def _run_prompt_submit(
                 payload["recoverable"] = True
             if not heartbeat_turn:
                 _retire_turn_marker(session, marker_key)
-            if not heartbeat_silent_noop and (
-                not heartbeat_turn or status != "error"
-            ):
+            if not heartbeat_silent_noop:
                 _emit("message.complete", sid, payload)
 
             # ── /goal continuation (Ralph-style loop) ─────────────────
@@ -9616,7 +9625,12 @@ def _run_prompt_submit(
             # ("✓ Goal achieved" / "⏸ budget exhausted") is surfaced as
             # a system line so the user sees progress regardless of
             # outcome. Mirrors gateway/run._post_turn_goal_continuation.
-            if status == "complete" and isinstance(raw, str) and raw.strip():
+            if (
+                not heartbeat_turn
+                and status == "complete"
+                and isinstance(raw, str)
+                and raw.strip()
+            ):
                 try:
                     from hermes_cli.goals import GoalManager
 
@@ -9663,7 +9677,7 @@ def _run_prompt_submit(
             # Apply pending_title now that the DB row exists — in the
             # session-owned profile store (not the launch profile).
             _pending = session.get("pending_title")
-            if _pending and status == "complete":
+            if not heartbeat_turn and _pending and status == "complete":
                 _session_key = session.get("session_key") or sid
                 try:
                     with _session_db(session) as _pdb:
@@ -9682,7 +9696,8 @@ def _run_prompt_submit(
                     pass
 
             if (
-                status == "complete"
+                not heartbeat_turn
+                and status == "complete"
                 and isinstance(raw, str)
                 and raw.strip()
                 and isinstance(text, str)
@@ -9733,7 +9748,8 @@ def _run_prompt_submit(
             # final text whole (cli.py:_voice_speak_response parity). The
             # streaming path already spoke everything via tts_queue.
             if (
-                status == "complete"
+                not heartbeat_turn
+                and status == "complete"
                 and tts_queue is None
                 and isinstance(raw, str)
                 and raw.strip()
@@ -9771,8 +9787,10 @@ def _run_prompt_submit(
                 # Close the turn with the same terminal error frame shape as
                 # the returned-error path (uniform client handling), retaining
                 # the failed turn for resume replay.
+                _emit_terminal_turn_error(
+                    sid, session, e, retain_inflight=not heartbeat_turn
+                )
                 if not heartbeat_turn:
-                    _emit_terminal_turn_error(sid, session, e)
                     turn_error_retained = True
             except Exception as emit_exc:
                 print(
@@ -9809,12 +9827,13 @@ def _run_prompt_submit(
                 pass
             # Resolve config while the resumed profile's HERMES_HOME override
             # remains active. Do not clear or replace prompt/history objects.
-            try:
-                from hermes_cli.mem_trim import trim_memory
+            if not heartbeat_turn:
+                try:
+                    from hermes_cli.mem_trim import trim_memory
 
-                trim_memory(reason="tui turn completion")
-            except Exception:
-                logger.debug("post-turn memory trim failed", exc_info=True)
+                    trim_memory(reason="tui turn completion")
+                except Exception:
+                    logger.debug("post-turn memory trim failed", exc_info=True)
             if home_token is not None:
                 reset_hermes_home_override(home_token)
             if secret_token is not None:
@@ -9822,10 +9841,12 @@ def _run_prompt_submit(
             _clear_session_context(session_tokens)
             # Clear the per-turn interim callback so a stale closure from
             # this turn can't fire during a later turn on the same agent.
-            agent.interim_assistant_callback = None
+            if not heartbeat_turn:
+                agent.interim_assistant_callback = None
             with session["history_lock"]:
                 session["running"] = False
-                session["last_active"] = time.time()
+                if not heartbeat_turn:
+                    session["last_active"] = time.time()
                 if not turn_error_retained and not heartbeat_turn:
                     _clear_inflight_turn(session)
             # Backstop for turns that never reached a terminal frame (the

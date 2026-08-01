@@ -1,6 +1,8 @@
 """Regression coverage for request overrides on live model switches."""
 
 import copy
+import threading
+import types
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -129,6 +131,206 @@ def _switch(agent, *, provider, base_url):
         base_url=base_url,
         api_mode="codex_responses",
     )
+
+
+class _ImmediateThread:
+    def __init__(self, *, target, **_kwargs):
+        self._target = target
+
+    def start(self):
+        self._target()
+
+
+class _RecordingAgent:
+    captured = None
+
+    def __init__(self, **kwargs):
+        type(self).captured = kwargs
+        self._session_messages = []
+
+    def run_conversation(self, **_kwargs):
+        return {"final_response": "done"}
+
+    def shutdown_memory_provider(self):
+        pass
+
+    def close(self):
+        pass
+
+
+def _capture_sibling_kwargs(monkeypatch, parent, sibling):
+    import run_agent
+
+    _RecordingAgent.captured = None
+    monkeypatch.setattr(run_agent, "AIAgent", _RecordingAgent)
+
+    if sibling.startswith("tui_"):
+        from tui_gateway import server
+
+        sid = f"request-overrides-{sibling}"
+        session = {
+            "agent": parent,
+            "session_key": "parent-session",
+            "history": [],
+            "history_lock": threading.Lock(),
+            "cwd": ".",
+        }
+        monkeypatch.setitem(server._sessions, sid, session)
+        monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+        monkeypatch.setattr(server, "_load_cfg", lambda: {"agent": {"max_turns": 25}})
+        monkeypatch.setattr(server, "_get_db", lambda: None)
+        monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+        method = "prompt.background" if sibling == "tui_background" else "preview.restart"
+        params = {"session_id": sid, "text": "work"}
+        if sibling == "tui_preview":
+            params = {"session_id": sid, "url": "http://127.0.0.1:3000"}
+        response = server._methods[method]("rid", params)
+        assert "result" in response
+    elif sibling == "delegate":
+        from tools.delegate_tool import _build_child_agent
+
+        monkeypatch.setattr("tools.delegate_tool._load_config", lambda: {})
+        _build_child_agent(
+            task_index=0,
+            goal="check overrides",
+            context=None,
+            toolsets=None,
+            model=None,
+            max_iterations=1,
+            task_count=1,
+            parent_agent=parent,
+        )
+    else:
+        monkeypatch.setattr(run_agent.threading, "Thread", _ImmediateThread)
+        parent._spawn_background_review(
+            messages_snapshot=[],
+            review_memory=True,
+        )
+
+    assert _RecordingAgent.captured is not None
+    return _RecordingAgent.captured
+
+
+def _assert_sibling_switch_contract(parent, kwargs):
+    explicit = copy.deepcopy(parent._caller_request_overrides)
+    parent_composed = copy.deepcopy(parent.request_overrides)
+    child = AIAgent(**kwargs)
+
+    assert child._caller_request_overrides == explicit
+    assert child.request_overrides == parent_composed
+
+    child._caller_request_overrides["extra_body"]["caller_flag"]["nested"] = False
+    child.request_overrides["extra_headers"]["X-Caller"] = "changed"
+    assert parent._caller_request_overrides == explicit
+    assert parent.request_overrides == parent_composed
+    child._caller_request_overrides = copy.deepcopy(explicit)
+    child.request_overrides = copy.deepcopy(parent_composed)
+
+    _switch_to_glm(child)
+
+    expected = {
+        **explicit,
+        "extra_body": {**GLM_THINKING, **explicit["extra_body"]},
+    }
+    assert child.request_overrides == expected
+    wire_kwargs = ChatCompletionsTransport().build_kwargs(
+        model=child.model,
+        messages=[{"role": "user", "content": "test"}],
+        request_overrides=child.request_overrides,
+    )
+    assert wire_kwargs["extra_headers"] == explicit["extra_headers"]
+    assert wire_kwargs["extra_body"] == expected["extra_body"]
+    assert wire_kwargs["timeout"] == explicit["timeout"]
+    assert "service_tier" not in wire_kwargs
+    assert "speed" not in wire_kwargs
+
+
+@pytest.mark.parametrize(
+    "sibling",
+    ["tui_background", "tui_preview", "delegate", "background_review"],
+)
+def test_sibling_agents_keep_caller_and_fast_override_provenance_separate(
+    runtime_override_env,
+    monkeypatch,
+    sibling,
+):
+    explicit = {
+        "extra_headers": {"X-Caller": "keep"},
+        "extra_body": {"caller_flag": {"nested": True}},
+        "timeout": 17,
+    }
+    parent = _openai_fast_agent(explicit)
+    parent.enabled_toolsets = ["file"]
+
+    kwargs = _capture_sibling_kwargs(monkeypatch, parent, sibling)
+
+    _assert_sibling_switch_contract(parent, kwargs)
+
+
+@pytest.mark.parametrize(
+    "sibling",
+    ["tui_background", "tui_preview", "delegate", "background_review"],
+)
+def test_sibling_agents_preserve_explicit_fast_named_scalars(
+    runtime_override_env,
+    monkeypatch,
+    sibling,
+):
+    explicit = {
+        **CALLER_OVERRIDES,
+        "service_tier": "flex",
+        "speed": "fast",
+    }
+    parent = _openai_fast_agent(explicit)
+    parent.enabled_toolsets = ["file"]
+
+    child = AIAgent(**_capture_sibling_kwargs(monkeypatch, parent, sibling))
+    _switch_to_glm(child)
+
+    assert child._caller_request_overrides == explicit
+    assert child.request_overrides == {
+        **explicit,
+        "extra_body": {**GLM_THINKING, **explicit["extra_body"]},
+    }
+
+
+def test_delegate_explicit_provider_override_channel_is_unchanged(monkeypatch):
+    from tools.delegate_tool import _build_child_agent
+
+    parent = types.SimpleNamespace(
+        model="gpt-5.4-mini",
+        provider="openai",
+        base_url=OPENAI_URL,
+        api_key="parent-key",
+        api_mode="chat_completions",
+        enabled_toolsets=["file"],
+        disabled_toolsets=[],
+        _delegate_depth=0,
+        _active_children=[],
+        _active_children_lock=threading.Lock(),
+    )
+    explicit = {"extra_headers": {"X-Profile": "keep"}}
+    monkeypatch.setattr("tools.delegate_tool._load_config", lambda: {})
+    monkeypatch.setattr("run_agent.AIAgent", _RecordingAgent)
+
+    _build_child_agent(
+        task_index=0,
+        goal="profile override",
+        context=None,
+        toolsets=None,
+        model="glm-5.2",
+        max_iterations=1,
+        task_count=1,
+        parent_agent=parent,
+        override_provider="custom:glm",
+        override_base_url=GLM_URL,
+        override_api_key="glm-key",
+        override_api_mode="chat_completions",
+        override_request_overrides=explicit,
+    )
+
+    assert _RecordingAgent.captured["request_overrides"] == explicit
+    assert "fast_mode_overrides" not in _RecordingAgent.captured
 
 
 def test_runtime_fast_overrides_do_not_cross_switches_or_reach_glm_wire(

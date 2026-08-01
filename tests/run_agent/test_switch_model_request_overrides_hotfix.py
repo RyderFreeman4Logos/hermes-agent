@@ -113,6 +113,45 @@ def _openai_fast_agent(explicit_overrides):
     )
 
 
+def _openai_session_agent(*, initial_fast, fallback_model=None):
+    return AIAgent(
+        api_key="openai-key",
+        base_url=OPENAI_URL,
+        provider="openai",
+        model="gpt-5.4-mini",
+        request_overrides=CALLER_OVERRIDES,
+        fast_mode_overrides={"service_tier": "priority"} if initial_fast else None,
+        service_tier="priority" if initial_fast else None,
+        fallback_model=fallback_model,
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+
+
+def _set_tui_fast(monkeypatch, agent, *, enabled):
+    import tui_gateway.server as server
+
+    session_id = "request-overrides-live-fast"
+    monkeypatch.setitem(
+        server._sessions,
+        session_id,
+        {"agent": agent, "session_key": session_id},
+    )
+    monkeypatch.setattr(server, "_persist_live_session_runtime", lambda _session: None)
+    monkeypatch.setattr(server, "_session_info", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    response = server._methods["config.set"](
+        "rid-fast",
+        {
+            "key": "fast",
+            "session_id": session_id,
+            "value": "fast" if enabled else "normal",
+        },
+    )
+    assert response["result"]["value"] == ("fast" if enabled else "normal")
+
+
 def _switch_to_glm(agent):
     agent.switch_model(
         new_model="glm-5.2",
@@ -294,43 +333,84 @@ def test_sibling_agents_preserve_explicit_fast_named_scalars(
     }
 
 
-def test_delegate_explicit_provider_override_channel_is_unchanged(monkeypatch):
+def test_delegate_differing_model_rebuilds_fast_overrides(runtime_override_env):
     from tools.delegate_tool import _build_child_agent
 
-    parent = types.SimpleNamespace(
-        model="gpt-5.4-mini",
-        provider="openai",
-        base_url=OPENAI_URL,
-        api_key="parent-key",
-        api_mode="chat_completions",
-        enabled_toolsets=["file"],
-        disabled_toolsets=[],
-        _delegate_depth=0,
-        _active_children=[],
-        _active_children_lock=threading.Lock(),
-    )
-    explicit = {"extra_headers": {"X-Profile": "keep"}}
-    monkeypatch.setattr("tools.delegate_tool._load_config", lambda: {})
-    monkeypatch.setattr("run_agent.AIAgent", _RecordingAgent)
-
-    _build_child_agent(
+    parent = _openai_fast_agent(CALLER_OVERRIDES)
+    child = _build_child_agent(
         task_index=0,
-        goal="profile override",
+        goal="different-model child",
         context=None,
         toolsets=None,
-        model="glm-5.2",
+        model="gpt-5.3-codex",
         max_iterations=1,
         task_count=1,
         parent_agent=parent,
-        override_provider="custom:glm",
-        override_base_url=GLM_URL,
-        override_api_key="glm-key",
-        override_api_mode="chat_completions",
-        override_request_overrides=explicit,
     )
 
-    assert _RecordingAgent.captured["request_overrides"] == explicit
-    assert "fast_mode_overrides" not in _RecordingAgent.captured
+    wire = ChatCompletionsTransport().build_kwargs(
+        model=child.model,
+        messages=[{"role": "user", "content": "hi"}],
+        request_overrides=child.request_overrides,
+    )
+    assert child._caller_request_overrides == CALLER_OVERRIDES
+    assert child.request_overrides == CALLER_OVERRIDES
+    assert "service_tier" not in wire
+    assert "speed" not in wire
+
+
+def test_delegate_provider_overrides_drop_on_child_fallback(runtime_override_env):
+    from tools.delegate_tool import _build_child_agent
+
+    parent = _openai_fast_agent(CALLER_OVERRIDES)
+    fallback_client = MagicMock(base_url=OPENAI_URL, api_key="openai-key")
+    fallback_client._custom_headers = {}
+    fallback_client.default_headers = {}
+
+    with patch(
+        "agent.auxiliary_client.resolve_provider_client",
+        return_value=(fallback_client, "gpt-5.4-mini"),
+    ):
+        child = _build_child_agent(
+            task_index=0,
+            goal="provider child with fallback",
+            context=None,
+            toolsets=None,
+            model="glm-5.2",
+            max_iterations=1,
+            task_count=1,
+            parent_agent=parent,
+            override_provider="custom:glm",
+            override_base_url=GLM_URL,
+            override_api_key="glm-key",
+            override_api_mode="chat_completions",
+            override_request_overrides={"extra_body": copy.deepcopy(GLM_THINKING)},
+            override_fallback_chain=[
+                {
+                    "provider": "openai",
+                    "model": "gpt-5.4-mini",
+                    "base_url": OPENAI_URL,
+                    "api_key": "openai-key",
+                    "api_mode": "chat_completions",
+                }
+            ],
+        )
+        before_fallback = copy.deepcopy(child.request_overrides)
+        assert child._try_activate_fallback() is True
+
+    wire = ChatCompletionsTransport().build_kwargs(
+        model=child.model,
+        messages=[{"role": "user", "content": "hi"}],
+        request_overrides=child.request_overrides,
+    )
+    assert before_fallback == {
+        "extra_headers": {"X-Caller": "keep"},
+        "extra_body": {"thinking": {"type": "enabled"}, "caller_flag": True},
+    }
+    assert child._caller_request_overrides == CALLER_OVERRIDES
+    assert child.request_overrides == CALLER_OVERRIDES
+    assert wire["extra_body"] == {"caller_flag": True}
+    assert "thinking" not in wire["extra_body"]
 
 
 def test_runtime_fast_overrides_do_not_cross_switches_or_reach_glm_wire(
@@ -505,33 +585,66 @@ def test_failed_switch_restores_nested_request_overrides():
     assert original["extra_body"]["thinking"]["type"] == "enabled"
 
 
-def test_primary_restore_uses_deep_copied_switched_overrides():
-    agent = _agent()
-    config = {
-        "agent": {"reasoning_overrides": {"gpt-5.4-mini": "low"}}
-    }
-    with (
-        patch("agent.credential_pool.load_pool", return_value=None),
-        patch("hermes_cli.config.load_config_readonly", return_value={}),
-        patch("hermes_cli.config.load_config", return_value=config),
-        patch(
-            "hermes_cli.config.get_compatible_custom_providers",
-            return_value=_configs(),
-        ),
-        patch("hermes_cli.timeouts.get_provider_request_timeout", return_value=None),
+@pytest.mark.parametrize("initial_fast", [False, True])
+def test_live_tui_fast_toggle_survives_transient_recovery(
+    runtime_override_env,
+    monkeypatch,
+    initial_fast,
+):
+    agent = _openai_session_agent(initial_fast=initial_fast)
+    target_fast = not initial_fast
+    _set_tui_fast(monkeypatch, agent, enabled=target_fast)
+    error = type("ReadTimeout", (Exception,), {})("transient")
+
+    with patch("agent.agent_runtime_helpers.time.sleep"):
+        assert agent._try_recover_primary_transport(
+            error,
+            retry_count=3,
+            max_retries=3,
+        ) is True
+
+    expected = copy.deepcopy(CALLER_OVERRIDES)
+    if target_fast:
+        expected["service_tier"] = "priority"
+    assert agent.service_tier == ("priority" if target_fast else None)
+    assert agent.request_overrides == expected
+
+
+@pytest.mark.parametrize("initial_fast", [False, True])
+def test_live_tui_fast_toggle_survives_fallback_restore(
+    runtime_override_env,
+    monkeypatch,
+    initial_fast,
+):
+    fallback_client = MagicMock(base_url=GLM_URL, api_key="glm-key")
+    fallback_client._custom_headers = {}
+    fallback_client.default_headers = {}
+    agent = _openai_session_agent(
+        initial_fast=initial_fast,
+        fallback_model=[
+            {
+                "provider": "custom:glm",
+                "model": "glm-5.2",
+                "base_url": GLM_URL,
+                "api_key": "glm-key",
+            }
+        ],
+    )
+    target_fast = not initial_fast
+    _set_tui_fast(monkeypatch, agent, enabled=target_fast)
+
+    with patch(
+        "agent.auxiliary_client.resolve_provider_client",
+        return_value=(fallback_client, "glm-5.2"),
     ):
-        _switch(agent, provider="openai-codex", base_url=CODEX_URL)
+        assert agent._try_activate_fallback() is True
+        assert agent._restore_primary_runtime() is True
 
-    primary_overrides = copy.deepcopy(agent.request_overrides)
-    agent.request_overrides = {"extra_body": copy.deepcopy(GLM_THINKING)}
-    agent._fallback_activated = True
-    agent._rate_limited_until = 0
-    agent.context_compressor = MagicMock()
-
-    assert agent._restore_primary_runtime() is True
-    assert agent.request_overrides == primary_overrides
-    agent.request_overrides["extra_body"]["caller_flag"] = False
-    assert agent._primary_runtime["request_overrides"] == primary_overrides
+    expected = copy.deepcopy(CALLER_OVERRIDES)
+    if target_fast:
+        expected["service_tier"] = "priority"
+    assert agent.service_tier == ("priority" if target_fast else None)
+    assert agent.request_overrides == expected
 
 
 def test_real_fallback_activation_rebuilds_and_restores_request_overrides():

@@ -7174,13 +7174,14 @@ def _handle_busy_submit(
     unwinding the turn) redirected the live turn with next-turn text — queue
     semantics betrayed by a millisecond race the user can't see.
     """
-    mode = "queue" if queued else _load_busy_input_mode()
     agent = session.get("agent")
     with session["history_lock"]:
         if not session.get("running"):
             # The turn ended between prompt.submit's first busy check and this
             # helper. Let the caller retry and claim the now-idle session.
             return None
+        heartbeat_running = bool(session.get("_heartbeat_running"))
+    mode = "queue" if queued or heartbeat_running else _load_busy_input_mode()
     text_only = _is_text_only_busy_payload(text)
     plain_text = _coerce_message_text(text).strip() if text_only else ""
     if mode == "steer" and text_only and plain_text and agent is not None and hasattr(agent, "steer"):
@@ -8976,6 +8977,7 @@ def _handle_heartbeat_event(sid: str, session: dict, evt: dict) -> None:
         if session.get("running"):
             return
         session["running"] = True
+        session["_heartbeat_running"] = True
     target = str(evt.get("target_id") or evt.get("session_id") or "unknown")
     status = str(evt.get("status") or "STUCK").upper()
     evidence = str(evt.get("evidence") or "no evidence available")
@@ -8996,6 +8998,7 @@ def _handle_heartbeat_event(sid: str, session: dict, evt: dict) -> None:
     except Exception:
         with session["history_lock"]:
             session["running"] = False
+            session.pop("_heartbeat_running", None)
         logger.warning("Heartbeat warm check-in dispatch failed", exc_info=True)
 
 
@@ -9845,6 +9848,8 @@ def _run_prompt_submit(
                 agent.interim_assistant_callback = None
             with session["history_lock"]:
                 session["running"] = False
+                if heartbeat_turn:
+                    session.pop("_heartbeat_running", None)
                 if not heartbeat_turn:
                     session["last_active"] = time.time()
                 if not turn_error_retained and not heartbeat_turn:

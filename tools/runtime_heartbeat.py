@@ -251,6 +251,13 @@ class RuntimeHeartbeat:
                 return "ALIVE", f"output grew {old_output}->{new_output} bytes"
             if new_cpu > old_cpu:
                 return "ALIVE", f"CPU advanced {old_cpu:.2f}->{new_cpu:.2f}s"
+            old_by_identity = target.baseline.get("cpu_by_identity") or {}
+            new_by_identity = snapshot.get("cpu_by_identity") or {}
+            if any(
+                total > float(old_by_identity.get(identity) or 0.0)
+                for identity, total in new_by_identity.items()
+            ):
+                return "ALIVE", "CPU advanced for a live PID/start identity"
             return "STUCK", str(
                 snapshot.get("evidence")
                 or "process is live but produced no output or CPU progress"
@@ -327,6 +334,7 @@ def inspect_process(target_id: str) -> Dict[str, Any]:
     if exited:
         return {"alive": False, "evidence": "process exited"}
     cpu_seconds = 0.0
+    cpu_by_identity = {}
     if (
         pid
         and pid_scope == "host"
@@ -351,16 +359,23 @@ def inspect_process(target_id: str) -> Dict[str, Any]:
                     != expected_start
                 ):
                     continue
-                cpu = psutil.Process(process_pid).cpu_times()
-                cpu_seconds += float(cpu.user + cpu.system)
+                try:
+                    cpu = psutil.Process(process_pid).cpu_times()
+                except Exception:
+                    continue
+                total = float(cpu.user + cpu.system)
+                cpu_seconds += total
+                cpu_by_identity[(process_pid, expected_start)] = total
             if process_registry._safe_host_start_time(pid) != host_start_time:
                 cpu_seconds = 0.0
+                cpu_by_identity = {}
         except Exception:
             pass
     return {
         "alive": True,
         "output_size": output_size,
         "cpu_seconds": cpu_seconds,
+        "cpu_by_identity": cpu_by_identity,
     }
 
 

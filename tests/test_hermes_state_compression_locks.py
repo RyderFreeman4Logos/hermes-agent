@@ -219,21 +219,32 @@ def test_busy_acquire_retries_with_jitter_then_succeeds(
     assert db.get_compression_lock_holder("busy-session") == "winner"
 
 
-def test_busy_acquire_expires_within_wall_budget(
+def test_busy_acquire_retries_through_exhaustion_budget(
     db: SessionDB, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     blocker = _hold_sqlite_writer(db)
-    monkeypatch.setattr(db, "_COMPRESSION_LOCK_ACQUIRE_PATIENCE_S", 0.12)
+    patience_s = 0.12
+    sleeps: list[float] = []
 
-    started = time.monotonic()
+    db._conn.execute("PRAGMA busy_timeout=0")
+    monkeypatch.setattr(db, "_COMPRESSION_LOCK_ACQUIRE_PATIENCE_S", patience_s)
+    monkeypatch.setattr(
+        hermes_state,
+        "time",
+        SimpleNamespace(
+            time=time.time, monotonic=lambda: sum(sleeps), sleep=sleeps.append
+        ),
+    )
+    monkeypatch.setattr(hermes_state.random, "uniform", lambda *_args: 0.02)
+
     try:
         assert db.try_acquire_compression_lock("busy-session", "candidate") is False
     finally:
-        elapsed = time.monotonic() - started
         blocker.rollback()
         blocker.close()
 
-    assert elapsed < 2.0
+    assert len(sleeps) > 1
+    assert sum(sleeps) == pytest.approx(patience_s)
 
 
 def test_acquire_non_busy_sqlite_error_fails_without_retry(

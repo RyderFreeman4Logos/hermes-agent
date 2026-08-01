@@ -42,7 +42,12 @@ def _coerce_usage_int(value: Any) -> int:
     return 0
 
 
-def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
+def _record_codex_app_server_usage(
+    agent,
+    turn,
+    *,
+    consume_post_compression_attribution: bool = True,
+) -> dict[str, Any]:
     """Translate Codex app-server token usage into Hermes accounting.
 
     Codex app-server reports usage via thread/tokenUsage/updated as:
@@ -131,6 +136,13 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
         except Exception:
             logger.debug("codex app-server usage update failed", exc_info=True)
 
+    if consume_post_compression_attribution:
+        from agent.conversation_loop import _ingest_successful_provider_usage
+
+        _ingest_successful_provider_usage(agent, usage_dict, first_call=True)
+    else:
+        agent._last_turn_usage = dict(usage_dict)
+
     agent.session_prompt_tokens += prompt_tokens
     agent.session_completion_tokens += completion_tokens
     agent.session_total_tokens += total_tokens
@@ -216,6 +228,7 @@ def _record_codex_app_server_compaction(
         turn_id,
         force,
     )
+    agent._awaiting_cache_usage_after_compression = True
     if not force:
         try:
             from agent.conversation_compression import COMPACTION_STATUS
@@ -245,7 +258,8 @@ def _record_codex_app_server_compaction(
         if not getattr(turn, "token_usage_last", None):
             compressor.last_prompt_tokens = -1
             compressor.last_completion_tokens = 0
-            compressor.awaiting_real_usage_after_compression = True
+            if hasattr(compressor, "awaiting_real_usage_after_compression"):
+                compressor.awaiting_real_usage_after_compression = True
 
     agent._last_compaction_in_place = False
     try:

@@ -133,7 +133,7 @@ export const MessageLine = memo(function MessageLine({
         <NoSelect flexShrink={0} fromLeftEdge width={eventGutterWidth}>
           <Text> </Text>
         </NoSelect>
-        <Text color={t.color.muted} dimColor>
+        <Text color={msg.tone === 'error' ? t.color.error : t.color.muted} dimColor={msg.tone !== 'error'}>
           ◈ {msg.text}
         </Text>
       </Box>

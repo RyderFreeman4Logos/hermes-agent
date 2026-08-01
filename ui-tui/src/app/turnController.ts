@@ -30,6 +30,8 @@ const ACTIVITY_LIMIT = 8
 const TRAIL_LIMIT = 8
 
 type CacheInfo = {
+  attribution?: 'post_compression'
+  level: 'error' | 'info'
   pct: number
   prompt_tokens: number
   read_tokens: number
@@ -41,14 +43,20 @@ const cacheFootnote = (cacheInfo?: CacheInfo): Msg | null => {
     return null
   }
 
-  if (cacheInfo.state === 'hit') {
-    return { kind: 'event', role: 'system', text: `cache ${Math.max(0, Math.round(cacheInfo.pct))}%` }
-  }
+  const cacheText =
+    cacheInfo.state === 'hit'
+      ? `cache ${Math.max(0, Math.round(cacheInfo.pct))}%`
+      : cacheInfo.state === 'cold_write'
+        ? 'cache cold-write'
+        : `cache ${cacheInfo.state}`
+
+  const attribution = cacheInfo.attribution === 'post_compression' ? ' · post-compression cold prefix (expected)' : ''
 
   return {
     kind: 'event',
     role: 'system',
-    text: cacheInfo.state === 'cold_write' ? 'cache cold-write' : `cache ${cacheInfo.state}`
+    text: `${cacheText}${attribution}`,
+    ...(cacheInfo.level === 'error' && { tone: 'error' as const })
   }
 }
 
@@ -678,11 +686,13 @@ class TurnController {
     }
 
     const footnote = cacheFootnote(payload.cache_info)
+
     if (footnote && finalMessages.some(message => message.role === 'assistant')) {
       finalMessages.push(footnote)
     }
 
     const completion = completionFootnote(payload.completed_at)
+
     if (completion) {
       finalMessages.push(completion)
     }

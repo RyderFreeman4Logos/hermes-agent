@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from agent.transports.chat_completions import ChatCompletionsTransport
+from agent.transports.codex import ResponsesApiTransport
 from run_agent import AIAgent
 
 
@@ -337,7 +338,12 @@ def test_routed_background_review_provider_overrides_remain_derived(
     runtime_override_env,
     monkeypatch,
 ):
-    parent = _openai_fast_agent(CALLER_OVERRIDES)
+    explicit = {
+        "extra_headers": {"X-Caller": "keep"},
+        "timeout": 17,
+    }
+    routed_overrides = {"extra_body": {"runtime_only": True}}
+    parent = _openai_fast_agent(explicit)
     parent.enabled_toolsets = ["file"]
     monkeypatch.setattr(
         "agent.background_review._resolve_review_runtime",
@@ -348,20 +354,44 @@ def test_routed_background_review_provider_overrides_remain_derived(
             "api_mode": "chat_completions",
             "base_url": GLM_URL,
             "api_key": "glm-key",
-            "request_overrides": {"extra_body": GLM_THINKING},
+            "request_overrides": routed_overrides,
         },
     )
 
-    child = AIAgent(
-        **_capture_sibling_kwargs(monkeypatch, parent, "background_review")
-    )
+    kwargs = _capture_sibling_kwargs(monkeypatch, parent, "background_review")
+    assert kwargs["request_overrides"] == explicit
+    assert kwargs["fast_mode_overrides"] == routed_overrides
 
-    assert child._caller_request_overrides == {}
-    assert child.request_overrides == {"extra_body": GLM_THINKING}
+    child = AIAgent(**kwargs)
+    expected = {
+        **explicit,
+        "extra_body": {**GLM_THINKING, **routed_overrides["extra_body"]},
+    }
+
+    assert child._caller_request_overrides == explicit
+    assert child.request_overrides == expected
+    wire = ChatCompletionsTransport().build_kwargs(
+        model=child.model,
+        messages=[{"role": "user", "content": "hi"}],
+        request_overrides=child.request_overrides,
+    )
+    assert wire["extra_headers"] == explicit["extra_headers"]
+    assert wire["extra_body"] == expected["extra_body"]
+    assert wire["timeout"] == explicit["timeout"]
 
     _switch(child, provider="openai-codex", base_url=CODEX_URL)
 
-    assert child.request_overrides == {}
+    assert child._caller_request_overrides == explicit
+    assert child.request_overrides == explicit
+    wire = ResponsesApiTransport().build_kwargs(
+        model=child.model,
+        messages=[{"role": "user", "content": "hi"}],
+        request_overrides=child.request_overrides,
+        is_codex_backend=True,
+    )
+    assert wire["extra_headers"] == explicit["extra_headers"]
+    assert wire["timeout"] == float(explicit["timeout"])
+    assert "extra_body" not in wire
 
 
 def test_delegate_differing_model_rebuilds_fast_overrides(runtime_override_env):

@@ -5229,6 +5229,37 @@ def _configured_fallback_allows(task_config: Dict[str, Any], exc: Exception) -> 
     )
 
 
+def _recover_configured_hop(
+    provider: str,
+    client: Any,
+    exc: Exception,
+    *,
+    main_runtime: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Reuse existing auth refresh/pool rotation and return the retry route."""
+    if _is_auth_error(exc):
+        auth_provider = _auth_refresh_provider_for_route(
+            provider, str(getattr(client, "base_url", "") or "")
+        )
+        if (
+            auth_provider not in {"auto", "", None}
+            and _refresh_provider_credentials(auth_provider)
+        ):
+            if auth_provider != _normalize_aux_provider(provider):
+                _evict_cached_clients(provider)
+            return auth_provider
+    pool_provider = _recoverable_pool_provider(
+        provider, client, main_runtime=main_runtime
+    )
+    if pool_provider and _recover_provider_pool(
+        pool_provider,
+        exc,
+        failed_api_key=str(getattr(client, "api_key", "") or ""),
+    ):
+        return provider
+    return None
+
+
 def _try_configured_fallbacks_sync(
     task: Optional[str],
     *,
@@ -5241,14 +5272,18 @@ def _try_configured_fallbacks_sync(
     reasoning_config: Optional[dict],
 ) -> Optional[Any]:
     start_index = 0
+    chain = _get_auxiliary_task_config(task).get("fallback_chain") or []
     while True:
         client, model, label = _try_configured_fallback_chain(
             task, "", reason="request failure", start_index=start_index,
         )
         if client is None:
             return None
-        start_index = int(re.match(r"fallback_chain\[(\d+)\]", label).group(1)) + 1
-        for _ in range(3):
+        entry_index = int(re.match(r"fallback_chain\[(\d+)\]", label).group(1))
+        start_index = entry_index + 1
+        entry = chain[entry_index]
+        recovery_attempted = False
+        for attempt in range(3):
             try:
                 response = _call_fallback_candidate_sync(
                     client, model, label,
@@ -5262,8 +5297,25 @@ def _try_configured_fallbacks_sync(
                 if response is not None:
                     return response
                 break
-            except Exception:
-                pass
+            except Exception as exc:
+                if attempt == 2:
+                    continue
+                should_recover = (
+                    _is_auth_error(exc)
+                    or _is_payment_error(exc)
+                    or (_is_rate_limit_error(exc) and attempt > 0)
+                )
+                if should_recover and not recovery_attempted:
+                    recovery_attempted = True
+                    retry_provider = _recover_configured_hop(
+                        str(entry.get("provider") or "").strip(), client, exc
+                    )
+                else:
+                    retry_provider = None
+                if retry_provider:
+                    client, model = _resolve_fallback_entry(entry)
+                    if client is None:
+                        break
 
 
 async def _try_configured_fallbacks_async(
@@ -5278,17 +5330,21 @@ async def _try_configured_fallbacks_async(
     reasoning_config: Optional[dict],
 ) -> Optional[Any]:
     start_index = 0
+    chain = _get_auxiliary_task_config(task).get("fallback_chain") or []
     while True:
         client, model, label = _try_configured_fallback_chain(
             task, "", reason="request failure", start_index=start_index,
         )
         if client is None:
             return None
-        start_index = int(re.match(r"fallback_chain\[(\d+)\]", label).group(1)) + 1
+        entry_index = int(re.match(r"fallback_chain\[(\d+)\]", label).group(1))
+        start_index = entry_index + 1
+        entry = chain[entry_index]
         client, model = _to_async_client(
             client, model or "", is_vision=(task == "vision"),
         )
-        for _ in range(3):
+        recovery_attempted = False
+        for attempt in range(3):
             try:
                 response = await _call_fallback_candidate_async(
                     client, model, label,
@@ -5302,8 +5358,28 @@ async def _try_configured_fallbacks_async(
                 if response is not None:
                     return response
                 break
-            except Exception:
-                pass
+            except Exception as exc:
+                if attempt == 2:
+                    continue
+                should_recover = (
+                    _is_auth_error(exc)
+                    or _is_payment_error(exc)
+                    or (_is_rate_limit_error(exc) and attempt > 0)
+                )
+                if should_recover and not recovery_attempted:
+                    recovery_attempted = True
+                    retry_provider = _recover_configured_hop(
+                        str(entry.get("provider") or "").strip(), client, exc
+                    )
+                else:
+                    retry_provider = None
+                if retry_provider:
+                    client, model = _resolve_fallback_entry(entry)
+                    if client is None:
+                        break
+                    client, model = _to_async_client(
+                        client, model or "", is_vision=(task == "vision"),
+                    )
 
 
 def _try_configured_fallback_for_unavailable_client(
@@ -8877,6 +8953,9 @@ def _call_llm_impl(
     # Handle unsupported temperature, max_tokens vs max_completion_tokens retry,
     # then payment fallback.
     original_primary_err = None
+    configured_retry_provider = None
+    configured_recovery_attempted = False
+    configured_primary_should_evict = False
     try:
         # Retry on the same provider for a transient transport blip
         # (connection reset / streaming-close / incomplete chunked read / 5xx /
@@ -8914,8 +8993,23 @@ def _call_llm_impl(
                 provider=resolved_provider, base_url=_base_info)
         except Exception as transient_err:
             original_primary_err = transient_err
+            configured_primary_should_evict |= bool(configured_chain) and (
+                _is_connection_error(transient_err)
+                or _is_payment_error(transient_err)
+                or _is_rate_limit_error(transient_err)
+            )
             if not configured_chain and not _is_transient_transport_error(transient_err):
                 raise
+            if configured_chain and (
+                _is_auth_error(transient_err) or _is_payment_error(transient_err)
+            ):
+                configured_recovery_attempted = True
+                configured_retry_provider = _recover_configured_hop(
+                    resolved_provider,
+                    client,
+                    transient_err,
+                    main_runtime=main_runtime,
+                )
             # Compression is on the critical preflight path: a user cannot
             # continue or resume an oversized session until it compacts. A
             # same-provider retry on a timeout means another full ``timeout``-
@@ -8944,6 +9038,25 @@ def _call_llm_impl(
                 )
                 time.sleep(_backoff)
                 try:
+                    if configured_retry_provider is not None:
+                        return _retry_same_provider_sync(
+                            task=task,
+                            resolved_provider=configured_retry_provider,
+                            resolved_model=resolved_model or final_model,
+                            resolved_base_url=resolved_base_url,
+                            resolved_api_key=resolved_api_key,
+                            resolved_api_mode=resolved_api_mode,
+                            main_runtime=main_runtime,
+                            final_model=final_model,
+                            messages=messages,
+                            temperature=temperature,
+                            max_tokens=max_tokens,
+                            tools=tools,
+                            effective_timeout=effective_timeout,
+                            effective_extra_body=effective_extra_body,
+                            reasoning_config=reasoning_config,
+                            extra_headers=extra_headers,
+                        )
                     return _validate_llm_response(
                         _relay_sync_completion(
                             client,
@@ -8962,14 +9075,45 @@ def _call_llm_impl(
                         ),
                         task)
                 except Exception as retry_transient:
+                    configured_primary_should_evict |= bool(configured_chain) and (
+                        _is_connection_error(retry_transient)
+                        or _is_payment_error(retry_transient)
+                        or _is_rate_limit_error(retry_transient)
+                    )
                     if not configured_chain and not _is_transient_transport_error(retry_transient):
                         raise
+                    if (
+                        configured_chain
+                        and not configured_recovery_attempted
+                        and (
+                            _is_auth_error(retry_transient)
+                            or _is_payment_error(retry_transient)
+                            or _is_rate_limit_error(retry_transient)
+                        )
+                    ):
+                        configured_recovery_attempted = True
+                        configured_retry_provider = _recover_configured_hop(
+                            resolved_provider,
+                            client,
+                            retry_transient,
+                            main_runtime=main_runtime,
+                        )
                     _last_transient = retry_transient
             # Retries exhausted — fall through to first_err fallback handling.
             raise _last_transient
     except Exception as first_err:
         if configured_chain:
             original_primary_err = original_primary_err or first_err
+            if configured_primary_should_evict:
+                try:
+                    _evict_cached_client_instance(
+                        getattr(client, "_real_client", client)
+                    )
+                except Exception:
+                    logger.debug(
+                        "Auxiliary: configured primary cache eviction failed",
+                        exc_info=True,
+                    )
             if _configured_fallback_allows(task_config, original_primary_err):
                 response = _try_configured_fallbacks_sync(
                     task,
@@ -8981,14 +9125,6 @@ def _call_llm_impl(
                 )
                 if response is not None:
                     return response
-            if _is_connection_error(original_primary_err):
-                try:
-                    _evict_cached_client_instance(client)
-                except Exception:
-                    logger.debug(
-                        "Auxiliary: cache eviction after connection error failed",
-                        exc_info=True,
-                    )
             raise original_primary_err
         if "temperature" in kwargs and _is_unsupported_temperature_error(first_err):
             retry_kwargs = dict(kwargs)
@@ -9623,6 +9759,9 @@ async def _async_call_llm_impl(
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
 
     original_primary_err = None
+    configured_retry_provider = None
+    configured_recovery_attempted = False
+    configured_primary_should_evict = False
     try:
         # Retry ONCE on the same provider for a transient transport blip
         # before the except-chain escalates to fallback — see call_llm()
@@ -9656,8 +9795,23 @@ async def _async_call_llm_impl(
                 provider=resolved_provider, base_url=_client_base)
         except Exception as transient_err:
             original_primary_err = transient_err
+            configured_primary_should_evict |= bool(configured_chain) and (
+                _is_connection_error(transient_err)
+                or _is_payment_error(transient_err)
+                or _is_rate_limit_error(transient_err)
+            )
             if not configured_chain and not _is_transient_transport_error(transient_err):
                 raise
+            if configured_chain and (
+                _is_auth_error(transient_err) or _is_payment_error(transient_err)
+            ):
+                configured_recovery_attempted = True
+                configured_retry_provider = _recover_configured_hop(
+                    resolved_provider,
+                    client,
+                    transient_err,
+                    main_runtime=main_runtime,
+                )
             # See call_llm(): compression is on the critical preflight path,
             # so skip the same-provider retry on a full-budget timeout and
             # fall straight through to fallback (issue #54465).
@@ -9673,6 +9827,23 @@ async def _async_call_llm_impl(
             last_err = transient_err
             for _ in range(attempts):
                 try:
+                    if configured_retry_provider is not None:
+                        return await _retry_same_provider_async(
+                            task=task,
+                            resolved_provider=configured_retry_provider,
+                            resolved_model=resolved_model or final_model,
+                            resolved_base_url=resolved_base_url,
+                            resolved_api_key=resolved_api_key,
+                            resolved_api_mode=resolved_api_mode,
+                            final_model=final_model,
+                            messages=messages,
+                            temperature=temperature,
+                            max_tokens=max_tokens,
+                            tools=tools,
+                            effective_timeout=effective_timeout,
+                            effective_extra_body=effective_extra_body,
+                            reasoning_config=reasoning_config,
+                        )
                     return _validate_llm_response(
                         await _relay_async_completion(
                             client,
@@ -9683,13 +9854,44 @@ async def _async_call_llm_impl(
                         ),
                         task)
                 except Exception as retry_err:
+                    configured_primary_should_evict |= bool(configured_chain) and (
+                        _is_connection_error(retry_err)
+                        or _is_payment_error(retry_err)
+                        or _is_rate_limit_error(retry_err)
+                    )
                     if not configured_chain and not _is_transient_transport_error(retry_err):
                         raise
+                    if (
+                        configured_chain
+                        and not configured_recovery_attempted
+                        and (
+                            _is_auth_error(retry_err)
+                            or _is_payment_error(retry_err)
+                            or _is_rate_limit_error(retry_err)
+                        )
+                    ):
+                        configured_recovery_attempted = True
+                        configured_retry_provider = _recover_configured_hop(
+                            resolved_provider,
+                            client,
+                            retry_err,
+                            main_runtime=main_runtime,
+                        )
                     last_err = retry_err
             raise last_err
     except Exception as first_err:
         if configured_chain:
             original_primary_err = original_primary_err or first_err
+            if configured_primary_should_evict:
+                try:
+                    _evict_cached_client_instance(
+                        getattr(client, "_real_client", client)
+                    )
+                except Exception:
+                    logger.debug(
+                        "Auxiliary (async): configured primary cache eviction failed",
+                        exc_info=True,
+                    )
             if _configured_fallback_allows(task_config, original_primary_err):
                 response = await _try_configured_fallbacks_async(
                     task,
@@ -9701,14 +9903,6 @@ async def _async_call_llm_impl(
                 )
                 if response is not None:
                     return response
-            if _is_connection_error(original_primary_err):
-                try:
-                    _evict_cached_client_instance(client)
-                except Exception:
-                    logger.debug(
-                        "Auxiliary (async): cache eviction after connection error failed",
-                        exc_info=True,
-                    )
             raise original_primary_err
         if "temperature" in kwargs and _is_unsupported_temperature_error(first_err):
             retry_kwargs = dict(kwargs)

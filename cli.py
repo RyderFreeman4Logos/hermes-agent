@@ -13843,7 +13843,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # starts. It spans generation (speech interrupts the turn) and
             # playback (speech cuts TTS), and disarms itself when the turn
             # is fully done. See _voice_full_duplex_listener.
-            if self._voice_mode and self._voice_continuous:
+            if not heartbeat_warm and self._voice_mode and self._voice_continuous:
                 threading.Thread(
                     target=self._voice_full_duplex_listener, daemon=True
                 ).start()
@@ -13861,7 +13861,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             stop_event = None
             _tts_normal_exit = False
 
-            if self._voice_tts:
+            if not heartbeat_warm and self._voice_tts:
                 try:
                     from tools.tts_tool import (
                         _import_sounddevice,
@@ -14074,7 +14074,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # stopped outright as soon as the turn ends. voice.thinking_sound
             # gates it (default on); macOS is handled inside (TCC-safe skip).
             _thinking_started = False
-            if self._voice_mode:
+            if not heartbeat_warm and self._voice_mode:
                 try:
                     from tools.voice_mode import start_thinking_sound
 
@@ -14238,7 +14238,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             response = result.get("final_response", "") if result else ""
 
             # Auto-generate session title after first exchange (non-blocking)
-            if response and result and not result.get("failed") and not result.get("partial"):
+            if (
+                not heartbeat_warm
+                and response
+                and result
+                and not result.get("failed")
+                and not result.get("partial")
+            ):
                 try:
                     from agent.title_generator import maybe_auto_title
                     # Route title-generation failures through the agent's
@@ -14284,7 +14290,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 response = f"Error: {error_detail}"
                 # Stop continuous voice mode on persistent errors (e.g. 429 rate limit)
                 # to avoid an infinite error → record → error loop
-                if self._voice_continuous:
+                if not heartbeat_warm and self._voice_continuous:
                     self._voice_continuous = False
                     _cprint(f"\n{_DIM}Continuous voice mode stopped due to error.{_RST}")
 
@@ -14460,7 +14466,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
             # Speak response aloud if voice TTS is enabled
             # Skip batch TTS when streaming TTS already handled it
-            if self._voice_tts and response and not use_streaming_tts:
+            if (
+                not heartbeat_warm
+                and self._voice_tts
+                and response
+                and not use_streaming_tts
+            ):
                 self._voice_speak_response_async(response)
 
 

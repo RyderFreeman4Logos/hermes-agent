@@ -39,6 +39,28 @@ def _dispatch_batch(runner, capacity, *, session_key="owner", interrupt_fn=None)
     )
 
 
+def _dispatch_single(runner, capacity, *, session_key="owner", interrupt_fn=None):
+    return ad.dispatch_async_delegation(
+        goal="capacity test",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key=session_key,
+        runner=runner,
+        interrupt_fn=interrupt_fn,
+        max_async_children=capacity,
+    )
+
+
+def _durable_count():
+    conn = ad._connect()
+    try:
+        return conn.execute("SELECT COUNT(*) FROM async_delegations").fetchone()[0]
+    finally:
+        conn.close()
+
+
 def _observe_admission_wait(monkeypatch):
     waiting = threading.Event()
     original_wait = ad._admission_condition.wait
@@ -49,6 +71,124 @@ def _observe_admission_wait(monkeypatch):
 
     monkeypatch.setattr(ad._admission_condition, "wait", observed_wait)
     return waiting
+
+
+@pytest.mark.parametrize(
+    "dispatch_one",
+    [
+        pytest.param(_dispatch_single, id="single"),
+        pytest.param(_dispatch_batch, id="batch"),
+    ],
+)
+def test_registration_rejects_when_process_backlog_is_full(dispatch_one):
+    release = threading.Event()
+    running_started = threading.Event()
+    queued_started = threading.Event()
+    rejected_started = threading.Event()
+
+    def running():
+        running_started.set()
+        assert release.wait(timeout=60)
+        return {"results": []}
+
+    running_dispatch = dispatch_one(running, 1, session_key="running-owner")
+    assert running_started.wait(timeout=5)
+    queued_dispatch = dispatch_one(
+        lambda: queued_started.set() or {"results": []},
+        1,
+        session_key="queued-owner",
+    )
+    try:
+        rejected = dispatch_one(
+            lambda: rejected_started.set() or {"results": []},
+            1,
+            session_key="rejected-owner",
+        )
+        queued_started_before_release = queued_started.is_set()
+        rejected_started_before_release = rejected_started.is_set()
+        active_before_release = ad.active_count()
+        durable_before_release = _durable_count()
+    finally:
+        release.set()
+
+    dispatches = [running_dispatch, queued_dispatch, rejected]
+    expected_ids = {
+        result["delegation_id"]
+        for result in dispatches
+        if result["status"] == "dispatched"
+    }
+    completed_ids = {
+        process_registry.completion_queue.get(timeout=5)["delegation_id"]
+        for _ in expected_ids
+    }
+    assert completed_ids == expected_ids
+    assert running_dispatch["status"] == "dispatched"
+    assert queued_dispatch["status"] == "dispatched"
+    assert rejected["status"] == "rejected"
+    assert "capacity reached" in rejected["error"].lower()
+    assert not queued_started_before_release
+    assert not rejected_started_before_release
+    assert active_before_release == 2
+    assert durable_before_release == 2
+    assert queued_started.is_set()
+    assert not rejected_started.is_set()
+    with pytest.raises(queue.Empty):
+        process_registry.completion_queue.get(timeout=0.2)
+
+
+def test_backlog_admission_is_atomic_across_sessions():
+    release = threading.Event()
+    running_started = threading.Event()
+    candidate_started = threading.Event()
+
+    def running():
+        running_started.set()
+        assert release.wait(timeout=60)
+        return {"results": []}
+
+    running_dispatch = _dispatch_batch(running, 1, session_key="occupier")
+    assert running_started.wait(timeout=5)
+
+    callers_ready = threading.Barrier(3)
+
+    def compete(dispatch_one, session_key):
+        callers_ready.wait(timeout=5)
+        return dispatch_one(
+            lambda: candidate_started.set() or {"results": []},
+            1,
+            session_key=session_key,
+        )
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as callers:
+            single = callers.submit(compete, _dispatch_single, "session-a")
+            batch = callers.submit(compete, _dispatch_batch, "session-b")
+            callers_ready.wait(timeout=5)
+            candidates = [single.result(timeout=5), batch.result(timeout=5)]
+        candidate_started_before_release = candidate_started.is_set()
+        active_before_release = ad.active_count()
+        durable_before_release = _durable_count()
+    finally:
+        release.set()
+
+    accepted = [result for result in candidates if result["status"] == "dispatched"]
+    expected_ids = {
+        running_dispatch["delegation_id"],
+        *(result["delegation_id"] for result in accepted),
+    }
+    completed_ids = {
+        process_registry.completion_queue.get(timeout=5)["delegation_id"]
+        for _ in expected_ids
+    }
+    assert completed_ids == expected_ids
+    assert sorted(result["status"] for result in candidates) == [
+        "dispatched",
+        "rejected",
+    ]
+    assert not candidate_started_before_release
+    assert active_before_release == 2
+    assert durable_before_release == 2
+    assert candidate_started.is_set()
 
 
 def test_cap_growth_never_oversubscribes_executor_generations(monkeypatch):
@@ -341,7 +481,7 @@ def test_cancel_queued_delegation_completes_once_without_starting_runner(
     assert not queued_started.is_set()
 
 
-def test_public_handler_does_not_run_inline_after_schedule_failure(monkeypatch):
+def test_public_handler_cleans_resources_after_schedule_rejection(monkeypatch):
     parent = MagicMock(
         _delegate_depth=0,
         session_id="schedule-failure-session",
@@ -349,7 +489,18 @@ def test_public_handler_does_not_run_inline_after_schedule_failure(monkeypatch):
         _active_children=[],
         _active_children_lock=None,
     )
-    child = MagicMock(model="m", _delegate_role="leaf", _subagent_id="child-0")
+    children = []
+
+    def build_child(**kwargs):
+        child = MagicMock(
+            model="m",
+            _delegate_role="leaf",
+            _subagent_id=f"child-{kwargs['task_index']}",
+        )
+        children.append(child)
+        parent._active_children.append(child)
+        return child
+
     credentials = {
         "model": "m",
         "provider": None,
@@ -359,7 +510,7 @@ def test_public_handler_does_not_run_inline_after_schedule_failure(monkeypatch):
         "command": None,
         "args": None,
     }
-    monkeypatch.setattr("tools.delegate_tool._build_child_agent", lambda **kw: child)
+    monkeypatch.setattr("tools.delegate_tool._build_child_agent", build_child)
     monkeypatch.setattr(
         "tools.delegate_tool._run_single_child",
         lambda *args, **kwargs: pytest.fail("schedule failure ran child inline"),
@@ -375,9 +526,26 @@ def test_public_handler_does_not_run_inline_after_schedule_failure(monkeypatch):
         "tools.async_delegation.dispatch_async_delegation_batch",
         lambda **kwargs: {"status": "rejected", "error": "submit failed"},
     )
+    monkeypatch.setattr(
+        "tools.delegation_live_log.new_live_delegation_id",
+        lambda: "deleg_rejected",
+    )
 
     result = json.loads(
-        AIAgent._dispatch_delegate_task(parent, {"goal": "must stay background"})
+        AIAgent._dispatch_delegate_task(
+            parent,
+            {"tasks": [{"goal": "first"}, {"goal": "second"}]},
+        )
     )
 
     assert result == {"error": "submit failed"}
+    assert parent._active_children == []
+    assert len(children) == 2
+    for child in children:
+        child.close.assert_called_once_with()
+
+    from tools.delegation_live_log import live_transcript_root
+
+    assert not (live_transcript_root() / "deleg_rejected").exists()
+    assert ad.active_count() == 0
+    assert _durable_count() == 0

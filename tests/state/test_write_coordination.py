@@ -2,7 +2,9 @@
 
 import multiprocessing
 import os
+import platform
 import sqlite3
+import sys
 import threading
 import time
 from pathlib import Path
@@ -133,6 +135,46 @@ def test_non_lock_errors_fail_immediately(db) -> None:
             patience_s=1.0,
         )
     assert time.monotonic() - started < 0.5
+
+
+def test_windows_byte_lock_seeds_fresh_file_without_truncating_existing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = []
+
+    class FakeMsvcrt:
+        LK_NBLCK = 1
+        LK_UNLCK = 2
+
+        @staticmethod
+        def locking(fd, mode, nbytes):
+            offset = os.lseek(fd, 0, os.SEEK_CUR)
+            if offset != 0 or offset + nbytes > os.fstat(fd).st_size:
+                raise OSError("cannot lock past EOF")
+            calls.append((mode, nbytes))
+
+    monkeypatch.setattr(platform, "system", lambda: "Windows")
+    monkeypatch.setitem(sys.modules, "msvcrt", FakeMsvcrt)
+
+    fresh = tmp_path / "fresh.lock"
+    with fresh.open("a+b") as handle:
+        assert fresh.stat().st_size == 0
+        assert _try_acquire_exclusive_file_lock(handle)
+        _release_exclusive_file_lock(handle)
+    assert fresh.read_bytes() == b"\0"
+
+    existing = tmp_path / "existing.lock"
+    existing.write_bytes(b"keep me")
+    with existing.open("a+b") as handle:
+        assert _try_acquire_exclusive_file_lock(handle)
+        _release_exclusive_file_lock(handle)
+    assert existing.read_bytes() == b"keep me"
+    assert calls == [
+        (FakeMsvcrt.LK_NBLCK, 1),
+        (FakeMsvcrt.LK_UNLCK, 1),
+        (FakeMsvcrt.LK_NBLCK, 1),
+        (FakeMsvcrt.LK_UNLCK, 1),
+    ]
 
 
 def test_advisory_lock_timeout_is_bounded(db, process_ctx) -> None:

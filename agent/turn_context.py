@@ -347,6 +347,7 @@ def build_turn_context(
     set_current_write_origin,
     ra,
     moa_active: bool = False,
+    defer_early_persistence: bool = False,
 ) -> TurnContext:
     """Run the once-per-turn setup and return the loop's input context.
 
@@ -380,6 +381,15 @@ def build_turn_context(
 
     # Restore the primary runtime if the previous turn activated fallback.
     agent._restore_primary_runtime()
+
+    # Tool workers inherit this turn context. Preserve named custom-provider
+    # identity (for example custom:pm) instead of the resolved "custom" class.
+    try:
+        from tools.runtime_heartbeat import bind_agent_provider
+
+        bind_agent_provider(agent)
+    except Exception:
+        logger.debug("Could not bind runtime heartbeat provider", exc_info=True)
 
     # Tell auxiliary_client what the live main provider/model are for this turn
     # after primary restoration has settled the runtime.
@@ -664,7 +674,12 @@ def build_turn_context(
     # the previous turn finished. The cheap gap pre-check gates the (more
     # expensive) token estimate, mirroring ``_should_run_preflight_estimate``.
     _idle_after = getattr(agent, "compression_idle_compact_after_seconds", 0)
-    if agent.compression_enabled and _idle_after > 0 and messages:
+    if (
+        not defer_early_persistence
+        and agent.compression_enabled
+        and _idle_after > 0
+        and messages
+    ):
         _idle_gap = time.time() - getattr(agent, "_last_activity_ts", time.time())
         if _idle_gap >= _idle_after:
             _compressor = agent.context_compressor
@@ -741,11 +756,15 @@ def build_turn_context(
     _preflight_compression_blocked = False
     agent._turn_received_provider_response = False
     agent._turn_preflight_display_snapshot = None
-    if agent.compression_enabled and _should_run_preflight_estimate(
-        messages,
-        agent.context_compressor.protect_first_n,
-        agent.context_compressor.protect_last_n,
-        agent.context_compressor.threshold_tokens,
+    if (
+        not defer_early_persistence
+        and agent.compression_enabled
+        and _should_run_preflight_estimate(
+            messages,
+            agent.context_compressor.protect_first_n,
+            agent.context_compressor.protect_last_n,
+            agent.context_compressor.threshold_tokens,
+        )
     ):
         _preflight_tokens = estimate_request_tokens_rough(
             messages,
@@ -1236,19 +1255,21 @@ def build_turn_context(
         agent._ensure_db_session()
         agent._persist_session(messages, conversation_history)
 
-    try:
-        if persist_lock is None:
-            _ensure_and_persist()
-        else:
-            with persist_lock:
+    if not defer_early_persistence:
+        try:
+            if persist_lock is None:
                 _ensure_and_persist()
-    except Exception:
-        logger.warning(
-            "Early turn-start session persistence failed for session=%s",
-            agent.session_id or "none",
-            exc_info=True,
-        )
-    finally:
+            else:
+                with persist_lock:
+                    _ensure_and_persist()
+        except Exception:
+            logger.warning(
+                "Early turn-start session persistence failed for session=%s",
+                agent.session_id or "none",
+                exc_info=True,
+            )
+
+    if not defer_early_persistence:
         # Keep an unmarked staged input available to a later close retry if the
         # normal persistence attempt failed. Once the marker is present, the
         # close path must no longer treat it as a pre-worker UI input.

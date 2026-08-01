@@ -1345,6 +1345,18 @@ class ProcessRegistry:
             self._finished[session.id] = session
         if not was_running:
             return
+        # The first terminal-state claimant owns heartbeat cancellation. Do
+        # this before publishing completion so a due timer cannot race it.
+        try:
+            from tools.runtime_heartbeat import runtime_heartbeat
+
+            runtime_heartbeat.cancel(session.id)
+        except Exception:
+            logger.debug(
+                "Failed to cancel heartbeat for process %s",
+                session.id,
+                exc_info=True,
+            )
         session._completion_event.set()
         self._write_checkpoint()
 
@@ -1434,6 +1446,7 @@ class ProcessRegistry:
         owns_event=None,
         *,
         skip_poll_observed: bool = True,
+        preserve_event_types: "set[str] | None" = None,
     ) -> "list[tuple[dict, str]]":
         """Pop all pending notification events and return formatted pairs.
 
@@ -1466,11 +1479,15 @@ class ProcessRegistry:
         """
         results: "list[tuple[dict, str]]" = []
         requeue: "list[dict]" = []
+        preserved_types = set(preserve_event_types or ())
         while not self.completion_queue.empty():
             try:
                 evt = self.completion_queue.get_nowait()
             except Exception:
                 break
+            if evt.get("type") in preserved_types:
+                requeue.append(evt)
+                continue
             # Positive-proof ownership beats bare key equality. Delegation
             # payloads always require proof; ordinary events require it once
             # they carry routing metadata. Ownerless ordinary events preserve
@@ -1508,7 +1525,11 @@ class ProcessRegistry:
             ):
                 continue
 
-            text = format_process_notification(evt)
+            text = (
+                format_runtime_heartbeat(evt)
+                if evt.get("type") == "heartbeat"
+                else format_process_notification(evt)
+            )
             if text:
                 text = completion_delivery_prompt(evt, text)
                 if text is not None:
@@ -2519,6 +2540,9 @@ def format_process_notification(evt: dict) -> "str | None":
     _sid = evt.get("session_id", "unknown")
     _cmd = evt.get("command", "unknown")
 
+    if evt_type == "heartbeat":
+        return None
+
     if evt_type == "watch_disabled":
         return f"[IMPORTANT: {evt.get('message', '')}]"
 
@@ -2562,6 +2586,18 @@ def format_process_notification(evt: dict) -> "str | None":
         f"(exit code {_exit}{_signal}).\n"
         f"Command: {_cmd}\n"
         f"Output:\n{_out}]"
+    )
+
+
+def format_runtime_heartbeat(evt: dict) -> str:
+    """Format a heartbeat control event for its owner-only internal turn."""
+    target = str(evt.get("target_id") or evt.get("session_id") or "unknown")
+    status = str(evt.get("status") or "STUCK").upper()
+    evidence = str(evt.get("evidence") or "no evidence available")
+    elapsed = max(0, int(evt.get("elapsed_s") or 0))
+    return (
+        f'[HEARTBEAT] Background target "{target}" is {status}: {evidence}. '
+        f"Elapsed: {elapsed}s. KV cache warm check-in."
     )
 
 

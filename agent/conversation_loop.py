@@ -94,6 +94,11 @@ logger = logging.getLogger(__name__)
 # to treat it as cancellation metadata rather than assistant prose.
 INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
 
+_INTERNAL_NOOP_EPHEMERAL_SUFFIX = (
+    "\n\n[Note: If this internal background check requires no action, return "
+    "an empty response with no text and no tool calls.]"
+)
+
 # Modules that indicate a deterministic local processing error when they
 # appear in an exception traceback WITHOUT any API-call module. Used by the
 # outer-loop error classifier to avoid retrying bugs that will fail
@@ -1237,6 +1242,8 @@ def run_conversation(
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    turn_origin: str = "user",
+    allow_silent_noop: bool = False,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -1279,6 +1286,15 @@ def run_conversation(
         except Exception:
             pass
 
+    _inject_internal_noop_instruction = (
+        turn_origin == "heartbeat_warm"
+        and allow_silent_noop is True
+        and isinstance(user_message, str)
+    )
+    if _inject_internal_noop_instruction and persist_user_message is None:
+        persist_user_message = user_message
+    _defer_heartbeat_warm_persistence = _inject_internal_noop_instruction
+
     # The gateway caches agents across user turns.  Compression state is
     # per-turn: carrying a prior in-place boundary forward would make a later
     # uncompressed result look like a compacted transcript to gateway writers.
@@ -1315,6 +1331,7 @@ def run_conversation(
         # MoA turns append per-call aggregated context to the API copy of the
         # user message, so no byte-stable api_content sidecar can be stamped.
         moa_active=bool(moa_config),
+        defer_early_persistence=_defer_heartbeat_warm_persistence,
     )
     user_message = _ctx.user_message
     original_user_message = _ctx.original_user_message
@@ -1340,6 +1357,7 @@ def run_conversation(
     final_response = None
     interrupted = False
     failed = False
+    _silent_noop = False
     codex_ack_continuations = 0
     length_continue_retries = 0
     truncated_tool_call_retries = 0
@@ -1622,6 +1640,12 @@ def run_conversation(
                     )
                     if _composed is not None:
                         api_msg["content"] = _composed
+                if (
+                    _inject_internal_noop_instruction
+                    and isinstance(api_msg.get("content"), str)
+                    and _INTERNAL_NOOP_EPHEMERAL_SUFFIX not in api_msg["content"]
+                ):
+                    api_msg["content"] += _INTERNAL_NOOP_EPHEMERAL_SUFFIX
             elif (
                 isinstance(_api_content, str)
                 and _api_content
@@ -1967,7 +1991,8 @@ def run_conversation(
             _compressor, "get_active_compression_failure_cooldown", lambda: None
         )()
         if (
-            agent.compression_enabled
+            not _defer_heartbeat_warm_persistence
+            and agent.compression_enabled
             and len(messages) > 1
             and compression_attempts < max_compression_attempts
             and not _preflight_compression_blocked
@@ -6528,6 +6553,50 @@ def run_conversation(
                 # chokepoint below, after final_msg is built, so it catches
                 # every path that reaches turn finalization, not just this one.)
                 final_response = assistant_message.content or ""
+
+                streamed = (
+                    getattr(agent, "_current_streamed_assistant_text", "") or ""
+                )
+                response_status = getattr(response, "status", None)
+                structured_abnormal = (
+                    getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID
+                    or any(
+                        bool(getattr(response, field, None))
+                        for field in (
+                            "error",
+                            "incomplete_details",
+                            "failure",
+                            "failed",
+                            "interrupted",
+                        )
+                    )
+                    or response_status
+                    not in (None, "", "completed", "success", "ok")
+                    or any(
+                        bool(getattr(assistant_message, field, None))
+                        for field in (
+                            "refusal",
+                            "function_call",
+                            "audio",
+                            "annotations",
+                        )
+                    )
+                )
+                if (
+                    turn_origin == "heartbeat_warm"
+                    and allow_silent_noop is True
+                    and getattr(agent, "_turn_received_provider_response", False)
+                    is True
+                    and finish_reason in {"stop", "success"}
+                    and not getattr(assistant_message, "tool_calls", None)
+                    and not agent._has_content_after_think_block(final_response)
+                    and not agent._has_content_after_think_block(streamed)
+                    and not structured_abnormal
+                ):
+                    _silent_noop = True
+                    _turn_exit_reason = "heartbeat_warm_noop"
+                    final_response = None
+                    break
                 
                 # Fix: unmute output when entering the no-tool-call branch
                 # so the user can see empty-response warnings and recovery
@@ -7279,6 +7348,8 @@ def run_conversation(
         _turn_exit_reason=_turn_exit_reason,
         _pending_verification_response=_pending_verification_response,
         _pending_verification_response_previewed=_pending_verification_response_previewed,
+        silent_noop=_silent_noop,
+        turn_origin=turn_origin,
     )
 
 

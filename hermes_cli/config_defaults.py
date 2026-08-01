@@ -28,6 +28,12 @@ DEFAULT_CONFIG = {
     # sessions (no live client) so accumulated agents don't pile up under memory
     # pressure. Reopening one re-resumes it from disk. 0/null disables.
     "max_live_sessions": 16,
+    # Warm-KV heartbeats are opt-in and exist only for explicitly managed
+    # background targets. Provider intervals have no fallback semantics.
+    "runtime": {
+        "warm_kv_timeout": {"providers": {}},
+        "heartbeat": {"enabled": False, "mode": "per_target"},
+    },
     "agent": {
         "max_turns": 500,
         # Inactivity timeout for gateway agent execution (seconds).

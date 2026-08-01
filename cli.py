@@ -4206,6 +4206,10 @@ class _CompletionDeliveryMessage(str):
     """Trusted model-only completion turn queued by the process registry."""
 
 
+class _HeartbeatWarmMessage(str):
+    """Owner-routed, nonpersistent warm-KV turn."""
+
+
 class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     """
     Interactive CLI for the Hermes Agent.
@@ -10627,7 +10631,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             if claim is None:
                 continue
             queued_message = (
-                _CompletionDeliveryMessage(synthetic_message)
+                _HeartbeatWarmMessage(synthetic_message)
+                if event.get("type") == "heartbeat"
+                else _CompletionDeliveryMessage(synthetic_message)
                 if event.get("type", "completion") == "completion"
                 else synthetic_message
             )
@@ -13646,6 +13652,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         images: list = None,
         voice_input: bool = False,
         completion_delivery: bool = False,
+        heartbeat_warm: bool = False,
     ) -> Optional[str]:
         """
         Send a message to the agent and get a response.
@@ -13809,14 +13816,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             agent._pending_cli_user_message = staged_user_message
             self.conversation_history.append(staged_user_message)
 
-        if persist_lock is None:
-            _stage_user_message()
-        else:
-            with persist_lock:
+        if not heartbeat_warm:
+            if persist_lock is None:
                 _stage_user_message()
+            else:
+                with persist_lock:
+                    _stage_user_message()
 
-        ChatConsole().print(f"[{_accent_hex()}]{'─' * 40}[/]")
-        print(flush=True)
+        if not heartbeat_warm:
+            ChatConsole().print(f"[{_accent_hex()}]{'─' * 40}[/]")
+            print(flush=True)
         
         try:
             # Run the conversation with interrupt monitoring
@@ -13953,24 +13962,25 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 # messages. Naive ``note + "\n\n" + agent_message`` crashed with
                 # TypeError when an image was attached (agent_message is a list)
                 # and a /model or /reload-skills note was queued for the turn.
-                _msn = getattr(self, '_pending_model_switch_note', None)
+                _msn = None if heartbeat_warm else getattr(self, '_pending_model_switch_note', None)
                 if _msn:
                     agent_message = _prepend_note_to_message(agent_message, _msn)
                     self._pending_model_switch_note = None
                 # Prepend pending /reload-skills note so the model sees which
                 # skills were added/removed before handling this turn. Same
                 # one-shot queue pattern as the model-switch note above.
-                _srn = getattr(self, '_pending_skills_reload_note', None)
+                _srn = None if heartbeat_warm else getattr(self, '_pending_skills_reload_note', None)
                 if _srn:
                     agent_message = _prepend_note_to_message(agent_message, _srn)
                     self._pending_skills_reload_note = None
                 # Barged mid-speech (VAD or record key)? Tell the model it was
                 # cut off — same one-shot, API-local note channel as above.
                 from tools.tts_streaming import SPEECH_INTERRUPTED_NOTE, take_speech_interrupted
-                if take_speech_interrupted():
+                if not heartbeat_warm and take_speech_interrupted():
                     agent_message = _prepend_note_to_message(agent_message, SPEECH_INTERRUPTED_NOTE)
-                _moa_cfg = getattr(self, "_pending_moa_config", None)
-                self._pending_moa_config = None
+                _moa_cfg = None if heartbeat_warm else getattr(self, "_pending_moa_config", None)
+                if not heartbeat_warm:
+                    self._pending_moa_config = None
                 if _moa_cfg is None:
                     _moa_cfg = None
                 # Model/skill notes and voice instructions are API-local. Keep
@@ -13980,18 +13990,27 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 _persist_clean_user_message = (
                     message if (_voice_prefix or agent_message != message) else None
                 )
-                _one_turn_model_restore = getattr(
-                    self, "_pending_one_turn_model_restore", None
+                _one_turn_model_restore = (
+                    None
+                    if heartbeat_warm
+                    else getattr(self, "_pending_one_turn_model_restore", None)
                 )
-                self._pending_one_turn_model_restore = None
+                if not heartbeat_warm:
+                    self._pending_one_turn_model_restore = None
                 try:
                     result = self.agent.run_conversation(
                         user_message=agent_message,
-                        conversation_history=self.conversation_history[:-1],  # Exclude the message we just added
+                        conversation_history=(
+                            self.conversation_history
+                            if heartbeat_warm
+                            else self.conversation_history[:-1]
+                        ),
                         stream_callback=stream_callback,
                         task_id=self.session_id,
                         persist_user_message=_persist_clean_user_message,
                         moa_config=_moa_cfg,
+                        turn_origin="heartbeat_warm" if heartbeat_warm else "user",
+                        allow_silent_noop=heartbeat_warm,
                     )
                     if getattr(self, "_pending_moa_disable_after_turn", False):
                         _restore = getattr(self, "_pending_moa_restore_model", None) or {}
@@ -14197,7 +14216,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             time.sleep(0.15)
 
             # Update history with full conversation
-            self.conversation_history = result.get("messages", self.conversation_history) if result else self.conversation_history
+            if not heartbeat_warm or not (result or {}).get("silent_noop"):
+                self.conversation_history = result.get("messages", self.conversation_history) if result else self.conversation_history
 
             # If auto-compression fired mid-turn, the agent created a new
             # continuation session and mutated self.agent.session_id. Sync
@@ -14417,7 +14437,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
             # Play terminal bell when agent finishes (if enabled).
             # Works over SSH — the bell propagates to the user's terminal.
-            if self.bell_on_complete:
+            if self.bell_on_complete and not heartbeat_warm:
                 sys.stdout.write("\a")
                 sys.stdout.flush()
 
@@ -17342,6 +17362,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     is_completion_delivery = isinstance(
                         user_input, _CompletionDeliveryMessage
                     )
+                    is_heartbeat_warm = isinstance(user_input, _HeartbeatWarmMessage)
 
                     if not user_input:
                         continue
@@ -17440,8 +17461,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     paste_refs = list(_paste_ref_re.finditer(user_input)) if isinstance(user_input, str) else []
                     if paste_refs:
                         user_input = self._expand_paste_references(user_input)
-                    print()
-                    self._print_user_message_preview(user_input)
+                    if not is_heartbeat_warm:
+                        print()
+                        self._print_user_message_preview(user_input)
                     
                     # Show image attachment count
                     if submit_images:
@@ -17453,7 +17475,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     self._interactive_turn = True
                     self._pet_turn_error = False
                     self._pet_reasoning = False
-                    self._turn_summary_begin()
+                    if not is_heartbeat_warm:
+                        self._turn_summary_begin()
                     app.invalidate()  # Refresh status line
 
                     try:
@@ -17462,6 +17485,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             images=submit_images or None,
                             voice_input=is_voice_input,
                             completion_delivery=is_completion_delivery,
+                            heartbeat_warm=is_heartbeat_warm,
                         )
                     finally:
                         self._agent_running = False
@@ -17474,7 +17498,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         # Post-turn accounting line (display.turn_summary).
                         # Emitted after the response box, before the prompt
                         # returns, so it reads as a footer for the turn.
-                        self._turn_summary_emit()
+                        if not is_heartbeat_warm:
+                            self._turn_summary_emit()
                         self._interactive_turn = False
 
                         app.invalidate()  # Refresh status line

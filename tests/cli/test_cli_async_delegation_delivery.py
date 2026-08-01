@@ -2,7 +2,7 @@
 
 import queue
 
-from cli import HermesCLI, _CompletionDeliveryMessage
+from cli import HermesCLI, _CompletionDeliveryMessage, _HeartbeatWarmMessage
 
 
 def test_cli_completion_drain_uses_visible_session_identity(monkeypatch):
@@ -122,4 +122,40 @@ def test_cli_numeric_completion_queues_model_nudge_and_none_queues_nothing(
     assert isinstance(prompt, _CompletionDeliveryMessage)
     assert "Background process proc-done completed normally" in prompt
     assert "If no user-visible action is needed, emit no response." in prompt
+    assert cli._pending_input.empty()
+
+
+def test_cli_heartbeat_routes_only_to_owner_as_silent_warm_turn(monkeypatch):
+    from tools.process_registry import ProcessRegistry
+
+    cli = HermesCLI.__new__(HermesCLI)
+    cli.session_id = "visible-session"
+    cli._pending_input = queue.Queue()
+    cli._session_db = None
+    registry = ProcessRegistry()
+    monkeypatch.setattr("tools.process_registry.process_registry", registry)
+    monkeypatch.setattr(
+        "tools.async_delegation.claim_event_delivery",
+        lambda _event, _consumer: "claim-token",
+    )
+    monkeypatch.setattr(
+        "tools.async_delegation.complete_event_delivery", lambda *_args: None
+    )
+    registry.completion_queue.put(
+        {
+            "type": "heartbeat",
+            "target_id": "proc-heartbeat",
+            "target_kind": "process",
+            "session_id": "proc-heartbeat",
+            "session_key": "visible-session",
+            "status": "ALIVE",
+            "evidence": "output grew",
+        }
+    )
+
+    cli._drain_process_notifications("cli-idle")
+
+    prompt = cli._pending_input.get_nowait()
+    assert isinstance(prompt, _HeartbeatWarmMessage)
+    assert "proc-heartbeat" in prompt
     assert cli._pending_input.empty()

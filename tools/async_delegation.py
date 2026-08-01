@@ -803,6 +803,9 @@ def dispatch_async_delegation(
     dict
         ``{"status": "dispatched", "delegation_id": ...}`` on success.
     """
+    from tools.runtime_heartbeat import preflight_current_heartbeat
+
+    heartbeat_interval = preflight_current_heartbeat()
     delegation_id = _new_delegation_id()
     dispatched_at = time.time()
     record: Dict[str, Any] = {
@@ -872,6 +875,18 @@ def dispatch_async_delegation(
             "status": "rejected",
             "error": f"Failed to schedule async delegation: {exc}",
         }
+    from tools.runtime_heartbeat import inspect_delegation, runtime_heartbeat
+
+    runtime_heartbeat.arm(
+        delegation_id,
+        caller_id=session_key,
+        kind="delegation",
+        interval=heartbeat_interval,
+        inspect=lambda _id=delegation_id: inspect_delegation(_id),
+    )
+    if progress_fn is not None:
+        _ensure_stale_monitor()
+
     logger.info(
         "Dispatched async delegation %s (session_key=%s): %s",
         delegation_id, session_key or "<cli>", (goal or "")[:80],
@@ -921,6 +936,17 @@ def _begin_finalization(
         on_not_started = record.pop("_on_not_started", None)
         event_record = dict(record)
         _admission_condition.notify_all()
+
+    try:
+        from tools.runtime_heartbeat import runtime_heartbeat
+
+        runtime_heartbeat.cancel(delegation_id)
+    except Exception:
+        logger.debug(
+            "Failed to cancel heartbeat for delegation %s",
+            delegation_id,
+            exc_info=True,
+        )
 
     return event_record, interrupt_fn, on_not_started
 
@@ -1041,6 +1067,9 @@ def dispatch_async_delegation_batch(
     runner admission remains off the foreground thread. If no runner takes
     ownership, ``on_not_started`` receives the terminal status exactly once.
     """
+    from tools.runtime_heartbeat import preflight_current_heartbeat
+
+    heartbeat_interval = preflight_current_heartbeat()
     delegation_id = delegation_id or _new_delegation_id()
     dispatched_at = time.time()
     n = len(goals)
@@ -1121,6 +1150,18 @@ def dispatch_async_delegation_batch(
             "status": "rejected",
             "error": f"Failed to schedule async delegation batch: {exc}",
         }
+    from tools.runtime_heartbeat import inspect_delegation, runtime_heartbeat
+
+    runtime_heartbeat.arm(
+        delegation_id,
+        caller_id=session_key,
+        kind="delegation",
+        interval=heartbeat_interval,
+        inspect=lambda _id=delegation_id: inspect_delegation(_id),
+    )
+    if progress_fn is not None:
+        _ensure_stale_monitor()
+
     logger.info(
         "Dispatched async delegation batch %s (%d task(s), session_key=%s)",
         delegation_id, n, session_key or "<cli>",
@@ -1518,6 +1559,13 @@ def _interrupt_record(delegation_id: str, reason: str) -> bool:
         interrupt_fn = record.get("interrupt_fn")
         is_batch = bool(record.get("is_batch"))
 
+    try:
+        from tools.runtime_heartbeat import runtime_heartbeat
+
+        runtime_heartbeat.cancel(delegation_id)
+    except Exception:
+        logger.debug("Could not cancel delegation heartbeat", exc_info=True)
+
     if callable(interrupt_fn):
         try:
             interrupt_fn()
@@ -1624,3 +1672,9 @@ def _reset_for_tests() -> None:
         _pending_admission_ids.clear()
         _admission_cap = 0
         _admission_condition.notify_all()
+    try:
+        from tools.runtime_heartbeat import runtime_heartbeat
+
+        runtime_heartbeat.cancel_all()
+    except Exception:
+        pass

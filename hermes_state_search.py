@@ -392,7 +392,7 @@ class SessionSearchMixin:
             # uses executescript(), which implicitly commits any pending
             # transaction and must not run inside _execute_write's BEGIN
             # IMMEDIATE. Sets fresh backfill markers on a populated DB.
-            with self._lock:
+            with self._write_guard():
                 self._ensure_fts_cjk_schema(self._conn)
                 self._conn.commit()
 
@@ -734,7 +734,7 @@ class SessionSearchMixin:
         # legacy work left, tokenizer newly installed): ensure the table +
         # markers exist so the backfill phase has work to claim.
         if self._fts_cjk_loaded:
-            with self._lock:
+            with self._write_guard():
                 self._ensure_fts_cjk_schema(self._conn)
                 self._conn.commit()
 
@@ -822,7 +822,7 @@ class SessionSearchMixin:
         if vacuum:
             _emit("vacuum")
             try:
-                with self._lock:
+                with self._write_guard():
                     self._conn.execute("VACUUM")
                 vacuum_ok = True
             except sqlite3.OperationalError as exc:
@@ -839,7 +839,7 @@ class SessionSearchMixin:
             # the file; use :meth:`logical_size_bytes`, which is truthful
             # immediately regardless of readers.
             try:
-                with self._lock:
+                with self._write_guard(patience_s=0.0):
                     self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             except Exception as exc:
                 logger.debug(
@@ -2109,10 +2109,11 @@ class SessionSearchMixin:
         Returns the number of FTS indexes that were optimized.
         """
         optimized = 0
-        with self._lock:
-            for tbl in self._FTS_TABLES:
+        for tbl in self._FTS_TABLES:
+            with self._lock:
                 if not self._fts_table_exists(tbl):
                     continue
+            with self._write_guard():
                 try:
                     # The column name in the INSERT must match the table name
                     # for FTS5 special commands.
@@ -2140,10 +2141,11 @@ class SessionSearchMixin:
         Returns the number of FTS indexes that were rebuilt.
         """
         rebuilt = 0
-        with self._lock:
-            for tbl in self._FTS_TABLES:
+        for tbl in self._FTS_TABLES:
+            with self._lock:
                 if not self._fts_table_exists(tbl):
                     continue
+            with self._write_guard():
                 try:
                     self._conn.execute(
                         f"INSERT INTO {tbl}({tbl}) VALUES('rebuild')"
@@ -2203,20 +2205,22 @@ class SessionSearchMixin:
             raise ValueError("max_commands must be greater than zero")
 
         executed = 0
-        with self._lock:
-            for tbl in self._FTS_TABLES:
+        for tbl in self._FTS_TABLES:
+            with self._lock:
                 if not self._fts_table_exists(tbl):
                     continue
-                # One-time (per instance) usermerge floor; the value is
-                # persisted in the index's config shadow table so future
-                # connections inherit it. Setting config is a metadata-only
-                # write — it never touches segment data.
-                if not getattr(self, "_fts_usermerge_floor_applied", False):
+            # One-time (per instance) usermerge floor; the value is
+            # persisted in the index's config shadow table so future
+            # connections inherit it. Setting config is a metadata-only
+            # write — it never touches segment data.
+            if not getattr(self, "_fts_usermerge_floor_applied", False):
+                with self._write_guard():
                     self._conn.execute(
                         f"INSERT INTO {tbl}({tbl}, rank) "
                         "VALUES('usermerge', 2)"
                     )
-                for _ in range(max_commands):
+            for _ in range(max_commands):
+                with self._write_guard():
                     before = self._conn.total_changes
                     self._conn.execute(
                         f"INSERT INTO {tbl}({tbl}, rank) VALUES('merge', ?)",
@@ -2225,5 +2229,5 @@ class SessionSearchMixin:
                     executed += 1
                     if self._conn.total_changes - before < 2:
                         break
-            self._fts_usermerge_floor_applied = True
+        self._fts_usermerge_floor_applied = True
         return executed

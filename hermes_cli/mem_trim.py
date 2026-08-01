@@ -7,6 +7,7 @@ Behavior is configured under ``context.memory_trim`` in ``config.yaml``.
 
 from __future__ import annotations
 
+import atexit
 import ctypes
 import gc
 import logging
@@ -28,6 +29,7 @@ _last_trim_monotonic = 0.0
 _probe_done = False
 _malloc_trim: Callable[[int], int] | None = None
 _trim_call_count = 0
+_process_exit_trim_attempted = False
 
 
 def _config_settings() -> tuple[bool, float, int, float]:
@@ -37,9 +39,9 @@ def _config_settings() -> tuple[bool, float, int, float]:
     log_every_n: Any = _DEFAULT_LOG_EVERY_N
     info_log_min_delta_mb: Any = _DEFAULT_INFO_LOG_MIN_DELTA_MB
     try:
-        from hermes_cli.config import load_config
+        from hermes_cli.config import load_config_readonly
 
-        config = load_config() or {}
+        config = load_config_readonly() or {}
         context = config.get("context") if isinstance(config, dict) else None
         settings = context.get("memory_trim") if isinstance(context, dict) else None
         if isinstance(settings, dict):
@@ -162,7 +164,6 @@ def _probe_glibc_malloc_trim() -> Callable[[int], int] | None:
 
 def trim_memory(
     *,
-    force: bool = False,
     reason: str = "",
     cooldown_seconds: float | None = None,
 ) -> bool:
@@ -172,12 +173,24 @@ def trim_memory(
     Unsupported allocators, the config kill switch, cooldown suppression, and all
     runtime errors return ``False`` without affecting the caller.
     """
-    enabled, configured_cooldown, log_every_n, info_log_min_delta_mb = _config_settings()
-    if not enabled:
-        return False
+    return _trim_memory(reason=reason, cooldown_seconds=cooldown_seconds)
 
-    global _last_trim_monotonic, _trim_call_count
+
+def _trim_memory(
+    *,
+    process_exit: bool = False,
+    reason: str = "",
+    cooldown_seconds: float | None = None,
+) -> bool:
+    global _last_trim_monotonic, _process_exit_trim_attempted, _trim_call_count
     with _trim_lock:
+        if process_exit:
+            if _process_exit_trim_attempted:
+                return False
+            _process_exit_trim_attempted = True
+        enabled, configured_cooldown, log_every_n, info_log_min_delta_mb = _config_settings()
+        if not enabled:
+            return False
         trim = _probe_glibc_malloc_trim()
         if trim is None:
             return False
@@ -187,7 +200,7 @@ def trim_memory(
             if cooldown_seconds is None
             else _cooldown_seconds(cooldown_seconds)
         )
-        if not force and _last_trim_monotonic and now - _last_trim_monotonic < cooldown:
+        if not process_exit and _last_trim_monotonic and now - _last_trim_monotonic < cooldown:
             return False
         # Rate-limit failed libc attempts too; a broken allocator must not make
         # every turn boundary run a full collection.
@@ -202,7 +215,7 @@ def trim_memory(
             duration_ms = (time.perf_counter() - started) * 1000
             _trim_call_count += 1
             if released and _should_log_trim(
-                force=force,
+                force=process_exit,
                 log_every_n=log_every_n,
                 call_count=_trim_call_count,
                 before=before,
@@ -230,3 +243,11 @@ def trim_memory(
                 exc,
             )
             return False
+
+
+def _trim_memory_at_process_exit() -> bool:
+    """Run one forced trim only from the interpreter's real exit path."""
+    return _trim_memory(process_exit=True, reason="process exit")
+
+
+atexit.register(_trim_memory_at_process_exit)

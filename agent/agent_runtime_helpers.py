@@ -2404,9 +2404,8 @@ def _rebuild_request_overrides_for_runtime(
         try:
             from hermes_cli.models import resolve_fast_mode_overrides
 
-            agent.request_overrides.update(
-                resolve_fast_mode_overrides(agent.model) or {}
-            )
+            for key, value in (resolve_fast_mode_overrides(agent.model) or {}).items():
+                agent.request_overrides.setdefault(key, value)
         except Exception:
             logger.debug(
                 "fast-mode request override rebuild skipped on runtime switch",

@@ -25,6 +25,144 @@ def _clean_async_state(tmp_path, monkeypatch):
         process_registry.completion_queue.get_nowait()
 
 
+def _dispatch_batch(runner, capacity, *, session_key="owner", interrupt_fn=None):
+    return ad.dispatch_async_delegation_batch(
+        goals=["capacity test"],
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key=session_key,
+        runner=runner,
+        interrupt_fn=interrupt_fn,
+        max_async_children=capacity,
+    )
+
+
+def _observe_admission_wait(monkeypatch):
+    waiting = threading.Event()
+    original_wait = ad._admission_condition.wait
+
+    def observed_wait(*args, **kwargs):
+        waiting.set()
+        return original_wait(*args, **kwargs)
+
+    monkeypatch.setattr(ad._admission_condition, "wait", observed_wait)
+    return waiting
+
+
+def test_cap_growth_never_oversubscribes_executor_generations(monkeypatch):
+    release = threading.Event()
+    first_started = threading.Event()
+    second_started = threading.Event()
+    active = 0
+    max_active = 0
+    active_lock = threading.Lock()
+
+    def runner(started):
+        def run():
+            nonlocal active, max_active
+            with active_lock:
+                active += 1
+                max_active = max(max_active, active)
+            started.set()
+            assert release.wait(timeout=60)
+            with active_lock:
+                active -= 1
+            return {"results": []}
+
+        return run
+
+    first = _dispatch_batch(runner(first_started), 1)
+    assert first_started.wait(timeout=5)
+    second = _dispatch_batch(runner(second_started), 2)
+    assert second_started.wait(timeout=5)
+
+    waiting = _observe_admission_wait(monkeypatch)
+    third_started = threading.Event()
+    third = _dispatch_batch(runner(third_started), 2)
+    assert waiting.wait(timeout=5)
+
+    assert not third_started.is_set()
+    with active_lock:
+        assert active == max_active == 2
+    assert sorted(r["status"] for r in ad.list_async_delegations()) == [
+        "queued",
+        "running",
+        "running",
+    ]
+
+    release.set()
+    expected_ids = {
+        first["delegation_id"],
+        second["delegation_id"],
+        third["delegation_id"],
+    }
+    completed_ids = {
+        process_registry.completion_queue.get(timeout=5)["delegation_id"]
+        for _ in expected_ids
+    }
+    assert completed_ids == expected_ids
+    assert third_started.is_set()
+    assert max_active == 2
+
+
+def test_cap_decrease_waits_for_running_excess_to_finish(monkeypatch):
+    first_started = threading.Event()
+    second_started = threading.Event()
+    first_release = threading.Event()
+    second_release = threading.Event()
+    active = 0
+    active_lock = threading.Lock()
+
+    def occupying_runner(started, release):
+        def run():
+            nonlocal active
+            with active_lock:
+                active += 1
+            started.set()
+            assert release.wait(timeout=60)
+            with active_lock:
+                active -= 1
+            return {"results": []}
+
+        return run
+
+    first = _dispatch_batch(occupying_runner(first_started, first_release), 2)
+    second = _dispatch_batch(occupying_runner(second_started, second_release), 2)
+    assert first_started.wait(timeout=5)
+    assert second_started.wait(timeout=5)
+
+    waiting = _observe_admission_wait(monkeypatch)
+    third_started = threading.Event()
+    old_active_at_third_start = []
+
+    def third_runner():
+        with active_lock:
+            old_active_at_third_start.append(active)
+        third_started.set()
+        return {"results": []}
+
+    third = _dispatch_batch(third_runner, 1)
+    first_release.set()
+    assert waiting.wait(timeout=5)
+    assert not third_started.is_set()
+
+    second_release.set()
+    assert third_started.wait(timeout=5)
+    assert old_active_at_third_start == [0]
+    expected_ids = {
+        first["delegation_id"],
+        second["delegation_id"],
+        third["delegation_id"],
+    }
+    completed_ids = {
+        process_registry.completion_queue.get(timeout=5)["delegation_id"]
+        for _ in expected_ids
+    }
+    assert completed_ids == expected_ids
+
+
 @pytest.mark.parametrize(
     "tool_args, expected_count, capacity",
     [
@@ -138,67 +276,66 @@ def test_public_handler_queues_when_worker_capacity_is_saturated(
 
 @pytest.mark.parametrize("cancel_scope", ["stop", "session"])
 def test_cancel_queued_delegation_completes_once_without_starting_runner(
-    cancel_scope,
+    monkeypatch, cancel_scope,
 ):
-    occupied = threading.Event()
+    first_started = threading.Event()
+    second_started = threading.Event()
     release_occupied = threading.Event()
     queued_started = threading.Event()
     queued_interrupted = threading.Event()
 
-    def occupying_runner():
-        occupied.set()
-        assert release_occupied.wait(timeout=60)
-        return {"results": [{"status": "completed", "summary": "occupied done"}]}
+    def occupying_runner(started):
+        def run():
+            started.set()
+            assert release_occupied.wait(timeout=60)
+            return {"results": []}
 
-    first = ad.dispatch_async_delegation_batch(
-        goals=["occupy worker"],
-        context=None,
-        toolsets=None,
-        role="leaf",
-        model="m",
+        return run
+
+    first = _dispatch_batch(
+        occupying_runner(first_started),
+        1,
         session_key="other-owner",
-        runner=occupying_runner,
         interrupt_fn=release_occupied.set,
-        max_async_children=1,
     )
-    assert occupied.wait(timeout=5)
+    assert first_started.wait(timeout=5)
+    second = _dispatch_batch(
+        occupying_runner(second_started),
+        2,
+        session_key="other-owner",
+        interrupt_fn=release_occupied.set,
+    )
+    assert second_started.wait(timeout=5)
 
-    queued = ad.dispatch_async_delegation_batch(
-        goals=["cancel before admission"],
-        context=None,
-        toolsets=None,
-        role="leaf",
-        model="m",
+    waiting = _observe_admission_wait(monkeypatch)
+    queued = _dispatch_batch(
+        lambda: queued_started.set() or {"results": []},
+        2,
         session_key="queued-owner",
-        runner=lambda: queued_started.set() or {"results": []},
         interrupt_fn=queued_interrupted.set,
-        max_async_children=1,
     )
     assert queued["status"] == "dispatched"
+    assert waiting.wait(timeout=5)
 
     if cancel_scope == "stop":
-        assert ad.interrupt_all(reason="/stop") == 2
+        assert ad.interrupt_all(reason="/stop") == 3
     else:
         assert ad.interrupt_for_session(session_key="queued-owner", reason="test") == 1
     assert queued_interrupted.is_set()
-    event = process_registry.completion_queue.get(timeout=5)
-    if cancel_scope == "stop":
-        other = process_registry.completion_queue.get(timeout=5)
-        events = {
-            event["delegation_id"]: event,
-            other["delegation_id"]: other,
-        }
-        assert events[queued["delegation_id"]]["status"] == "interrupted"
-        assert first["delegation_id"] in events
-    else:
-        assert event["delegation_id"] == queued["delegation_id"]
-        assert event["status"] == "interrupted"
     assert not queued_started.is_set()
 
     release_occupied.set()
-    if cancel_scope == "session":
-        first_event = process_registry.completion_queue.get(timeout=5)
-        assert first_event["delegation_id"] == first["delegation_id"]
+    expected_ids = {
+        first["delegation_id"],
+        second["delegation_id"],
+        queued["delegation_id"],
+    }
+    events = {}
+    for _ in expected_ids:
+        event = process_registry.completion_queue.get(timeout=5)
+        events[event["delegation_id"]] = event
+    assert events.keys() == expected_ids
+    assert events[queued["delegation_id"]]["status"] == "interrupted"
     with pytest.raises(queue.Empty):
         process_registry.completion_queue.get(timeout=0.2)
     assert not queued_started.is_set()

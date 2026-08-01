@@ -251,8 +251,11 @@ class TestRunConversationCodexPath:
                 allow_silent_noop=True,
             )
 
-        assert result["final_response"] == "echo: [HEARTBEAT] inspect target"
+        assert result["final_response"].startswith(
+            "echo: [HEARTBEAT] inspect target"
+        )
         assert any(message.get("role") == "tool" for message in result["messages"])
+        assert result["messages"][0]["content"] == "[HEARTBEAT] inspect target"
         assert agent._user_turn_count == 9
         assert agent._turns_since_memory == 4
         assert agent._iters_since_skill == 5
@@ -263,7 +266,10 @@ class TestRunConversationCodexPath:
     def test_empty_successful_heartbeat_returns_structured_silent_noop(
         self, monkeypatch
     ):
+        wire_inputs = []
+
         def empty_turn(self, user_input: str, **kwargs):
+            wire_inputs.append(user_input)
             return TurnResult(
                 final_text="",
                 projected_messages=[],
@@ -294,6 +300,11 @@ class TestRunConversationCodexPath:
         assert result["final_response"] == ""
         assert result["messages"] == history
         assert agent._session_messages == history
+        from agent.conversation_loop import _INTERNAL_NOOP_EPHEMERAL_SUFFIX
+
+        assert wire_inputs == [
+            "[HEARTBEAT] target remains ALIVE" + _INTERNAL_NOOP_EPHEMERAL_SUFFIX
+        ]
 
     def test_heartbeat_app_server_failure_keeps_visible_recovery_text(
         self, monkeypatch

@@ -709,8 +709,14 @@ def run_codex_app_server_turn(
     # standard run_conversation() flow (line ~11823) before the early
     # return reaches us. Do NOT append again — that would duplicate.
 
+    wire_user_message = user_message
+    if turn_origin == "heartbeat_warm" and allow_silent_noop:
+        from agent.conversation_loop import _INTERNAL_NOOP_EPHEMERAL_SUFFIX
+
+        if _INTERNAL_NOOP_EPHEMERAL_SUFFIX not in wire_user_message:
+            wire_user_message += _INTERNAL_NOOP_EPHEMERAL_SUFFIX
     try:
-        turn = agent._codex_session.run_turn(user_input=user_message)
+        turn = agent._codex_session.run_turn(user_input=wire_user_message)
     except Exception as exc:
         logger.exception("codex app-server turn failed")
         # Crash → unconditionally drop the session so the next turn

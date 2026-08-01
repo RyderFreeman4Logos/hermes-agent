@@ -31,6 +31,8 @@ import time
 import types
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 
 def _make_cli():
     """Build a HermesCLI with prompt_toolkit stubbed (same pattern as
@@ -152,6 +154,55 @@ def test_unacknowledged_interrupt_message_is_requeued_not_dropped():
     # instantly self-abort at its first _interrupt_requested check.
     assert agent._interrupt_requested is False
     assert agent.clear_calls >= 1
+
+
+@pytest.mark.parametrize("api_mode", ["chat_completions", "codex_app_server"])
+def test_acknowledged_heartbeat_interrupt_is_cleared_before_requeue(api_mode):
+    cli = _make_cli()
+
+    class HeartbeatAgent(_StubAgent):
+        def run_conversation(self, **kwargs):
+            assert kwargs["turn_origin"] == "heartbeat_warm"
+            time.sleep(self.turn_seconds)
+            return {
+                "final_response": "",
+                "messages": [],
+                "api_calls": 1,
+                "completed": False,
+                "partial": True,
+                "interrupted": True,
+                "interrupt_message": self._interrupt_message,
+                "response_previewed": True,
+            }
+
+    class CheckingQueue(queue.Queue):
+        def put(self, item, *args, **kwargs):
+            assert agent._interrupt_requested is False
+            super().put(item, *args, **kwargs)
+
+    agent = HeartbeatAgent(cli.session_id)
+    agent.api_mode = api_mode
+    cli.agent = agent
+    cli._interrupt_queue = queue.Queue()
+    cli._pending_input = CheckingQueue()
+    cli._interrupt_queue.put("real user prompt")
+
+    with patch.object(cli, "_ensure_runtime_credentials", return_value=True), patch.object(
+        cli,
+        "_resolve_turn_agent_config",
+        return_value={
+            "signature": cli._active_agent_route_signature,
+            "model": None,
+            "runtime": None,
+            "request_overrides": None,
+        },
+    ), patch.object(cli, "_init_agent", return_value=True):
+        cli.chat("[HEARTBEAT] inspect target", heartbeat_warm=True)
+
+    assert cli._pending_input.get_nowait() == "real user prompt"
+    assert agent.clear_calls == 1
+    assert agent._interrupt_requested is False
+    assert cli.conversation_history == []
 
 
 def test_completion_delivery_chat_stages_ephemeral_user_message():

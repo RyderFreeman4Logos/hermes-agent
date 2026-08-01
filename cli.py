@@ -13982,6 +13982,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._last_turn_interrupted = _interrupted_this_turn
             if _interrupted_this_turn:
                 pending_message = result.get("interrupt_message") or interrupt_msg
+                if heartbeat_warm and pending_message and not agent_thread.is_alive():
+                    try:
+                        if getattr(self.agent, "_interrupt_requested", False):
+                            self.agent.clear_interrupt()
+                    except Exception:
+                        pass
                 # Add indicator that we were interrupted
                 if response and pending_message:
                     response = response + "\n\n---\n_[Interrupted - processing new message]_"

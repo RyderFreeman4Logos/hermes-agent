@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 
 def _config():
@@ -55,9 +58,10 @@ def _run(monkeypatch, *, preflight):
     monkeypatch.setattr("tools.process_registry.process_registry", registry)
     monkeypatch.setattr("tools.approval.get_current_session_key", lambda default="": "owner")
     monkeypatch.setattr("gateway.session_context.async_delivery_supported", lambda: True)
-    monkeypatch.setattr(
-        "tools.runtime_heartbeat.preflight_current_heartbeat", preflight
-    )
+    if preflight is not None:
+        monkeypatch.setattr(
+            "tools.runtime_heartbeat.preflight_current_heartbeat", preflight
+        )
     return json.loads(
         terminal_tool(
             command="sleep 30",
@@ -93,3 +97,59 @@ def test_terminal_arms_only_after_successful_spawn(monkeypatch):
     arm.assert_called_once()
     assert arm.call_args.kwargs["interval"] == 1700
     assert arm.call_args.kwargs["caller_id"] == "owner"
+
+
+@pytest.mark.parametrize(
+    ("providers_yaml", "expected_interval"),
+    [("      custom:pm: 1700\n", 1700), ("      custom: 1700\n", None)],
+)
+def test_real_config_binding_and_worker_preflight_before_spawn(
+    monkeypatch, tmp_path, providers_yaml, expected_interval
+):
+    from tools.runtime_heartbeat import (
+        bind_agent_provider,
+        reset_current_provider,
+        runtime_heartbeat,
+    )
+    from tools.thread_context import propagate_context_to_thread
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "runtime:\n"
+        "  heartbeat:\n"
+        "    enabled: true\n"
+        "    mode: per_target\n"
+        "  warm_kv_timeout:\n"
+        "    providers:\n"
+        f"{providers_yaml}",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    arm = MagicMock(return_value=True)
+    monkeypatch.setattr(runtime_heartbeat, "arm", arm)
+    agent = SimpleNamespace(
+        provider="custom",
+        requested_provider="custom:pm",
+        base_url="https://pm.invalid/v1",
+        model="gpt-5.4-mini",
+    )
+    token = bind_agent_provider(agent)
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            result, registry, proc = executor.submit(
+                propagate_context_to_thread(
+                    lambda: _run(monkeypatch, preflight=None)
+                )
+            ).result(timeout=5)
+    finally:
+        reset_current_provider(token)
+
+    if expected_interval is None:
+        assert "custom:pm" in result["error"]
+        registry.spawn_local.assert_not_called()
+        arm.assert_not_called()
+    else:
+        assert result["session_id"] == proc.id
+        registry.spawn_local.assert_called_once()
+        assert arm.call_args.kwargs["interval"] == expected_interval

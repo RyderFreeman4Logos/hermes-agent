@@ -21,6 +21,7 @@ import enum
 import contextvars
 import json
 import logging
+import shutil
 
 logger = logging.getLogger(__name__)
 import os
@@ -2971,6 +2972,7 @@ def delegate_task(
     # live_paths is empty and delegation proceeds exactly as before.
     from tools.delegation_live_log import (
         create_live_transcripts,
+        live_transcript_root,
         update_manifest_statuses,
         wrap_progress_callback,
     )
@@ -3438,8 +3440,17 @@ def delegate_task(
                 )
             return json.dumps(payload, ensure_ascii=False)
 
-        # Capacity is queued by the async registry. A submit failure is a
-        # scheduling error, not permission to occupy the foreground turn.
+        for _c in _child_agents:
+            try:
+                if hasattr(_c, "close"):
+                    _c.close()
+            except Exception:
+                logger.debug("Failed to close rejected delegation child", exc_info=True)
+        if live_deleg_id:
+            shutil.rmtree(live_transcript_root() / live_deleg_id, ignore_errors=True)
+
+        # A full backlog or submit failure is a scheduling error, not
+        # permission to occupy the foreground turn.
         return tool_error(dispatch.get("error", "Failed to schedule delegation."))
 
     # ----- Synchronous path -----

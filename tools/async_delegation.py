@@ -71,6 +71,10 @@ _executor_max_workers: int = 0
 _records_lock = threading.Lock()
 _admission_condition = threading.Condition(_records_lock)
 _admission_cap = 0
+# Accepted records that have not yet left the admission backlog. Keep this
+# separate from record status so a cancelled queued future still occupies its
+# bounded slot until the executor drains it.
+_pending_admission_ids: set[str] = set()
 # delegation_id -> record dict. Kept for the lifetime of the run plus a short
 # tail after completion so `list_async_delegations()` can show recent results.
 _records: Dict[str, Dict[str, Any]] = {}
@@ -80,6 +84,10 @@ _ACTIVE_STATUSES = frozenset(
 )
 
 _DEFAULT_MAX_ASYNC_CHILDREN = 3
+_BACKLOG_FULL_ERROR = (
+    "Async delegation capacity reached: the process-wide background backlog is full. "
+    "Wait for queued work to start before dispatching more."
+)
 # How many completed records to retain for status queries before pruning.
 _MAX_RETAINED_COMPLETED = 50
 _DURABLE_RETENTION_SECONDS = 7 * 24 * 60 * 60
@@ -547,6 +555,7 @@ def _admit_worker(delegation_id: str) -> bool:
         while True:
             record = _records.get(delegation_id)
             if record is None or record.get("status") != "queued":
+                _pending_admission_ids.discard(delegation_id)
                 return False
             running = sum(
                 1
@@ -554,10 +563,28 @@ def _admit_worker(delegation_id: str) -> bool:
                 if current.get("status") in ("running", "stalling")
             )
             if running < _admission_cap:
+                _pending_admission_ids.discard(delegation_id)
                 record["status"] = "running"
                 record["_progress_ts"] = time.time()
                 return True
             _admission_condition.wait()
+
+
+def _try_register_queued(record: Dict[str, Any]) -> bool:
+    """Atomically reserve one process-wide backlog slot for ``record``."""
+    delegation_id = record["delegation_id"]
+    with _records_lock:
+        running = sum(
+            1
+            for current in _records.values()
+            if current.get("status") in ("running", "stalling")
+        )
+        available_runner_slots = max(0, _admission_cap - running)
+        if len(_pending_admission_ids) >= _admission_cap + available_runner_slots:
+            return False
+        _pending_admission_ids.add(delegation_id)
+        _records[delegation_id] = record
+        return True
 
 
 def active_count() -> int:
@@ -750,8 +777,8 @@ def dispatch_async_delegation(
         stale-detection block at the top of this module). When omitted, the
         delegation is not monitored.
     max_async_children
-        Maximum number of runners admitted at once. Additional registered
-        delegations wait on the executor queue without blocking the caller.
+        Maximum number of runners admitted at once and queued registrations
+        retained process-wide. Excess registrations are rejected immediately.
 
     Returns
     -------
@@ -781,11 +808,14 @@ def dispatch_async_delegation(
         "_progress_ts": dispatched_at,
         "_interrupted_at": None,
     }
-    with _records_lock:
-        _records[delegation_id] = record
+    executor = _get_executor(max_async_children)
+    if not _try_register_queued(record):
+        return {
+            "status": "rejected",
+            "error": _BACKLOG_FULL_ERROR,
+        }
 
     _persist_dispatch(record)
-    executor = _get_executor(max_async_children)
 
     def _worker() -> None:
         if not _admit_worker(delegation_id):
@@ -817,6 +847,7 @@ def dispatch_async_delegation(
     except Exception as exc:  # pragma: no cover — pool submit failure is rare
         with _records_lock:
             _records.pop(delegation_id, None)
+            _pending_admission_ids.discard(delegation_id)
         _delete_durable_delegation(delegation_id)
         return {
             "status": "rejected",
@@ -978,7 +1009,8 @@ def dispatch_async_delegation_batch(
     they run.
 
     Returns ``{"status": "dispatched", "delegation_id": ...}`` after the
-    batch is registered. Executor capacity only controls when its runner starts.
+    batch is registered. Excess process-wide backlog is rejected immediately;
+    runner admission remains off the foreground thread.
     """
     delegation_id = delegation_id or _new_delegation_id()
     dispatched_at = time.time()
@@ -1009,11 +1041,14 @@ def dispatch_async_delegation_batch(
         "_progress_ts": dispatched_at,
         "_interrupted_at": None,
     }
-    with _records_lock:
-        _records[delegation_id] = record
+    executor = _get_executor(max_async_children)
+    if not _try_register_queued(record):
+        return {
+            "status": "rejected",
+            "error": _BACKLOG_FULL_ERROR,
+        }
 
     _persist_dispatch(record)
-    executor = _get_executor(max_async_children)
 
     def _worker() -> None:
         if not _admit_worker(delegation_id):
@@ -1050,6 +1085,7 @@ def dispatch_async_delegation_batch(
     except Exception as exc:  # pragma: no cover
         with _records_lock:
             _records.pop(delegation_id, None)
+            _pending_admission_ids.discard(delegation_id)
         _delete_durable_delegation(delegation_id)
         return {
             "status": "rejected",
@@ -1553,5 +1589,6 @@ def _reset_for_tests() -> None:
         thread.join(timeout=2)
     with _admission_condition:
         _records.clear()
+        _pending_admission_ids.clear()
         _admission_cap = 0
         _admission_condition.notify_all()

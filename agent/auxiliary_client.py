@@ -3774,6 +3774,7 @@ def _evict_cached_client_instance(target: Any) -> bool:
     """
     if target is None:
         return False
+    target = getattr(target, "_real_client", target)
     evicted = False
     with _client_cache_lock:
         for key in list(_client_cache.keys()):
@@ -3929,6 +3930,7 @@ def _retry_same_provider_sync(
     effective_extra_body: dict,
     reasoning_config: Optional[dict],
     extra_headers: Optional[Dict[str, str]] = None,
+    client_ref: Optional[list] = None,
 ) -> Any:
     if task == "vision":
         _, retry_client, retry_model = resolve_vision_provider_client(
@@ -3951,6 +3953,8 @@ def _retry_same_provider_sync(
         raise RuntimeError(
             f"Auxiliary {task or 'call'}: provider {resolved_provider} could not be rebuilt after recovery"
         )
+    if client_ref is not None:
+        client_ref[0] = retry_client
 
     retry_base = str(getattr(retry_client, "base_url", "") or "")
     retry_kwargs = _build_call_kwargs(
@@ -3992,6 +3996,7 @@ async def _retry_same_provider_async(
     resolved_base_url: Optional[str],
     resolved_api_key: Optional[str],
     resolved_api_mode: Optional[str],
+    main_runtime: Optional[Dict[str, Any]],
     final_model: Optional[str],
     messages: list,
     temperature: Optional[float],
@@ -4001,6 +4006,7 @@ async def _retry_same_provider_async(
     effective_extra_body: dict,
     reasoning_config: Optional[dict],
     extra_headers: Optional[Dict[str, str]] = None,
+    client_ref: Optional[list] = None,
 ) -> Any:
     if task == "vision":
         _, retry_client, retry_model = resolve_vision_provider_client(
@@ -4009,6 +4015,7 @@ async def _retry_same_provider_async(
             base_url=resolved_base_url,
             api_key=resolved_api_key,
             async_mode=True,
+            main_runtime=main_runtime,
         )
     else:
         retry_client, retry_model = _get_cached_client(
@@ -4018,11 +4025,14 @@ async def _retry_same_provider_async(
             base_url=resolved_base_url,
             api_key=resolved_api_key,
             api_mode=resolved_api_mode,
+            main_runtime=main_runtime,
         )
     if retry_client is None:
         raise RuntimeError(
             f"Auxiliary {task or 'call'}: provider {resolved_provider} could not be rebuilt after recovery"
         )
+    if client_ref is not None:
+        client_ref[0] = retry_client
 
     retry_base = str(getattr(retry_client, "base_url", "") or "")
     retry_kwargs = _build_call_kwargs(
@@ -4816,6 +4826,7 @@ def _try_configured_fallbacks_sync(
                     client, model = _resolve_fallback_entry(entry)
                     if client is None:
                         break
+        _evict_cached_client_instance(client)
 
 
 async def _try_configured_fallbacks_async(
@@ -4880,6 +4891,7 @@ async def _try_configured_fallbacks_async(
                     client, model = _to_async_client(
                         client, model or "", is_vision=(task == "vision"),
                     )
+        _evict_cached_client_instance(client)
 
 
 def _try_configured_fallback_for_unavailable_client(
@@ -4924,11 +4936,11 @@ def _resolve_fallback_entry(entry: Dict[str, Any]) -> Tuple[Optional[Any], Optio
     base_url = str(entry.get("base_url") or "").strip() or None
     api_key = _fallback_entry_api_key(entry)
     api_mode = str(entry.get("api_mode") or entry.get("transport") or "").strip() or None
-    return resolve_provider_client(
+    return _get_cached_client(
         provider,
         model=model,
-        explicit_base_url=base_url,
-        explicit_api_key=api_key,
+        base_url=base_url,
+        api_key=api_key,
         api_mode=api_mode,
     )
 
@@ -8281,6 +8293,7 @@ def call_llm(
     configured_retry_provider = None
     configured_recovery_attempted = False
     configured_primary_should_evict = False
+    configured_primary_client = [client]
     try:
         # Retry on the same provider for a transient transport blip
         # (connection reset / streaming-close / incomplete chunked read / 5xx /
@@ -8381,6 +8394,7 @@ def call_llm(
                             effective_extra_body=effective_extra_body,
                             reasoning_config=reasoning_config,
                             extra_headers=extra_headers,
+                            client_ref=configured_primary_client,
                         )
                     return _validate_llm_response(
                         _relay_sync_completion(
@@ -8429,11 +8443,9 @@ def call_llm(
     except Exception as first_err:
         if configured_chain:
             original_primary_err = original_primary_err or first_err
-            if configured_primary_should_evict:
+            if configured_primary_should_evict or configured_recovery_attempted:
                 try:
-                    _evict_cached_client_instance(
-                        getattr(client, "_real_client", client)
-                    )
+                    _evict_cached_client_instance(configured_primary_client[0])
                 except Exception:
                     logger.debug(
                         "Auxiliary: configured primary cache eviction failed",
@@ -9046,6 +9058,7 @@ async def async_call_llm(
     configured_retry_provider = None
     configured_recovery_attempted = False
     configured_primary_should_evict = False
+    configured_primary_client = [client]
     try:
         # Retry ONCE on the same provider for a transient transport blip
         # before the except-chain escalates to fallback — see call_llm()
@@ -9119,6 +9132,7 @@ async def async_call_llm(
                             resolved_base_url=resolved_base_url,
                             resolved_api_key=resolved_api_key,
                             resolved_api_mode=resolved_api_mode,
+                            main_runtime=main_runtime,
                             final_model=final_model,
                             messages=messages,
                             temperature=temperature,
@@ -9127,6 +9141,7 @@ async def async_call_llm(
                             effective_timeout=effective_timeout,
                             effective_extra_body=effective_extra_body,
                             reasoning_config=reasoning_config,
+                            client_ref=configured_primary_client,
                         )
                     return _validate_llm_response(
                         await _relay_async_completion(
@@ -9166,11 +9181,9 @@ async def async_call_llm(
     except Exception as first_err:
         if configured_chain:
             original_primary_err = original_primary_err or first_err
-            if configured_primary_should_evict:
+            if configured_primary_should_evict or configured_recovery_attempted:
                 try:
-                    _evict_cached_client_instance(
-                        getattr(client, "_real_client", client)
-                    )
+                    _evict_cached_client_instance(configured_primary_client[0])
                 except Exception:
                     logger.debug(
                         "Auxiliary (async): configured primary cache eviction failed",
@@ -9368,6 +9381,7 @@ async def async_call_llm(
                     resolved_base_url=resolved_base_url,
                     resolved_api_key=resolved_api_key,
                     resolved_api_mode=resolved_api_mode,
+                    main_runtime=main_runtime,
                     final_model=final_model,
                     messages=messages,
                     temperature=temperature,
@@ -9411,6 +9425,7 @@ async def async_call_llm(
                         resolved_base_url=resolved_base_url,
                         resolved_api_key=resolved_api_key,
                         resolved_api_mode=resolved_api_mode,
+                        main_runtime=main_runtime,
                         final_model=final_model,
                         messages=messages,
                         temperature=temperature,

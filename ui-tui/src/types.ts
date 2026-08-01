@@ -119,6 +119,7 @@ export interface Msg {
   panelData?: PanelData
   role: Role
   text: string
+  tone?: ActivityItem['tone']
   thinking?: string
   // MoA reference-model output stored in `thinking` (see turnController's
   // recordMoaReference): unlike ordinary model reasoning, this is the

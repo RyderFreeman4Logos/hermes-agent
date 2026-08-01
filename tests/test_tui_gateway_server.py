@@ -7778,6 +7778,43 @@ def test_compress_session_history_passes_force():
     assert agent._compress_context.call_args.kwargs.get("force") is True
 
 
+def test_compress_session_history_restores_cache_attribution_on_outer_rollback():
+    original = [
+        {"role": "user", "content": "one"},
+        {"role": "assistant", "content": "two"},
+        {"role": "user", "content": "three"},
+        {"role": "assistant", "content": "four"},
+    ]
+    current = [*original, {"role": "user", "content": "typed during compression"}]
+    compressor = types.SimpleNamespace(awaiting_real_usage_after_compression=False)
+    agent = types.SimpleNamespace(
+        _awaiting_cache_usage_after_compression=False,
+        _compression_skipped_due_to_lock=False,
+        context_compressor=compressor,
+    )
+
+    def compress(*_args, **_kwargs):
+        compressor.awaiting_real_usage_after_compression = True
+        agent._awaiting_cache_usage_after_compression = True
+        return ([{"role": "user", "content": "summary"}], "")
+
+    agent._compress_context = compress
+    session = _session(agent=agent, history=current, history_version=2)
+
+    with patch.object(server, "_get_usage", return_value={}):
+        removed, _usage = server._compress_session_history(
+            session,
+            approx_tokens=100,
+            before_messages=original,
+            history_version=1,
+        )
+
+    assert removed == 0
+    assert session["history"] == current
+    assert compressor.awaiting_real_usage_after_compression is False
+    assert agent._awaiting_cache_usage_after_compression is False
+
+
 def test_compress_session_history_works_when_auto_compaction_disabled():
     """compression.enabled: false disables *automatic* compaction only —
     manual /compress must still work on every TUI route (session.compress
@@ -16734,7 +16771,13 @@ def test_prompt_submit_releases_old_history_before_heap_trim(monkeypatch):
         assert cleanup_order == ["trim", "reset_home"]
     finally:
         server._sessions.pop("sid_trim", None)
-def test_tui_cache_callback_emits_first_call_cache_status():
+
+
+@pytest.mark.parametrize(
+    ("pct", "kind"),
+    [(94, "error"), (95, "cache_hit")],
+)
+def test_tui_cache_callback_uses_95_percent_error_boundary(pct, kind):
     class _Agent:
         pass
 
@@ -16746,10 +16789,41 @@ def test_tui_cache_callback_emits_first_call_cache_status():
         lambda event_type, sid, payload: emitted.append((event_type, sid, payload)),
     ):
         assert server._attach_tui_cache_callback(agent, "cache-sid") is agent
-        agent._tui_cache_callback("hit", 87, 1_740, 2_000)
+        getattr(agent, "_tui_cache_callback")("hit", pct, pct * 20, 2_000)
 
     assert emitted == [
-        ("status.update", "cache-sid", {"kind": "cache_hit", "text": "cache 87%"})
+        ("status.update", "cache-sid", {"kind": kind, "text": f"cache {pct}%"})
+    ]
+
+
+def test_tui_cache_callback_labels_post_compression_usage():
+    class _Agent:
+        _first_turn_usage = {
+            "cache_attribution": "post_compression",
+            "cache_read_tokens": 1_880,
+            "cache_write_tokens": 0,
+            "prompt_tokens": 2_000,
+        }
+
+    agent = _Agent()
+    emitted: list[tuple[str, str, dict]] = []
+    with patch.object(
+        server,
+        "_emit",
+        lambda event_type, sid, payload: emitted.append((event_type, sid, payload)),
+    ):
+        server._attach_tui_cache_callback(agent, "cache-sid")
+        getattr(agent, "_tui_cache_callback")("hit", 94, 1_880, 2_000)
+
+    assert emitted == [
+        (
+            "status.update",
+            "cache-sid",
+            {
+                "kind": "error",
+                "text": "cache 94% · post-compression cold prefix (expected)",
+            },
+        )
     ]
 
 
@@ -16765,6 +16839,25 @@ def test_cache_info_classifies_first_call_usage():
         "prompt_tokens": 2_000,
         "pct": 87,
         "state": "hit",
+        "level": "error",
+    }
+
+
+def test_cache_info_attributes_post_compression_usage():
+    assert server._cache_info_from_usage(
+        {
+            "cache_attribution": "post_compression",
+            "cache_read_tokens": 1_900,
+            "cache_write_tokens": 0,
+            "prompt_tokens": 2_000,
+        }
+    ) == {
+        "attribution": "post_compression",
+        "read_tokens": 1_900,
+        "prompt_tokens": 2_000,
+        "pct": 95,
+        "state": "hit",
+        "level": "info",
     }
 
 

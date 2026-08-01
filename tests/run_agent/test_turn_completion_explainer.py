@@ -26,6 +26,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from agent.context_engine import ContextEngine
 from agent.copilot_acp_client import CopilotACPClient
 from run_agent import AIAgent
 
@@ -464,14 +465,21 @@ def test_heartbeat_does_not_consume_user_maintenance_triggers(heartbeat_event):
     review.assert_called_once()
 
 
-def test_first_api_call_reports_cache_hit_to_tui_callback():
+@pytest.mark.parametrize(
+    ("cached_tokens", "expected_pct", "should_be_red"),
+    [(1_880, 94, True), (1_900, 95, False)],
+)
+def test_first_api_call_reports_cache_hit_to_tui_callback(
+    cached_tokens, expected_pct, should_be_red
+):
     agent = _make_agent(max_iterations=10)
+    agent.quiet_mode = False
     response = _mock_response(content="Done.", finish_reason="stop")
     response.usage = SimpleNamespace(
         prompt_tokens=2_000,
         completion_tokens=10,
         total_tokens=2_010,
-        prompt_tokens_details=SimpleNamespace(cached_tokens=1_740),
+        prompt_tokens_details=SimpleNamespace(cached_tokens=cached_tokens),
     )
     agent.client.chat.completions.create.side_effect = [response]
     cache_events = []
@@ -483,11 +491,138 @@ def test_first_api_call_reports_cache_hit_to_tui_callback():
         patch.object(agent, "_persist_session"),
         patch.object(agent, "_save_trajectory"),
         patch.object(agent, "_cleanup_task_resources"),
+        patch.object(agent, "_vprint") as vprint,
     ):
         result = agent.run_conversation("do something")
 
     assert result["final_response"] == "Done."
-    assert cache_events == [("hit", 87, 1_740, 2_000)]
+    assert cache_events == [("hit", expected_pct, cached_tokens, 2_000)]
+    assert "cache_attribution" not in agent._first_turn_usage
+    cache_lines = [
+        call.args[0] for call in vprint.call_args_list if "💾 Cache:" in call.args[0]
+    ]
+    assert len(cache_lines) == 1
+    red_pct = f"\033[31m{expected_pct}%\033[0m"
+    assert (red_pct in cache_lines[0]) is should_be_red
+    assert "post-compression cold prefix" not in cache_lines[0]
+
+
+def test_post_compression_cache_attribution_survives_retry_then_clears():
+    class _RateLimitError(Exception):
+        status_code = 429
+
+        def __str__(self):
+            return "Error code: 429 - Rate limit exceeded."
+
+    class _NoOpContextEngine(ContextEngine):
+        @property
+        def name(self):
+            return "no-op"
+
+        def update_from_response(self, usage):
+            pass
+
+        def should_compress(self, prompt_tokens=None):
+            return False
+
+        def compress(
+            self,
+            messages,
+            current_tokens=None,
+            focus_topic=None,
+            force=False,
+            memory_context="",
+        ):
+            return messages
+
+    def response(cached_tokens: int | None, *, tool_id: str = "", content: str = ""):
+        tool_calls = []
+        if tool_id:
+            tool_calls = [
+                SimpleNamespace(
+                    id=tool_id,
+                    type="function",
+                    function=SimpleNamespace(name="noop", arguments="{}"),
+                )
+            ]
+        result = _mock_response(
+            content=content,
+            finish_reason="tool_calls" if tool_id else "stop",
+            tool_calls=tool_calls,
+        )
+        if cached_tokens is not None:
+            result.usage = SimpleNamespace(
+                prompt_tokens=2_000,
+                completion_tokens=10,
+                total_tokens=2_010,
+                prompt_tokens_details=SimpleNamespace(cached_tokens=cached_tokens),
+            )
+        return result
+
+    agent = _make_agent(max_iterations=10)
+    agent.quiet_mode = False
+    agent.tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "noop",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+    agent.valid_tool_names = {"noop"}
+    engine = _NoOpContextEngine()
+    setattr(agent, "context_compressor", engine)
+    agent.client.chat.completions.create.side_effect = [
+        response(2_000, tool_id="before"),
+        _RateLimitError(),
+        response(None, tool_id="no-usage"),
+        response(1_880, tool_id="after"),
+        response(1_900, content="Done."),
+    ]
+    cache_usage = []
+    agent._tui_cache_callback = lambda *_args: cache_usage.append(
+        dict(agent._first_turn_usage or {})
+    )
+    executions = 0
+
+    def execute_tools(assistant_message, messages, _task_id, _api_call_count):
+        nonlocal executions
+        call_id = assistant_message.tool_calls[0].id
+        messages.append({"role": "tool", "tool_call_id": call_id, "content": "ok"})
+        if executions == 0:
+            setattr(agent, "_awaiting_cache_usage_after_compression", True)
+        executions += 1
+
+    with (
+        patch("run_agent.time.sleep", return_value=None),
+        patch.object(agent, "_execute_tool_calls", side_effect=execute_tools),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch.object(agent, "_vprint") as vprint,
+    ):
+        result = agent.run_conversation("work")
+
+    assert result["final_response"] == "Done."
+    assert executions == 3
+    assert len(cache_usage) == 2
+    assert "cache_attribution" not in cache_usage[0]
+    assert cache_usage[1]["cache_attribution"] == "post_compression"
+    assert cache_usage[1]["cache_read_tokens"] == 1_880
+    assert agent._first_turn_usage == cache_usage[1]
+    assert getattr(agent, "_awaiting_cache_usage_after_compression") is False
+    assert not hasattr(engine, "awaiting_real_usage_after_compression")
+    assert agent.client.chat.completions.create.call_count == 5
+    cache_lines = [
+        call.args[0] for call in vprint.call_args_list if "💾 Cache:" in call.args[0]
+    ]
+    assert len(cache_lines) == 3
+    assert ["post-compression cold prefix (expected)" in line for line in cache_lines] == [
+        False,
+        True,
+        False,
+    ]
 
 
 def test_run_conversation_partial_stream_recovery_surfaces_explanation():

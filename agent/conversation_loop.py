@@ -38,7 +38,7 @@ from agent.conversation_compression import (
     conversation_history_after_compression,
 )
 from agent.context_engine import automatic_compaction_status_message
-from agent.display import KawaiiSpinner
+from agent.display import KawaiiSpinner, _RED, _RESET
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.turn_context import (
     _compression_warrants_another_preflight_pass,
@@ -83,13 +83,54 @@ from agent.retry_utils import (
     zai_coding_overload_retry_ceiling,
 )
 from agent.trajectory import has_incomplete_scratchpad
-from agent.usage_pricing import estimate_usage_cost, normalize_usage
+from agent.usage_pricing import (
+    CACHE_HIT_ERROR_THRESHOLD,
+    POST_COMPRESSION_CACHE_NOTE,
+    cache_hit_percent,
+    estimate_usage_cost,
+    normalize_usage,
+)
 from hermes_constants import PARTIAL_STREAM_STUB_ID
 from hermes_logging import set_session_context
 from tools.skill_provenance import set_current_write_origin
 from utils import base_url_host_matches, env_var_enabled
 
 logger = logging.getLogger(__name__)
+
+
+def _ingest_successful_provider_usage(agent, usage: dict, *, first_call: bool) -> bool:
+    """Store one real usage reading and consume host-owned cache attribution."""
+    agent._last_turn_usage = dict(usage)
+    post_compression = bool(
+        getattr(agent, "_awaiting_cache_usage_after_compression", False)
+    )
+    if not (first_call or post_compression):
+        return False
+
+    cache_usage = dict(usage)
+    if post_compression:
+        cache_usage["cache_attribution"] = "post_compression"
+        agent._awaiting_cache_usage_after_compression = False
+    agent._first_turn_usage = cache_usage
+
+    cache_callback = getattr(agent, "_tui_cache_callback", None)
+    if callable(cache_callback):
+        cache_read = cache_usage.get("cache_read_tokens", 0) or 0
+        cache_write = cache_usage.get("cache_write_tokens", 0) or 0
+        prompt_tokens = cache_usage.get("prompt_tokens", 0) or 0
+        if cache_read > 0:
+            cache_state = "hit"
+            cache_pct = cache_hit_percent(cache_read, prompt_tokens)
+        elif cache_write > 0:
+            cache_state, cache_pct = "cold_write", 0
+        else:
+            cache_state, cache_pct = "unknown", 0
+        try:
+            cache_callback(cache_state, cache_pct, cache_read, prompt_tokens)
+        except Exception:
+            logger.debug("TUI first-call cache callback failed", exc_info=True)
+    return post_compression
+
 
 # Stable prefix of the local interrupt status string emitted when a turn is
 # cancelled while waiting on the provider. Surfaces (ACP, TUI) match on this
@@ -3449,17 +3490,10 @@ def run_conversation(
                         "cache_write_tokens": canonical_usage.cache_write_tokens,
                         "reasoning_tokens": canonical_usage.reasoning_tokens,
                     }
+                    post_compression_cache = _ingest_successful_provider_usage(
+                        agent, usage_dict, first_call=api_call_count == 1
+                    )
                     agent.context_compressor.update_from_response(usage_dict)
-
-                    # Stash this response's canonical usage so the post-turn
-                    # on_turn_complete() observation hook can forward it (the
-                    # same dict shape passed to update_from_response). A turn
-                    # may make several API calls; the engine's per-turn signal
-                    # of interest is the cost/size of the latest assembled
-                    # request, so we keep the most recent call's usage.
-                    agent._last_turn_usage = dict(usage_dict)
-                    if api_call_count == 1:
-                        agent._first_turn_usage = dict(usage_dict)
                 elif getattr(
                     agent.context_compressor,
                     "awaiting_real_usage_after_compression",
@@ -3493,36 +3527,6 @@ def run_conversation(
                     agent.session_cache_read_tokens += canonical_usage.cache_read_tokens
                     agent.session_cache_write_tokens += canonical_usage.cache_write_tokens
                     agent.session_reasoning_tokens += canonical_usage.reasoning_tokens
-
-                    # The first provider call is the useful cache-health
-                    # signal: later calls mostly hit because this turn just
-                    # populated the cache.
-                    if api_call_count == 1:
-                        cache_callback = getattr(agent, "_tui_cache_callback", None)
-                        if callable(cache_callback):
-                            cache_read = canonical_usage.cache_read_tokens or 0
-                            cache_write = canonical_usage.cache_write_tokens or 0
-                            if cache_read > 0:
-                                cache_state = "hit"
-                                cache_pct = (
-                                    round(100 * cache_read / prompt_tokens)
-                                    if prompt_tokens
-                                    else 0
-                                )
-                            elif cache_write > 0:
-                                cache_state = "cold_write"
-                                cache_pct = 0
-                            else:
-                                cache_state = "unknown"
-                                cache_pct = 0
-                            try:
-                                cache_callback(
-                                    cache_state, cache_pct, cache_read, prompt_tokens
-                                )
-                            except Exception:
-                                logger.debug(
-                                    "TUI first-call cache callback failed", exc_info=True
-                                )
 
                     # Log API call details for debugging/observability
                     _cache_pct = ""
@@ -3648,11 +3652,19 @@ def run_conversation(
                     written = canonical_usage.cache_write_tokens
                     prompt = usage_dict["prompt_tokens"]
                     if (cached or written) and not agent.quiet_mode:
-                        hit_pct = (cached / prompt * 100) if prompt > 0 else 0
+                        hit_pct = cache_hit_percent(cached, prompt)
+                        hit_text = f"{hit_pct}%"
+                        if hit_pct < CACHE_HIT_ERROR_THRESHOLD:
+                            hit_text = f"{_RED}{hit_text}{_RESET}"
+                        cache_note = (
+                            f" · {POST_COMPRESSION_CACHE_NOTE}"
+                            if post_compression_cache
+                            else ""
+                        )
                         agent._vprint(
                             f"{agent.log_prefix}   💾 Cache: "
                             f"{cached:,}/{prompt:,} tokens "
-                            f"({hit_pct:.0f}% hit, {written:,} written)"
+                            f"({hit_text} hit, {written:,} written){cache_note}"
                         )
                 
                 _retry.has_retried_429 = False  # Reset on success

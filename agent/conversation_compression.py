@@ -3492,7 +3492,14 @@ def compress_context(
         agent.context_compressor.last_compression_rough_tokens = _compressed_est
         agent.context_compressor.last_prompt_tokens = -1
         agent.context_compressor.last_completion_tokens = 0
-        agent.context_compressor.awaiting_real_usage_after_compression = True
+        # A failed session publication can roll ``compressed`` back to the
+        # original transcript. Only a real rewrite owns the next cache reading.
+        if compressed != messages_before_compression:
+            agent._awaiting_cache_usage_after_compression = True
+            if hasattr(
+                agent.context_compressor, "awaiting_real_usage_after_compression"
+            ):
+                agent.context_compressor.awaiting_real_usage_after_compression = True
         # Arm the effectiveness verdict only after a completed rewrite crosses
         # the full compaction boundary. Exceptions, aborts, and no-op attempts
         # leave this false, so unrelated later usage cannot be charged to an
@@ -3529,9 +3536,14 @@ def compress_context(
             pass
 
         logger.info(
-            "context compression done: session=%s messages=%d->%d rough_tokens=~%s awaiting_real_usage=true",
+            "context compression done: session=%s messages=%d->%d rough_tokens=~%s awaiting_real_usage=%s",
             agent.session_id or "none", _pre_msg_count, len(compressed),
             f"{_compressed_est:,}",
+            getattr(
+                agent.context_compressor,
+                "awaiting_real_usage_after_compression",
+                False,
+            ),
         )
         _commit_status = "committed" if split_status in {"not_applicable", "in_place_committed", "rotated_committed"} else "aborted"
         _emit_compression_attempt_telemetry(
@@ -3684,7 +3696,11 @@ def _compress_context_via_codex_app_server(
         # Codex turn supplies usage. Minimal external test engines may not expose
         # the ContextEngine update hook; preserve their existing bookkeeping.
         if hasattr(agent.context_compressor, "update_from_response"):
-            _record_codex_app_server_usage(agent, result)
+            _record_codex_app_server_usage(
+                agent,
+                result,
+                consume_post_compression_attribution=False,
+            )
     except Exception:
         logger.debug("codex compaction bookkeeping failed", exc_info=True)
 

@@ -137,6 +137,8 @@ class TestRunConversationCodexPath:
         assert agent.context_compressor.context_length == 200000
 
     def test_native_codex_compaction_updates_bookkeeping(self, monkeypatch):
+        from tui_gateway import server as tui_server
+
         def fake_run_turn(self, user_input: str, **kwargs):
             return TurnResult(
                 final_text="done",
@@ -146,8 +148,8 @@ class TestRunConversationCodexPath:
                 compacted=True,
                 token_usage_last={
                     "totalTokens": 300_000,
-                    "inputTokens": 300_000,
-                    "cachedInputTokens": 0,
+                    "inputTokens": 15_000,
+                    "cachedInputTokens": 285_000,
                     "outputTokens": 0,
                     "reasoningOutputTokens": 0,
                 },
@@ -158,9 +160,20 @@ class TestRunConversationCodexPath:
             CodexAppServerSession, "ensure_started", lambda self: "thread-compact-1"
         )
         events = []
+        gateway_events = []
         agent = _make_codex_agent(event_callback=lambda name, payload: events.append((name, payload)))
+        tui_server._attach_tui_cache_callback(agent, "codex-cache-sid")
 
-        with patch.object(agent, "_spawn_background_review", return_value=None):
+        with (
+            patch.object(agent, "_spawn_background_review", return_value=None),
+            patch.object(
+                tui_server,
+                "_emit",
+                side_effect=lambda event, sid, payload: gateway_events.append(
+                    (event, sid, payload)
+                ),
+            ),
+        ):
             result = agent.run_conversation("hello")
 
         assert result["completed"] is True
@@ -170,6 +183,27 @@ class TestRunConversationCodexPath:
         assert agent.context_compressor.last_prompt_tokens == 300_000
         assert agent.context_compressor.awaiting_real_usage_after_compression is False
         assert agent.context_compressor._ineffective_compression_count == 1
+        assert gateway_events == [
+            (
+                "status.update",
+                "codex-cache-sid",
+                {
+                    "kind": "cache_hit",
+                    "text": "cache 95% · post-compression cold prefix (expected)",
+                },
+            )
+        ]
+        assert tui_server._cache_info_from_usage(
+            getattr(agent, "_first_turn_usage")
+        ) == {
+            "attribution": "post_compression",
+            "read_tokens": 285_000,
+            "prompt_tokens": 300_000,
+            "pct": 95,
+            "state": "hit",
+            "level": "info",
+        }
+        assert getattr(agent, "_awaiting_cache_usage_after_compression") is False
         assert events == [
             (
                 "session:compress",
@@ -185,6 +219,75 @@ class TestRunConversationCodexPath:
                 },
             )
         ]
+
+    def test_explicit_compact_usage_waits_for_next_useful_turn_attribution(self):
+        class FakeSession:
+            def __init__(self):
+                self.turns = iter(
+                    [
+                        TurnResult(
+                            final_text="first",
+                            projected_messages=[{"role": "assistant", "content": "first"}],
+                            thread_id="thread-compact-1",
+                            turn_id="turn-useful-1",
+                            token_usage_last={
+                                "totalTokens": 130,
+                                "inputTokens": 80,
+                                "cachedInputTokens": 20,
+                                "outputTokens": 25,
+                                "reasoningOutputTokens": 5,
+                            },
+                        ),
+                        TurnResult(
+                            final_text="second",
+                            projected_messages=[{"role": "assistant", "content": "second"}],
+                            thread_id="thread-compact-1",
+                            turn_id="turn-useful-2",
+                            token_usage_last={
+                                "totalTokens": 130,
+                                "inputTokens": 80,
+                                "cachedInputTokens": 20,
+                                "outputTokens": 25,
+                                "reasoningOutputTokens": 5,
+                            },
+                        ),
+                    ]
+                )
+
+            def compact_thread(self):
+                return TurnResult(
+                    thread_id="thread-compact-1",
+                    turn_id="turn-compact-1",
+                    token_usage_last={
+                        "totalTokens": 300_000,
+                        "inputTokens": 15_000,
+                        "cachedInputTokens": 285_000,
+                        "outputTokens": 0,
+                        "reasoningOutputTokens": 0,
+                    },
+                )
+
+            def run_turn(self, *, user_input, **_kwargs):
+                return next(self.turns)
+
+        agent = _make_codex_agent()
+        agent._codex_session = FakeSession()
+
+        agent._compress_context([], "system", force=True)
+
+        assert agent.session_api_calls == 1
+        assert agent.session_total_tokens == 300_000
+        assert agent.context_compressor._ineffective_compression_count == 1
+        assert agent._awaiting_cache_usage_after_compression is True
+
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            agent.run_conversation("first useful turn")
+        assert agent._first_turn_usage["cache_attribution"] == "post_compression"
+        assert agent._awaiting_cache_usage_after_compression is False
+
+        with patch.object(agent, "_spawn_background_review", return_value=None):
+            agent.run_conversation("following turn")
+        assert "cache_attribution" not in agent._first_turn_usage
 
     def test_projected_messages_are_spliced(self, fake_session):
         agent = _make_codex_agent()

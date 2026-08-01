@@ -23,6 +23,11 @@ from agent.secret_scope import (
     reset_secret_scope,
     set_secret_scope,
 )
+from agent.usage_pricing import (
+    CACHE_HIT_ERROR_THRESHOLD,
+    POST_COMPRESSION_CACHE_NOTE,
+    cache_hit_percent,
+)
 from hermes_constants import (
     DEFAULT_INDICATOR_STYLE,
     INDICATOR_STYLES,
@@ -4653,6 +4658,13 @@ def _compress_session_history(
     )
 
     agent = session["agent"]
+    compressor = getattr(agent, "context_compressor", None)
+    cache_attribution_pending_before = bool(
+        getattr(agent, "_awaiting_cache_usage_after_compression", False)
+    )
+    real_usage_pending_before = bool(
+        getattr(compressor, "awaiting_real_usage_after_compression", False)
+    )
     # Snapshot history under the lock so the LLM-bound compression call
     # below does NOT hold history_lock for the duration of the request —
     # otherwise other handlers acquiring the lock (prompt.submit etc.)
@@ -4741,6 +4753,13 @@ def _compress_session_history(
                 agent,
                 committed=False,
             )
+            agent._awaiting_cache_usage_after_compression = (
+                cache_attribution_pending_before
+            )
+            if compressor is not None and hasattr(
+                compressor, "awaiting_real_usage_after_compression"
+            ):
+                compressor.awaiting_real_usage_after_compression = real_usage_pending_before
             usage = _get_usage(agent)
             return 0, usage
         session["history"] = compressed
@@ -4898,6 +4917,10 @@ def _get_usage(agent) -> dict:
     return usage
 
 
+def _cache_level(pct: int) -> str:
+    return "error" if pct < CACHE_HIT_ERROR_THRESHOLD else "info"
+
+
 def _cache_info_from_usage(usage: Any) -> dict[str, int | str] | None:
     if not isinstance(usage, dict):
         return None
@@ -4924,7 +4947,7 @@ def _cache_info_from_usage(usage: Any) -> dict[str, int | str] | None:
     read_tokens = tokens(*read_keys)
     write_tokens = tokens(*write_keys)
     prompt_tokens = tokens("prompt_tokens")
-    pct = round(100 * read_tokens / prompt_tokens) if prompt_tokens else 0
+    pct = cache_hit_percent(read_tokens, prompt_tokens)
     state = (
         "hit"
         if read_tokens
@@ -4934,12 +4957,16 @@ def _cache_info_from_usage(usage: Any) -> dict[str, int | str] | None:
         if prompt_tokens < 1024
         else "miss"
     )
-    return {
+    cache_info: dict[str, int | str] = {
         "read_tokens": read_tokens,
         "prompt_tokens": prompt_tokens,
         "pct": pct,
         "state": state,
+        "level": _cache_level(pct),
     }
+    if usage.get("cache_attribution") == "post_compression":
+        cache_info["attribution"] = "post_compression"
+    return cache_info
 
 
 def _probe_credentials(agent) -> str:
@@ -5742,9 +5769,23 @@ def _agent_cbs(sid: str) -> dict:
 
 def _attach_tui_cache_callback(agent, sid: str):
     """Attach the first-provider-call cache signal to a live TUI agent."""
-    def emit_cache_state(state: str, pct: int, _read: int, _prompt: int) -> None:
+    def emit_cache_state(state: str, pct: int, read: int, prompt: int) -> None:
+        cache_info = _cache_info_from_usage(
+            getattr(agent, "_first_turn_usage", None)
+        ) or {
+            "read_tokens": read,
+            "prompt_tokens": prompt,
+            "pct": pct,
+            "state": state,
+            "level": _cache_level(pct),
+        }
+        state = str(cache_info["state"])
+        pct = int(cache_info["pct"])
         text = f"cache {pct}%" if state == "hit" else f"cache {state.upper()}"
-        _emit("status.update", sid, {"kind": "cache_hit", "text": text})
+        if cache_info.get("attribution") == "post_compression":
+            text += f" · {POST_COMPRESSION_CACHE_NOTE}"
+        kind = "error" if cache_info["level"] == "error" else "cache_hit"
+        _emit("status.update", sid, {"kind": kind, "text": text})
 
     agent._tui_cache_callback = emit_cache_state
     return agent

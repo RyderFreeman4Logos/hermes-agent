@@ -172,6 +172,126 @@ def test_heartbeat_silent_noop_leaves_no_durable_or_live_history():
     external_memory.assert_not_called()
 
 
+def test_heartbeat_meaningful_tool_result_is_returned_and_persisted():
+    agent = _make_agent(max_iterations=10)
+    tool_call = SimpleNamespace(
+        id="heartbeat-tool",
+        type="function",
+        function=SimpleNamespace(name="web_search", arguments="{}"),
+    )
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(content="", finish_reason="tool_calls", tool_calls=[tool_call]),
+        _mock_response(content="Target is still working.", finish_reason="stop"),
+    ]
+    persisted = []
+
+    def _execute(_assistant, messages, _task_id, api_call_count=0):
+        messages.append(
+            {
+                "role": "tool",
+                "tool_call_id": "heartbeat-tool",
+                "content": "process output grew",
+            }
+        )
+
+    with (
+        patch.object(agent, "_execute_tool_calls", side_effect=_execute),
+        patch.object(
+            agent,
+            "_flush_messages_to_session_db",
+            side_effect=lambda messages, _history=None: persisted.append(list(messages)),
+        ),
+        patch.object(agent, "_save_session_log"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation(
+            "[HEARTBEAT] inspect target",
+            turn_origin="heartbeat_warm",
+            allow_silent_noop=True,
+        )
+
+    assert result["silent_noop"] is False
+    assert result["final_response"] == "Target is still working."
+    assert [message["role"] for message in result["messages"]] == [
+        "user",
+        "assistant",
+        "tool",
+        "assistant",
+    ]
+    assert persisted[-1] == result["messages"]
+
+
+def test_heartbeat_early_error_leaves_no_unmatched_synthetic_user_row():
+    agent = _make_agent(max_iterations=10)
+    agent.provider = "nous"
+    history = [
+        {"role": "user", "content": "real question"},
+        {"role": "assistant", "content": "real answer"},
+    ]
+
+    with (
+        patch("agent.nous_rate_guard.nous_rate_limit_remaining", return_value=60),
+        patch("agent.nous_rate_guard.format_remaining", return_value="1m"),
+        patch.object(agent, "_try_activate_fallback", return_value=False),
+        patch.object(agent, "_save_session_log") as save_log,
+        patch.object(agent, "_flush_messages_to_session_db") as flush,
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation(
+            "[HEARTBEAT] inspect target",
+            conversation_history=history,
+            turn_origin="heartbeat_warm",
+            allow_silent_noop=True,
+        )
+
+    assert result["messages"] == history
+    assert agent._session_messages == history
+    save_log.assert_not_called()
+    flush.assert_not_called()
+
+
+def test_heartbeat_does_not_consume_user_maintenance_triggers():
+    agent = _make_agent(max_iterations=10)
+    agent._user_turn_count = 9
+    agent._turns_since_memory = 4
+    agent._memory_nudge_interval = 5
+    agent._memory_store = MagicMock()
+    agent._iters_since_skill = 5
+    agent._skill_nudge_interval = 5
+    agent.valid_tool_names = {"memory", "skill_manage"}
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(content="", finish_reason="stop"),
+        _mock_response(content="real reply", finish_reason="stop"),
+    ]
+
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch.object(agent, "_spawn_background_review") as review,
+    ):
+        agent.run_conversation(
+            "[HEARTBEAT] inspect target",
+            turn_origin="heartbeat_warm",
+            allow_silent_noop=True,
+        )
+        assert agent._user_turn_count == 9
+        assert agent._turns_since_memory == 4
+        assert agent._iters_since_skill == 5
+        review.assert_not_called()
+        cached_system_prompt = agent._cached_system_prompt
+
+        result = agent.run_conversation("real user turn")
+
+    assert result["final_response"] == "real reply"
+    assert agent._user_turn_count == 10
+    assert agent._turns_since_memory == 0
+    assert agent._iters_since_skill == 0
+    assert agent._cached_system_prompt == cached_system_prompt
+    review.assert_called_once()
+
+
 def test_first_api_call_reports_cache_hit_to_tui_callback():
     agent = _make_agent(max_iterations=10)
     response = _mock_response(content="Done.", finish_reason="stop")

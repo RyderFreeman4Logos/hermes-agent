@@ -76,11 +76,10 @@ def finalize_turn(
     from agent.conversation_loop import logger
 
     ephemeral_heartbeat_turn = turn_origin == "heartbeat_warm"
-    if ephemeral_heartbeat_turn:
+    if ephemeral_heartbeat_turn and silent_noop:
         messages[:] = list(conversation_history or [])
         agent._session_messages = messages
         final_response = ""
-        silent_noop = True
 
     budget_exhausted = (
         api_call_count >= agent.max_iterations
@@ -626,7 +625,8 @@ def finalize_turn(
 
     # Check skill trigger NOW — based on how many tool iterations THIS turn used.
     _should_review_skills = False
-    if (agent._skill_nudge_interval > 0
+    if (not ephemeral_heartbeat_turn
+            and agent._skill_nudge_interval > 0
             and agent._iters_since_skill >= agent._skill_nudge_interval
             and "skill_manage" in agent.valid_tool_names):
         _should_review_skills = True

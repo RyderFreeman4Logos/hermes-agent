@@ -1,3 +1,4 @@
+import copy
 import json
 import os
 import subprocess
@@ -3631,6 +3632,169 @@ def test_tui_foreign_heartbeat_never_crosses_owner(monkeypatch):
         session,
         _runtime_heartbeat_event(session_key="foreign-owner"),
     )
+
+
+@pytest.mark.parametrize("existing_snapshot", [None, {
+    "user": "real prompt",
+    "assistant": "partial answer",
+    "status": "error",
+    "error": "real turn failed",
+    "recoverable": True,
+}])
+def test_tui_heartbeat_returned_error_preserves_recovery_state(
+    monkeypatch, existing_snapshot
+):
+    class _Agent:
+        def run_conversation(self, *_args, **_kwargs):
+            return {
+                "final_response": None,
+                "messages": [],
+                "api_calls": 1,
+                "completed": False,
+                "failed": True,
+                "error": "heartbeat provider failed",
+            }
+
+    snapshot = copy.deepcopy(existing_snapshot)
+    session = _session(agent=_Agent(), inflight_turn=copy.deepcopy(snapshot))
+    emitted = []
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: emitted.append(args))
+    monkeypatch.setattr(server, "make_stream_renderer", lambda _cols: None)
+    monkeypatch.setattr(server, "render_message", lambda _raw, _cols: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+
+    server._run_prompt_submit(
+        "rid",
+        "heartbeat-sid",
+        session,
+        "[HEARTBEAT] inspect target",
+        turn_origin="heartbeat_warm",
+        allow_silent_noop=True,
+    )
+
+    assert session.get("inflight_turn") == snapshot
+    assert not any(event[0] == "message.complete" for event in emitted)
+
+
+@pytest.mark.parametrize("existing_snapshot", [None, {
+    "user": "real prompt",
+    "assistant": "partial answer",
+    "status": "error",
+    "error": "real turn failed",
+    "recoverable": True,
+}])
+def test_tui_heartbeat_exception_preserves_recovery_state(
+    monkeypatch, tmp_path, existing_snapshot
+):
+    class _Agent:
+        def run_conversation(self, *_args, **_kwargs):
+            raise RuntimeError("heartbeat exploded")
+
+    snapshot = copy.deepcopy(existing_snapshot)
+    session = _session(agent=_Agent(), inflight_turn=copy.deepcopy(snapshot))
+    emitted = []
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: emitted.append(args))
+    monkeypatch.setattr(server, "make_stream_renderer", lambda _cols: None)
+    monkeypatch.setattr(server, "render_message", lambda _raw, _cols: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_CRASH_LOG", str(tmp_path / "heartbeat-crash.log"))
+
+    server._run_prompt_submit(
+        "rid",
+        "heartbeat-sid",
+        session,
+        "[HEARTBEAT] inspect target",
+        turn_origin="heartbeat_warm",
+        allow_silent_noop=True,
+    )
+
+    assert session.get("inflight_turn") == snapshot
+    assert not any(event[0] == "message.complete" for event in emitted)
+
+
+def test_tui_heartbeat_preserves_pending_user_only_state(monkeypatch):
+    prompts = []
+
+    class _Agent:
+        model = "test-model"
+        provider = "test-provider"
+        base_url = "https://example.test"
+        interim_assistant_callback = None
+
+        def clear_interrupt(self):
+            pass
+
+        def run_conversation(self, prompt, **kwargs):
+            prompts.append(prompt)
+            if kwargs.get("turn_origin") == "heartbeat_warm":
+                return {
+                    "final_response": "",
+                    "messages": [],
+                    "api_calls": 1,
+                    "completed": True,
+                    "silent_noop": True,
+                }
+            return {
+                "final_response": "real reply",
+                "messages": [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": "real reply"},
+                ],
+                "api_calls": 1,
+                "completed": True,
+            }
+
+    moa_restore = {
+        "override": None,
+        "model": "prior-model",
+        "provider": "prior-provider",
+    }
+    one_turn_restore = {"model": "protected-once-model"}
+    session = _session(
+        agent=_Agent(),
+        moa_one_shot_restore=copy.deepcopy(moa_restore),
+        one_turn_model_restore=copy.deepcopy(one_turn_restore),
+    )
+    reaction_notes = Mock(return_value="[The user reacted 👍 to your message]")
+    restored = []
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "make_stream_renderer", lambda _cols: None)
+    monkeypatch.setattr(server, "render_message", lambda _raw, _cols: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_pending_reaction_notes", reaction_notes)
+    monkeypatch.setattr(
+        server,
+        "_apply_model_switch",
+        lambda _sid, _session, raw, **_kwargs: restored.append(raw),
+    )
+    from tools import tts_streaming
+
+    tts_streaming.mark_speech_interrupted()
+    server._run_prompt_submit(
+        "rid-heartbeat",
+        "sid",
+        session,
+        "[HEARTBEAT] inspect target",
+        turn_origin="heartbeat_warm",
+        allow_silent_noop=True,
+    )
+
+    assert session["moa_one_shot_restore"] == moa_restore
+    assert session["one_turn_model_restore"] == one_turn_restore
+    assert reaction_notes.call_count == 0
+
+    server._run_prompt_submit("rid-user", "sid", session, "real user prompt")
+
+    assert "moa_one_shot_restore" not in session
+    assert "one_turn_model_restore" not in session
+    assert reaction_notes.call_count == 1
+    assert restored == ["prior-model --provider prior-provider"]
+    assert tts_streaming.SPEECH_INTERRUPTED_NOTE in prompts[-1]
+    assert "reacted" in prompts[-1].lower()
+    assert tts_streaming.take_speech_interrupted() is False
 
 
 def test_session_close_commits_memory_and_fires_finalize_hook(monkeypatch):

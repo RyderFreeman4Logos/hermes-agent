@@ -16,6 +16,9 @@ logger = logging.getLogger(__name__)
 _current_provider: contextvars.ContextVar[str] = contextvars.ContextVar(
     "runtime_heartbeat_provider", default=""
 )
+_current_cache_context: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "runtime_heartbeat_cache_context", default=""
+)
 
 
 class HeartbeatConfigError(ValueError):
@@ -41,11 +44,29 @@ def canonical_runtime_provider_identity(agent) -> str:
     return provider or requested
 
 
+def canonical_runtime_cache_context_identity(agent) -> str:
+    """Return the secret-free deployment identity that owns a prompt cache."""
+    from agent.backend_identity import BackendIdentity
+
+    identity = BackendIdentity.build(
+        canonical_runtime_provider_identity(agent),
+        getattr(agent, "model", ""),
+        getattr(agent, "base_url", ""),
+    )
+    api_mode = str(getattr(agent, "api_mode", "") or "").strip().lower()
+    return "|".join((identity.provider, identity.base_url, identity.model, api_mode))
+
+
 def set_current_provider(provider: str | None) -> contextvars.Token[str]:
     return _current_provider.set(str(provider or "").strip().lower())
 
 
-def reset_current_provider(token: contextvars.Token[str]) -> None:
+def reset_current_provider(token) -> None:
+    if isinstance(token, tuple):
+        provider_token, cache_token = token
+        _current_cache_context.reset(cache_token)
+        _current_provider.reset(provider_token)
+        return
     _current_provider.reset(token)
 
 
@@ -53,8 +74,15 @@ def get_current_provider() -> str:
     return _current_provider.get()
 
 
-def bind_agent_provider(agent) -> contextvars.Token[str]:
-    return set_current_provider(canonical_runtime_provider_identity(agent))
+def get_current_cache_context() -> str:
+    return _current_cache_context.get()
+
+
+def bind_agent_provider(agent):
+    return (
+        set_current_provider(canonical_runtime_provider_identity(agent)),
+        _current_cache_context.set(canonical_runtime_cache_context_identity(agent)),
+    )
 
 
 def resolve_heartbeat_interval(
@@ -109,6 +137,8 @@ class _Target:
     interval: int
     inspect: Callable[[], Dict[str, Any]]
     started_at: float
+    provider: str = ""
+    cache_context: str = ""
     generation: int = 0
     timer: Any = None
     baseline: Dict[str, Any] = field(default_factory=dict)
@@ -129,6 +159,9 @@ class RuntimeHeartbeat:
         self._lock = threading.RLock()
         self._publication_done = threading.Condition(self._lock)
         self._targets: Dict[str, _Target] = {}
+        self._group_tokens: Dict[tuple[str, int, str, str], int] = {}
+        self._group_next_emit: Dict[tuple[str, int, str, str], float] = {}
+        self._next_group_token = 0
 
     def _queue(self):
         if self._event_queue is not None:
@@ -145,6 +178,8 @@ class RuntimeHeartbeat:
         kind: str,
         interval: Optional[int],
         inspect: Callable[[], Dict[str, Any]],
+        provider: str | None = None,
+        cache_context: str | None = None,
     ) -> bool:
         """Arm after target creation using its already validated interval."""
         if interval is None:
@@ -165,9 +200,23 @@ class RuntimeHeartbeat:
             interval=interval,
             inspect=inspect,
             started_at=time.time(),
+            provider=str(provider if provider is not None else get_current_provider()),
+            cache_context=str(
+                cache_context
+                if cache_context is not None
+                else get_current_cache_context()
+            ),
         )
         self.cancel(key)
         with self._lock:
+            group = self._group_key(target)
+            if not any(
+                self._group_key(other) == group
+                for other in self._targets.values()
+            ):
+                self._next_group_token += 1
+                self._group_tokens[group] = self._next_group_token
+                self._group_next_emit.pop(group, None)
             self._targets[key] = target
         try:
             baseline = dict(inspect() or {})
@@ -194,11 +243,28 @@ class RuntimeHeartbeat:
         target.timer = timer
         timer.start()
 
+    @staticmethod
+    def _group_key(target: _Target) -> tuple[str, int, str, str]:
+        return (
+            target.caller_id,
+            target.interval,
+            target.provider,
+            target.cache_context,
+        )
+
     def cancel(self, target_id: str) -> bool:
         with self._lock:
             target = self._targets.pop(str(target_id), None)
             if target is None:
                 return False
+            group = self._group_key(target)
+            if not any(
+                self._group_key(candidate) == group
+                for candidate in self._targets.values()
+            ):
+                self._next_group_token += 1
+                self._group_tokens[group] = self._next_group_token
+                self._group_next_emit.pop(group, None)
             if target.timer is not None:
                 target.timer.cancel()
             while target.publishing:
@@ -223,14 +289,50 @@ class RuntimeHeartbeat:
         """Rearm one owner's live targets with each stored exact interval."""
         count = 0
         with self._lock:
+            groups = set()
             for key, target in tuple(self._targets.items()):
                 if target.caller_id != str(caller_id):
                     continue
                 if target.timer is not None:
                     target.timer.cancel()
                 self._schedule_locked(key, target)
+                groups.add(self._group_key(target))
                 count += 1
+            now = time.monotonic()
+            for group in groups:
+                self._next_group_token += 1
+                self._group_tokens[group] = self._next_group_token
+                self._group_next_emit[group] = now + group[1]
         return count
+
+    def is_event_current(self, event: Dict[str, Any], agent=None) -> bool:
+        """Return whether a queued owner heartbeat still has live work."""
+        if event.get("type") != "heartbeat":
+            return True
+        token = event.get("heartbeat_group_token")
+        interval = event.get("heartbeat_interval")
+        caller_id = str(event.get("session_key") or "")
+        if not isinstance(token, int) or not isinstance(interval, int):
+            return False
+        provider = str(event.get("provider") or "")
+        cache_context = str(event.get("cache_context") or "")
+        group = (caller_id, interval, provider, cache_context)
+        if agent is not None and (
+            provider != canonical_runtime_provider_identity(agent)
+            or cache_context != canonical_runtime_cache_context_identity(agent)
+        ):
+            return False
+        with self._lock:
+            if self._group_tokens.get(group) != token:
+                return False
+            if event.get("heartbeat_terminal") is True:
+                return True
+            if not isinstance(event.get("generation"), int):
+                return False
+            return any(
+                self._group_key(target) == group
+                for target in self._targets.values()
+            )
 
     def outstanding_for_caller(self, caller_id: str) -> list[str]:
         with self._lock:
@@ -297,18 +399,33 @@ class RuntimeHeartbeat:
             if inspection_error is None:
                 target.baseline = snapshot
                 self._schedule_locked(key, target)
+            group = self._group_key(target)
+            now = time.monotonic()
+            if status == "ALIVE":
+                if now < self._group_next_emit.get(group, 0.0):
+                    return
+                self._group_next_emit[group] = now + target.interval
+            group_token = self._group_tokens[group]
             target.publishing = True
         try:
             self._queue().put(
                 {
                     "type": "heartbeat",
                     "target_id": target.target_id,
+                    "target_ids": [target.target_id],
+                    "generation": generation,
+                    "generations": [generation],
                     "target_kind": target.kind,
                     "session_id": target.target_id if target.kind == "process" else "",
                     "session_key": target.caller_id,
+                    "provider": target.provider,
+                    "cache_context": target.cache_context,
                     "status": status,
                     "evidence": evidence[:500],
                     "elapsed_s": max(0, int(time.time() - target.started_at)),
+                    "heartbeat_interval": target.interval,
+                    "heartbeat_group_token": group_token,
+                    "heartbeat_terminal": inspection_error is not None,
                 }
             )
         finally:

@@ -88,9 +88,14 @@ def _runtime_heartbeat_event(**overrides):
     event = {
         "type": "heartbeat",
         "target_id": "proc-heartbeat",
+        "target_ids": ["proc-heartbeat"],
+        "generations": [11],
+        "generation": 11,
         "target_kind": "process",
         "session_id": "proc-heartbeat",
         "session_key": "agent:main:telegram:dm:12345:678",
+        "provider": "openai",
+        "cache_context": "openai-cache",
         "status": "ALIVE",
         "evidence": "output grew",
     }
@@ -98,7 +103,15 @@ def _runtime_heartbeat_event(**overrides):
     return event
 
 
-def test_gateway_heartbeat_routes_to_exact_idle_owner(monkeypatch):
+@pytest.fixture
+def current_heartbeat(monkeypatch):
+    monkeypatch.setattr(
+        "tools.runtime_heartbeat.runtime_heartbeat.is_event_current",
+        lambda _event: True,
+    )
+
+
+def test_gateway_heartbeat_routes_to_exact_idle_owner(monkeypatch, current_heartbeat):
     event = _runtime_heartbeat_event()
     adapter = SimpleNamespace(handle_message=AsyncMock())
     runner = _runner(adapter, origins={event["session_key"]: object()})
@@ -112,10 +125,57 @@ def test_gateway_heartbeat_routes_to_exact_idle_owner(monkeypatch):
     assert inject.await_args.kwargs == {
         "turn_origin": "heartbeat_warm",
         "allow_silent_noop": True,
+        "heartbeat_event": event,
     }
 
 
-def test_gateway_alive_heartbeat_does_not_duplicate_busy_turn(monkeypatch):
+def test_gateway_push_heartbeat_preserves_typed_event_metadata():
+    event = _runtime_heartbeat_event()
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter, origins={event["session_key"]: object()})
+
+    delivered = asyncio.run(
+        runner._inject_watch_notification(
+            "[HEARTBEAT] target remains ALIVE",
+            event,
+            turn_origin="heartbeat_warm",
+            allow_silent_noop=True,
+        )
+    )
+
+    assert delivered is True
+    message_event = adapter.handle_message.await_args.args[0]
+    assert message_event.internal is True
+    assert message_event.metadata["turn_origin"] == "heartbeat_warm"
+    assert message_event.metadata["allow_silent_noop"] is True
+    assert message_event.metadata["heartbeat_event"] == event
+
+
+def test_gateway_raw_api_heartbeat_never_self_posts_as_user_traffic(monkeypatch):
+    adapter = SimpleNamespace(handle_message=AsyncMock(), supports_push=False)
+    runner = _runner(adapter)
+    runner.adapters = {Platform.API_SERVER: adapter}
+    event = _runtime_heartbeat_event(session_key="opaque-api-session")
+    wake = AsyncMock()
+    monkeypatch.setattr("gateway.wake.deliver_wake", wake)
+
+    delivered = asyncio.run(
+        runner._inject_watch_notification(
+            "[HEARTBEAT] target remains ALIVE",
+            event,
+            turn_origin="heartbeat_warm",
+            allow_silent_noop=True,
+        )
+    )
+
+    assert delivered is None
+    wake.assert_not_awaited()
+    adapter.handle_message.assert_not_awaited()
+
+
+def test_gateway_alive_heartbeat_does_not_duplicate_busy_turn(
+    monkeypatch, current_heartbeat
+):
     event = _runtime_heartbeat_event()
     adapter = SimpleNamespace(handle_message=AsyncMock())
     runner = _runner(adapter, origins={event["session_key"]: object()})
@@ -128,7 +188,30 @@ def test_gateway_alive_heartbeat_does_not_duplicate_busy_turn(monkeypatch):
     inject.assert_not_awaited()
 
 
-def test_gateway_foreign_heartbeat_never_crosses_owner(monkeypatch):
+@pytest.mark.parametrize("status", ["STUCK", "UNKNOWN"])
+def test_gateway_unhealthy_heartbeat_is_directly_visible_without_model_turn(
+    monkeypatch, current_heartbeat, status
+):
+    event = _runtime_heartbeat_event(status=status, evidence="no progress")
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter, origins={event["session_key"]: object()})
+    runner._running_agents = {event["session_key"]: object()}
+    inject = AsyncMock()
+    deliver = AsyncMock(return_value=True)
+    monkeypatch.setattr(runner, "_inject_watch_notification", inject)
+    monkeypatch.setattr(runner, "_deliver_platform_notice", deliver)
+
+    asyncio.run(runner._handle_heartbeat_event(event))
+
+    inject.assert_not_awaited()
+    deliver.assert_awaited_once()
+    assert status in deliver.await_args.args[1]
+    assert "no progress" in deliver.await_args.args[1]
+
+
+def test_gateway_foreign_heartbeat_never_crosses_owner(
+    monkeypatch, current_heartbeat
+):
     adapter = SimpleNamespace(handle_message=AsyncMock())
     runner = _runner(adapter, origins={})
     runner._running_agents = {}

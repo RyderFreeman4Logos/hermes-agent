@@ -23,8 +23,10 @@ import random
 import re
 import ssl
 import time
+from copy import deepcopy
 from typing import Any, Dict, List, Optional
 
+from agent.chat_completion_helpers import direct_api_call, estimate_request_context_tokens
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.conversation_compression import (
     COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
@@ -1086,6 +1088,180 @@ def _notify_context_engine_turn_complete(
         )
 
 
+def run_heartbeat_warm(
+    agent,
+    user_message: Any,
+    system_message: str = None,
+    conversation_history: List[Dict[str, Any]] = None,
+    *,
+    moa_config: Optional[dict[str, Any]] = None,
+    heartbeat_event: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Run one isolated cache-warm attempt without entering the turn lifecycle."""
+    retained_history = list(conversation_history or [])
+    request_history = list(
+        conversation_history
+        if conversation_history is not None
+        else (getattr(agent, "_session_messages", None) or [])
+    )
+    api_calls = 0
+
+    def finish(*, silent: bool, status: str = "", evidence: str = ""):
+        agent._session_messages = retained_history
+        agent._inflight_turn_id = None
+        final = "" if silent else (
+            f"[HEARTBEAT ALERT] {status}: "
+            f"{evidence or 'target liveness is uncertain'}"
+        )
+        return {
+            "final_response": final,
+            "messages": retained_history,
+            "api_calls": api_calls,
+            "completed": True,
+            "failed": False,
+            "error": None,
+            "silent_noop": silent,
+            "turn_exit_reason": (
+                "heartbeat_silent_noop" if silent else "heartbeat_alert"
+            ),
+            "response_previewed": False,
+        }
+
+    from tools.runtime_heartbeat import runtime_heartbeat
+
+    if not isinstance(heartbeat_event, dict) or not runtime_heartbeat.is_event_current(
+        heartbeat_event, agent
+    ):
+        return finish(silent=True)
+    status = str(heartbeat_event.get("status") or "").upper()
+    if status in {"STUCK", "UNKNOWN"}:
+        return finish(
+            silent=False,
+            status=status,
+            evidence=str(heartbeat_event.get("evidence") or ""),
+        )
+    api_mode = str(getattr(agent, "api_mode", "") or "").lower()
+    provider = str(getattr(agent, "provider", "") or "").lower()
+    if (
+        status != "ALIVE"
+        or moa_config is not None
+        or provider in {"moa", "openai-codex"}
+        or api_mode not in {
+            "chat_completions",
+            "anthropic_messages",
+            "bedrock_converse",
+        }
+    ):
+        return finish(silent=True)
+
+    api_messages = []
+    for message in request_history:
+        if not isinstance(message, dict):
+            continue
+        api_message = deepcopy(message)
+        api_content = api_message.pop("api_content", None)
+        if (
+            isinstance(api_content, str)
+            and api_content
+            and message.get("role") in {"user", "assistant"}
+        ):
+            api_message["content"] = api_content
+        for field in (
+            "display_kind",
+            "display_metadata",
+            "_row_id",
+            "reasoning",
+            "finish_reason",
+            "_thinking_prefill",
+        ):
+            api_message.pop(field, None)
+        agent._copy_reasoning_content_for_api(message, api_message)
+        if agent._should_sanitize_tool_calls():
+            agent._sanitize_tool_calls_for_strict_api(api_message, model=agent.model)
+        api_messages.append(api_message)
+    api_messages.append({"role": "user", "content": deepcopy(user_message)})
+
+    active_system_prompt = (
+        system_message
+        if system_message is not None
+        else getattr(agent, "_cached_system_prompt", None)
+    )
+    if active_system_prompt:
+        api_messages.insert(0, {"role": "system", "content": active_system_prompt})
+    if agent.prefill_messages:
+        system_offset = int(
+            bool(api_messages and api_messages[0].get("role") == "system")
+        )
+        for index, prefill in enumerate(agent.prefill_messages):
+            api_messages.insert(system_offset + index, deepcopy(prefill))
+    api_messages = agent._sanitize_api_messages(api_messages)
+    api_messages = agent._drop_thinking_only_and_merge_users(
+        api_messages,
+        drop_codex_reasoning_items=True,
+    )
+    for message in api_messages:
+        if isinstance(message.get("content"), str):
+            message["content"] = message["content"].strip()
+        for tool_call in message.get("tool_calls") or ():
+            try:
+                arguments = json.loads(tool_call["function"]["arguments"])
+                tool_call["function"]["arguments"] = json.dumps(
+                    arguments, separators=(",", ":"), sort_keys=True
+                )
+            except Exception:
+                try:
+                    tool_call["function"]["arguments"] = _repair_tool_call_arguments(
+                        tool_call["function"].get("arguments"),
+                        tool_call["function"].get("name", "?"),
+                    )
+                except Exception:
+                    pass
+    if agent._use_prompt_caching:
+        static_system_prefix = getattr(agent, "_cached_system_prompt_static", None)
+        api_messages = apply_anthropic_cache_control(
+            api_messages,
+            cache_ttl=agent._cache_ttl,
+            native_anthropic=agent._use_native_cache_layout,
+            static_system_prefix=(
+                static_system_prefix
+                if isinstance(static_system_prefix, str)
+                else None
+            ),
+        )
+
+    api_kwargs = agent._build_api_kwargs(api_messages)
+    for field in ("tools", "tool_choice", "parallel_tool_calls"):
+        api_kwargs.pop(field, None)
+    if api_mode in {"chat_completions", "anthropic_messages"}:
+        api_kwargs["stream"] = False
+    configured_limit = int(
+        getattr(getattr(agent, "context_compressor", None), "threshold_tokens", 0)
+        or 0
+    )
+    pressure_limit = min(
+        limit for limit in (configured_limit, 272_000) if limit > 0
+    )
+    if estimate_request_context_tokens(api_kwargs) >= pressure_limit:
+        return finish(silent=True)
+    if not runtime_heartbeat.is_event_current(heartbeat_event, agent):
+        return finish(silent=True)
+
+    api_calls = 1
+    try:
+        if api_mode == "chat_completions":
+            agent.client.chat.completions.create(**api_kwargs)
+        else:
+            previous_disable_streaming = getattr(agent, "_disable_streaming", False)
+            agent._disable_streaming = True
+            try:
+                direct_api_call(agent, api_kwargs)
+            finally:
+                agent._disable_streaming = previous_disable_streaming
+    except Exception:
+        logger.debug("Isolated heartbeat warm attempt failed", exc_info=True)
+    return finish(silent=True)
+
+
 def run_conversation(
     agent,
     user_message: Any,
@@ -1100,6 +1276,7 @@ def run_conversation(
     moa_config: Optional[dict[str, Any]] = None,
     turn_origin: str = "user",
     allow_silent_noop: bool = False,
+    heartbeat_event: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -1129,6 +1306,15 @@ def run_conversation(
     Returns:
         Dict: Complete conversation result with final response and message history
     """
+    if turn_origin == "heartbeat_warm":
+        return run_heartbeat_warm(
+            agent,
+            user_message,
+            system_message,
+            conversation_history,
+            moa_config=moa_config,
+            heartbeat_event=heartbeat_event,
+        )
     if moa_config is None:
         try:
             from hermes_cli.moa_config import decode_moa_turn
@@ -2241,7 +2427,9 @@ def run_conversation(
                     if agent.thinking_callback:
                         agent.thinking_callback("")
 
-                _use_streaming = True
+                _use_streaming = not _defer_heartbeat_warm_persistence
+                # Heartbeats use one non-streaming transport request. The streaming
+                # helper may retry or fall back when a provider rejects streaming.
                 # Provider signaled "stream not supported" on a previous
                 # attempt — switch to non-streaming for the rest of this
                 # session instead of re-failing every retry.
@@ -2472,6 +2660,11 @@ def run_conversation(
                             error_details.append("response.choices is empty")
 
                 if response_invalid:
+                    if _defer_heartbeat_warm_persistence:
+                        _silent_noop = True
+                        final_response = ""
+                        _turn_exit_reason = "heartbeat_invalid_response"
+                        break
                     agent._invoke_api_request_error_hook(
                         task_id=effective_task_id,
                         turn_id=turn_id,
@@ -3459,6 +3652,11 @@ def run_conversation(
                 break
 
             except Exception as api_error:
+                if _defer_heartbeat_warm_persistence:
+                    _silent_noop = True
+                    final_response = ""
+                    _turn_exit_reason = "heartbeat_provider_error"
+                    break
                 # Stop spinner silently — retry status is buffered and
                 # only flushed when every retry+fallback is exhausted.
                 if thinking_spinner:
@@ -5533,6 +5731,9 @@ def run_conversation(
             agent._ephemeral_max_output_tokens = min(_boost, _boost_cap)
             continue
 
+        if _defer_heartbeat_warm_persistence and _silent_noop:
+            break
+
         # Guard: if all retries exhausted without a successful response
         # (e.g. repeated context-length errors that exhausted retry_count),
         # the `response` variable is still None. Break out cleanly.
@@ -5571,6 +5772,12 @@ def run_conversation(
                     assistant_message.content = "\n".join(parts)
                 else:
                     assistant_message.content = str(raw)
+
+            if _defer_heartbeat_warm_persistence:
+                silent_noop = True
+                final_response = ""
+                _turn_exit_reason = "heartbeat_warm_response"
+                break
 
             try:
                 from hermes_cli.lifecycle import (
@@ -7060,6 +7267,11 @@ def run_conversation(
                 break
             
         except Exception as e:
+            if _defer_heartbeat_warm_persistence:
+                _silent_noop = True
+                final_response = ""
+                _turn_exit_reason = "heartbeat_processing_error"
+                break
             # Phase-aware error classification. The huge outer try/except spans
             # both the actual API request and all local post-processing of the
             # returned assistant message. Deterministic local bugs (e.g.

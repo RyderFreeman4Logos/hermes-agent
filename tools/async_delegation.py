@@ -401,7 +401,11 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
 
 
 def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
-    """Claim a durable delegation event; non-durable events need no token."""
+    """Claim a durable delegation or reject a stale heartbeat event."""
+    if evt.get("type") == "heartbeat":
+        from tools.runtime_heartbeat import runtime_heartbeat
+
+        return "" if runtime_heartbeat.is_event_current(evt) else None
     if evt.get("type") != "async_delegation":
         return ""
     delegation_id = str(evt.get("delegation_id") or "")

@@ -4196,7 +4196,14 @@ class _CompletionDeliveryMessage(str):
 
 
 class _HeartbeatWarmMessage(str):
-    """Owner-routed, nonpersistent warm-KV turn."""
+    """Typed queue envelope for an internal cache-warm control turn."""
+
+    heartbeat_event: Optional[dict]
+
+    def __new__(cls, text: str, heartbeat_event: Optional[dict] = None):
+        message = super().__new__(cls, text)
+        message.heartbeat_event = heartbeat_event
+        return message
 
 
 class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
@@ -10352,13 +10359,20 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             claim = claim_event_delivery(event, consumer)
             if claim is None:
                 continue
-            queued_message = (
-                _HeartbeatWarmMessage(synthetic_message)
-                if event.get("type") == "heartbeat"
-                else _CompletionDeliveryMessage(synthetic_message)
-                if event.get("type", "completion") == "completion"
-                else synthetic_message
-            )
+            if event.get("type") == "heartbeat":
+                status = str(event.get("status") or "").upper()
+                if status in {"STUCK", "UNKNOWN"}:
+                    _cprint(f"\n⚠ {synthetic_message}")
+                    complete_event_delivery(event, claim)
+                    continue
+                if status != "ALIVE":
+                    complete_event_delivery(event, claim)
+                    continue
+                queued_message = _HeartbeatWarmMessage(synthetic_message, event)
+            elif event.get("type", "completion") == "completion":
+                queued_message = _CompletionDeliveryMessage(synthetic_message)
+            else:
+                queued_message = synthetic_message
             self._pending_input.put(queued_message)
             complete_event_delivery(event, claim)
 
@@ -13339,6 +13353,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         voice_input: bool = False,
         completion_delivery: bool = False,
         heartbeat_warm: bool = False,
+        heartbeat_event: Optional[dict] = None,
     ) -> Optional[str]:
         """
         Send a message to the agent and get a response.
@@ -13697,6 +13712,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         moa_config=_moa_cfg,
                         turn_origin="heartbeat_warm" if heartbeat_warm else "user",
                         allow_silent_noop=heartbeat_warm,
+                        heartbeat_event=heartbeat_event,
                     )
                     if getattr(self, "_pending_moa_disable_after_turn", False):
                         _restore = getattr(self, "_pending_moa_restore_model", None) or {}
@@ -16896,6 +16912,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         user_input, _CompletionDeliveryMessage
                     )
                     is_heartbeat_warm = isinstance(user_input, _HeartbeatWarmMessage)
+                    heartbeat_event = (
+                        user_input.heartbeat_event if is_heartbeat_warm else None
+                    )
 
                     if not user_input:
                         continue
@@ -17008,6 +17027,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             voice_input=is_voice_input,
                             completion_delivery=is_completion_delivery,
                             heartbeat_warm=is_heartbeat_warm,
+                            heartbeat_event=heartbeat_event,
                         )
                     finally:
                         self._agent_running = False
@@ -17016,7 +17036,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         self._pending_tool_info.clear()
                         self._last_scrollback_tool = ""
                         self._pet_reasoning = False
-                        self._pet_react_turn_end()
+                        if not is_heartbeat_warm:
+                            self._pet_react_turn_end()
                         # Post-turn accounting line (display.turn_summary).
                         # Emitted after the response box, before the prompt
                         # returns, so it reads as a footer for the turn.
@@ -17052,16 +17073,22 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         # continuation prompt back into _pending_input so the
                         # next loop iteration picks it up naturally (and any
                         # user input that arrives in between still preempts).
-                        try:
-                            self._maybe_continue_goal_after_turn()
-                        except Exception as _goal_exc:
-                            logging.debug("goal continuation hook failed: %s", _goal_exc)
+                        if not is_heartbeat_warm:
+                            try:
+                                self._maybe_continue_goal_after_turn()
+                            except Exception as _goal_exc:
+                                logging.debug("goal continuation hook failed: %s", _goal_exc)
 
                         # Continuous voice: auto-restart recording after agent responds.
                         # Dispatch to a daemon thread so play_beep (sd.wait) and
                         # AudioRecorder.start (lock acquire) never block process_loop —
                         # otherwise queued user input would stall silently.
-                        if self._voice_mode and self._voice_continuous and not self._voice_recording:
+                        if (
+                            not is_heartbeat_warm
+                            and self._voice_mode
+                            and self._voice_continuous
+                            and not self._voice_recording
+                        ):
                             def _restart_recording():
                                 try:
                                     if self._voice_tts:

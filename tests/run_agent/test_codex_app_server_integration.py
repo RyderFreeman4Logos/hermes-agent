@@ -66,6 +66,27 @@ def _make_codex_agent(**kwargs):
     )
 
 
+@pytest.fixture
+def heartbeat_event(monkeypatch):
+    event = {
+        "type": "heartbeat",
+        "target_id": "codex-heartbeat",
+        "target_ids": ["codex-heartbeat"],
+        "generations": [3],
+        "generation": 3,
+        "session_key": "codex-owner",
+        "provider": "openai",
+        "cache_context": "codex-cache-context",
+        "status": "ALIVE",
+        "evidence": "process still active",
+    }
+    monkeypatch.setattr(
+        "tools.runtime_heartbeat.runtime_heartbeat.is_event_current",
+        lambda candidate, agent=None: candidate is event,
+    )
+    return event
+
+
 class TestApiModeAccepted:
     def test_api_mode_is_codex_app_server(self):
         agent = _make_codex_agent()
@@ -230,7 +251,9 @@ class TestRunConversationCodexPath:
         assert agent._iters_since_skill == 2
         assert agent._user_turn_count == 2
 
-    def test_heartbeat_preserves_counters_and_meaningful_output(self, fake_session):
+    def test_heartbeat_preserves_counters_and_discards_synthetic_output(
+        self, fake_session, heartbeat_event
+    ):
         agent = _make_codex_agent()
         agent._user_turn_count = 9
         agent._turns_since_memory = 4
@@ -249,22 +272,21 @@ class TestRunConversationCodexPath:
                 "[HEARTBEAT] inspect target",
                 turn_origin="heartbeat_warm",
                 allow_silent_noop=True,
+                heartbeat_event=heartbeat_event,
             )
 
-        assert result["final_response"].startswith(
-            "echo: [HEARTBEAT] inspect target"
-        )
-        assert any(message.get("role") == "tool" for message in result["messages"])
-        assert result["messages"][0]["content"] == "[HEARTBEAT] inspect target"
+        assert result["silent_noop"] is True
+        assert result["final_response"] == ""
+        assert result["messages"] == []
         assert agent._user_turn_count == 9
         assert agent._turns_since_memory == 4
         assert agent._iters_since_skill == 5
-        persist.assert_called_once()
+        persist.assert_not_called()
         memory_sync.assert_not_called()
         review.assert_not_called()
 
     def test_empty_successful_heartbeat_returns_structured_silent_noop(
-        self, monkeypatch
+        self, monkeypatch, heartbeat_event
     ):
         wire_inputs = []
 
@@ -294,20 +316,17 @@ class TestRunConversationCodexPath:
             conversation_history=history,
             turn_origin="heartbeat_warm",
             allow_silent_noop=True,
+            heartbeat_event=heartbeat_event,
         )
 
         assert result["silent_noop"] is True
         assert result["final_response"] == ""
         assert result["messages"] == history
         assert agent._session_messages == history
-        from agent.conversation_loop import _INTERNAL_NOOP_EPHEMERAL_SUFFIX
+        assert wire_inputs == []
 
-        assert wire_inputs == [
-            "[HEARTBEAT] target remains ALIVE" + _INTERNAL_NOOP_EPHEMERAL_SUFFIX
-        ]
-
-    def test_heartbeat_app_server_failure_keeps_visible_recovery_text(
-        self, monkeypatch
+    def test_heartbeat_app_server_failure_stays_ephemeral(
+        self, monkeypatch, heartbeat_event
     ):
         def failed_turn(self, user_input: str, **kwargs):
             raise RuntimeError("heartbeat app-server failed")
@@ -327,10 +346,12 @@ class TestRunConversationCodexPath:
             conversation_history=history,
             turn_origin="heartbeat_warm",
             allow_silent_noop=True,
+            heartbeat_event=heartbeat_event,
         )
 
-        assert "Codex app-server turn failed" in result["final_response"]
-        assert result["error"] == "heartbeat app-server failed"
+        assert result["silent_noop"] is True
+        assert result["final_response"] == ""
+        assert result["error"] is None
         assert result["messages"] == history
         assert agent._session_messages == history
 

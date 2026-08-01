@@ -76,10 +76,11 @@ def finalize_turn(
     from agent.conversation_loop import logger
 
     ephemeral_heartbeat_turn = turn_origin == "heartbeat_warm"
-    if ephemeral_heartbeat_turn and silent_noop:
+    if ephemeral_heartbeat_turn:
         messages[:] = list(conversation_history or [])
         agent._session_messages = messages
         final_response = ""
+        silent_noop = True
 
     budget_exhausted = (
         api_call_count >= agent.max_iterations

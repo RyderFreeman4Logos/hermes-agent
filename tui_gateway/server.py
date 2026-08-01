@@ -8966,26 +8966,35 @@ def _notification_poller_loop(
 
 
 def _handle_heartbeat_event(sid: str, session: dict, evt: dict) -> None:
-    """Run one silent cache-warm turn in the exact owning idle session."""
+    """Warm ALIVE targets silently; surface unhealthy targets directly."""
+    from tools.runtime_heartbeat import runtime_heartbeat
+
+    if not runtime_heartbeat.is_event_current(evt):
+        return
     event_key = str(evt.get("session_key") or "")
     if not event_key or (
         event_key not in {str(sid or ""), str(session.get("session_key") or "")}
         and not _session_owns_notification_event(sid, session, evt)
     ):
         return
-    with session["history_lock"]:
-        if session.get("running"):
-            return
-        session["running"] = True
-        session["_heartbeat_running"] = True
     target = str(evt.get("target_id") or evt.get("session_id") or "unknown")
-    status = str(evt.get("status") or "STUCK").upper()
+    status = str(evt.get("status") or "").upper()
     evidence = str(evt.get("evidence") or "no evidence available")
     elapsed = max(0, int(evt.get("elapsed_s") or 0))
     prompt = (
         f'[HEARTBEAT] Background target "{target}" is {status}: {evidence}. '
         f"Elapsed: {elapsed}s. KV cache warm check-in."
     )
+    if status in {"STUCK", "UNKNOWN"}:
+        _emit("status.update", sid, {"kind": "process", "text": prompt})
+        return
+    if status != "ALIVE":
+        return
+    with session["history_lock"]:
+        if session.get("running"):
+            return
+        session["running"] = True
+        session["_heartbeat_running"] = True
     try:
         _run_prompt_submit(
             f"__heartbeat__{int(time.time() * 1000)}",
@@ -8993,7 +9002,8 @@ def _handle_heartbeat_event(sid: str, session: dict, evt: dict) -> None:
             session,
             prompt,
             turn_origin="heartbeat_warm",
-            allow_silent_noop=status == "ALIVE",
+            allow_silent_noop=True,
+            heartbeat_event=evt,
         )
     except Exception:
         with session["history_lock"]:
@@ -9114,6 +9124,7 @@ def _run_prompt_submit(
     rid, sid: str, session: dict, text: Any, *, display_kind: str | None = None,
     display_metadata: dict | None = None, completion_delivery: bool = False,
     turn_origin: str | None = None, allow_silent_noop: bool = False,
+    heartbeat_event: Any = None,
 ) -> None:
     heartbeat_turn = turn_origin == "heartbeat_warm"
     with session["history_lock"]:
@@ -9425,6 +9436,8 @@ def _run_prompt_submit(
                 run_kwargs["turn_origin"] = turn_origin
             if "allow_silent_noop" in _run_params:
                 run_kwargs["allow_silent_noop"] = bool(allow_silent_noop)
+            if heartbeat_turn and "heartbeat_event" in _run_params:
+                run_kwargs["heartbeat_event"] = heartbeat_event
             if display_kind and "persist_user_display_kind" in _run_params:
                 run_kwargs["persist_user_display_kind"] = display_kind
                 run_kwargs["persist_user_display_metadata"] = display_metadata

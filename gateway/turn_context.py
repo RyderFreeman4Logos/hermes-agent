@@ -92,6 +92,7 @@ class TurnContext:
     completion_delivery_synthetic: bool = False
     turn_origin: Optional[str] = None
     allow_silent_noop: bool = False
+    heartbeat_event: Optional[dict[str, Any]] = None
     user_config: Any = None
     enabled_toolsets: Any = None
     disabled_toolsets: Any = None

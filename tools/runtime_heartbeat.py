@@ -327,11 +327,18 @@ def inspect_process(target_id: str) -> Dict[str, Any]:
     if exited:
         return {"alive": False, "evidence": "process exited"}
     cpu_seconds = 0.0
-    if pid and pid_scope == "host":
+    if (
+        pid
+        and pid_scope == "host"
+        and host_start_time is not None
+        and process_registry._safe_host_start_time(pid) == host_start_time
+    ):
         try:
             import psutil
 
-            process_registry._remember_local_descendants(session)
+            process_registry._remember_local_descendants(
+                session, include_subreaper=True
+            )
             with session._lock:
                 tracked = dict(session._tracked_descendants)
             processes = [(pid, host_start_time), *tracked.items()]
@@ -346,6 +353,8 @@ def inspect_process(target_id: str) -> Dict[str, Any]:
                     continue
                 cpu = psutil.Process(process_pid).cpu_times()
                 cpu_seconds += float(cpu.user + cpu.system)
+            if process_registry._safe_host_start_time(pid) != host_start_time:
+                cpu_seconds = 0.0
         except Exception:
             pass
     return {

@@ -544,10 +544,16 @@ class ProcessRegistry:
         except Exception:
             return False
 
-    def _remember_local_descendants(self, session: ProcessSession) -> None:
+    def _remember_local_descendants(
+        self, session: ProcessSession, *, include_subreaper: bool = False
+    ) -> None:
         """Remember descendants that may later detach from the launcher's group."""
         proc = session.process
-        if _IS_WINDOWS or proc is None or session._subreaper_managed:
+        if (
+            _IS_WINDOWS
+            or proc is None
+            or (session._subreaper_managed and not include_subreaper)
+        ):
             return
         try:
             import psutil

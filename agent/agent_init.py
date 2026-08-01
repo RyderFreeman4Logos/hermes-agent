@@ -494,6 +494,7 @@ def init_agent(
     reasoning_config: Dict[str, Any] = None,
     service_tier: str = None,
     request_overrides: Dict[str, Any] = None,
+    fast_mode_overrides: Dict[str, Any] = None,
     prefill_messages: List[Dict[str, Any]] = None,
     platform: str = None,
     user_id: str = None,
@@ -822,7 +823,8 @@ def init_agent(
     agent.reasoning_config = reasoning_config  # None = use default (medium for OpenRouter)
     agent.service_tier = service_tier
     agent._caller_request_overrides = _copy.deepcopy(request_overrides or {})
-    agent.request_overrides = _copy.deepcopy(agent._caller_request_overrides)
+    agent.request_overrides = _copy.deepcopy(fast_mode_overrides or {})
+    agent.request_overrides.update(_copy.deepcopy(agent._caller_request_overrides))
     agent.prefill_messages = prefill_messages or []  # Prefilled conversation turns
     agent._force_ascii_payload = False
     

@@ -130,6 +130,32 @@ async def test_heartbeat_silent_noop_skips_warning_and_transcript_fallback(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["STUCK", "UNKNOWN"])
+async def test_unhealthy_heartbeat_does_not_opt_into_silent_noop(
+    monkeypatch, tmp_path, status
+):
+    runner = _runner(monkeypatch, tmp_path)
+    caller_id = "agent:main:telegram:group:-1001:12345"
+    runner.session_store._entries = {caller_id: object()}
+    runner._inject_watch_notification = AsyncMock(return_value=True)
+
+    await runner._handle_heartbeat_event(
+        {
+            "type": "heartbeat",
+            "target_id": "proc-heartbeat",
+            "session_key": caller_id,
+            "status": status,
+            "evidence": "not healthy",
+        }
+    )
+
+    assert runner._inject_watch_notification.call_args.kwargs == {
+        "turn_origin": "heartbeat_warm",
+        "allow_silent_noop": False,
+    }
+
+
+@pytest.mark.asyncio
 async def test_heartbeat_early_error_skips_transcript_fallback(monkeypatch, tmp_path):
     runner = _runner(monkeypatch, tmp_path)
     history = [

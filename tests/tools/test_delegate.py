@@ -1100,6 +1100,64 @@ class TestDelegationReasoningEffort(unittest.TestCase):
         call_kwargs = MockAgent.call_args[1]
         self.assertEqual(call_kwargs["reasoning_config"], {"enabled": True, "effort": "low"})
 
+
+class TestDelegationRequestedProvider(unittest.TestCase):
+    @patch("tools.delegate_tool._load_config", return_value={})
+    @patch("run_agent.AIAgent")
+    def test_default_child_preserves_parent_requested_provider(
+        self, MockAgent, _mock_cfg
+    ):
+        MockAgent.return_value = MagicMock()
+        parent = _make_mock_parent()
+        parent.provider = "custom"
+        parent.requested_provider = "custom:pm"
+        parent.base_url = "https://pm.invalid/v1"
+
+        _build_child_agent(
+            task_index=0,
+            goal="test",
+            context=None,
+            toolsets=None,
+            model=None,
+            max_iterations=1,
+            task_count=1,
+            parent_agent=parent,
+        )
+
+        self.assertEqual(MockAgent.call_args.kwargs["provider"], "custom")
+        self.assertEqual(
+            MockAgent.call_args.kwargs["requested_provider"], "custom:pm"
+        )
+
+    @patch("tools.delegate_tool._load_config", return_value={})
+    @patch("run_agent.AIAgent")
+    def test_explicit_child_provider_overrides_parent_provenance(
+        self, MockAgent, _mock_cfg
+    ):
+        MockAgent.return_value = MagicMock()
+        parent = _make_mock_parent()
+        parent.requested_provider = "custom:pm"
+
+        _build_child_agent(
+            task_index=0,
+            goal="test",
+            context=None,
+            toolsets=None,
+            model="child-model",
+            max_iterations=1,
+            task_count=1,
+            parent_agent=parent,
+            override_provider="anthropic",
+            override_base_url="https://api.anthropic.com",
+            override_api_key="child-key",
+            inherit_parent_api_key=False,
+        )
+
+        self.assertEqual(MockAgent.call_args.kwargs["provider"], "anthropic")
+        self.assertEqual(
+            MockAgent.call_args.kwargs["requested_provider"], "anthropic"
+        )
+
 # =========================================================================
 # Dispatch helper, progress events, concurrency
 # =========================================================================

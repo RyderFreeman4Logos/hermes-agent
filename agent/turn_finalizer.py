@@ -608,17 +608,19 @@ def finalize_turn(
     # If a /steer landed after the final assistant turn (no more tool
     # batches to drain into), hand it back to the caller so it can be
     # delivered as the next user turn instead of being silently lost.
-    _leftover_steer = agent._drain_pending_steer()
-    if _leftover_steer:
-        result["pending_steer"] = _leftover_steer
-    agent._response_was_previewed = False
+    if not ephemeral_heartbeat_turn:
+        _leftover_steer = agent._drain_pending_steer()
+        if _leftover_steer:
+            result["pending_steer"] = _leftover_steer
+        agent._response_was_previewed = False
 
     # Include interrupt message if one triggered the interrupt
     if interrupted and agent._interrupt_message:
         result["interrupt_message"] = agent._interrupt_message
 
     # Clear interrupt state after handling
-    agent.clear_interrupt()
+    if not ephemeral_heartbeat_turn:
+        agent.clear_interrupt()
 
     # Clear stream callback so it doesn't leak into future calls
     agent._stream_callback = None

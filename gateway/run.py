@@ -21267,7 +21267,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             f"Elapsed: {elapsed}s. KV cache warm check-in.",
             evt,
             turn_origin="heartbeat_warm",
-            allow_silent_noop=True,
+            allow_silent_noop=status == "ALIVE",
         )
 
     async def _async_delegation_watcher(self, interval: float = 2.0) -> None:

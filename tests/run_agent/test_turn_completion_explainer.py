@@ -260,6 +260,10 @@ def test_heartbeat_does_not_consume_user_maintenance_triggers():
     agent._iters_since_skill = 5
     agent._skill_nudge_interval = 5
     agent.valid_tool_names = {"memory", "skill_manage"}
+    agent._memory_manager = MagicMock()
+    agent._memory_manager.prefetch_all.return_value = ""
+    agent._pending_steer = "queued user steer"
+    agent._pending_redirect = "queued user redirect"
     agent.client.chat.completions.create.side_effect = [
         _mock_response(content="", finish_reason="stop"),
         _mock_response(content="real reply", finish_reason="stop"),
@@ -279,9 +283,15 @@ def test_heartbeat_does_not_consume_user_maintenance_triggers():
         assert agent._user_turn_count == 9
         assert agent._turns_since_memory == 4
         assert agent._iters_since_skill == 5
+        assert agent._pending_steer == "queued user steer"
+        assert agent._pending_redirect == "queued user redirect"
+        agent._memory_manager.on_turn_start.assert_not_called()
+        agent._memory_manager.prefetch_all.assert_not_called()
         review.assert_not_called()
         cached_system_prompt = agent._cached_system_prompt
 
+        agent._pending_steer = None
+        agent._pending_redirect = None
         result = agent.run_conversation("real user turn")
 
     assert result["final_response"] == "real reply"
@@ -289,6 +299,8 @@ def test_heartbeat_does_not_consume_user_maintenance_triggers():
     assert agent._turns_since_memory == 0
     assert agent._iters_since_skill == 0
     assert agent._cached_system_prompt == cached_system_prompt
+    agent._memory_manager.on_turn_start.assert_called_once()
+    agent._memory_manager.prefetch_all.assert_called_once()
     review.assert_called_once()
 
 

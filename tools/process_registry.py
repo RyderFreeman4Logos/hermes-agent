@@ -119,6 +119,7 @@ class ProcessSession:
     completion_reason: str = "exited"           # exited|killed|lost|failed_start|already_exited
     termination_source: str = ""                # process.kill|kill_all|backend_lost|failed_start
     output_buffer: str = ""                     # Rolling output (last MAX_OUTPUT_CHARS)
+    output_size: int = 0                         # Monotonic emitted character count
     max_output_chars: int = MAX_OUTPUT_CHARS
     detached: bool = False                      # True if recovered from crash (no pipe)
     pid_scope: str = "host"                     # "host" for local/PTY PIDs, "sandbox" for env-local PIDs
@@ -1038,12 +1039,14 @@ class ProcessRegistry:
                 session.completion_reason = "failed_start"
                 session.termination_source = "failed_start"
                 session.output_buffer = result.get("output", "").strip()
+                session.output_size = len(session.output_buffer)
         except Exception as e:
             session.exited = True
             session.exit_code = -1
             session.completion_reason = "failed_start"
             session.termination_source = "failed_start"
             session.output_buffer = f"Failed to start: {e}"
+            session.output_size = len(session.output_buffer)
 
         if not session.exited:
             # Start a poller thread that periodically reads the log file
@@ -1091,6 +1094,7 @@ class ProcessRegistry:
                 first_chunk = False
             with session._lock:
                 session.output_buffer += chunk
+                session.output_size += len(chunk)
                 if len(session.output_buffer) > session.max_output_chars:
                     session.output_buffer = session.output_buffer[-session.max_output_chars:]
             self._check_watch_patterns(session, chunk)
@@ -1205,6 +1209,7 @@ class ProcessRegistry:
                     prev_output_len = len(new_output)
                     with session._lock:
                         session.output_buffer = new_output
+                        session.output_size += len(delta)
                         if len(session.output_buffer) > session.max_output_chars:
                             session.output_buffer = session.output_buffer[-session.max_output_chars:]
                     if delta:
@@ -1255,6 +1260,7 @@ class ProcessRegistry:
                         text = chunk if isinstance(chunk, str) else chunk.decode("utf-8", errors="replace")
                         with session._lock:
                             session.output_buffer += text
+                            session.output_size += len(text)
                             if len(session.output_buffer) > session.max_output_chars:
                                 session.output_buffer = session.output_buffer[-session.max_output_chars:]
                         self._check_watch_patterns(session, text)
@@ -1555,6 +1561,7 @@ class ProcessRegistry:
         with session._lock:
             if drained:
                 session.output_buffer += drained
+                session.output_size += len(drained)
                 if len(session.output_buffer) > session.max_output_chars:
                     session.output_buffer = session.output_buffer[-session.max_output_chars:]
             session.exited = True

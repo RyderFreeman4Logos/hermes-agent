@@ -383,6 +383,7 @@ def test_host_process_cpu_includes_identity_checked_descendants(monkeypatch):
     snapshot = inspect_process("host")
 
     assert snapshot["cpu_seconds"] == 6.0
+    assert snapshot["cpu_by_identity"] == {(100, 10): 1.5, (200, 20): 4.5}
 
     monkeypatch.setattr(
         process_registry,
@@ -390,6 +391,30 @@ def test_host_process_cpu_includes_identity_checked_descendants(monkeypatch):
         lambda pid: {100: 11, 200: 20, 300: 31}[pid],
     )
     assert inspect_process("host")["cpu_seconds"] == 0.0
+
+
+def test_cpu_progress_survives_a_high_cpu_child_exiting():
+    from tools.runtime_heartbeat import RuntimeHeartbeat
+
+    target = SimpleNamespace(
+        kind="process",
+        baseline={
+            "output_size": 0,
+            "cpu_seconds": 5.1,
+            "cpu_by_identity": {(100, 10): 0.1, (200, 20): 5.0},
+        },
+    )
+    snapshot = {
+        "alive": True,
+        "output_size": 0,
+        "cpu_seconds": 0.2,
+        "cpu_by_identity": {(100, 10): 0.2},
+    }
+
+    status, evidence = RuntimeHeartbeat._assess(target, snapshot)
+
+    assert status == "ALIVE"
+    assert "CPU advanced" in evidence
 
 
 @pytest.mark.skipif(
@@ -410,11 +435,13 @@ def test_linux_subreaper_descendant_cpu_keeps_heartbeat_alive(
         process_registry_module, "CHECKPOINT_PATH", tmp_path / "processes.json"
     )
     stop = tmp_path / "stop-worker"
+    marker = f"hermes-heartbeat-worker:{stop}"
     worker_code = (
-        "import pathlib,sys; stop=pathlib.Path(sys.argv[1]); "
+        "import pathlib,sys; marker=sys.argv[1]; stop=pathlib.Path(sys.argv[2]); "
         'exec("n=0\\nwhile not stop.exists():\\n for _ in range(100000): n += 1")'
     )
-    command = shlex.join([sys.executable, "-c", worker_code, str(stop)])
+    expected_argv = [sys.executable, "-c", worker_code, marker, str(stop)]
+    command = shlex.join(expected_argv)
     session = registry.spawn_local(command, cwd=str(tmp_path))
     events = queue.Queue()
     FakeTimer.created = []
@@ -429,7 +456,7 @@ def test_linux_subreaper_descendant_cpu_keeps_heartbeat_alive(
                     (
                         child
                         for child in psutil.Process(session.pid).children(recursive=True)
-                        if str(stop) in child.cmdline()
+                        if child.cmdline() == expected_argv
                     ),
                     None,
                 )
@@ -449,6 +476,9 @@ def test_linux_subreaper_descendant_cpu_keeps_heartbeat_alive(
             inspect=lambda: inspect_process(session.id),
         )
         baseline = dict(manager._targets[session.id].baseline)
+        baseline_worker_cpu = baseline["cpu_by_identity"].get(
+            (worker.pid, worker_start), 0.0
+        )
 
         def _advanced_worker_cpu():
             if registry._safe_host_start_time(worker.pid) != worker_start:
@@ -458,7 +488,7 @@ def test_linux_subreaper_descendant_cpu_keeps_heartbeat_alive(
             except psutil.Error:
                 return None
             total = float(cpu.user + cpu.system)
-            return total if total >= 0.25 else None
+            return total if total > baseline_worker_cpu else None
 
         worker_cpu = _wait_until(_advanced_worker_cpu)
         assert worker_cpu is not None, "CPU worker made no measurable progress"

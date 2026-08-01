@@ -140,6 +140,38 @@ def test_run_conversation_empty_exhausted_surfaces_explanation():
     assert "No reply:" in result["final_response"]
 
 
+def test_heartbeat_silent_noop_leaves_no_durable_or_live_history():
+    agent = _make_agent(max_iterations=10)
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(content="", finish_reason="stop")
+    ]
+    history = [
+        {"role": "user", "content": "real question"},
+        {"role": "assistant", "content": "real answer"},
+    ]
+
+    with (
+        patch.object(agent, "_persist_session") as persist,
+        patch.object(agent, "_save_trajectory") as trajectory,
+        patch.object(agent, "_cleanup_task_resources"),
+        patch.object(agent, "_sync_external_memory_for_turn") as external_memory,
+    ):
+        result = agent.run_conversation(
+            "[HEARTBEAT] target remains ALIVE",
+            conversation_history=history,
+            turn_origin="heartbeat_warm",
+            allow_silent_noop=True,
+        )
+
+    assert result["silent_noop"] is True
+    assert result["final_response"] == ""
+    assert result["messages"] == history
+    assert agent._session_messages == history
+    persist.assert_not_called()
+    trajectory.assert_not_called()
+    external_memory.assert_not_called()
+
+
 def test_first_api_call_reports_cache_hit_to_tui_callback():
     agent = _make_agent(max_iterations=10)
     response = _mock_response(content="Done.", finish_reason="stop")
@@ -195,4 +227,3 @@ def test_run_conversation_partial_stream_recovery_surfaces_explanation():
     assert result["final_response"].startswith(recovered)
     assert "No reply:" in result["final_response"]
     assert result["response_previewed"] is False
-

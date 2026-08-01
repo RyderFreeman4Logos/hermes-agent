@@ -679,6 +679,9 @@ def dispatch_async_delegation(
         ``{"status": "dispatched", "delegation_id": ...}`` on success, or
         ``{"status": "rejected", "error": ...}`` when at capacity.
     """
+    from tools.runtime_heartbeat import preflight_current_heartbeat
+
+    heartbeat_interval = preflight_current_heartbeat()
     delegation_id = _new_delegation_id()
     dispatched_at = time.time()
     record: Dict[str, Any] = {
@@ -757,6 +760,15 @@ def dispatch_async_delegation(
             "status": "rejected",
             "error": f"Failed to schedule async delegation: {exc}",
         }
+    from tools.runtime_heartbeat import inspect_delegation, runtime_heartbeat
+
+    runtime_heartbeat.arm(
+        delegation_id,
+        caller_id=session_key,
+        kind="delegation",
+        interval=heartbeat_interval,
+        inspect=lambda _id=delegation_id: inspect_delegation(_id),
+    )
     if progress_fn is not None:
         _ensure_stale_monitor()
 
@@ -795,6 +807,17 @@ def _begin_finalization(
         record["interrupt_fn"] = None  # drop the closure; child is done
         record["progress_fn"] = None  # stop stale-monitor sampling
         event_record = dict(record)
+
+    try:
+        from tools.runtime_heartbeat import runtime_heartbeat
+
+        runtime_heartbeat.cancel(delegation_id)
+    except Exception:
+        logger.debug(
+            "Failed to cancel heartbeat for delegation %s",
+            delegation_id,
+            exc_info=True,
+        )
 
     return event_record, interrupt_fn
 
@@ -913,6 +936,9 @@ def dispatch_async_delegation_batch(
     ``{"status": "rejected", "error": ...}`` when the async pool is at
     capacity.
     """
+    from tools.runtime_heartbeat import preflight_current_heartbeat
+
+    heartbeat_interval = preflight_current_heartbeat()
     delegation_id = delegation_id or _new_delegation_id()
     dispatched_at = time.time()
     n = len(goals)
@@ -998,6 +1024,15 @@ def dispatch_async_delegation_batch(
             "status": "rejected",
             "error": f"Failed to schedule async delegation batch: {exc}",
         }
+    from tools.runtime_heartbeat import inspect_delegation, runtime_heartbeat
+
+    runtime_heartbeat.arm(
+        delegation_id,
+        caller_id=session_key,
+        kind="delegation",
+        interval=heartbeat_interval,
+        inspect=lambda _id=delegation_id: inspect_delegation(_id),
+    )
     if progress_fn is not None:
         _ensure_stale_monitor()
 
@@ -1372,6 +1407,12 @@ def interrupt_all(reason: str = "shutdown") -> int:
             if r.get("status") in ("running", "stalling")
         ]
     for r in targets:
+        try:
+            from tools.runtime_heartbeat import runtime_heartbeat
+
+            runtime_heartbeat.cancel(r.get("delegation_id", ""))
+        except Exception:
+            logger.debug("Could not cancel delegation heartbeat", exc_info=True)
         fn = r.get("interrupt_fn")
         if callable(fn):
             try:
@@ -1425,6 +1466,12 @@ def interrupt_for_session(
             )
         ]
     for r in targets:
+        try:
+            from tools.runtime_heartbeat import runtime_heartbeat
+
+            runtime_heartbeat.cancel(r.get("delegation_id", ""))
+        except Exception:
+            logger.debug("Could not cancel delegation heartbeat", exc_info=True)
         fn = r.get("interrupt_fn")
         if callable(fn):
             try:
@@ -1459,3 +1506,9 @@ def _reset_for_tests() -> None:
         thread.join(timeout=2)
     with _records_lock:
         _records.clear()
+    try:
+        from tools.runtime_heartbeat import runtime_heartbeat
+
+        runtime_heartbeat.cancel_all()
+    except Exception:
+        pass

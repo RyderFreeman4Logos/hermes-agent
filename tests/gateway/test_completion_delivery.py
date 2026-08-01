@@ -84,6 +84,62 @@ def _completion_event(*, started_at, session_id="proc_reused"):
     }
 
 
+def _runtime_heartbeat_event(**overrides):
+    event = {
+        "type": "heartbeat",
+        "target_id": "proc-heartbeat",
+        "target_kind": "process",
+        "session_id": "proc-heartbeat",
+        "session_key": "agent:main:telegram:dm:12345:678",
+        "status": "ALIVE",
+        "evidence": "output grew",
+    }
+    event.update(overrides)
+    return event
+
+
+def test_gateway_heartbeat_routes_to_exact_idle_owner(monkeypatch):
+    event = _runtime_heartbeat_event()
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter, origins={event["session_key"]: object()})
+    runner._running_agents = {}
+    inject = AsyncMock(return_value=True)
+    monkeypatch.setattr(runner, "_inject_watch_notification", inject)
+
+    asyncio.run(runner._handle_heartbeat_event(event))
+
+    inject.assert_awaited_once()
+    assert inject.await_args.kwargs == {
+        "turn_origin": "heartbeat_warm",
+        "allow_silent_noop": True,
+    }
+
+
+def test_gateway_alive_heartbeat_does_not_duplicate_busy_turn(monkeypatch):
+    event = _runtime_heartbeat_event()
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter, origins={event["session_key"]: object()})
+    runner._running_agents = {event["session_key"]: object()}
+    inject = AsyncMock(return_value=True)
+    monkeypatch.setattr(runner, "_inject_watch_notification", inject)
+
+    asyncio.run(runner._handle_heartbeat_event(event))
+
+    inject.assert_not_awaited()
+
+
+def test_gateway_foreign_heartbeat_never_crosses_owner(monkeypatch):
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter, origins={})
+    runner._running_agents = {}
+    inject = AsyncMock(return_value=True)
+    monkeypatch.setattr(runner, "_inject_watch_notification", inject)
+
+    asyncio.run(runner._handle_heartbeat_event(_runtime_heartbeat_event()))
+
+    inject.assert_not_awaited()
+
+
 def _stop_after_sleeps(monkeypatch, runner, count):
     sleep_calls = 0
 

@@ -65,6 +65,8 @@ def finalize_turn(
     _turn_exit_reason,
     _pending_verification_response=None,
     _pending_verification_response_previewed=False,
+    silent_noop=False,
+    turn_origin: str = "user",
 ):
     """Run the post-loop finalization and return the turn ``result`` dict.
 
@@ -72,6 +74,13 @@ def finalize_turn(
     loop). See module docstring.
     """
     from agent.conversation_loop import logger
+
+    ephemeral_heartbeat_turn = turn_origin == "heartbeat_warm"
+    if ephemeral_heartbeat_turn:
+        messages[:] = list(conversation_history or [])
+        agent._session_messages = messages
+        final_response = ""
+        silent_noop = True
 
     budget_exhausted = (
         api_call_count >= agent.max_iterations
@@ -174,7 +183,7 @@ def finalize_turn(
 
     # Determine if conversation completed successfully
     normal_text_response = str(_turn_exit_reason).startswith("text_response(")
-    completed = (
+    completed = bool(silent_noop) or (
         final_response is not None
         and not failed
         and (
@@ -228,11 +237,12 @@ def finalize_turn(
 
     # Save trajectory if enabled.  ``user_message`` may be a multimodal
     # list of parts; the trajectory format wants a plain string.
-    try:
-        agent._save_trajectory(messages, _summarize_user_message_for_log(user_message), completed)
-    except Exception as _save_err:
-        _cleanup_errors.append(f"save_trajectory: {_save_err}")
-        logger.error("finalize_turn: _save_trajectory failed: %s", _save_err, exc_info=True)
+    if not ephemeral_heartbeat_turn:
+        try:
+            agent._save_trajectory(messages, _summarize_user_message_for_log(user_message), completed)
+        except Exception as _save_err:
+            _cleanup_errors.append(f"save_trajectory: {_save_err}")
+            logger.error("finalize_turn: _save_trajectory failed: %s", _save_err, exc_info=True)
 
     # Clean up VM and browser for this task after conversation completes
     try:
@@ -330,7 +340,8 @@ def finalize_turn(
         _apply_override = getattr(agent, "_apply_persist_user_message_override", None)
         if callable(_apply_override):
             _apply_override(messages)
-        agent._persist_session(messages, conversation_history)
+        if not ephemeral_heartbeat_turn:
+            agent._persist_session(messages, conversation_history)
     except Exception as _persist_err:
         _cleanup_errors.append(f"persist_session: {_persist_err}")
         logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)
@@ -420,7 +431,7 @@ def finalize_turn(
     #     an empty response, the "(empty)" terminal sentinel, or a
     #     suspiciously short partial fragment with no terminating
     #     punctuation (e.g. "The").  A real short answer keeps its text.
-    if not interrupted:
+    if not interrupted and not silent_noop:
         try:
             if agent._turn_completion_explainer_enabled():
                 _stripped = (final_response or "").strip()
@@ -519,18 +530,19 @@ def finalize_turn(
         # provider response (early failure / interrupt), which is exactly the
         # contract: real usage when available, ``None`` otherwise.
         _turn_usage = getattr(agent, "_last_turn_usage", None)
-        _notify_context_engine_turn_complete(
-            agent,
-            messages,
-            usage=_turn_usage,
-            logger=logger,
-            turn_id=turn_id,
-            task_id=effective_task_id,
-            api_call_count=api_call_count,
-            interrupted=interrupted,
-            failed=failed,
-            turn_exit_reason=_turn_exit_reason,
-        )
+        if not ephemeral_heartbeat_turn:
+            _notify_context_engine_turn_complete(
+                agent,
+                messages,
+                usage=_turn_usage,
+                logger=logger,
+                turn_id=turn_id,
+                task_id=effective_task_id,
+                api_call_count=api_call_count,
+                interrupted=interrupted,
+                failed=failed,
+                turn_exit_reason=_turn_exit_reason,
+            )
     except Exception as exc:
         logger.warning("on_turn_complete notification failed: %s", exc)
 
@@ -585,6 +597,7 @@ def finalize_turn(
             (getattr(agent, "request_overrides", {}) or {}).get("extra_body") or {}
         ).get("service_tier"),
         "session_id": agent.session_id,
+        "silent_noop": bool(silent_noop),
     }
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
@@ -620,12 +633,13 @@ def finalize_turn(
         agent._iters_since_skill = 0
 
     # External memory provider: sync the completed turn + queue next prefetch.
-    agent._sync_external_memory_for_turn(
-        original_user_message=original_user_message,
-        final_response=final_response,
-        interrupted=interrupted,
-        messages=messages,
-    )
+    if not ephemeral_heartbeat_turn:
+        agent._sync_external_memory_for_turn(
+            original_user_message=original_user_message,
+            final_response=final_response,
+            interrupted=interrupted,
+            messages=messages,
+        )
 
     # Background memory/skill review — runs AFTER the response is delivered
     # so it never competes with the user's task for model attention.
@@ -651,18 +665,19 @@ def finalize_turn(
     # Plugins can use this for cleanup, flushing buffers, etc.
     try:
         from hermes_cli.lifecycle import invoke_hook as _invoke_hook
-        _invoke_hook(
-            "on_session_end",
-            session_id=agent.session_id,
-            task_id=effective_task_id,
-            turn_id=turn_id,
-            completed=completed,
-            failed=failed,
-            interrupted=interrupted,
-            turn_exit_reason=_turn_exit_reason,
-            model=agent.model,
-            platform=getattr(agent, "platform", None) or "",
-        )
+        if not ephemeral_heartbeat_turn:
+            _invoke_hook(
+                "on_session_end",
+                session_id=agent.session_id,
+                task_id=effective_task_id,
+                turn_id=turn_id,
+                completed=completed,
+                failed=failed,
+                interrupted=interrupted,
+                turn_exit_reason=_turn_exit_reason,
+                model=agent.model,
+                platform=getattr(agent, "platform", None) or "",
+            )
     except Exception as exc:
         logger.warning("on_session_end hook failed: %s", exc)
 

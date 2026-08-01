@@ -6206,6 +6206,7 @@ def _make_agent(
         model=model,
         max_iterations=_cfg_max_turns(cfg, 500),
         provider=runtime.get("provider"),
+        requested_provider=requested_provider,
         base_url=runtime.get("base_url"),
         api_key=runtime.get("api_key"),
         api_mode=runtime.get("api_mode"),
@@ -8783,6 +8784,10 @@ def _notification_poller_loop(
         if evt.get("type") == "completion" and process_registry.is_completion_consumed(_evt_sid):
             continue
 
+        if evt.get("type") == "heartbeat":
+            _handle_heartbeat_event(sid, session, evt)
+            continue
+
         text = format_process_notification(evt)
         if not text:
             continue
@@ -8886,6 +8891,9 @@ def _notification_poller_loop(
         _evt_sid = evt.get("session_id", "")
         if evt.get("type") == "completion" and process_registry.is_completion_consumed(_evt_sid):
             continue
+        if evt.get("type") == "heartbeat":
+            _handle_heartbeat_event(sid, session, evt)
+            continue
         text = format_process_notification(evt)
         if not text:
             continue
@@ -8948,6 +8956,41 @@ def _notification_poller_loop(
     # Hand any other sessions' events back to the shared queue.
     for evt in deferred:
         process_registry.completion_queue.put(evt)
+
+
+def _handle_heartbeat_event(sid: str, session: dict, evt: dict) -> None:
+    """Run one silent cache-warm turn in the exact owning idle session."""
+    event_key = str(evt.get("session_key") or "")
+    if not event_key or (
+        event_key not in {str(sid or ""), str(session.get("session_key") or "")}
+        and not _session_owns_notification_event(sid, session, evt)
+    ):
+        return
+    with session["history_lock"]:
+        if session.get("running"):
+            return
+        session["running"] = True
+    target = str(evt.get("target_id") or evt.get("session_id") or "unknown")
+    status = str(evt.get("status") or "STUCK").upper()
+    evidence = str(evt.get("evidence") or "no evidence available")
+    elapsed = max(0, int(evt.get("elapsed_s") or 0))
+    prompt = (
+        f'[HEARTBEAT] Background target "{target}" is {status}: {evidence}. '
+        f"Elapsed: {elapsed}s. KV cache warm check-in."
+    )
+    try:
+        _run_prompt_submit(
+            f"__heartbeat__{int(time.time() * 1000)}",
+            sid,
+            session,
+            prompt,
+            turn_origin="heartbeat_warm",
+            allow_silent_noop=True,
+        )
+    except Exception:
+        with session["history_lock"]:
+            session["running"] = False
+        logger.warning("Heartbeat warm check-in dispatch failed", exc_info=True)
 
 
 def _async_delegation_display_metadata(evt: dict) -> dict:
@@ -9061,16 +9104,21 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
 def _run_prompt_submit(
     rid, sid: str, session: dict, text: Any, *, display_kind: str | None = None,
     display_metadata: dict | None = None, completion_delivery: bool = False,
+    turn_origin: str | None = None, allow_silent_noop: bool = False,
 ) -> None:
+    heartbeat_turn = turn_origin == "heartbeat_warm"
     with session["history_lock"]:
         history = list(session["history"])
         history_version = int(session.get("history_version", 0))
-        images = list(session.get("attached_images", []))
-        session["attached_images"] = []
+        images = [] if heartbeat_turn else list(session.get("attached_images", []))
+        if not heartbeat_turn:
+            session["attached_images"] = []
         inflight = session.get("inflight_turn")
         # A retained failed turn (see _fail_inflight_turn) is a stale leftover
         # by the time a new turn starts — replace it, never append onto it.
-        if not isinstance(inflight, dict) or inflight.get("status") == "error":
+        if not heartbeat_turn and (
+            not isinstance(inflight, dict) or inflight.get("status") == "error"
+        ):
             _start_inflight_turn(session, text)
     agent = session["agent"]
     if hasattr(agent, "clear_interrupt"):
@@ -9078,7 +9126,8 @@ def _run_prompt_submit(
             agent.clear_interrupt()
         except Exception:
             pass
-    _emit("message.start", sid)
+    if not heartbeat_turn:
+        _emit("message.start", sid)
 
     def run():
         approval_token = None
@@ -9089,7 +9138,7 @@ def _run_prompt_submit(
         result = None  # turn outcome; read after the finally for leftover /steer
         tts_queue = None  # streaming-TTS feed for this turn (voice mode)
         thinking_started = False  # ambient thinking sound armed for this turn
-        one_turn_restore = session.pop("one_turn_model_restore", None)
+        one_turn_restore = None if heartbeat_turn else session.pop("one_turn_model_restore", None)
         # True once a failed turn's snapshot was retained for resume replay —
         # tells the finally below to skip the normal inflight clear.
         turn_error_retained = False
@@ -9101,9 +9150,13 @@ def _run_prompt_submit(
         # session_key mid-turn, so remember the key we wrote under.
         marker_home = _session_home(session)
         marker_key = str(session.get("session_key") or "")
-        marker_attempt = int(session.pop("_auto_continue_attempt", 0) or 0)
-        marker_text = session.pop("_auto_continue_prompt", None) or text
-        if isinstance(marker_text, str) and marker_text.strip():
+        marker_attempt = (
+            0
+            if heartbeat_turn
+            else int(session.pop("_auto_continue_attempt", 0) or 0)
+        )
+        marker_text = text if heartbeat_turn else session.pop("_auto_continue_prompt", None) or text
+        if not heartbeat_turn and isinstance(marker_text, str) and marker_text.strip():
             record_turn_start(marker_home, marker_key, marker_text, attempts=marker_attempt)
         try:
             from tools.approval import (
@@ -9329,7 +9382,7 @@ def _run_prompt_submit(
 
             run_kwargs = {
                 "conversation_history": list(history),
-                "stream_callback": _stream,
+                "stream_callback": None if heartbeat_turn else _stream,
                 "persist_user_message": (
                     _build_persist_user_message(prompt, images, run_message) if images else prompt
                 ),
@@ -9352,10 +9405,19 @@ def _run_prompt_submit(
                 _run_params = {}
             if "task_id" in _run_params:
                 run_kwargs["task_id"] = session["session_key"]
+            if turn_origin is not None and "turn_origin" in _run_params:
+                run_kwargs["turn_origin"] = turn_origin
+            if "allow_silent_noop" in _run_params:
+                run_kwargs["allow_silent_noop"] = bool(allow_silent_noop)
             if display_kind and "persist_user_display_kind" in _run_params:
                 run_kwargs["persist_user_display_kind"] = display_kind
                 run_kwargs["persist_user_display_metadata"] = display_metadata
             result = agent.run_conversation(run_message, **run_kwargs)
+            heartbeat_silent_noop = bool(
+                heartbeat_turn
+                and isinstance(result, dict)
+                and result.get("silent_noop") is True
+            )
             if display_kind and isinstance(text, str):
                 db = getattr(agent, "_session_db", None)
                 current_session_id = getattr(agent, "session_id", None) or session.get("session_key")
@@ -9422,7 +9484,7 @@ def _run_prompt_submit(
             last_reasoning = None
             status_note = None
             if isinstance(result, dict):
-                if isinstance(result.get("messages"), list):
+                if not heartbeat_silent_noop and isinstance(result.get("messages"), list):
                     with session["history_lock"]:
                         current_version = int(session.get("history_version", 0))
                         if current_version == history_version:
@@ -9493,6 +9555,8 @@ def _run_prompt_submit(
                 status = "complete"
 
             payload = {"text": raw, "usage": _get_usage(agent), "status": status}
+            if heartbeat_silent_noop:
+                payload["silent"] = True
             turn_usage = getattr(agent, "_first_turn_usage", None)
             if turn_usage is None:
                 turn_usage = result.get("usage") if isinstance(result, dict) else None
@@ -9528,15 +9592,17 @@ def _run_prompt_submit(
                         result.get("error") if isinstance(result, dict) else raw,
                     )
                     turn_error_retained = True
-                else:
+                elif not heartbeat_turn:
                     _clear_inflight_turn(session)
             if status == "error":
                 payload["error"] = str(
                     (result.get("error") if isinstance(result, dict) else "") or raw
                 )
                 payload["recoverable"] = True
-            _retire_turn_marker(session, marker_key)
-            _emit("message.complete", sid, payload)
+            if not heartbeat_turn:
+                _retire_turn_marker(session, marker_key)
+            if not heartbeat_silent_noop:
+                _emit("message.complete", sid, payload)
 
             # ── /goal continuation (Ralph-style loop) ─────────────────
             # After every TUI turn, if a /goal is active, ask the judge
@@ -9755,13 +9821,15 @@ def _run_prompt_submit(
             with session["history_lock"]:
                 session["running"] = False
                 session["last_active"] = time.time()
-                if not turn_error_retained:
+                if not turn_error_retained and not heartbeat_turn:
                     _clear_inflight_turn(session)
             # Backstop for turns that never reached a terminal frame (the
             # frame paths retire the marker as they emit).
-            _retire_turn_marker(session, marker_key)
-            session.pop("_auto_continue_scheduled", None)
-            _emit_settled_session_info(sid, session, agent)
+            if not heartbeat_turn:
+                _retire_turn_marker(session, marker_key)
+            if not heartbeat_turn:
+                session.pop("_auto_continue_scheduled", None)
+                _emit_settled_session_info(sid, session, agent)
 
         # A user prompt that arrived mid-turn (interrupt + queue) wins over
         # every auto follow-up below — drain it first and skip them this cycle;
@@ -9824,6 +9892,7 @@ def _run_prompt_submit(
                 session_key=session.get("session_key", ""),
                 owns_event=lambda e: _session_owns_notification_event(sid, session, e),
                 skip_poll_observed=False,
+                preserve_event_types={"heartbeat"},
             )
             for index, (_evt, synth) in enumerate(drained):
                 with session["history_lock"]:

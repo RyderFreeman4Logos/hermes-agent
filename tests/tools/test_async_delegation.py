@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -63,6 +64,64 @@ def _drain_for(delegation_id, timeout=5.0):
             continue
         time.sleep(0.02)
     return None
+
+
+def test_heartbeat_config_is_validated_before_delegation_submit(monkeypatch):
+    from tools.runtime_heartbeat import HeartbeatConfigError
+
+    monkeypatch.setattr(
+        "tools.runtime_heartbeat.preflight_current_heartbeat",
+        lambda: (_ for _ in ()).throw(
+            HeartbeatConfigError("missing exact mapping for custom:pm")
+        ),
+    )
+    get_executor = MagicMock()
+    monkeypatch.setattr(ad, "_get_executor", get_executor)
+
+    with pytest.raises(HeartbeatConfigError, match="custom:pm"):
+        ad.dispatch_async_delegation(
+            goal="g",
+            context=None,
+            toolsets=None,
+            role="leaf",
+            model="m",
+            session_key="owner",
+            runner=lambda: {"status": "completed"},
+        )
+
+    get_executor.assert_not_called()
+    assert ad.active_count() == 0
+
+
+def test_delegation_arms_after_submit_and_cancels_on_completion(monkeypatch):
+    from tools.runtime_heartbeat import runtime_heartbeat
+
+    gate = threading.Event()
+    monkeypatch.setattr(
+        "tools.runtime_heartbeat.preflight_current_heartbeat", lambda: 1700
+    )
+    arm = MagicMock(return_value=True)
+    cancel = MagicMock(return_value=True)
+    monkeypatch.setattr(runtime_heartbeat, "arm", arm)
+    monkeypatch.setattr(runtime_heartbeat, "cancel", cancel)
+
+    result = ad.dispatch_async_delegation(
+        goal="g",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="owner",
+        runner=lambda: (gate.wait(timeout=5), {"status": "completed"})[1],
+    )
+    assert result["status"] == "dispatched"
+    arm.assert_called_once()
+    assert arm.call_args.kwargs["interval"] == 1700
+    assert arm.call_args.kwargs["caller_id"] == "owner"
+
+    gate.set()
+    assert _drain_for(result["delegation_id"]) is not None
+    cancel.assert_called_once_with(result["delegation_id"])
 
 
 def test_dispatch_returns_immediately_without_blocking():

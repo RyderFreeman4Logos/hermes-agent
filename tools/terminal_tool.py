@@ -2548,6 +2548,16 @@ def terminal_tool(
                 session_key=session_key,
             )
             try:
+                heartbeat_interval = None
+                if notify_on_complete:
+                    from gateway.session_context import async_delivery_supported
+
+                    if async_delivery_supported():
+                        from tools.runtime_heartbeat import (
+                            preflight_current_heartbeat,
+                        )
+
+                        heartbeat_interval = preflight_current_heartbeat()
                 if env_type == "local":
                     proc_session = process_registry.spawn_local(
                         command=command,
@@ -2752,6 +2762,19 @@ def terminal_tool(
                 if notify_on_complete and background:
                     proc_session.notify_on_complete = True
                     result_data["notify_on_complete"] = True
+
+                    from tools.runtime_heartbeat import (
+                        inspect_process,
+                        runtime_heartbeat,
+                    )
+
+                    runtime_heartbeat.arm(
+                        proc_session.id,
+                        caller_id=session_key,
+                        kind="process",
+                        interval=heartbeat_interval,
+                        inspect=lambda _id=proc_session.id: inspect_process(_id),
+                    )
 
                     # In gateway mode, auto-register a fast watcher so the
                     # gateway can detect completion and trigger a new agent

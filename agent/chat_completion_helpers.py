@@ -1882,6 +1882,15 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         agent.requested_provider = fb_provider
         agent.base_url = fb_base_url
         agent.api_mode = fb_api_mode
+        try:
+            from tools.runtime_heartbeat import bind_agent_provider
+
+            bind_agent_provider(agent)
+        except Exception:
+            logger.debug(
+                "Could not refresh runtime heartbeat fallback provider",
+                exc_info=True,
+            )
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent._fallback_activated = True

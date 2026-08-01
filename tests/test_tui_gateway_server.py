@@ -3568,6 +3568,71 @@ def _session(agent=None, **extra):
     }
 
 
+def _runtime_heartbeat_event(**overrides):
+    event = {
+        "type": "heartbeat",
+        "target_id": "proc-heartbeat",
+        "target_kind": "process",
+        "session_id": "proc-heartbeat",
+        "session_key": "heartbeat-owner",
+        "status": "ALIVE",
+        "evidence": "output grew 0->128 bytes",
+    }
+    event.update(overrides)
+    return event
+
+
+def test_tui_heartbeat_routes_to_idle_owner_as_silent_turn(monkeypatch):
+    session = _session(session_key="heartbeat-owner")
+    submitted = []
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *args, **kwargs: submitted.append((args, kwargs)),
+    )
+
+    server._handle_heartbeat_event(
+        "heartbeat-sid", session, _runtime_heartbeat_event()
+    )
+
+    assert len(submitted) == 1
+    args, kwargs = submitted[0]
+    assert args[1] == "heartbeat-sid"
+    assert "proc-heartbeat" in args[3]
+    assert kwargs == {
+        "turn_origin": "heartbeat_warm",
+        "allow_silent_noop": True,
+    }
+
+
+def test_tui_alive_heartbeat_does_not_duplicate_busy_turn(monkeypatch):
+    session = _session(session_key="heartbeat-owner", running=True)
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *_args, **_kwargs: pytest.fail("busy heartbeat created a turn"),
+    )
+
+    server._handle_heartbeat_event(
+        "heartbeat-sid", session, _runtime_heartbeat_event()
+    )
+
+
+def test_tui_foreign_heartbeat_never_crosses_owner(monkeypatch):
+    session = _session(session_key="heartbeat-owner")
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *_args, **_kwargs: pytest.fail("foreign heartbeat created a turn"),
+    )
+
+    server._handle_heartbeat_event(
+        "heartbeat-sid",
+        session,
+        _runtime_heartbeat_event(session_key="foreign-owner"),
+    )
+
+
 def test_session_close_commits_memory_and_fires_finalize_hook(monkeypatch):
     calls = {"hooks": []}
 

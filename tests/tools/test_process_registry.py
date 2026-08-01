@@ -49,6 +49,36 @@ def _make_session(
     return s
 
 
+def test_terminal_claim_cancels_heartbeat_before_completion_publication(
+    registry, monkeypatch
+):
+    from tools.runtime_heartbeat import runtime_heartbeat
+
+    order = []
+    session = _make_session(sid="proc-heartbeat", exited=True, exit_code=0)
+    session.notify_on_complete = True
+    session.session_key = "owner"
+    registry._running[session.id] = session
+    monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+    monkeypatch.setattr(
+        runtime_heartbeat,
+        "cancel",
+        lambda target_id: order.append(("cancel", target_id)) or True,
+    )
+
+    class RecordingQueue:
+        def put(self, event):
+            order.append(("publish", event["session_id"]))
+
+    registry.completion_queue = RecordingQueue()
+    registry._move_to_finished(session)
+
+    assert order == [
+        ("cancel", "proc-heartbeat"),
+        ("publish", "proc-heartbeat"),
+    ]
+
+
 def _spawn_python_sleep(seconds: float) -> subprocess.Popen:
     """Spawn a portable short-lived Python sleep process."""
     return subprocess.Popen(

@@ -10309,6 +10309,10 @@ def _(rid, params: dict) -> dict:
             current_overrides.pop("speed", None)
             if nv == "fast":
                 current_overrides.update(overrides)
+            caller_overrides = getattr(agent, "_caller_request_overrides", {}) or {}
+            for name in ("service_tier", "speed"):
+                if name in caller_overrides:
+                    current_overrides[name] = caller_overrides[name]
             agent.request_overrides = current_overrides
             _persist_live_session_runtime(session)
             _emit(

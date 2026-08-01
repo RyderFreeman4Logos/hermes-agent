@@ -725,9 +725,9 @@ def _run_review_in_thread(
             # unmapped except on gpt-5.6/xAI). Let the routed fork use
             # provider defaults — matching the ``not _routed`` gate on
             # _cached_system_prompt below.
+            _fork_kwargs["fast_mode_overrides"] = _rt.get("request_overrides") or {}
             if not _routed:
                 _fork_kwargs["reasoning_config"] = getattr(agent, "reasoning_config", None)
-                _fork_kwargs["fast_mode_overrides"] = _rt.get("request_overrides") or {}
             review_agent = AIAgent(
                 model=_rt.get("model") or agent.model,
                 max_iterations=16,
@@ -739,7 +739,7 @@ def _run_review_in_thread(
                 api_key=_rt.get("api_key") or None,
                 credential_pool=_rt.get("credential_pool"),
                 request_overrides=(
-                    _rt.get("request_overrides")
+                    {}
                     if _routed
                     else getattr(agent, "_caller_request_overrides", {})
                 ) or {},

@@ -1303,7 +1303,13 @@ def try_recover_primary_transport(
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent.api_key = rt["api_key"]
-        agent.request_overrides = copy.deepcopy(rt.get("request_overrides", {}))
+        _rebuild_request_overrides_for_runtime(
+            agent,
+            previous_provider=rt["provider"],
+            previous_base_url=rt["base_url"],
+            previous_model=rt["model"],
+            force=True,
+        )
 
         if agent.api_mode == "anthropic_messages":
             from agent.anthropic_adapter import build_anthropic_client
@@ -1535,7 +1541,13 @@ def restore_primary_runtime(agent) -> bool:
             agent._transport_cache.clear()
         agent.api_key = rt["api_key"]
         agent._client_kwargs = dict(rt["client_kwargs"])
-        agent.request_overrides = copy.deepcopy(rt.get("request_overrides", {}))
+        _rebuild_request_overrides_for_runtime(
+            agent,
+            previous_provider=rt["provider"],
+            previous_base_url=rt["base_url"],
+            previous_model=rt["model"],
+            force=True,
+        )
         agent._use_prompt_caching = rt["use_prompt_caching"]
         # Default to native layout when the restored snapshot predates the
         # native-vs-proxy split (older sessions saved before this PR).
@@ -2359,8 +2371,9 @@ def _rebuild_request_overrides_for_runtime(
     previous_provider: str,
     previous_base_url: str,
     previous_model: str,
+    force: bool = False,
 ) -> None:
-    """Replace provider-derived overrides after a runtime identity change."""
+    """Replace provider-derived overrides after an identity change or recovery."""
     from hermes_cli.runtime_provider import _normalize_base_url_for_match
 
     previous = (
@@ -2373,7 +2386,7 @@ def _rebuild_request_overrides_for_runtime(
         _normalize_base_url_for_match(getattr(agent, "base_url", "")),
         str(getattr(agent, "model", "") or "").strip().lower(),
     )
-    if previous == current:
+    if not force and previous == current:
         return
 
     caller_overrides = getattr(agent, "_caller_request_overrides", {})

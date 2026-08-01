@@ -794,10 +794,8 @@ def _run_review_in_thread(
                 base_url=_rt.get("base_url") or None,
                 api_key=_rt.get("api_key") or None,
                 credential_pool=_rt.get("credential_pool"),
-                request_overrides=(
-                    {}
-                    if _routed
-                    else getattr(agent, "_caller_request_overrides", {})
+                request_overrides=getattr(
+                    agent, "_caller_request_overrides", {}
                 ) or {},
                 parent_session_id=agent.session_id,
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),

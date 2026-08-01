@@ -1,5 +1,6 @@
 """Real SQLite multiprocess coverage for SessionDB writer coordination."""
 
+import errno
 import multiprocessing
 import os
 import platform
@@ -11,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+import hermes_state
 from hermes_state import (
     SessionDB,
     _release_exclusive_file_lock,
@@ -63,6 +65,28 @@ def _crash_with_advisory_lock(lock_path: str, ready) -> None:
         os._exit(2)
     ready.set()
     os._exit(23)
+
+
+def _fail_advisory_lock(monkeypatch, system_name: str, error_code: int) -> None:
+    if system_name == "Windows":
+        class FakeMsvcrt:
+            LK_NBLCK = 1
+            LK_UNLCK = 2
+
+            @staticmethod
+            def locking(_fd, _mode, _nbytes):
+                raise OSError(error_code, "advisory lock failure")
+
+        monkeypatch.setattr(platform, "system", lambda: "Windows")
+        monkeypatch.setitem(sys.modules, "msvcrt", FakeMsvcrt)
+        return
+
+    import fcntl
+
+    def fail(*_args):
+        raise OSError(error_code, "advisory lock failure")
+
+    monkeypatch.setattr(fcntl, "flock", fail)
 
 
 @pytest.fixture
@@ -177,6 +201,16 @@ def test_windows_byte_lock_seeds_fresh_file_without_truncating_existing(
     ]
 
 
+def test_windows_lock_violation_is_contention(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fail_advisory_lock(monkeypatch, "Windows", errno.EACCES)
+    lock_path = tmp_path / "busy.lock"
+    lock_path.write_bytes(b"\0")
+    with lock_path.open("a+b") as handle:
+        assert not _try_acquire_exclusive_file_lock(handle)
+
+
 def test_advisory_lock_timeout_is_bounded(db, process_ctx) -> None:
     ready, release = process_ctx.Event(), process_ctx.Event()
     holder = process_ctx.Process(
@@ -210,3 +244,111 @@ def test_advisory_lock_is_cleaned_up_after_crash(db, process_ctx) -> None:
 
     db.set_meta("after-crash", "written")
     assert db.get_meta("after-crash") == "written"
+
+
+@pytest.mark.parametrize("system_name", ["POSIX", "Windows"])
+def test_delete_mode_public_write_survives_unsupported_advisory_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    system_name: str,
+) -> None:
+    monkeypatch.setattr(hermes_state, "resolve_journal_mode", lambda: "delete")
+    database = SessionDB(db_path=tmp_path / f"{system_name}.db")
+    assert database._conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+
+    _fail_advisory_lock(monkeypatch, system_name, errno.ENOTSUP)
+
+    try:
+        database.set_meta("unsupported-lock", "written")
+        assert database.get_meta("unsupported-lock") == "written"
+    finally:
+        database.close()
+
+
+@pytest.mark.parametrize("system_name", ["POSIX", "Windows"])
+def test_fatal_advisory_lock_error_propagates_without_contention_wait(
+    db,
+    monkeypatch: pytest.MonkeyPatch,
+    system_name: str,
+) -> None:
+    _fail_advisory_lock(monkeypatch, system_name, errno.EIO)
+
+    started = time.monotonic()
+    with pytest.raises(OSError) as excinfo:
+        db.set_meta("fatal-lock", "not-written")
+    assert excinfo.value.errno == errno.EIO
+    assert time.monotonic() - started < 0.5
+    assert db.get_meta("fatal-lock") is None
+
+
+def test_automatic_fts_merge_waits_for_advisory_lock(db, process_ctx) -> None:
+    if not db._fts_enabled:
+        pytest.skip("FTS5 unavailable in this build")
+    ready, release = process_ctx.Event(), process_ctx.Event()
+    holder = process_ctx.Process(
+        target=_hold_advisory_lock,
+        args=(str(session_db_write_lock_path(db.db_path)), ready, release),
+    )
+    holder.start()
+    assert ready.wait(10)
+    release_timer = threading.Timer(0.3, release.set)
+    release_timer.start()
+    started = time.monotonic()
+    try:
+        db._try_incremental_merge_fts()
+    finally:
+        release.set()
+        release_timer.join()
+        holder.join(10)
+    assert holder.exitcode == 0
+    assert time.monotonic() - started >= 0.2
+    assert db._fts_usermerge_floor_applied
+
+
+def test_schema_open_waits_for_advisory_lock(db, process_ctx) -> None:
+    ready, release = process_ctx.Event(), process_ctx.Event()
+    holder = process_ctx.Process(
+        target=_hold_advisory_lock,
+        args=(str(session_db_write_lock_path(db.db_path)), ready, release),
+    )
+    holder.start()
+    assert ready.wait(10)
+    release_timer = threading.Timer(0.3, release.set)
+    release_timer.start()
+    started = time.monotonic()
+    reopened = None
+    try:
+        reopened = SessionDB(db_path=db.db_path)
+    finally:
+        release.set()
+        release_timer.join()
+        holder.join(10)
+    assert holder.exitcode == 0
+    assert time.monotonic() - started >= 0.2
+    reopened.set_meta("coordinated-open", "written")
+    assert reopened.get_meta("coordinated-open") == "written"
+    reopened.close()
+
+
+def test_vacuum_waits_for_advisory_lock(
+    db, process_ctx, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(db, "optimize_fts", lambda: 0)
+    ready, release = process_ctx.Event(), process_ctx.Event()
+    holder = process_ctx.Process(
+        target=_hold_advisory_lock,
+        args=(str(session_db_write_lock_path(db.db_path)), ready, release),
+    )
+    holder.start()
+    assert ready.wait(10)
+    release_timer = threading.Timer(0.3, release.set)
+    release_timer.start()
+    started = time.monotonic()
+    try:
+        assert db.vacuum() == 0
+    finally:
+        release.set()
+        release_timer.join()
+        holder.join(10)
+    assert holder.exitcode == 0
+    assert time.monotonic() - started >= 0.2

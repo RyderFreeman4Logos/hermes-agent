@@ -230,6 +230,36 @@ class TestRunConversationCodexPath:
         assert agent._iters_since_skill == 2
         assert agent._user_turn_count == 2
 
+    def test_heartbeat_preserves_counters_and_meaningful_output(self, fake_session):
+        agent = _make_codex_agent()
+        agent._user_turn_count = 9
+        agent._turns_since_memory = 4
+        agent._memory_nudge_interval = 5
+        agent._memory_store = MagicMock()
+        agent._iters_since_skill = 5
+        agent._skill_nudge_interval = 5
+        agent.valid_tool_names = {"memory", "skill_manage"}
+
+        with (
+            patch.object(agent, "_persist_session") as persist,
+            patch.object(agent, "_sync_external_memory_for_turn") as memory_sync,
+            patch.object(agent, "_spawn_background_review") as review,
+        ):
+            result = agent.run_conversation(
+                "[HEARTBEAT] inspect target",
+                turn_origin="heartbeat_warm",
+                allow_silent_noop=True,
+            )
+
+        assert result["final_response"] == "echo: [HEARTBEAT] inspect target"
+        assert any(message.get("role") == "tool" for message in result["messages"])
+        assert agent._user_turn_count == 9
+        assert agent._turns_since_memory == 4
+        assert agent._iters_since_skill == 5
+        persist.assert_called_once()
+        memory_sync.assert_not_called()
+        review.assert_not_called()
+
     def test_user_message_not_duplicated(self, fake_session):
         """Regression guard: the user message must appear exactly once in
         the messages list. The standard run_conversation pre-loop appends

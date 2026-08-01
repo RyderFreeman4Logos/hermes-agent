@@ -636,6 +636,7 @@ def run_codex_app_server_turn(
     messages: List[Dict[str, Any]],
     effective_task_id: str,
     should_review_memory: bool = False,
+    turn_origin: str = "user",
 ) -> Dict[str, Any]:
     """Codex app-server runtime path. Hands the entire turn to a `codex
     app-server` subprocess and projects its events back into Hermes'
@@ -792,7 +793,10 @@ def run_codex_app_server_turn(
         # we avoid the #860/#42039 duplicate user-message write (append_message
         # is a raw INSERT with no dedup, so a gateway re-write would duplicate
         # the already-flushed user turn). See gateway/run.py agent_persisted.
-        if getattr(agent, "_session_db", None) is not None:
+        if (
+            turn_origin != "heartbeat_warm"
+            and getattr(agent, "_session_db", None) is not None
+        ):
             try:
                 _codex_flush_ok = agent._flush_messages_to_session_db(messages)
             except Exception:
@@ -824,9 +828,10 @@ def run_codex_app_server_turn(
     # Only _iters_since_skill needs explicit increment, since the
     # chat_completions loop bumps it per tool iteration (line ~12110)
     # and that loop is bypassed on this path.
-    agent._iters_since_skill = (
-        getattr(agent, "_iters_since_skill", 0) + turn.tool_iterations
-    )
+    if turn_origin != "heartbeat_warm":
+        agent._iters_since_skill = (
+            getattr(agent, "_iters_since_skill", 0) + turn.tool_iterations
+        )
     _record_codex_app_server_compaction(agent, turn)
     usage_result = _record_codex_app_server_usage(agent, turn)
     api_calls = 1
@@ -835,7 +840,8 @@ def run_codex_app_server_turn(
     # pattern the chat_completions path uses (line ~15432).
     should_review_skills = False
     if (
-        agent._skill_nudge_interval > 0
+        turn_origin != "heartbeat_warm"
+        and agent._skill_nudge_interval > 0
         and agent._iters_since_skill >= agent._skill_nudge_interval
         and "skill_manage" in agent.valid_tool_names
     ):
@@ -844,7 +850,11 @@ def run_codex_app_server_turn(
 
     # External memory provider sync (mirrors line ~15439). Skipped on
     # interrupt/error to avoid feeding partial transcripts to memory.
-    if not turn.interrupted and turn.error is None:
+    if (
+        turn_origin != "heartbeat_warm"
+        and not turn.interrupted
+        and turn.error is None
+    ):
         try:
             agent._sync_external_memory_for_turn(
                 original_user_message=original_user_message,

@@ -5,10 +5,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from agent.transports.chat_completions import ChatCompletionsTransport
 from run_agent import AIAgent
 
 
 GLM_URL = "https://api.z.ai/api/coding/paas/v4"
+OPENAI_URL = "https://api.openai.com/v1"
 CODEX_URL = "https://chatgpt.com/backend-api/codex/responses"
 PM_URL = "https://pm.example/v1"
 CALLER_OVERRIDES = {
@@ -16,6 +18,7 @@ CALLER_OVERRIDES = {
     "extra_body": {"caller_flag": True},
 }
 GLM_THINKING = {"thinking": {"type": "enabled"}}
+FAST_MODE_OVERRIDES = {"service_tier": "priority", "speed": "fast"}
 
 
 def _agent() -> AIAgent:
@@ -74,6 +77,50 @@ def _configs():
     ]
 
 
+@pytest.fixture
+def runtime_override_env():
+    config = {"custom_providers": _configs()}
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+        patch("hermes_cli.config.load_config", return_value=config),
+        patch("hermes_cli.config.load_config_readonly", return_value=config),
+        patch(
+            "hermes_cli.config.get_compatible_custom_providers",
+            return_value=_configs(),
+        ),
+        patch("agent.credential_pool.load_pool", return_value=None),
+        patch("hermes_cli.timeouts.get_provider_request_timeout", return_value=None),
+    ):
+        yield
+
+
+def _openai_fast_agent(explicit_overrides):
+    return AIAgent(
+        api_key="openai-key",
+        base_url=OPENAI_URL,
+        provider="openai",
+        model="gpt-5.4-mini",
+        service_tier="priority",
+        request_overrides=explicit_overrides,
+        fast_mode_overrides=FAST_MODE_OVERRIDES,
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+
+
+def _switch_to_glm(agent):
+    agent.switch_model(
+        new_model="glm-5.2",
+        new_provider="custom:glm",
+        api_key="glm-key",
+        base_url=GLM_URL,
+        api_mode="chat_completions",
+    )
+
+
 def _switch(agent, *, provider, base_url):
     agent.switch_model(
         new_model="gpt-5.4-mini",
@@ -82,6 +129,106 @@ def _switch(agent, *, provider, base_url):
         base_url=base_url,
         api_mode="codex_responses",
     )
+
+
+def test_runtime_fast_overrides_do_not_cross_switches_or_reach_glm_wire(
+    runtime_override_env,
+):
+    explicit = {
+        "extra_headers": {"X-Caller": "keep"},
+        "extra_body": {"caller_flag": {"nested": True}},
+        "timeout": 17,
+    }
+    agent = _openai_fast_agent(explicit)
+
+    assert agent._caller_request_overrides == explicit
+    assert agent.request_overrides == {**FAST_MODE_OVERRIDES, **explicit}
+
+    _switch_to_glm(agent)
+
+    expected_glm = {
+        **explicit,
+        "extra_body": {**GLM_THINKING, **explicit["extra_body"]},
+    }
+    assert agent.request_overrides == expected_glm
+    wire_kwargs = ChatCompletionsTransport().build_kwargs(
+        model=agent.model,
+        messages=[{"role": "user", "content": "test"}],
+        request_overrides=agent.request_overrides,
+    )
+    assert wire_kwargs["extra_headers"] == explicit["extra_headers"]
+    assert wire_kwargs["extra_body"] == expected_glm["extra_body"]
+    assert wire_kwargs["timeout"] == 17
+    assert "service_tier" not in wire_kwargs
+    assert "speed" not in wire_kwargs
+
+    agent.switch_model(
+        new_model="gpt-5.4-mini",
+        new_provider="openai",
+        api_key="openai-key",
+        base_url=OPENAI_URL,
+        api_mode="chat_completions",
+    )
+
+    assert agent.request_overrides == {"service_tier": "priority", **explicit}
+    assert "thinking" not in agent.request_overrides["extra_body"]
+    assert "speed" not in agent.request_overrides
+
+
+def test_explicit_fast_named_scalars_remain_caller_owned(runtime_override_env):
+    explicit = {
+        **CALLER_OVERRIDES,
+        "service_tier": "flex",
+        "speed": "fast",
+    }
+    agent = _openai_fast_agent(explicit)
+
+    assert agent._caller_request_overrides == explicit
+    assert agent.request_overrides == explicit
+
+    _switch_to_glm(agent)
+
+    assert agent.request_overrides == {
+        **explicit,
+        "extra_body": {**GLM_THINKING, **explicit["extra_body"]},
+    }
+
+
+def test_failed_reverse_switch_restores_runtime_and_caller_provenance(
+    runtime_override_env,
+):
+    explicit = copy.deepcopy(CALLER_OVERRIDES)
+    agent = _openai_fast_agent(explicit)
+    _switch_to_glm(agent)
+    old_runtime = {
+        name: copy.deepcopy(getattr(agent, name))
+        for name in (
+            "model",
+            "provider",
+            "base_url",
+            "api_mode",
+            "api_key",
+            "request_overrides",
+            "_primary_runtime",
+        )
+    }
+    old_caller = copy.deepcopy(agent._caller_request_overrides)
+    agent._create_openai_client = MagicMock(side_effect=RuntimeError("client failed"))
+
+    with pytest.raises(RuntimeError, match="client failed"):
+        agent.switch_model(
+            new_model="gpt-5.4-mini",
+            new_provider="openai",
+            api_key="openai-key",
+            base_url=OPENAI_URL,
+            api_mode="chat_completions",
+        )
+
+    for name, value in old_runtime.items():
+        assert getattr(agent, name) == value
+    assert agent._caller_request_overrides == old_caller == explicit
+    assert "service_tier" not in agent.request_overrides
+    assert "speed" not in agent.request_overrides
 
 
 @pytest.mark.parametrize(

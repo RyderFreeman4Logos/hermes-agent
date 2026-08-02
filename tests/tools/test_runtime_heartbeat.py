@@ -534,7 +534,10 @@ def test_provider_activity_resets_only_exact_group_from_dispatch_time(monkeypatc
     from tools.runtime_heartbeat import RuntimeHeartbeat
 
     FakeTimer.created = []
-    monkeypatch.setattr("tools.runtime_heartbeat.time.monotonic", lambda: 100.0)
+    clock = SimpleNamespace(now=80.0)
+    monkeypatch.setattr(
+        "tools.runtime_heartbeat.time.monotonic", lambda: clock.now
+    )
     manager = RuntimeHeartbeat(event_queue=queue.Queue(), timer_factory=FakeTimer)
     alive = lambda: {"alive": True, "progress": True}
     manager.arm(
@@ -557,6 +560,7 @@ def test_provider_activity_resets_only_exact_group_from_dispatch_time(monkeypatc
     )
     old_a, old_b = FakeTimer.created
 
+    clock.now = 100.0
     assert manager.reset_for_caller(
         "owner",
         provider="openai",
@@ -566,6 +570,130 @@ def test_provider_activity_resets_only_exact_group_from_dispatch_time(monkeypatc
     assert old_a.cancelled is True
     assert old_b.cancelled is False
     assert FakeTimer.created[-1].interval == 1690.0
+
+
+def test_late_older_activity_is_noop_for_exact_mixed_interval_groups(monkeypatch):
+    from tools.runtime_heartbeat import RuntimeHeartbeat
+
+    FakeTimer.created = []
+    clock = SimpleNamespace(now=100.0)
+    monkeypatch.setattr(
+        "tools.runtime_heartbeat.time.monotonic", lambda: clock.now
+    )
+    manager = RuntimeHeartbeat(event_queue=queue.Queue(), timer_factory=FakeTimer)
+    alive = lambda: {"alive": True, "progress": True}
+    for target_id, interval in (("short", 1700), ("long", 3300)):
+        manager.arm(
+            target_id,
+            caller_id="owner",
+            kind="delegation",
+            interval=interval,
+            inspect=alive,
+            provider="openai",
+            cache_context="cache-a",
+        )
+
+    clock.now = 300.0
+    assert manager.reset_for_caller(
+        "owner",
+        provider="openai",
+        cache_context="cache-a",
+        activity_at=250.0,
+    ) == 2
+
+    accepted = {}
+    for target_id in ("short", "long"):
+        target = manager._targets[target_id]
+        group = manager._group_key(target)
+        pending = {"target_id": target_id, "accepted": True}
+        replacement = {"target_id": target_id, "replacement": True}
+        manager._group_pending[group] = pending
+        manager._group_replacements[group] = replacement
+        accepted[target_id] = (
+            target,
+            target.timer,
+            target.deadline,
+            target.generation,
+            manager._group_tokens[group],
+            manager._group_next_emit[group],
+            pending,
+            replacement,
+        )
+
+    clock.now = 400.0
+    assert manager.reset_for_caller(
+        "owner",
+        provider="openai",
+        cache_context="cache-a",
+        activity_at=200.0,
+    ) == 0
+
+    for target_id, state in accepted.items():
+        target, timer, deadline, generation, token, next_emit, pending, replacement = state
+        group = manager._group_key(target)
+        assert manager._targets[target_id] is target
+        assert target.timer is timer
+        assert timer.cancelled is False
+        assert target.deadline == deadline
+        assert target.generation == generation
+        assert manager._group_tokens[group] == token
+        assert manager._group_next_emit[group] == next_emit
+        assert manager._group_pending[group] is pending
+        assert manager._group_replacements[group] is replacement
+
+
+def test_late_activity_cannot_reset_reused_target_generation(monkeypatch):
+    from tools.runtime_heartbeat import RuntimeHeartbeat
+
+    FakeTimer.created = []
+    clock = SimpleNamespace(now=100.0)
+    monkeypatch.setattr(
+        "tools.runtime_heartbeat.time.monotonic", lambda: clock.now
+    )
+    manager = RuntimeHeartbeat(event_queue=queue.Queue(), timer_factory=FakeTimer)
+    alive = lambda: {"alive": True, "progress": True}
+    arm = lambda: manager.arm(
+        "target",
+        caller_id="owner",
+        kind="delegation",
+        interval=1700,
+        inspect=alive,
+        provider="openai",
+        cache_context="cache-a",
+    )
+    assert arm() is True
+
+    clock.now = 300.0
+    assert manager.cancel("target") is True
+    assert arm() is True
+    target = manager._targets["target"]
+    group = manager._group_key(target)
+    pending = {"target_id": "target", "accepted": True}
+    replacement = {"target_id": "target", "replacement": True}
+    manager._group_next_emit[group] = target.deadline
+    manager._group_pending[group] = pending
+    manager._group_replacements[group] = replacement
+    timer = target.timer
+    deadline = target.deadline
+    generation = target.generation
+    token = manager._group_tokens[group]
+
+    clock.now = 400.0
+    assert manager.reset_for_caller(
+        "owner",
+        provider="openai",
+        cache_context="cache-a",
+        activity_at=150.0,
+    ) == 0
+    assert manager._targets["target"] is target
+    assert target.timer is timer
+    assert timer.cancelled is False
+    assert target.deadline == deadline
+    assert target.generation == generation
+    assert manager._group_tokens[group] == token
+    assert manager._group_next_emit[group] == deadline
+    assert manager._group_pending[group] is pending
+    assert manager._group_replacements[group] is replacement
 
 
 def test_cancel_waits_for_inflight_publication_before_returning():

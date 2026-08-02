@@ -712,6 +712,9 @@ def test_heartbeat_malformed_response_never_retries_or_falls_back(heartbeat_even
     ]
 
     with (
+        patch(
+            "tools.runtime_heartbeat.runtime_heartbeat.reset_for_caller"
+        ) as reset_deadline,
         patch.object(agent, "_try_activate_fallback", return_value=False) as fallback,
         patch.object(agent, "_persist_session"),
         patch.object(agent, "_save_trajectory"),
@@ -725,6 +728,7 @@ def test_heartbeat_malformed_response_never_retries_or_falls_back(heartbeat_even
 
     assert result["silent_noop"] is True
     assert agent.client.chat.completions.create.call_count == 1
+    reset_deadline.assert_not_called()
     fallback.assert_not_called()
 
 

@@ -4320,48 +4320,67 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
         )
 
 
-def _attach_model_switch_after_compression(sid: str, session: dict, agent) -> None:
-    """Attach this TUI session's resolved deferred route to its live agent."""
-    pending = session.get("after_compression_model_switch")
-    if pending is None:
-        return
-
-    from hermes_cli.model_switch import schedule_model_switch_after_compression
-
-    def _on_applied(result, old_model, _old_provider):
-        if session.get("after_compression_model_switch") is not result:
-            return
-        session.pop("after_compression_model_switch", None)
-        session.pop("one_turn_model_restore", None)
-        session["model_override"] = {
-            "model": result.new_model,
-            "provider": result.target_provider,
-            "base_url": result.base_url,
-            "api_key": result.api_key,
-            "api_mode": result.api_mode,
-        }
-        _append_model_switch_marker(
-            session,
-            model=result.new_model,
-            provider=result.target_provider,
-        )
-        _emit("session.info", sid, _session_info(agent, session))
-        _emit(
-            "status",
-            sid,
-            {
-                "message": (
-                    f"Model switched after compression: {old_model} → "
-                    f"{result.new_model}"
-                )
-            },
-        )
-
-    schedule_model_switch_after_compression(
-        agent,
-        pending,
-        on_applied=_on_applied,
+def _attach_model_switch_after_compression(
+    sid: str,
+    session: dict,
+    agent,
+    pending=None,
+):
+    """Publish this TUI session's deferred route under the live-agent lock."""
+    from hermes_cli.model_switch import (
+        model_switch_transaction_lock,
+        schedule_model_switch_after_compression,
     )
+
+    with model_switch_transaction_lock(agent):
+        previous = session.get("after_compression_model_switch")
+        pending = pending if pending is not None else previous
+        if pending is None:
+            return previous
+        session["after_compression_model_switch"] = pending
+
+        def _on_applied(result, old_model, _old_provider):
+            if session.get("after_compression_model_switch") is not result:
+                return
+            session.pop("after_compression_model_switch", None)
+            session.pop("one_turn_model_restore", None)
+            session["model_override"] = {
+                "model": result.new_model,
+                "provider": result.target_provider,
+                "base_url": result.base_url,
+                "api_key": result.api_key,
+                "api_mode": result.api_mode,
+            }
+            _append_model_switch_marker(
+                session,
+                model=result.new_model,
+                provider=result.target_provider,
+            )
+            _emit("session.info", sid, _session_info(agent, session))
+            _emit(
+                "status",
+                sid,
+                {
+                    "message": (
+                        f"Model switched after compression: {old_model} → "
+                        f"{result.new_model}"
+                    )
+                },
+            )
+
+        try:
+            schedule_model_switch_after_compression(
+                agent,
+                pending,
+                on_applied=_on_applied,
+            )
+        except BaseException:
+            if previous is None:
+                session.pop("after_compression_model_switch", None)
+            else:
+                session["after_compression_model_switch"] = previous
+            raise
+        return previous
 
 
 def _apply_model_switch(
@@ -4536,9 +4555,12 @@ def _apply_model_switch(
     if after_compression:
         if agent is None:
             raise ValueError("/model --after-compression requires a live session")
-        replaced = session.get("after_compression_model_switch")
-        session["after_compression_model_switch"] = result
-        _attach_model_switch_after_compression(sid, session, agent)
+        replaced = _attach_model_switch_after_compression(
+            sid,
+            session,
+            agent,
+            pending=result,
+        )
         return {
             "value": result.new_model,
             "warning": result.warning_message or "",
@@ -4827,24 +4849,26 @@ def _compress_session_history(
     if partial and tail:
         compressed = rejoin_compressed_head_and_tail(compressed, tail)
     with session["history_lock"]:
-        if int(session.get("history_version", 0)) != history_version:
-            # External mutation during compaction — drop the compressed
-            # result so we don't clobber concurrent edits.
-            finalize_context_engine_compression_notification(
-                agent,
-                committed=False,
-            )
-            agent._awaiting_cache_usage_after_compression = (
-                cache_attribution_pending_before
-            )
-            if compressor is not None and hasattr(
-                compressor, "awaiting_real_usage_after_compression"
-            ):
-                compressor.awaiting_real_usage_after_compression = real_usage_pending_before
-            usage = _get_usage(agent)
-            return 0, usage
-        session["history"] = compressed
-        session["history_version"] = history_version + 1
+        current_history = list(session.get("history", []))
+        current_version = int(session.get("history_version", 0))
+        newer_messages = []
+        if current_version != history_version:
+            if current_history[: len(history)] == history:
+                newer_messages = current_history[len(history) :]
+            else:
+                logger.warning(
+                    "Compression history changed non-append-only; preserving current history"
+                )
+                newer_messages = current_history
+        session["history"] = [*compressed, *newer_messages]
+        session["history_version"] = current_version + 1
+    if newer_messages:
+        try:
+            for message in newer_messages:
+                message.pop("_db_persisted", None)
+            agent._flush_messages_to_session_db(newer_messages, None)
+        except Exception:
+            logger.exception("Failed to persist messages that arrived during compression")
     usage = _get_usage(agent)
     return len(history) - len(compressed), usage
 
@@ -4879,11 +4903,20 @@ def _sync_session_key_after_compress(
     if not new_session_id or new_session_id == old_key:
         return
 
-    lease_reanchored = _transfer_active_session_slot(
-        sid,
-        session,
-        new_session_id=new_session_id,
-    )
+    try:
+        lease_reanchored = _transfer_active_session_slot(
+            sid,
+            session,
+            new_session_id=new_session_id,
+        )
+    except Exception:
+        lease_reanchored = False
+        logger.exception(
+            "Compression session lease re-anchor failed: sid=%s old_session_id=%s new_session_id=%s",
+            sid,
+            old_key,
+            new_session_id,
+        )
     if not lease_reanchored:
         logger.warning(
             "Compression session lease did not re-anchor: sid=%s old_session_id=%s new_session_id=%s",
@@ -12982,6 +13015,10 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
                 )
                 return describe_compression_lock_skip(e.holder)
             _sync_session_key_after_compress(sid, session)
+            finalize_context_engine_compression_notification(
+                agent,
+                committed=True,
+            )
 
             with session["history_lock"]:
                 _after_messages = list(session.get("history", []))
@@ -13005,10 +13042,6 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
             _lines = [_fb["headline"], _fb["token_line"]]
             if _fb.get("note"):
                 _lines.append(_fb["note"])
-            finalize_context_engine_compression_notification(
-                agent,
-                committed=True,
-            )
             return "\n".join(_lines)
         elif name == "fast" and agent:
             mode = arg.lower()

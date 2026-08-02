@@ -4112,75 +4112,71 @@ class GatewaySlashCommandsMixin:
                 if partial and tail:
                     compressed = rejoin_compressed_head_and_tail(compressed, tail)
 
-                # _compress_context either rotated (legacy: ended the old
-                # session, created a continuation id — write compressed messages
-                # into the NEW session so the original stays searchable) or
-                # compacted in place (compression.in_place / #38763: same id,
-                # transcript replaced with the compacted set).
+                # _compress_context has already published the authoritative
+                # child transcript. Advance the gateway route with the store's
+                # lineage-checked CAS instead of rewriting that child from an
+                # outer snapshot (which could fail after the inner commit).
                 new_session_id = tmp_agent.session_id
-                rotated = new_session_id != session_entry.session_id
+                old_session_id = session_entry.session_id
+                rotated = new_session_id != old_session_id
                 _in_place = bool(getattr(tmp_agent, "_last_compaction_in_place", False))
 
-                # Persist the compressed transcript BEFORE repointing the live
-                # session onto the new session_id. Order matters: if we
-                # repointed first and the canonical DB write then failed (lock
-                # contention under concurrent writes, ENOSPC, a disk/IO error),
-                # the session entry would already reference a brand-new, empty
-                # session_id while the handler still reported success — the
-                # user's active conversation would silently vanish from view.
-                # Writing first, and treating a write failure as fatal, keeps
-                # the old history reachable (on rotation the entry still points
-                # at it; in place the original transcript is untouched) and lets
-                # the outer handler surface a "compress failed" banner instead.
-                #
-                # Only rewrite the transcript when rotation produced a NEW
-                # session id.  In-place compaction does NOT need a rewrite:
-                # archive_and_compact() has already soft-archived the previous
-                # active rows and inserted the compacted messages as the new
-                # active set inside _compress_context().  Calling
-                # rewrite_transcript() after in-place compaction would invoke
-                # replace_messages(active_only=False) which DELETEs ALL rows —
-                # including the archived turns that archive_and_compact()
-                # deliberately preserved (silent data loss, #61145).
-                #
-                # The third case: _compress_context could NOT rotate AND was
-                # not in-place (e.g. legacy mode but _session_db unavailable /
-                # the DB split raised) — there session_id is unchanged for a
-                # FAILURE reason, and rewrite_transcript() would DELETE the
-                # original messages and replace them with only the compressed
-                # summary (permanent data loss #44794, #39704).
                 if rotated:
-                    if not await self.async_session_store.rewrite_transcript(
-                        new_session_id, compressed
-                    ):
-                        raise RuntimeError(
-                            f"failed to persist compressed transcript for "
-                            f"session {new_session_id}"
+                    try:
+                        advanced = await self.async_session_store.advance_compression_session(
+                            session_entry.session_key,
+                            old_session_id,
+                            new_session_id,
                         )
-                    session_entry.session_id = new_session_id
-                    await self.async_session_store._save()
-                    await asyncio.to_thread(
-                        self._sync_telegram_topic_binding,
-                        source, session_entry, reason="compress-command",
-                    )
-                elif _in_place:
-                    # archive_and_compact() already persisted the compacted
-                    # transcript inside _compress_context — nothing to do.
-                    pass
-                else:
+                        if advanced is not None:
+                            session_entry = advanced
+                    except Exception as exc:
+                        # advance_compression_session mutates the shared entry
+                        # before persisting mirrors. Keep the coherent child
+                        # route and let its existing startup healing retry disk.
+                        if session_entry.session_id == old_session_id:
+                            session_entry.session_id = new_session_id
+                        logger.warning(
+                            "Manual /compress committed child %s but route mirror "
+                            "persistence needs healing: %s",
+                            new_session_id,
+                            exc,
+                        )
+                    for message in tail:
+                        await self.async_session_store.append_to_transcript(
+                            new_session_id,
+                            message,
+                        )
+                    if session_entry.session_id == new_session_id:
+                        try:
+                            await asyncio.to_thread(
+                                self._sync_telegram_topic_binding,
+                                source,
+                                session_entry,
+                                reason="compress-command",
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Manual /compress committed child %s but topic binding refresh failed",
+                                new_session_id,
+                            )
+                elif not _in_place:
                     logger.warning(
                         "Manual /compress: session rotation did not occur "
                         "(session_id unchanged) and in-place mode is off — "
                         "preserving original transcript instead of overwriting "
                         "it (#44794)."
                     )
-                # Reset stored token count — transcript changed, old value is stale
-                await self.async_session_store.update_session(
-                    session_entry.session_key, last_prompt_tokens=0
-                )
+                # The child/in-place publication is authoritative from here.
+                # Finalize before non-critical mirrors/summary rendering so a
+                # later outer failure can never claim to roll it back.
                 finalize_context_engine_compression_notification(
                     tmp_agent,
                     committed=True,
+                )
+                # Reset stored token count — transcript changed, old value is stale
+                await self.async_session_store.update_session(
+                    session_entry.session_key, last_prompt_tokens=0
                 )
                 new_tokens = estimate_request_tokens_rough(
                     compressed, system_prompt=_sys_prompt, tools=_tools

@@ -2721,8 +2721,19 @@ class SessionStore:
             cleaned = sanitize_model_override(override)
             if entry.model_override == cleaned:
                 return
+            previous = entry.model_override
             entry.model_override = cleaned
-            self._save()
+            try:
+                self._save()
+            except BaseException:
+                entry.model_override = previous
+                try:
+                    self._save()
+                except BaseException:
+                    logger.exception(
+                        "gateway.session: failed to restore model override after save error"
+                    )
+                raise
 
     def get_model_override(self, session_key: str) -> Optional[Dict[str, str]]:
         """Return the persisted /model override for *session_key*, if any."""

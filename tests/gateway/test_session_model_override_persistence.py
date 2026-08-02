@@ -86,6 +86,35 @@ def test_override_persists_and_survives_restart(store_factory, tmp_path):
     }
 
 
+def test_override_save_failure_restores_memory_and_disk(
+    store_factory, tmp_path, monkeypatch
+):
+    store = store_factory()
+    entry = store.get_or_create_session(_make_source())
+    store.set_model_override(entry.session_key, OVERRIDE)
+    real_save = store._save
+    calls = 0
+
+    def fail_after_first_write():
+        nonlocal calls
+        calls += 1
+        real_save()
+        if calls == 1:
+            raise OSError("injected post-write mirror failure")
+
+    monkeypatch.setattr(store, "_save", fail_after_first_write)
+    with pytest.raises(OSError, match="post-write mirror failure"):
+        store.set_model_override(
+            entry.session_key,
+            {"model": "replacement", "provider": "anthropic"},
+        )
+
+    assert store.get_model_override(entry.session_key) == sanitize_model_override(OVERRIDE)
+    assert store_factory().get_model_override(entry.session_key) == sanitize_model_override(
+        OVERRIDE
+    )
+
+
 def _make_runner(store):
     from gateway.run import GatewayRunner
 

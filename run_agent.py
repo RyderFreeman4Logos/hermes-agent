@@ -7797,30 +7797,14 @@ class AIAgent:
         """Forwarder — see ``agent.codex_runtime.run_codex_app_server_turn``."""
         from agent.codex_runtime import run_codex_app_server_turn
 
-        original_event_callback = getattr(self, "event_callback", None)
-
-        def _model_switch_boundary_event(name, payload):
-            if name == "session:compress":
-                from hermes_cli.model_switch import (
-                    apply_model_switch_after_compression,
-                )
-
-                apply_model_switch_after_compression(self)
-            if callable(original_event_callback):
-                original_event_callback(name, payload)
-
-        self.event_callback = _model_switch_boundary_event
-        try:
-            return run_codex_app_server_turn(
-                self,
-                user_message=user_message,
-                original_user_message=original_user_message,
-                messages=messages,
-                effective_task_id=effective_task_id,
-                should_review_memory=should_review_memory,
-            )
-        finally:
-            self.event_callback = original_event_callback
+        return run_codex_app_server_turn(
+            self,
+            user_message=user_message,
+            original_user_message=original_user_message,
+            messages=messages,
+            effective_task_id=effective_task_id,
+            should_review_memory=should_review_memory,
+        )
 
 def main(
     query: str = None,

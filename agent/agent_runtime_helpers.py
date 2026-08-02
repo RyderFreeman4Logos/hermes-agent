@@ -2795,11 +2795,26 @@ def _switch_model_unlocked(agent, new_model, new_provider, api_key='', base_url=
     )
     _sm_custom_providers = None
     if _is_deferred_boundary_switch:
-        # Scheduling resolved the context intent. Do not probe either route or
-        # prewarm LM Studio while the compression publication fence is held.
+        # Resolve only scheduled/configured destination metadata while the
+        # publication fence is held: no endpoint probes or LM Studio prewarm.
         _destination_context_intent = getattr(
             agent, "_deferred_model_switch_context_length", None
         )
+        if not isinstance(_destination_context_intent, int) or _destination_context_intent <= 0:
+            try:
+                from hermes_cli.config import get_custom_provider_context_length
+
+                _destination_context_intent = get_custom_provider_context_length(
+                    model=agent.model,
+                    base_url=agent.base_url,
+                )
+            except Exception:
+                _destination_context_intent = None
+        if not isinstance(_destination_context_intent, int) or _destination_context_intent <= 0:
+            raise RuntimeError(
+                "deferred model switch has no destination context length; "
+                "configure context_length for the target provider"
+            )
         agent._config_context_length = _destination_context_intent
         _effective_context_length = _destination_context_intent
     else:
@@ -2847,9 +2862,7 @@ def _switch_model_unlocked(agent, new_model, new_provider, api_key='', base_url=
     # ── Update context compressor ──
     if hasattr(agent, "context_compressor") and agent.context_compressor:
         if _is_deferred_boundary_switch:
-            new_context_length = _effective_context_length or getattr(
-                agent.context_compressor, "context_length", None
-            )
+            new_context_length = _effective_context_length
         else:
             from agent.model_metadata import get_model_context_length
             if _sm_custom_providers is None:

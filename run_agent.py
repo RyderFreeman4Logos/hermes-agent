@@ -6945,18 +6945,12 @@ class AIAgent:
         invocation paths (concurrent, sequential, inline).
         """
         from tools.delegate_tool import (
-            _resolve_force_background,
             _strip_model_hidden_task_fields,
             delegate_task as _delegate_task,
         )
-        # The model-facing path owns the no-inline policy; stale model/caller
-        # background fields are ignored. Top-level dispatch is always forced
-        # async. Nested orchestrators retain the synchronous composition path by
-        # default, unless delegation.force_background enables the same guarantee.
-        _is_subagent = getattr(self, "_delegate_depth", 0) > 0
-        _force_background = (
-            _resolve_force_background(None) if _is_subagent else True
-        )
+        # Model-facing delegation is always asynchronous at every depth. Direct
+        # Python callers retain delegate_task's explicit synchronous semantics.
+        _force_background = True
         return _delegate_task(
             goal=function_args.get("goal"),
             context=function_args.get("context"),

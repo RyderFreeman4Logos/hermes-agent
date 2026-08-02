@@ -4,8 +4,8 @@ Delegate Tool -- Subagent Architecture
 
 Spawns child AIAgent instances with isolated context, inherited toolsets,
 and their own terminal sessions. Supports single-task and batch (parallel)
-modes. Top-level model calls run in the background; orchestrator children
-wait for their own workers so they can synthesize the results.
+modes. Every model-facing call runs in the background; direct Python callers
+may explicitly retain synchronous composition.
 
 Each child gets:
   - A fresh conversation (no parent history)
@@ -4424,9 +4424,9 @@ DELEGATE_TASK_SCHEMA = {
             "background": {
                 "type": "boolean",
                 "description": (
-                    "DEPRECATED / IGNORED. Top-level single and batch "
-                    "delegations run in the background automatically — you do "
-                    "not need to (and cannot) opt in or out. A single result or "
+                    "DEPRECATED / IGNORED. Model-facing single and batch "
+                    "delegations at every depth run in the background automatically — "
+                    "you do not need to (and cannot) opt in or out. A single result or "
                     "consolidated batch result re-enters the conversation when "
                     "the work finishes; just continue working in the meantime. "
                     "Setting this has no effect; the parameter remains only for "
@@ -4444,26 +4444,13 @@ from tools.registry import registry, tool_error
 
 
 def _model_background_value(args: dict, parent_agent=None) -> bool:
-    """Background flag for the MODEL-facing dispatch path (registry fallback).
-
-    Delegations from the top-level agent always run in the background — the
-    model does not choose. This applies to both a single task and a fan-out
-    batch (the whole batch is one async unit that joins on all children and
-    returns one consolidated result). The one
-    exception is a delegation from an orchestrator subagent (depth > 0), which
-    needs its workers' results within its own turn. The live path is
-    ``run_agent._dispatch_delegate_task``; this lambda mirrors it for the rare
-    case the intercept is bypassed. Direct Python callers of ``delegate_task``
-    keep the historical synchronous default.
-    """
-    is_subagent = getattr(parent_agent, "_delegate_depth", 0) > 0
-    return not is_subagent
+    """Force every model-facing dispatch onto the asynchronous path."""
+    return True
 
 
 def _model_force_background_value(parent_agent=None) -> bool:
-    """No-inline guarantee for the registry's model-facing fallback path."""
-    is_subagent = getattr(parent_agent, "_delegate_depth", 0) > 0
-    return _resolve_force_background(None) if is_subagent else True
+    """Reject model-facing work before start when async dispatch is unavailable."""
+    return True
 
 
 _MODEL_HIDDEN_TASK_FIELDS = {"acp_command", "acp_args"}

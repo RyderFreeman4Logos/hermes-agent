@@ -13,16 +13,15 @@ from run_agent import AIAgent
 
 
 @pytest.mark.parametrize(
-    ("configured", "depth", "expected_background", "expected_force"),
+    ("configured", "depth"),
     [
-        pytest.param(False, 0, True, True, id="top-level-always-guaranteed"),
-        pytest.param(False, 1, False, False, id="nested-default-sync"),
-        pytest.param(True, 1, True, True, id="configured-nested-guarantee"),
+        pytest.param(False, 0, id="top-level-config-disabled"),
+        pytest.param(False, 1, id="nested-config-disabled"),
+        pytest.param(False, 2, id="deeply-nested-config-disabled"),
+        pytest.param(True, 1, id="nested-config-enabled"),
     ],
 )
-def test_model_dispatch_resolves_no_inline_guarantee_at_every_depth(
-    configured, depth, expected_background, expected_force
-):
+def test_model_dispatch_forces_no_inline_guarantee_at_every_depth(configured, depth):
     agent = AIAgent.__new__(AIAgent)
     setattr(agent, "_delegate_depth", depth)
 
@@ -32,23 +31,24 @@ def test_model_dispatch_resolves_no_inline_guarantee_at_every_depth(
     ):
         result = AIAgent._dispatch_delegate_task(
             agent,
-            {"goal": "test", "background": not expected_background},
+            {"goal": "test", "background": False},
         )
 
     assert result == "dispatched"
-    assert delegate.call_args.kwargs["background"] is expected_background
-    assert delegate.call_args.kwargs["force_background"] is expected_force
+    assert delegate.call_args.kwargs["background"] is True
+    assert delegate.call_args.kwargs["force_background"] is True
 
 
 @pytest.mark.parametrize(
-    ("depth", "configured", "expected"),
+    ("depth", "configured"),
     [
-        (0, False, True),
-        (1, False, False),
-        (1, True, True),
+        (0, False),
+        (1, False),
+        (2, False),
+        (1, True),
     ],
 )
-def test_registry_fallback_resolves_force_background(monkeypatch, depth, configured, expected):
+def test_registry_fallback_forces_background(monkeypatch, depth, configured):
     import tools.delegate_tool as delegate_tool
 
     monkeypatch.setattr(
@@ -58,7 +58,8 @@ def test_registry_fallback_resolves_force_background(monkeypatch, depth, configu
     )
     parent = SimpleNamespace(_delegate_depth=depth)
 
-    assert delegate_tool._model_force_background_value(parent) is expected
+    assert delegate_tool._model_background_value({}, parent) is True
+    assert delegate_tool._model_force_background_value(parent) is True
 
 
 def test_force_background_defaults_to_false():

@@ -149,6 +149,7 @@ class ProcessSession:
     _watch_cooldown_until: float = field(default=0.0, repr=False)
     _watch_strike_candidate: bool = field(default=False, repr=False)
     _watch_consecutive_strikes: int = field(default=0, repr=False)
+    _started_monotonic: float = field(default_factory=time.monotonic, repr=False)
     _completion_event: threading.Event = field(default_factory=threading.Event, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
@@ -244,6 +245,9 @@ class ProcessRegistry:
     def _emit_output(self, session: ProcessSession, chunk: str) -> None:
         """Forward a freshly-read chunk to the live-output sink, if one is set.
         Called from reader threads; never raise into the read loop."""
+        with self._lock:
+            if self._running.get(session.id) is not session:
+                return
         sink = self.on_output
         if sink is None or not chunk:
             return
@@ -844,6 +848,7 @@ class ProcessRegistry:
         use_pty: bool = False,
         execution_timeout: Optional[float] = None,
         notification_metadata: Optional[Dict[str, Any]] = None,
+        defer_registration: bool = False,
     ) -> ProcessSession:
         """
         Spawn a background process locally.
@@ -854,6 +859,8 @@ class ProcessRegistry:
             use_pty: If True, use a pseudo-terminal via ptyprocess for interactive
                      CLI tools (Codex, Claude Code, Python REPL). Falls back to
                      subprocess.Popen if ptyprocess is not installed.
+            defer_registration: Return the session unregistered for a caller to
+                                promote or discard after an inline wait.
         """
         # Guard against the `A && B &` subshell-wait trap (issue #68915).
         # Bash parses ``A && B &`` as ``(A && B) &`` — a subshell that holds
@@ -910,12 +917,13 @@ class ProcessRegistry:
                 )
                 session._reader_thread = reader
 
-                with self._lock:
-                    self._prune_if_needed()
-                    self._running[session.id] = session
+                if not defer_registration:
+                    with self._lock:
+                        self._prune_if_needed()
+                        self._running[session.id] = session
 
-                self._write_checkpoint()
-                self._arm_execution_deadline(session)
+                    self._write_checkpoint()
+                    self._arm_execution_deadline(session)
                 reader.start()
                 return session
 
@@ -983,12 +991,13 @@ class ProcessRegistry:
             )
             session._reader_thread = reader
 
-            with self._lock:
-                self._prune_if_needed()
-                self._running[session.id] = session
+            if not defer_registration:
+                with self._lock:
+                    self._prune_if_needed()
+                    self._running[session.id] = session
 
-            self._write_checkpoint()
-            self._arm_execution_deadline(session)
+                self._write_checkpoint()
+                self._arm_execution_deadline(session)
             reader.start()
         except Exception:
             # Post-Popen setup failed — kill the orphaned subprocess (and any
@@ -1030,6 +1039,7 @@ class ProcessRegistry:
         timeout: int = 10,
         execution_timeout: Optional[float] = None,
         notification_metadata: Optional[Dict[str, Any]] = None,
+        defer_registration: bool = False,
     ) -> ProcessSession:
         """
         Spawn a background process through a non-local environment backend.
@@ -1041,6 +1051,9 @@ class ProcessRegistry:
 
         This is less capable than local spawn (no live stdout pipe, no stdin),
         but it ensures the command runs in the correct sandbox context.
+
+        ``defer_registration`` leaves the session for the caller to promote or
+        discard after an inline wait.
         """
         started_at = time.time()
         session = ProcessSession(
@@ -1124,19 +1137,23 @@ class ProcessRegistry:
             )
             session._reader_thread = reader
 
-        with self._lock:
-            self._prune_if_needed()
-            self._running[session.id] = session
+        if not defer_registration:
+            with self._lock:
+                self._prune_if_needed()
+                self._running[session.id] = session
 
         if session.exited:
             self._move_to_finished(session)
         else:
-            self._write_checkpoint()
-            self._arm_execution_deadline(session)
+            if not defer_registration:
+                self._write_checkpoint()
+                self._arm_execution_deadline(session)
             assert reader is not None
             try:
                 reader.start()
             except Exception:
+                if defer_registration:
+                    self.promote(session)
                 self.kill_process(
                     session.id,
                     source="failed_start",
@@ -1145,6 +1162,74 @@ class ProcessRegistry:
                 raise
 
         return session
+
+    def wait_for_promotion(self, session: ProcessSession, threshold: float) -> str:
+        """Wait until an unregistered process exits, is interrupted, or ages out."""
+        from tools.interrupt import is_interrupted as _is_interrupted
+
+        deadline = session._started_monotonic + max(0.0, float(threshold))
+        while True:
+            self._reconcile_local_exit(session)
+            with session._lock:
+                if session.exited:
+                    return "exited"
+            if _is_interrupted():
+                return "interrupted"
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return "running"
+            session._completion_event.wait(timeout=min(0.1, remaining))
+
+    def promote(
+        self,
+        session: ProcessSession,
+        notification_metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Atomically register a still-running process for background management."""
+        with session._lock:
+            if session.exited:
+                return False
+            for key, value in (notification_metadata or {}).items():
+                setattr(session, key, value)
+            with self._lock:
+                if session.id in self._finished:
+                    return False
+                if self._running.get(session.id) is session:
+                    return True
+                self._prune_if_needed()
+                self._running[session.id] = session
+            self._arm_execution_deadline(session)
+        self._write_checkpoint()
+        return True
+
+    def discard(self, session: ProcessSession, *, source: str) -> dict:
+        """Terminate an unregistered candidate without leaving an orphan."""
+        if self.promote(session):
+            result = self.kill_process(
+                session.id,
+                source=source,
+                consume_output=False,
+            )
+        else:
+            result = {
+                "status": "already_exited",
+                "exit_code": session.exit_code,
+                "output": session.output_buffer,
+            }
+
+        if result.get("status") in {"killed", "already_exited"}:
+            if session._deadline_timer is not None:
+                session._deadline_timer.cancel()
+                session._deadline_timer = None
+            with self._lock:
+                self._running.pop(session.id, None)
+                self._finished.pop(session.id, None)
+            self._completion_consumed.discard(session.id)
+            self._poll_observed.discard(session.id)
+            self._write_checkpoint()
+        else:
+            result.setdefault("session_id", session.id)
+        return result
 
     # ----- Reader / Poller Threads -----
 
@@ -1384,8 +1469,10 @@ class ProcessRegistry:
 
         with self._lock:
             was_running = self._running.pop(session.id, None) is not None
-            self._finished[session.id] = session
+            if was_running:
+                self._finished[session.id] = session
         if not was_running:
+            session._completion_event.set()
             return
         if session._deadline_timer is not None:
             session._deadline_timer.cancel()

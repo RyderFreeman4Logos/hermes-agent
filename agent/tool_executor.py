@@ -159,6 +159,43 @@ def _flush_session_db_after_tool_progress(
         return False
 
 
+def _no_progress_halt_decision(agent):
+    decision = getattr(agent, "_tool_guardrail_halt_decision", None)
+    return decision if decision is not None and decision.code == "no_progress_loop" else None
+
+
+def _append_no_progress_skipped_results(agent, messages: list, tool_calls) -> bool:
+    """Preserve every provider call id without starting post-halt work."""
+    decision = _no_progress_halt_decision(agent)
+    if decision is None:
+        return False
+    content = json.dumps(
+        {
+            "error": "Tool call skipped because the no-progress guardrail halted this turn",
+            "status": "skipped",
+            "skipped": True,
+            "guardrail": decision.to_metadata(),
+        },
+        ensure_ascii=False,
+    )
+    for tool_call in tool_calls:
+        function_name = tool_call.function.name
+        messages.append(
+            make_tool_result_message(
+                function_name,
+                content,
+                tool_call.id,
+                effect_disposition="none",
+            )
+        )
+        _flush_session_db_after_tool_progress(
+            agent,
+            messages,
+            stage=f"guardrail-skipped tool result {function_name}",
+        )
+    return True
+
+
 def _ra():
     """Lazy reference to ``run_agent`` so patches like ``run_agent._set_interrupt`` work."""
     import run_agent
@@ -726,6 +763,21 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
 
         parsed_calls.append(
             (tool_call, function_name, function_args, [], None, _ts_scope_block)
+        )
+
+    # A result-dependent halt cannot fence already-submitted futures. Reuse the
+    # sequential executor only for batches that repeat a canonical signature or
+    # could continue the current turn's streak; unrelated calls keep concurrency.
+    if agent._tool_guardrails.batch_requires_result_fence(
+        [(name, args) for _, name, args, _, _, _ in parsed_calls]
+    ):
+        return execute_tool_calls_sequential(
+            agent,
+            assistant_message,
+            messages,
+            effective_task_id,
+            api_call_count,
+            finalize=finalize,
         )
 
     # ── Logging / callbacks ──────────────────────────────────────────
@@ -1326,6 +1378,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     for i, tool_call in enumerate(assistant_message.tool_calls, 1):
         if getattr(agent, "_incremental_persistence_failed", False):
             return
+        if _append_no_progress_skipped_results(
+            agent, messages, assistant_message.tool_calls[i - 1 :]
+        ):
+            break
         # SAFETY: check interrupt BEFORE starting each tool.
         # If the user sent "stop" during a previous tool's execution,
         # do NOT start any more tools -- skip them all immediately.
@@ -2023,7 +2079,7 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
         _exec_cwd = Path(_active_env.cwd) if _active_env is not None and _active_env.cwd else None
         segments = _plan_tool_batch_segments(assistant_message.tool_calls, execution_cwd=_exec_cwd)
 
-    for kind, calls in segments:
+    for segment_index, (kind, calls) in enumerate(segments):
         if getattr(agent, "_incremental_persistence_failed", False):
             return
         segment_message = SimpleNamespace(tool_calls=list(calls))
@@ -2040,6 +2096,14 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
 
         if getattr(agent, "_incremental_persistence_failed", False):
             return
+        if _no_progress_halt_decision(agent) is not None:
+            remaining_calls = [
+                call
+                for _, later_calls in segments[segment_index + 1 :]
+                for call in later_calls
+            ]
+            _append_no_progress_skipped_results(agent, messages, remaining_calls)
+            break
 
     # ── Whole-turn finalize (budget + /steer) ─────────────────────────
     total_tools = len(assistant_message.tool_calls)

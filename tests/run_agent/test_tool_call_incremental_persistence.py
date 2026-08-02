@@ -446,8 +446,12 @@ def test_segmented_batch_stops_before_later_segment_after_persist_failure():
 def test_execute_tool_calls_concurrent_flushes_each_tool_result_in_order():
     agent = _make_agent()
     tool_calls = [
-        _mock_tool_call(name="web_search", call_id="c1"),
-        _mock_tool_call(name="web_search", call_id="c2"),
+        _mock_tool_call(
+            name="web_search", arguments='{"query":"one"}', call_id="c1"
+        ),
+        _mock_tool_call(
+            name="web_search", arguments='{"query":"two"}', call_id="c2"
+        ),
     ]
     messages: list = []
     assistant_message = SimpleNamespace(content="", tool_calls=tool_calls)

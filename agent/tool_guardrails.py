@@ -295,6 +295,22 @@ class ToolCallGuardrailController:
     def halt_decision(self) -> ToolGuardrailDecision | None:
         return self._halt_decision
 
+    def batch_requires_result_fence(
+        self,
+        calls: list[tuple[str, Mapping[str, Any] | None]],
+    ) -> bool:
+        """Return whether a batch could extend one canonical result streak."""
+        signatures = [
+            ToolCallSignature.from_call(tool_name, _coerce_args(args))
+            for tool_name, args in calls
+        ]
+        if len(signatures) != len(set(signatures)):
+            return True
+        return bool(
+            self._last_observation is not None
+            and self._last_observation[0] in signatures
+        )
+
     def before_call(self, tool_name: str, args: Mapping[str, Any] | None) -> ToolGuardrailDecision:
         signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
 

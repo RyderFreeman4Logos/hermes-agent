@@ -1,6 +1,7 @@
 """Runtime tests for tool-call loop guardrails."""
 
 import json
+import threading
 import uuid
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -36,6 +37,11 @@ def _mock_response(content="Hello", finish_reason="stop", tool_calls=None):
     msg = SimpleNamespace(content=content, tool_calls=tool_calls)
     choice = SimpleNamespace(message=msg, finish_reason=finish_reason)
     return SimpleNamespace(choices=[choice], model="test/model", usage=None)
+
+
+def _json_payload(content: str) -> dict:
+    """Parse a JSON result with or without the untrusted-source wrapper."""
+    return json.loads(content[content.index("{") : content.rindex("}") + 1])
 
 
 def _make_agent(*tool_names: str, max_iterations: int = 10, config: dict | None = None) -> AIAgent:
@@ -517,6 +523,164 @@ def test_identical_tool_and_result_loop_halts_after_five_without_sixth_work():
     user_messages = [message for message in result["messages"] if message["role"] == "user"]
     assert len(user_messages) == 1
     assert all(message.get("display_kind") != "auto_continue" for message in result["messages"])
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "tool_args"),
+    [
+        pytest.param("web_search", {"query": "same"}, id="parallel-safe"),
+        pytest.param("terminal", {"command": "pwd"}, id="sequential"),
+    ],
+)
+def test_identical_tool_batch_fences_sixth_dispatch_and_preserves_every_result_id(
+    tool_name, tool_args
+):
+    agent = _make_agent(tool_name, max_iterations=200)
+    # Distinct raw JSON survives provider-call deduplication while parsing to
+    # the same canonical tool signature used by the no-progress guardrail.
+    calls = [
+        _mock_tool_call(tool_name, json.dumps(tool_args) + (" " * i), f"batch-{i}")
+        for i in range(1, 7)
+    ]
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(content="", finish_reason="tool_calls", tool_calls=calls)
+    ]
+    starts = []
+    completions = []
+    progress = []
+    agent.tool_start_callback = lambda *args: starts.append(args)
+    agent.tool_complete_callback = lambda *args: completions.append(args)
+    agent.tool_progress_callback = lambda *args, **kwargs: progress.append((args, kwargs))
+
+    with (
+        patch(
+            "run_agent.handle_function_call",
+            return_value=json.dumps({"ok": "same-result"}),
+        ) as dispatch,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("run one repeated batch")
+
+    assert result["turn_exit_reason"] == "no_progress_loop"
+    assert result["api_calls"] == 1
+    assert result["guardrail"]["code"] == "no_progress_loop"
+    assert result["guardrail"]["count"] == 5
+    assert agent.client.chat.completions.create.call_count == 1
+    expected_physical_ids = [f"batch-{i}" for i in range(1, 6)]
+    assert dispatch.call_count == 5
+    assert [call.kwargs["tool_call_id"] for call in dispatch.call_args_list] == (
+        expected_physical_ids
+    )
+    assert [event[0] for event in starts] == expected_physical_ids
+    assert [event[0] for event in completions] == expected_physical_ids
+    assert sum(event[0][0] == "tool.completed" for event in progress) == 5
+
+    tool_messages = [m for m in result["messages"] if m.get("role") == "tool"]
+    assert [m["tool_call_id"] for m in tool_messages] == [
+        f"batch-{i}" for i in range(1, 7)
+    ]
+    skipped = _json_payload(tool_messages[-1]["content"])
+    assert skipped["skipped"] is True
+    assert skipped["guardrail"]["code"] == "no_progress_loop"
+    assert skipped["guardrail"]["count"] == 5
+    assert [m["role"] for m in result["messages"]] == [
+        "user",
+        "assistant",
+        *(["tool"] * 6),
+        "assistant",
+    ]
+
+
+def test_streak_four_then_matching_batch_call_skips_every_later_physical_call():
+    agent = _make_agent("web_search", "terminal", max_iterations=200)
+    repeated_args = {"query": "same"}
+    repeated_result = json.dumps({"ok": "same-result"})
+    for expected_count in range(1, 5):
+        decision = agent._tool_guardrails.after_call(
+            "web_search", repeated_args, repeated_result, failed=False
+        )
+        assert decision.count == expected_count
+
+    calls = [
+        _mock_tool_call("web_search", json.dumps(repeated_args), "mixed-1"),
+        _mock_tool_call("terminal", json.dumps({"command": "pwd"}), "mixed-2"),
+        _mock_tool_call("web_search", json.dumps({"query": "different"}), "mixed-3"),
+    ]
+    messages = []
+    with patch(
+        "run_agent.handle_function_call", return_value=repeated_result
+    ) as dispatch:
+        agent._execute_tool_calls(
+            SimpleNamespace(content="", tool_calls=calls), messages, "task-1"
+        )
+
+    assert dispatch.call_count == 1
+    assert [m["tool_call_id"] for m in messages] == [
+        "mixed-1",
+        "mixed-2",
+        "mixed-3",
+    ]
+    for skipped_message in messages[1:]:
+        skipped = _json_payload(skipped_message["content"])
+        assert skipped["skipped"] is True
+        assert skipped["guardrail"]["count"] == 5
+
+
+def test_identical_args_with_changing_results_dispatches_all_six_without_halt():
+    agent = _make_agent("web_search", max_iterations=200)
+    calls = [
+        _mock_tool_call("web_search", json.dumps({"query": "same"}), f"changing-{i}")
+        for i in range(1, 7)
+    ]
+    messages = []
+    physical = []
+
+    def changing_result(name, args, task_id, **kwargs):
+        physical.append(kwargs["tool_call_id"])
+        return json.dumps({"result": len(physical)})
+
+    with patch("run_agent.handle_function_call", side_effect=changing_result):
+        agent._execute_tool_calls(
+            SimpleNamespace(content="", tool_calls=calls), messages, "task-1"
+        )
+
+    assert physical == [f"changing-{i}" for i in range(1, 7)]
+    assert [m["tool_call_id"] for m in messages] == physical
+    assert agent._tool_guardrail_halt_decision is None
+
+
+def test_six_distinct_parallel_safe_calls_still_overlap():
+    agent = _make_agent("web_search", max_iterations=200)
+    calls = [
+        _mock_tool_call(
+            "web_search", json.dumps({"query": f"distinct-{i}"}), f"distinct-{i}"
+        )
+        for i in range(1, 7)
+    ]
+    messages = []
+    rendezvous = threading.Barrier(6)
+    physical = []
+    lock = threading.Lock()
+
+    def overlapping_result(name, args, task_id, **kwargs):
+        with lock:
+            physical.append(kwargs["tool_call_id"])
+        rendezvous.wait(timeout=3)
+        return json.dumps({"result": args["query"]})
+
+    with patch("run_agent.handle_function_call", side_effect=overlapping_result):
+        agent._execute_tool_calls(
+            SimpleNamespace(content="", tool_calls=calls), messages, "task-1"
+        )
+
+    assert not rendezvous.broken
+    assert set(physical) == {f"distinct-{i}" for i in range(1, 7)}
+    assert [m["tool_call_id"] for m in messages] == [
+        f"distinct-{i}" for i in range(1, 7)
+    ]
+    assert agent._tool_guardrail_halt_decision is None
 
 
 @pytest.mark.parametrize("reset_kind", ["args", "result", "tool"])

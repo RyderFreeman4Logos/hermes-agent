@@ -7064,9 +7064,20 @@ class AIAgent:
         persist_user_display_metadata: Optional[Dict[str, Any]] = None,
         moa_config: Optional[dict[str, Any]] = None,
         turn_origin: str = "user",
-        allow_silent_noop: bool = False,
+        heartbeat_event: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
+        if turn_origin == "heartbeat_warm":
+            from agent.conversation_loop import run_heartbeat_warm
+
+            return run_heartbeat_warm(
+                self,
+                user_message,
+                system_message,
+                conversation_history,
+                moa_config=moa_config,
+                heartbeat_event=heartbeat_event,
+            )
         from agent.aux_accounting import (
             reset_accounting_context,
             set_accounting_context,
@@ -7105,12 +7116,16 @@ class AIAgent:
         task_started = False
         task_finished = False
         relay_outcome = "failed"
-        heartbeat_turn = turn_origin == "heartbeat_warm"
-        previous_persistence_defer = getattr(
-            self, "_defer_heartbeat_persistence", False
-        )
-        if heartbeat_turn:
-            self._defer_heartbeat_persistence = True
+        if not getattr(self, "_delegate_depth", 0):
+            try:
+                from tools.approval import get_current_session_key
+                from tools.runtime_heartbeat import runtime_heartbeat
+
+                caller_id = get_current_session_key(default="") or ""
+                if caller_id:
+                    runtime_heartbeat.reset_for_caller(caller_id)
+            except Exception:
+                logger.debug("Could not reset caller heartbeat deadline", exc_info=True)
         try:
             relay_lease = relay_runtime.SESSION_COORDINATOR.acquire_conversation(
                 profile_key=relay_runtime.current_profile_key(),
@@ -7162,44 +7177,7 @@ class AIAgent:
                     persist_user_display_kind=persist_user_display_kind,
                     persist_user_display_metadata=persist_user_display_metadata,
                     moa_config=moa_config,
-                    turn_origin=turn_origin,
-                    allow_silent_noop=allow_silent_noop,
                 )
-            if heartbeat_turn and isinstance(result, dict):
-                messages = result.get("messages")
-                history = list(conversation_history or [])
-                heartbeat_user_idx = -1
-                if isinstance(messages, list):
-                    heartbeat_user_idx = next(
-                        (
-                            index
-                            for index in range(len(messages) - 1, -1, -1)
-                            if isinstance(messages[index], dict)
-                            and messages[index].get("role") == "user"
-                            and messages[index].get("content") == user_message
-                        ),
-                        -1,
-                    )
-                new_messages = (
-                    messages[heartbeat_user_idx + 1:]
-                    if heartbeat_user_idx >= 0
-                    else []
-                )
-                has_assistant_evidence = any(
-                    isinstance(message, dict)
-                    and message.get("role") in {"assistant", "tool"}
-                    for message in new_messages
-                )
-                if result.get("silent_noop") is True:
-                    result["messages"] = history
-                    self._session_messages = history
-                    result["final_response"] = ""
-                elif not has_assistant_evidence:
-                    result["messages"] = history
-                    self._session_messages = history
-                else:
-                    self._defer_heartbeat_persistence = previous_persistence_defer
-                    self._persist_session(messages, conversation_history)
             terminal = result if isinstance(result, dict) else {}
             if terminal.get("interrupted") is True:
                 relay_outcome = "cancelled"
@@ -7250,7 +7228,6 @@ class AIAgent:
                         reset_accounting_context(acct_token)
                     if token is not None:
                         reset_conversation_context(token)
-                    self._defer_heartbeat_persistence = previous_persistence_defer
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """
@@ -7274,8 +7251,6 @@ class AIAgent:
         messages: List[Dict[str, Any]],
         effective_task_id: str,
         should_review_memory: bool = False,
-        turn_origin: str = "user",
-        allow_silent_noop: bool = False,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.codex_runtime.run_codex_app_server_turn``."""
         from agent.codex_runtime import run_codex_app_server_turn
@@ -7286,8 +7261,6 @@ class AIAgent:
             messages=messages,
             effective_task_id=effective_task_id,
             should_review_memory=should_review_memory,
-            turn_origin=turn_origin,
-            allow_silent_noop=allow_silent_noop,
         )
 
 def main(

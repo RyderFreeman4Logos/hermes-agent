@@ -5084,11 +5084,6 @@ class TurnRunner:
                     ),
                     "_completion_delivery_synthetic": True,
                 }
-            if ctx.turn_origin is not None:
-                _conversation_kwargs["turn_origin"] = ctx.turn_origin
-                _conversation_kwargs["allow_silent_noop"] = ctx.allow_silent_noop
-                if ctx.turn_origin == "heartbeat_warm":
-                    _conversation_kwargs["heartbeat_event"] = ctx.heartbeat_event
             if _persist_user_message_override is not None:
                 _conversation_kwargs["persist_user_message"] = _persist_user_message_override
             elif observed_group_context:
@@ -5235,23 +5230,17 @@ class TurnRunner:
         _effective_history_offset = (
             0 if (_session_was_split or _compacted_in_place) else len(agent_history)
         )
-        _heartbeat_silent_noop = bool(
-            ctx.turn_origin == "heartbeat_warm"
-            and result.get("silent_noop") is True
-        )
-
         if not final_response:
-            if not _heartbeat_silent_noop:
-                final_response = _normalize_empty_agent_response(
-                    result, final_response or "", history_len=len(agent_history),
+            final_response = _normalize_empty_agent_response(
+                result, final_response or "", history_len=len(agent_history),
+            )
+            final_response = _sanitize_gateway_final_response(
+                ctx.source.platform, final_response
+            )
+            if not final_response:
+                final_response = (
+                    f"⚠️ {result['error']}" if result.get("error") else ""
                 )
-                final_response = _sanitize_gateway_final_response(
-                    ctx.source.platform, final_response
-                )
-                if not final_response:
-                    final_response = (
-                        f"⚠️ {result['error']}" if result.get("error") else ""
-                    )
             return {
                 "final_response": final_response,
                 "messages": result.get("messages", []),
@@ -5278,7 +5267,6 @@ class TurnRunner:
                 "last_prompt_tokens": _last_prompt_toks,
                 "input_tokens": _input_toks,
                 "output_tokens": _output_toks,
-                "silent_noop": _heartbeat_silent_noop,
                 "model": _resolved_model,
                 "context_length": _context_length,
             }
@@ -5322,11 +5310,7 @@ class TurnRunner:
                 final_response = final_response + "\n" + "\n".join(unique_tags)
 
         # Auto-generate session title after first exchange (non-blocking)
-        if (
-            ctx.turn_origin != "heartbeat_warm"
-            and final_response
-            and self._runner._session_db
-        ):
+        if final_response and self._runner._session_db:
             try:
                 from agent.title_generator import maybe_auto_title
                 all_msgs = ctx.result_holder[0].get("messages", []) if ctx.result_holder[0] else []
@@ -5417,7 +5401,6 @@ class TurnRunner:
             "session_id": effective_session_id,
             "response_previewed": result.get("response_previewed", False),
             "response_transformed": result.get("response_transformed", False),
-            "silent_noop": _heartbeat_silent_noop,
             # Pass through the agent_persisted flag so the persistence block
             # above can correctly determine whether the codex app-server path
             # self-persisted (it didn't — see codex_runtime.py).  Default
@@ -13442,6 +13425,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return format_status_text()
 
     async def _busy_stop_command(self, event: MessageEvent, quick_key: str, source):
+        state = self._peek_session_state(quick_key)
+        if state is not None and state.turn.heartbeat_owner is not None:
+            return EphemeralReply(
+                "⏳ Heartbeat check-in is still running — session remains busy."
+            )
         # /stop must hard-kill the session when an agent is running.
         # A soft interrupt (agent.interrupt()) doesn't help when the agent
         # is truly hung — the executor thread is blocked and never checks
@@ -14091,6 +14079,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if running_agent is _AGENT_PENDING_SENTINEL:
                 # Agent is being set up but not ready yet.
                 if event.get_command() == "stop":
+                    if (
+                        _ra_state is not None
+                        and _ra_state.turn.heartbeat_owner is not None
+                    ):
+                        return EphemeralReply(
+                            "⏳ Heartbeat check-in is still running — session remains busy."
+                        )
                     # Force-clean the sentinel so the session is unlocked.
                     self._release_running_agent_state(_quick_key)
                     logger.info("HARD STOP (pending) for session %s — sentinel cleared", _quick_key)
@@ -15546,7 +15541,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     message,
                     conversation_history=history,
                     turn_origin="heartbeat_warm",
-                    allow_silent_noop=True,
                     heartbeat_event=heartbeat_event,
                 )
             )
@@ -15565,33 +15559,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "_completion_delivery_synthetic"
             )
         )
-        _event_metadata = getattr(event, "metadata", None) or {}
-        turn_origin = (
-            "heartbeat_warm"
-            if getattr(event, "internal", False)
-            and _event_metadata.get("turn_origin") == "heartbeat_warm"
-            else None
-        )
-        allow_silent_noop = bool(
-            getattr(event, "internal", False)
-            and _event_metadata.get("allow_silent_noop") is True
-        )
-        heartbeat_event = (
-            _event_metadata.get("heartbeat_event")
-            if turn_origin == "heartbeat_warm"
-            else None
-        )
         logger.info(
             "inbound message: platform=%s user=%s chat=%s msg=%r reply_to_id=%s reply_to_text=%r",
             _platform_name, source.user_name or source.user_id or "unknown",
             source.chat_id or "unknown", _msg_preview, _reply_id, _reply_txt,
         )
-
-        if turn_origin == "heartbeat_warm":
-            await self._run_isolated_heartbeat(
-                event.text or "", _quick_key, heartbeat_event
-            )
-            return ""
 
         # Get or create session
         # Topic-mode DMs: rewrite a stale/foreign thread_id to the user's
@@ -16753,9 +16725,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=event.message_type,
                 completion_delivery_synthetic=_completion_delivery_synthetic,
-                turn_origin=turn_origin,
-                allow_silent_noop=allow_silent_noop,
-                heartbeat_event=heartbeat_event,
             )
 
             # Stop persistent typing indicator now that the agent is done.
@@ -16804,18 +16773,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # empty-response handling (and the suppression below) applies.
             if _is_gateway_hidden_reasoning_incomplete_turn(agent_result):
                 response = ""
-            _heartbeat_silent_noop = bool(
-                turn_origin == "heartbeat_warm"
-                and agent_result.get("silent_noop") is True
-            )
             try:
                 from gateway.response_filters import is_intentional_silence_agent_result
-                _intentional_silence = (
-                    _heartbeat_silent_noop
-                    or is_intentional_silence_agent_result(agent_result, response)
+                _intentional_silence = is_intentional_silence_agent_result(
+                    agent_result, response
                 )
             except Exception:
-                _intentional_silence = _heartbeat_silent_noop
+                _intentional_silence = False
 
             # Convert the agent's internal "(empty)" sentinel into a
             # user-friendly message.  "(empty)" means the model failed to
@@ -16829,27 +16793,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "rephrase your question."
                 )
             agent_messages = agent_result.get("messages", [])
-            _heartbeat_user_idx = -1
-            if turn_origin == "heartbeat_warm" and isinstance(agent_messages, list):
-                _heartbeat_user_idx = next(
-                    (
-                        index
-                        for index in range(len(agent_messages) - 1, -1, -1)
-                        if isinstance(agent_messages[index], dict)
-                        and agent_messages[index].get("role") == "user"
-                        and agent_messages[index].get("content")
-                        in (message_text, persist_user_message)
-                    ),
-                    -1,
-                )
-            _heartbeat_has_evidence = _heartbeat_user_idx >= 0 and any(
-                isinstance(message, dict)
-                and message.get("role") in {"assistant", "tool"}
-                for message in agent_messages[_heartbeat_user_idx + 1:]
-            )
-            _heartbeat_skip_transcript = bool(
-                turn_origin == "heartbeat_warm" and not _heartbeat_has_evidence
-            )
             _response_time = time.time() - _msg_start_time
             _api_calls = agent_result.get("api_calls", 0)
             _resp_len = len(response)
@@ -17169,7 +17112,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # If this is a fresh session (no history), write the full tool
             # definitions as the first entry so the transcript is self-describing
             # -- the same list of dicts sent as tools=[...] in the API request.
-            if is_context_overflow_failure or _heartbeat_skip_transcript:
+            if is_context_overflow_failure:
                 pass  # Skip all transcript writes — don't grow a broken session
             elif not history:
                 tool_defs = agent_result.get("tools", [])
@@ -17200,7 +17143,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Use the filtered history length (history_offset) that was actually
             # passed to the agent, not len(history) which includes session_meta
             # entries that were stripped before the agent saw them.
-            if is_context_overflow_failure or _heartbeat_skip_transcript:
+            if is_context_overflow_failure:
                 pass  # handled above — skip all transcript writes
             elif (
                 agent_failed_early or hidden_reasoning_incomplete
@@ -17363,8 +17306,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 and bool(getattr(_stts_adapter, "_streaming_tts_turn_completed", lambda *_a, **_k: False)(session_key, run_generation))
             )
             if (
-                turn_origin != "heartbeat_warm"
-                and not _streaming_tts_done
+                not _streaming_tts_done
                 and self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent)
             ):
                 await self._send_voice_reply(event, response)
@@ -20938,9 +20880,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
 
     async def _inject_watch_notification(
-        self, synth_text: str, evt: dict, *, turn_origin: str | None = None,
-        allow_silent_noop: bool = False,
-        heartbeat_event: dict | None = None,
+        self, synth_text: str, evt: dict,
     ) -> Optional[bool]:
         """Inject a watch/completion notification as a synthetic message event.
 
@@ -20953,8 +20893,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         source = self._build_process_event_source(evt)
         if not source:
-            if turn_origin == "heartbeat_warm":
-                return None
             # API-server-originated sessions bind a RAW session key (the
             # X-Hermes-Session-Id value — see _bind_api_server_session), not a
             # structured ``agent:main:...`` key, so _build_process_event_source
@@ -21012,8 +20950,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return None
         from gateway.wake import adapter_supports_push as _wake_push_ok
         if not _wake_push_ok(adapter):
-            if turn_origin == "heartbeat_warm":
-                return None
             # Non-push adapter (api_server) resolved WITH routing metadata:
             # its chat_id is the raw session id (see _bind_api_server_session,
             # which binds chat_id = session_id). handle_message would run the
@@ -21046,13 +20982,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             parent_session_id = str(evt.get("parent_session_id") or "").strip()
             if parent_session_id:
                 metadata["gateway_session_id"] = parent_session_id
-            if turn_origin is not None:
-                metadata["turn_origin"] = turn_origin
-                metadata["allow_silent_noop"] = bool(allow_silent_noop)
-                if turn_origin == "heartbeat_warm":
-                    metadata["heartbeat_event"] = (
-                        heartbeat_event if isinstance(heartbeat_event, dict) else evt
-                    )
             synth_event = MessageEvent(
                 text=synth_text,
                 message_type=MessageType.TEXT,
@@ -21376,6 +21305,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source = self._build_process_event_source(evt)
         if source is None or source.platform == Platform.API_SERVER:
             return
+        adapter = self._adapter_for_source(source)
+        if adapter is None:
+            return
+        pending_drain_owners = getattr(adapter, "_pending_drain_owners", None)
         state = self._session_state(caller_id)
         if state.turn.agent is not None:
             return
@@ -21383,15 +21316,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         state.turn.agent = _AGENT_PENDING_SENTINEL
         state.turn.started_ts = time.time()
         state.turn.heartbeat_owner = heartbeat_owner
+        if isinstance(pending_drain_owners, dict):
+            pending_drain_owners[caller_id] = heartbeat_owner
         self._persist_active_agents()
         try:
             if not runtime_heartbeat.is_event_current(evt):
                 return
             await self._run_isolated_heartbeat(text, caller_id, evt)
         finally:
-            self._release_running_agent_state(
+            released = self._release_running_agent_state(
                 caller_id, heartbeat_owner=heartbeat_owner
             )
+            if (
+                isinstance(pending_drain_owners, dict)
+                and pending_drain_owners.get(caller_id) is heartbeat_owner
+            ):
+                pending_drain_owners.pop(caller_id, None)
+                active_sessions = getattr(adapter, "_active_sessions", {})
+                get_pending_message = getattr(adapter, "get_pending_message", None)
+                start_session_processing = getattr(
+                    adapter, "_start_session_processing", None
+                )
+                if (
+                    released
+                    and caller_id not in active_sessions
+                    and callable(get_pending_message)
+                    and callable(start_session_processing)
+                ):
+                    pending = get_pending_message(caller_id)
+                    if pending is not None:
+                        start_session_processing(pending, caller_id)
 
     async def _async_delegation_watcher(self, interval: float = 2.0) -> None:
         """Drain async-delegation completions and inject them as new turns.
@@ -23242,9 +23196,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
         completion_delivery_synthetic: bool = False,
-        turn_origin: Optional[str] = None,
-        allow_silent_noop: bool = False,
-        heartbeat_event: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -23265,9 +23216,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
                 completion_delivery_synthetic=completion_delivery_synthetic,
-                turn_origin=turn_origin,
-                allow_silent_noop=allow_silent_noop,
-                heartbeat_event=heartbeat_event,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -23281,9 +23229,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
                 completion_delivery_synthetic=completion_delivery_synthetic,
-                turn_origin=turn_origin,
-                allow_silent_noop=allow_silent_noop,
-                heartbeat_event=heartbeat_event,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -23407,9 +23352,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
         completion_delivery_synthetic: bool = False,
-        turn_origin: Optional[str] = None,
-        allow_silent_noop: bool = False,
-        heartbeat_event: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -23423,14 +23365,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         This is run in a thread pool to not block the event loop.
         Supports interruption via new messages.
         """
-        if turn_origin == "heartbeat_warm":
-            return {
-                "final_response": "",
-                "messages": list(history),
-                "api_calls": 0,
-                "completed": True,
-                "silent_noop": True,
-            }
         # ---- Proxy mode: delegate to remote API server ----
         if self._get_proxy_url():
             return await self._run_agent_via_proxy(
@@ -23703,9 +23637,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
             completion_delivery_synthetic=completion_delivery_synthetic,
-            turn_origin=turn_origin,
-            allow_silent_noop=allow_silent_noop,
-            heartbeat_event=heartbeat_event,
         )
         turn_runner = TurnRunner(self, turn_ctx)
         # Callback invoked by agent on tool lifecycle events — extracted to

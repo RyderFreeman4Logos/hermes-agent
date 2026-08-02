@@ -3634,7 +3634,6 @@ def test_tui_heartbeat_routes_to_idle_owner_as_silent_turn(
     assert "proc-heartbeat" in args[3]
     assert kwargs == {
         "turn_origin": "heartbeat_warm",
-        "allow_silent_noop": True,
         "heartbeat_event": event,
     }
 
@@ -3726,12 +3725,9 @@ def test_tui_submit_during_heartbeat_is_queued_and_drained_once(
         def steer(self, _text):
             pytest.fail("user prompt steered into heartbeat")
 
-        def run_conversation(
-            self, prompt, *, turn_origin=None, allow_silent_noop=False, **kwargs
-        ):
+        def run_conversation(self, prompt, *, turn_origin=None, **kwargs):
             prompts.append(prompt)
             if turn_origin == "heartbeat_warm":
-                assert allow_silent_noop is True
                 busy_responses.append(
                     server._handle_busy_submit(
                         "rid-user",
@@ -3837,7 +3833,6 @@ def test_tui_heartbeat_returned_error_preserves_recovery_state(
         session,
         "[HEARTBEAT] inspect target",
         turn_origin="heartbeat_warm",
-        allow_silent_noop=True,
     )
 
     assert session.get("inflight_turn") == snapshot
@@ -3878,7 +3873,6 @@ def test_tui_heartbeat_exception_preserves_recovery_state(
         session,
         "[HEARTBEAT] inspect target",
         turn_origin="heartbeat_warm",
-        allow_silent_noop=True,
     )
 
     assert session.get("inflight_turn") == snapshot
@@ -3973,7 +3967,6 @@ def test_tui_heartbeat_preserves_pending_user_only_state(monkeypatch):
         session,
         "[HEARTBEAT] inspect target",
         turn_origin="heartbeat_warm",
-        allow_silent_noop=True,
     )
 
     assert session["moa_one_shot_restore"] == moa_restore

@@ -2411,6 +2411,12 @@ def _(rid, params: dict) -> dict:
                 before_messages=before_messages,
                 history_version=history_version,
             )
+            agent = session["agent"]
+            _sync_session_key_after_compress(sid, session)
+            finalize_context_engine_compression_notification(
+                agent,
+                committed=True,
+            )
             with session["history_lock"]:
                 messages = list(session.get("history", []))
             after_count = len(messages)
@@ -2429,8 +2435,6 @@ def _(rid, params: dict) -> dict:
                 if after_count
                 else 0
             )
-            agent = session["agent"]
-            _sync_session_key_after_compress(sid, session)
             summary = summarize_manual_compression(
                 before_messages,
                 messages,
@@ -2440,10 +2444,6 @@ def _(rid, params: dict) -> dict:
             )
             info = _session_info(agent, session)
             _emit("session.info", sid, info)
-            finalize_context_engine_compression_notification(
-                agent,
-                committed=True,
-            )
             return _ok(
                 rid,
                 {

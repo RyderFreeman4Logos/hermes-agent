@@ -153,6 +153,7 @@ def test_codex_app_server_compaction_heartbeat_refreshes_activity_while_waiting(
 def _schedule_codex_switch(agent):
     agent.model = "old-codex"
     agent.provider = "openai-codex"
+    agent.codex_app_server_auto_compaction = "hermes"
     agent.switch_calls = []
 
     def _switch(model, provider, *_args):
@@ -232,62 +233,47 @@ def test_codex_outer_publication_controls_deferred_switch():
     assert agent.switch_calls == [("next-model", "next-provider")]
 
 
-def test_native_codex_compaction_applies_before_boundary_event(monkeypatch):
-    from run_agent import AIAgent
-
-    events = []
+def test_native_inline_codex_compaction_rejects_deferred_switch():
     agent = SimpleNamespace(
         model="old-model",
-        provider="old-provider",
-        base_url="https://old.example/v1",
+        provider="openai-codex",
+        base_url="https://chatgpt.com/backend-api/codex",
         api_key="old-key",
         api_mode="codex_app_server",
-        event_callback=lambda name, _payload: events.append((name, agent.model)),
-        _emit_status=lambda _message: None,
+        codex_app_server_auto_compaction="native",
     )
 
-    def switch_model(model, provider, api_key, base_url, api_mode):
-        events.append(("switch", model))
-        agent.model = model
-        agent.provider = provider
-        agent.api_key = api_key
-        agent.base_url = base_url
-        agent.api_mode = api_mode
+    with pytest.raises(ValueError, match="inline auto-compaction"):
+        schedule_model_switch_after_compression(
+            agent,
+            ModelSwitchResult(
+                success=True,
+                new_model="next-model",
+                target_provider="openai-codex",
+            ),
+        )
 
-    agent.switch_model = switch_model
-    schedule_model_switch_after_compression(
-        agent,
-        ModelSwitchResult(
-            success=True,
-            new_model="next-model",
-            target_provider="next-provider",
-        ),
+    assert get_model_switch_after_compression(agent) is None
+    assert agent.model == "old-model"
+
+
+def test_codex_responses_deferred_switch_remains_supported():
+    agent = SimpleNamespace(
+        model="old-model",
+        provider="openai-codex",
+        base_url="https://chatgpt.com/backend-api/codex/responses",
+        api_key="old-key",
+        api_mode="codex_responses",
+    )
+    pending = ModelSwitchResult(
+        success=True,
+        new_model="next-model",
+        target_provider="openai-codex",
     )
 
-    def fake_turn(owner, **_kwargs):
-        owner.event_callback("session:compress", {"mode": "native"})
-        events.append(("background", owner.model))
-        return {"final_response": "done"}
-
-    monkeypatch.setattr(
-        "agent.codex_runtime.run_codex_app_server_turn",
-        fake_turn,
-    )
-
-    result = AIAgent._run_codex_app_server_turn(
-        agent,
-        user_message="hello",
-        original_user_message="hello",
-        messages=[],
-        effective_task_id="default",
-    )
-
-    assert result["final_response"] == "done"
-    assert events == [
-        ("switch", "next-model"),
-        ("session:compress", "next-model"),
-        ("background", "next-model"),
-    ]
+    assert schedule_model_switch_after_compression(agent, pending) is None
+    assert get_model_switch_after_compression(agent) is pending
+    assert agent.model == "old-model"
 
 
 

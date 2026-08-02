@@ -214,7 +214,11 @@ async def test_gateway_deferred_switch_waits_for_compression_boundary(
             self.writes.append((key, dict(override)))
 
         def get_model_override(self, key):
-            return dict(self.writes[-1][1]) if self.writes[-1][0] == key else None
+            return (
+                dict(self.writes[-1][1])
+                if self.writes and self.writes[-1][0] == key
+                else None
+            )
 
     store = _Store()
     runner.session_store = store
@@ -372,6 +376,74 @@ async def test_gateway_deferred_persistence_failure_rolls_back_and_keeps_pending
         assert state.model_override is None
     finally:
         db.close()
+
+
+def test_gateway_callback_failure_restores_all_frontend_mirrors():
+    runner = _make_runner()
+    session_key = "agent:main:telegram:dm:mirror-rollback"
+    pending = _fake_switch_result()
+    pending.new_model = "new-model"
+
+    class _Agent:
+        def __init__(self):
+            self.model = "old-model"
+            self.provider = "openrouter"
+            self.api_key = "old-key"
+            self.base_url = "https://old.example/v1"
+            self.api_mode = "chat_completions"
+
+        def switch_model(
+            self,
+            new_model,
+            new_provider,
+            api_key="",
+            base_url="",
+            api_mode="",
+        ):
+            self.model = new_model
+            self.provider = new_provider
+            self.api_key = api_key
+            self.base_url = base_url
+            self.api_mode = api_mode
+
+    class _Store:
+        def __init__(self):
+            self.override = {"model": "old-model", "provider": "openrouter"}
+
+        def get_model_override(self, _key):
+            return dict(self.override) if self.override else None
+
+        def set_model_override(self, _key, override):
+            self.override = dict(override) if override else None
+
+    class _FailOnceNotes(dict):
+        def __init__(self):
+            super().__init__({session_key: "old note"})
+            self.failed = False
+
+        def __setitem__(self, key, value):
+            if not self.failed:
+                self.failed = True
+                raise OSError("injected final mirror failure")
+            super().__setitem__(key, value)
+
+    agent = _Agent()
+    state = runner._session_state(session_key).conversation
+    state.after_compression_model_switch = pending
+    state.model_override = {"model": "old-model", "provider": "openrouter"}
+    store = _Store()
+    notes = _FailOnceNotes()
+    runner.session_store = store
+    runner._pending_model_notes = notes
+    runner._attach_model_switch_after_compression(session_key, agent)
+
+    assert apply_model_switch_after_compression(agent) == "failed"
+    assert (agent.model, agent.provider) == ("old-model", "openrouter")
+    assert get_model_switch_after_compression(agent) is pending
+    assert state.after_compression_model_switch is pending
+    assert state.model_override == {"model": "old-model", "provider": "openrouter"}
+    assert store.override == {"model": "old-model", "provider": "openrouter"}
+    assert notes[session_key] == "old note"
 
 
 @pytest.mark.asyncio

@@ -7920,7 +7920,10 @@ def test_session_compress_reports_aborted_summary_without_success(monkeypatch):
         server._sessions.pop("sid", None)
 
 
-def test_stale_tui_compression_keeps_deferred_route_pending(tmp_path):
+def test_stale_tui_compression_reconciles_forward_and_preserves_new_input(tmp_path):
+    from agent.conversation_compression import (
+        finalize_context_engine_compression_notification,
+    )
     from hermes_cli.model_switch import (
         ModelSwitchResult,
         get_model_switch_after_compression,
@@ -7960,9 +7963,7 @@ def test_stale_tui_compression_keeps_deferred_route_pending(tmp_path):
             api_mode="anthropic_messages",
         )
         schedule_model_switch_after_compression(agent, pending)
-        messages = [
-            {"role": "user", "content": f"m{i}"} for i in range(10)
-        ]
+        messages = [{"role": "user", "content": f"m{i}"} for i in range(10)]
         session = {
             "agent": agent,
             "history_lock": threading.Lock(),
@@ -7970,13 +7971,17 @@ def test_stale_tui_compression_keeps_deferred_route_pending(tmp_path):
             "history_version": 1,
             "after_compression_model_switch": pending,
         }
+        newer_input = {"role": "user", "content": "arrived during compression"}
+        compacted = [
+            {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
+            {"role": "user", "content": "tail question"},
+        ]
 
         def stale_during_compression(*_args, **_kwargs):
-            session["history_version"] = 2
-            return [
-                {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
-                {"role": "user", "content": "tail question"},
-            ]
+            with session["history_lock"]:
+                session["history"].append(newer_input)
+                session["history_version"] = 2
+            return compacted
 
         compressor.compress.side_effect = stale_during_compression
         removed, _usage = server._compress_session_history(
@@ -7986,14 +7991,116 @@ def test_stale_tui_compression_keeps_deferred_route_pending(tmp_path):
             approx_tokens=10_000,
         )
 
-        assert removed == 0
-        assert session["history"] == messages
-        assert session["history_version"] == 2
+        assert removed == len(messages) - len(compacted)
+        assert session["history"] == [*compacted, newer_input]
+        assert session["history_version"] == 3
         assert session["after_compression_model_switch"] is pending
         assert get_model_switch_after_compression(agent) is pending
         assert agent.model == "test/model"
+
+        original_session_id = "original-session"
+        assert agent.session_id != original_session_id
+        assert db.get_session(original_session_id)["end_reason"] == "compression"
+        assert any(
+            message.get("content") == newer_input["content"]
+            for message in db.get_messages_as_conversation(agent.session_id)
+        )
+        assert finalize_context_engine_compression_notification(agent, committed=True)
+        assert agent.model == "next-model"
+        assert get_model_switch_after_compression(agent) is None
     finally:
         db.close()
+
+
+def test_tui_deferred_replacement_holds_frontend_and_agent_lock(monkeypatch):
+    from hermes_cli import model_switch
+    from hermes_cli.model_switch import (
+        ModelSwitchResult,
+        apply_model_switch_after_compression,
+        get_model_switch_after_compression,
+    )
+
+    class Agent:
+        def __init__(self):
+            self.model = "old-model"
+            self.provider = "openrouter"
+            self.api_key = "old-key"
+            self.base_url = "https://old.example/v1"
+            self.api_mode = "chat_completions"
+            self.switches = []
+
+        def switch_model(self, model, provider, api_key="", base_url="", api_mode=""):
+            self.switches.append(model)
+            self.model = model
+            self.provider = provider
+            self.api_key = api_key
+            self.base_url = base_url
+            self.api_mode = api_mode
+
+    agent = Agent()
+    first = ModelSwitchResult(
+        success=True,
+        new_model="first-deferred",
+        target_provider="anthropic",
+    )
+    second = ModelSwitchResult(
+        success=True,
+        new_model="replacement-deferred",
+        target_provider="anthropic",
+    )
+    session = {
+        "agent": agent,
+        "running": True,
+        "history": [],
+        "history_lock": threading.Lock(),
+        "history_version": 0,
+        "after_compression_model_switch": first,
+    }
+    server._attach_model_switch_after_compression("sid", session, agent)
+    entered = threading.Event()
+    release = threading.Event()
+    real_schedule = model_switch.schedule_model_switch_after_compression
+
+    def paused_schedule(target, result, *, on_applied=None):
+        assert session["after_compression_model_switch"] is result
+        entered.set()
+        assert release.wait(5)
+        return real_schedule(target, result, on_applied=on_applied)
+
+    monkeypatch.setattr(model_switch, "switch_model", lambda **_kwargs: second)
+    monkeypatch.setattr(
+        model_switch,
+        "schedule_model_switch_after_compression",
+        paused_schedule,
+    )
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+
+    replies = []
+    thread = threading.Thread(
+        target=lambda: replies.append(
+            server._apply_model_switch(
+                "sid",
+                session,
+                "replacement-deferred --after-compression --provider anthropic",
+            )
+        )
+    )
+    thread.start()
+    assert entered.wait(5)
+    switch_lock = model_switch.model_switch_transaction_lock(agent)
+    acquired = switch_lock.acquire(blocking=False)
+    if acquired:
+        switch_lock.release()
+    release.set()
+    thread.join(5)
+
+    assert not thread.is_alive()
+    assert acquired is False
+    assert replies[0]["replaced"] is True
+    assert get_model_switch_after_compression(agent) is second
+    assert session["after_compression_model_switch"] is second
+    assert apply_model_switch_after_compression(agent) == "applied"
+    assert agent.switches == ["replacement-deferred"]
 
 
 def test_busy_immediate_switch_cancels_deferred_before_compression_race():
@@ -8149,7 +8256,7 @@ def test_session_compress_syncs_session_key_after_rotation(monkeypatch):
         server._sessions.pop("sid", None)
 
 
-def test_session_compress_sync_failure_discards_lcm_notification(monkeypatch):
+def test_session_compress_post_commit_failure_keeps_lcm_notification(monkeypatch):
     from agent.conversation_compression import (
         _queue_context_engine_compression_notification,
     )
@@ -8189,7 +8296,8 @@ def test_session_compress_sync_failure_discards_lcm_notification(monkeypatch):
                 }
             )
         assert resp["error"]["code"] == 5005
-        assert events == []
+        assert events == ["notify"]
+        assert server._sessions["sid"]["session_key"] == "rotated-id"
     finally:
         server._sessions.pop("sid", None)
 

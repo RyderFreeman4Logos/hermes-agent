@@ -4,6 +4,7 @@ import json
 
 from types import SimpleNamespace
 
+from agent.models_dev import ModelInfo
 from agent.conversation_compression import (
     _queue_context_engine_compression_notification,
     finalize_context_engine_compression_notification,
@@ -136,6 +137,55 @@ def test_scheduling_is_non_mutating_and_last_schedule_wins():
         [],
     )
     assert get_model_switch_after_compression(agent) is second
+
+
+def test_scheduling_uses_destination_custom_context_without_source_fallback(
+    monkeypatch,
+):
+    agent = _Agent()
+    agent.context_compressor.context_length = 200_000
+    result = _result("custom-model", "custom-provider")
+    result.model_info = None
+    result.base_url = "https://custom.example/v1"
+    calls = []
+
+    def resolve_destination(model, base_url, **_kwargs):
+        calls.append((model, base_url))
+        return 32_000
+
+    monkeypatch.setattr(
+        "hermes_cli.config.get_custom_provider_context_length",
+        resolve_destination,
+    )
+
+    schedule_model_switch_after_compression(agent, result)
+
+    assert calls == [("custom-model", "https://custom.example/v1")]
+    assert result.context_length == 32_000
+    assert result.context_length != agent.context_compressor.context_length
+
+
+def test_scheduling_prefers_destination_metadata_context(monkeypatch):
+    agent = _Agent()
+    agent.context_compressor.context_length = 200_000
+    result = _result()
+    result.model_info = ModelInfo(
+        id="new-model",
+        name="New Model",
+        family="test",
+        provider_id="new-provider",
+        context_window=64_000,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.get_custom_provider_context_length",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("metadata destination must not need config fallback")
+        ),
+    )
+
+    schedule_model_switch_after_compression(agent, result)
+
+    assert result.context_length == 64_000
 
 
 def test_scheduling_is_strictly_in_process_and_does_not_mutate_session_db():

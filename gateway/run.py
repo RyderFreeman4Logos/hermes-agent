@@ -5538,7 +5538,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         from hermes_cli.model_switch import schedule_model_switch_after_compression
 
-        def _on_applied(result, old_model, _old_provider):
+        def _on_applied(result, old_model, old_provider):
             current = self._peek_session_state(session_key)
             if (
                 current is None
@@ -5551,24 +5551,73 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "base_url": result.base_url,
             }
             store = getattr(self, "session_store", None)
-            if store is not None:
-                store.set_model_override(session_key, persisted_override)
-            current.conversation.after_compression_model_switch = None
-            current.conversation.model_override = {
-                "model": result.new_model,
-                "provider": result.target_provider,
-                "api_key": result.api_key,
-                "base_url": result.base_url,
-                "api_mode": result.api_mode,
-            }
+            missing = object()
+            old_persisted = missing
+            old_pending = current.conversation.after_compression_model_switch
+            old_override = current.conversation.model_override
             pending_notes = getattr(self, "_pending_model_notes", None)
-            if pending_notes is not None:
-                pending_notes[session_key] = (
-                    f"[Note: model was just switched from {old_model} to "
-                    f"{result.new_model} via "
-                    f"{result.provider_label or result.target_provider}. "
-                    "Adjust your self-identification accordingly.]"
-                )
+            old_note = (
+                pending_notes.get(session_key, missing)
+                if pending_notes is not None
+                else missing
+            )
+            store_touched = False
+            try:
+                if store is not None:
+                    old_persisted = {
+                        "model": old_model,
+                        "provider": old_provider,
+                    }
+                    getter = getattr(store, "get_model_override", None)
+                    if callable(getter):
+                        try:
+                            old_persisted = getter(session_key)
+                        except Exception:
+                            logger.exception(
+                                "failed to snapshot gateway model override"
+                            )
+                    store_touched = True
+                    store.set_model_override(session_key, persisted_override)
+                current.conversation.after_compression_model_switch = None
+                current.conversation.model_override = {
+                    "model": result.new_model,
+                    "provider": result.target_provider,
+                    "api_key": result.api_key,
+                    "base_url": result.base_url,
+                    "api_mode": result.api_mode,
+                }
+                if pending_notes is not None:
+                    pending_notes[session_key] = (
+                        f"[Note: model was just switched from {old_model} to "
+                        f"{result.new_model} via "
+                        f"{result.provider_label or result.target_provider}. "
+                        "Adjust your self-identification accordingly.]"
+                    )
+            except BaseException:
+                current.conversation.after_compression_model_switch = old_pending
+                current.conversation.model_override = old_override
+                if pending_notes is not None:
+                    try:
+                        if old_note is missing:
+                            pending_notes.pop(session_key, None)
+                        else:
+                            pending_notes[session_key] = old_note
+                    except BaseException:
+                        logger.exception(
+                            "failed to restore gateway model note after callback error"
+                        )
+                if (
+                    store_touched
+                    and old_persisted is not missing
+                    and store is not None
+                ):
+                    try:
+                        store.set_model_override(session_key, old_persisted)
+                    except BaseException:
+                        logger.exception(
+                            "failed to restore gateway model override after callback error"
+                        )
+                raise
 
         schedule_model_switch_after_compression(
             agent,

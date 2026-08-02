@@ -278,10 +278,14 @@ def test_deferred_apply_uses_scheduled_runtime_metadata_only():
         target_provider="openrouter",
         api_key="new-key",
         base_url="https://openrouter.ai/api/v1",
-        context_length=128_000,
+        context_length=None,
         reasoning_config={"effort": "low"},
     )
-    schedule_model_switch_after_compression(agent, pending)
+    with patch(
+        "hermes_cli.config.get_custom_provider_context_length",
+        return_value=128_000,
+    ):
+        schedule_model_switch_after_compression(agent, pending)
 
     with (
         patch(
@@ -305,3 +309,50 @@ def test_deferred_apply_uses_scheduled_runtime_metadata_only():
     assert agent.model == "openai/gpt-4o-mini"
     assert agent.context_compressor.context_length == 128_000
     assert agent.reasoning_config == {"effort": "low"}
+
+
+def test_deferred_apply_without_destination_context_fails_closed():
+    from types import SimpleNamespace
+
+    from hermes_cli.model_switch import apply_model_switch_after_compression
+
+    agent = _make_agent_openrouter()
+    agent._invalidate_system_prompt = lambda: None
+    agent._build_system_prompt = lambda system_message=None: "prompt"
+    agent._create_openai_client = lambda *_args, **_kwargs: MagicMock()
+    agent.context_compressor = SimpleNamespace(
+        context_length=200_000,
+        threshold_tokens=160_000,
+        update_model=lambda **values: agent.context_compressor.__dict__.update(values),
+    )
+    pending = ModelSwitchResult(
+        success=True,
+        new_model="custom/model",
+        target_provider="custom-provider",
+        api_key="new-key",
+        base_url="https://custom.example/v1",
+    )
+
+    with (
+        patch(
+            "hermes_cli.config.get_custom_provider_context_length",
+            return_value=None,
+        ),
+        patch(
+            "agent.model_metadata.get_model_context_length",
+            side_effect=AssertionError("network-capable resolver called"),
+        ),
+        patch.object(
+            agent,
+            "_ensure_lmstudio_runtime_loaded",
+            side_effect=AssertionError("boundary provider prewarm"),
+            create=True,
+        ),
+    ):
+        schedule_model_switch_after_compression(agent, pending)
+        status = apply_model_switch_after_compression(agent)
+
+    assert status == "failed"
+    assert (agent.model, agent.provider) == ("x-ai/grok-4", "openrouter")
+    assert agent.context_compressor.context_length == 200_000
+    assert get_model_switch_after_compression(agent) is pending

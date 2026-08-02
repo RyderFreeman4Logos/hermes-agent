@@ -103,21 +103,20 @@ async def test_compress_command_works_when_auto_compaction_disabled():
 
 
 @pytest.mark.asyncio
-async def test_outer_transcript_write_failure_keeps_deferred_route_pending(
+async def test_outer_transcript_mirror_failure_reconciles_committed_child(
     tmp_path,
 ):
     from hermes_cli.model_switch import (
         ModelSwitchResult,
         get_model_switch_after_compression,
+        schedule_model_switch_after_compression,
     )
     from hermes_state import AsyncSessionDB, SessionDB
     from tests.run_agent.test_compression_boundary_hook import (
         TestCompressionBoundaryHook,
     )
 
-    history = [
-        {"role": "user", "content": f"m{i}"} for i in range(10)
-    ]
+    history = [{"role": "user", "content": f"m{i}"} for i in range(10)]
     runner = _make_runner(history)
     db = SessionDB(db_path=tmp_path / "gateway-outer-write.db")
     agent = TestCompressionBoundaryHook()._make_agent(db)
@@ -156,7 +155,16 @@ async def test_outer_transcript_write_failure_keeps_deferred_route_pending(
     session_key = session_entry.session_key
     runner._session_db = AsyncSessionDB(db)
     runner._after_compression_model_switches = {session_key: pending}
-    runner.session_store.rewrite_transcript.return_value = False
+
+    def advance(_key, expected_session_id, target_session_id):
+        assert session_entry.session_id == expected_session_id
+        session_entry.session_id = target_session_id
+        return session_entry
+
+    runner.session_store.advance_compression_session.side_effect = advance
+    runner.session_store.rewrite_transcript.side_effect = OSError(
+        "obsolete outer mirror must not own the committed boundary"
+    )
 
     try:
         with (
@@ -169,15 +177,17 @@ async def test_outer_transcript_write_failure_keeps_deferred_route_pending(
         ):
             result = await runner._handle_compress_command(_make_event())
 
-        assert "Compression failed" in result
-        assert session_entry.session_id == "original-session"
-        assert runner.session_store.load_transcript.return_value == history
-        assert agent.model == "test/model"
-        assert get_model_switch_after_compression(agent) is pending
-        assert runner._after_compression_model_switches[session_key] is pending
+        assert "Compressed:" in result
+        assert session_entry.session_id == agent.session_id
+        assert session_entry.session_id != "original-session"
+        assert db.get_session("original-session")["end_reason"] == "compression"
+        assert db.get_session(agent.session_id)["model"] == "next-model"
+        assert agent.model == "next-model"
+        assert get_model_switch_after_compression(agent) is None
+        assert session_key not in runner._after_compression_model_switches
+        runner.session_store.rewrite_transcript.assert_not_called()
     finally:
         db.close()
-
 
 @pytest.mark.asyncio
 async def test_compress_command_surfaces_aux_model_failure_even_when_recovered():

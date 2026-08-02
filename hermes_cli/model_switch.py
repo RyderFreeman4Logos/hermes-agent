@@ -628,11 +628,29 @@ def schedule_model_switch_after_compression(
     """Schedule a validated route without mutating the active runtime."""
     if not result.success or not result.new_model or not result.target_provider:
         raise ValueError("deferred model switch requires a resolved model and provider")
+    if (
+        getattr(agent, "api_mode", "") == "codex_app_server"
+        and str(
+            getattr(agent, "codex_app_server_auto_compaction", "native") or "native"
+        ).lower()
+        == "native"
+    ):
+        raise ValueError(
+            "deferred model switching is unavailable with Codex inline "
+            "auto-compaction; set compression.codex_app_server_auto to hermes"
+        )
     if result.context_length is None:
         model_context = getattr(result.model_info, "context_window", 0)
         if not isinstance(model_context, int) or model_context <= 0:
-            compressor = getattr(agent, "context_compressor", None)
-            model_context = getattr(compressor, "context_length", 0)
+            try:
+                from hermes_cli.config import get_custom_provider_context_length
+
+                model_context = get_custom_provider_context_length(
+                    model=result.new_model,
+                    base_url=result.base_url,
+                )
+            except Exception:  # noqa: BLE001
+                model_context = None
         if isinstance(model_context, int) and model_context > 0:
             result.context_length = model_context
     if result.reasoning_config is None:

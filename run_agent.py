@@ -707,6 +707,13 @@ class AIAgent:
         instead of a bare reset. Default callers pass nothing and keep the
         existing reset-only behavior.
         """
+        # Deferred /model intent is scoped to this conversation. Compression
+        # rotation does not call reset_session_state(), so its live lineage keeps
+        # the pending route while /new, /resume, and /branch clear it here.
+        from hermes_cli.model_switch import clear_model_switch_after_compression
+
+        clear_model_switch_after_compression(self)
+
         # Token usage counters
         self.session_total_tokens = 0
         self.session_input_tokens = 0
@@ -7279,16 +7286,33 @@ class AIAgent:
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.codex_runtime.run_codex_app_server_turn``."""
         from agent.codex_runtime import run_codex_app_server_turn
-        return run_codex_app_server_turn(
-            self,
-            user_message=user_message,
-            original_user_message=original_user_message,
-            messages=messages,
-            effective_task_id=effective_task_id,
-            should_review_memory=should_review_memory,
-            turn_origin=turn_origin,
-            allow_silent_noop=allow_silent_noop,
-        )
+
+        original_event_callback = getattr(self, "event_callback", None)
+
+        def _model_switch_boundary_event(name, payload):
+            if name == "session:compress":
+                from hermes_cli.model_switch import (
+                    apply_model_switch_after_compression,
+                )
+
+                apply_model_switch_after_compression(self)
+            if callable(original_event_callback):
+                original_event_callback(name, payload)
+
+        self.event_callback = _model_switch_boundary_event
+        try:
+            return run_codex_app_server_turn(
+                self,
+                user_message=user_message,
+                original_user_message=original_user_message,
+                messages=messages,
+                effective_task_id=effective_task_id,
+                should_review_memory=should_review_memory,
+                turn_origin=turn_origin,
+                allow_silent_noop=allow_silent_noop,
+            )
+        finally:
+            self.event_callback = original_event_callback
 
 def main(
     query: str = None,

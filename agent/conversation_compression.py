@@ -1238,17 +1238,26 @@ def _queue_context_engine_compression_notification(
     *,
     new_session_id: str,
     old_session_id: str,
+    post_boundary_notifications: Optional[list] = None,
 ) -> None:
     """Stage exactly one existing hook call for an outer host transaction."""
     if callable(getattr(agent, _PENDING_CONTEXT_ENGINE_NOTIFICATION, None)):
         raise RuntimeError("a compression notification is already pending")
 
     def _notify() -> bool:
-        return _notify_context_engine_compression_complete(
+        from hermes_cli.model_switch import apply_model_switch_after_compression
+
+        applied = apply_model_switch_after_compression(agent) == "applied"
+        extra_observed = False
+        for notification in post_boundary_notifications or ():
+            notification()
+            extra_observed = True
+        observed = _notify_context_engine_compression_complete(
             agent,
             new_session_id=new_session_id,
             old_session_id=old_session_id,
         )
+        return applied or extra_observed or observed
 
     setattr(agent, _PENDING_CONTEXT_ENGINE_NOTIFICATION, _notify)
 
@@ -1366,6 +1375,7 @@ def compress_context(
                 approx_tokens=approx_tokens,
                 task_id=task_id,
                 force=force,
+                defer_context_engine_notification=defer_context_engine_notification,
             )
         finally:
             if _codex_fence_entered:
@@ -2074,6 +2084,8 @@ def compress_context(
 
         _session_commit_succeeded = False
         split_status = "not_applicable"
+        _route_transaction_context = None
+        _route_transaction = None
         if agent._session_db:
             split_status = "pending"
             try:
@@ -2082,6 +2094,26 @@ def compress_context(
                 # conversation's pre-compaction turns are about to be summarized
                 # away regardless of whether the id rotates).
                 agent.commit_memory_session(messages)
+
+                # Stage the already-resolved route before durable publication.
+                # The transaction consumes it only after the DB seam below
+                # succeeds, and restores the working runtime on any failure.
+                from hermes_cli.model_switch import (
+                    DeferredModelSwitchTransaction,
+                    model_switch_after_compression_transaction,
+                )
+
+                if defer_context_engine_notification:
+                    _route_transaction = DeferredModelSwitchTransaction()
+                else:
+                    _route_transaction_context = (
+                        model_switch_after_compression_transaction(agent)
+                    )
+                    _route_transaction = _route_transaction_context.__enter__()
+                if _route_transaction.active:
+                    agent._invalidate_system_prompt()
+                    new_system_prompt = agent._build_system_prompt(system_message)
+                    agent._cached_system_prompt = new_system_prompt
 
                 if in_place:
                     # ── In-place compaction: keep the same session_id ──────────
@@ -2102,6 +2134,15 @@ def compress_context(
                     # for search/recovery (Teknium review — keep one durable id
                     # WITHOUT destroying history, unlike a hard replace_messages).
                     # See #38763.
+                    if _route_transaction.active:
+                        agent._session_db.update_session_meta(
+                            agent.session_id,
+                            json.dumps(
+                                _route_transaction.model_config,
+                                sort_keys=True,
+                            ),
+                            model=agent.model,
+                        )
                     agent._session_db.archive_and_compact(
                         agent.session_id, persisted_compressed
                     )
@@ -2228,8 +2269,19 @@ def compress_context(
                         for message in compressed
                         if isinstance(message, dict)
                     }
+                if _route_transaction_context is not None:
+                    _route_transaction_context.__exit__(None, None, None)
+                    _route_transaction_context = None
                 _session_commit_succeeded = True
             except Exception as e:
+                if _route_transaction_context is not None:
+                    try:
+                        _route_transaction_context.__exit__(
+                            type(e), e, e.__traceback__
+                        )
+                    except Exception:
+                        pass
+                    _route_transaction_context = None
                 if (
                     not in_place
                     and locals().get("old_session_id")
@@ -2427,6 +2479,7 @@ def _compress_context_via_codex_app_server(
     approx_tokens: Optional[int] = None,
     task_id: str = "default",
     force: bool = False,
+    defer_context_engine_notification: bool = False,
 ) -> Tuple[list, str]:
     """Route compaction to Codex app-server for Codex-owned threads.
 
@@ -2523,6 +2576,20 @@ def _compress_context_via_codex_app_server(
         _complete_compaction_lifecycle()
         return messages, existing_prompt
 
+    post_boundary_notifications = []
+    event_callback = getattr(agent, "event_callback", None)
+
+    def _capture_boundary_event(name, payload):
+        if name == "session:compress" and callable(event_callback):
+            post_boundary_notifications.append(
+                lambda: event_callback(name, payload)
+            )
+            return
+        if callable(event_callback):
+            event_callback(name, payload)
+
+    if callable(event_callback):
+        agent.event_callback = _capture_boundary_event
     try:
         from agent.codex_runtime import (
             _record_codex_app_server_compaction,
@@ -2542,7 +2609,24 @@ def _compress_context_via_codex_app_server(
         if hasattr(agent.context_compressor, "update_from_response"):
             _record_codex_app_server_usage(agent, result)
     except Exception:
-        logger.debug("codex compaction bookkeeping failed", exc_info=True)
+        logger.debug("codex app-server compaction accounting failed", exc_info=True)
+    finally:
+        if callable(event_callback):
+            agent.event_callback = event_callback
+
+    if defer_context_engine_notification:
+        _queue_context_engine_compression_notification(
+            agent,
+            new_session_id=str(getattr(agent, "session_id", "") or ""),
+            old_session_id=str(getattr(agent, "session_id", "") or ""),
+            post_boundary_notifications=post_boundary_notifications,
+        )
+    else:
+        from hermes_cli.model_switch import apply_model_switch_after_compression
+
+        apply_model_switch_after_compression(agent)
+        for notification in post_boundary_notifications:
+            notification()
 
     _refresh_delegate_model_pool_schema_after_compression(agent)
 

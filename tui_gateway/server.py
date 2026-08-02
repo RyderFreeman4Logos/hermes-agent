@@ -1984,6 +1984,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
             # Session DB row deferred to first run_conversation() call.
             # pending_title applied post-first-message (see cli.exec handler).
             current["agent"] = agent
+            _attach_model_switch_after_compression(sid, current, agent)
             # Baseline for the per-turn config sync; the profile home
             # override is still active here.
             current["config_model_seen"] = _config_model_target()
@@ -4047,6 +4048,50 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
         )
 
 
+def _attach_model_switch_after_compression(sid: str, session: dict, agent) -> None:
+    """Attach this TUI session's resolved deferred route to its live agent."""
+    pending = session.get("after_compression_model_switch")
+    if pending is None:
+        return
+
+    from hermes_cli.model_switch import schedule_model_switch_after_compression
+
+    def _on_applied(result, old_model, _old_provider):
+        if session.get("after_compression_model_switch") is not result:
+            return
+        session.pop("after_compression_model_switch", None)
+        session.pop("one_turn_model_restore", None)
+        session["model_override"] = {
+            "model": result.new_model,
+            "provider": result.target_provider,
+            "base_url": result.base_url,
+            "api_key": result.api_key,
+            "api_mode": result.api_mode,
+        }
+        _append_model_switch_marker(
+            session,
+            model=result.new_model,
+            provider=result.target_provider,
+        )
+        _emit("session.info", sid, _session_info(agent, session))
+        _emit(
+            "status",
+            sid,
+            {
+                "message": (
+                    f"Model switched after compression: {old_model} → "
+                    f"{result.new_model}"
+                )
+            },
+        )
+
+    schedule_model_switch_after_compression(
+        agent,
+        pending,
+        on_applied=_on_applied,
+    )
+
+
 def _apply_model_switch(
     sid: str,
     session: dict,
@@ -4074,16 +4119,26 @@ def _apply_model_switch(
         is_global_flag = parsed_flags.is_global
         is_session = parsed_flags.is_session
         one_turn = parsed_flags.is_once
+        after_compression = bool(
+            getattr(parsed_flags, "is_after_compression", False)
+        )
+        errors = tuple(getattr(parsed_flags, "errors", ()))
     else:
         model_input, explicit_provider, is_global_flag, _force_refresh, is_session = parsed_flags
         one_turn = False
+        after_compression = False
+        errors = ()
     # Conflict validation delegates to the shared single-owner parser; the
     # TUI surfaces it as a raised ValueError (its historical behavior)
     # using the canonical error copy.
+    if errors:
+        raise ValueError(MODEL_SWITCH_ERROR_TEXT[errors[0]])
     if is_global_flag and one_turn:
         raise ValueError(MODEL_SWITCH_ERROR_TEXT[MODEL_SWITCH_ERR_ONCE_WITH_GLOBAL])
     persist_global = (
-        persist_override
+        False
+        if after_compression
+        else persist_override
         if persist_override is not None
         else resolve_persist_behavior(
             is_global_flag,
@@ -4147,13 +4202,14 @@ def _apply_model_switch(
         explicit_provider=explicit_provider,
         user_providers=user_provs,
         custom_providers=custom_provs,
+        validate_live=not after_compression,
     )
     if not result.success:
         raise ValueError(result.error_message or "model switch failed")
 
     restore_snapshot = _snapshot_agent_model_runtime(agent) if (one_turn and agent) else None
 
-    if agent:
+    if agent and not after_compression:
         try:
             from hermes_cli.context_switch_guard import merge_preflight_compression_warning
 
@@ -4195,6 +4251,21 @@ def _apply_model_switch(
                 "confirm_required": True,
                 "confirm_message": confirm_msg,
             }
+
+    if after_compression:
+        if agent is None:
+            raise ValueError("/model --after-compression requires a live session")
+        replaced = session.get("after_compression_model_switch")
+        session["after_compression_model_switch"] = result
+        _attach_model_switch_after_compression(sid, session, agent)
+        return {
+            "value": result.new_model,
+            "warning": result.warning_message or "",
+            "confirm_required": False,
+            "scope": "after_compression",
+            "pending": True,
+            "replaced": replaced is not None,
+        }
 
     if agent:
         try:
@@ -4251,6 +4322,7 @@ def _apply_model_switch(
             "api_key": result.api_key,
             "api_mode": result.api_mode,
         }
+    session.pop("after_compression_model_switch", None)
     if persist_global:
         _persist_model_switch(result)
     return {
@@ -5908,6 +5980,7 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
         session.pop("create_reasoning_override", None)
         session.pop("create_service_tier_override", None)
         session.pop("one_turn_model_restore", None)
+        session.pop("after_compression_model_switch", None)
         new_agent = _make_agent(
             sid,
             session["session_key"],

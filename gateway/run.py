@@ -2320,6 +2320,7 @@ _AGENT_PENDING_SENTINEL = object()
 #   _clear_conversation_scope calls.
 _CONVERSATION_SCOPED_STATE: tuple = (
     "_session_model_overrides",
+    "_after_compression_model_switches",
     "_pending_one_turn_model_restores",
     "_session_reasoning_overrides",
     "_session_service_tier_overrides",
@@ -4497,6 +4498,8 @@ class TurnRunner:
                     self._runner._enforce_agent_cache_cap()
             logger.debug("Created new agent for session %s (sig=%s)", ctx.session_key, _sig)
 
+        self._runner._attach_model_switch_after_compression(ctx.session_key, agent)
+
         # Per-message state — callbacks and reasoning config change every
         # turn and must not be baked into the cached agent constructor.
         # Gate on needs_progress_queue (tool_progress OR thinking_progress)
@@ -5468,6 +5471,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _turn_lease_tokens = legacy_lease_token_property()
     _session_run_generation = legacy_dict_property("_session_run_generation")
     _session_model_overrides = legacy_dict_property("_session_model_overrides")
+    _after_compression_model_switches = legacy_dict_property(
+        "_after_compression_model_switches"
+    )
     _pending_one_turn_model_restores = legacy_dict_property(
         "_pending_one_turn_model_restores"
     )
@@ -5512,6 +5518,55 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not sessions:
             return None
         return sessions.get(session_key)
+
+    def _attach_model_switch_after_compression(
+        self,
+        session_key: Optional[str],
+        agent: Any,
+    ) -> None:
+        """Bind conversation-scoped deferred route state to a live agent."""
+        if not session_key:
+            return
+        state = self._peek_session_state(session_key)
+        pending = (
+            state.conversation.after_compression_model_switch
+            if state is not None
+            else None
+        )
+        if pending is None:
+            return
+
+        from hermes_cli.model_switch import schedule_model_switch_after_compression
+
+        def _on_applied(result, old_model, _old_provider):
+            current = self._peek_session_state(session_key)
+            if (
+                current is None
+                or current.conversation.after_compression_model_switch is not result
+            ):
+                return
+            current.conversation.after_compression_model_switch = None
+            current.conversation.model_override = {
+                "model": result.new_model,
+                "provider": result.target_provider,
+                "api_key": result.api_key,
+                "base_url": result.base_url,
+                "api_mode": result.api_mode,
+            }
+            pending_notes = getattr(self, "_pending_model_notes", None)
+            if pending_notes is not None:
+                pending_notes[session_key] = (
+                    f"[Note: model was just switched from {old_model} to "
+                    f"{result.new_model} via "
+                    f"{result.provider_label or result.target_provider}. "
+                    "Adjust your self-identification accordingly.]"
+                )
+
+        schedule_model_switch_after_compression(
+            agent,
+            pending,
+            on_applied=_on_applied,
+        )
 
     def _is_session_running(self, session_key: str) -> bool:
         """True when the session holds a running-turn slot (agent or sentinel)."""
@@ -16164,11 +16219,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     _hyg_agent,
                                     _hyg_session_row,
                                 )
+                                self._attach_model_switch_after_compression(
+                                    session_key,
+                                    _hyg_agent,
+                                )
                                 # If compression must rebuild instead of retaining
                                 # the cached prompt, make the persisted result
                                 # deliberately stale for every real gateway surface.
                                 _hyg_agent.platform = _GATEWAY_HYGIENE_PLATFORM
                                 _hyg_cleanup_deferred = False
+                                _hyg_boundary_committed = False
                                 try:
                                     # Gateway hygiene runs before the user turn
                                     # starts and already owns the session binding.
@@ -16203,6 +16263,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             _hyg_msgs, "",
                                             approx_tokens=_approx_tokens,
                                             commit_fence=_hyg_commit_fence,
+                                            defer_context_engine_notification=True,
                                         ),
                                     )
                                     try:
@@ -16406,6 +16467,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             session_entry.session_id,
                                         )
 
+                                    _hyg_boundary_committed = bool(
+                                        _hyg_rotated or _hyg_in_place
+                                    )
+
                                     logger.info(
                                         "Session hygiene: compressed %s → %s msgs, "
                                         "~%s → ~%s tokens",
@@ -16483,6 +16548,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                 _werr,
                                             )
                                 finally:
+                                    from agent.conversation_compression import (
+                                        finalize_context_engine_compression_notification,
+                                    )
+
+                                    finalize_context_engine_compression_notification(
+                                        _hyg_agent,
+                                        committed=_hyg_boundary_committed,
+                                    )
                                     # Evict the cached agent so the next turn
                                     # rebuilds its system prompt from current
                                     # SOUL.md, memory, and skills.

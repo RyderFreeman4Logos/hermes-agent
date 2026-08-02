@@ -3363,6 +3363,84 @@ def test_apply_model_switch_persist_override_false_never_persists(monkeypatch):
     assert session["model_override"]["model"] == "new/model"
 
 
+def test_apply_model_switch_after_compression_defers_tui_route(monkeypatch):
+    from hermes_cli.model_switch import (
+        ModelSwitchResult,
+        apply_model_switch_after_compression,
+        get_model_switch_after_compression,
+    )
+
+    class Agent:
+        def __init__(self):
+            self.model = "old/model"
+            self.provider = "openrouter"
+            self.api_key = "old-key"
+            self.base_url = "https://old.example/v1"
+            self.api_mode = "chat_completions"
+            self.calls = []
+
+        def switch_model(
+            self,
+            new_model,
+            new_provider,
+            api_key="",
+            base_url="",
+            api_mode="",
+        ):
+            self.calls.append((new_model, new_provider))
+            self.model = new_model
+            self.provider = new_provider
+            self.api_key = api_key
+            self.base_url = base_url
+            self.api_mode = api_mode
+
+    result = ModelSwitchResult(
+        success=True,
+        new_model="next/model",
+        target_provider="anthropic",
+        api_key="next-key",
+        base_url="https://api.anthropic.com",
+        api_mode="anthropic_messages",
+        provider_label="Anthropic",
+    )
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", lambda **kw: result)
+    monkeypatch.setattr(
+        "hermes_cli.model_cost_guard.expensive_model_warning",
+        lambda *a, **k: None,
+    )
+    monkeypatch.setattr(
+        server,
+        "_persist_model_switch",
+        lambda _r: pytest.fail("deferred switch must stay session-scoped"),
+    )
+    monkeypatch.setattr(server, "_persist_live_session_runtime", lambda *a: None)
+    agent = Agent()
+    session = {
+        "agent": agent,
+        "model_override": {
+            "model": "old/model",
+            "provider": "openrouter",
+        },
+    }
+
+    out = server._apply_model_switch(
+        "sid",
+        session,
+        "next/model --after-compression --provider anthropic",
+    )
+
+    assert out["pending"] is True
+    assert agent.calls == []
+    assert session["model_override"]["model"] == "old/model"
+    assert session["after_compression_model_switch"] is result
+    assert get_model_switch_after_compression(agent) is result
+
+    assert apply_model_switch_after_compression(agent) == "applied"
+    assert agent.calls == [("next/model", "anthropic")]
+    assert session["model_override"]["model"] == "next/model"
+    assert "after_compression_model_switch" not in session
+
+
 def test_startup_runtime_uses_tui_provider_env(monkeypatch):
     monkeypatch.setenv("HERMES_MODEL", "nous/hermes-test")
     monkeypatch.setenv("HERMES_TUI_PROVIDER", "nous")
@@ -7636,6 +7714,12 @@ def test_session_compress_preserves_compute_host_aborted_summary(monkeypatch):
 
 
 def test_session_compress_reports_aborted_summary_without_success(monkeypatch):
+    from hermes_cli.model_switch import (
+        ModelSwitchResult,
+        get_model_switch_after_compression,
+        schedule_model_switch_after_compression,
+    )
+
     compression_state = types.SimpleNamespace(
         _last_compress_aborted=True,
         _last_summary_fallback_used=False,
@@ -7647,7 +7731,19 @@ def test_session_compress_reports_aborted_summary_without_success(monkeypatch):
         context_compressor=compression_state,
         _cached_system_prompt="",
         tools=None,
+        model="old-model",
+        provider="old-provider",
+        _last_compression_committed=False,
+        switch_model=lambda *_args, **_kwargs: pytest.fail(
+            "aborted compression must not apply the deferred switch"
+        ),
     )
+    pending = ModelSwitchResult(
+        success=True,
+        new_model="new-model",
+        target_provider="new-provider",
+    )
+    schedule_model_switch_after_compression(agent, pending)
     history = [{"role": "user", "content": f"m{i}"} for i in range(6)]
     server._sessions["sid"] = _session(agent=agent, history=history)
 
@@ -7677,6 +7773,7 @@ def test_session_compress_reports_aborted_summary_without_success(monkeypatch):
         )
         assert "no API key was found" in result["summary"]["note"]
         assert "Compressed:" not in result["summary"]["headline"]
+        assert get_model_switch_after_compression(agent) is pending
     finally:
         server._sessions.pop("sid", None)
 

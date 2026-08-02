@@ -206,3 +206,125 @@ def test_deferred_unknown_custom_model_fails_closed_without_network(monkeypatch)
     assert result.success is False
     assert "local" in result.error_message.lower()
     assert calls == []
+
+
+def test_deferred_custom_current_direct_alias_propagates_local_only_policy(monkeypatch):
+    from hermes_cli import model_switch as ms
+
+    config = _pm_config()
+    calls = _install_network_tripwires(monkeypatch)
+
+    def provider_info(_provider, *, allow_network=True):
+        calls.append("provider registry")
+        raise AssertionError("provider registry")
+
+    monkeypatch.setattr("agent.models_dev.get_provider_info", provider_info)
+    monkeypatch.setattr("hermes_cli.runtime_provider.load_config", lambda: config)
+    monkeypatch.setattr(
+        ms,
+        "DIRECT_ALIASES",
+        {
+            "next": ms.DirectAlias(
+                model="gpt-5.6-sol",
+                provider="pm",
+                base_url="",
+            )
+        },
+    )
+    monkeypatch.setattr(
+        "agent.credential_pool.write_credential_pool",
+        lambda *_a, **_k: calls.append("credential pool write"),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.auth._save_auth_store",
+        lambda *_a, **_k: calls.append("auth store write"),
+    )
+
+    result = switch_model(
+        raw_input="next",
+        current_provider="custom:current",
+        current_model="old-model",
+        user_providers=config["providers"],
+        validate_live=False,
+    )
+
+    assert result.success is True
+    assert (result.target_provider, result.new_model) == ("pm", "gpt-5.6-sol")
+    assert calls == []
+
+
+def test_deferred_provider_alias_auth_enumeration_is_read_only(monkeypatch):
+    calls = []
+
+    def provider_info(_provider, *, allow_network=True):
+        calls.append("provider registry")
+        raise AssertionError("provider registry")
+
+    class EmptyPool:
+        def has_credentials(self):
+            return False
+
+    def load_pool(_provider, *, read_only=False):
+        if not read_only:
+            calls.append("writable credential pool")
+        return EmptyPool()
+
+    monkeypatch.setattr("agent.models_dev.get_provider_info", provider_info)
+    monkeypatch.setattr(
+        "agent.models_dev.fetch_models_dev",
+        lambda **_kwargs: calls.append("models.dev") or {},
+    )
+    monkeypatch.setattr("agent.credential_pool.load_pool", load_pool)
+    monkeypatch.setattr(
+        "agent.credential_pool.write_credential_pool",
+        lambda *_a, **_k: calls.append("credential pool write"),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.auth._save_auth_store",
+        lambda *_a, **_k: calls.append("auth store write"),
+    )
+
+    result = switch_model(
+        raw_input="gpt-5.6-sol",
+        explicit_provider="openai",
+        current_provider="custom:current",
+        current_model="old-model",
+        validate_live=False,
+    )
+
+    assert result.success is False
+    assert "no credentials configured" in result.error_message
+    assert calls == []
+
+
+def test_deferred_missing_local_api_mode_fails_closed(monkeypatch):
+    config = _pm_config()
+    config["providers"]["pm"].pop("api_mode")
+    monkeypatch.setattr("hermes_cli.runtime_provider.load_config", lambda: config)
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **_kwargs: {
+            "provider": "pm",
+            "api_key": "test-token",
+            "base_url": "https://pm.invalid/v1",
+            "api_mode": "",
+        },
+    )
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.determine_api_mode",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("deferred scheduling must not guess an API mode")
+        ),
+    )
+
+    result = switch_model(
+        raw_input="gpt-5.6-sol",
+        explicit_provider="pm",
+        current_provider="openai-codex",
+        current_model="gpt-5.4",
+        user_providers=config["providers"],
+        validate_live=False,
+    )
+
+    assert result.success is False
+    assert "api mode" in result.error_message.lower()

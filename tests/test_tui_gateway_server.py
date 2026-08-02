@@ -3776,6 +3776,163 @@ def test_apply_model_switch_after_compression_defers_tui_route(monkeypatch):
     assert "after_compression_model_switch" not in session
 
 
+@pytest.mark.parametrize("emit_failure", [0, 1, 2])
+def test_deferred_tui_emit_failure_does_not_rollback_authoritative_activation(
+    monkeypatch, emit_failure
+):
+    from hermes_cli.model_switch import (
+        ModelSwitchResult,
+        apply_model_switch_after_compression,
+        get_model_switch_after_compression,
+    )
+
+    class Agent:
+        def __init__(self):
+            self.model = "old/model"
+            self.provider = "old-provider"
+            self.api_key = "old-key"
+            self.base_url = "https://old.invalid/v1"
+            self.api_mode = "chat_completions"
+
+        def switch_model(self, model, provider, api_key="", base_url="", api_mode=""):
+            self.model = model
+            self.provider = provider
+            self.api_key = api_key
+            self.base_url = base_url
+            self.api_mode = api_mode
+
+    pending = ModelSwitchResult(
+        success=True,
+        new_model="new/model",
+        target_provider="new-provider",
+        api_key="new-key",
+        base_url="https://new.invalid/v1",
+        api_mode="anthropic_messages",
+    )
+    agent = Agent()
+    session = _session(
+        agent=agent,
+        history=[{"role": "user", "content": "old marker"}],
+        model_override={"model": "old/model", "provider": "old-provider"},
+        after_compression_model_switch=pending,
+    )
+    emitted = []
+
+    def emit(*args):
+        emitted.append(args)
+        if len(emitted) == emit_failure:
+            raise RuntimeError("transport closed")
+
+    monkeypatch.setattr(server, "_emit", emit)
+    if emit_failure == 0:
+        monkeypatch.setattr(
+            server,
+            "_session_info",
+            lambda *_a, **_k: (_ for _ in ()).throw(OSError("observer unavailable")),
+        )
+    server._attach_model_switch_after_compression("sid", session, agent, pending)
+
+    assert apply_model_switch_after_compression(agent) == "applied"
+    assert (agent.model, agent.provider) == ("new/model", "new-provider")
+    assert get_model_switch_after_compression(agent) is None
+    assert "after_compression_model_switch" not in session
+    assert session["model_override"]["model"] == "new/model"
+    assert session["history"][-1]["display_kind"] == "model_switch"
+
+
+def test_deferred_tui_history_failure_rolls_back_every_authoritative_mirror():
+    from hermes_cli.model_switch import (
+        ModelSwitchResult,
+        apply_model_switch_after_compression,
+        get_model_switch_after_compression,
+    )
+
+    class BrokenMarkerDB:
+        def __init__(self):
+            self.row: dict[str, object] = {
+                "model": "old/model",
+                "model_config": json.dumps(
+                    {"model": "old/model", "provider": "old-provider"}
+                ),
+            }
+
+        def get_session(self, _session_id):
+            return dict(self.row)
+
+        def update_session_meta(self, _session_id, model_config, *, model=None):
+            self.row["model_config"] = model_config
+            self.row["model"] = model
+
+        def append_message(self, **_kwargs):
+            raise OSError("history unavailable")
+
+    class Agent:
+        def __init__(self):
+            self.model = "old/model"
+            self.provider = "old-provider"
+            self.api_key = "old-key"
+            self.base_url = "https://old.invalid/v1"
+            self.api_mode = "chat_completions"
+            self.session_id = "session-key"
+            self._session_db = BrokenMarkerDB()
+
+        def switch_model(self, model, provider, api_key="", base_url="", api_mode=""):
+            self.model = model
+            self.provider = provider
+            self.api_key = api_key
+            self.base_url = base_url
+            self.api_mode = api_mode
+
+    pending = ModelSwitchResult(
+        success=True,
+        new_model="new/model",
+        target_provider="new-provider",
+        api_key="new-key",
+        base_url="https://new.invalid/v1",
+        api_mode="anthropic_messages",
+    )
+    agent = Agent()
+    old_override = {"model": "old/model", "provider": "old-provider"}
+    old_history = [{"role": "user", "content": "old marker"}]
+    session = _session(
+        agent=agent,
+        history=list(old_history),
+        session_key="session-key",
+        model_override=old_override,
+        after_compression_model_switch=pending,
+    )
+    server._attach_model_switch_after_compression("sid", session, agent, pending)
+
+    assert apply_model_switch_after_compression(agent) == "failed"
+    assert (agent.model, agent.provider) == ("old/model", "old-provider")
+    assert get_model_switch_after_compression(agent) is pending
+    assert session["after_compression_model_switch"] is pending
+    assert session["model_override"] == old_override
+    assert session["history"] == old_history
+    assert json.loads(str(agent._session_db.row["model_config"]))["model"] == "old/model"
+
+
+def test_required_model_switch_marker_rejects_missing_database(monkeypatch):
+    class MissingDatabase:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, *_args):
+            return False
+
+    session = _session()
+    monkeypatch.setattr(server, "_ensure_session_db_row", lambda _session: None)
+    monkeypatch.setattr(server, "_session_db", lambda _session: MissingDatabase())
+
+    with pytest.raises(RuntimeError, match="session database unavailable"):
+        server._append_model_switch_marker(
+            session,
+            model="new/model",
+            provider="new-provider",
+            require_durable=True,
+        )
+
+
 def test_apply_model_switch_allows_provider_only_deferred_route(monkeypatch):
     from hermes_cli.model_switch import ModelSwitchResult
 
@@ -8927,7 +9084,7 @@ def test_session_compress_syncs_session_key_after_rotation(monkeypatch):
     monkeypatch.setattr(
         server,
         "_restart_slash_worker",
-        lambda sid, s: (restart_calls.append(s), events.append("sync")),
+        lambda sid, s: (restart_calls.append(s), events.append("restart")),
     )
 
     try:
@@ -8943,7 +9100,116 @@ def test_session_compress_syncs_session_key_after_rotation(monkeypatch):
         assert server._sessions["sid"]["session_key"] == "rotated-id"
         assert server._sessions["sid"]["pending_title"] is None
         assert len(restart_calls) == 1
-        assert events == ["sync", "notify"]
+        assert events == ["notify", "restart"]
+    finally:
+        server._sessions.pop("sid", None)
+
+
+@pytest.mark.parametrize("route", ["session.compress", "slash.compress", "live-slash"])
+@pytest.mark.parametrize("activation_succeeds", [True, False])
+def test_manual_compress_restarts_worker_from_final_authoritative_route(
+    monkeypatch, route, activation_succeeds
+):
+    events = []
+    agent = types.SimpleNamespace(
+        model="old/model",
+        provider="old-provider",
+        session_id="child",
+        _cached_system_prompt="",
+        tools=None,
+        context_compressor=None,
+    )
+    session = _session(
+        agent=agent,
+        running=False,
+        history=[{"role": "user", "content": "before"}],
+        after_compression_model_switch="pending",
+    )
+    session["session_key"] = "parent"
+    closed = []
+
+    class ExistingWorker:
+        def close(self):
+            closed.append(True)
+
+    session["slash_worker"] = ExistingWorker()
+    server._sessions["sid"] = session
+
+    def compress(_session, _focus=None, **_kwargs):
+        _session["history"] = [{"role": "user", "content": "summary"}]
+        return 0, {"total": 0}
+
+    def sync(_sid, _session, *, restart_slash_worker=True, **_kwargs):
+        assert restart_slash_worker is False
+        _session["session_key"] = "child"
+        events.append(("sync", agent.model, agent.provider))
+
+    def finalize(_agent, *, committed):
+        assert committed is True
+        events.append(("finalize", _agent.model, _agent.provider))
+        if activation_succeeds:
+            _agent.model = "new/model"
+            _agent.provider = "new-provider"
+            session.pop("after_compression_model_switch", None)
+
+    spawned = []
+
+    class CapturingWorker:
+        def __init__(self, session_key, model, profile_home=None):
+            spawned.append((session_key, model, agent.provider))
+            events.append(("restart", model, agent.provider))
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(server, "_compress_session_history", compress)
+    monkeypatch.setattr(server, "_sync_session_key_after_compress", sync)
+    monkeypatch.setattr(server, "_SlashWorker", CapturingWorker)
+    monkeypatch.setattr(server, "_session_info", lambda *_a: {"model": agent.model})
+    monkeypatch.setattr(server, "_emit", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        "agent.conversation_compression.finalize_context_engine_compression_notification",
+        finalize,
+    )
+
+    try:
+        if route == "session.compress":
+            response = server.handle_request(
+                {
+                    "id": "1",
+                    "method": "session.compress",
+                    "params": {"session_id": "sid"},
+                }
+            )
+            assert "result" in response
+        elif route == "slash.compress":
+            response = server.handle_request(
+                {
+                    "id": "1",
+                    "method": "command.dispatch",
+                    "params": {
+                        "session_id": "sid",
+                        "name": "compress",
+                        "arg": "",
+                    },
+                }
+            )
+            assert "result" in response
+        else:
+            assert "live session sync failed" not in server._mirror_slash_side_effects(
+                "sid", session, "/compress"
+            )
+
+        expected = (
+            ("new/model", "new-provider")
+            if activation_succeeds
+            else ("old/model", "old-provider")
+        )
+        assert [event[0] for event in events] == ["sync", "finalize", "restart"]
+        assert events[-1][1:] == expected
+        assert spawned == [("child", *expected)]
+        assert closed == [True]
+        assert ("after_compression_model_switch" in session) is (not activation_succeeds)
     finally:
         server._sessions.pop("sid", None)
 
@@ -11645,7 +11911,7 @@ def test_mirror_slash_compress_does_not_prelock_history(monkeypatch):
         session["history"] = [{"role": "user", "content": "summary"}]
         return (1, {"total": 0})
 
-    def _fake_sync(_sid, _session):
+    def _fake_sync(_sid, _session, **_kwargs):
         seen["sync"] = True
 
     monkeypatch.setattr(server, "_compress_session_history", _fake_compress)

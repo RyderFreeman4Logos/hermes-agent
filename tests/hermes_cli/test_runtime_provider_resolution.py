@@ -1553,3 +1553,368 @@ def test_resolve_named_custom_runtime_pool_result_includes_extra_headers(monkeyp
     assert resolved["source"] == "pool:lmstudio-pool"
     assert resolved["provider"] == "custom"
     assert resolved["requested_provider"] == "custom:lmstudio"
+
+
+@pytest.mark.parametrize(
+    ("provider", "resolver_name", "credentials"),
+    [
+        (
+            "openai-codex",
+            "resolve_codex_runtime_credentials",
+            {
+                "api_key": "cached-codex",
+                "base_url": "https://chatgpt.com/backend-api/codex",
+            },
+        ),
+        (
+            "nous",
+            "resolve_nous_runtime_credentials",
+            {
+                "api_key": _fake_invoke_jwt(),
+                "base_url": "https://inference-api.nousresearch.com/v1",
+            },
+        ),
+        (
+            "qwen-oauth",
+            "resolve_qwen_runtime_credentials",
+            {
+                "api_key": "cached-qwen",
+                "base_url": "https://portal.qwen.ai/v1",
+            },
+        ),
+    ],
+)
+def test_local_only_runtime_propagates_no_refresh_policy(
+    monkeypatch, provider, resolver_name, credentials
+):
+    seen = []
+
+    class EmptyPool:
+        def has_credentials(self):
+            return False
+
+    def load_pool(_provider, *, read_only=False):
+        assert read_only is True
+        return EmptyPool()
+
+    def resolve(**kwargs):
+        seen.append(kwargs)
+        assert kwargs["allow_network"] is False
+        return credentials
+
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: provider)
+    monkeypatch.setattr(rp, "load_pool", load_pool)
+    monkeypatch.setattr(rp, resolver_name, resolve)
+    monkeypatch.setattr(rp, "_get_model_config", lambda: {})
+
+    resolved = rp.resolve_runtime_provider(requested=provider, allow_network=False)
+
+    assert resolved["provider"] == provider
+    assert seen
+
+
+def test_local_only_qwen_expired_token_fails_without_refresh(monkeypatch):
+    from hermes_cli import auth
+
+    refreshed = []
+    monkeypatch.setattr(
+        auth,
+        "_read_qwen_cli_tokens",
+        lambda: {
+            "access_token": "expired-qwen",
+            "refresh_token": "refresh-qwen",
+            "expiry_date": 1,
+        },
+    )
+    monkeypatch.setattr(
+        auth,
+        "_refresh_qwen_cli_tokens",
+        lambda *_a, **_k: refreshed.append(True),
+    )
+
+    with pytest.raises(auth.AuthError, match="refresh"):
+        auth.resolve_qwen_runtime_credentials(allow_network=False)
+
+    assert refreshed == []
+
+
+def test_local_only_nous_keeps_runtime_minimum_ttl(monkeypatch):
+    from hermes_cli import auth
+
+    monkeypatch.setattr(
+        auth,
+        "get_provider_auth_state",
+        lambda _provider: {
+            "agent_key": _fake_invoke_jwt(ttl_seconds=600),
+            "scope": "inference:invoke",
+        },
+    )
+
+    with pytest.raises(auth.AuthError, match="refresh"):
+        auth.resolve_nous_runtime_credentials(allow_network=False)
+
+
+def test_local_only_nous_expired_pool_key_falls_back_without_refresh(monkeypatch):
+    stale = _fake_invoke_jwt(ttl_seconds=600)
+    fresh = _fake_invoke_jwt(ttl_seconds=3600)
+    refreshed = []
+    singleton_calls = []
+    entry = SimpleNamespace(
+        runtime_api_key=stale,
+        access_token="",
+        agent_key=stale,
+        agent_key_expires_at=None,
+        scope="inference:invoke",
+    )
+    pool = SimpleNamespace(
+        has_credentials=lambda: True,
+        select=lambda: entry,
+        try_refresh_current=lambda: refreshed.append(True),
+    )
+
+    def resolve_singleton(**kwargs):
+        singleton_calls.append(kwargs)
+        return {
+            "api_key": fresh,
+            "base_url": "https://inference-api.nousresearch.com/v1",
+            "source": "cached_invoke_jwt",
+        }
+
+    monkeypatch.setattr(rp, "load_pool", lambda *_args, **_kwargs: pool)
+    monkeypatch.setattr(rp, "resolve_nous_runtime_credentials", resolve_singleton)
+    monkeypatch.setattr(rp, "_get_model_config", lambda: {})
+
+    resolved = rp.resolve_runtime_provider(requested="nous", allow_network=False)
+
+    assert resolved["api_key"] == fresh
+    assert singleton_calls == [{"timeout_seconds": 15.0, "allow_network": False}]
+    assert refreshed == []
+
+
+def test_local_only_explicit_nous_base_url_disables_refresh(monkeypatch):
+    calls = []
+    token = _fake_invoke_jwt(ttl_seconds=3600)
+
+    monkeypatch.setattr(
+        rp,
+        "load_pool",
+        lambda *_args, **_kwargs: SimpleNamespace(has_credentials=lambda: False),
+    )
+    monkeypatch.setattr(rp, "_get_model_config", lambda: {})
+
+    def resolve(**kwargs):
+        calls.append(kwargs)
+        return {
+            "api_key": token,
+            "base_url": "https://inference-api.nousresearch.com/v1",
+            "source": "cached_invoke_jwt",
+        }
+
+    monkeypatch.setattr(rp, "resolve_nous_runtime_credentials", resolve)
+
+    resolved = rp.resolve_runtime_provider(
+        requested="nous",
+        explicit_base_url="https://custom.invalid/v1",
+        allow_network=False,
+    )
+
+    assert resolved["api_key"] == token
+    assert resolved["base_url"] == "https://custom.invalid/v1"
+    assert calls == [{"timeout_seconds": 15.0, "allow_network": False}]
+
+
+def test_local_only_vertex_expired_token_fails_without_refresh(monkeypatch):
+    from agent import vertex_adapter as vertex
+
+    class Credentials:
+        token = "expired-vertex"
+        expired = True
+        expiry = None
+
+    refreshed = []
+    monkeypatch.setattr(vertex, "google", object())
+    monkeypatch.setattr(vertex, "_resolve_credentials_path", lambda _path: "/tmp/test.json")
+    monkeypatch.setattr(vertex, "_resolve_project_override", lambda: "test-project")
+    monkeypatch.setattr(
+        vertex,
+        "_creds_cache",
+        {"/tmp/test.json": (Credentials(), "test-project")},
+    )
+    monkeypatch.setattr(
+        vertex,
+        "_refresh_credentials",
+        lambda *_a, **_k: refreshed.append(True),
+    )
+
+    token, base_url = vertex.get_vertex_config(allow_network=False)
+
+    assert (token, base_url) == (None, None)
+    assert refreshed == []
+
+
+def test_read_only_pool_selection_never_refreshes_or_persists(monkeypatch):
+    from agent import credential_pool as cp
+
+    events = []
+    expiring = cp.PooledCredential(
+        provider="anthropic",
+        id="expiring",
+        label="expiring",
+        auth_type=cp.AUTH_TYPE_OAUTH,
+        priority=0,
+        source="manual",
+        access_token="test-access-token",
+        expires_at_ms=0,
+    )
+    live = cp.PooledCredential(
+        provider="anthropic",
+        id="live",
+        label="live",
+        auth_type=cp.AUTH_TYPE_OAUTH,
+        priority=1,
+        source="manual",
+        access_token="test-live-token",
+        expires_at_ms=int((time.time() + 3600) * 1000),
+    )
+    dead = cp.PooledCredential(
+        provider="anthropic",
+        id="dead",
+        label="dead",
+        auth_type=cp.AUTH_TYPE_OAUTH,
+        priority=2,
+        source="manual",
+        access_token="test-dead-token",
+        last_status=cp.STATUS_DEAD,
+        last_status_at=time.time() - cp.DEAD_MANUAL_PRUNE_TTL_SECONDS - 1,
+    )
+    monkeypatch.setattr(
+        cp,
+        "read_credential_pool",
+        lambda _provider: [expiring.to_dict(), live.to_dict(), dead.to_dict()],
+    )
+    monkeypatch.setattr(
+        cp,
+        "write_credential_pool",
+        lambda *_args, **_kwargs: events.append("write"),
+    )
+    monkeypatch.setattr(
+        cp.CredentialPool,
+        "_refresh_entry",
+        lambda self, entry, *, force=False: events.append("refresh") or entry,
+    )
+
+    pool = cp.load_pool("anthropic", read_only=True)
+
+    assert pool.has_available() is True
+    selected = pool.select()
+    assert selected is not None
+    assert selected.id == "live"
+    assert [entry.id for entry in pool.entries()] == ["expiring", "live", "dead"]
+    assert events == []
+
+
+def test_read_only_pool_rejects_expired_oauth_entry():
+    from agent import credential_pool as cp
+
+    expired = cp.PooledCredential(
+        provider="qwen-oauth",
+        id="expired",
+        label="expired",
+        auth_type=cp.AUTH_TYPE_OAUTH,
+        priority=0,
+        source="qwen-cli",
+        access_token="test-expired-token",
+        expires_at_ms=0,
+    )
+
+    pool = cp.CredentialPool("qwen-oauth", [expired], read_only=True)
+
+    assert pool.has_available() is False
+    assert pool.select() is None
+
+
+def test_read_only_pool_does_not_exchange_copilot_token(monkeypatch):
+    from agent import credential_pool as cp
+    from hermes_cli import copilot_auth
+
+    exchanges = []
+    monkeypatch.setattr(cp, "read_credential_pool", lambda _provider: [])
+    monkeypatch.setattr(
+        copilot_auth,
+        "resolve_copilot_token",
+        lambda: ("test-copilot-token", "test"),
+    )
+    monkeypatch.setattr(
+        copilot_auth,
+        "get_copilot_api_token",
+        lambda _token: exchanges.append(True),
+    )
+
+    pool = cp.load_pool("copilot", read_only=True)
+
+    assert pool.has_credentials() is False
+    assert exchanges == []
+
+
+def test_local_only_anthropic_resolution_does_not_refresh(monkeypatch):
+    from agent import anthropic_adapter as anthropic
+
+    class EmptyPool:
+        def has_credentials(self):
+            return False
+
+    refreshed = []
+    monkeypatch.setattr(rp, "load_pool", lambda *_args, **_kwargs: EmptyPool())
+    monkeypatch.setattr(
+        anthropic,
+        "read_claude_code_credentials",
+        lambda: {
+            "accessToken": "expired-test-token",
+            "refreshToken": "test-refresh-token",
+        },
+    )
+    monkeypatch.setattr(anthropic, "is_claude_code_token_valid", lambda _creds: False)
+    monkeypatch.setattr(
+        anthropic,
+        "_refresh_oauth_token",
+        lambda _creds: refreshed.append(True),
+    )
+    monkeypatch.setattr(anthropic, "_resolve_anthropic_pool_token", lambda: None)
+    for name in ("ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+
+    with pytest.raises(rp.AuthError, match="No Anthropic credentials"):
+        rp.resolve_runtime_provider(requested="anthropic", allow_network=False)
+
+    assert refreshed == []
+
+
+def test_local_only_copilot_resolution_skips_token_exchange(monkeypatch):
+    from hermes_cli import auth, copilot_auth
+
+    class EmptyPool:
+        def has_credentials(self):
+            return False
+
+    exchanges = []
+    monkeypatch.setattr(rp, "load_pool", lambda *_args, **_kwargs: EmptyPool())
+    monkeypatch.setattr(
+        copilot_auth,
+        "resolve_copilot_token",
+        lambda: ("test-copilot-token", "test"),
+    )
+    monkeypatch.setattr(
+        copilot_auth,
+        "get_copilot_api_token",
+        lambda _token: exchanges.append(True)
+        or ("test-api-token", "https://copilot.example.test"),
+    )
+
+    with pytest.raises(rp.AuthError):
+        rp.resolve_runtime_provider(requested="copilot", allow_network=False)
+
+    assert exchanges == []
+
+    live = auth.resolve_api_key_provider_credentials("copilot")
+    assert live["base_url"] == "https://copilot.example.test"
+    assert exchanges

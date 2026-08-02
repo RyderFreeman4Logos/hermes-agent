@@ -141,6 +141,7 @@ class _Target:
     cache_context: str = ""
     generation: int = 0
     timer: Any = None
+    deadline: float = 0.0
     baseline: Dict[str, Any] = field(default_factory=dict)
     publishing: bool = False
 
@@ -240,13 +241,28 @@ class RuntimeHeartbeat:
         return True
 
     def _schedule_locked(
-        self, key: str, target: _Target, *, delay: Optional[float] = None
+        self,
+        key: str,
+        target: _Target,
+        *,
+        delay: Optional[float] = None,
+        deadline: Optional[float] = None,
     ) -> None:
+        if deadline is None:
+            delay = float(target.interval if delay is None else max(0.0, delay))
+            deadline = time.monotonic() + delay
+        else:
+            delay = float(
+                max(0.0, deadline - time.monotonic())
+                if delay is None
+                else max(0.0, delay)
+            )
+        target.deadline = deadline
         self._next_generation += 1
         target.generation = self._next_generation
         generation = target.generation
         timer = self._timer_factory(
-            target.interval if delay is None else delay,
+            delay,
             lambda: self._fire(key, generation),
         )
         if hasattr(timer, "daemon"):
@@ -323,7 +339,7 @@ class RuntimeHeartbeat:
             raise ValueError("provider and cache_context must be supplied together")
         count = 0
         with self._lock:
-            groups = set()
+            groups: Dict[tuple[str, int, str, str], float] = {}
             now = time.monotonic()
             dispatch_at = now if activity_at is None else min(now, float(activity_at))
             for key, target in tuple(self._targets.items()):
@@ -335,16 +351,22 @@ class RuntimeHeartbeat:
                     str(cache_context),
                 ):
                     continue
+                deadline = dispatch_at + target.interval
+                if deadline <= target.deadline:
+                    continue
                 if target.timer is not None:
                     target.timer.cancel()
-                delay = max(0.0, target.interval - (now - dispatch_at))
-                self._schedule_locked(key, target, delay=delay)
-                groups.add(group)
+                self._schedule_locked(
+                    key, target, delay=deadline - now, deadline=deadline
+                )
+                groups[group] = deadline
                 count += 1
-            for group in groups:
+            for group, deadline in groups.items():
                 self._next_group_token += 1
                 self._group_tokens[group] = self._next_group_token
-                self._group_next_emit[group] = dispatch_at + group[1]
+                self._group_next_emit[group] = max(
+                    deadline, self._group_next_emit.get(group, 0.0)
+                )
                 self._group_pending.pop(group, None)
                 self._group_replacements.pop(group, None)
         return count

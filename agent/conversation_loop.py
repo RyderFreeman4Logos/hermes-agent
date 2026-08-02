@@ -1341,7 +1341,9 @@ def run_heartbeat_warm(
     api_calls = 1
     dispatch_started_at = time.monotonic()
     try:
-        dispatch_client.chat.completions.create(**api_kwargs)
+        response = dispatch_client.chat.completions.create(**api_kwargs)
+        if not agent._get_transport().validate_response(response):
+            return finish(silent=True)
     except Exception:
         logger.debug("Isolated heartbeat warm attempt failed", exc_info=True)
     else:

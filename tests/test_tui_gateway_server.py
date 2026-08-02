@@ -3498,6 +3498,91 @@ def test_apply_model_switch_no_target_reports_pending_route():
         server._apply_model_switch("sid", session, "")
 
 
+def test_busy_config_set_schedules_after_compression_on_live_agent(monkeypatch):
+    from hermes_cli.model_switch import ModelSwitchResult, get_model_switch_after_compression
+
+    agent = types.SimpleNamespace(
+        model="old/model",
+        provider="openrouter",
+        base_url="https://openrouter.ai/api/v1",
+        api_key="old-key",
+        api_mode="chat_completions",
+    )
+    result = ModelSwitchResult(
+        success=True,
+        new_model="next/model",
+        target_provider="anthropic",
+        api_key="next-key",
+        base_url="https://api.anthropic.com",
+        api_mode="anthropic_messages",
+        provider_label="Anthropic",
+    )
+    session = {"agent": agent, "running": True}
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"model": {}})
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", lambda **_kw: result)
+    monkeypatch.setattr(
+        "hermes_cli.model_cost_guard.expensive_model_warning", lambda *a, **k: None
+    )
+    server._sessions["busy-after-compression"] = session
+    try:
+        response = server._methods["config.set"](
+            "request",
+            {
+                "key": "model",
+                "value": "next/model --after-compression --provider anthropic",
+                "session_id": "busy-after-compression",
+            },
+        )["result"]
+    finally:
+        server._sessions.pop("busy-after-compression", None)
+
+    assert response["pending"] is True
+    assert response["replaced"] is False
+    assert "pending_model_switch" not in session
+    assert session["after_compression_model_switch"] is result
+    assert get_model_switch_after_compression(agent) is result
+
+
+def test_tui_slash_and_status_expose_replaced_deferred_route(monkeypatch):
+    from hermes_cli.model_switch import ModelSwitchResult
+
+    pending = ModelSwitchResult(
+        success=True,
+        new_model="next/model",
+        target_provider="anthropic",
+        provider_label="Anthropic",
+    )
+    session = {
+        "agent": types.SimpleNamespace(model="old/model", provider="openrouter"),
+        "running": False,
+        "after_compression_model_switch": pending,
+    }
+    monkeypatch.setattr(
+        server,
+        "_apply_model_switch",
+        lambda *_args, **_kwargs: {
+            "value": "next/model",
+            "warning": "",
+            "confirm_required": False,
+            "confirm_message": "",
+            "scope": "after_compression",
+            "pending": True,
+            "replaced": True,
+        },
+    )
+
+    slash = server._mirror_slash_side_effects(
+        "sid", session, "/model next/model --after-compression"
+    )
+    status = server._format_live_model_output(session)
+
+    assert "successful compression" in slash
+    assert "replaced" in slash.lower()
+    assert "next/model" in status
+    assert "Anthropic" in status
+    assert "pending" in status.lower()
+
+
 def test_startup_runtime_uses_tui_provider_env(monkeypatch):
     monkeypatch.setenv("HERMES_MODEL", "nous/hermes-test")
     monkeypatch.setenv("HERMES_TUI_PROVIDER", "nous")

@@ -124,12 +124,13 @@ class TestInPlaceCompaction:
             # Live transcript actually shrank.
             assert len(compressed) == 2
 
-    def test_in_place_publishes_route_prompt_billing_and_history_atomically(self):
+    def test_in_place_reconciles_route_after_committed_history(self):
         import json
 
         from agent.conversation_compression import compress_context
         from hermes_cli.model_switch import (
             ModelSwitchResult,
+            get_model_switch_after_compression,
             schedule_model_switch_after_compression,
         )
         from hermes_state import SessionDB
@@ -189,13 +190,24 @@ class TestInPlaceCompaction:
                     system_message="sys",
                 )
 
-            assert observed["model"] == "new-model"
-            assert observed["config"]["provider"] == "new-provider"
-            assert "Model: new-model" in observed["prompt"]
-            assert observed["billing_provider"] == "new-provider"
-            assert observed["billing_base_url"] == "https://new.example/v1"
-            assert observed["billing_mode"] == "responses"
+            # The transcript is irreversible here, so it still carries the old
+            # route. Deferred activation is post-commit reconciliation and may
+            # not make this publication claim rollback on a later callback error.
+            assert observed["model"] == "test/model"
+            assert observed["config"].get("provider") != "new-provider"
+            assert "Model: new-model" not in observed["prompt"]
+            assert observed["billing_provider"] == "old-provider"
+            assert observed["billing_base_url"] == "https://old.example/v1"
+            assert observed["billing_mode"] == "chat_completions"
             assert len(observed["messages"]) == 2
+            published = db.get_session(sid)
+            assert published["model"] == "new-model"
+            assert json.loads(published["model_config"])["provider"] == "new-provider"
+            assert "Model: new-model" in published["system_prompt"]
+            assert published["billing_provider"] == "new-provider"
+            assert published["billing_base_url"] == "https://new.example/v1"
+            assert published["billing_mode"] == "responses"
+            assert get_model_switch_after_compression(agent) is None
 
     def test_in_place_alternation_preserved(self):
         """The compacted list must not introduce consecutive same-role messages."""

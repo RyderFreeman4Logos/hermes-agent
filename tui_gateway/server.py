@@ -10366,7 +10366,7 @@ def _(rid, params: dict) -> dict:
                         pending_model = parsed.model_input
                     except Exception:
                         pending_model = str(value)
-                    session["pending_model_switch"] = {
+                    queued_switch = {
                         "raw": value,
                         "confirm_expensive_model": bool(
                             params.get("confirm_expensive_model", False)
@@ -10380,6 +10380,20 @@ def _(rid, params: dict) -> dict:
                             getattr(parsed, "explicit_provider", "") or ""
                         ).strip(),
                     }
+                    from hermes_cli.model_switch import (
+                        clear_model_switch_after_compression,
+                        model_switch_transaction_lock,
+                    )
+
+                    agent = session.get("agent")
+                    if agent is None:
+                        session.pop("after_compression_model_switch", None)
+                        session["pending_model_switch"] = queued_switch
+                    else:
+                        with model_switch_transaction_lock(agent):
+                            clear_model_switch_after_compression(agent)
+                            session.pop("after_compression_model_switch", None)
+                            session["pending_model_switch"] = queued_switch
                     return _ok(
                         rid,
                         {

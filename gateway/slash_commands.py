@@ -1681,7 +1681,11 @@ class GatewaySlashCommandsMixin:
           /model <name> --provider <provider> — switch provider + model
           /model --provider <provider>        — switch to provider, auto-detect model
         """
-        from gateway.run import _hermes_home, _load_gateway_config
+        from gateway.run import (
+            _AGENT_PENDING_SENTINEL,
+            _hermes_home,
+            _load_gateway_config,
+        )
         from hermes_cli.model_switch import (
             switch_model as _switch_model, parse_model_switch_args,
             resolve_persist_behavior,
@@ -2192,15 +2196,24 @@ class GatewaySlashCommandsMixin:
             if _cache_lock and _cache is not None:
                 with _cache_lock:
                     cached_entry = _cache.get(session_key)
+            running_agent = self._running_agents.get(session_key)
+            if running_agent is _AGENT_PENDING_SENTINEL:
+                running_agent = None
+            cached_agent = (
+                cached_entry[0]
+                if cached_entry and cached_entry[0] is not None
+                else None
+            )
+            live_agent = running_agent or cached_agent
 
             if after_compression:
                 state = self._session_state(session_key)
                 replaced = state.conversation.after_compression_model_switch
                 state.conversation.after_compression_model_switch = result
-                if cached_entry and cached_entry[0] is not None:
+                if live_agent is not None:
                     self._attach_model_switch_after_compression(
                         session_key,
-                        cached_entry[0],
+                        live_agent,
                     )
                 lines = [
                     "Model switch scheduled after the next successful compression: "
@@ -2213,22 +2226,31 @@ class GatewaySlashCommandsMixin:
                     )
                 return "\n".join(lines)
 
-            if cached_entry and cached_entry[0] is not None:
+            from hermes_cli.model_switch import (
+                clear_model_switch_after_compression,
+                model_switch_transaction_lock,
+            )
+
+            state = self._session_state(session_key)
+            if live_agent is not None:
                 try:
-                    cached_entry[0].switch_model(
-                        new_model=result.new_model,
-                        new_provider=result.target_provider,
-                        api_key=result.api_key,
-                        base_url=result.base_url,
-                        api_mode=result.api_mode,
-                    )
+                    with model_switch_transaction_lock(live_agent):
+                        # Never mutate an active turn's route. Its next request
+                        # is rebuilt from the override below, but the superseded
+                        # deferred intent must be cancelled on the live object.
+                        if running_agent is None:
+                            live_agent.switch_model(
+                                new_model=result.new_model,
+                                new_provider=result.target_provider,
+                                api_key=result.api_key,
+                                base_url=result.base_url,
+                                api_mode=result.api_mode,
+                            )
+                        clear_model_switch_after_compression(live_agent)
+                        state.conversation.after_compression_model_switch = None
                 except Exception as exc:
-                    # In-place swap rolled the agent back to the OLD working
-                    # model/client and re-raised.  Abort the commit: skip DB
-                    # persist, session override, cache eviction, and config
-                    # write so a failed switch is a no-op rather than a dead
-                    # conversation (#50163).  Without this early return the
-                    # next message rebuilds a broken agent from the override.
+                    # In-place swap rolled the idle cached agent back to the OLD
+                    # working model/client and re-raised. Abort the commit.
                     logger.warning("In-place model switch failed for cached agent: %s", exc)
                     return t(
                         "gateway.model.error_prefix",
@@ -2237,6 +2259,8 @@ class GatewaySlashCommandsMixin:
                             f"staying on {current_model}."
                         ),
                     )
+            else:
+                state.conversation.after_compression_model_switch = None
 
             # Persist the new model to the session DB so the dashboard
             # shows the updated model (#34850).
@@ -2279,8 +2303,7 @@ class GatewaySlashCommandsMixin:
                 "base_url": result.base_url,
                 "api_mode": result.api_mode,
             }
-            # A successful immediate /model supersedes deferred intent.
-            self._after_compression_model_switches.pop(session_key, None)
+            # Deferred intent was atomically cleared with the live agent above.
             if one_turn:
                 if not hasattr(self, "_pending_one_turn_model_restores"):
                     self._pending_one_turn_model_restores = {}

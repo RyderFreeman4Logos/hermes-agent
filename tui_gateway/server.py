@@ -4528,7 +4528,7 @@ def _apply_model_switch(
         except Exception as exc:
             logger.debug("preflight-compression switch warning failed: %s", exc)
 
-    if not confirm_expensive_model:
+    if not confirm_expensive_model and not after_compression:
         try:
             from hermes_cli.model_cost_guard import expensive_model_warning
 

@@ -1329,6 +1329,8 @@ def _model_sort_key(model_id: str, prefix: str) -> tuple:
 def resolve_alias(
     raw_input: str,
     current_provider: str,
+    *,
+    allow_network: bool = True,
 ) -> Optional[tuple[str, str, str]]:
     """Resolve a short alias against the current provider's catalog.
 
@@ -1366,7 +1368,9 @@ def resolve_alias(
     # Build catalog from models.dev, then merge in static _PROVIDER_MODELS
     # entries that models.dev may be missing (e.g. newly added models not
     # yet synced to the registry).
-    catalog = list_provider_models(current_provider)
+    catalog = list_provider_models(
+        current_provider, **({} if allow_network else {"allow_network": False})
+    )
     try:
         from hermes_cli.models import _PROVIDER_MODELS
         static = _PROVIDER_MODELS.get(current_provider, [])
@@ -1428,6 +1432,8 @@ def get_authenticated_provider_slugs(
 def _resolve_alias_fallback(
     raw_input: str,
     authenticated_providers: list[str] = (),
+    *,
+    allow_network: bool = True,
 ) -> Optional[tuple[str, str, str]]:
     """Try to resolve an alias on the user's authenticated providers.
 
@@ -1436,7 +1442,11 @@ def _resolve_alias_fallback(
     """
     providers = authenticated_providers or ("openrouter", "nous")
     for provider in providers:
-        result = resolve_alias(raw_input, provider)
+        result = resolve_alias(
+            raw_input,
+            provider,
+            **({} if allow_network else {"allow_network": False}),
+        )
         if result is not None:
             return result
     return None
@@ -1619,6 +1629,48 @@ def _configured_provider_matches(
     return matches
 
 
+def _configured_model_for_provider(
+    model_name: str,
+    provider: str,
+    user_providers: Optional[dict],
+    custom_providers: Optional[list],
+) -> str:
+    """Return the configured spelling when this provider declares the model."""
+    target = str(provider or "").strip().lower()
+    if target.startswith("custom:"):
+        target = custom_provider_slug(target.removeprefix("custom:"))
+    for slug, configured_model in _configured_provider_matches(
+        model_name, user_providers, custom_providers
+    ).items():
+        candidate = str(slug).strip().lower()
+        if candidate.startswith("custom:"):
+            candidate = custom_provider_slug(candidate.removeprefix("custom:"))
+        if candidate == target:
+            return configured_model
+    return ""
+
+
+def _configured_default_model_for_provider(
+    provider: str,
+    user_providers: Optional[dict],
+    custom_providers: Optional[list],
+) -> str:
+    """Return an explicitly configured provider default without discovery."""
+    target = str(provider or "").strip().lower()
+    if isinstance(user_providers, dict):
+        for slug, config in user_providers.items():
+            if str(slug).strip().lower() == target and isinstance(config, dict):
+                return str(config.get("default_model") or config.get("model") or "").strip()
+    if target.startswith("custom:"):
+        for config in custom_providers or []:
+            if not isinstance(config, dict):
+                continue
+            name = str(config.get("name") or config.get("provider_key") or "")
+            if custom_provider_slug(name) == target:
+                return str(config.get("default_model") or config.get("model") or "").strip()
+    return ""
+
+
 def _resolve_named_custom_model_id(
     model_name: str,
     target_provider: str,
@@ -1715,17 +1767,34 @@ def switch_model(
     new_model = raw_input.strip()
     target_provider = current_provider
     resolved_moa_preset = False
+    local_model_authority = False
+    network_kwargs = {} if validate_live else {"allow_network": False}
+
+    def resolve_switch_provider(name: str):
+        return resolve_provider_full(
+            name, user_providers, custom_providers, **network_kwargs
+        )
+
+    def resolve_switch_alias(model: str, provider: str):
+        return resolve_alias(model, provider, **network_kwargs)
+
+    # Reject malformed targets before provider, credential, or metadata resolution.
+    if new_model and " " in new_model:
+        return ModelSwitchResult(
+            success=False,
+            is_global=is_global,
+            error_message=(
+                f"'{new_model}' contains spaces. Model names must be a single identifier "
+                f"(for example: claude-sonnet-4-5 or openai/gpt-5.5)."
+            ),
+        )
 
     # =================================================================
     # PATH A: Explicit --provider given
     # =================================================================
     if explicit_provider:
         # Resolve the provider
-        pdef = resolve_provider_full(
-            explicit_provider,
-            user_providers,
-            custom_providers,
-        )
+        pdef = resolve_switch_provider(explicit_provider)
         if pdef is None and explicit_provider.strip().lower() == "custom":
             pdef = _bare_custom_provider_def(current_base_url)
         if pdef is None:
@@ -1802,7 +1871,26 @@ def switch_model(
                     ),
                 )
 
-        # If no model specified, try auto-detect from endpoint
+        # Deferred scheduling may only use an explicit local default; endpoint
+        # auto-detection remains an immediate-switch behavior.
+        if not new_model and not validate_live:
+            new_model = _configured_default_model_for_provider(
+                target_provider, user_providers, custom_providers
+            )
+            if not new_model:
+                return ModelSwitchResult(
+                    success=False,
+                    target_provider=target_provider,
+                    provider_label=pdef.name,
+                    is_global=is_global,
+                    error_message=(
+                        f"Provider '{pdef.name}' has no locally configured default model. "
+                        f"Specify the model explicitly: /model <model-name> "
+                        f"--provider {explicit_provider} --after-compression"
+                    ),
+                )
+
+        # Immediate provider-only switches retain endpoint auto-detection.
         if not new_model:
             if pdef.base_url:
                 from hermes_cli.runtime_provider import _auto_detect_local_model
@@ -1832,10 +1920,21 @@ def switch_model(
                     ),
                 )
 
-        # Resolve alias on the TARGET provider
-        alias_result = resolve_alias(new_model, target_provider)
-        if alias_result is not None:
-            _, new_model, resolved_alias = alias_result
+        # Deferred config declarations are authoritative and avoid catalog lookup.
+        configured_model = (
+            _configured_model_for_provider(
+                new_model, target_provider, user_providers, custom_providers
+            )
+            if not validate_live
+            else ""
+        )
+        if configured_model:
+            new_model = configured_model
+            local_model_authority = True
+        else:
+            alias_result = resolve_switch_alias(new_model, target_provider)
+            if alias_result is not None:
+                _, new_model, resolved_alias = alias_result
 
     # =================================================================
     # PATH B: No explicit provider — resolve from model input
@@ -1854,9 +1953,9 @@ def switch_model(
                 resolved_moa_preset = True
                 alias_result = None
             else:
-                alias_result = resolve_alias(raw_input, current_provider)
+                alias_result = resolve_switch_alias(raw_input, current_provider)
         except Exception:
-            alias_result = resolve_alias(raw_input, current_provider)
+            alias_result = resolve_switch_alias(raw_input, current_provider)
 
         # --- Step a: Try alias resolution on current provider ---
 
@@ -1877,7 +1976,9 @@ def switch_model(
                     user_providers=user_providers,
                     custom_providers=custom_providers,
                 )
-                fallback_result = _resolve_alias_fallback(raw_input, authed)
+                fallback_result = _resolve_alias_fallback(
+                    raw_input, authed, **network_kwargs
+                )
                 if fallback_result is not None:
                     target_provider, new_model, resolved_alias = fallback_result
                     logger.debug(
@@ -1920,7 +2021,7 @@ def switch_model(
         # coincidentally match entries in native providers' static catalogs.
         resolved_in_current_catalog = False
         if is_aggregator(target_provider) and not resolved_alias:
-            catalog = list_provider_models(target_provider)
+            catalog = list_provider_models(target_provider, **network_kwargs)
             if catalog:
                 new_model_lower = new_model.lower()
                 for mid in catalog:
@@ -1989,6 +2090,9 @@ def switch_model(
                     if isinstance(user_providers, dict) and target_provider in user_providers:
                         explicit_provider = target_provider
 
+        if config_routed:
+            local_model_authority = True
+
         # --- Step e: detect_provider_for_model() as last resort ---
         _base = current_base_url or ""
         is_custom = (
@@ -2013,15 +2117,13 @@ def switch_model(
     # =================================================================
 
     provider_changed = target_provider != current_provider
-    provider_label = get_label(target_provider)
+    provider_label = (
+        get_label(target_provider) if validate_live else target_provider
+    )
     if target_provider == "custom" and current_base_url:
         provider_label = "Custom endpoint"
     if target_provider.startswith("custom:"):
-        custom_pdef = resolve_provider_full(
-            target_provider,
-            user_providers,
-            custom_providers,
-        )
+        custom_pdef = resolve_switch_provider(target_provider)
         if custom_pdef is not None:
             provider_label = custom_pdef.name
 
@@ -2137,6 +2239,15 @@ def switch_model(
         new_model, target_provider, custom_providers
     )
     new_model = normalize_model_for_provider(new_model, target_provider)
+    if not validate_live and _configured_model_for_provider(
+        new_model, target_provider, user_providers, custom_providers
+    ):
+        local_model_authority = True
+    if (
+        target_provider == current_provider
+        and new_model.lower() == str(current_model or "").strip().lower()
+    ):
+        local_model_authority = True
 
     # --- Validate ---
     try:
@@ -2159,7 +2270,7 @@ def switch_model(
     # Override rejection if model is in the user's saved provider config.
     # API /v1/models may not list cloud/aliased models even though the server supports them.
     if not validation.get("accepted"):
-        override = False
+        override = not validate_live and local_model_authority
         if user_providers:
             from hermes_cli.config import is_provider_enabled
             # user_providers is a dict: {provider_slug: config_dict}
@@ -2206,6 +2317,23 @@ def switch_model(
                 error_message=msg,
             )
 
+    if (
+        not validate_live
+        and not local_model_authority
+        and not validation.get("recognized")
+    ):
+        return ModelSwitchResult(
+            success=False,
+            new_model=new_model,
+            target_provider=target_provider,
+            provider_label=provider_label,
+            is_global=is_global,
+            error_message=(
+                f"Cannot schedule '{new_model}' for '{target_provider}': no local "
+                "configured model or catalog entry is available."
+            ),
+        )
+
     # Apply auto-correction if validation found a closer match
     if validation.get("corrected_model"):
         new_model = validation["corrected_model"]
@@ -2249,18 +2377,14 @@ def switch_model(
         from hermes_cli.models import normalize_opencode_base_url
         base_url = normalize_opencode_base_url(target_provider, api_mode, base_url)
 
-    # Deferred resolution may read the local models.dev cache but never refresh it.
-    capabilities = get_model_capabilities(
-        target_provider,
-        new_model,
-        allow_network=validate_live,
-    )
-
-    model_info = get_model_info(
-        target_provider,
-        new_model,
-        allow_network=validate_live,
-    )
+    if validate_live:
+        capabilities = get_model_capabilities(target_provider, new_model)
+        model_info = get_model_info(target_provider, new_model)
+    else:
+        # Deferred scheduling uses config/static validation only; live metadata
+        # discovery remains immediate-switch behavior.
+        capabilities = None
+        model_info = None
 
     # --- Collect warnings ---
     warnings: list[str] = []

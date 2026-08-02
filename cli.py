@@ -9487,7 +9487,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             except Exception as exc:
                 logger.debug("preflight-compression switch warning failed: %s", exc)
 
-        if not self._confirm_expensive_model_switch(result):
+        if not after_compression and not self._confirm_expensive_model_switch(result):
             _cprint("  Model switch cancelled.")
             return
 

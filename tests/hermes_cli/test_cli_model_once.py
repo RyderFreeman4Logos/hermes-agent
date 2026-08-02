@@ -109,6 +109,13 @@ def test_cli_model_after_compression_resolves_now_without_mutating_route(monkeyp
 
     stub = _StubCLI()
     stub.agent = DeferredAgent()
+    monkeypatch.setattr(
+        stub,
+        "_confirm_expensive_model_switch",
+        lambda result: (_ for _ in ()).throw(
+            AssertionError("deferred schedule must not run cost discovery")
+        ),
+    )
     printed = []
     monkeypatch.setattr(cli_mod, "_cprint", lambda s, *a, **k: printed.append(str(s)))
     monkeypatch.setattr(
@@ -131,30 +138,40 @@ def test_cli_model_after_compression_resolves_now_without_mutating_route(monkeyp
         "hermes_cli.model_switch.switch_model",
         lambda **_: ModelSwitchResult(
             success=True,
-            new_model="next/model",
-            target_provider="anthropic",
+            new_model="gpt-5.6-sol",
+            target_provider="pm",
             api_key="sk-next",
-            base_url="https://api.anthropic.com",
-            api_mode="anthropic_messages",
-            provider_label="Anthropic",
+            base_url="https://pm.invalid/v1",
+            api_mode="codex_responses",
+            provider_label="pm",
+        ),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.resolve_display_context_length",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("deferred schedule must use local scheduling metadata")
         ),
     )
 
     cli_mod.HermesCLI._handle_model_switch(
         stub,
-        "/model next/model --after-compression --provider anthropic",
+        "/model gpt-5.6-sol --provider pm --after-compression",
     )
 
+    agent = stub.agent
+    assert agent is not None
+    pending = get_model_switch_after_compression(agent)
+    assert pending is not None
     assert stub.model == "old/model"
     assert stub.provider == "openrouter"
-    assert stub.agent.calls == []
-    assert get_model_switch_after_compression(stub.agent).new_model == "next/model"
+    assert agent.calls == []
+    assert pending.new_model == "gpt-5.6-sol"
     assert any("after the next successful compression" in line for line in printed)
 
-    assert apply_model_switch_after_compression(stub.agent) == "applied"
-    assert stub.model == "next/model"
-    assert stub.provider == "anthropic"
-    assert stub.agent.calls[-1]["new_model"] == "next/model"
+    assert apply_model_switch_after_compression(agent) == "applied"
+    assert stub.model == "gpt-5.6-sol"
+    assert stub.provider == "pm"
+    assert agent.calls[-1]["new_model"] == "gpt-5.6-sol"
 
 
 def test_cli_model_picker_reports_pending_deferred_route(monkeypatch):

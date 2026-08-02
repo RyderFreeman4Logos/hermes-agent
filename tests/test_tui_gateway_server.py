@@ -3731,17 +3731,17 @@ def test_apply_model_switch_after_compression_defers_tui_route(monkeypatch):
 
     result = ModelSwitchResult(
         success=True,
-        new_model="next/model",
-        target_provider="anthropic",
+        new_model="gpt-5.6-sol",
+        target_provider="pm",
         api_key="next-key",
-        base_url="https://api.anthropic.com",
-        api_mode="anthropic_messages",
-        provider_label="Anthropic",
+        base_url="https://pm.invalid/v1",
+        api_mode="codex_responses",
+        provider_label="pm",
     )
     monkeypatch.setattr("hermes_cli.model_switch.switch_model", lambda **kw: result)
     monkeypatch.setattr(
         "hermes_cli.model_cost_guard.expensive_model_warning",
-        lambda *a, **k: None,
+        lambda *a, **k: pytest.fail("deferred schedule must not run cost discovery"),
     )
     monkeypatch.setattr(
         server,
@@ -3761,7 +3761,7 @@ def test_apply_model_switch_after_compression_defers_tui_route(monkeypatch):
     out = server._apply_model_switch(
         "sid",
         session,
-        "next/model --after-compression --provider anthropic",
+        "gpt-5.6-sol --provider pm --after-compression",
     )
 
     assert out["pending"] is True
@@ -3771,8 +3771,8 @@ def test_apply_model_switch_after_compression_defers_tui_route(monkeypatch):
     assert get_model_switch_after_compression(agent) is result
 
     assert apply_model_switch_after_compression(agent) == "applied"
-    assert agent.calls == [("next/model", "anthropic")]
-    assert session["model_override"]["model"] == "next/model"
+    assert agent.calls == [("gpt-5.6-sol", "pm")]
+    assert session["model_override"]["model"] == "gpt-5.6-sol"
     assert "after_compression_model_switch" not in session
 
 

@@ -2468,6 +2468,9 @@ class GatewaySlashCommandsMixin:
 
             return "\n".join(lines)
 
+        if after_compression:
+            return await _finish_switch()
+
         # Expensive-model confirmation gate (typed /model <name> path).
         # The pickers (Telegram/Discord inline keyboards, TUI, dashboard)
         # already confirm via their own UI affordances; this covers the

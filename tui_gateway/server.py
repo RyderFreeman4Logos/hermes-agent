@@ -8986,6 +8986,8 @@ def _handle_heartbeat_event(sid: str, session: dict, evt: dict) -> None:
         f"Elapsed: {elapsed}s. KV cache warm check-in."
     )
     if status in {"STUCK", "UNKNOWN"}:
+        if not runtime_heartbeat.is_event_current(evt):
+            return
         _emit("status.update", sid, {"kind": "process", "text": prompt})
         return
     if status != "ALIVE":

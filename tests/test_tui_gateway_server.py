@@ -3669,6 +3669,26 @@ def test_tui_unhealthy_heartbeat_is_directly_visible_without_model_turn(
     assert session["running"] is False
 
 
+def test_tui_unhealthy_heartbeat_revalidates_at_notice_boundary(monkeypatch):
+    session = _session(session_key="heartbeat-owner")
+    event = _runtime_heartbeat_event(status="STUCK", evidence="no progress")
+    emitted = []
+    checks = iter((True, False))
+    monkeypatch.setattr(
+        "tools.runtime_heartbeat.runtime_heartbeat.is_event_current",
+        lambda _event: next(checks),
+    )
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda *args, **kwargs: emitted.append((args, kwargs)),
+    )
+
+    server._handle_heartbeat_event("heartbeat-sid", session, event)
+
+    assert emitted == []
+
+
 def test_tui_alive_heartbeat_does_not_duplicate_busy_turn(
     monkeypatch, current_heartbeat
 ):

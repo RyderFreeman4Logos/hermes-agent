@@ -287,7 +287,7 @@ def test_alive_coalescing_does_not_suppress_unhealthy_group_event():
     ]
 
 
-def test_group_event_remains_current_when_representative_completes():
+def test_group_event_replaced_when_representative_completes():
     from tools.runtime_heartbeat import RuntimeHeartbeat
 
     FakeTimer.created = []
@@ -303,15 +303,109 @@ def test_group_event_remains_current_when_representative_completes():
     first_a, first_b = FakeTimer.created
     first_a.callback()
     queued = events.get_nowait()
-
-    assert manager.cancel("a") is True
     first_b.callback()
 
-    assert manager.is_event_current(queued) is True
+    assert manager.cancel("a") is True
+    replacement = events.get_nowait()
+
+    assert queued["target_id"] == "a"
+    assert manager.is_event_current(queued) is False
+    assert replacement["target_id"] == "b"
+    assert manager.is_event_current(replacement) is True
     assert events.empty()
     assert manager.outstanding_for_caller("owner") == ["b"]
     assert manager.cancel("b") is True
-    assert manager.is_event_current(queued) is False
+    assert manager.is_event_current(replacement) is False
+
+
+def test_consumed_group_event_does_not_publish_late_replacement():
+    from tools.runtime_heartbeat import RuntimeHeartbeat
+
+    FakeTimer.created = []
+    events = queue.Queue()
+    manager = RuntimeHeartbeat(event_queue=events, timer_factory=FakeTimer)
+    alive = lambda: {"alive": True, "progress": True}
+    manager.arm(
+        "a", caller_id="owner", kind="delegation", interval=1700, inspect=alive
+    )
+    manager.arm(
+        "b", caller_id="owner", kind="delegation", interval=1700, inspect=alive
+    )
+    first_a, first_b = FakeTimer.created
+    first_a.callback()
+    event = events.get_nowait()
+    first_b.callback()
+
+    assert manager.is_event_current(event, consume=True) is True
+    assert manager.cancel("a") is True
+    assert events.empty()
+
+
+def test_unhealthy_event_is_stale_when_exact_target_completes():
+    from tools.runtime_heartbeat import RuntimeHeartbeat
+
+    FakeTimer.created = []
+    events = queue.Queue()
+    manager = RuntimeHeartbeat(event_queue=events, timer_factory=FakeTimer)
+    manager.arm(
+        "stuck", caller_id="owner", kind="delegation", interval=1700,
+        inspect=lambda: {"alive": True, "progress": False},
+    )
+    manager.arm(
+        "alive", caller_id="owner", kind="delegation", interval=1700,
+        inspect=lambda: {"alive": True, "progress": True},
+    )
+    FakeTimer.created[0].callback()
+    event = events.get_nowait()
+
+    assert event["status"] == "STUCK"
+    assert manager.cancel("stuck") is True
+    assert manager.is_event_current(event) is False
+    assert manager.outstanding_for_caller("owner") == ["alive"]
+
+
+def test_event_generation_is_stale_after_target_rearm():
+    from tools.runtime_heartbeat import RuntimeHeartbeat
+
+    FakeTimer.created = []
+    events = queue.Queue()
+    manager = RuntimeHeartbeat(event_queue=events, timer_factory=FakeTimer)
+    manager.arm(
+        "target", caller_id="owner", kind="delegation", interval=1700,
+        inspect=lambda: {"alive": True, "progress": False},
+    )
+    FakeTimer.created[0].callback()
+    event = events.get_nowait()
+
+    assert manager.is_event_current(event) is True
+    assert manager.reset_for_caller("owner") == 1
+    assert manager.is_event_current(event) is False
+
+
+def test_reused_target_id_cannot_revive_old_generation():
+    from tools.runtime_heartbeat import RuntimeHeartbeat
+
+    FakeTimer.created = []
+    events = queue.Queue()
+    manager = RuntimeHeartbeat(event_queue=events, timer_factory=FakeTimer)
+    alive = lambda: {"alive": True, "progress": True}
+    manager.arm(
+        "target", caller_id="owner", kind="delegation", interval=1700,
+        inspect=lambda: {"alive": True, "progress": False},
+    )
+    manager.arm(
+        "sibling", caller_id="owner", kind="delegation", interval=1700,
+        inspect=alive,
+    )
+    FakeTimer.created[0].callback()
+    event = events.get_nowait()
+
+    manager.arm(
+        "target", caller_id="owner", kind="delegation", interval=1700,
+        inspect=alive,
+    )
+
+    assert manager.is_event_current(event) is False
 
 
 def test_same_owner_distinct_provider_cache_contexts_do_not_coalesce():
@@ -507,7 +601,10 @@ def test_inspection_failure_publishes_visible_unknown_without_rearming():
     event = events.get_nowait()
     assert event["status"] == "UNKNOWN"
     assert "backend inspection failed" in event["evidence"]
-    assert manager.outstanding_for_caller("owner") == []
+    assert manager.outstanding_for_caller("owner") == ["delegate"]
+    assert manager.is_event_current(event) is True
+    assert manager.cancel("delegate") is True
+    assert manager.is_event_current(event) is False
     assert len(FakeTimer.created) == 1
 
 

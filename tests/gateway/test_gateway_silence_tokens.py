@@ -40,7 +40,7 @@ def _runner(monkeypatch, tmp_path):
     runner._pending_messages = {}
     runner._pending_approvals = {}
     runner._is_user_authorized = lambda _source: True
-    runner._set_session_env = lambda _context: None
+    runner._set_session_env = MagicMock()
     runner._handle_active_session_busy_message = AsyncMock(return_value=False)
     runner._session_db = MagicMock()
     runner._recover_telegram_topic_thread_id = lambda _source: None
@@ -96,18 +96,20 @@ async def test_heartbeat_silent_noop_skips_warning_and_transcript_fallback(
         {"role": "user", "content": "real question"},
         {"role": "assistant", "content": "real answer"},
     ]
-    runner.session_store.load_transcript.return_value = history
-    runner._run_agent = AsyncMock(
-        return_value={
-            "final_response": "",
-            "messages": list(history),
-            "history_offset": len(history),
-            "api_calls": 1,
-            "completed": True,
-            "silent_noop": True,
-            "last_prompt_tokens": 0,
-        }
-    )
+    agent = MagicMock()
+    agent._session_messages = history
+    agent.run_conversation.return_value = {
+        "final_response": "",
+        "messages": list(history),
+        "history_offset": len(history),
+        "api_calls": 1,
+        "completed": True,
+        "silent_noop": True,
+        "last_prompt_tokens": 0,
+    }
+    session_key = "agent:main:telegram:group:-1001:12345"
+    runner.session_store.get_or_create_session.return_value.last_prompt_tokens = 321
+    runner._agent_cache[session_key] = (agent, "sig", 2, "sess-silent")
     heartbeat_event = {"type": "heartbeat", "event_generation": 1}
     event = MessageEvent(
         text="[HEARTBEAT] target remains ALIVE",
@@ -123,13 +125,20 @@ async def test_heartbeat_silent_noop_skips_warning_and_transcript_fallback(
     response = await runner._handle_message_with_agent(
         event,
         _source(),
-        "agent:main:telegram:group:-1001:12345",
+        session_key,
         1,
     )
 
     assert response == ""
+    agent.run_conversation.assert_called_once()
+    assert agent.run_conversation.call_args.kwargs["heartbeat_event"] is heartbeat_event
+    runner.hooks.emit.assert_not_awaited()
+    runner.session_store.get_or_create_session.assert_not_called()
+    runner._set_session_env.assert_not_called()
+    runner.session_store.load_transcript.assert_not_called()
     runner.session_store.append_to_transcript.assert_not_called()
-    assert runner._run_agent.await_args_list[0].kwargs["heartbeat_event"] is heartbeat_event
+    runner.session_store.update_session.assert_not_called()
+    assert runner.session_store.get_or_create_session.return_value.last_prompt_tokens == 321
 
 
 @pytest.mark.asyncio
@@ -168,6 +177,7 @@ async def test_raw_api_heartbeat_is_directly_visible_without_model_turn(
     monkeypatch, tmp_path, status
 ):
     runner = _runner(monkeypatch, tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     caller_id = "raw-api-session"
     runner.session_store._entries = {caller_id: object()}
     runner._inject_watch_notification = AsyncMock(return_value=True)
@@ -188,11 +198,14 @@ async def test_raw_api_heartbeat_is_directly_visible_without_model_turn(
     )
 
     runner._inject_watch_notification.assert_not_awaited()
-    runner._deliver_platform_notice.assert_awaited_once()
-    source, message = runner._deliver_platform_notice.await_args_list[0].args
-    assert source.platform == Platform.API_SERVER
-    assert source.chat_id == caller_id
-    assert status in message
+    runner._deliver_platform_notice.assert_not_awaited()
+    from gateway.status import read_runtime_status
+
+    notices = read_runtime_status()["runtime_notices"]
+    assert notices[-1]["type"] == "runtime_heartbeat"
+    assert notices[-1]["status"] == status
+    assert notices[-1]["session_key"] == caller_id
+    assert notices[-1]["target_id"] == "proc-heartbeat"
 
 
 @pytest.mark.asyncio
@@ -202,19 +215,11 @@ async def test_heartbeat_early_error_skips_transcript_fallback(monkeypatch, tmp_
         {"role": "user", "content": "real question"},
         {"role": "assistant", "content": "real answer"},
     ]
-    runner.session_store.load_transcript.return_value = history
-    runner._run_agent = AsyncMock(
-        return_value={
-            "final_response": "provider unavailable",
-            "messages": list(history),
-            "history_offset": len(history),
-            "api_calls": 1,
-            "completed": False,
-            "failed": True,
-            "error": "provider unavailable",
-            "last_prompt_tokens": 0,
-        }
-    )
+    agent = MagicMock()
+    agent._session_messages = history
+    agent.run_conversation.side_effect = RuntimeError("provider unavailable")
+    session_key = "agent:main:telegram:group:-1001:12345"
+    runner._agent_cache[session_key] = (agent, "sig", 2, "sess-silent")
     heartbeat_event = {"type": "heartbeat", "event_generation": 1}
     event = MessageEvent(
         text="[HEARTBEAT] target remains ALIVE",
@@ -230,8 +235,38 @@ async def test_heartbeat_early_error_skips_transcript_fallback(monkeypatch, tmp_
     await runner._handle_message_with_agent(
         event,
         _source(),
-        "agent:main:telegram:group:-1001:12345",
+        session_key,
         1,
     )
 
     runner.session_store.append_to_transcript.assert_not_called()
+    runner.session_store.update_session.assert_not_called()
+    runner.hooks.emit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ordinary_gateway_runner_never_accepts_heartbeat_fallback(
+    monkeypatch, tmp_path
+):
+    runner = _runner(monkeypatch, tmp_path)
+    history = [{"role": "assistant", "content": "real answer"}]
+
+    result = await runner._run_agent_inner(
+        "[HEARTBEAT] inspect target",
+        "context",
+        history,
+        _source(),
+        "sess-silent",
+        session_key="agent:main:telegram:group:-1001:12345",
+        turn_origin="heartbeat_warm",
+        allow_silent_noop=True,
+        heartbeat_event={"type": "heartbeat"},
+    )
+
+    assert result == {
+        "final_response": "",
+        "messages": history,
+        "api_calls": 0,
+        "completed": True,
+        "silent_noop": True,
+    }

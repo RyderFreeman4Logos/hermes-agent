@@ -26,7 +26,7 @@ import time
 from copy import deepcopy
 from typing import Any, Dict, List, Optional
 
-from agent.chat_completion_helpers import direct_api_call, estimate_request_context_tokens
+from agent.chat_completion_helpers import estimate_request_context_tokens
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.conversation_compression import (
     COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
@@ -1146,11 +1146,7 @@ def run_heartbeat_warm(
         status != "ALIVE"
         or moa_config is not None
         or provider in {"moa", "openai-codex"}
-        or api_mode not in {
-            "chat_completions",
-            "anthropic_messages",
-            "bedrock_converse",
-        }
+        or api_mode != "chat_completions"
     ):
         return finish(silent=True)
 
@@ -1230,10 +1226,9 @@ def run_heartbeat_warm(
         )
 
     api_kwargs = agent._build_api_kwargs(api_messages)
-    for field in ("tools", "tool_choice", "parallel_tool_calls"):
-        api_kwargs.pop(field, None)
-    if api_mode in {"chat_completions", "anthropic_messages"}:
-        api_kwargs["stream"] = False
+    if api_kwargs.get("tools"):
+        api_kwargs["tool_choice"] = "none"
+    api_kwargs["stream"] = False
     configured_limit = int(
         getattr(getattr(agent, "context_compressor", None), "threshold_tokens", 0)
         or 0
@@ -1243,20 +1238,14 @@ def run_heartbeat_warm(
     )
     if estimate_request_context_tokens(api_kwargs) >= pressure_limit:
         return finish(silent=True)
-    if not runtime_heartbeat.is_event_current(heartbeat_event, agent):
+    if not runtime_heartbeat.is_event_current(
+        heartbeat_event, agent, consume=True
+    ):
         return finish(silent=True)
 
     api_calls = 1
     try:
-        if api_mode == "chat_completions":
-            agent.client.chat.completions.create(**api_kwargs)
-        else:
-            previous_disable_streaming = getattr(agent, "_disable_streaming", False)
-            agent._disable_streaming = True
-            try:
-                direct_api_call(agent, api_kwargs)
-            finally:
-                agent._disable_streaming = previous_disable_streaming
+        agent.client.chat.completions.create(**api_kwargs)
     except Exception:
         logger.debug("Isolated heartbeat warm attempt failed", exc_info=True)
     return finish(silent=True)

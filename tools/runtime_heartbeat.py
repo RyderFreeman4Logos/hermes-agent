@@ -161,7 +161,12 @@ class RuntimeHeartbeat:
         self._targets: Dict[str, _Target] = {}
         self._group_tokens: Dict[tuple[str, int, str, str], int] = {}
         self._group_next_emit: Dict[tuple[str, int, str, str], float] = {}
+        self._group_pending: Dict[tuple[str, int, str, str], Dict[str, Any]] = {}
+        self._group_replacements: Dict[
+            tuple[str, int, str, str], Dict[str, Any]
+        ] = {}
         self._next_group_token = 0
+        self._next_generation = 0
 
     def _queue(self):
         if self._event_queue is not None:
@@ -217,6 +222,8 @@ class RuntimeHeartbeat:
                 self._next_group_token += 1
                 self._group_tokens[group] = self._next_group_token
                 self._group_next_emit.pop(group, None)
+                self._group_pending.pop(group, None)
+                self._group_replacements.pop(group, None)
             self._targets[key] = target
         try:
             baseline = dict(inspect() or {})
@@ -233,7 +240,8 @@ class RuntimeHeartbeat:
         return True
 
     def _schedule_locked(self, key: str, target: _Target) -> None:
-        target.generation += 1
+        self._next_generation += 1
+        target.generation = self._next_generation
         generation = target.generation
         timer = self._timer_factory(
             target.interval, lambda: self._fire(key, generation)
@@ -253,6 +261,7 @@ class RuntimeHeartbeat:
         )
 
     def cancel(self, target_id: str) -> bool:
+        replacement_event = None
         with self._lock:
             target = self._targets.pop(str(target_id), None)
             if target is None:
@@ -265,11 +274,24 @@ class RuntimeHeartbeat:
                 self._next_group_token += 1
                 self._group_tokens[group] = self._next_group_token
                 self._group_next_emit.pop(group, None)
+                self._group_pending.pop(group, None)
+                self._group_replacements.pop(group, None)
+            else:
+                pending = self._group_pending.get(group)
+                if pending is not None and pending.get("target_id") == target.target_id:
+                    self._group_pending.pop(group, None)
+                    replacement_event = self._group_replacements.pop(group, None)
+                    if replacement_event is None:
+                        self._group_next_emit[group] = 0.0
+                    else:
+                        self._group_pending[group] = replacement_event
             if target.timer is not None:
                 target.timer.cancel()
             while target.publishing:
                 self._publication_done.wait()
-            return True
+        if replacement_event is not None:
+            self._queue().put(replacement_event)
+        return True
 
     def cancel_for_caller(self, caller_id: str) -> int:
         with self._lock:
@@ -303,16 +325,27 @@ class RuntimeHeartbeat:
                 self._next_group_token += 1
                 self._group_tokens[group] = self._next_group_token
                 self._group_next_emit[group] = now + group[1]
+                self._group_pending.pop(group, None)
+                self._group_replacements.pop(group, None)
         return count
 
-    def is_event_current(self, event: Dict[str, Any], agent=None) -> bool:
-        """Return whether a queued owner heartbeat still has live work."""
+    def is_event_current(
+        self, event: Dict[str, Any], agent=None, *, consume: bool = False
+    ) -> bool:
+        """Return whether the event's exact target generation is still live."""
         if event.get("type") != "heartbeat":
             return True
         token = event.get("heartbeat_group_token")
         interval = event.get("heartbeat_interval")
+        generation = event.get("generation")
+        target_id = str(event.get("target_id") or "")
         caller_id = str(event.get("session_key") or "")
-        if not isinstance(token, int) or not isinstance(interval, int):
+        if (
+            not target_id
+            or not isinstance(token, int)
+            or not isinstance(interval, int)
+            or not isinstance(generation, int)
+        ):
             return False
         provider = str(event.get("provider") or "")
         cache_context = str(event.get("cache_context") or "")
@@ -325,14 +358,45 @@ class RuntimeHeartbeat:
         with self._lock:
             if self._group_tokens.get(group) != token:
                 return False
-            if event.get("heartbeat_terminal") is True:
-                return True
-            if not isinstance(event.get("generation"), int):
+            target = self._targets.get(target_id)
+            if (
+                target is None
+                or self._group_key(target) != group
+                or target.generation != generation
+            ):
                 return False
-            return any(
-                self._group_key(target) == group
-                for target in self._targets.values()
+        try:
+            alive = dict(target.inspect() or {}).get("alive") is True
+        except Exception:
+            alive = str(event.get("status") or "").upper() == "UNKNOWN"
+        if not alive:
+            return False
+        with self._lock:
+            current = (
+                self._targets.get(target_id) is target
+                and target.generation == generation
+                and self._group_tokens.get(group) == token
             )
+            pending = self._group_pending.get(group)
+            if (
+                current
+                and consume
+                and pending is not None
+                and pending.get("target_id") == target_id
+                and pending.get("generation") == generation
+            ):
+                self._group_pending.pop(group, None)
+                self._group_replacements.pop(group, None)
+            return current
+
+    @staticmethod
+    def _retarget_event(event: Dict[str, Any], target: _Target) -> None:
+        event["target_id"] = target.target_id
+        event["target_ids"] = [target.target_id]
+        event["generation"] = target.generation
+        event["generations"] = [target.generation]
+        event["target_kind"] = target.kind
+        event["session_id"] = target.target_id if target.kind == "process" else ""
 
     def outstanding_for_caller(self, caller_id: str) -> list[str]:
         with self._lock:
@@ -403,36 +467,46 @@ class RuntimeHeartbeat:
             now = time.monotonic()
             if status == "ALIVE":
                 if now < self._group_next_emit.get(group, 0.0):
+                    pending = self._group_pending.get(group)
+                    if pending is not None:
+                        replacement = dict(pending)
+                        self._retarget_event(replacement, target)
+                        replacement["evidence"] = evidence[:500]
+                        replacement["elapsed_s"] = max(
+                            0, int(time.time() - target.started_at)
+                        )
+                        self._group_replacements[group] = replacement
                     return
                 self._group_next_emit[group] = now + target.interval
             group_token = self._group_tokens[group]
             target.publishing = True
+            event_generation = target.generation
+            event = {
+                "type": "heartbeat",
+                "target_id": target.target_id,
+                "target_ids": [target.target_id],
+                "generation": event_generation,
+                "generations": [event_generation],
+                "target_kind": target.kind,
+                "session_id": target.target_id if target.kind == "process" else "",
+                "session_key": target.caller_id,
+                "provider": target.provider,
+                "cache_context": target.cache_context,
+                "status": status,
+                "evidence": evidence[:500],
+                "elapsed_s": max(0, int(time.time() - target.started_at)),
+                "heartbeat_interval": target.interval,
+                "heartbeat_group_token": group_token,
+                "heartbeat_terminal": inspection_error is not None,
+            }
+            if status == "ALIVE":
+                self._group_replacements.pop(group, None)
+                self._group_pending[group] = event
         try:
-            self._queue().put(
-                {
-                    "type": "heartbeat",
-                    "target_id": target.target_id,
-                    "target_ids": [target.target_id],
-                    "generation": generation,
-                    "generations": [generation],
-                    "target_kind": target.kind,
-                    "session_id": target.target_id if target.kind == "process" else "",
-                    "session_key": target.caller_id,
-                    "provider": target.provider,
-                    "cache_context": target.cache_context,
-                    "status": status,
-                    "evidence": evidence[:500],
-                    "elapsed_s": max(0, int(time.time() - target.started_at)),
-                    "heartbeat_interval": target.interval,
-                    "heartbeat_group_token": group_token,
-                    "heartbeat_terminal": inspection_error is not None,
-                }
-            )
+            self._queue().put(event)
         finally:
             with self._lock:
                 target.publishing = False
-                if inspection_error is not None and self._targets.get(key) is target:
-                    self._targets.pop(key, None)
                 self._publication_done.notify_all()
 
 

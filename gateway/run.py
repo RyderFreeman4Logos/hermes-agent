@@ -43,7 +43,7 @@ import time
 from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Awaitable, Callable, Dict, Optional, Any, List, Tuple, Union, cast
 
 from agent.async_utils import consume_detached_task_result, safe_schedule_threadsafe
@@ -15526,6 +15526,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
         return source
 
+    async def _run_isolated_heartbeat(
+        self, message: str, session_key: str, heartbeat_event: Any
+    ) -> None:
+        """Use only the session's existing agent for an isolated warm request."""
+        cache = getattr(self, "_agent_cache", None)
+        cache_lock = getattr(self, "_agent_cache_lock", None)
+        if cache is None or cache_lock is None:
+            return
+        with cache_lock:
+            cached = cache.get(session_key)
+            agent = cached[0] if isinstance(cached, tuple) and cached else None
+        if agent is None or agent is _AGENT_PENDING_SENTINEL:
+            return
+        history = list(getattr(agent, "_session_messages", None) or [])
+        try:
+            await self._run_in_executor_with_context(
+                lambda: agent.run_conversation(
+                    message,
+                    conversation_history=history,
+                    turn_origin="heartbeat_warm",
+                    allow_silent_noop=True,
+                    heartbeat_event=heartbeat_event,
+                )
+            )
+        except Exception:
+            logger.debug("Isolated gateway heartbeat failed", exc_info=True)
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
@@ -15559,6 +15586,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _platform_name, source.user_name or source.user_id or "unknown",
             source.chat_id or "unknown", _msg_preview, _reply_id, _reply_txt,
         )
+
+        if turn_origin == "heartbeat_warm":
+            await self._run_isolated_heartbeat(
+                event.text or "", _quick_key, heartbeat_event
+            )
+            return ""
 
         # Get or create session
         # Topic-mode DMs: rewrite a stale/foreign thread_id to the user's
@@ -21300,17 +21333,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     chat_id=caller_id,
                     chat_type=getattr(entry, "chat_type", None) or "private",
                 )
+            if not runtime_heartbeat.is_event_current(evt):
+                return
+            if source.platform == Platform.API_SERVER:
+                from gateway.status import write_runtime_status
+
+                write_runtime_status(
+                    runtime_notice={
+                        "type": "runtime_heartbeat",
+                        "status": status,
+                        "target_id": target,
+                        "session_key": caller_id,
+                        "evidence": evidence,
+                        "elapsed_s": elapsed,
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
+                return
             await self._deliver_platform_notice(source, text)
             return
         if status != "ALIVE" or caller_id in getattr(self, "_running_agents", {}):
             return
-        await self._inject_watch_notification(
-            text,
-            evt,
-            turn_origin="heartbeat_warm",
-            allow_silent_noop=True,
-            heartbeat_event=evt,
-        )
+        source = self._build_process_event_source(evt)
+        if source is None or source.platform == Platform.API_SERVER:
+            return
+        await self._run_isolated_heartbeat(text, caller_id, evt)
 
     async def _async_delegation_watcher(self, interval: float = 2.0) -> None:
         """Drain async-delegation completions and inject them as new turns.
@@ -23333,9 +23380,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         This is run in a thread pool to not block the event loop.
         Supports interruption via new messages.
         """
-        if turn_origin == "heartbeat_warm" and (
-            not isinstance(heartbeat_event, dict) or self._get_proxy_url()
-        ):
+        if turn_origin == "heartbeat_warm":
             return {
                 "final_response": "",
                 "messages": list(history),

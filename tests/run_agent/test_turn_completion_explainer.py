@@ -77,7 +77,7 @@ def heartbeat_event(monkeypatch):
     }
     monkeypatch.setattr(
         "tools.runtime_heartbeat.runtime_heartbeat.is_event_current",
-        lambda candidate, agent=None: candidate is event,
+        lambda candidate, agent=None, **_kwargs: candidate is event,
     )
     return event
 
@@ -196,7 +196,7 @@ def test_heartbeat_silent_noop_leaves_no_durable_or_live_history(heartbeat_event
     external_memory.assert_not_called()
 
 
-def test_heartbeat_uses_one_provider_response_without_tools_or_persistence(
+def test_heartbeat_uses_one_provider_response_with_tools_disabled_on_wire(
     heartbeat_event,
 ):
     agent = _make_agent(max_iterations=10)
@@ -250,7 +250,9 @@ def test_heartbeat_uses_one_provider_response_without_tools_or_persistence(
     request = agent.client.chat.completions.create.call_args.kwargs
     assert request["messages"][0]["role"] == "system"
     assert "You are helpful." in request["messages"][0]["content"]
-    assert "tools" not in request
+    assert request["tools"] == agent.tools
+    assert request["tool_choice"] == "none"
+    assert request["stream"] is False
 
 
 @pytest.mark.parametrize(
@@ -537,14 +539,48 @@ def test_heartbeat_skips_moa_fanout(heartbeat_event):
     agent.client.chat.completions.create.assert_not_called()
 
 
+def test_anthropic_heartbeat_skips_without_any_transport_or_fallback(
+    heartbeat_event,
+):
+    agent = _make_agent(max_iterations=10)
+    agent.provider = "anthropic"
+    agent.api_mode = "anthropic_messages"
+
+    with (
+        patch.object(agent, "_create_request_openai_client") as openai_client,
+        patch.object(agent, "_create_request_anthropic_client") as anthropic_client,
+        patch.object(agent, "_anthropic_messages_create") as anthropic_dispatch,
+        patch.object(agent, "_try_activate_fallback") as fallback,
+    ):
+        result = agent.run_conversation(
+            "[HEARTBEAT] inspect target",
+            turn_origin="heartbeat_warm",
+            allow_silent_noop=True,
+            heartbeat_event=heartbeat_event,
+        )
+
+    assert result["silent_noop"] is True
+    openai_client.assert_not_called()
+    anthropic_client.assert_not_called()
+    anthropic_dispatch.assert_not_called()
+    agent.client.chat.completions.create.assert_not_called()
+    fallback.assert_not_called()
+
+
 def test_heartbeat_revalidates_generation_at_provider_boundary(
     heartbeat_event, monkeypatch
 ):
     agent = _make_agent(max_iterations=10)
     checks = iter((True, False))
+    calls = []
+
+    def current(candidate, agent=None, **kwargs):
+        calls.append(kwargs)
+        return next(checks)
+
     monkeypatch.setattr(
         "tools.runtime_heartbeat.runtime_heartbeat.is_event_current",
-        lambda candidate, agent=None: next(checks),
+        current,
     )
 
     with (
@@ -560,6 +596,7 @@ def test_heartbeat_revalidates_generation_at_provider_boundary(
         )
 
     assert result["silent_noop"] is True
+    assert calls == [{}, {"consume": True}]
     agent.client.chat.completions.create.assert_not_called()
 
 

@@ -41,17 +41,16 @@ def test_after_compression_rejects_immediate_scopes():
     )
 
 
-def test_after_compression_requires_model_target():
+def test_after_compression_requires_model_target_or_provider():
     request = parse_model_switch_args("--after-compression")
     provider_only = parse_model_switch_args(
         "--after-compression --provider anthropic"
     )
 
     assert MODEL_SWITCH_ERR_AFTER_COMPRESSION_REQUIRES_TARGET in request.errors
-    assert (
-        MODEL_SWITCH_ERR_AFTER_COMPRESSION_REQUIRES_TARGET
-        in provider_only.errors
-    )
+    assert provider_only.errors == ()
+    assert provider_only.target == ""
+    assert provider_only.explicit_provider == "anthropic"
 
 
 def test_after_compression_allows_explicit_session_scope():

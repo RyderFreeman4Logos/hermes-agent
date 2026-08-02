@@ -4106,6 +4106,7 @@ def _apply_model_switch(
         parse_model_switch_args,
         resolve_persist_behavior,
         switch_model,
+        get_model_switch_after_compression,
         MODEL_SWITCH_ERR_ONCE_WITH_GLOBAL,
         MODEL_SWITCH_ERROR_TEXT,
     )
@@ -4147,7 +4148,15 @@ def _apply_model_switch(
             explicit_provider=explicit_provider,
         )
     )
-    if not model_input:
+    if not model_input and not explicit_provider:
+        pending = session.get("after_compression_model_switch")
+        if pending is None:
+            pending = get_model_switch_after_compression(session.get("agent"))
+        if pending is not None:
+            raise ValueError(
+                "model value required; pending after compression: "
+                f"{pending.new_model} via {pending.target_provider}"
+            )
         raise ValueError("model value required")
 
     agent = session.get("agent")

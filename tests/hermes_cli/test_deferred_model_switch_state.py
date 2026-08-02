@@ -54,11 +54,14 @@ class _SessionDB:
             "billing_mode": "chat_completions",
         }
         self.fail_route_publication = False
+        self.fail_billing_publication = False
+        self.writes = 0
 
     def get_session(self, _session_id):
         return dict(self.row)
 
     def update_session_meta(self, _session_id, model_config, model=None):
+        self.writes += 1
         if self.fail_route_publication and model == "new-model":
             raise RuntimeError("durable route publication failed")
         self.row["model_config"] = model_config
@@ -66,11 +69,40 @@ class _SessionDB:
             self.row["model"] = model
 
     def update_system_prompt(self, _session_id, prompt):
+        self.writes += 1
         self.row["system_prompt"] = prompt
+
+    def publish_session_route(
+        self,
+        _session_id,
+        *,
+        model_config_json,
+        model,
+        system_prompt,
+        billing_provider,
+        billing_base_url,
+        billing_mode,
+    ):
+        self.writes += 1
+        if self.fail_route_publication and model == "new-model":
+            raise RuntimeError("durable route publication failed")
+        if self.fail_billing_publication and billing_provider == "new-provider":
+            raise RuntimeError("billing route publication failed")
+        self.row.update(
+            model=model,
+            model_config=model_config_json,
+            system_prompt=system_prompt,
+            billing_provider=billing_provider,
+            billing_base_url=billing_base_url,
+            billing_mode=billing_mode,
+        )
 
     def update_session_billing_route(
         self, _session_id, *, provider, base_url, billing_mode=None
     ):
+        self.writes += 1
+        if self.fail_billing_publication and provider == "new-provider":
+            raise RuntimeError("billing route publication failed")
         self.row.update(
             billing_provider=provider,
             billing_base_url=base_url,
@@ -106,7 +138,7 @@ def test_scheduling_is_non_mutating_and_last_schedule_wins():
     assert get_model_switch_after_compression(agent) is second
 
 
-def test_scheduling_persists_only_a_secret_free_descriptor():
+def test_scheduling_is_strictly_in_process_and_does_not_mutate_session_db():
     agent = _Agent()
     agent.session_id = "session-1"
     agent._session_db = _SessionDB()
@@ -115,15 +147,8 @@ def test_scheduling_persists_only_a_secret_free_descriptor():
 
     schedule_model_switch_after_compression(agent, result)
 
-    stored = json.loads(agent._session_db.row["model_config"])
-    descriptor = stored["pending_model_switch_after_compression"]
-    assert descriptor == {
-        "model": "new-model",
-        "provider": "new-provider",
-        "api_mode": "responses",
-    }
-    assert "new-key" not in json.dumps(stored)
-    assert "new.example" not in json.dumps(stored)
+    assert agent._session_db.writes == 0
+    assert json.loads(agent._session_db.row["model_config"]) == {"max_iterations": 7}
     assert get_model_switch_after_compression(agent) is result
 
 
@@ -186,6 +211,45 @@ def test_durable_publication_failure_rolls_back_runtime_and_keeps_pending():
     assert get_model_switch_after_compression(agent) is result
     assert agent._session_db.row["model"] == "old-model"
     assert agent._session_db.row["model_config"] == scheduled_config
+
+
+def test_billing_publication_failure_rolls_back_runtime_and_keeps_pending():
+    agent = _Agent()
+    agent.session_id = "session-1"
+    agent._session_db = _SessionDB()
+    agent._session_init_model_config = {"max_iterations": 7}
+    agent._build_system_prompt = lambda _message: "new prompt"
+    result = _result()
+    schedule_model_switch_after_compression(agent, result)
+    original_row = dict(agent._session_db.row)
+    agent._session_db.fail_billing_publication = True
+
+    assert apply_model_switch_after_compression(agent) == "failed"
+
+    assert (agent.model, agent.provider) == ("old-model", "old-provider")
+    assert get_model_switch_after_compression(agent) is result
+    assert agent._session_db.row == original_row
+
+
+def test_missing_session_row_aborts_publication_and_keeps_pending(tmp_path):
+    from hermes_state import SessionDB
+
+    agent = _Agent()
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        agent.session_id = "missing-session"
+        agent._session_db = db
+        agent._session_init_model_config = {"max_iterations": 7}
+        agent._build_system_prompt = lambda _message: "new prompt"
+        result = _result()
+        schedule_model_switch_after_compression(agent, result)
+
+        assert apply_model_switch_after_compression(agent) == "failed"
+        assert (agent.model, agent.provider) == ("old-model", "old-provider")
+        assert get_model_switch_after_compression(agent) is result
+        assert db.get_session(agent.session_id) is None
+    finally:
+        db.close()
 
 
 def test_outer_commit_controls_application_and_orders_it_before_hook():

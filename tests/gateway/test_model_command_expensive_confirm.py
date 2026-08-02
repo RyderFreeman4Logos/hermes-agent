@@ -205,6 +205,18 @@ async def test_gateway_deferred_switch_waits_for_compression_boundary(
     runner._agent_cache_lock = threading.Lock()
     runner._session_db = None
     runner._evict_cached_agent = lambda _key: None
+    class _Store:
+        def __init__(self):
+            self.writes = []
+
+        def set_model_override(self, key, override):
+            self.writes.append((key, dict(override)))
+
+        def get_model_override(self, key):
+            return dict(self.writes[-1][1]) if self.writes[-1][0] == key else None
+
+    store = _Store()
+    runner.session_store = store
     event = _make_event(
         "/model openai/gpt-5.5-pro --after-compression --provider openrouter"
     )
@@ -225,5 +237,21 @@ async def test_gateway_deferred_switch_waits_for_compression_boundary(
     assert agent.calls == [("openai/gpt-5.5-pro", "openrouter")]
     assert session_key not in runner._after_compression_model_switches
     assert runner._session_model_overrides[session_key]["model"] == (
+        "openai/gpt-5.5-pro"
+    )
+    assert store.writes == [
+        (
+            session_key,
+            {
+                "model": "openai/gpt-5.5-pro",
+                "provider": "openrouter",
+                "base_url": "https://openrouter.ai/api/v1",
+            },
+        )
+    ]
+    restarted = _make_runner()
+    restarted.session_store = store
+    restarted._rehydrate_session_model_override(session_key)
+    assert restarted._session_model_overrides[session_key]["model"] == (
         "openai/gpt-5.5-pro"
     )

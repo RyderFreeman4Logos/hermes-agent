@@ -5545,6 +5545,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 or current.conversation.after_compression_model_switch is not result
             ):
                 return
+            persisted_override = {
+                "model": result.new_model,
+                "provider": result.target_provider,
+                "base_url": result.base_url,
+            }
+            store = getattr(self, "session_store", None)
+            if store is not None:
+                store.set_model_override(session_key, persisted_override)
             current.conversation.after_compression_model_switch = None
             current.conversation.model_override = {
                 "model": result.new_model,

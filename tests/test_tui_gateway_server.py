@@ -3441,6 +3441,63 @@ def test_apply_model_switch_after_compression_defers_tui_route(monkeypatch):
     assert "after_compression_model_switch" not in session
 
 
+def test_apply_model_switch_allows_provider_only_deferred_route(monkeypatch):
+    from hermes_cli.model_switch import ModelSwitchResult
+
+    agent = types.SimpleNamespace(
+        model="old/model",
+        provider="openrouter",
+        base_url="https://openrouter.ai/api/v1",
+        api_key="old-key",
+        api_mode="chat_completions",
+    )
+    result = ModelSwitchResult(
+        success=True,
+        new_model="claude-sonnet-4-6",
+        target_provider="anthropic",
+        api_key="next-key",
+        base_url="https://api.anthropic.com",
+        api_mode="anthropic_messages",
+    )
+    seen = {}
+
+    def fake_switch_model(**kwargs):
+        seen.update(kwargs)
+        return result
+
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", fake_switch_model)
+    monkeypatch.setattr(
+        "hermes_cli.model_cost_guard.expensive_model_warning", lambda *a, **k: None
+    )
+    session = {"agent": agent}
+
+    out = server._apply_model_switch(
+        "sid", session, "--provider anthropic --after-compression"
+    )
+
+    assert out["pending"] is True
+    assert seen["raw_input"] == ""
+    assert seen["explicit_provider"] == "anthropic"
+    assert session["after_compression_model_switch"] is result
+
+
+def test_apply_model_switch_no_target_reports_pending_route():
+    from hermes_cli.model_switch import ModelSwitchResult
+
+    pending = ModelSwitchResult(
+        success=True,
+        new_model="next/model",
+        target_provider="anthropic",
+    )
+    session = {
+        "agent": types.SimpleNamespace(model="old/model", provider="openrouter"),
+        "after_compression_model_switch": pending,
+    }
+
+    with pytest.raises(ValueError, match=r"next/model.*anthropic"):
+        server._apply_model_switch("sid", session, "")
+
+
 def test_startup_runtime_uses_tui_provider_env(monkeypatch):
     monkeypatch.setenv("HERMES_MODEL", "nous/hermes-test")
     monkeypatch.setenv("HERMES_TUI_PROVIDER", "nous")

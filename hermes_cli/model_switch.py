@@ -512,28 +512,41 @@ def _persist_session_model_config(
     *,
     model: Optional[str] = None,
     system_prompt: Optional[str] = None,
+    result: Optional[ModelSwitchResult] = None,
 ) -> None:
     """Publish secret-free route metadata before updating the live mirror."""
     session_db = getattr(agent, "_session_db", None)
     session_id = getattr(agent, "session_id", None)
     if session_db is not None and session_id:
-        session_db.update_session_meta(
-            session_id,
-            json.dumps(config, sort_keys=True),
-            model=model,
-        )
-        if system_prompt is not None:
-            session_db.update_system_prompt(session_id, system_prompt)
+        publish = getattr(session_db, "publish_session_route", None)
+        if callable(publish) and result is not None:
+            publish(
+                session_id,
+                model_config_json=json.dumps(config, sort_keys=True),
+                model=model,
+                system_prompt=system_prompt,
+                billing_provider=result.target_provider,
+                billing_base_url=result.base_url,
+                billing_mode=result.api_mode,
+            )
+        else:
+            session_db.update_session_meta(
+                session_id,
+                json.dumps(config, sort_keys=True),
+                model=model,
+            )
+            if system_prompt is not None:
+                session_db.update_system_prompt(session_id, system_prompt)
+            if result is not None and hasattr(
+                session_db, "update_session_billing_route"
+            ):
+                session_db.update_session_billing_route(
+                    session_id,
+                    provider=result.target_provider,
+                    base_url=result.base_url,
+                    billing_mode=result.api_mode or None,
+                )
     setattr(agent, "_session_init_model_config", copy.deepcopy(config))
-
-
-def _pending_descriptor(result: ModelSwitchResult) -> dict[str, str]:
-    """Durable scheduling metadata; resolved credentials stay memory-only."""
-    return {
-        "model": result.new_model,
-        "provider": result.target_provider,
-        "api_mode": result.api_mode,
-    }
 
 
 def _applied_model_config(
@@ -575,6 +588,18 @@ def _snapshot_durable_session_route(agent: Any) -> tuple[Any, Optional[str], Any
 def _restore_durable_session_route(snapshot: tuple[Any, Optional[str], Any]) -> None:
     session_db, session_id, row = snapshot
     if session_db is None or not session_id or not row:
+        return
+    publish = getattr(session_db, "publish_session_route", None)
+    if callable(publish):
+        publish(
+            session_id,
+            model_config_json=row.get("model_config") or "{}",
+            model=row.get("model") or "",
+            system_prompt=row.get("system_prompt"),
+            billing_provider=row.get("billing_provider") or "",
+            billing_base_url=row.get("billing_base_url") or "",
+            billing_mode=row.get("billing_mode") or "",
+        )
         return
     session_db.update_session_meta(
         session_id,
@@ -622,9 +647,6 @@ def schedule_model_switch_after_compression(
             result.reasoning_config = None
     with model_switch_transaction_lock(agent):
         previous = get_model_switch_after_compression(agent)
-        config = _session_model_config(agent)
-        config[_AFTER_COMPRESSION_CONFIG_KEY] = _pending_descriptor(result)
-        _persist_session_model_config(agent, config)
         setattr(agent, _AFTER_COMPRESSION_ATTR, result)
         setattr(agent, _AFTER_COMPRESSION_CALLBACK_ATTR, on_applied)
         agent._model_switch_after_compression_state = {
@@ -731,11 +753,10 @@ def model_switch_after_compression_transaction(
             }
             _emit_deferred_model_switch_status(
                 agent,
-                "Deferred model switch failed after compression; "
+                "Deferred model switch failed before compression publication; "
                 f"still using {old_model}: {exc}",
             )
-            yield DeferredModelSwitchTransaction(status="failed", result=result)
-            return
+            raise
         finally:
             agent._applying_model_switch_after_compression = False
             for name, value in (
@@ -796,23 +817,6 @@ def model_switch_after_compression_transaction(
                 callback(result, old_model, old_provider)
             except Exception:
                 logger.exception("deferred model-switch frontend sync failed")
-        session_db = getattr(agent, "_session_db", None)
-        session_id = getattr(agent, "session_id", None)
-        if session_db is not None and session_id and hasattr(
-            session_db, "update_session_billing_route"
-        ):
-            try:
-                session_db.update_session_billing_route(
-                    session_id,
-                    provider=result.target_provider,
-                    base_url=result.base_url,
-                    billing_mode=result.api_mode or None,
-                )
-            except Exception:
-                logger.warning(
-                    "failed to persist billing route for deferred model switch",
-                    exc_info=True,
-                )
         _emit_deferred_model_switch_status(
             agent,
             "Deferred model switch applied after compression: "
@@ -826,6 +830,8 @@ def apply_model_switch_after_compression(agent: Any) -> str:
     try:
         with model_switch_after_compression_transaction(agent) as transaction:
             if transaction.active:
+                result = transaction.result
+                assert result is not None
                 prompt = None
                 invalidate_prompt = getattr(agent, "_invalidate_system_prompt", None)
                 build_prompt = getattr(agent, "_build_system_prompt", None)
@@ -837,8 +843,9 @@ def apply_model_switch_after_compression(agent: Any) -> str:
                 _persist_session_model_config(
                     agent,
                     transaction.model_config or {},
-                    model=transaction.result.new_model,
+                    model=result.new_model,
                     system_prompt=prompt,
+                    result=result,
                 )
     except Exception:
         return "failed"
@@ -1029,7 +1036,7 @@ MODEL_SWITCH_ERROR_TEXT = {
     MODEL_SWITCH_ERR_ONCE_REQUIRES_TARGET: "/model --once requires a model or provider.",
     MODEL_SWITCH_ERR_AFTER_COMPRESSION_WITH_ONCE: "/model --after-compression cannot be combined with --once",
     MODEL_SWITCH_ERR_AFTER_COMPRESSION_WITH_GLOBAL: "/model --after-compression cannot be combined with --global",
-    MODEL_SWITCH_ERR_AFTER_COMPRESSION_REQUIRES_TARGET: "/model --after-compression requires a model target.",
+    MODEL_SWITCH_ERR_AFTER_COMPRESSION_REQUIRES_TARGET: "/model --after-compression requires a model or provider.",
 }
 
 
@@ -1110,7 +1117,11 @@ def parse_model_switch_args(raw: str) -> ModelSwitchRequest:
         errors.append(MODEL_SWITCH_ERR_AFTER_COMPRESSION_WITH_ONCE)
     if parsed.is_after_compression and parsed.is_global:
         errors.append(MODEL_SWITCH_ERR_AFTER_COMPRESSION_WITH_GLOBAL)
-    if parsed.is_after_compression and not parsed.model_input:
+    if (
+        parsed.is_after_compression
+        and not parsed.model_input
+        and not parsed.explicit_provider
+    ):
         errors.append(MODEL_SWITCH_ERR_AFTER_COMPRESSION_REQUIRES_TARGET)
 
     if parsed.is_after_compression:

@@ -5,6 +5,8 @@ import uuid
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from run_agent import AIAgent
 
 
@@ -420,3 +422,140 @@ def test_guardrail_halt_emits_final_response_through_stream_delta_callback():
     assert halt_text in text_deltas, (
         f"halt message was never streamed; callback only saw {deltas!r}"
     )
+
+
+def _run_tool_sequence(
+    agent, steps, final_response="done", prompt="exercise the tool sequence"
+):
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[
+                _mock_tool_call(name, json.dumps(args), f"step-{i}")
+            ],
+        )
+        for i, (name, args, _result) in enumerate(steps)
+    ] + [_mock_response(content=final_response, finish_reason="stop", tool_calls=None)]
+
+    with (
+        patch(
+            "run_agent.handle_function_call",
+            side_effect=[result for _name, _args, result in steps],
+        ) as dispatch,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation(prompt)
+
+    return result, dispatch
+
+
+def test_identical_tool_and_result_loop_halts_after_five_without_sixth_work():
+    agent = _make_agent("custom_tool", "skill_manage", max_iterations=200)
+    agent._skill_nudge_interval = 1
+    starts = []
+    completions = []
+    progress = []
+    agent.tool_start_callback = lambda *args: starts.append(args)
+    agent.tool_complete_callback = lambda *args: completions.append(args)
+    agent.tool_progress_callback = lambda *args, **kwargs: progress.append((args, kwargs))
+
+    args_a = {"secret": "args-must-not-leak", "nested": {"b": 2, "a": 1}}
+    args_b = {"nested": {"a": 1, "b": 2}, "secret": "args-must-not-leak"}
+    result_a = json.dumps({"secret": "result-must-not-leak", "ok": True})
+    result_b = json.dumps({"ok": True, "secret": "result-must-not-leak"})
+    steps = [
+        ("custom_tool", args_a if i % 2 else args_b, result_a if i % 2 else result_b)
+        for i in range(1, 7)
+    ]
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[
+                _mock_tool_call(name, json.dumps(args), f"same-{i}")
+            ],
+        )
+        for i, (name, args, _result) in enumerate(steps, 1)
+    ]
+
+    with (
+        patch(
+            "run_agent.handle_function_call",
+            side_effect=[result for _name, _args, result in steps],
+        ) as dispatch,
+        patch.object(agent, "_persist_session") as persist,
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch.object(agent, "_spawn_background_review") as background_review,
+    ):
+        result = agent.run_conversation("repeat the same work forever")
+
+    assert agent.max_iterations == 200
+    assert result["turn_exit_reason"] == "no_progress_loop"
+    assert result["failed"] is True
+    assert result["completed"] is False
+    assert result["api_calls"] == 5
+    assert result["guardrail"]["code"] == "no_progress_loop"
+    assert result["guardrail"]["count"] == 5
+    audit = json.dumps(result["guardrail"])
+    assert "args-must-not-leak" not in audit
+    assert "result-must-not-leak" not in audit
+
+    assert agent.client.chat.completions.create.call_count == 5
+    assert dispatch.call_count == 5
+    assert len(starts) == 5
+    assert len(completions) == 5
+    assert sum(event[0][0] == "tool.completed" for event in progress) == 5
+    assert persist.call_count == 2
+    background_review.assert_not_called()
+
+    roles = [message["role"] for message in result["messages"]]
+    assert roles == ["user"] + [role for _ in range(5) for role in ("assistant", "tool")] + ["assistant"]
+    user_messages = [message for message in result["messages"] if message["role"] == "user"]
+    assert len(user_messages) == 1
+    assert all(message.get("display_kind") != "auto_continue" for message in result["messages"])
+
+
+@pytest.mark.parametrize("reset_kind", ["args", "result", "tool"])
+def test_no_progress_loop_only_counts_consecutive_equivalent_observations(reset_kind):
+    agent = _make_agent(
+        "web_search", "read_file", max_iterations=200, config=_hard_stop_config()
+    )
+    base = ("web_search", {"value": 1}, json.dumps({"value": 1}))
+    reset = {
+        "args": ("web_search", {"value": 2}, base[2]),
+        "result": ("web_search", base[1], json.dumps({"value": 2})),
+        "tool": ("read_file", base[1], base[2]),
+    }[reset_kind]
+
+    result, dispatch = _run_tool_sequence(agent, [base] * 4 + [reset] + [base] * 4)
+
+    assert dispatch.call_count == 9
+    assert result["final_response"] == "done"
+    assert result["turn_exit_reason"].startswith("text_response")
+    assert "guardrail" not in result
+
+
+def test_no_progress_loop_state_resets_for_a_real_new_user_turn():
+    agent = _make_agent("web_search", max_iterations=200, config=_hard_stop_config())
+    step = ("web_search", {"value": 1}, json.dumps({"value": 1}))
+
+    first, first_dispatch = _run_tool_sequence(
+        agent, [step] * 4, final_response="first done", prompt="first user turn"
+    )
+    second, second_dispatch = _run_tool_sequence(
+        agent, [step] * 4, final_response="second done", prompt="second user turn"
+    )
+
+    assert first_dispatch.call_count == 4
+    assert second_dispatch.call_count == 4
+    assert first["final_response"] == "first done"
+    assert second["final_response"] == "second done"
+    assert first["session_id"] == second["session_id"]
+    assert first["turn_exit_reason"].startswith("text_response")
+    assert second["turn_exit_reason"].startswith("text_response")
+    assert "guardrail" not in first
+    assert "guardrail" not in second

@@ -614,7 +614,8 @@ def finalize_turn(
 
     # Check skill trigger NOW — based on how many tool iterations THIS turn used.
     _should_review_skills = False
-    if (agent._skill_nudge_interval > 0
+    if (_turn_exit_reason != "no_progress_loop"
+            and agent._skill_nudge_interval > 0
             and agent._iters_since_skill >= agent._skill_nudge_interval
             and "skill_manage" in agent.valid_tool_names):
         _should_review_skills = True
@@ -630,7 +631,9 @@ def finalize_turn(
 
     # Background memory/skill review — runs AFTER the response is delivered
     # so it never competes with the user's task for model attention.
-    if final_response and not interrupted and (_should_review_memory or _should_review_skills):
+    if (_turn_exit_reason != "no_progress_loop"
+            and final_response and not interrupted
+            and (_should_review_memory or _should_review_skills)):
         try:
             agent._spawn_background_review(
                 messages_snapshot=list(messages),

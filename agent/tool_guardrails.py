@@ -134,6 +134,8 @@ class ToolCallGuardrailConfig:
 # pathological, so the defaults are deliberately low.
 _DEFAULT_MAX_WEB_SEARCHES_PER_TURN = 50
 _DEFAULT_MAX_SUBAGENTS_PER_TURN = 50
+# Always-on L1 safety ceiling; configurable soft warnings remain separate.
+_NO_PROGRESS_LOOP_HALT_AFTER = 5
 
 
 @dataclass(frozen=True)
@@ -281,6 +283,7 @@ class ToolCallGuardrailController:
         self._exact_failure_counts: dict[ToolCallSignature, int] = {}
         self._same_tool_failure_counts: dict[str, int] = {}
         self._no_progress: dict[ToolCallSignature, tuple[str, int]] = {}
+        self._last_observation: tuple[ToolCallSignature, str, int] | None = None
         self._halt_decision: ToolGuardrailDecision | None = None
         # Per-turn runaway-loop cap counters. Reset every turn (this method
         # runs at the start of each run_conversation), so the caps bound a
@@ -355,10 +358,37 @@ class ToolCallGuardrailController:
         *,
         failed: bool | None = None,
     ) -> ToolGuardrailDecision:
-        args = _coerce_args(args)
-        signature = ToolCallSignature.from_call(tool_name, args)
+        """Record a tool result and return any warning/halt decision."""
+        signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
         if failed is None:
             failed, _ = classify_tool_failure(tool_name, result)
+
+        result_hash = _result_hash(result)
+        previous = self._last_observation
+        repeat_count = (
+            previous[2] + 1
+            if previous is not None
+            and previous[0] == signature
+            and previous[1] == result_hash
+            else 1
+        )
+        self._last_observation = (signature, result_hash, repeat_count)
+        if repeat_count == 1:
+            self._no_progress.clear()
+        if repeat_count >= _NO_PROGRESS_LOOP_HALT_AFTER:
+            decision = ToolGuardrailDecision(
+                action="halt",
+                code="no_progress_loop",
+                message=(
+                    f"Stopped {tool_name}: the same tool call returned an equivalent "
+                    f"result {repeat_count} consecutive times in this turn."
+                ),
+                tool_name=tool_name,
+                count=repeat_count,
+                signature=signature,
+            )
+            self._halt_decision = decision
+            return decision
 
         if failed:
             exact_count = self._exact_failure_counts.get(signature, 0) + 1
@@ -416,7 +446,6 @@ class ToolCallGuardrailController:
             self._no_progress.pop(signature, None)
             return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
 
-        result_hash = _result_hash(result)
         previous = self._no_progress.get(signature)
         repeat_count = 1
         if previous is not None and previous[0] == result_hash:

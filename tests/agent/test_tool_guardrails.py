@@ -63,7 +63,7 @@ def test_config_parses_nested_warn_and_hard_stop_thresholds():
     assert cfg.no_progress_block_after == 8
 
 
-def test_default_repeated_identical_failed_call_warns_without_blocking():
+def test_default_repeated_identical_failed_call_warns_then_halts():
     controller = ToolCallGuardrailController()
     args = {"query": "same"}
 
@@ -75,10 +75,11 @@ def test_default_repeated_identical_failed_call_warns_without_blocking():
         )
 
     assert decisions[0].action == "allow"
-    assert [d.action for d in decisions[1:]] == ["warn", "warn", "warn", "warn"]
-    assert {d.code for d in decisions[1:]} == {"repeated_exact_failure_warning"}
+    assert [d.action for d in decisions[1:]] == ["warn", "warn", "warn", "halt"]
+    assert {d.code for d in decisions[1:4]} == {"repeated_exact_failure_warning"}
+    assert decisions[4].code == "no_progress_loop"
     assert controller.before_call("web_search", args).action == "allow"
-    assert controller.halt_decision is None
+    assert controller.halt_decision == decisions[4]
 
 
 def test_hard_stop_enabled_blocks_repeated_exact_failure_before_next_execution():

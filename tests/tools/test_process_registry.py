@@ -724,6 +724,40 @@ class TestSpawnEnvSanitization:
         # A failed launch must not be exposed as a running/tracked session.
         assert session.id not in registry._running
 
+    def test_spawn_via_env_carries_deadline_and_notification_metadata(self, registry):
+        commands = []
+
+        class FakeEnv:
+            def execute(self, command, **kwargs):
+                commands.append(command)
+                return {"output": "4321", "returncode": 0}
+        fake_thread = MagicMock()
+        fake_timer = MagicMock()
+
+        def assert_registered():
+            assert len(registry._running) == 1
+
+        fake_thread.start.side_effect = assert_registered
+        fake_timer.start.side_effect = assert_registered
+        with patch(
+            "tools.process_registry.threading.Thread", return_value=fake_thread
+        ), patch(
+            "tools.process_registry.threading.Timer", return_value=fake_timer
+        ), patch.object(registry, "_write_checkpoint"):
+            session = registry.spawn_via_env(
+                FakeEnv(),
+                "echo hello",
+                execution_timeout=12,
+                notification_metadata={"notify_on_complete": True},
+            )
+
+        assert session.execution_deadline == pytest.approx(session.started_at + 12)
+        assert session.notify_on_complete is True
+        assert session.id in registry._running
+        assert "nohup setsid bash -lc" in commands[0]
+        fake_timer.start.assert_called_once()
+        fake_thread.start.assert_called_once()
+
     def test_env_poller_quotes_temp_paths_with_spaces(self, registry):
         session = _make_session(sid="proc_space")
         session.exited = False
@@ -944,6 +978,36 @@ class TestKillProcess:
         result = registry.kill_process(s.id)
         assert result["status"] == "already_exited"
 
+    def test_kill_pty_uses_process_tree_termination(self, registry, monkeypatch):
+        s = _make_session(sid="proc_pty_tree")
+        s.pid = 424242
+        s.host_start_time = 99
+        s._pty = MagicMock()
+        registry._running[s.id] = s
+        terminate = MagicMock()
+        monkeypatch.setattr(registry, "_terminate_host_pid", terminate)
+
+        result = registry.kill_process(s.id)
+
+        assert result["status"] == "killed"
+        terminate.assert_called_once_with(424242, 99)
+        s._pty.terminate.assert_not_called()
+
+    def test_kill_remote_uses_process_group(self, registry, monkeypatch):
+        env = MagicMock()
+        s = _make_session(sid="proc_remote_tree")
+        s.pid = 4321
+        s.pid_scope = "sandbox"
+        s.env_ref = env
+        registry._running[s.id] = s
+        monkeypatch.setattr(registry, "_daemon_term_grace_seconds", lambda: 0.0)
+
+        result = registry.kill_process(s.id)
+
+        assert result["status"] == "killed"
+        command = env.execute.call_args.args[0]
+        assert "kill -TERM -- -4321" in command
+        assert "kill -KILL -- -4321" in command
 
     def test_kill_detached_session_uses_host_pid(self, registry):
         s = _make_session(sid="proc_detached", command="sleep 999")

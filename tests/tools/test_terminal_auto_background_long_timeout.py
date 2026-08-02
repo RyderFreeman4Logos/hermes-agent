@@ -3,6 +3,12 @@
 from __future__ import annotations
 
 import json
+import os
+import shlex
+import signal
+import sys
+import time
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -52,7 +58,13 @@ def _run(
     env.execute.return_value = {"output": "foreground", "returncode": 0}
     proc = _session()
     registry = MagicMock(pending_watchers=[])
-    registry.spawn_local.return_value = proc
+    def fake_spawn(**spawn_kwargs):
+        for key, value in spawn_kwargs.get("notification_metadata", {}).items():
+            setattr(proc, key, value)
+        return proc
+
+    registry.spawn_local.side_effect = fake_spawn
+    registry.spawn_via_env.side_effect = fake_spawn
     create_environment = MagicMock(return_value=env)
     active_environments = {} if fresh_environment else {"default": env}
 
@@ -79,6 +91,75 @@ def _run(
         result = json.loads(terminal_tool(command=command, **kwargs))
 
     return result, env, proc, registry, create_environment
+
+
+@pytest.fixture
+def terminal_runtime(monkeypatch):
+    import tools.async_delegation as async_delegation
+    import tools.process_registry as process_module
+    import tools.terminal_tool as terminal_tool
+
+    monkeypatch.setattr(
+        async_delegation, "restore_undelivered_completions", lambda _queue: 0
+    )
+    registry = process_module.ProcessRegistry()
+    monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+    monkeypatch.setattr(process_module, "process_registry", registry)
+    monkeypatch.setattr(
+        terminal_tool,
+        "_get_env_config",
+        lambda: _config(timeout=2, auto_background_timeout_threshold=1),
+    )
+    monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
+    monkeypatch.setattr(
+        terminal_tool,
+        "_check_all_guards",
+        lambda *_args, **_kwargs: {"approved": True},
+    )
+    monkeypatch.setattr(
+        terminal_tool,
+        "_active_environments",
+        {"default": SimpleNamespace(env={})},
+    )
+    monkeypatch.setattr(terminal_tool, "_last_activity", {"default": 0})
+    monkeypatch.setattr(
+        terminal_tool,
+        "_create_environment",
+        lambda **_kwargs: pytest.fail("cached local environment should be reused"),
+    )
+    monkeypatch.setattr("tools.approval.get_current_session_key", lambda default="": "")
+    monkeypatch.setattr(
+        "gateway.session_context.async_delivery_supported", lambda: True
+    )
+    monkeypatch.setattr(
+        "gateway.session_context.get_session_env", lambda *_args, **_kwargs: ""
+    )
+    monkeypatch.setattr(
+        "tools.runtime_heartbeat.preflight_current_heartbeat", lambda: None
+    )
+    monkeypatch.setattr(
+        "tools.runtime_heartbeat.runtime_heartbeat.arm",
+        lambda *_args, **_kwargs: False,
+    )
+    return terminal_tool, registry
+
+
+def _wait_until(predicate, timeout=5):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return predicate()
+
+
+def _pid_is_running(pid):
+    try:
+        os.kill(pid, 0)
+        stat = Path(f"/proc/{pid}/stat")
+        return not stat.exists() or stat.read_text(encoding="utf-8").split()[2] != "Z"
+    except OSError:
+        return False
 
 
 @pytest.mark.parametrize(
@@ -114,7 +195,89 @@ def test_auto_promotion_rewrites_long_execution_budget_to_7200():
 
     assert result["session_id"] == "proc_auto_bg"
     assert create_environment.call_args.kwargs["timeout"] == 7200
+    assert registry.spawn_local.call_args.kwargs["execution_timeout"] == 7200
     registry.spawn_local.assert_called_once()
+
+
+def test_auto_promotion_carries_deadline_to_remote_spawn():
+    result, _, _, registry, _ = _run(
+        config=_config(env_type="docker"),
+        timeout=21,
+        background=False,
+    )
+
+    assert result["session_id"] == "proc_auto_bg"
+    assert registry.spawn_via_env.call_args.kwargs["execution_timeout"] == 7200
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-tree regression")
+def test_promoted_execution_deadline_kills_process_tree_once(
+    terminal_runtime, monkeypatch, tmp_path
+):
+    terminal_tool, registry = terminal_runtime
+    monkeypatch.setattr(terminal_tool, "AUTO_BACKGROUND_TIMEOUT", 1)
+    child_pid_path = tmp_path / "child.pid"
+    child_code = "import time; time.sleep(30)"
+    parent_code = (
+        "import pathlib,subprocess,sys,time; "
+        f"p=subprocess.Popen([sys.executable, '-c', {child_code!r}]); "
+        f"pathlib.Path({str(child_pid_path)!r}).write_text(str(p.pid)); "
+        "print('parent-ready', flush=True); time.sleep(30)"
+    )
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(parent_code)}"
+
+    result = json.loads(
+        terminal_tool.terminal_tool(command=command, timeout=2, background=False)
+    )
+    session_id = result["session_id"]
+    child_pid = None
+    try:
+        assert _wait_until(child_pid_path.exists)
+        child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+        assert _pid_is_running(child_pid)
+        session = registry._running.get(session_id) or registry._finished[session_id]
+        assert session._completion_event.wait(5)
+        assert _wait_until(lambda: not _pid_is_running(child_pid))
+        assert registry.poll(session_id)["status"] == "exited"
+
+        events = []
+        while not registry.completion_queue.empty():
+            events.append(registry.completion_queue.get_nowait())
+        matching = [event for event in events if event.get("session_id") == session_id]
+        assert len(matching) == 1
+        assert matching[0]["completion_reason"] == "killed"
+        assert matching[0]["termination_source"] == "execution_timeout"
+        assert "parent-ready" in matching[0]["output"]
+    finally:
+        if session_id in registry._running:
+            registry.kill_process(session_id)
+        if child_pid is not None and _pid_is_running(child_pid):
+            os.kill(child_pid, signal.SIGKILL)
+
+
+def test_notify_metadata_survives_completion_before_spawn_returns(
+    terminal_runtime, monkeypatch
+):
+    terminal_tool, registry = terminal_runtime
+    original_spawn = registry.spawn_local
+
+    def complete_before_return(**kwargs):
+        session = original_spawn(**kwargs)
+        assert session._completion_event.wait(3)
+        return session
+
+    monkeypatch.setattr(registry, "spawn_local", complete_before_return)
+    result = json.loads(
+        terminal_tool.terminal_tool(command="true", timeout=2, background=False)
+    )
+
+    events = []
+    while not registry.completion_queue.empty():
+        events.append(registry.completion_queue.get_nowait())
+    matching = [
+        event for event in events if event.get("session_id") == result["session_id"]
+    ]
+    assert len(matching) == 1
 
 
 def test_timeout_at_threshold_stays_foreground():

@@ -113,6 +113,7 @@ class ProcessSession:
     env_ref: Any = None                         # Reference to the environment object
     cwd: Optional[str] = None                   # Working directory
     started_at: float = 0.0                     # time.time() of spawn (wall clock)
+    execution_deadline: Optional[float] = None  # absolute wall-clock child deadline
     host_start_time: Optional[int] = None       # kernel start ticks (/proc/<pid>/stat f22) — PID-reuse guard
     process_group_id: Optional[int] = None      # POSIX group created for local background work
     exited: bool = False                        # Whether the process has finished
@@ -152,6 +153,7 @@ class ProcessSession:
     _completion_event: threading.Event = field(default_factory=threading.Event, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
+    _deadline_timer: Optional[threading.Timer] = field(default=None, repr=False)
     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (when use_pty=True)
     _tracked_descendants: Dict[int, Optional[int]] = field(default_factory=dict, repr=False)
     _completion_supervisor_started: bool = field(default=False, repr=False)
@@ -658,6 +660,20 @@ class ProcessRegistry:
             name=f"proc-supervisor-{session.id}",
         ).start()
 
+    def _arm_execution_deadline(self, session: ProcessSession) -> None:
+        """Terminate a managed process tree when its absolute deadline expires."""
+        if session.execution_deadline is None:
+            return
+        timer = threading.Timer(
+            max(0.0, session.execution_deadline - time.time()),
+            self.kill_process,
+            args=(session.id,),
+            kwargs={"source": "execution_timeout", "consume_output": False},
+        )
+        timer.daemon = True
+        session._deadline_timer = timer
+        timer.start()
+
     @staticmethod
     def _daemon_term_grace_seconds() -> float:
         """Grace window (s) between SIGTERM and escalated SIGKILL.
@@ -827,6 +843,8 @@ class ProcessRegistry:
         session_key: str = "",
         env_vars: dict = None,
         use_pty: bool = False,
+        execution_timeout: Optional[float] = None,
+        notification_metadata: Optional[Dict[str, Any]] = None,
     ) -> ProcessSession:
         """
         Spawn a background process locally.
@@ -847,13 +865,20 @@ class ProcessRegistry:
 
         safe_command = _rewrite_bg(command)
 
+        started_at = time.time()
         session = ProcessSession(
             id=f"proc_{uuid.uuid4().hex[:12]}",
             command=command,
             task_id=task_id,
             session_key=session_key,
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
-            started_at=time.time(),
+            started_at=started_at,
+            execution_deadline=(
+                started_at + max(0.0, float(execution_timeout))
+                if execution_timeout is not None
+                else None
+            ),
+            **(notification_metadata or {}),
         )
 
         if use_pty:
@@ -885,18 +910,32 @@ class ProcessRegistry:
                     name=f"proc-pty-reader-{session.id}",
                 )
                 session._reader_thread = reader
-                reader.start()
 
                 with self._lock:
                     self._prune_if_needed()
                     self._running[session.id] = session
 
                 self._write_checkpoint()
+                self._arm_execution_deadline(session)
+                reader.start()
                 return session
 
             except ImportError:
                 logger.warning("ptyprocess not installed, falling back to pipe mode")
             except Exception as e:
+                if session._deadline_timer is not None:
+                    session._deadline_timer.cancel()
+                    session._deadline_timer = None
+                with self._lock:
+                    self._running.pop(session.id, None)
+                    self._finished.pop(session.id, None)
+                if session._pty is not None:
+                    try:
+                        session._pty.terminate(force=True)
+                    except Exception:
+                        pass
+                    session._pty = None
+                    session.pid = None
                 logger.warning("PTY spawn failed (%s), falling back to pipe mode", e)
 
         # Standard Popen path (non-PTY or PTY fallback)
@@ -944,13 +983,14 @@ class ProcessRegistry:
                 name=f"proc-reader-{session.id}",
             )
             session._reader_thread = reader
-            reader.start()
 
             with self._lock:
                 self._prune_if_needed()
                 self._running[session.id] = session
 
             self._write_checkpoint()
+            self._arm_execution_deadline(session)
+            reader.start()
         except Exception:
             # Post-Popen setup failed — kill the orphaned subprocess (and any
             # descendants spawned via setsid) before re-raising so they do not
@@ -970,6 +1010,13 @@ class ProcessRegistry:
                 proc.wait(timeout=5)
             except Exception:
                 pass
+            if session._deadline_timer is not None:
+                session._deadline_timer.cancel()
+                session._deadline_timer = None
+            with self._lock:
+                self._running.pop(session.id, None)
+                self._finished.pop(session.id, None)
+            self._write_checkpoint()
             raise
 
         return session
@@ -982,6 +1029,8 @@ class ProcessRegistry:
         task_id: str = "",
         session_key: str = "",
         timeout: int = 10,
+        execution_timeout: Optional[float] = None,
+        notification_metadata: Optional[Dict[str, Any]] = None,
     ) -> ProcessSession:
         """
         Spawn a background process through a non-local environment backend.
@@ -994,15 +1043,22 @@ class ProcessRegistry:
         This is less capable than local spawn (no live stdout pipe, no stdin),
         but it ensures the command runs in the correct sandbox context.
         """
+        started_at = time.time()
         session = ProcessSession(
             id=f"proc_{uuid.uuid4().hex[:12]}",
             command=command,
             task_id=task_id,
             session_key=session_key,
             cwd=cwd,
-            started_at=time.time(),
+            started_at=started_at,
+            execution_deadline=(
+                started_at + max(0.0, float(execution_timeout))
+                if execution_timeout is not None
+                else None
+            ),
             env_ref=env,
             pid_scope="sandbox",
+            **(notification_metadata or {}),
         )
 
         # Run the command in the sandbox with output capture
@@ -1017,9 +1073,12 @@ class ProcessRegistry:
         quoted_exit_path = shlex.quote(exit_path)
         bg_command = (
             f"mkdir -p {quoted_temp_dir} && "
-            f"( nohup bash -lc {quoted_command} > {quoted_log_path} 2>&1; "
-            f"rc=$?; printf '%s\\n' \"$rc\" > {quoted_exit_path} ) & "
-            f"echo $! > {quoted_pid_path} && cat {quoted_pid_path}"
+            f"( nohup setsid bash -lc {quoted_command} > {quoted_log_path} 2>&1 & "
+            f"child=$!; printf '%s\\n' \"$child\" > {quoted_pid_path}; "
+            f"wait \"$child\"; rc=$?; printf '%s\\n' \"$rc\" > {quoted_exit_path} "
+            f") >/dev/null 2>&1 & "
+            f"while [ ! -s {quoted_pid_path} ]; do sleep 0.01; done; "
+            f"cat {quoted_pid_path}"
         )
 
         try:
@@ -1055,6 +1114,7 @@ class ProcessRegistry:
             session.output_buffer = f"Failed to start: {e}"
             session.output_size = len(session.output_buffer)
 
+        reader = None
         if not session.exited:
             # Start a poller thread that periodically reads the log file
             reader = threading.Thread(
@@ -1064,15 +1124,26 @@ class ProcessRegistry:
                 name=f"proc-poller-{session.id}",
             )
             session._reader_thread = reader
-            reader.start()
 
         with self._lock:
             self._prune_if_needed()
-            if not session.exited:
-                self._running[session.id] = session
+            self._running[session.id] = session
 
-        if not session.exited:
+        if session.exited:
+            self._move_to_finished(session)
+        else:
             self._write_checkpoint()
+            self._arm_execution_deadline(session)
+            assert reader is not None
+            try:
+                reader.start()
+            except Exception:
+                self.kill_process(
+                    session.id,
+                    source="failed_start",
+                    consume_output=False,
+                )
+                raise
 
         return session
 
@@ -1357,6 +1428,9 @@ class ProcessRegistry:
             self._finished[session.id] = session
         if not was_running:
             return
+        if session._deadline_timer is not None:
+            session._deadline_timer.cancel()
+            session._deadline_timer = None
         # The first terminal-state claimant owns heartbeat cancellation. Do
         # this before publishing completion so a due timer cannot race it.
         try:
@@ -1893,20 +1967,32 @@ class ProcessRegistry:
         # Kill via PTY, Popen (local), or env execute (non-local)
         try:
             if session._pty:
-                # PTY process -- terminate via ptyprocess
-                try:
+                # PTYs can launch descendants too; terminate the full host tree.
+                if session.pid:
+                    self._terminate_host_pid(
+                        session.pid,
+                        session.host_start_time,
+                    )
+                else:
                     session._pty.terminate(force=True)
-                except Exception:
-                    if session.pid:
-                        os.kill(session.pid, signal.SIGTERM)
             elif session.process:
                 # Local process -- kill the process tree. On Windows this
                 # must be taskkill /T /F; Popen.terminate() only kills the
                 # shell wrapper and leaves Git Bash descendants behind.
                 self._terminate_host_pid(session.process.pid, session.host_start_time)
             elif session.env_ref and session.pid:
-                # Non-local -- kill inside sandbox
-                session.env_ref.execute(f"kill {session.pid} 2>/dev/null", timeout=5)
+                # Non-local -- the wrapper starts a dedicated process group.
+                grace = self._daemon_term_grace_seconds()
+                remote_kill = (
+                    f"kill -TERM -- -{session.pid} 2>/dev/null || "
+                    f"kill {session.pid} 2>/dev/null; "
+                    f"sleep {grace}; "
+                    f"kill -KILL -- -{session.pid} 2>/dev/null || true"
+                )
+                session.env_ref.execute(
+                    remote_kill,
+                    timeout=max(5, int(grace) + 3),
+                )
             elif session.detached and session.pid_scope == "host" and session.pid:
                 self._terminate_host_pid(session.pid, session.host_start_time)
             # Capture output after termination; kill intent and consumption were
@@ -2270,6 +2356,7 @@ class ProcessRegistry:
                             "host_start_time": s.host_start_time,
                             "cwd": s.cwd,
                             "started_at": s.started_at,
+                            "execution_deadline": s.execution_deadline,
                             "task_id": s.task_id,
                             "session_key": s.session_key,
                             "watcher_platform": s.watcher_platform,
@@ -2349,6 +2436,7 @@ class ProcessRegistry:
                 pid_scope=pid_scope,
                 cwd=entry.get("cwd"),
                 started_at=entry.get("started_at", time.time()),
+                execution_deadline=entry.get("execution_deadline"),
                 detached=True,  # Can't read output, but can report status + kill
                 watcher_platform=entry.get("watcher_platform", ""),
                 watcher_chat_id=entry.get("watcher_chat_id", ""),
@@ -2379,6 +2467,7 @@ class ProcessRegistry:
                     "message_id": session.watcher_message_id,
                     "notify_on_complete": session.notify_on_complete,
                 })
+            self._arm_execution_deadline(session)
 
         self._write_checkpoint()
 

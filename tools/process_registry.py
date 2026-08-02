@@ -839,6 +839,11 @@ class ProcessRegistry:
                 logger.debug("Could not resolve environment temp dir: %s", exc)
         return "/tmp"
 
+    @classmethod
+    def _env_artifact_paths(cls, env: Any, session_id: str):
+        stem = f"{cls._env_temp_dir(env)}/hermes_bg_{session_id}"
+        return tuple(f"{stem}.{suffix}" for suffix in ("log", "pid", "exit"))
+
     def spawn_local(
         self,
         command: str,
@@ -1076,9 +1081,7 @@ class ProcessRegistry:
 
         # Run the command in the sandbox with output capture
         temp_dir = self._env_temp_dir(env)
-        log_path = f"{temp_dir}/hermes_bg_{session.id}.log"
-        pid_path = f"{temp_dir}/hermes_bg_{session.id}.pid"
-        exit_path = f"{temp_dir}/hermes_bg_{session.id}.exit"
+        log_path, pid_path, exit_path = self._env_artifact_paths(env, session.id)
         quoted_command = shlex.quote(command)
         quoted_temp_dir = shlex.quote(temp_dir)
         quoted_log_path = shlex.quote(log_path)
@@ -1179,17 +1182,18 @@ class ProcessRegistry:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 if session.env_ref is not None and session.pid is not None:
-                    temp_dir = self._env_temp_dir(session.env_ref)
-                    prefix = f"{temp_dir}/hermes_proc_{session.id}"
+                    log_path, pid_path, exit_path = self._env_artifact_paths(
+                        session.env_ref, session.id
+                    )
                     with session._lock:
                         previous_output_length = len(session.output_buffer)
                     try:
                         self._poll_env_once(
                             session,
                             session.env_ref,
-                            f"{prefix}.log",
-                            f"{prefix}.pid",
-                            f"{prefix}.exit",
+                            log_path,
+                            pid_path,
+                            exit_path,
                             previous_output_length,
                         )
                     except Exception as exc:

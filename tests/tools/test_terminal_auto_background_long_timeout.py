@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import os
+import select
 import shlex
 import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -207,6 +209,57 @@ class _TimedRemoteEnvironment:
                 "returncode": 0,
             }
         raise AssertionError(f"unexpected remote command: {command}")
+
+
+class _ShellRemoteEnvironment:
+    """Execute the nonlocal shell contract without faking artifact reads."""
+
+    def __init__(self, temp_dir):
+        self.temp_dir = temp_dir
+        self.commands = []
+        self.transports = []
+
+    def get_temp_dir(self):
+        return str(self.temp_dir)
+
+    def execute(self, command, timeout=10, **_kwargs):
+        self.commands.append(command)
+        if "nohup setsid bash -lc" in command and "while [ ! -s" in command:
+            transport = subprocess.Popen(
+                ["/bin/bash", "-lc", command],
+                cwd=self.temp_dir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                start_new_session=True,
+            )
+            self.transports.append(transport)
+            assert transport.stdout is not None
+            ready, _, _ = select.select([transport.stdout], [], [], timeout)
+            output = transport.stdout.readline() if ready else ""
+            return {
+                "output": output,
+                "returncode": 0 if output.strip().isdigit() else 124,
+            }
+
+        completed = subprocess.run(
+            ["/bin/bash", "-lc", command],
+            cwd=self.temp_dir,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+        return {"output": completed.stdout, "returncode": completed.returncode}
+
+    def cleanup(self):
+        for transport in self.transports:
+            try:
+                transport.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                transport.kill()
+                transport.wait(timeout=2)
 
 
 @pytest.mark.parametrize("requested_timeout", [2, None], ids=["requested", "configured"])
@@ -490,6 +543,57 @@ def test_nonlocal_completion_after_threshold_promotes_and_notifies_once(
     finally:
         if session_id in registry._running:
             registry.kill_process(session_id, consume_output=False)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX nonlocal shell contract")
+@pytest.mark.parametrize(
+    ("sleep_seconds", "promoted"),
+    [(0.15, False), (1.4, True)],
+    ids=["before-threshold-inline", "after-threshold-promoted"],
+)
+def test_shell_backed_nonlocal_threshold_contract(
+    terminal_runtime, monkeypatch, tmp_path, sleep_seconds, promoted
+):
+    terminal_tool, registry = terminal_runtime
+    env = _ShellRemoteEnvironment(tmp_path)
+    terminal_tool._active_environments["default"] = env
+    monkeypatch.setattr(
+        terminal_tool,
+        "_get_env_config",
+        lambda: _config(
+            env_type="docker",
+            timeout=4,
+            cwd=str(tmp_path),
+            auto_background_timeout_threshold=1,
+        ),
+    )
+    marker = "remote-after-threshold" if promoted else "remote-before-threshold"
+    command = f"sleep {sleep_seconds}; printf '%s\\n' {shlex.quote(marker)}"
+
+    try:
+        result = json.loads(terminal_tool.terminal_tool(command=command, timeout=4))
+        if not promoted:
+            assert result["output"].strip() == marker
+            assert result["exit_code"] == 0
+            assert "session_id" not in result
+            assert registry.list_sessions() == []
+            time.sleep(0.25)
+            assert registry.completion_queue.empty()
+        else:
+            session_id = result["session_id"]
+            assert result["notify_on_complete"] is True
+            event = registry.completion_queue.get(timeout=5)
+            assert event["session_id"] == session_id
+            assert event["output"].strip() == marker
+            time.sleep(0.25)
+            assert registry.completion_queue.empty()
+            assert [session["session_id"] for session in registry.list_sessions()] == [
+                session_id
+            ]
+        assert sum(command.startswith("kill -0") for command in env.commands) <= 4
+    finally:
+        registry.kill_all()
+        env.cleanup()
 
 
 @pytest.mark.parametrize(

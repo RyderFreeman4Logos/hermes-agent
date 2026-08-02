@@ -9328,6 +9328,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
           /model                              — show current model + usage hints
           /model <name>                       — switch model (this session only)
           /model <name> --once                — switch for the next turn only
+          /model <name> --after-compression   — switch after successful compression
           /model <name> --session             — switch for this session only (explicit)
           /model <name> --global              — switch and persist to config.yaml
           /model <name> --provider <provider> — switch provider + model
@@ -9357,6 +9358,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         force_refresh = request.force_refresh
         is_session = request.is_session
         one_turn = request.is_once
+        after_compression = request.is_after_compression
         if request.errors:
             # CLI decoration: "  ✗ " prefix over the canonical error copy.
             _cprint(f"  ✗ {request.error_messages()[0]}")
@@ -9365,8 +9367,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # --session/--once force session-scope, otherwise defer to
         # model.persist_switch_by_default (defaults to False so /model is
         # session-scoped unless the user opts in).
-        persist_global = resolve_persist_behavior(
-            is_global_flag, is_session, is_once=one_turn,
+        persist_global = False if after_compression else resolve_persist_behavior(
+            is_global_flag,
+            is_session,
+            is_once=one_turn,
             explicit_provider=explicit_provider,
         )
 
@@ -9447,13 +9451,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             explicit_provider=explicit_provider,
             user_providers=user_provs,
             custom_providers=custom_provs,
+            validate_live=not after_compression,
         )
 
         if not result.success:
             _cprint(f"  ✗ {result.error_message}")
             return
 
-        if self.agent is not None:
+        if self.agent is not None and not after_compression:
             try:
                 from hermes_cli.context_switch_guard import merge_preflight_compression_warning
 
@@ -9472,6 +9477,50 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         if not self._confirm_expensive_model_switch(result):
             _cprint("  Model switch cancelled.")
+            return
+
+        if after_compression:
+            if self.agent is None:
+                _cprint("  ✗ No active session is available for deferred switching.")
+                return
+            from hermes_cli.model_switch import (
+                format_model_for_display,
+                schedule_model_switch_after_compression,
+            )
+
+            old_model = str(self.model or "")
+
+            def _sync_deferred_model_switch(applied_result, _old_model, _old_provider):
+                applied_agent = self.agent
+                self.model = applied_result.new_model
+                self.provider = applied_result.target_provider
+                self.requested_provider = applied_result.target_provider
+                self._explicit_api_key = applied_result.api_key
+                self._explicit_base_url = applied_result.base_url
+                self.api_key = getattr(applied_agent, "api_key", applied_result.api_key)
+                self.base_url = getattr(applied_agent, "base_url", applied_result.base_url)
+                self.api_mode = getattr(applied_agent, "api_mode", applied_result.api_mode)
+                self._pending_one_turn_model_restore = None
+                self._pending_model_switch_note = (
+                    "[Note: model was just switched from "
+                    f"{format_model_for_display(old_model)} to "
+                    f"{format_model_for_display(applied_result.new_model)} via "
+                    f"{applied_result.provider_label or applied_result.target_provider}. "
+                    "Adjust your self-identification accordingly.]"
+                )
+
+            replaced = schedule_model_switch_after_compression(
+                self.agent,
+                result,
+                on_applied=_sync_deferred_model_switch,
+            )
+            _cprint(
+                "  ✓ Model switch scheduled after the next successful compression: "
+                f"{format_model_for_display(result.new_model)}"
+            )
+            _cprint(f"    Provider: {result.provider_label or result.target_provider}")
+            if replaced is not None:
+                _cprint("    (replaced the previously scheduled model switch)")
             return
 
         # Apply to CLI state.

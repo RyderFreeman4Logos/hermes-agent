@@ -22,6 +22,10 @@ from gateway.config import Platform
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
+from hermes_cli.model_switch import (
+    apply_model_switch_after_compression,
+    get_model_switch_after_compression,
+)
 
 
 def _make_runner():
@@ -29,6 +33,7 @@ def _make_runner():
     runner.adapters = {}
     runner._voice_mode = {}
     runner._session_model_overrides = {}
+    runner._after_compression_model_switches = {}
     runner._running_agents = {}
     return runner
 
@@ -166,3 +171,59 @@ async def test_failed_inplace_swap_aborts_commit(tmp_path, monkeypatch):
     assert evicted == []
     # The agent stayed on its old model (rolled back).
     assert agent.model == "old-model"
+
+
+@pytest.mark.asyncio
+async def test_gateway_deferred_switch_waits_for_compression_boundary(
+    tmp_path, monkeypatch
+):
+    _setup_isolated_home(tmp_path, monkeypatch, warn=False)
+    runner = _make_runner()
+
+    class _Agent:
+        def __init__(self):
+            self.model = "old-model"
+            self.provider = "openrouter"
+            self.calls = []
+
+        def switch_model(
+            self,
+            new_model,
+            new_provider,
+            api_key="",
+            base_url="",
+            api_mode="",
+        ):
+            self.calls.append((new_model, new_provider))
+            self.model = new_model
+            self.provider = new_provider
+
+    import threading
+
+    agent = _Agent()
+    runner._agent_cache = {}
+    runner._agent_cache_lock = threading.Lock()
+    runner._session_db = None
+    runner._evict_cached_agent = lambda _key: None
+    event = _make_event(
+        "/model openai/gpt-5.5-pro --after-compression --provider openrouter"
+    )
+    session_key = runner._session_key_for_source(event.source)
+    runner._agent_cache[session_key] = (agent, None)
+
+    reply = await runner._handle_model_command(event)
+
+    assert "successful compression" in reply
+    assert agent.calls == []
+    assert runner._session_model_overrides == {}
+    assert runner._after_compression_model_switches[session_key].new_model == (
+        "openai/gpt-5.5-pro"
+    )
+    assert get_model_switch_after_compression(agent) is not None
+
+    assert apply_model_switch_after_compression(agent) == "applied"
+    assert agent.calls == [("openai/gpt-5.5-pro", "openrouter")]
+    assert session_key not in runner._after_compression_model_switches
+    assert runner._session_model_overrides[session_key]["model"] == (
+        "openai/gpt-5.5-pro"
+    )

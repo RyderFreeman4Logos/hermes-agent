@@ -1675,6 +1675,7 @@ class GatewaySlashCommandsMixin:
           /model                              — interactive picker (Telegram/Discord) or text list
           /model <name>                       — switch model (this session only)
           /model <name> --once                — switch for the next turn only
+          /model <name> --after-compression   — switch after successful compression
           /model <name> --session             — switch for this session only (explicit)
           /model <name> --global              — switch and persist to config.yaml
           /model <name> --provider <provider> — switch provider + model
@@ -1706,10 +1707,11 @@ class GatewaySlashCommandsMixin:
         force_refresh = request.force_refresh
         is_session = request.is_session
         one_turn = request.is_once
+        after_compression = request.is_after_compression
         if request.errors:
             # Gateway decoration: "❌ " prefix over the canonical error copy.
             return f"❌ {request.error_messages()[0]}"
-        persist_global = resolve_persist_behavior(
+        persist_global = False if after_compression else resolve_persist_behavior(
             is_global_flag,
             is_session,
             is_once=one_turn,
@@ -1929,6 +1931,10 @@ class GatewaySlashCommandsMixin:
                             "base_url": result.base_url,
                             "api_mode": result.api_mode,
                         }
+                        _self._after_compression_model_switches.pop(
+                            _session_key,
+                            None,
+                        )
 
                         # Write-through the non-secret parts to the session
                         # store so the picked model survives a gateway restart
@@ -2139,30 +2145,31 @@ class GatewaySlashCommandsMixin:
             explicit_provider=explicit_provider,
             user_providers=user_provs,
             custom_providers=custom_provs,
+            validate_live=not after_compression,
         )
 
         if not result.success:
             return t("gateway.model.error_prefix", error=result.error_message)
 
-        try:
-            from hermes_cli.context_switch_guard import (
-                enrich_model_switch_warnings_for_gateway,
-            )
+        if not after_compression:
+            try:
+                from hermes_cli.context_switch_guard import (
+                    enrich_model_switch_warnings_for_gateway,
+                )
 
-            # Offload: merge_preflight_compression_warning() calls the sync
-            # resolve_display_context_length() provider probe ladder — must
-            # not run on the loop.
-            await asyncio.to_thread(
-                enrich_model_switch_warnings_for_gateway,
-                result,
-                self,
-                session_key=session_key,
-                source=source,
-                custom_providers=custom_provs,
-                load_gateway_config=_load_gateway_config,
-            )
-        except Exception as exc:
-            logger.debug("preflight-compression switch warning failed: %s", exc)
+                # The provider probe ladder is synchronous; keep it off the
+                # gateway event loop.
+                await asyncio.to_thread(
+                    enrich_model_switch_warnings_for_gateway,
+                    result,
+                    self,
+                    session_key=session_key,
+                    source=source,
+                    custom_providers=custom_provs,
+                    load_gateway_config=_load_gateway_config,
+                )
+            except Exception as exc:
+                logger.debug("preflight-compression switch warning failed: %s", exc)
 
         async def _finish_switch() -> str:
             """Apply the resolved switch (agent, session, config) and build the reply."""
@@ -2173,6 +2180,26 @@ class GatewaySlashCommandsMixin:
             if _cache_lock and _cache is not None:
                 with _cache_lock:
                     cached_entry = _cache.get(session_key)
+
+            if after_compression:
+                state = self._session_state(session_key)
+                replaced = state.conversation.after_compression_model_switch
+                state.conversation.after_compression_model_switch = result
+                if cached_entry and cached_entry[0] is not None:
+                    self._attach_model_switch_after_compression(
+                        session_key,
+                        cached_entry[0],
+                    )
+                lines = [
+                    "Model switch scheduled after the next successful compression: "
+                    f"`{result.new_model}`",
+                    f"Provider: {result.provider_label or result.target_provider}",
+                ]
+                if replaced is not None:
+                    lines.append(
+                        "_(replaced the previously scheduled model switch)_"
+                    )
+                return "\n".join(lines)
 
             if cached_entry and cached_entry[0] is not None:
                 try:
@@ -2240,6 +2267,8 @@ class GatewaySlashCommandsMixin:
                 "base_url": result.base_url,
                 "api_mode": result.api_mode,
             }
+            # A successful immediate /model supersedes deferred intent.
+            self._after_compression_model_switches.pop(session_key, None)
             if one_turn:
                 if not hasattr(self, "_pending_one_turn_model_restores"):
                     self._pending_one_turn_model_restores = {}
@@ -3979,6 +4008,7 @@ class GatewaySlashCommandsMixin:
                 session_db=getattr(self._session_db, "_db", self._session_db),
             )
             _seed_hygiene_system_prompt(tmp_agent, session_row)
+            self._attach_model_switch_after_compression(session_key, tmp_agent)
             # Keep the real source platform during construction so external
             # context engines bind correctly. If compression has to rebuild the
             # prompt, stamp that provider-less fallback as stale for the next

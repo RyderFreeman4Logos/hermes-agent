@@ -96,6 +96,8 @@ class ConversationState:
 
     # /model per-session override (model/provider/api_key/base_url/api_mode).
     model_override: Optional[Dict[str, Any]] = None
+    # Resolved /model request waiting for the next committed compression.
+    after_compression_model_switch: Any = None
     # /model --once restore snapshot.
     one_turn_restore: Optional[Dict[str, Any]] = None
     # /reasoning per-session override.
@@ -121,6 +123,7 @@ class ConversationState:
         automatically.
         """
         self.model_override = None
+        self.after_compression_model_switch = None
         self.one_turn_restore = None
         self.reasoning_override = None
         self.service_tier_override = _UNSET_TIER
@@ -359,6 +362,9 @@ LEGACY_FIELD_SPECS: Dict[str, _FieldSpec] = {
     "_busy_ack_ts": _FieldSpec("turn", "busy_ack_ts", float, _present_nonzero),
     "_session_model_overrides": _FieldSpec(
         "conversation", "model_override", lambda: None, _present_not_none
+    ),
+    "_after_compression_model_switches": _FieldSpec(
+        "conversation", "after_compression_model_switch", lambda: None, _present_not_none
     ),
     "_pending_one_turn_model_restores": _FieldSpec(
         "conversation", "one_turn_restore", lambda: None, _present_not_none

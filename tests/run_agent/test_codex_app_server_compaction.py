@@ -4,8 +4,18 @@ from types import SimpleNamespace
 import pytest
 
 from agent.codex_runtime import _record_codex_app_server_compaction
-from agent.conversation_compression import COMPACTION_DONE_STATUS, COMPACTION_STATUS, compress_context
+from agent.conversation_compression import (
+    COMPACTION_DONE_STATUS,
+    COMPACTION_STATUS,
+    compress_context,
+    finalize_context_engine_compression_notification,
+)
 from agent.transports.codex_app_server_session import TurnResult
+from hermes_cli.model_switch import (
+    ModelSwitchResult,
+    get_model_switch_after_compression,
+    schedule_model_switch_after_compression,
+)
 
 
 class FakeCodexSession:
@@ -67,6 +77,7 @@ class DummyAgent:
         self.status_callback = lambda kind, text: self.status_events.append((kind, text))
         self.warnings = []
         self.events = []
+        self.order = []
         self.built_prompts = []
         self.touch_calls = []
         self.touch_provenances = []
@@ -89,6 +100,7 @@ class DummyAgent:
         return "built prompt"
 
     def event_callback(self, name, payload):
+        self.order.append(name)
         self.events.append((name, payload))
 
 
@@ -144,6 +156,146 @@ def test_codex_app_server_compaction_heartbeat_refreshes_activity_while_waiting(
     assert all(
         p is ActivityProvenance.AGENT_COMPRESSION for p in agent.touch_provenances
     )
+
+
+def _schedule_codex_switch(agent):
+    agent.model = "old-codex"
+    agent.provider = "openai-codex"
+    agent.switch_calls = []
+
+    def _switch(model, provider, *_args):
+        agent.order.append("switch")
+        agent.switch_calls.append((model, provider))
+        agent.model = model
+        agent.provider = provider
+
+    agent.switch_model = _switch
+    result = ModelSwitchResult(
+        success=True,
+        new_model="next-model",
+        target_provider="next-provider",
+    )
+    schedule_model_switch_after_compression(agent, result)
+    return result
+
+
+def test_codex_successful_compaction_applies_deferred_switch_before_return():
+    agent = DummyAgent(TurnResult(thread_id="thread-1", turn_id="compact-turn-1"))
+    _schedule_codex_switch(agent)
+
+    compress_context(
+        agent,
+        [{"role": "user", "content": "hi"}],
+        "system",
+        approx_tokens=100000,
+        task_id="test",
+        force=True,
+    )
+
+    assert agent.switch_calls == [("next-model", "next-provider")]
+    assert agent.order.index("switch") < agent.order.index("session:compress")
+    assert get_model_switch_after_compression(agent) is None
+
+
+def test_codex_failed_compaction_keeps_deferred_switch():
+    agent = DummyAgent(
+        TurnResult(
+            thread_id="thread-1",
+            turn_id="compact-turn-1",
+            error="compact failed",
+        )
+    )
+    pending = _schedule_codex_switch(agent)
+
+    compress_context(
+        agent,
+        [{"role": "user", "content": "hi"}],
+        "system",
+        approx_tokens=100000,
+        task_id="test",
+        force=True,
+    )
+
+    assert agent.switch_calls == []
+    assert get_model_switch_after_compression(agent) is pending
+
+
+def test_codex_outer_publication_controls_deferred_switch():
+    agent = DummyAgent(TurnResult(thread_id="thread-1", turn_id="compact-turn-1"))
+    pending = _schedule_codex_switch(agent)
+
+    compress_context(
+        agent,
+        [{"role": "user", "content": "hi"}],
+        "system",
+        approx_tokens=100000,
+        task_id="test",
+        force=True,
+        defer_context_engine_notification=True,
+    )
+
+    assert agent.switch_calls == []
+    assert get_model_switch_after_compression(agent) is pending
+    assert finalize_context_engine_compression_notification(agent, committed=True)
+    assert agent.switch_calls == [("next-model", "next-provider")]
+
+
+def test_native_codex_compaction_applies_before_boundary_event(monkeypatch):
+    from run_agent import AIAgent
+
+    events = []
+    agent = SimpleNamespace(
+        model="old-model",
+        provider="old-provider",
+        base_url="https://old.example/v1",
+        api_key="old-key",
+        api_mode="codex_app_server",
+        event_callback=lambda name, _payload: events.append((name, agent.model)),
+        _emit_status=lambda _message: None,
+    )
+
+    def switch_model(model, provider, api_key, base_url, api_mode):
+        events.append(("switch", model))
+        agent.model = model
+        agent.provider = provider
+        agent.api_key = api_key
+        agent.base_url = base_url
+        agent.api_mode = api_mode
+
+    agent.switch_model = switch_model
+    schedule_model_switch_after_compression(
+        agent,
+        ModelSwitchResult(
+            success=True,
+            new_model="next-model",
+            target_provider="next-provider",
+        ),
+    )
+
+    def fake_turn(owner, **_kwargs):
+        owner.event_callback("session:compress", {"mode": "native"})
+        events.append(("background", owner.model))
+        return {"final_response": "done"}
+
+    monkeypatch.setattr(
+        "agent.codex_runtime.run_codex_app_server_turn",
+        fake_turn,
+    )
+
+    result = AIAgent._run_codex_app_server_turn(
+        agent,
+        user_message="hello",
+        original_user_message="hello",
+        messages=[],
+        effective_task_id="default",
+    )
+
+    assert result["final_response"] == "done"
+    assert events == [
+        ("switch", "next-model"),
+        ("session:compress", "next-model"),
+        ("background", "next-model"),
+    ]
 
 
 

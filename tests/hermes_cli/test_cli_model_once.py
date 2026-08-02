@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from hermes_cli.model_switch import ModelSwitchResult
+from hermes_cli.model_switch import (
+    ModelSwitchResult,
+    apply_model_switch_after_compression,
+    get_model_switch_after_compression,
+)
 
 
 class _FakeAgent:
@@ -76,6 +80,80 @@ def test_cli_model_once_records_restore_and_does_not_persist(monkeypatch):
     assert stub.agent.calls[-1]["new_model"] == "claude-sonnet-4.6"
     assert stub._pending_one_turn_model_restore["model"] == "old/model"
     assert "next turn only" in printed[-1]
+
+
+def test_cli_model_after_compression_resolves_now_without_mutating_route(monkeypatch):
+    import cli as cli_mod
+
+    class DeferredAgent(_FakeAgent):
+        def switch_model(
+            self,
+            new_model,
+            new_provider,
+            api_key="",
+            base_url="",
+            api_mode="",
+        ):
+            self.calls.append(
+                {
+                    "new_model": new_model,
+                    "new_provider": new_provider,
+                    "api_key": api_key,
+                    "base_url": base_url,
+                    "api_mode": api_mode,
+                }
+            )
+            self.model = new_model
+            self.provider = new_provider
+
+    stub = _StubCLI()
+    stub.agent = DeferredAgent()
+    printed = []
+    monkeypatch.setattr(cli_mod, "_cprint", lambda s, *a, **k: printed.append(str(s)))
+    monkeypatch.setattr(
+        cli_mod,
+        "save_config_value",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not persist")),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.inventory.load_picker_context",
+        lambda: SimpleNamespace(
+            user_providers=None,
+            custom_providers=None,
+            with_overrides=lambda **_: SimpleNamespace(
+                user_providers=None,
+                custom_providers=None,
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.switch_model",
+        lambda **_: ModelSwitchResult(
+            success=True,
+            new_model="next/model",
+            target_provider="anthropic",
+            api_key="sk-next",
+            base_url="https://api.anthropic.com",
+            api_mode="anthropic_messages",
+            provider_label="Anthropic",
+        ),
+    )
+
+    cli_mod.HermesCLI._handle_model_switch(
+        stub,
+        "/model next/model --after-compression --provider anthropic",
+    )
+
+    assert stub.model == "old/model"
+    assert stub.provider == "openrouter"
+    assert stub.agent.calls == []
+    assert get_model_switch_after_compression(stub.agent).new_model == "next/model"
+    assert any("after the next successful compression" in line for line in printed)
+
+    assert apply_model_switch_after_compression(stub.agent) == "applied"
+    assert stub.model == "next/model"
+    assert stub.provider == "anthropic"
+    assert stub.agent.calls[-1]["new_model"] == "next/model"
 
 
 def test_cli_restore_model_runtime_snapshot_restores_agent():

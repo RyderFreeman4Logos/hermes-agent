@@ -128,6 +128,87 @@ def test_rebind_moves_serialization_to_new_session_id():
     _run(scenario())
 
 
+def test_queued_completion_cannot_call_provider_before_deferred_switch():
+    """A completion queued during compression sees the post-boundary route."""
+    from types import SimpleNamespace
+
+    from agent.conversation_compression import (
+        _queue_context_engine_compression_notification,
+        finalize_context_engine_compression_notification,
+    )
+    from hermes_cli.model_switch import (
+        ModelSwitchResult,
+        schedule_model_switch_after_compression,
+    )
+
+    async def scenario():
+        registry = SessionTurnLeaseRegistry()
+        token = await registry.acquire(
+            "parent", owner_key="foreground", generation=1, timeout=5
+        )
+        assert registry.rebind(token, "child") is True
+        events = []
+
+        class Agent:
+            model = "old-model"
+            provider = "old-provider"
+            context_compressor = SimpleNamespace(
+                on_session_start=lambda **_kw: None
+            )
+
+            def switch_model(
+                self,
+                new_model,
+                new_provider,
+                _api_key="",
+                _base_url="",
+                _api_mode="",
+            ):
+                events.append("switch")
+                self.model = new_model
+                self.provider = new_provider
+
+        agent = Agent()
+        schedule_model_switch_after_compression(
+            agent,
+            ModelSwitchResult(
+                success=True,
+                new_model="new-model",
+                target_provider="new-provider",
+            ),
+        )
+        _queue_context_engine_compression_notification(
+            agent,
+            new_session_id="child",
+            old_session_id="parent",
+        )
+
+        async def queued_completion():
+            queued = await registry.acquire(
+                "child", owner_key="background", generation=1, timeout=5
+            )
+            events.append(f"provider:{agent.model}")
+            registry.release(queued)
+
+        waiter = asyncio.create_task(queued_completion())
+        await asyncio.sleep(0)
+        assert not waiter.done()
+        events.append("publication")
+        assert finalize_context_engine_compression_notification(
+            agent,
+            committed=True,
+        )
+        registry.release(token)
+        await waiter
+        return events
+
+    assert _run(scenario()) == [
+        "publication",
+        "switch",
+        "provider:new-model",
+    ]
+
+
 # ---------------------------------------------------------------------------
 # GatewayRunner wiring
 # ---------------------------------------------------------------------------

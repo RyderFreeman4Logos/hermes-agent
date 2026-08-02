@@ -62,47 +62,147 @@ def test_after_compression_allows_explicit_session_scope():
     assert request.errors == ()
 
 
-def test_deferred_resolution_runs_local_validation_without_provider_discovery(
-    monkeypatch,
-):
-    def fail_network_discovery(*_args, **_kwargs):
-        raise AssertionError("network model discovery")
+def _pm_config(*, with_models=True):
+    provider = {
+        "base_url": "https://pm.invalid/v1",
+        "api_key": "test-token",
+        "api_mode": "codex_responses",
+        "discover_models": False,
+    }
+    if with_models:
+        provider.update(
+            {
+                "default_model": "current-model",
+                "models": {
+                    "current-model": {"context_length": 262_144},
+                    "gpt-5.6-sol": {"context_length": 1_048_576},
+                },
+            }
+        )
+    return {"providers": {"pm": provider}}
 
-    def cache_only_models_dev(*_args, **kwargs):
-        assert kwargs.get("allow_network") is False
-        return {}
 
-    monkeypatch.setattr(
-        "hermes_cli.models.provider_model_ids",
-        fail_network_discovery,
-    )
-    monkeypatch.setattr(
-        "hermes_cli.models.fetch_api_models",
-        fail_network_discovery,
-    )
-    monkeypatch.setattr(
-        "agent.models_dev.fetch_models_dev",
-        cache_only_models_dev,
-    )
+def _install_network_tripwires(monkeypatch):
+    calls = []
 
-    invalid = switch_model(
-        raw_input="qwen3.5-4b",
+    def fail(name):
+        def trip(*_args, **_kwargs):
+            calls.append(name)
+            raise AssertionError(name)
+
+        return trip
+
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", fail("models.dev"))
+    monkeypatch.setattr("agent.model_metadata.get_model_context_length", fail("metadata"))
+    monkeypatch.setattr("hermes_cli.model_switch.get_model_capabilities", fail("capabilities"))
+    monkeypatch.setattr("hermes_cli.model_switch.get_model_info", fail("model info"))
+    monkeypatch.setattr("hermes_cli.models.fetch_api_models", fail("provider /models"))
+    monkeypatch.setattr("hermes_cli.models.provider_model_ids", fail("provider catalog"))
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider._auto_detect_local_model",
+        fail("local /models"),
+    )
+    monkeypatch.setattr("socket.getaddrinfo", fail("DNS"))
+    return calls
+
+
+def test_deferred_exact_configured_model_is_strictly_local(monkeypatch):
+    config = _pm_config()
+    calls = _install_network_tripwires(monkeypatch)
+    monkeypatch.setattr("hermes_cli.runtime_provider.load_config", lambda: config)
+
+    result = switch_model(
+        raw_input="gpt-5.6-sol",
+        explicit_provider="pm",
         current_provider="openai-codex",
         current_model="gpt-5.4",
-        current_base_url="https://chatgpt.com/backend-api/codex",
-        current_api_key="test-token",
-        validate_live=False,
-    )
-    valid = switch_model(
-        raw_input="gpt-5.4",
-        current_provider="openai-codex",
-        current_model="gpt-5.3-codex",
-        current_base_url="https://chatgpt.com/backend-api/codex",
-        current_api_key="test-token",
+        user_providers=config["providers"],
         validate_live=False,
     )
 
-    assert invalid.success is False
-    assert "doesn't look like" in invalid.error_message
-    assert valid.success is True
-    assert valid.new_model == "gpt-5.4"
+    assert result.success is True
+    assert (result.target_provider, result.new_model) == ("pm", "gpt-5.6-sol")
+    assert calls == []
+
+
+def test_deferred_provider_only_uses_configured_default_and_context(monkeypatch):
+    from types import SimpleNamespace
+
+    from hermes_cli.model_switch import (
+        get_model_switch_after_compression,
+        schedule_model_switch_after_compression,
+    )
+
+    config = _pm_config()
+    calls = _install_network_tripwires(monkeypatch)
+    monkeypatch.setattr("hermes_cli.runtime_provider.load_config", lambda: config)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: config)
+
+    result = switch_model(
+        raw_input="",
+        explicit_provider="pm",
+        current_provider="openai-codex",
+        current_model="gpt-5.4",
+        user_providers=config["providers"],
+        validate_live=False,
+    )
+    agent = SimpleNamespace(
+        model="gpt-5.4",
+        provider="openai-codex",
+        api_mode="chat_completions",
+    )
+    schedule_model_switch_after_compression(agent, result)
+
+    pending = get_model_switch_after_compression(agent)
+    assert pending is not None
+    assert result.success is True
+    assert (pending.target_provider, pending.new_model) == ("pm", "current-model")
+    assert (pending.base_url, pending.api_mode) == (
+        "https://pm.invalid/v1",
+        "codex_responses",
+    )
+    assert pending.context_length == 262_144
+    assert (agent.model, agent.provider) == ("gpt-5.4", "openai-codex")
+    assert calls == []
+
+
+def test_deferred_true_space_rejects_before_resolution(monkeypatch):
+    calls = []
+
+    def trip(*_args, **_kwargs):
+        calls.append("metadata")
+        raise AssertionError("metadata")
+
+    monkeypatch.setattr("hermes_cli.model_switch.resolve_provider_full", trip)
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider", trip)
+
+    result = switch_model(
+        raw_input="gpt-5.6 sol",
+        explicit_provider="pm",
+        current_provider="openai-codex",
+        current_model="gpt-5.4",
+        validate_live=False,
+    )
+
+    assert result.success is False
+    assert "spaces" in result.error_message
+    assert calls == []
+
+
+def test_deferred_unknown_custom_model_fails_closed_without_network(monkeypatch):
+    config = _pm_config(with_models=False)
+    calls = _install_network_tripwires(monkeypatch)
+    monkeypatch.setattr("hermes_cli.runtime_provider.load_config", lambda: config)
+
+    result = switch_model(
+        raw_input="gpt-5.6-sol",
+        explicit_provider="pm",
+        current_provider="openai-codex",
+        current_model="gpt-5.4",
+        user_providers=config["providers"],
+        validate_live=False,
+    )
+
+    assert result.success is False
+    assert "local" in result.error_message.lower()
+    assert calls == []

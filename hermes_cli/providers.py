@@ -796,6 +796,8 @@ def resolve_provider_full(
     name: str,
     user_providers: Optional[Dict[str, Any]] = None,
     custom_providers: Optional[List[Dict[str, Any]]] = None,
+    *,
+    allow_network: bool = True,
 ) -> Optional[ProviderDef]:
     """Full resolution chain: built-in → models.dev → user config.
 
@@ -805,12 +807,14 @@ def resolve_provider_full(
         name: Provider name or alias.
         user_providers: The ``providers:`` dict from config.yaml (optional).
         custom_providers: The ``custom_providers:`` list from config.yaml (optional).
+        allow_network: Whether models.dev provider metadata may refresh.
 
     Returns:
         ProviderDef if found, else None.
     """
     canonical = normalize_provider(name)
     raw = name.strip().lower()
+    network_kwargs = {} if allow_network else {"allow_network": False}
 
     # 0. User-defined config providers win over the built-in alias table.
     #    A user who declares ``providers.<name>`` in config.yaml has stated
@@ -856,7 +860,7 @@ def resolve_provider_full(
             pass
 
     # 1. Built-in (models.dev + overlays)
-    pdef = get_provider(canonical)
+    pdef = get_provider(canonical, **network_kwargs)
     if pdef is not None:
         return pdef
 
@@ -879,7 +883,7 @@ def resolve_provider_full(
     # 3. Try models.dev directly (for providers not in our ALIASES)
     try:
         from agent.models_dev import get_provider_info as _mdev_provider
-        mdev_info = _mdev_provider(canonical)
+        mdev_info = _mdev_provider(canonical, **network_kwargs)
         if mdev_info is not None:
             return ProviderDef(
                 id=canonical,

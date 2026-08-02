@@ -179,6 +179,12 @@ async def test_gateway_deferred_switch_waits_for_compression_boundary(
     tmp_path, monkeypatch
 ):
     _setup_isolated_home(tmp_path, monkeypatch, warn=False)
+    monkeypatch.setattr(
+        "hermes_cli.model_cost_guard.expensive_model_warning",
+        lambda *_a, **_kw: pytest.fail(
+            "deferred schedule must not run cost discovery"
+        ),
+    )
     runner = _make_runner()
 
     class _Agent:

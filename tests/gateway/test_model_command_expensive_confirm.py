@@ -25,6 +25,7 @@ from gateway.session import SessionSource
 from hermes_cli.model_switch import (
     apply_model_switch_after_compression,
     get_model_switch_after_compression,
+    schedule_model_switch_after_compression,
 )
 
 
@@ -253,6 +254,47 @@ async def test_gateway_deferred_switch_waits_for_compression_boundary(
     restarted.session_store = store
     restarted._rehydrate_session_model_override(session_key)
     assert restarted._session_model_overrides[session_key]["model"] == (
+        "openai/gpt-5.5-pro"
+    )
+
+
+@pytest.mark.asyncio
+async def test_gateway_immediate_switch_clears_active_agent_deferred_state(
+    tmp_path, monkeypatch
+):
+    _setup_isolated_home(tmp_path, monkeypatch, warn=False)
+    runner = _make_runner()
+    runner._agent_cache = {}
+    runner._agent_cache_lock = __import__("threading").Lock()
+    runner._session_db = None
+    runner._evict_cached_agent = lambda _key: None
+    runner.session_store = SimpleNamespace(
+        set_model_override=lambda *_args: None,
+    )
+
+    class _ActiveAgent:
+        model = "old-model"
+        provider = "openrouter"
+
+        def switch_model(self, *_args, **_kwargs):
+            raise AssertionError("must not mutate the active turn route")
+
+    agent = _ActiveAgent()
+    deferred = _fake_switch_result()
+    deferred.new_model = "deferred-model"
+    schedule_model_switch_after_compression(agent, deferred)
+    event = _make_event("/model openai/gpt-5.5-pro --provider openrouter")
+    session_key = runner._session_key_for_source(event.source)
+    runner._running_agents[session_key] = agent
+    runner._after_compression_model_switches[session_key] = deferred
+
+    reply = await runner._handle_model_command(event)
+
+    assert "gpt-5.5-pro" in reply
+    assert get_model_switch_after_compression(agent) is None
+    assert session_key not in runner._after_compression_model_switches
+    assert agent.model == "old-model"
+    assert runner._session_model_overrides[session_key]["model"] == (
         "openai/gpt-5.5-pro"
     )
 

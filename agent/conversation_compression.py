@@ -2106,16 +2106,23 @@ def _queue_context_engine_compression_notification(
     *,
     new_session_id: str,
     old_session_id: str,
+    system_message: Optional[str] = None,
     post_boundary_notifications: Optional[list] = None,
 ) -> None:
-    """Stage exactly one existing hook call for an outer host transaction."""
+    """Stage route activation and observers for the authoritative outer commit."""
     if callable(getattr(agent, _PENDING_CONTEXT_ENGINE_NOTIFICATION, None)):
         raise RuntimeError("a compression notification is already pending")
 
     def _notify() -> bool:
         from hermes_cli.model_switch import apply_model_switch_after_compression
 
-        applied = apply_model_switch_after_compression(agent) == "applied"
+        applied = (
+            apply_model_switch_after_compression(
+                agent,
+                system_message=system_message,
+            )
+            == "applied"
+        )
         extra_observed = False
         for notification in post_boundary_notifications or ():
             notification()
@@ -2135,12 +2142,18 @@ def finalize_context_engine_compression_notification(
     *,
     committed: bool,
 ) -> bool:
-    """Emit or discard a deferred notification; repeated calls are no-ops."""
+    """Commit or discard queued boundary effects; repeated calls are no-ops."""
     pending = getattr(agent, _PENDING_CONTEXT_ENGINE_NOTIFICATION, None)
     setattr(agent, _PENDING_CONTEXT_ENGINE_NOTIFICATION, None)
     if not committed or not callable(pending):
         return False
-    return bool(pending())
+    try:
+        return bool(pending())
+    except Exception:
+        # This is post-commit reconciliation. Never claim transcript rollback
+        # after the durable compression boundary has already closed.
+        logger.exception("post-compression commit reconciliation failed")
+        return False
 
 
 def compress_context(
@@ -2171,8 +2184,9 @@ def compress_context(
             by the manual ``/compress`` slash command so users can retry
             immediately after an auto-compress abort.  Auto-compress
             callers use the default ``False``.
-        defer_context_engine_notification: Delay the existing context-engine
-            hook until a manual host commits its outer history transaction.
+        defer_context_engine_notification: Delay all post-boundary effects
+            (deferred route activation and observers) until a manual host
+            commits its outer history transaction.
         commit_fence: Optional cooperative fence for executor callers that
             may time out. It prevents a late worker from mutating session state
             after its caller has moved on.
@@ -3195,8 +3209,6 @@ def compress_context(
 
         _session_commit_succeeded = False
         split_status = "not_applicable"
-        _route_transaction_context = None
-        _route_transaction = None
         _system_prompt_before_route = new_system_prompt
         if agent._session_db:
             split_status = "pending"
@@ -3207,31 +3219,12 @@ def compress_context(
                 # away regardless of whether the id rotates).
                 agent.commit_memory_session(messages)
 
-                # Stage the already-resolved route before durable publication.
-                # The transaction consumes it only after the DB seam below
-                # succeeds, and restores the working runtime on any failure.
-                from hermes_cli.model_switch import (
-                    model_switch_after_compression_transaction,
-                )
-
-                _route_transaction_context = (
-                    model_switch_after_compression_transaction(agent)
-                )
-                _route_transaction = _route_transaction_context.__enter__()
-                if _route_transaction.active:
-                    agent._invalidate_system_prompt()
-                    new_system_prompt = agent._build_system_prompt(system_message)
-                    agent._cached_system_prompt = new_system_prompt
-
-                published_config = (
-                    _route_transaction.model_config
-                    if _route_transaction.active
-                    else copy.deepcopy(
-                        getattr(agent, "_session_init_model_config", {}) or {}
-                    )
-                )
-                published_route = (
-                    _route_transaction.result if _route_transaction.active else None
+                # The inner SQLite seam is not authoritative for TUI/gateway
+                # callers. Publish compression on the current route; deferred
+                # activation is finalized only after their outer transcript
+                # publication succeeds.
+                published_config = copy.deepcopy(
+                    getattr(agent, "_session_init_model_config", {}) or {}
                 )
 
                 if in_place:
@@ -3259,15 +3252,6 @@ def compress_context(
                         model_config_json=json.dumps(published_config, sort_keys=True),
                         model=agent.model,
                         system_prompt=new_system_prompt,
-                        billing_provider=(
-                            published_route.target_provider if published_route else None
-                        ),
-                        billing_base_url=(
-                            published_route.base_url if published_route else None
-                        ),
-                        billing_mode=(
-                            published_route.api_mode if published_route else None
-                        ),
                     )
                     split_status = "in_place_committed"
                     # Reset the flush identity set so the next turn's appends are
@@ -3342,15 +3326,6 @@ def compress_context(
                         messages=persisted_compressed,
                         cwd=getattr(agent, "working_directory", None),
                         profile_name=_profile_for_child,
-                        billing_provider=(
-                            published_route.target_provider if published_route else None
-                        ),
-                        billing_base_url=(
-                            published_route.base_url if published_route else None
-                        ),
-                        billing_mode=(
-                            published_route.api_mode if published_route else None
-                        ),
                         compression_lock_holder=_lock_holder,
                         require_compression_lease=_lock_holder is not None,
                     )
@@ -3398,19 +3373,8 @@ def compress_context(
                         for message in compressed
                         if isinstance(message, dict)
                     }
-                if _route_transaction_context is not None:
-                    _route_transaction_context.__exit__(None, None, None)
-                    _route_transaction_context = None
                 _session_commit_succeeded = True
             except Exception as e:
-                if _route_transaction_context is not None:
-                    try:
-                        _route_transaction_context.__exit__(
-                            type(e), e, e.__traceback__
-                        )
-                    except Exception:
-                        pass
-                    _route_transaction_context = None
                 if (
                     not in_place
                     and locals().get("old_session_id")
@@ -3485,17 +3449,22 @@ def compress_context(
         # ignores kwargs. Fires in BOTH modes: rotation passes old→new ids; in-place
         # passes the SAME id (the boundary is real even though the id didn't move).
         if _context_engine_boundary_committed:
-            if defer_context_engine_notification:
-                _queue_context_engine_compression_notification(
+            _queue_context_engine_compression_notification(
+                agent,
+                new_session_id=agent.session_id or "",
+                old_session_id=_boundary_parent,
+                system_message=system_message,
+            )
+            if not defer_context_engine_notification:
+                finalize_context_engine_compression_notification(
                     agent,
-                    new_session_id=agent.session_id or "",
-                    old_session_id=_boundary_parent,
+                    committed=True,
                 )
-            else:
-                _notify_context_engine_compression_complete(
-                    agent,
-                    new_session_id=agent.session_id or "",
-                    old_session_id=_boundary_parent,
+                # A successful deferred switch rebuilt the prompt under the
+                # committed route. Return that prompt for the first request on
+                # compressed context, not the pre-switch snapshot.
+                new_system_prompt = (
+                    getattr(agent, "_cached_system_prompt", None) or new_system_prompt
                 )
 
         # Notify memory providers of the compaction boundary so provider-cached

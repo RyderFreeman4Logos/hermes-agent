@@ -754,7 +754,7 @@ def model_switch_after_compression_transaction(
             }
             _emit_deferred_model_switch_status(
                 agent,
-                "Deferred model switch failed before compression publication; "
+                "Deferred model switch failed after committed compression; "
                 f"still using {old_model}: {exc}",
             )
             raise
@@ -822,7 +822,11 @@ def model_switch_after_compression_transaction(
         )
 
 
-def apply_model_switch_after_compression(agent: Any) -> str:
+def apply_model_switch_after_compression(
+    agent: Any,
+    *,
+    system_message: Optional[str] = None,
+) -> str:
     """Apply and durably publish a pending route at a committed boundary."""
     transaction = DeferredModelSwitchTransaction()
     try:
@@ -836,7 +840,7 @@ def apply_model_switch_after_compression(agent: Any) -> str:
                 if callable(invalidate_prompt):
                     invalidate_prompt()
                 if callable(build_prompt):
-                    prompt = build_prompt(None)
+                    prompt = build_prompt(system_message)
                     agent._cached_system_prompt = prompt
                 _persist_session_model_config(
                     agent,

@@ -43,7 +43,7 @@ import time
 from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Awaitable, Callable, Dict, Optional, Any, List, Tuple, Union, cast
 
 from agent.async_utils import consume_detached_task_result, safe_schedule_threadsafe
@@ -5087,6 +5087,8 @@ class TurnRunner:
             if ctx.turn_origin is not None:
                 _conversation_kwargs["turn_origin"] = ctx.turn_origin
                 _conversation_kwargs["allow_silent_noop"] = ctx.allow_silent_noop
+                if ctx.turn_origin == "heartbeat_warm":
+                    _conversation_kwargs["heartbeat_event"] = ctx.heartbeat_event
             if _persist_user_message_override is not None:
                 _conversation_kwargs["persist_user_message"] = _persist_user_message_override
             elif observed_group_context:
@@ -15524,6 +15526,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
         return source
 
+    async def _run_isolated_heartbeat(
+        self, message: str, session_key: str, heartbeat_event: Any
+    ) -> None:
+        """Use only the session's existing agent for an isolated warm request."""
+        cache = getattr(self, "_agent_cache", None)
+        cache_lock = getattr(self, "_agent_cache_lock", None)
+        if cache is None or cache_lock is None:
+            return
+        with cache_lock:
+            cached = cache.get(session_key)
+            agent = cached[0] if isinstance(cached, tuple) and cached else None
+        if agent is None or agent is _AGENT_PENDING_SENTINEL:
+            return
+        history = list(getattr(agent, "_session_messages", None) or [])
+        try:
+            await self._run_in_executor_with_context(
+                lambda: agent.run_conversation(
+                    message,
+                    conversation_history=history,
+                    turn_origin="heartbeat_warm",
+                    allow_silent_noop=True,
+                    heartbeat_event=heartbeat_event,
+                )
+            )
+        except Exception:
+            logger.debug("Isolated gateway heartbeat failed", exc_info=True)
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
@@ -15544,13 +15573,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             else None
         )
         allow_silent_noop = bool(
-            turn_origin and _event_metadata.get("allow_silent_noop")
+            getattr(event, "internal", False)
+            and _event_metadata.get("allow_silent_noop") is True
+        )
+        heartbeat_event = (
+            _event_metadata.get("heartbeat_event")
+            if turn_origin == "heartbeat_warm"
+            else None
         )
         logger.info(
             "inbound message: platform=%s user=%s chat=%s msg=%r reply_to_id=%s reply_to_text=%r",
             _platform_name, source.user_name or source.user_id or "unknown",
             source.chat_id or "unknown", _msg_preview, _reply_id, _reply_txt,
         )
+
+        if turn_origin == "heartbeat_warm":
+            await self._run_isolated_heartbeat(
+                event.text or "", _quick_key, heartbeat_event
+            )
+            return ""
 
         # Get or create session
         # Topic-mode DMs: rewrite a stale/foreign thread_id to the user's
@@ -16714,6 +16755,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 completion_delivery_synthetic=_completion_delivery_synthetic,
                 turn_origin=turn_origin,
                 allow_silent_noop=allow_silent_noop,
+                heartbeat_event=heartbeat_event,
             )
 
             # Stop persistent typing indicator now that the agent is done.
@@ -20898,6 +20940,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     async def _inject_watch_notification(
         self, synth_text: str, evt: dict, *, turn_origin: str | None = None,
         allow_silent_noop: bool = False,
+        heartbeat_event: dict | None = None,
     ) -> Optional[bool]:
         """Inject a watch/completion notification as a synthetic message event.
 
@@ -20910,6 +20953,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         source = self._build_process_event_source(evt)
         if not source:
+            if turn_origin == "heartbeat_warm":
+                return None
             # API-server-originated sessions bind a RAW session key (the
             # X-Hermes-Session-Id value — see _bind_api_server_session), not a
             # structured ``agent:main:...`` key, so _build_process_event_source
@@ -20967,6 +21012,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return None
         from gateway.wake import adapter_supports_push as _wake_push_ok
         if not _wake_push_ok(adapter):
+            if turn_origin == "heartbeat_warm":
+                return None
             # Non-push adapter (api_server) resolved WITH routing metadata:
             # its chat_id is the raw session id (see _bind_api_server_session,
             # which binds chat_id = session_id). handle_message would run the
@@ -21002,6 +21049,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if turn_origin is not None:
                 metadata["turn_origin"] = turn_origin
                 metadata["allow_silent_noop"] = bool(allow_silent_noop)
+                if turn_origin == "heartbeat_warm":
+                    metadata["heartbeat_event"] = (
+                        heartbeat_event if isinstance(heartbeat_event, dict) else evt
+                    )
             synth_event = MessageEvent(
                 text=synth_text,
                 message_type=MessageType.TEXT,
@@ -21256,24 +21307,57 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             evt["thread_id"] = parsed["thread_id"]
 
     async def _handle_heartbeat_event(self, evt: dict) -> None:
-        """Inject one silent warm turn only into the exact idle owner."""
+        """Warm ALIVE targets silently; surface unhealthy targets directly."""
+        from tools.runtime_heartbeat import runtime_heartbeat
+
+        if not runtime_heartbeat.is_event_current(evt):
+            return
         caller_id = str(evt.get("session_key") or "")
         entries = getattr(getattr(self, "session_store", None), "_entries", {})
         if not caller_id or caller_id not in entries:
             return
-        if caller_id in getattr(self, "_running_agents", {}):
-            return
         target = str(evt.get("target_id") or evt.get("session_id") or "unknown")
-        status = str(evt.get("status") or "STUCK").upper()
+        status = str(evt.get("status") or "").upper()
         evidence = str(evt.get("evidence") or "no evidence available")
         elapsed = max(0, int(evt.get("elapsed_s") or 0))
-        await self._inject_watch_notification(
+        text = (
             f'[HEARTBEAT] Background target "{target}" is {status}: {evidence}. '
-            f"Elapsed: {elapsed}s. KV cache warm check-in.",
-            evt,
-            turn_origin="heartbeat_warm",
-            allow_silent_noop=status == "ALIVE",
+            f"Elapsed: {elapsed}s. KV cache warm check-in."
         )
+        if status in {"STUCK", "UNKNOWN"}:
+            source = self._build_process_event_source(evt)
+            if source is None:
+                entry = entries[caller_id]
+                source = SessionSource(
+                    platform=getattr(entry, "platform", None) or Platform.API_SERVER,
+                    chat_id=caller_id,
+                    chat_type=getattr(entry, "chat_type", None) or "private",
+                )
+            if not runtime_heartbeat.is_event_current(evt):
+                return
+            if source.platform == Platform.API_SERVER:
+                from gateway.status import write_runtime_status
+
+                write_runtime_status(
+                    runtime_notice={
+                        "type": "runtime_heartbeat",
+                        "status": status,
+                        "target_id": target,
+                        "session_key": caller_id,
+                        "evidence": evidence,
+                        "elapsed_s": elapsed,
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
+                return
+            await self._deliver_platform_notice(source, text)
+            return
+        if status != "ALIVE" or caller_id in getattr(self, "_running_agents", {}):
+            return
+        source = self._build_process_event_source(evt)
+        if source is None or source.platform == Platform.API_SERVER:
+            return
+        await self._run_isolated_heartbeat(text, caller_id, evt)
 
     async def _async_delegation_watcher(self, interval: float = 2.0) -> None:
         """Drain async-delegation completions and inject them as new turns.
@@ -23117,6 +23201,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         completion_delivery_synthetic: bool = False,
         turn_origin: Optional[str] = None,
         allow_silent_noop: bool = False,
+        heartbeat_event: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -23139,6 +23224,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 completion_delivery_synthetic=completion_delivery_synthetic,
                 turn_origin=turn_origin,
                 allow_silent_noop=allow_silent_noop,
+                heartbeat_event=heartbeat_event,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -23154,6 +23240,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 completion_delivery_synthetic=completion_delivery_synthetic,
                 turn_origin=turn_origin,
                 allow_silent_noop=allow_silent_noop,
+                heartbeat_event=heartbeat_event,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -23279,6 +23366,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         completion_delivery_synthetic: bool = False,
         turn_origin: Optional[str] = None,
         allow_silent_noop: bool = False,
+        heartbeat_event: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -23292,6 +23380,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         This is run in a thread pool to not block the event loop.
         Supports interruption via new messages.
         """
+        if turn_origin == "heartbeat_warm":
+            return {
+                "final_response": "",
+                "messages": list(history),
+                "api_calls": 0,
+                "completed": True,
+                "silent_noop": True,
+            }
         # ---- Proxy mode: delegate to remote API server ----
         if self._get_proxy_url():
             return await self._run_agent_via_proxy(
@@ -23566,6 +23662,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             completion_delivery_synthetic=completion_delivery_synthetic,
             turn_origin=turn_origin,
             allow_silent_noop=allow_silent_noop,
+            heartbeat_event=heartbeat_event,
         )
         turn_runner = TurnRunner(self, turn_ctx)
         # Callback invoked by agent on tool lifecycle events — extracted to

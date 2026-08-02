@@ -3591,9 +3591,14 @@ def _runtime_heartbeat_event(**overrides):
     event = {
         "type": "heartbeat",
         "target_id": "proc-heartbeat",
+        "target_ids": ["proc-heartbeat"],
+        "generations": [5],
+        "generation": 5,
         "target_kind": "process",
         "session_id": "proc-heartbeat",
         "session_key": "heartbeat-owner",
+        "provider": "openai",
+        "cache_context": "openai-cache",
         "status": "ALIVE",
         "evidence": "output grew 0->128 bytes",
     }
@@ -3601,8 +3606,19 @@ def _runtime_heartbeat_event(**overrides):
     return event
 
 
-def test_tui_heartbeat_routes_to_idle_owner_as_silent_turn(monkeypatch):
+@pytest.fixture
+def current_heartbeat(monkeypatch):
+    monkeypatch.setattr(
+        "tools.runtime_heartbeat.runtime_heartbeat.is_event_current",
+        lambda _event: True,
+    )
+
+
+def test_tui_heartbeat_routes_to_idle_owner_as_silent_turn(
+    monkeypatch, current_heartbeat
+):
     session = _session(session_key="heartbeat-owner")
+    event = _runtime_heartbeat_event()
     submitted = []
     monkeypatch.setattr(
         server,
@@ -3610,9 +3626,7 @@ def test_tui_heartbeat_routes_to_idle_owner_as_silent_turn(monkeypatch):
         lambda *args, **kwargs: submitted.append((args, kwargs)),
     )
 
-    server._handle_heartbeat_event(
-        "heartbeat-sid", session, _runtime_heartbeat_event()
-    )
+    server._handle_heartbeat_event("heartbeat-sid", session, event)
 
     assert len(submitted) == 1
     args, kwargs = submitted[0]
@@ -3621,30 +3635,63 @@ def test_tui_heartbeat_routes_to_idle_owner_as_silent_turn(monkeypatch):
     assert kwargs == {
         "turn_origin": "heartbeat_warm",
         "allow_silent_noop": True,
+        "heartbeat_event": event,
     }
 
 
 @pytest.mark.parametrize("status", ["STUCK", "UNKNOWN"])
-def test_tui_unhealthy_heartbeat_is_not_silent(monkeypatch, status):
+def test_tui_unhealthy_heartbeat_is_directly_visible_without_model_turn(
+    monkeypatch, current_heartbeat, status
+):
     session = _session(session_key="heartbeat-owner")
-    submitted = []
+    event = _runtime_heartbeat_event(status=status, evidence="no progress")
+    emitted = []
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda *args, **kwargs: submitted.append((args, kwargs)),
+        lambda *_args, **_kwargs: pytest.fail("unhealthy heartbeat created a model turn"),
+    )
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event_type, sid, payload: emitted.append((event_type, sid, payload)),
     )
 
-    server._handle_heartbeat_event(
-        "heartbeat-sid", session, _runtime_heartbeat_event(status=status)
+    server._handle_heartbeat_event("heartbeat-sid", session, event)
+
+    assert len(emitted) == 1
+    event_type, emitted_sid, payload = emitted[0]
+    assert event_type == "status.update"
+    assert emitted_sid == "heartbeat-sid"
+    assert payload["kind"] == "process"
+    assert status in payload["text"]
+    assert "no progress" in payload["text"]
+    assert session["running"] is False
+
+
+def test_tui_unhealthy_heartbeat_revalidates_at_notice_boundary(monkeypatch):
+    session = _session(session_key="heartbeat-owner")
+    event = _runtime_heartbeat_event(status="STUCK", evidence="no progress")
+    emitted = []
+    checks = iter((True, False))
+    monkeypatch.setattr(
+        "tools.runtime_heartbeat.runtime_heartbeat.is_event_current",
+        lambda _event: next(checks),
+    )
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda *args, **kwargs: emitted.append((args, kwargs)),
     )
 
-    assert submitted[0][1] == {
-        "turn_origin": "heartbeat_warm",
-        "allow_silent_noop": False,
-    }
+    server._handle_heartbeat_event("heartbeat-sid", session, event)
+
+    assert emitted == []
 
 
-def test_tui_alive_heartbeat_does_not_duplicate_busy_turn(monkeypatch):
+def test_tui_alive_heartbeat_does_not_duplicate_busy_turn(
+    monkeypatch, current_heartbeat
+):
     session = _session(session_key="heartbeat-owner", running=True)
     monkeypatch.setattr(
         server,
@@ -3658,7 +3705,9 @@ def test_tui_alive_heartbeat_does_not_duplicate_busy_turn(monkeypatch):
 
 
 @pytest.mark.parametrize("mode", ["interrupt", "steer"])
-def test_tui_submit_during_heartbeat_is_queued_and_drained_once(monkeypatch, mode):
+def test_tui_submit_during_heartbeat_is_queued_and_drained_once(
+    monkeypatch, current_heartbeat, mode
+):
     prompts = []
     busy_responses = []
 
@@ -3735,7 +3784,9 @@ def test_tui_submit_during_heartbeat_is_queued_and_drained_once(monkeypatch, mod
     assert completed[0][2]["text"] == "user reply"
 
 
-def test_tui_foreign_heartbeat_never_crosses_owner(monkeypatch):
+def test_tui_foreign_heartbeat_never_crosses_owner(
+    monkeypatch, current_heartbeat
+):
     session = _session(session_key="heartbeat-owner")
     monkeypatch.setattr(
         server,

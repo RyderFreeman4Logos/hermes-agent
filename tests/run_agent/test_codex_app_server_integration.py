@@ -288,6 +288,7 @@ class TestRunConversationCodexPath:
             {"role": "user", "content": "real question"},
             {"role": "assistant", "content": "real answer"},
         ]
+        agent._session_messages = history
 
         result = agent.run_conversation(
             "[HEARTBEAT] target remains ALIVE",
@@ -321,6 +322,7 @@ class TestRunConversationCodexPath:
             {"role": "user", "content": "real question"},
             {"role": "assistant", "content": "real answer"},
         ]
+        agent._session_messages = history
 
         result = agent.run_conversation(
             "[HEARTBEAT] target inspection",

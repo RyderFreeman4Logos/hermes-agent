@@ -729,6 +729,34 @@ class TestHealthDetailedEndpoint:
                 assert isinstance(data["pid"], int)
                 assert "updated_at" in data
 
+    @pytest.mark.asyncio
+    async def test_health_detailed_returns_persisted_heartbeat_provenance(
+        self, adapter, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        from gateway.status import write_runtime_status
+
+        notice = {
+            "type": "runtime_heartbeat",
+            "status": "UNKNOWN",
+            "target_id": "proc-17",
+            "session_key": "api-session",
+            "generation": 17,
+            "target_kind": "process",
+            "provider": "custom:pm",
+            "cache_context": "custom:pm|https://pm.invalid/v1|model-a|chat_completions",
+            "heartbeat_group_token": 23,
+        }
+        write_runtime_status(runtime_notice=notice)
+        app = _create_app(adapter)
+
+        with patch("gateway.run._resolve_gateway_model", return_value="test/model"):
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.get("/health/detailed")
+                assert response.status == 200
+                data = await response.json()
+
+        assert data["runtime_notices"][-1] == notice
 
     @pytest.mark.asyncio
     async def test_public_health_does_not_run_readiness_probes(self, adapter):
@@ -2860,4 +2888,3 @@ class TestCreateAgentModelRecovery:
         )
         adapter._create_agent(session_id="another-session", gateway_session_key="stable-chan-1")
         assert captured[1]["model"] == "minimax/minimax-m3"
-

@@ -968,6 +968,15 @@ def _rewrite_system_content_blocks(system_message: dict, effective: str) -> bool
     return False
 
 
+def _effective_system_prompt(agent, active_system_prompt):
+    """Return the byte-exact system prefix used for a physical request."""
+    effective = active_system_prompt or ""
+    ephemeral = getattr(agent, "ephemeral_system_prompt", None)
+    if ephemeral:
+        effective = (effective + "\n\n" + ephemeral).strip()
+    return effective
+
+
 def _sync_failover_system_message(agent, api_messages, active_system_prompt):
     """Refresh the in-flight system message after a provider failover.
 
@@ -987,9 +996,7 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
     if not isinstance(sp, str) or not sp:
         return active_system_prompt
     if api_messages and api_messages[0].get("role") == "system":
-        effective = sp
-        if agent.ephemeral_system_prompt:
-            effective = (effective + "\n\n" + agent.ephemeral_system_prompt).strip()
+        effective = _effective_system_prompt(agent, sp)
         if not _rewrite_system_content_blocks(api_messages[0], effective):
             api_messages[0]["content"] = effective
     return sp
@@ -1251,8 +1258,6 @@ def run_heartbeat_warm(
     api_calls = 0
 
     def finish(*, silent: bool, status: str = "", evidence: str = ""):
-        agent._session_messages = retained_history
-        agent._inflight_turn_id = None
         final = "" if silent else (
             f"[HEARTBEAT ALERT] {status}: "
             f"{evidence or 'target liveness is uncertain'}"
@@ -1289,7 +1294,7 @@ def run_heartbeat_warm(
     if (
         status != "ALIVE"
         or moa_config is not None
-        or provider in {"moa", "openai-codex"}
+        or provider in {"copilot-acp", "moa", "openai-codex"}
         or api_mode != "chat_completions"
     ):
         return finish(silent=True)
@@ -1326,8 +1331,9 @@ def run_heartbeat_warm(
         if system_message is not None
         else getattr(agent, "_cached_system_prompt", None)
     )
-    if active_system_prompt:
-        api_messages.insert(0, {"role": "system", "content": active_system_prompt})
+    effective_system = _effective_system_prompt(agent, active_system_prompt)
+    if effective_system:
+        api_messages.insert(0, {"role": "system", "content": effective_system})
     if agent.prefill_messages:
         system_offset = int(
             bool(api_messages and api_messages[0].get("role") == "system")
@@ -1382,6 +1388,7 @@ def run_heartbeat_warm(
     )
     if estimate_request_context_tokens(api_kwargs) >= pressure_limit:
         return finish(silent=True)
+    dispatch_client = agent.client
     if not runtime_heartbeat.is_event_current(
         heartbeat_event, agent, consume=True
     ):
@@ -1389,7 +1396,7 @@ def run_heartbeat_warm(
 
     api_calls = 1
     try:
-        agent.client.chat.completions.create(**api_kwargs)
+        dispatch_client.chat.completions.create(**api_kwargs)
     except Exception:
         logger.debug("Isolated heartbeat warm attempt failed", exc_info=True)
     return finish(silent=True)
@@ -1907,9 +1914,7 @@ def run_conversation(
         # every turn. ``apply_anthropic_cache_control`` may split its stable
         # prefix into content blocks on the wire, but the stored string and
         # its byte-stability remain unchanged.
-        effective_system = active_system_prompt or ""
-        if agent.ephemeral_system_prompt:
-            effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
+        effective_system = _effective_system_prompt(agent, active_system_prompt)
         if effective_system:
             api_messages = [{"role": "system", "content": effective_system}] + api_messages
 

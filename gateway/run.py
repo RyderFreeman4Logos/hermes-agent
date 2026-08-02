@@ -22180,26 +22180,60 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if source.platform == Platform.API_SERVER:
                 from gateway.status import write_runtime_status
 
+                generation = evt.get("generation")
+                group_token = evt.get("heartbeat_group_token")
                 write_runtime_status(
                     runtime_notice={
                         "type": "runtime_heartbeat",
                         "status": status,
-                        "target_id": target,
-                        "session_key": caller_id,
-                        "evidence": evidence,
+                        "target_id": target[:500],
+                        "session_key": caller_id[:500],
+                        "evidence": evidence[:2000],
                         "elapsed_s": elapsed,
+                        "generation": (
+                            generation
+                            if isinstance(generation, int)
+                            and not isinstance(generation, bool)
+                            else None
+                        ),
+                        "target_kind": str(evt.get("target_kind") or "")[:100],
+                        "provider": str(evt.get("provider") or "")[:500],
+                        "cache_context": str(
+                            evt.get("cache_context") or ""
+                        )[:1000],
+                        "heartbeat_group_token": (
+                            group_token
+                            if isinstance(group_token, int)
+                            and not isinstance(group_token, bool)
+                            else None
+                        ),
                         "created_at": datetime.now(timezone.utc).isoformat(),
                     }
                 )
                 return
             await self._deliver_platform_notice(source, text)
             return
-        if status != "ALIVE" or caller_id in getattr(self, "_running_agents", {}):
+        if status != "ALIVE":
             return
         source = self._build_process_event_source(evt)
         if source is None or source.platform == Platform.API_SERVER:
             return
-        await self._run_isolated_heartbeat(text, caller_id, evt)
+        state = self._session_state(caller_id)
+        if state.turn.agent is not None:
+            return
+        heartbeat_owner = object()
+        state.turn.agent = _AGENT_PENDING_SENTINEL
+        state.turn.started_ts = time.time()
+        state.turn.heartbeat_owner = heartbeat_owner
+        self._persist_active_agents()
+        try:
+            if not runtime_heartbeat.is_event_current(evt):
+                return
+            await self._run_isolated_heartbeat(text, caller_id, evt)
+        finally:
+            self._release_running_agent_state(
+                caller_id, heartbeat_owner=heartbeat_owner
+            )
 
     async def _async_delegation_watcher(self, interval: float = 2.0) -> None:
         """Drain async-delegation completions and inject them as new turns.
@@ -22769,6 +22803,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str,
         *,
         run_generation: Optional[int] = None,
+        heartbeat_owner: Any = None,
     ) -> bool:
         """Pop ALL per-running-agent state entries for ``session_key``.
 
@@ -22801,6 +22836,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return False
         state = self._peek_session_state(session_key)
         if state is not None:
+            slot_owner = state.turn.heartbeat_owner
+            if slot_owner is not None and (
+                heartbeat_owner is not slot_owner
+                or state.turn.agent is not _AGENT_PENDING_SENTINEL
+            ):
+                return False
+            if heartbeat_owner is not None and slot_owner is not heartbeat_owner:
+                return False
             lease = state.turn.lease
             if lease is not None:
                 try:

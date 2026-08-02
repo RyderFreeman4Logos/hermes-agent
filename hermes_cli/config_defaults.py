@@ -1720,8 +1720,9 @@ DEFAULT_CONFIG = {
                                        # are rejected; explicit non-forced Python callers fall back
                                        # synchronously. Floor of 1, no ceiling.
                                        # (Replaces the deprecated max_async_children.)
-        # No-inline guarantee for nested/internal model delegation. Top-level
-        # model delegation is always background regardless of this setting.
+        # Default only for direct/internal Python callers that omit
+        # force_background. Model-facing top-level and nested delegation is
+        # always asynchronous and rejects before start when unavailable.
         "force_background": False,
         # Orchestrator role controls (see tools/delegate_tool.py:_get_max_spawn_depth
         # and _get_orchestrator_enabled).  Floored at 1, no upper ceiling —

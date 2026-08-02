@@ -1240,7 +1240,7 @@ code_execution:
 # Supports single tasks and batch mode (default 3 parallel, configurable).
 delegation:
   max_iterations: 50                          # Max tool-calling turns per child (default: 50)
-  force_background: false                    # Set true to keep nested/internal model delegation off the foreground turn; rejects if async delivery is unavailable.
+  force_background: false                    # Default only for direct/internal Python callers that omit force_background; model-facing top-level/nested delegation is always async and rejects before start when unavailable.
   # max_concurrent_children: 3                # Max parallel child agents per batch (default: 3, floor: 1, no ceiling).
                                               # WARNING: values above 10 multiply API cost linearly.
   # max_spawn_depth: 1                        # Delegation tree depth cap (range: 1-3, default: 1 = flat).

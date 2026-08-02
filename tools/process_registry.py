@@ -22,8 +22,8 @@ Usage:
     # Poll for status
     result = process_registry.poll(session.id)
 
-    # Block until done
-    result = process_registry.wait(session.id, timeout=300)
+    # Short bounded wait (model-facing long waits are guarded by _handle_process)
+    result = process_registry.wait(session.id, timeout=10)
 
     # Kill it
     process_registry.kill(session.id)
@@ -1661,7 +1661,7 @@ class ProcessRegistry:
             self._completion_consumed.add(session_id)
         return result
 
-    def wait(self, session_id: str, timeout: int = None) -> dict:
+    def wait(self, session_id: str, timeout: Optional[int] = None) -> dict:
         """
         Block until a process exits, timeout, or interrupt.
 
@@ -2527,7 +2527,9 @@ PROCESS_SCHEMA = {
     "description": (
         "Manage background processes started with terminal(background=true). "
         "Actions: 'list' (show all), 'poll' (check status + new output), "
-        "'log' (full output with pagination), 'wait' (block until done or timeout), "
+        "'log' (full output with pagination), 'wait' (short bounded wait only; "
+        "long waits return current status immediately — rely on "
+        "notify_on_complete instead), "
         "'kill' (terminate), 'write' (send raw stdin data without newline), "
         "'submit' (send data + Enter, for answering prompts), 'close' (close stdin/send EOF)."
     ),
@@ -2549,7 +2551,7 @@ PROCESS_SCHEMA = {
             },
             "timeout": {
                 "type": "integer",
-                "description": "Max seconds to block for 'wait' action. Returns partial output on timeout.",
+                "description": "Max seconds for a short 'wait'. Budgets above terminal.auto_background_timeout_threshold return current status immediately; rely on notify_on_complete for long work.",
                 "minimum": 1
             },
             "offset": {
@@ -2620,7 +2622,37 @@ def _handle_process(args, **kw):
             return json.dumps(_redact_process_result(process_registry.read_log(
                 session_id, offset=args.get("offset", 0), limit=args.get("limit", 200))), ensure_ascii=False)
         elif action == "wait":
-            return json.dumps(_redact_process_result(process_registry.wait(session_id, timeout=args.get("timeout"))), ensure_ascii=False)
+            requested_timeout = args.get("timeout")
+            try:
+                from tools.terminal_tool import _get_env_config
+
+                terminal_config = _get_env_config()
+            except Exception:
+                terminal_config = {}
+            configured_timeout = int(terminal_config.get("timeout", 180))
+            threshold = int(
+                terminal_config.get("auto_background_timeout_threshold", 200)
+            )
+            effective_timeout = (
+                configured_timeout
+                if requested_timeout is None
+                else min(requested_timeout, configured_timeout)
+            )
+            if effective_timeout > threshold:
+                result = _redact_process_result(process_registry.poll(session_id))
+                result["note"] = (
+                    f"process(wait) effective timeout={effective_timeout}s exceeds "
+                    f"terminal.auto_background_timeout_threshold={threshold}s, so "
+                    "current status was returned immediately. Do not wait or poll in "
+                    "a loop; rely on notify_on_complete for the terminal result."
+                )
+                return json.dumps(result, ensure_ascii=False)
+            return json.dumps(
+                _redact_process_result(
+                    process_registry.wait(session_id, timeout=effective_timeout)
+                ),
+                ensure_ascii=False,
+            )
         elif action == "kill":
             return json.dumps(
                 _redact_process_result(process_registry.kill_process(session_id)),

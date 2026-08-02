@@ -774,7 +774,10 @@ def test_public_handler_cleans_resources_after_schedule_rejection(monkeypatch):
         )
     )
 
-    assert result == {"error": "submit failed"}
+    assert result["status"] == "rejected"
+    assert result["mode"] == "background"
+    assert "submit failed" in result["error"]
+    assert "not started" in result["note"]
     assert parent._active_children == []
     assert len(children) == 2
     for child in children:

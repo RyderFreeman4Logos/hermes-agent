@@ -2881,6 +2881,25 @@ def _recover_tasks_from_json_string(
     return parsed, None
 
 
+def _resolve_force_background(value: Optional[bool]) -> bool:
+    """Resolve the no-inline guarantee; explicit Python callers may opt out."""
+    if value is None:
+        value = _load_config().get("force_background", False)
+    return is_truthy_value(value, default=False)
+
+
+def _force_background_rejection(error: str) -> str:
+    return json.dumps(
+        {
+            "status": "rejected",
+            "mode": "background",
+            "error": f"force_background delegation was not started: {error}",
+            "note": "The subagent was not started; no synchronous fallback ran.",
+        },
+        ensure_ascii=False,
+    )
+
+
 def delegate_task(
     goal: Optional[str] = None,
     context: Optional[str] = None,
@@ -2890,6 +2909,7 @@ def delegate_task(
     background: Optional[bool] = None,
     model_profile: Optional[str] = None,
     parent_agent=None,
+    force_background: Optional[bool] = None,
 ) -> str:
     """
     Spawn one or more child agents to handle delegated tasks.
@@ -2928,6 +2948,9 @@ def delegate_task(
     # as one message once ALL children finish — the chat is not blocked while
     # they run.
     background = is_truthy_value(background, default=False) if background is not None else False
+    force_background = _resolve_force_background(force_background)
+    if force_background:
+        background = True
 
     # Depth limit — configurable via delegation.max_spawn_depth,
     # default 2 for parity with the original MAX_DEPTH constant.
@@ -3282,6 +3305,44 @@ def delegate_task(
             combined["live_transcripts"] = list(live_paths)
         return combined
 
+    def _detach_children_from_parent() -> None:
+        if not hasattr(parent_agent, "_active_children"):
+            return
+        active_children_lock = getattr(parent_agent, "_active_children_lock", None)
+        for _, _, child in children:
+            try:
+                if active_children_lock:
+                    with active_children_lock:
+                        parent_agent._active_children.remove(child)
+                else:
+                    parent_agent._active_children.remove(child)
+            except ValueError:
+                pass
+
+    def _reattach_children_to_parent() -> None:
+        if not hasattr(parent_agent, "_active_children"):
+            return
+        active_children = parent_agent._active_children
+        active_children_lock = getattr(parent_agent, "_active_children_lock", None)
+
+        def _reattach() -> None:
+            for _, _, child in children:
+                if child not in active_children:
+                    active_children.append(child)
+
+        if active_children_lock:
+            with active_children_lock:
+                _reattach()
+        else:
+            _reattach()
+
+    def _reject_unstarted_force(error: str) -> str:
+        _detach_children_from_parent()
+        _finalize_unstarted_children(children, parent_agent, "error")
+        if live_deleg_id:
+            shutil.rmtree(live_transcript_root() / live_deleg_id, ignore_errors=True)
+        return _force_background_rejection(error)
+
     # ----- Background dispatch: run the WHOLE batch as one async unit -----
     # When background is true, the entire fan-out runs on the daemon executor
     # via a single async delegation. _execute_and_aggregate() joins on every
@@ -3295,14 +3356,17 @@ def delegate_task(
 
         # Finite sessions cannot route a detached subagent result back to the
         # agent after their turn/process ends. This includes stateless HTTP
-        # requests (#10760) and one-shot Kanban workers (#63169). Fall back to
-        # SYNCHRONOUS execution so the result returns in this same turn instead
-        # of handing out a handle with no durable consumer. Mirrors the
-        # pool-at-capacity inline fallback below.
+        # requests (#10760) and one-shot Kanban workers (#63169). Historical
+        # direct Python callers may fall back synchronously, but a model-facing
+        # force_background guarantee rejects instead of occupying the turn.
         try:
             from gateway.session_context import async_delivery_supported
             _async_ok = async_delivery_supported()
-        except Exception:
+        except Exception as exc:
+            if force_background:
+                return _reject_unstarted_force(
+                    f"async delivery capability check failed: {exc}"
+                )
             _async_ok = True
 
         _wake_sid = ""
@@ -3329,6 +3393,10 @@ def delegate_task(
                 _async_ok = True
 
         if not _async_ok:
+            if force_background:
+                return _reject_unstarted_force(
+                    "no durable async completion route is available"
+                )
             logger.info(
                 "delegate_task: async delivery unsupported on this session "
                 "runtime; running the batch synchronously instead."
@@ -3381,20 +3449,8 @@ def delegate_task(
         _parent_session_id = getattr(parent_agent, "session_id", None)
         _child_agents = [c for (_, _, c) in children]
 
-        # Detach every child from the parent's interrupt-propagation list — the
-        # batch's lifecycle is owned by the async registry now, not the parent
-        # turn. _build_child_agent attached them (correct for sync runs).
-        if hasattr(parent_agent, "_active_children"):
-            _ac_lock = getattr(parent_agent, "_active_children_lock", None)
-            for _c in _child_agents:
-                try:
-                    if _ac_lock:
-                        with _ac_lock:
-                            parent_agent._active_children.remove(_c)
-                    else:
-                        parent_agent._active_children.remove(_c)
-                except ValueError:
-                    pass
+        # The async registry now owns this lifecycle, not the parent turn.
+        _detach_children_from_parent()
 
         _not_started_lock = threading.Lock()
         _not_started_finalized = False
@@ -3406,6 +3462,16 @@ def delegate_task(
                     return
                 _not_started_finalized = True
             _finalize_unstarted_children(children, parent_agent, status)
+
+        _dispatch_returned = False
+        _deferred_not_started_status: Optional[str] = None
+
+        def _on_not_started(status: str) -> None:
+            nonlocal _deferred_not_started_status
+            if not force_background and not _dispatch_returned:
+                _deferred_not_started_status = status
+                return
+            _finalize_not_started(status)
 
         def _batch_runner():
             # This batch is detached from the foreground turn. Its lifecycle is
@@ -3475,13 +3541,22 @@ def delegate_task(
             parent_session_id=_parent_session_id,
             runner=_batch_runner,
             interrupt_fn=_batch_interrupt,
-            on_not_started=_finalize_not_started,
+            on_not_started=_on_not_started,
             max_async_children=_get_max_async_children(),
             # Reuse the live-transcript directory's id (when created) so the
             # returned delegation_id matches cache/delegation/live/<id>/.
             delegation_id=live_deleg_id,
             progress_fn=_batch_progress,
         )
+        _dispatch_returned = True
+        if (
+            not force_background
+            and _deferred_not_started_status is not None
+            and dispatch.get("status") == "dispatched"
+        ):
+            # A queued dispatch can lose ownership concurrently before the
+            # dispatch call returns; in that case it still owns cleanup.
+            _finalize_not_started(_deferred_not_started_status)
 
         if dispatch.get("status") == "dispatched":
             n = len(_goals)
@@ -3515,13 +3590,30 @@ def delegate_task(
                 )
             return json.dumps(payload, ensure_ascii=False)
 
-        _finalize_not_started("error")
-        if live_deleg_id:
-            shutil.rmtree(live_transcript_root() / live_deleg_id, ignore_errors=True)
-
         # A full backlog or submit failure is a scheduling error, not
-        # permission to occupy the foreground turn.
-        return tool_error(dispatch.get("error", "Failed to schedule delegation."))
+        # permission to occupy a forced model-facing foreground turn.
+        if force_background:
+            _finalize_not_started("error")
+            if live_deleg_id:
+                shutil.rmtree(
+                    live_transcript_root() / live_deleg_id, ignore_errors=True
+                )
+            return _force_background_rejection(
+                dispatch.get("error", "Failed to schedule delegation.")
+            )
+        logger.info(
+            "delegate_task: async pool rejected the batch (%s); running it "
+            "synchronously for an explicit non-forced Python caller.",
+            dispatch.get("error", "rejected"),
+        )
+        _reattach_children_to_parent()
+        _sync_result = _execute_and_aggregate()
+        if isinstance(_sync_result, dict):
+            _sync_result["note"] = (
+                "The async delegation pool rejected this batch, so the "
+                "explicit force_background=false caller ran it SYNCHRONOUSLY."
+            )
+        return json.dumps(_sync_result, ensure_ascii=False)
 
     # ----- Synchronous path -----
     return json.dumps(_execute_and_aggregate(), ensure_ascii=False)
@@ -4368,6 +4460,12 @@ def _model_background_value(args: dict, parent_agent=None) -> bool:
     return not is_subagent
 
 
+def _model_force_background_value(parent_agent=None) -> bool:
+    """No-inline guarantee for the registry's model-facing fallback path."""
+    is_subagent = getattr(parent_agent, "_delegate_depth", 0) > 0
+    return _resolve_force_background(None) if is_subagent else True
+
+
 _MODEL_HIDDEN_TASK_FIELDS = {"acp_command", "acp_args"}
 
 
@@ -4402,6 +4500,7 @@ registry.register(
         role=args.get("role"),
         model_profile=args.get("model_profile"),
         background=_model_background_value(args, kw.get("parent_agent")),
+        force_background=_model_force_background_value(kw.get("parent_agent")),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,

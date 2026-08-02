@@ -1,7 +1,7 @@
 """Gateway intentional-silence token behavior."""
 
 from datetime import datetime
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -40,7 +40,7 @@ def _runner(monkeypatch, tmp_path):
     runner._pending_messages = {}
     runner._pending_approvals = {}
     runner._is_user_authorized = lambda _source: True
-    runner._set_session_env = lambda _context: None
+    runner._set_session_env = MagicMock()
     runner._handle_active_session_busy_message = AsyncMock(return_value=False)
     runner._session_db = MagicMock()
     runner._recover_telegram_topic_thread_id = lambda _source: None
@@ -96,18 +96,21 @@ async def test_heartbeat_silent_noop_skips_warning_and_transcript_fallback(
         {"role": "user", "content": "real question"},
         {"role": "assistant", "content": "real answer"},
     ]
-    runner.session_store.load_transcript.return_value = history
-    runner._run_agent = AsyncMock(
-        return_value={
-            "final_response": "",
-            "messages": list(history),
-            "history_offset": len(history),
-            "api_calls": 1,
-            "completed": True,
-            "silent_noop": True,
-            "last_prompt_tokens": 0,
-        }
-    )
+    agent = MagicMock()
+    agent._session_messages = history
+    agent.run_conversation.return_value = {
+        "final_response": "",
+        "messages": list(history),
+        "history_offset": len(history),
+        "api_calls": 1,
+        "completed": True,
+        "silent_noop": True,
+        "last_prompt_tokens": 0,
+    }
+    session_key = "agent:main:telegram:group:-1001:12345"
+    runner.session_store.get_or_create_session.return_value.last_prompt_tokens = 321
+    runner._agent_cache[session_key] = (agent, "sig", 2, "sess-silent")
+    heartbeat_event = {"type": "heartbeat", "event_generation": 1}
     event = MessageEvent(
         text="[HEARTBEAT] target remains ALIVE",
         source=_source(),
@@ -115,29 +118,43 @@ async def test_heartbeat_silent_noop_skips_warning_and_transcript_fallback(
         metadata={
             "turn_origin": "heartbeat_warm",
             "allow_silent_noop": True,
+            "heartbeat_event": heartbeat_event,
         },
     )
 
     response = await runner._handle_message_with_agent(
         event,
         _source(),
-        "agent:main:telegram:group:-1001:12345",
+        session_key,
         1,
     )
 
     assert response == ""
+    agent.run_conversation.assert_called_once()
+    assert agent.run_conversation.call_args.kwargs["heartbeat_event"] is heartbeat_event
+    runner.hooks.emit.assert_not_awaited()
+    runner.session_store.get_or_create_session.assert_not_called()
+    runner._set_session_env.assert_not_called()
+    runner.session_store.load_transcript.assert_not_called()
     runner.session_store.append_to_transcript.assert_not_called()
+    runner.session_store.update_session.assert_not_called()
+    assert runner.session_store.get_or_create_session.return_value.last_prompt_tokens == 321
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status", ["STUCK", "UNKNOWN"])
-async def test_unhealthy_heartbeat_does_not_opt_into_silent_noop(
+async def test_unhealthy_heartbeat_is_directly_visible_without_model_turn(
     monkeypatch, tmp_path, status
 ):
     runner = _runner(monkeypatch, tmp_path)
     caller_id = "agent:main:telegram:group:-1001:12345"
     runner.session_store._entries = {caller_id: object()}
     runner._inject_watch_notification = AsyncMock(return_value=True)
+    runner._deliver_platform_notice = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        "tools.runtime_heartbeat.runtime_heartbeat.is_event_current",
+        lambda *_args, **_kwargs: True,
+    )
 
     await runner._handle_heartbeat_event(
         {
@@ -149,10 +166,46 @@ async def test_unhealthy_heartbeat_does_not_opt_into_silent_noop(
         }
     )
 
-    assert runner._inject_watch_notification.call_args.kwargs == {
-        "turn_origin": "heartbeat_warm",
-        "allow_silent_noop": False,
-    }
+    runner._inject_watch_notification.assert_not_awaited()
+    runner._deliver_platform_notice.assert_awaited_once()
+    assert status in runner._deliver_platform_notice.await_args_list[0].args[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["STUCK", "UNKNOWN"])
+async def test_raw_api_heartbeat_is_directly_visible_without_model_turn(
+    monkeypatch, tmp_path, status
+):
+    runner = _runner(monkeypatch, tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    caller_id = "raw-api-session"
+    runner.session_store._entries = {caller_id: object()}
+    runner._inject_watch_notification = AsyncMock(return_value=True)
+    runner._deliver_platform_notice = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        "tools.runtime_heartbeat.runtime_heartbeat.is_event_current",
+        lambda *_args, **_kwargs: True,
+    )
+
+    await runner._handle_heartbeat_event(
+        {
+            "type": "heartbeat",
+            "target_id": "proc-heartbeat",
+            "session_key": caller_id,
+            "status": status,
+            "evidence": "not healthy",
+        }
+    )
+
+    runner._inject_watch_notification.assert_not_awaited()
+    runner._deliver_platform_notice.assert_not_awaited()
+    from gateway.status import read_runtime_status
+
+    notices = read_runtime_status()["runtime_notices"]
+    assert notices[-1]["type"] == "runtime_heartbeat"
+    assert notices[-1]["status"] == status
+    assert notices[-1]["session_key"] == caller_id
+    assert notices[-1]["target_id"] == "proc-heartbeat"
 
 
 @pytest.mark.asyncio
@@ -162,19 +215,12 @@ async def test_heartbeat_early_error_skips_transcript_fallback(monkeypatch, tmp_
         {"role": "user", "content": "real question"},
         {"role": "assistant", "content": "real answer"},
     ]
-    runner.session_store.load_transcript.return_value = history
-    runner._run_agent = AsyncMock(
-        return_value={
-            "final_response": "provider unavailable",
-            "messages": list(history),
-            "history_offset": len(history),
-            "api_calls": 1,
-            "completed": False,
-            "failed": True,
-            "error": "provider unavailable",
-            "last_prompt_tokens": 0,
-        }
-    )
+    agent = MagicMock()
+    agent._session_messages = history
+    agent.run_conversation.side_effect = RuntimeError("provider unavailable")
+    session_key = "agent:main:telegram:group:-1001:12345"
+    runner._agent_cache[session_key] = (agent, "sig", 2, "sess-silent")
+    heartbeat_event = {"type": "heartbeat", "event_generation": 1}
     event = MessageEvent(
         text="[HEARTBEAT] target remains ALIVE",
         source=_source(),
@@ -182,64 +228,45 @@ async def test_heartbeat_early_error_skips_transcript_fallback(monkeypatch, tmp_
         metadata={
             "turn_origin": "heartbeat_warm",
             "allow_silent_noop": True,
+            "heartbeat_event": heartbeat_event,
         },
     )
 
     await runner._handle_message_with_agent(
         event,
         _source(),
-        "agent:main:telegram:group:-1001:12345",
+        session_key,
         1,
     )
 
     runner.session_store.append_to_transcript.assert_not_called()
+    runner.session_store.update_session.assert_not_called()
+    runner.hooks.emit.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_unhealthy_heartbeat_is_visible_without_starting_auto_title(
+async def test_ordinary_gateway_runner_never_accepts_heartbeat_fallback(
     monkeypatch, tmp_path
 ):
     runner = _runner(monkeypatch, tmp_path)
-    runner._should_send_voice_reply = (
-        gateway_run.GatewayRunner._should_send_voice_reply.__get__(
-            runner, gateway_run.GatewayRunner
-        )
-    )
-    runner._send_voice_reply = AsyncMock()
-    runner._voice_mode[runner._voice_key(Platform.TELEGRAM, "-1001")] = "all"
-    history = [
-        {"role": "user", "content": "real question"},
-        {"role": "assistant", "content": "real answer"},
-    ]
-    runner.session_store.load_transcript.return_value = history
-    runner._run_agent = AsyncMock(
-        return_value={
-            "final_response": "Target is STUCK: no CPU or output progress.",
-            "messages": list(history),
-            "history_offset": len(history),
-            "api_calls": 1,
-            "completed": True,
-            "last_prompt_tokens": 0,
-        }
-    )
-    event = MessageEvent(
-        text="[HEARTBEAT] target remains STUCK",
-        source=_source(),
-        internal=True,
-        metadata={
-            "turn_origin": "heartbeat_warm",
-            "allow_silent_noop": False,
-        },
+    history = [{"role": "assistant", "content": "real answer"}]
+
+    result = await runner._run_agent_inner(
+        "[HEARTBEAT] inspect target",
+        "context",
+        history,
+        _source(),
+        "sess-silent",
+        session_key="agent:main:telegram:group:-1001:12345",
+        turn_origin="heartbeat_warm",
+        allow_silent_noop=True,
+        heartbeat_event={"type": "heartbeat"},
     )
 
-    with patch("agent.title_generator.maybe_auto_title") as auto_title:
-        response = await runner._handle_message_with_agent(
-            event,
-            _source(),
-            "agent:main:telegram:group:-1001:12345",
-            1,
-        )
-
-    assert response == "Target is STUCK: no CPU or output progress."
-    auto_title.assert_not_called()
-    runner._send_voice_reply.assert_not_awaited()
+    assert result == {
+        "final_response": "",
+        "messages": history,
+        "api_calls": 0,
+        "completed": True,
+        "silent_noop": True,
+    }

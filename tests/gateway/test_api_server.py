@@ -708,6 +708,7 @@ class TestHealthDetailedEndpoint:
             "active_agents": 2,
             "exit_reason": None,
             "updated_at": "2026-04-14T00:00:00Z",
+            "runtime_notices": [{"type": "runtime_heartbeat", "status": "STUCK"}],
         }), patch("gateway.run._resolve_gateway_model", return_value="test/model"):
             async with TestClient(TestServer(app)) as cli:
                 resp = await cli.get("/health/detailed")
@@ -718,6 +719,9 @@ class TestHealthDetailedEndpoint:
                 assert data["gateway_state"] == "running"
                 assert data["platforms"] == {"telegram": {"state": "connected"}}
                 assert data["active_agents"] == 2
+                assert data["runtime_notices"] == [
+                    {"type": "runtime_heartbeat", "status": "STUCK"}
+                ]
                 # Derived busy/drainable: this endpoint is served BY the live
                 # gateway, so running + 2 agents ⇒ busy and drainable.
                 assert data["gateway_busy"] is True

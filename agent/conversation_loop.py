@@ -96,11 +96,6 @@ logger = logging.getLogger(__name__)
 # to treat it as cancellation metadata rather than assistant prose.
 INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
 
-_INTERNAL_NOOP_EPHEMERAL_SUFFIX = (
-    "\n\n[Note: If this internal background check requires no action, return "
-    "an empty response with no text and no tool calls.]"
-)
-
 # Modules that indicate a deterministic local processing error when they
 # appear in an exception traceback WITHOUT any API-call module. Used by the
 # outer-loop error classifier to avoid retrying bugs that will fail
@@ -1291,10 +1286,16 @@ def run_heartbeat_warm(
         )
     api_mode = str(getattr(agent, "api_mode", "") or "").lower()
     provider = str(getattr(agent, "provider", "") or "").lower()
+    base_url = str(getattr(agent, "base_url", "") or "").lower()
+    dispatch_client = agent.client
+    from agent.copilot_acp_client import CopilotACPClient
+
     if (
         status != "ALIVE"
         or moa_config is not None
         or provider in {"copilot-acp", "moa", "openai-codex"}
+        or base_url.startswith(("acp://copilot", "acp+tcp://"))
+        or isinstance(dispatch_client, CopilotACPClient)
         or api_mode != "chat_completions"
     ):
         return finish(silent=True)
@@ -1388,7 +1389,6 @@ def run_heartbeat_warm(
     )
     if estimate_request_context_tokens(api_kwargs) >= pressure_limit:
         return finish(silent=True)
-    dispatch_client = agent.client
     if not runtime_heartbeat.is_event_current(
         heartbeat_event, agent, consume=True
     ):
@@ -1414,9 +1414,6 @@ def run_conversation(
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
-    turn_origin: str = "user",
-    allow_silent_noop: bool = False,
-    heartbeat_event: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -1446,15 +1443,6 @@ def run_conversation(
     Returns:
         Dict: Complete conversation result with final response and message history
     """
-    if turn_origin == "heartbeat_warm":
-        return run_heartbeat_warm(
-            agent,
-            user_message,
-            system_message,
-            conversation_history,
-            moa_config=moa_config,
-            heartbeat_event=heartbeat_event,
-        )
     if moa_config is None:
         try:
             from hermes_cli.moa_config import decode_moa_turn
@@ -1467,15 +1455,6 @@ def run_conversation(
                     persist_user_message = _decoded_message
         except Exception:
             pass
-
-    _inject_internal_noop_instruction = (
-        turn_origin == "heartbeat_warm"
-        and allow_silent_noop is True
-        and isinstance(user_message, str)
-    )
-    if _inject_internal_noop_instruction and persist_user_message is None:
-        persist_user_message = user_message
-    _defer_heartbeat_warm_persistence = turn_origin == "heartbeat_warm"
 
     # The gateway caches agents across user turns.  Compression state is
     # per-turn: carrying a prior in-place boundary forward would make a later
@@ -1513,7 +1492,6 @@ def run_conversation(
         # MoA turns append per-call aggregated context to the API copy of the
         # user message, so no byte-stable api_content sidecar can be stamped.
         moa_active=bool(moa_config),
-        defer_early_persistence=_defer_heartbeat_warm_persistence,
     )
     user_message = _ctx.user_message
     original_user_message = _ctx.original_user_message
@@ -1539,7 +1517,6 @@ def run_conversation(
     final_response = None
     interrupted = False
     failed = False
-    _silent_noop = False
     codex_ack_continuations = 0
     length_continue_retries = 0
     truncated_tool_call_retries = 0
@@ -1601,16 +1578,10 @@ def run_conversation(
             messages=messages,
             effective_task_id=effective_task_id,
             should_review_memory=_should_review_memory,
-            turn_origin=turn_origin,
-            allow_silent_noop=allow_silent_noop,
         )
 
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
-        _redirect_text = (
-            None
-            if _defer_heartbeat_warm_persistence
-            else agent._drain_pending_redirect()
-        )
+        _redirect_text = agent._drain_pending_redirect()
         if _redirect_text:
             _apply_active_turn_redirect(agent, messages, _redirect_text)
             if isinstance(original_user_message, str):
@@ -1676,8 +1647,7 @@ def run_conversation(
 
         # Track tool-calling iterations for skill nudge.
         # Counter resets whenever skill_manage is actually used.
-        if (not _defer_heartbeat_warm_persistence
-                and agent._skill_nudge_interval > 0
+        if (agent._skill_nudge_interval > 0
                 and "skill_manage" in agent.valid_tool_names):
             agent._iters_since_skill += 1
         
@@ -1693,11 +1663,7 @@ def run_conversation(
         # iteration, no tools yet), the steer stays pending for the next
         # tool batch — injecting into a user message would break role
         # alternation, and there's no tool output to piggyback on.
-        _pre_api_steer = (
-            None
-            if _defer_heartbeat_warm_persistence
-            else agent._drain_pending_steer()
-        )
+        _pre_api_steer = agent._drain_pending_steer()
         if _pre_api_steer:
             _injected = False
             for _si in range(len(messages) - 1, -1, -1):
@@ -1833,12 +1799,7 @@ def run_conversation(
                     )
                     if _composed is not None:
                         api_msg["content"] = _composed
-                if (
-                    _inject_internal_noop_instruction
-                    and isinstance(api_msg.get("content"), str)
-                    and _INTERNAL_NOOP_EPHEMERAL_SUFFIX not in api_msg["content"]
-                ):
-                    api_msg["content"] += _INTERNAL_NOOP_EPHEMERAL_SUFFIX
+
             elif (
                 isinstance(_api_content, str)
                 and _api_content
@@ -2182,8 +2143,7 @@ def run_conversation(
             _compressor, "get_active_compression_failure_cooldown", lambda: None
         )()
         if (
-            not _defer_heartbeat_warm_persistence
-            and agent.compression_enabled
+            agent.compression_enabled
             and len(messages) > 1
             and compression_attempts < max_compression_attempts
             and not _preflight_compression_blocked
@@ -2552,9 +2512,7 @@ def run_conversation(
                     if agent.thinking_callback:
                         agent.thinking_callback("")
 
-                _use_streaming = not _defer_heartbeat_warm_persistence
-                # Heartbeats use one non-streaming transport request. The streaming
-                # helper may retry or fall back when a provider rejects streaming.
+                _use_streaming = True
                 # Provider signaled "stream not supported" on a previous
                 # attempt — switch to non-streaming for the rest of this
                 # session instead of re-failing every retry.
@@ -2657,16 +2615,12 @@ def run_conversation(
                         with _redirect_lock:
                             if _model_request_active is not None:
                                 _model_request_active.clear()
-                            _redirect_crossed_response = bool(
-                                not _defer_heartbeat_warm_persistence
-                                and agent._pending_redirect
-                            )
+                            _redirect_crossed_response = bool(agent._pending_redirect)
                     else:
                         if _model_request_active is not None:
                             _model_request_active.clear()
                         _redirect_crossed_response = bool(
-                            not _defer_heartbeat_warm_persistence
-                            and agent._has_pending_redirect()
+                            agent._has_pending_redirect()
                         )
                 if _redirect_crossed_response:
                     # The response and redirect can cross on different threads:
@@ -2678,10 +2632,7 @@ def run_conversation(
                         thinking_spinner = None
                     if agent.thinking_callback:
                         agent.thinking_callback("")
-                    if (
-                        not _defer_heartbeat_warm_persistence
-                        and agent.clear_interrupt(preserve_redirect=True)
-                    ):
+                    if agent.clear_interrupt(preserve_redirect=True):
                         _retry.restart_with_redirected_messages = True
                     else:
                         interrupted = True
@@ -2786,11 +2737,6 @@ def run_conversation(
                             error_details.append("response.choices is empty")
 
                 if response_invalid:
-                    if _defer_heartbeat_warm_persistence:
-                        _silent_noop = True
-                        final_response = ""
-                        _turn_exit_reason = "heartbeat_invalid_response"
-                        break
                     agent._invoke_api_request_error_hook(
                         task_id=effective_task_id,
                         turn_id=turn_id,
@@ -2936,18 +2882,14 @@ def run_conversation(
                             # users hit when a redirect lands during provider
                             # backoff. Rebuild from the correction instead,
                             # mirroring the InterruptedError handler.
-                            if (
-                                not _defer_heartbeat_warm_persistence
-                                and agent.clear_interrupt(preserve_redirect=True)
-                            ):
+                            if agent.clear_interrupt(preserve_redirect=True):
                                 _retry.restart_with_redirected_messages = True
                                 break
                             agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during retry wait, aborting.", force=True)
                             _interrupt_text = f"Operation interrupted during retry ({_failure_hint}, attempt {retry_count}/{max_retries})."
                             close_interrupted_tool_sequence(messages, _interrupt_text)
                             agent._persist_session(messages, conversation_history)
-                            if not _defer_heartbeat_warm_persistence:
-                                agent.clear_interrupt()
+                            agent.clear_interrupt()
                             return {
                                 "final_response": _interrupt_text,
                                 "messages": messages,
@@ -3743,19 +3685,13 @@ def run_conversation(
                     thinking_spinner = None
                 if agent.thinking_callback:
                     agent.thinking_callback("")
-                if (
-                    not _defer_heartbeat_warm_persistence
-                    and agent._has_pending_redirect()
-                ):
+                if agent._has_pending_redirect():
                     # redirect() deliberately used the interrupt machinery to
                     # cancel only this provider request. Keep its correction
                     # queued, clear the cancellation bit, and let the outer
                     # loop rebuild a clean request tail. Never materialize
                     # incomplete signed/encrypted reasoning items.
-                    if (
-                        not _defer_heartbeat_warm_persistence
-                        and agent.clear_interrupt(preserve_redirect=True)
-                    ):
+                    if agent.clear_interrupt(preserve_redirect=True):
                         _retry.restart_with_redirected_messages = True
                         break
                 api_elapsed = time.time() - api_start_time
@@ -3778,11 +3714,6 @@ def run_conversation(
                 break
 
             except Exception as api_error:
-                if _defer_heartbeat_warm_persistence:
-                    _silent_noop = True
-                    final_response = ""
-                    _turn_exit_reason = "heartbeat_provider_error"
-                    break
                 # Stop spinner silently — retry status is buffered and
                 # only flushed when every retry+fallback is exhausted.
                 if thinking_spinner:
@@ -4515,18 +4446,14 @@ def run_conversation(
                     # Preserve a pending redirect (mid-stream correction): the
                     # user is steering, not stopping. Rebuild the turn from the
                     # correction instead of aborting with a dead-end interrupt.
-                    if (
-                        not _defer_heartbeat_warm_persistence
-                        and agent.clear_interrupt(preserve_redirect=True)
-                    ):
+                    if agent.clear_interrupt(preserve_redirect=True):
                         _retry.restart_with_redirected_messages = True
                         break
                     agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during error handling, aborting retries.", force=True)
                     _interrupt_text = f"Operation interrupted: handling API error ({error_type}: {agent._clean_error_message(str(api_error))})."
                     close_interrupted_tool_sequence(messages, _interrupt_text)
                     agent._persist_session(messages, conversation_history)
-                    if not _defer_heartbeat_warm_persistence:
-                        agent.clear_interrupt()
+                    agent.clear_interrupt()
                     return {
                         "final_response": _interrupt_text,
                         "messages": messages,
@@ -5804,18 +5731,14 @@ def run_conversation(
                         # Same preserve-redirect rule as the retry-wait above:
                         # a steering correction must survive backoff, not die
                         # as "Operation interrupted".
-                        if (
-                            not _defer_heartbeat_warm_persistence
-                            and agent.clear_interrupt(preserve_redirect=True)
-                        ):
+                        if agent.clear_interrupt(preserve_redirect=True):
                             _retry.restart_with_redirected_messages = True
                             break
                         agent._vprint(f"{agent.log_prefix}⚡ Interrupt detected during retry wait, aborting.", force=True)
                         _interrupt_text = f"Operation interrupted: retrying API call after error (retry {retry_count}/{max_retries})."
                         close_interrupted_tool_sequence(messages, _interrupt_text)
                         agent._persist_session(messages, conversation_history)
-                        if not _defer_heartbeat_warm_persistence:
-                            agent.clear_interrupt()
+                        agent.clear_interrupt()
                         return {
                             "final_response": _interrupt_text,
                             "messages": messages,
@@ -5900,8 +5823,6 @@ def run_conversation(
             agent._ephemeral_max_output_tokens = min(_boost, _boost_cap)
             continue
 
-        if _defer_heartbeat_warm_persistence and _silent_noop:
-            break
 
         # Guard: if all retries exhausted without a successful response
         # (e.g. repeated context-length errors that exhausted retry_count),
@@ -5942,11 +5863,6 @@ def run_conversation(
                 else:
                     assistant_message.content = str(raw)
 
-            if _defer_heartbeat_warm_persistence:
-                silent_noop = True
-                final_response = ""
-                _turn_exit_reason = "heartbeat_warm_response"
-                break
 
             try:
                 from hermes_cli.lifecycle import (
@@ -6790,50 +6706,6 @@ def run_conversation(
                 # chokepoint below, after final_msg is built, so it catches
                 # every path that reaches turn finalization, not just this one.)
                 final_response = assistant_message.content or ""
-
-                streamed = (
-                    getattr(agent, "_current_streamed_assistant_text", "") or ""
-                )
-                response_status = getattr(response, "status", None)
-                structured_abnormal = (
-                    getattr(response, "id", "") == PARTIAL_STREAM_STUB_ID
-                    or any(
-                        bool(getattr(response, field, None))
-                        for field in (
-                            "error",
-                            "incomplete_details",
-                            "failure",
-                            "failed",
-                            "interrupted",
-                        )
-                    )
-                    or response_status
-                    not in (None, "", "completed", "success", "ok")
-                    or any(
-                        bool(getattr(assistant_message, field, None))
-                        for field in (
-                            "refusal",
-                            "function_call",
-                            "audio",
-                            "annotations",
-                        )
-                    )
-                )
-                if (
-                    turn_origin == "heartbeat_warm"
-                    and allow_silent_noop is True
-                    and getattr(agent, "_turn_received_provider_response", False)
-                    is True
-                    and finish_reason in {"stop", "success"}
-                    and not getattr(assistant_message, "tool_calls", None)
-                    and not agent._has_content_after_think_block(final_response)
-                    and not agent._has_content_after_think_block(streamed)
-                    and not structured_abnormal
-                ):
-                    _silent_noop = True
-                    _turn_exit_reason = "heartbeat_warm_noop"
-                    final_response = None
-                    break
                 
                 # Fix: unmute output when entering the no-tool-call branch
                 # so the user can see empty-response warnings and recovery
@@ -7471,11 +7343,6 @@ def run_conversation(
                 break
             
         except Exception as e:
-            if _defer_heartbeat_warm_persistence:
-                _silent_noop = True
-                final_response = ""
-                _turn_exit_reason = "heartbeat_processing_error"
-                break
             # Phase-aware error classification. The huge outer try/except spans
             # both the actual API request and all local post-processing of the
             # returned assistant message. Deterministic local bugs (e.g.
@@ -7590,8 +7457,6 @@ def run_conversation(
         _turn_exit_reason=_turn_exit_reason,
         _pending_verification_response=_pending_verification_response,
         _pending_verification_response_previewed=_pending_verification_response_previewed,
-        silent_noop=_silent_noop,
-        turn_origin=turn_origin,
     )
 
 

@@ -347,7 +347,6 @@ def build_turn_context(
     set_current_write_origin,
     ra,
     moa_active: bool = False,
-    defer_early_persistence: bool = False,
 ) -> TurnContext:
     """Run the once-per-turn setup and return the loop's input context.
 
@@ -540,16 +539,14 @@ def build_turn_context(
 
     # Hydrate todo store from conversation history.
     if (
-        not defer_early_persistence
-        and conversation_history
+        conversation_history
         and not agent._todo_store.has_items()
     ):
         agent._hydrate_todo_store(conversation_history)
 
     # Hydrate per-session nudge counters from persisted history (issue #22357).
     if (
-        not defer_early_persistence
-        and conversation_history
+        conversation_history
         and agent._user_turn_count == 0
     ):
         prior_user_turns = sum(
@@ -581,8 +578,7 @@ def build_turn_context(
     agent._persist_user_message_idx = current_turn_user_idx
 
     # Track real user turns for memory flush and periodic nudge logic.
-    if not defer_early_persistence:
-        agent._user_turn_count += 1
+    agent._user_turn_count += 1
     # Copilot x-initiator: the first API call of this user turn is
     # user-initiated; tool-loop follow-ups revert to "agent" (#3040).
     agent._is_user_initiated_turn = True
@@ -601,8 +597,7 @@ def build_turn_context(
 
     # Track memory nudge trigger (turn-based, checked here).
     should_review_memory = False
-    if (not defer_early_persistence
-            and agent._memory_nudge_interval > 0
+    if (agent._memory_nudge_interval > 0
             and "memory" in agent.valid_tool_names
             and agent._memory_store):
         agent._turns_since_memory += 1
@@ -614,7 +609,7 @@ def build_turn_context(
     # and notify the host so it can play hearts. Token-free, never touches the
     # conversation, and never fatal — a purely optional UI beat.
     reaction_callback = getattr(agent, "reaction_callback", None)
-    if not defer_early_persistence and reaction_callback is not None:
+    if reaction_callback is not None:
         try:
             from agent.reactions import detect_reaction
 
@@ -685,8 +680,7 @@ def build_turn_context(
     # expensive) token estimate, mirroring ``_should_run_preflight_estimate``.
     _idle_after = getattr(agent, "compression_idle_compact_after_seconds", 0)
     if (
-        not defer_early_persistence
-        and agent.compression_enabled
+        agent.compression_enabled
         and _idle_after > 0
         and messages
     ):
@@ -767,8 +761,7 @@ def build_turn_context(
     agent._turn_received_provider_response = False
     agent._turn_preflight_display_snapshot = None
     if (
-        not defer_early_persistence
-        and agent.compression_enabled
+        agent.compression_enabled
         and _should_run_preflight_estimate(
             messages,
             agent.context_compressor.protect_first_n,
@@ -1178,7 +1171,7 @@ def build_turn_context(
         agent._interrupt_thread_signal_pending = False
 
     # Notify memory providers of the new turn (BEFORE prefetch_all).
-    if not defer_early_persistence and agent._memory_manager:
+    if agent._memory_manager:
         try:
             _turn_msg = original_user_message if isinstance(original_user_message, str) else ""
             agent._memory_manager.on_turn_start(agent._user_turn_count, _turn_msg)
@@ -1190,7 +1183,7 @@ def build_turn_context(
     # Skip prefetch on trivial prompts (greetings, acknowledgements) to
     # prevent memory-context injection on turns that carry no semantic signal.
     ext_prefetch_cache = ""
-    if not defer_early_persistence and agent._memory_manager:
+    if agent._memory_manager:
         try:
             _query = original_user_message if isinstance(original_user_message, str) else ""
             if not is_trivial_prompt(_query):
@@ -1265,30 +1258,28 @@ def build_turn_context(
         agent._ensure_db_session()
         agent._persist_session(messages, conversation_history)
 
-    if not defer_early_persistence:
-        try:
-            if persist_lock is None:
+    try:
+        if persist_lock is None:
+            _ensure_and_persist()
+        else:
+            with persist_lock:
                 _ensure_and_persist()
-            else:
-                with persist_lock:
-                    _ensure_and_persist()
-        except Exception:
-            logger.warning(
-                "Early turn-start session persistence failed for session=%s",
-                agent.session_id or "none",
-                exc_info=True,
-            )
+    except Exception:
+        logger.warning(
+            "Early turn-start session persistence failed for session=%s",
+            agent.session_id or "none",
+            exc_info=True,
+        )
 
-    if not defer_early_persistence:
-        # Keep an unmarked staged input available to a later close retry if the
-        # normal persistence attempt failed. Once the marker is present, the
-        # close path must no longer treat it as a pre-worker UI input.
-        if (
-            not isinstance(pending_cli_message, dict)
-            or pending_cli_message.get("_db_persisted")
-            or pending_cli_message.get("_completion_delivery_synthetic")
-        ):
-            agent._pending_cli_user_message = None
+    # Keep an unmarked staged input available to a later close retry if the
+    # normal persistence attempt failed. Once the marker is present, the
+    # close path must no longer treat it as a pre-worker UI input.
+    if (
+        not isinstance(pending_cli_message, dict)
+        or pending_cli_message.get("_db_persisted")
+        or pending_cli_message.get("_completion_delivery_synthetic")
+    ):
+        agent._pending_cli_user_message = None
 
     return TurnContext(
         user_message=user_message,

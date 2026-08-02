@@ -636,8 +636,6 @@ def run_codex_app_server_turn(
     messages: List[Dict[str, Any]],
     effective_task_id: str,
     should_review_memory: bool = False,
-    turn_origin: str = "user",
-    allow_silent_noop: bool = False,
 ) -> Dict[str, Any]:
     """Codex app-server runtime path. Hands the entire turn to a `codex
     app-server` subprocess and projects its events back into Hermes'
@@ -709,14 +707,8 @@ def run_codex_app_server_turn(
     # standard run_conversation() flow (line ~11823) before the early
     # return reaches us. Do NOT append again — that would duplicate.
 
-    wire_user_message = user_message
-    if turn_origin == "heartbeat_warm" and allow_silent_noop:
-        from agent.conversation_loop import _INTERNAL_NOOP_EPHEMERAL_SUFFIX
-
-        if _INTERNAL_NOOP_EPHEMERAL_SUFFIX not in wire_user_message:
-            wire_user_message += _INTERNAL_NOOP_EPHEMERAL_SUFFIX
     try:
-        turn = agent._codex_session.run_turn(user_input=wire_user_message)
+        turn = agent._codex_session.run_turn(user_input=user_message)
     except Exception as exc:
         logger.exception("codex app-server turn failed")
         # Crash → unconditionally drop the session so the next turn
@@ -734,7 +726,7 @@ def run_codex_app_server_turn(
             if _user_interrupted
             else None
         )
-        if _user_interrupted and turn_origin != "heartbeat_warm":
+        if _user_interrupted:
             agent.clear_interrupt()
         return {
             "final_response": (
@@ -763,7 +755,7 @@ def run_codex_app_server_turn(
     _interrupt_message = (
         getattr(agent, "_interrupt_message", None) if _user_interrupted else None
     )
-    if _user_interrupted and turn_origin != "heartbeat_warm":
+    if _user_interrupted:
         agent.clear_interrupt()
 
     # If the turn signalled the underlying client is wedged (deadline
@@ -800,10 +792,7 @@ def run_codex_app_server_turn(
         # we avoid the #860/#42039 duplicate user-message write (append_message
         # is a raw INSERT with no dedup, so a gateway re-write would duplicate
         # the already-flushed user turn). See gateway/run.py agent_persisted.
-        if (
-            turn_origin != "heartbeat_warm"
-            and getattr(agent, "_session_db", None) is not None
-        ):
+        if getattr(agent, "_session_db", None) is not None:
             try:
                 _codex_flush_ok = agent._flush_messages_to_session_db(messages)
             except Exception:
@@ -827,23 +816,6 @@ def run_codex_app_server_turn(
                     getattr(agent, "session_id", None),
                 )
 
-    silent_noop = bool(
-        turn_origin == "heartbeat_warm"
-        and allow_silent_noop
-        and not turn.final_text
-        and not turn.projected_messages
-        and not turn.interrupted
-        and turn.error is None
-    )
-    if silent_noop:
-        if (
-            messages
-            and isinstance(messages[-1], dict)
-            and messages[-1].get("role") == "user"
-            and messages[-1].get("content") == user_message
-        ):
-            messages.pop()
-        agent._session_messages = messages
 
     # Counter ticks for the agent-improvement loop.
     # _turns_since_memory and _user_turn_count are ALREADY incremented
@@ -852,10 +824,9 @@ def run_codex_app_server_turn(
     # Only _iters_since_skill needs explicit increment, since the
     # chat_completions loop bumps it per tool iteration (line ~12110)
     # and that loop is bypassed on this path.
-    if turn_origin != "heartbeat_warm":
-        agent._iters_since_skill = (
-            getattr(agent, "_iters_since_skill", 0) + turn.tool_iterations
-        )
+    agent._iters_since_skill = (
+        getattr(agent, "_iters_since_skill", 0) + turn.tool_iterations
+    )
     _record_codex_app_server_compaction(agent, turn)
     usage_result = _record_codex_app_server_usage(agent, turn)
     api_calls = 1
@@ -864,8 +835,7 @@ def run_codex_app_server_turn(
     # pattern the chat_completions path uses (line ~15432).
     should_review_skills = False
     if (
-        turn_origin != "heartbeat_warm"
-        and agent._skill_nudge_interval > 0
+        agent._skill_nudge_interval > 0
         and agent._iters_since_skill >= agent._skill_nudge_interval
         and "skill_manage" in agent.valid_tool_names
     ):
@@ -875,8 +845,7 @@ def run_codex_app_server_turn(
     # External memory provider sync (mirrors line ~15439). Skipped on
     # interrupt/error to avoid feeding partial transcripts to memory.
     if (
-        turn_origin != "heartbeat_warm"
-        and not turn.interrupted
+        not turn.interrupted
         and turn.error is None
     ):
         try:
@@ -919,7 +888,6 @@ def run_codex_app_server_turn(
             else {}
         ),
         "error": turn.error,
-        "silent_noop": silent_noop,
         # The codex app-server runtime IS an early-return path that bypasses
         # conversation_loop, but we flush the projected assistant/tool messages
         # ourselves above (see the _flush_messages_to_session_db call after

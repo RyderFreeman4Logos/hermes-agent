@@ -9374,7 +9374,6 @@ def _handle_heartbeat_event(sid: str, session: dict, evt: dict) -> None:
             session,
             prompt,
             turn_origin="heartbeat_warm",
-            allow_silent_noop=True,
             heartbeat_event=evt,
         )
     except Exception:
@@ -9503,7 +9502,7 @@ def _run_prompt_submit(
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     completion_delivery: bool = False,
-    turn_origin: str | None = None, allow_silent_noop: bool = False,
+    turn_origin: str | None = None,
     heartbeat_event: Any = None,
 ) -> None:
     heartbeat_turn = turn_origin == "heartbeat_warm"
@@ -9827,8 +9826,6 @@ def _run_prompt_submit(
                 run_kwargs["task_id"] = session["session_key"]
             if turn_origin is not None and "turn_origin" in _run_params:
                 run_kwargs["turn_origin"] = turn_origin
-            if "allow_silent_noop" in _run_params:
-                run_kwargs["allow_silent_noop"] = bool(allow_silent_noop)
             if heartbeat_turn and "heartbeat_event" in _run_params:
                 run_kwargs["heartbeat_event"] = heartbeat_event
             if display_kind and "persist_user_display_kind" in _run_params:

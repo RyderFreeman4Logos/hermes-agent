@@ -116,6 +116,9 @@ FOREGROUND_MAX_TIMEOUT = _safe_parse_import_env(
     "integer",
 )
 
+# Fixed execution budget for calls promoted off the foreground turn.
+AUTO_BACKGROUND_TIMEOUT = 7200
+
 # Disk usage warning threshold (in GB)
 DISK_USAGE_WARNING_THRESHOLD_GB = _safe_parse_import_env(
     "TERMINAL_DISK_WARNING_GB",
@@ -1071,10 +1074,12 @@ TERMINAL_TOOL_DESCRIPTION = """Execute shell commands on a Linux environment. Fi
 Do NOT use cat/head/tail (use read_file), grep/rg/find/ls (use search_files), sed/awk (use patch), or echo/heredoc file creation (use write_file). Reserve terminal for: builds, installs, git, processes, scripts, network, package managers, and anything that needs a shell.
 Environment state persists: activate a virtualenv or export variables once per session, not before every command.
 
-Foreground (default): returns INSTANTLY when the command finishes, even with a high timeout — set timeout generously for long builds.
-Background: set background=true (returns a session_id). Pair with notify_on_complete=true for bounded tasks; leave silent only for servers/daemons that never exit. Never use nohup/setsid/trailing '&' — use background=true so Hermes tracks the process. After starting a server, verify readiness with a health check, then act in a separate call; no blind sleep loops. Manage with process(action="poll"/"wait").
-Working directory: use 'workdir' for per-command cwd. When a command changes the session cwd (cd, pushd), the result includes a "cwd" field — trust it instead of prefixing every command with 'cd'.
-PTY: set pty=true for interactive CLIs (they hang without it). Pipe git output to cat if it might page.
+Foreground (default): Short commands return INSTANTLY when done. A requested or configured budget above terminal.auto_background_timeout_threshold is safely promoted to managed background execution with completion notification; prefer foreground only for short commands.
+Background: set background=true and notify_on_complete=true for bounded long work; leave notifications off only for servers, watchers, and daemons. Never use nohup, setsid, disown, or trailing '&' because Hermes must track the process.
+After starting a server, verify readiness with a health check or log signal, then act in a separate call. Avoid blind sleep loops.
+Use process(action="poll") only for occasional progress checks. Keep process(wait) short and bounded; for long work, rely on notify_on_complete instead of blocking the turn.
+Working directory: use 'workdir' for per-command cwd. When a command changes the session cwd, trust the returned "cwd" field.
+PTY: set pty=true for interactive CLIs; they hang without it. Pipe git output to cat if it might page.
 """
 
 # Global state for environment lifecycle management
@@ -1459,10 +1464,25 @@ def _ensure_terminal_env_bridged() -> None:
 
 
 def _get_env_config() -> Dict[str, Any]:
-    """Get terminal environment configuration from environment variables."""
+    """Get resolved terminal configuration from config and bridged environment."""
     # Default image with Python and Node.js for maximum compatibility
     default_image = "nikolaik/python-nodejs:python3.11-nodejs20"
     _ensure_terminal_env_bridged()
+    auto_background_timeout_threshold = 200
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        terminal_config = load_config_readonly().get("terminal") or {}
+        auto_background_timeout_threshold = max(
+            1,
+            int(terminal_config.get("auto_background_timeout_threshold", 200)),
+        )
+    except (AttributeError, TypeError, ValueError):
+        logger.warning(
+            "Invalid terminal.auto_background_timeout_threshold; using 200s"
+        )
+    except Exception:
+        logger.debug("Could not load terminal auto-background threshold", exc_info=True)
     env_type = os.getenv("TERMINAL_ENV", "local")
     
     mount_docker_cwd = os.getenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "false").lower() in {"true", "1", "yes"}
@@ -1545,6 +1565,7 @@ def _get_env_config() -> Dict[str, Any]:
         "host_cwd": host_cwd,
         "docker_mount_cwd_to_workspace": mount_docker_cwd,
         "timeout": _parse_env_var("TERMINAL_TIMEOUT", "180"),
+        "auto_background_timeout_threshold": auto_background_timeout_threshold,
         "lifetime_seconds": _parse_env_var("TERMINAL_LIFETIME_SECONDS", "300"),
         # SSH-specific config
         "ssh_host": os.getenv("TERMINAL_SSH_HOST", ""),
@@ -2352,15 +2373,6 @@ def terminal_tool(
             )
         effective_timeout = timeout or default_timeout
 
-        # Reject foreground commands where the model explicitly requests
-        # a timeout above FOREGROUND_MAX_TIMEOUT — nudge it toward background.
-        if not background and timeout and timeout > FOREGROUND_MAX_TIMEOUT:
-            return tool_error(
-                f"Foreground timeout {timeout}s exceeds the maximum of "
-                f"{FOREGROUND_MAX_TIMEOUT}s. Use background=true with "
-                f"notify_on_complete=true for long-running commands."
-            )
-
         # Guardrail: long-lived server/watch commands should run as managed
         # background sessions, not foreground shell hacks.
         if not background:
@@ -2372,6 +2384,43 @@ def terminal_tool(
                     "error": guidance,
                     "status": "error",
                 }, ensure_ascii=False)
+
+        if watch_patterns and not background:
+            return tool_error(
+                "watch_patterns requires background=true. Start the server/watcher "
+                "as a managed background process instead of occupying the foreground turn."
+            )
+
+        auto_background_threshold = int(
+            config.get("auto_background_timeout_threshold", 200)
+        )
+        if not background and effective_timeout > auto_background_threshold:
+            try:
+                from gateway.session_context import async_delivery_supported
+
+                if not async_delivery_supported():
+                    return tool_error(
+                        "Long terminal command was not started: this session cannot "
+                        "deliver a managed background completion. Use a short bounded "
+                        f"timeout at or below {auto_background_threshold}s."
+                    )
+            except Exception:
+                return tool_error(
+                    "Long terminal command was not started because async completion "
+                    "delivery could not be verified."
+                )
+
+            background = True
+            notify_on_complete = True
+            effective_timeout = AUTO_BACKGROUND_TIMEOUT
+
+        # Last-resort cap for any foreground budget not covered by promotion.
+        if not background and effective_timeout > FOREGROUND_MAX_TIMEOUT:
+            return tool_error(
+                f"Foreground timeout {effective_timeout}s exceeds the maximum of "
+                f"{FOREGROUND_MAX_TIMEOUT}s. Use background=true with "
+                f"notify_on_complete=true for long-running commands."
+            )
 
         # Start cleanup thread
         _start_cleanup_thread()
@@ -2707,7 +2756,7 @@ def terminal_tool(
 
                 # Nudge: background=True without notify_on_complete=True OR
                 # watch_patterns is a silent process. The agent has NO way to
-                # learn it finished short of calling process(action="poll"/"wait")
+                # learn it finished short of calling process(action="poll")
                 # explicitly. That's correct only for genuine long-lived
                 # processes that never exit (servers, watchers). For every
                 # bounded task (tests, builds, CI pollers, deploys, batch
@@ -2726,7 +2775,7 @@ def terminal_tool(
                         "almost certainly wanted notify_on_complete=true so the "
                         "system pings you on exit. Re-launch with "
                         "notify_on_complete=true, or call process(action='poll') "
-                        "/ process(action='wait') yourself to learn the outcome. "
+                        "occasionally to inspect progress. "
                         "Only ignore this hint for genuine long-lived processes "
                         "that never exit (servers, watchers, daemons)."
                     )
@@ -2832,9 +2881,8 @@ def terminal_tool(
                             "this session — it cannot receive an async completion after "
                             "the turn ends (a one-shot runner such as `hermes -z`, a "
                             "cron job, a Kanban worker, or a stateless HTTP endpoint). "
-                            "The process is "
-                            "running in the background; retrieve its result with "
-                            "process(action='poll') or process(action='wait')."
+                            "The process is running in the background; inspect it "
+                            "occasionally with process(action='poll')."
                         )
                         logger.info(
                             "background proc %s: async delivery unsupported on this "
@@ -3376,7 +3424,7 @@ TERMINAL_SCHEMA = {
             },
             "timeout": {
                 "type": "integer",
-                "description": f"Max seconds to wait (default: 180, foreground max: {FOREGROUND_MAX_TIMEOUT}). Returns INSTANTLY when command finishes — set high for long tasks, you won't wait unnecessarily. Foreground timeout above {FOREGROUND_MAX_TIMEOUT}s is rejected; use background=true for longer commands.",
+                "description": f"Maximum execution budget in seconds (default: 180). A foreground budget above terminal.auto_background_timeout_threshold is safely promoted to background=true with notify_on_complete=true and a bounded {AUTO_BACKGROUND_TIMEOUT}s budget; any remaining foreground budget above {FOREGROUND_MAX_TIMEOUT}s is rejected.",
                 "minimum": 1
             },
             "workdir": {

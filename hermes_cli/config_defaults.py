@@ -267,6 +267,9 @@ DEFAULT_CONFIG = {
         # it here without patching the built desktop app.
         "font_family": "",
         "timeout": 180,
+        # Foreground calls whose real execution budget exceeds this are
+        # promoted to managed background execution so the turn stays steerable.
+        "auto_background_timeout_threshold": 200,
         # Bounded grace period (seconds) between SIGTERM and an escalated
         # SIGKILL when terminating a host process tree (browser daemons, etc.).
         # A daemon that stalls in its SIGTERM handler is force-killed after this
@@ -1713,9 +1716,13 @@ DEFAULT_CONFIG = {
                                  # "medium", "low", "minimal", "none" (empty = inherit)
         "max_concurrent_children": 3,  # unified concurrency cap: max parallel children per batch
                                        # AND max concurrent background (background=true)
-                                       # delegation units. New async dispatches beyond the cap
-                                       # fall back to synchronous execution. Floor of 1, no ceiling.
+                                       # delegation units. Forced async dispatches beyond the cap
+                                       # are rejected; explicit non-forced Python callers fall back
+                                       # synchronously. Floor of 1, no ceiling.
                                        # (Replaces the deprecated max_async_children.)
+        # No-inline guarantee for nested/internal model delegation. Top-level
+        # model delegation is always background regardless of this setting.
+        "force_background": False,
         # Orchestrator role controls (see tools/delegate_tool.py:_get_max_spawn_depth
         # and _get_orchestrator_enabled).  Floored at 1, no upper ceiling —
         # raise deliberately, each level multiplies API cost.

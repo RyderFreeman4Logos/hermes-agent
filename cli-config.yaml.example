@@ -233,6 +233,7 @@ terminal:
   # Desktop xterm font. Install the font locally; Nerd Fonts render Powerlevel10k glyphs.
   # font_family: "MesloLGS NF"  # Also accepts a CSS stack; blank uses bundled JetBrains Mono.
   timeout: 180
+  auto_background_timeout_threshold: 200  # Longer foreground budgets auto-promote to managed background execution.
   # HOME policy for tool subprocesses:
   #   auto    - default: host uses your real HOME; containers use HERMES_HOME/home
   #   real    - force your real OS-user HOME
@@ -1275,6 +1276,7 @@ code_execution:
 # Supports single tasks and batch mode (default 3 parallel, configurable).
 delegation:
   max_iterations: 50                          # Max tool-calling turns per child (default: 50)
+  force_background: false                    # Set true to keep nested/internal model delegation off the foreground turn; rejects if async delivery is unavailable.
   # max_concurrent_children: 3                # Max parallel child agents per batch (default: 3, floor: 1, no ceiling).
                                               # WARNING: values above 10 multiply API cost linearly.
   # max_spawn_depth: 1                        # Delegation tree depth cap (range: 1-3, default: 1 = flat).

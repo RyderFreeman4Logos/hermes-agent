@@ -530,6 +530,44 @@ def test_caller_reset_preserves_exact_interval_and_other_owner():
     assert FakeTimer.created[-1].interval == 1700
 
 
+def test_provider_activity_resets_only_exact_group_from_dispatch_time(monkeypatch):
+    from tools.runtime_heartbeat import RuntimeHeartbeat
+
+    FakeTimer.created = []
+    monkeypatch.setattr("tools.runtime_heartbeat.time.monotonic", lambda: 100.0)
+    manager = RuntimeHeartbeat(event_queue=queue.Queue(), timer_factory=FakeTimer)
+    alive = lambda: {"alive": True, "progress": True}
+    manager.arm(
+        "a",
+        caller_id="owner",
+        kind="delegation",
+        interval=1700,
+        inspect=alive,
+        provider="openai",
+        cache_context="cache-a",
+    )
+    manager.arm(
+        "b",
+        caller_id="owner",
+        kind="delegation",
+        interval=1700,
+        inspect=alive,
+        provider="openai",
+        cache_context="cache-b",
+    )
+    old_a, old_b = FakeTimer.created
+
+    assert manager.reset_for_caller(
+        "owner",
+        provider="openai",
+        cache_context="cache-a",
+        activity_at=90.0,
+    ) == 1
+    assert old_a.cancelled is True
+    assert old_b.cancelled is False
+    assert FakeTimer.created[-1].interval == 1690.0
+
+
 def test_cancel_waits_for_inflight_publication_before_returning():
     from tools.runtime_heartbeat import RuntimeHeartbeat
 

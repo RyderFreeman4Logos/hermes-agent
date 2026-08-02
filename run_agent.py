@@ -7117,16 +7117,6 @@ class AIAgent:
         task_started = False
         task_finished = False
         relay_outcome = "failed"
-        if not getattr(self, "_delegate_depth", 0):
-            try:
-                from tools.approval import get_current_session_key
-                from tools.runtime_heartbeat import runtime_heartbeat
-
-                caller_id = get_current_session_key(default="") or ""
-                if caller_id:
-                    runtime_heartbeat.reset_for_caller(caller_id)
-            except Exception:
-                logger.debug("Could not reset caller heartbeat deadline", exc_info=True)
         try:
             relay_lease = relay_runtime.SESSION_COORDINATOR.acquire_conversation(
                 profile_key=relay_runtime.current_profile_key(),

@@ -322,13 +322,61 @@ def test_heartbeat_skips_provider_at_compression_or_hard_limit(
     agent.client.chat.completions.create.assert_not_called()
 
 
-def test_real_caller_activity_resets_heartbeat_deadline(heartbeat_event):
+def test_successful_provider_dispatches_reset_exact_heartbeat_group(heartbeat_event):
     from tools.approval import reset_current_session_key, set_current_session_key
+    from tools.runtime_heartbeat import (
+        canonical_runtime_cache_context_identity,
+        canonical_runtime_provider_identity,
+    )
 
     agent = _make_agent(max_iterations=10)
     agent.client.chat.completions.create.side_effect = [
         _mock_response(content="", finish_reason="stop"),
         _mock_response(content="real reply", finish_reason="stop"),
+    ]
+    token = set_current_session_key("owner-session")
+    try:
+        with (
+            patch(
+                "tools.runtime_heartbeat.runtime_heartbeat.reset_for_caller"
+            ) as reset_deadline,
+            patch("agent.conversation_loop.time.monotonic", return_value=123.0),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            agent.run_conversation(
+                "[HEARTBEAT] inspect target",
+                turn_origin="heartbeat_warm",
+                heartbeat_event=heartbeat_event,
+            )
+            reset_deadline.assert_called_once_with(
+                "owner-session",
+                provider="openrouter",
+                cache_context="test-cache-context",
+                activity_at=123.0,
+            )
+
+            reset_deadline.reset_mock()
+            agent.run_conversation("real user turn")
+            reset_deadline.assert_called_once_with(
+                "owner-session",
+                provider=canonical_runtime_provider_identity(agent),
+                cache_context=canonical_runtime_cache_context_identity(agent),
+                activity_at=123.0,
+            )
+    finally:
+        reset_current_session_key(token)
+
+
+def test_failed_provider_calls_do_not_extend_heartbeat_lease(heartbeat_event):
+    from tools.approval import reset_current_session_key, set_current_session_key
+
+    agent = _make_agent(max_iterations=10)
+    agent._api_max_retries = 1
+    agent.client.chat.completions.create.side_effect = [
+        RuntimeError("warm failed before response"),
+        RuntimeError("ordinary failed before response"),
     ]
     token = set_current_session_key("owner-session")
     try:
@@ -343,13 +391,13 @@ def test_real_caller_activity_resets_heartbeat_deadline(heartbeat_event):
             agent.run_conversation(
                 "[HEARTBEAT] inspect target",
                 turn_origin="heartbeat_warm",
-                    heartbeat_event=heartbeat_event,
+                heartbeat_event=heartbeat_event,
             )
             agent.run_conversation("real user turn")
     finally:
         reset_current_session_key(token)
 
-    reset_deadline.assert_called_once_with("owner-session")
+    reset_deadline.assert_not_called()
 
 
 def test_heartbeat_early_error_leaves_no_unmatched_synthetic_user_row(
@@ -730,6 +778,23 @@ def test_anthropic_heartbeat_skips_without_any_transport_or_fallback(
     fallback.assert_not_called()
 
 
+def test_gemini_chat_completions_heartbeat_skips_transport(heartbeat_event):
+    agent = _make_agent(max_iterations=10)
+    agent.provider = "gemini"
+    agent.requested_provider = "gemini"
+    agent.api_mode = "chat_completions"
+    agent.base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
+
+    result = agent.run_conversation(
+        "[HEARTBEAT] inspect target",
+        turn_origin="heartbeat_warm",
+        heartbeat_event=heartbeat_event,
+    )
+
+    assert result["silent_noop"] is True
+    agent.client.chat.completions.create.assert_not_called()
+
+
 def test_copilot_acp_heartbeat_skips_without_transport_dispatch(heartbeat_event):
     agent = _make_agent(max_iterations=10)
     agent.provider = "copilot-acp"
@@ -925,6 +990,29 @@ def test_heartbeat_completion_preserves_unowned_marker_and_history(heartbeat_eve
 
     assert agent._inflight_turn_id == "ordinary-turn"
     assert agent._session_messages is ordinary_history
+
+
+def test_heartbeat_skips_custom_alias_resolved_to_gemini_native(heartbeat_event):
+    from agent.gemini_native_adapter import GeminiNativeClient
+
+    agent = _make_agent()
+    agent.provider = "custom"
+    agent.requested_provider = "custom:gemini"
+    agent.base_url = "https://generativelanguage.googleapis.com/v1beta"
+    gemini_client = GeminiNativeClient(
+        api_key="test-key", http_client=MagicMock()
+    )
+    gemini_client._create_chat_completion = MagicMock()
+    agent.client = gemini_client
+
+    result = agent.run_conversation(
+        "[HEARTBEAT] inspect target",
+        turn_origin="heartbeat_warm",
+        heartbeat_event=heartbeat_event,
+    )
+
+    assert result["silent_noop"] is True
+    gemini_client._create_chat_completion.assert_not_called()
 
 
 def test_heartbeat_skips_custom_alias_resolved_to_copilot_acp(heartbeat_event):

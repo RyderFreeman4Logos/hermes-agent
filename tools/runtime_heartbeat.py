@@ -239,12 +239,15 @@ class RuntimeHeartbeat:
             self._schedule_locked(key, target)
         return True
 
-    def _schedule_locked(self, key: str, target: _Target) -> None:
+    def _schedule_locked(
+        self, key: str, target: _Target, *, delay: Optional[float] = None
+    ) -> None:
         self._next_generation += 1
         target.generation = self._next_generation
         generation = target.generation
         timer = self._timer_factory(
-            target.interval, lambda: self._fire(key, generation)
+            target.interval if delay is None else delay,
+            lambda: self._fire(key, generation),
         )
         if hasattr(timer, "daemon"):
             timer.daemon = True
@@ -307,24 +310,41 @@ class RuntimeHeartbeat:
             target_ids = list(self._targets)
         return sum(self.cancel(target_id) for target_id in target_ids)
 
-    def reset_for_caller(self, caller_id: str) -> int:
-        """Rearm one owner's live targets with each stored exact interval."""
+    def reset_for_caller(
+        self,
+        caller_id: str,
+        *,
+        provider: str | None = None,
+        cache_context: str | None = None,
+        activity_at: float | None = None,
+    ) -> int:
+        """Rearm matching live targets from a successful provider dispatch."""
+        if (provider is None) != (cache_context is None):
+            raise ValueError("provider and cache_context must be supplied together")
         count = 0
         with self._lock:
             groups = set()
+            now = time.monotonic()
+            dispatch_at = now if activity_at is None else min(now, float(activity_at))
             for key, target in tuple(self._targets.items()):
                 if target.caller_id != str(caller_id):
                     continue
+                group = self._group_key(target)
+                if provider is not None and group[2:] != (
+                    str(provider),
+                    str(cache_context),
+                ):
+                    continue
                 if target.timer is not None:
                     target.timer.cancel()
-                self._schedule_locked(key, target)
-                groups.add(self._group_key(target))
+                delay = max(0.0, target.interval - (now - dispatch_at))
+                self._schedule_locked(key, target, delay=delay)
+                groups.add(group)
                 count += 1
-            now = time.monotonic()
             for group in groups:
                 self._next_group_token += 1
                 self._group_tokens[group] = self._next_group_token
-                self._group_next_emit[group] = now + group[1]
+                self._group_next_emit[group] = dispatch_at + group[1]
                 self._group_pending.pop(group, None)
                 self._group_replacements.pop(group, None)
         return count

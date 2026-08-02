@@ -194,6 +194,11 @@ async def test_raw_api_heartbeat_is_directly_visible_without_model_turn(
             "session_key": caller_id,
             "status": status,
             "evidence": "not healthy",
+            "generation": 17,
+            "target_kind": "process",
+            "provider": "custom:pm",
+            "cache_context": "custom:pm|https://pm.invalid/v1|model-a|chat_completions",
+            "heartbeat_group_token": 23,
         }
     )
 
@@ -206,6 +211,13 @@ async def test_raw_api_heartbeat_is_directly_visible_without_model_turn(
     assert notices[-1]["status"] == status
     assert notices[-1]["session_key"] == caller_id
     assert notices[-1]["target_id"] == "proc-heartbeat"
+    assert notices[-1]["generation"] == 17
+    assert notices[-1]["target_kind"] == "process"
+    assert notices[-1]["provider"] == "custom:pm"
+    assert notices[-1]["cache_context"] == (
+        "custom:pm|https://pm.invalid/v1|model-a|chat_completions"
+    )
+    assert notices[-1]["heartbeat_group_token"] == 23
 
 
 @pytest.mark.asyncio

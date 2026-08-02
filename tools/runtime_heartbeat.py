@@ -376,6 +376,14 @@ class RuntimeHeartbeat:
                 self._targets.get(target_id) is target
                 and target.generation == generation
                 and self._group_tokens.get(group) == token
+                and (
+                    agent is None
+                    or (
+                        provider == canonical_runtime_provider_identity(agent)
+                        and cache_context
+                        == canonical_runtime_cache_context_identity(agent)
+                    )
+                )
             )
             pending = self._group_pending.get(group)
             if (

@@ -3197,6 +3197,7 @@ def compress_context(
         split_status = "not_applicable"
         _route_transaction_context = None
         _route_transaction = None
+        _system_prompt_before_route = new_system_prompt
         if agent._session_db:
             split_status = "pending"
             try:
@@ -3210,21 +3211,28 @@ def compress_context(
                 # The transaction consumes it only after the DB seam below
                 # succeeds, and restores the working runtime on any failure.
                 from hermes_cli.model_switch import (
-                    DeferredModelSwitchTransaction,
                     model_switch_after_compression_transaction,
                 )
 
-                if defer_context_engine_notification:
-                    _route_transaction = DeferredModelSwitchTransaction()
-                else:
-                    _route_transaction_context = (
-                        model_switch_after_compression_transaction(agent)
-                    )
-                    _route_transaction = _route_transaction_context.__enter__()
+                _route_transaction_context = (
+                    model_switch_after_compression_transaction(agent)
+                )
+                _route_transaction = _route_transaction_context.__enter__()
                 if _route_transaction.active:
                     agent._invalidate_system_prompt()
                     new_system_prompt = agent._build_system_prompt(system_message)
                     agent._cached_system_prompt = new_system_prompt
+
+                published_config = (
+                    _route_transaction.model_config
+                    if _route_transaction.active
+                    else copy.deepcopy(
+                        getattr(agent, "_session_init_model_config", {}) or {}
+                    )
+                )
+                published_route = (
+                    _route_transaction.result if _route_transaction.active else None
+                )
 
                 if in_place:
                     # ── In-place compaction: keep the same session_id ──────────
@@ -3245,17 +3253,21 @@ def compress_context(
                     # for search/recovery (Teknium review — keep one durable id
                     # WITHOUT destroying history, unlike a hard replace_messages).
                     # See #38763.
-                    if _route_transaction.active:
-                        agent._session_db.update_session_meta(
-                            agent.session_id,
-                            json.dumps(
-                                _route_transaction.model_config,
-                                sort_keys=True,
-                            ),
-                            model=agent.model,
-                        )
                     agent._session_db.archive_and_compact(
-                        agent.session_id, persisted_compressed
+                        agent.session_id,
+                        persisted_compressed,
+                        model_config_json=json.dumps(published_config, sort_keys=True),
+                        model=agent.model,
+                        system_prompt=new_system_prompt,
+                        billing_provider=(
+                            published_route.target_provider if published_route else None
+                        ),
+                        billing_base_url=(
+                            published_route.base_url if published_route else None
+                        ),
+                        billing_mode=(
+                            published_route.api_mode if published_route else None
+                        ),
                     )
                     split_status = "in_place_committed"
                     # Reset the flush identity set so the next turn's appends are
@@ -3325,11 +3337,20 @@ def compress_context(
                         source=agent.platform
                         or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
                         model=agent.model,
-                        model_config=agent._session_init_model_config,
+                        model_config=published_config,
                         system_prompt=new_system_prompt,
                         messages=persisted_compressed,
                         cwd=getattr(agent, "working_directory", None),
                         profile_name=_profile_for_child,
+                        billing_provider=(
+                            published_route.target_provider if published_route else None
+                        ),
+                        billing_base_url=(
+                            published_route.base_url if published_route else None
+                        ),
+                        billing_mode=(
+                            published_route.api_mode if published_route else None
+                        ),
                         compression_lock_holder=_lock_holder,
                         require_compression_lease=_lock_holder is not None,
                     )
@@ -3365,12 +3386,9 @@ def compress_context(
                         except (ValueError, Exception) as e:
                             logger.debug("Could not propagate title on compression: %s", e)
 
-                # In-place mode still updates/replaces the current row here.
-                # Rotation already published prompt + compacted handoff atomically.
+                # Rotation and in-place mode both published the prompt with the
+                # compacted transcript in the transaction above.
                 if in_place:
-                    agent._session_db.update_system_prompt(
-                        agent.session_id, new_system_prompt
-                    )
                     agent._last_flushed_db_idx = 0
                 else:
                     agent._last_flushed_db_idx = len(compressed)
@@ -3401,9 +3419,11 @@ def compress_context(
                     # Atomic publication failed (including lease loss): keep the
                     # parent live and discard the stale compacted snapshot.
                     old_session_id = None
-                    messages[:] = copy.deepcopy(messages_before_compression)
-                    compressed = messages
-                    _compression_made_progress = False
+                messages[:] = copy.deepcopy(messages_before_compression)
+                compressed = messages
+                new_system_prompt = _system_prompt_before_route
+                _compression_made_progress = False
+                compacted_in_place = False
                 split_status = (
                     "aborted"
                     if locals().get("old_session_id") is None and not in_place
@@ -3427,10 +3447,10 @@ def compress_context(
         # is the id the boundary notifications attribute the prior state to: the old
         # id on rotation, the (unchanged) current id in-place.
         _old_sid = locals().get("old_session_id")
-        _is_boundary = bool(_old_sid) or in_place
         _context_engine_boundary_committed = _session_commit_succeeded and (
             bool(_old_sid) or compacted_in_place
         )
+        _is_boundary = _context_engine_boundary_committed
         _boundary_parent = _old_sid or agent.session_id or ""
 
         # Round-2 #4: the activity heartbeat's terminal "context compression

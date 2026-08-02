@@ -9409,6 +9409,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if not model_input and not explicit_provider:
             model_display = self.model or "unknown"
             provider_display = get_label(self.provider) if self.provider else "unknown"
+            from hermes_cli.model_switch import get_model_switch_after_compression
+
+            pending = (
+                get_model_switch_after_compression(self.agent)
+                if self.agent is not None
+                else None
+            )
+            if pending is not None:
+                _cprint(
+                    "  Pending after compression: "
+                    f"{pending.new_model} via {get_label(pending.target_provider)}"
+                )
 
             try:
                 if ctx is None:

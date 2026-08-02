@@ -3654,6 +3654,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         system_prompt: str = None,
         cwd: str = None,
         profile_name: str = None,
+        billing_provider: str = None,
+        billing_base_url: str = None,
+        billing_mode: str = None,
         compression_lock_holder: str = None,
         require_compression_lease: bool = True,
     ) -> None:
@@ -3663,6 +3666,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         one transaction. Readers can therefore observe either the live parent or
         a complete child, never an ended parent with a missing/empty child.
         """
+        if billing_provider is not None:
+            self.flush_token_counts()
+
         def _do(conn):
             lock_row = conn.execute(
                 "SELECT holder, expires_at FROM compression_locks WHERE session_id = ?",
@@ -3696,16 +3702,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 """INSERT INTO sessions (
                    id, source, model, model_config, system_prompt,
                    system_prompt_hash,
+                   billing_provider, billing_base_url, billing_mode,
                    parent_session_id, cwd, git_branch, git_repo_root,
                    profile_name, user_id, session_key, chat_id, chat_type,
                    thread_id, display_name, origin_json, started_at
-                ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ) VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     child_session_id,
                     source,
                     model,
                     json.dumps(model_config) if model_config else None,
                     system_prompt_hash,
+                    billing_provider,
+                    billing_base_url,
+                    billing_mode,
                     parent_session_id,
                     cwd or parent["cwd"],
                     parent["git_branch"],
@@ -4480,6 +4490,44 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 (system_prompt_hash, session_id),
             )
             self._delete_unreferenced_system_prompts(conn)
+        self._execute_write(_do)
+
+    def publish_session_route(
+        self,
+        session_id: str,
+        *,
+        model_config_json: str,
+        model: Optional[str],
+        system_prompt: Optional[str],
+        billing_provider: Optional[str],
+        billing_base_url: Optional[str],
+        billing_mode: Optional[str],
+    ) -> None:
+        """Atomically publish the session route, prompt, and billing metadata."""
+        self.flush_token_counts()
+
+        def _do(conn):
+            system_prompt_hash = self._store_system_prompt(conn, system_prompt)
+            updated = conn.execute(
+                """UPDATE sessions SET
+                   model_config = ?, model = ?, system_prompt = NULL,
+                   system_prompt_hash = ?,
+                   billing_provider = ?, billing_base_url = ?, billing_mode = ?
+                   WHERE id = ?""",
+                (
+                    model_config_json,
+                    model,
+                    system_prompt_hash,
+                    billing_provider,
+                    billing_base_url,
+                    billing_mode,
+                    session_id,
+                ),
+            )
+            if updated.rowcount != 1:
+                raise RuntimeError(f"Session route target not found: {session_id}")
+            self._delete_unreferenced_system_prompts(conn)
+
         self._execute_write(_do)
 
     def update_session_model(self, session_id: str, model: str) -> None:
@@ -6956,7 +7004,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return cursor.fetchone() is not None
 
     def archive_and_compact(
-        self, session_id: str, compacted_messages: List[Dict[str, Any]]
+        self,
+        session_id: str,
+        compacted_messages: List[Dict[str, Any]],
+        *,
+        model_config_json: Optional[str] = None,
+        model: Optional[str] = None,
+        system_prompt: Optional[str] = None,
+        billing_provider: Optional[str] = None,
+        billing_base_url: Optional[str] = None,
+        billing_mode: Optional[str] = None,
     ) -> int:
         """Non-destructive in-place compaction for a single durable session id.
 
@@ -6982,7 +7039,30 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         matching what the live load returns. Returns the new active count.
         """
 
+        if billing_provider is not None:
+            self.flush_token_counts()
+
         def _do(conn):
+            if model_config_json is not None:
+                conn.execute(
+                    """UPDATE sessions SET
+                       model_config = ?,
+                       model = COALESCE(?, model),
+                       system_prompt = ?,
+                       billing_provider = COALESCE(?, billing_provider),
+                       billing_base_url = COALESCE(?, billing_base_url),
+                       billing_mode = COALESCE(?, billing_mode)
+                       WHERE id = ?""",
+                    (
+                        model_config_json,
+                        model,
+                        system_prompt,
+                        billing_provider,
+                        billing_base_url,
+                        billing_mode,
+                        session_id,
+                    ),
+                )
             # Soft-archive the live turns: active=0 hides them from the live
             # context load, compacted=1 marks them as "summarized away" (vs
             # rewind/undo's active=0+compacted=0, which means "user took it

@@ -6,6 +6,7 @@ from hermes_cli.model_switch import (
     ModelSwitchResult,
     apply_model_switch_after_compression,
     get_model_switch_after_compression,
+    schedule_model_switch_after_compression,
 )
 
 
@@ -154,6 +155,45 @@ def test_cli_model_after_compression_resolves_now_without_mutating_route(monkeyp
     assert stub.model == "next/model"
     assert stub.provider == "anthropic"
     assert stub.agent.calls[-1]["new_model"] == "next/model"
+
+
+def test_cli_model_picker_reports_pending_deferred_route(monkeypatch):
+    import cli as cli_mod
+
+    stub = _StubCLI()
+    stub.agent = _FakeAgent()
+    opened = []
+    stub._open_model_picker = lambda *args, **kwargs: opened.append((args, kwargs))
+    schedule_model_switch_after_compression(
+        stub.agent,
+        ModelSwitchResult(
+            success=True,
+            new_model="next/model",
+            target_provider="anthropic",
+        ),
+    )
+    printed = []
+    monkeypatch.setattr(cli_mod, "_cprint", lambda s, *a, **k: printed.append(str(s)))
+    monkeypatch.setattr(
+        "hermes_cli.inventory.load_picker_context",
+        lambda: SimpleNamespace(
+            user_providers=None,
+            custom_providers=None,
+            with_overrides=lambda **_: SimpleNamespace(
+                user_providers=None,
+                custom_providers=None,
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.inventory.build_models_payload",
+        lambda *_args, **_kwargs: {"providers": [{"slug": "anthropic"}]},
+    )
+
+    cli_mod.HermesCLI._handle_model_switch(stub, "/model")
+
+    assert opened
+    assert any("next/model" in line and "pending" in line.lower() for line in printed)
 
 
 def test_cli_restore_model_runtime_snapshot_restores_agent():

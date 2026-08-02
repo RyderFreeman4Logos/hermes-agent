@@ -202,6 +202,76 @@ class TestCompressionBoundaryHook:
                 child["model_config"] or ""
             )
 
+    def test_deferred_notification_still_publishes_target_route_atomically(self):
+        import json
+
+        from agent.conversation_compression import (
+            finalize_context_engine_compression_notification,
+        )
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+            agent = self._make_agent(db)
+            compressor = MagicMock()
+            compressor.compress.return_value = [
+                {"role": "user", "content": "summary"}
+            ]
+            compressor.compression_count = 1
+            compressor.last_prompt_tokens = 0
+            compressor.last_completion_tokens = 0
+            compressor._last_summary_error = None
+            compressor._last_compress_aborted = False
+            agent.context_compressor = compressor
+            agent._ensure_db_session()
+            pending = ModelSwitchResult(
+                success=True,
+                new_model="new-model",
+                target_provider="new-provider",
+                api_key="new-key",
+                base_url="https://new.example/v1",
+                api_mode="responses",
+            )
+            schedule_model_switch_after_compression(agent, pending)
+
+            def switch_model(model, provider, api_key, base_url, api_mode):
+                agent.model = model
+                agent.provider = provider
+                agent.api_key = api_key
+                agent.base_url = base_url
+                agent.api_mode = api_mode
+
+            agent.switch_model = MagicMock(side_effect=switch_model)
+            old_sid = agent.session_id
+
+            agent._compress_context(
+                [{"role": "user", "content": "request"}],
+                "sys",
+                approx_tokens=100,
+                defer_context_engine_notification=True,
+            )
+
+            child = db.get_session(agent.session_id)
+            config = json.loads(child["model_config"])
+            assert child["model"] == "new-model"
+            assert config["provider"] == "new-provider"
+            assert "Model: new-model" in child["system_prompt"]
+            assert child["billing_provider"] == "new-provider"
+            assert child["billing_mode"] == "responses"
+            assert get_model_switch_after_compression(agent) is None
+            compressor.on_session_start.assert_not_called()
+
+            assert finalize_context_engine_compression_notification(
+                agent, committed=True
+            )
+            compressor.on_session_start.assert_called_once_with(
+                agent.session_id,
+                boundary_reason="compression",
+                old_session_id=old_sid,
+                platform="cli",
+                conversation_id=None,
+            )
+
     def test_apply_failure_after_rotation_keeps_pending_and_old_route(self):
         from hermes_state import SessionDB
 
@@ -225,15 +295,20 @@ class TestCompressionBoundaryHook:
             schedule_model_switch_after_compression(agent, pending)
             agent.switch_model = MagicMock(side_effect=RuntimeError("switch failed"))
 
-            agent._compress_context(
-                [{"role": "user", "content": "request"}],
+            messages = [{"role": "user", "content": "request"}]
+            returned, returned_prompt = agent._compress_context(
+                messages,
                 "sys",
                 approx_tokens=100,
             )
 
-            assert agent.session_id != original_sid
+            assert returned == messages
+            assert "Model: test/model" in returned_prompt
+            assert "broken-model" not in returned_prompt
+            assert agent.session_id == original_sid
             assert agent.model == "test/model"
             assert get_model_switch_after_compression(agent) is pending
+            compressor.on_session_start.assert_not_called()
 
     def test_publication_failure_rolls_back_switch_and_keeps_pending(self):
         from hermes_state import SessionDB

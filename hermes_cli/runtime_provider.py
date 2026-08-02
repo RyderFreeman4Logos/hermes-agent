@@ -579,13 +579,17 @@ def _try_resolve_from_custom_pool(
     provider_label: str,
     api_mode_override: Optional[str] = None,
     provider_name: Optional[str] = None,
+    allow_network: bool = True,
 ) -> Optional[Dict[str, Any]]:
     """Check if a credential pool exists for a custom endpoint and return a runtime dict if so."""
     pool_key = get_custom_provider_pool_key(base_url, provider_name=provider_name)
     if not pool_key:
         return None
     try:
-        pool = load_pool(pool_key)
+        pool = load_pool(
+            pool_key,
+            **({} if allow_network else {"read_only": True}),
+        )
         if not pool.has_credentials():
             return None
         entry = pool.select()
@@ -1024,6 +1028,7 @@ def _resolve_named_custom_runtime(
     requested_provider: str,
     explicit_api_key: Optional[str] = None,
     explicit_base_url: Optional[str] = None,
+    allow_network: bool = True,
 ) -> Optional[Dict[str, Any]]:
     # Bare `provider="custom"` with an explicit base_url (e.g. propagated
     # from a `model_aliases:` direct-alias resolution) — build a runtime
@@ -1047,7 +1052,12 @@ def _resolve_named_custom_runtime(
         # Check credential pool first — mirrors the named-custom-provider path
         # so bare `provider: custom` with a configured custom_providers entry
         # also gets its api_key from the pool instead of env var fallbacks.
-        pool_result = _try_resolve_from_custom_pool(base_url, "custom", None)
+        pool_result = _try_resolve_from_custom_pool(
+            base_url,
+            "custom",
+            None,
+            allow_network=allow_network,
+        )
         if pool_result:
             pool_result["source"] = "direct-alias"
             return pool_result
@@ -1088,7 +1098,13 @@ def _resolve_named_custom_runtime(
         return None
 
     # Check if a credential pool exists for this custom endpoint
-    pool_result = _try_resolve_from_custom_pool(base_url, "custom", custom_provider.get("api_mode"), provider_name=custom_provider.get("name"))
+    pool_result = _try_resolve_from_custom_pool(
+        base_url,
+        "custom",
+        custom_provider.get("api_mode"),
+        provider_name=custom_provider.get("name"),
+        allow_network=allow_network,
+    )
     if pool_result:
         # Propagate the model name even when using pooled credentials —
         # the pool doesn't know about the custom_providers model field.
@@ -1156,6 +1172,7 @@ def _resolve_openrouter_runtime(
     requested_provider: str,
     explicit_api_key: Optional[str] = None,
     explicit_base_url: Optional[str] = None,
+    allow_network: bool = True,
 ) -> Dict[str, Any]:
     model_cfg = _get_model_config()
     cfg_base_url = model_cfg.get("base_url") if isinstance(model_cfg.get("base_url"), str) else ""
@@ -1273,6 +1290,7 @@ def _resolve_openrouter_runtime(
         pool_result = _try_resolve_from_custom_pool(
             base_url, effective_provider, _parse_api_mode(model_cfg.get("api_mode")),
             provider_name=requested_provider if requested_norm != "custom" else None,
+            allow_network=allow_network,
         )
         if pool_result:
             return pool_result
@@ -1470,7 +1488,11 @@ def _resolve_explicit_runtime(
     explicit_api_key: Optional[str] = None,
     explicit_base_url: Optional[str] = None,
     target_model: Optional[str] = None,
+    allow_network: bool = True,
 ) -> Optional[Dict[str, Any]]:
+    network_kwargs: Dict[str, Any] = (
+        {} if allow_network else {"allow_network": False}
+    )
     explicit_api_key = str(explicit_api_key or "").strip()
     explicit_base_url = str(explicit_base_url or "").strip().rstrip("/")
     if not explicit_api_key and not explicit_base_url:
@@ -1488,7 +1510,9 @@ def _resolve_explicit_runtime(
         if not api_key:
             from agent.anthropic_adapter import resolve_anthropic_token
 
-            api_key = resolve_anthropic_token()
+            api_key = resolve_anthropic_token(
+                **({} if allow_network else {"allow_network": False})
+            )
             if not api_key:
                 raise AuthError(
                     "No Anthropic credentials found. Set ANTHROPIC_TOKEN or ANTHROPIC_API_KEY, "
@@ -1508,7 +1532,11 @@ def _resolve_explicit_runtime(
         api_key = explicit_api_key
         last_refresh = None
         if not api_key:
-            creds = resolve_codex_runtime_credentials()
+            creds = (
+                resolve_codex_runtime_credentials()
+                if allow_network
+                else resolve_codex_runtime_credentials(allow_network=False)
+            )
             api_key = creds.get("api_key", "")
             last_refresh = creds.get("last_refresh")
             if not explicit_base_url:
@@ -1547,6 +1575,7 @@ def _resolve_explicit_runtime(
         if not api_key:
             creds = resolve_nous_runtime_credentials(
                 timeout_seconds=float(_getenv("HERMES_NOUS_TIMEOUT_SECONDS", "15")),
+                **network_kwargs,
             )
             api_key = creds.get("api_key", "")
             expires_at = creds.get("expires_at")
@@ -1580,14 +1609,20 @@ def _resolve_explicit_runtime(
         base_url = explicit_base_url
         if not base_url:
             if provider in {"kimi-coding", "kimi-coding-cn"}:
-                creds = resolve_api_key_provider_credentials(provider)
+                creds = resolve_api_key_provider_credentials(
+                    provider,
+                    **({} if allow_network else {"allow_network": False}),
+                )
                 base_url = creds.get("base_url", "").rstrip("/")
             else:
                 base_url = env_url or pconfig.inference_base_url
 
         api_key = explicit_api_key
         if not api_key:
-            creds = resolve_api_key_provider_credentials(provider)
+            creds = resolve_api_key_provider_credentials(
+                provider,
+                **({} if allow_network else {"allow_network": False}),
+            )
             api_key = creds.get("api_key", "")
             if not base_url:
                 base_url = creds.get("base_url", "").rstrip("/")
@@ -1630,6 +1665,7 @@ def resolve_runtime_provider(
     explicit_api_key: Optional[str] = None,
     explicit_base_url: Optional[str] = None,
     target_model: Optional[str] = None,
+    allow_network: bool = True,
 ) -> Dict[str, Any]:
     """Resolve runtime provider credentials for agent execution.
 
@@ -1642,6 +1678,9 @@ def resolve_runtime_provider(
     behavior (api_mode derived from config).
     """
     requested_provider = resolve_requested_provider(requested)
+    network_kwargs: Dict[str, Any] = (
+        {} if allow_network else {"allow_network": False}
+    )
 
     # Honour ``providers.<name>.enabled: false`` for BOTH user-defined
     # custom providers and the built-in ones (openai / anthropic /
@@ -1722,7 +1761,11 @@ def resolve_runtime_provider(
     if requested_provider in ("vertex", "google-vertex", "vertex-ai", "gcp-vertex", "vertexai"):
         from agent.vertex_adapter import get_vertex_config
 
-        token, base_url = get_vertex_config()
+        token, base_url = (
+            get_vertex_config()
+            if allow_network
+            else get_vertex_config(allow_network=False)
+        )
         if not token or not base_url:
             raise AuthError(
                 "Vertex AI credentials could not be resolved. Vertex uses "
@@ -1746,6 +1789,7 @@ def resolve_runtime_provider(
         requested_provider=requested_provider,
         explicit_api_key=explicit_api_key,
         explicit_base_url=explicit_base_url,
+        allow_network=allow_network,
     )
     if custom_runtime:
         custom_runtime["requested_provider"] = requested_provider
@@ -1784,6 +1828,7 @@ def resolve_runtime_provider(
                     requested_provider=requested_provider,
                     explicit_api_key=explicit_api_key,
                     explicit_base_url=explicit_base_url,
+                    allow_network=allow_network,
                 )
                 runtime["requested_provider"] = requested_provider
                 return runtime
@@ -1801,6 +1846,7 @@ def resolve_runtime_provider(
         explicit_api_key=explicit_api_key,
         explicit_base_url=explicit_base_url,
         target_model=target_model,
+        allow_network=allow_network,
     )
     if explicit_runtime:
         return explicit_runtime
@@ -1826,7 +1872,14 @@ def resolve_runtime_provider(
         )
 
     try:
-        pool = load_pool(provider) if should_use_pool else None
+        pool = (
+            load_pool(
+                provider,
+                **({} if allow_network else {"read_only": True}),
+            )
+            if should_use_pool
+            else None
+        )
     except Exception:
         pool = None
     if pool and pool.has_credentials():
@@ -1851,25 +1904,32 @@ def resolve_runtime_provider(
                 "scope": getattr(entry, "scope", None),
             }
             if not _agent_key_is_usable(nous_state, min_ttl):
-                logger.debug("Nous pool entry agent_key expired/missing, refreshing selected pool entry")
-                try:
-                    refreshed = pool.try_refresh_current()
-                except Exception as exc:
-                    logger.debug("Nous pool entry refresh failed: %s", exc)
-                    refreshed = None
-                if refreshed is not None:
-                    entry = refreshed
-                    pool_api_key = (
-                        getattr(entry, "runtime_api_key", None)
-                        or getattr(entry, "access_token", "")
+                if allow_network:
+                    logger.debug(
+                        "Nous pool entry agent_key expired/missing, refreshing selected pool entry"
                     )
-                    nous_state = {
-                        "agent_key": getattr(entry, "agent_key", None),
-                        "agent_key_expires_at": getattr(entry, "agent_key_expires_at", None),
-                        "scope": getattr(entry, "scope", None),
-                    }
+                    try:
+                        refreshed = pool.try_refresh_current()
+                    except Exception as exc:
+                        logger.debug("Nous pool entry refresh failed: %s", exc)
+                        refreshed = None
+                    if refreshed is not None:
+                        entry = refreshed
+                        pool_api_key = (
+                            getattr(entry, "runtime_api_key", None)
+                            or getattr(entry, "access_token", "")
+                        )
+                        nous_state = {
+                            "agent_key": getattr(entry, "agent_key", None),
+                            "agent_key_expires_at": getattr(
+                                entry, "agent_key_expires_at", None
+                            ),
+                            "scope": getattr(entry, "scope", None),
+                        }
                 if not pool_api_key or not _agent_key_is_usable(nous_state, min_ttl):
-                    logger.debug("Nous pool entry agent_key still unavailable, falling through to runtime resolution")
+                    logger.debug(
+                        "Nous pool entry agent_key still unavailable, falling through to runtime resolution"
+                    )
                     pool_api_key = ""
         if (
             entry is not None
@@ -1899,6 +1959,7 @@ def resolve_runtime_provider(
 
             creds = resolve_nous_runtime_credentials(
                 timeout_seconds=float(_getenv("HERMES_NOUS_TIMEOUT_SECONDS", "15")),
+                **network_kwargs,
             )
             return {
                 "provider": "nous",
@@ -1919,7 +1980,7 @@ def resolve_runtime_provider(
 
     if provider == "openai-codex":
         try:
-            creds = resolve_codex_runtime_credentials()
+            creds = resolve_codex_runtime_credentials(**network_kwargs)
             return {
                 "provider": "openai-codex",
                 "api_mode": "codex_responses",
@@ -1939,7 +2000,7 @@ def resolve_runtime_provider(
 
     if provider == "xai-oauth":
         try:
-            creds = resolve_xai_oauth_runtime_credentials()
+            creds = resolve_xai_oauth_runtime_credentials(**network_kwargs)
             return {
                 "provider": "xai-oauth",
                 "api_mode": "codex_responses",
@@ -1957,7 +2018,7 @@ def resolve_runtime_provider(
 
     if provider == "qwen-oauth":
         try:
-            creds = resolve_qwen_runtime_credentials()
+            creds = resolve_qwen_runtime_credentials(**network_kwargs)
             return {
                 "provider": "qwen-oauth",
                 "api_mode": "chat_completions",
@@ -1977,7 +2038,7 @@ def resolve_runtime_provider(
         pconfig = PROVIDER_REGISTRY.get(provider)
         if pconfig and pconfig.auth_type == "oauth_minimax":
             from hermes_cli.auth import resolve_minimax_oauth_runtime_credentials
-            creds = resolve_minimax_oauth_runtime_credentials()
+            creds = resolve_minimax_oauth_runtime_credentials(**network_kwargs)
             return {
                 "provider": provider,
                 "api_mode": "anthropic_messages",
@@ -2054,7 +2115,9 @@ def resolve_runtime_provider(
                 )
         else:
             from agent.anthropic_adapter import resolve_anthropic_token
-            token = resolve_anthropic_token()
+            token = resolve_anthropic_token(
+                **({} if allow_network else {"allow_network": False})
+            )
             if not token:
                 raise AuthError(
                     "No Anthropic credentials found. Set ANTHROPIC_TOKEN or ANTHROPIC_API_KEY, "
@@ -2149,7 +2212,10 @@ def resolve_runtime_provider(
     # API-key providers (z.ai/GLM, Kimi, MiniMax, MiniMax-CN)
     pconfig = PROVIDER_REGISTRY.get(provider)
     if pconfig and pconfig.auth_type == "api_key":
-        creds = resolve_api_key_provider_credentials(provider)
+        creds = resolve_api_key_provider_credentials(
+            provider,
+            **({} if allow_network else {"allow_network": False}),
+        )
         # An explicitly selected API-key provider is authoritative. Returning
         # a runtime with an empty key defers failure until the first request and
         # can make a later fallback look like a silent provider switch. Fail at
@@ -2226,6 +2292,7 @@ def resolve_runtime_provider(
         requested_provider=requested_provider,
         explicit_api_key=explicit_api_key,
         explicit_base_url=explicit_base_url,
+        allow_network=allow_network,
     )
     runtime["requested_provider"] = requested_provider
     return runtime

@@ -2412,11 +2412,16 @@ def _(rid, params: dict) -> dict:
                 history_version=history_version,
             )
             agent = session["agent"]
-            _sync_session_key_after_compress(sid, session)
+            _sync_session_key_after_compress(
+                sid,
+                session,
+                restart_slash_worker=False,
+            )
             finalize_context_engine_compression_notification(
                 agent,
                 committed=True,
             )
+            _restart_slash_worker(sid, session)
             with session["history_lock"]:
                 messages = list(session.get("history", []))
             after_count = len(messages)

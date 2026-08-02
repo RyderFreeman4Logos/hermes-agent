@@ -3569,7 +3569,13 @@ def _persist_live_session_system_prompt(session: dict | None) -> None:
         logger.debug("failed to persist live session system prompt", exc_info=True)
 
 
-def _append_model_switch_marker(session: dict | None, *, model: str, provider: str) -> None:
+def _append_model_switch_marker(
+    session: dict | None,
+    *,
+    model: str,
+    provider: str,
+    require_durable: bool = False,
+) -> None:
     """Record a real system-history pivot after a live model switch."""
     if not session:
         return
@@ -3612,15 +3618,20 @@ def _append_model_switch_marker(session: dict | None, *, model: str, provider: s
 
         _ensure_session_db_row(session)
         with _session_db(session) as scoped_db:
-            if scoped_db is not None:
-                scoped_db.append_message(
-                    session_id=session_key,
-                    role="user",
-                    content=marker,
-                    display_kind="model_switch",
-                )
+            if scoped_db is None:
+                if require_durable:
+                    raise RuntimeError("session database unavailable for model switch marker")
+                return
+            scoped_db.append_message(
+                session_id=session_key,
+                role="user",
+                content=marker,
+                display_kind="model_switch",
+            )
     except Exception:
         logger.debug("failed to persist model switch marker", exc_info=True)
+        if require_durable:
+            raise
 
 
 def _write_config_key(key_path: str, value):
@@ -4070,31 +4081,74 @@ def _attach_model_switch_after_compression(
         def _on_applied(result, old_model, _old_provider):
             if session.get("after_compression_model_switch") is not result:
                 return
-            session.pop("after_compression_model_switch", None)
-            session.pop("one_turn_model_restore", None)
-            session["model_override"] = {
-                "model": result.new_model,
-                "provider": result.target_provider,
-                "base_url": result.base_url,
-                "api_key": result.api_key,
-                "api_mode": result.api_mode,
+            missing = object()
+            old_values = {
+                key: session.get(key, missing)
+                for key in (
+                    "after_compression_model_switch",
+                    "one_turn_model_restore",
+                    "model_override",
+                    "history",
+                    "history_version",
+                )
             }
-            _append_model_switch_marker(
-                session,
-                model=result.new_model,
-                provider=result.target_provider,
+            old_history = old_values["history"]
+            old_history_items = list(old_history) if isinstance(old_history, list) else None
+            try:
+                session.pop("after_compression_model_switch", None)
+                session.pop("one_turn_model_restore", None)
+                session["model_override"] = {
+                    "model": result.new_model,
+                    "provider": result.target_provider,
+                    "base_url": result.base_url,
+                    "api_key": result.api_key,
+                    "api_mode": result.api_mode,
+                }
+                _append_model_switch_marker(
+                    session,
+                    model=result.new_model,
+                    provider=result.target_provider,
+                    require_durable=True,
+                )
+            except Exception:
+                for key, value in old_values.items():
+                    if value is missing:
+                        session.pop(key, None)
+                    else:
+                        session[key] = value
+                if old_history_items is not None:
+                    old_history[:] = old_history_items
+                raise
+
+            # Transport publication is an observer, not route authority. A closed
+            # frontend must not roll back a committed runtime + durable marker.
+            notifications = []
+            try:
+                notifications.append(("session.info", _session_info(agent, session)))
+            except Exception:
+                logger.debug(
+                    "deferred model switch session info failed",
+                    exc_info=True,
+                )
+            notifications.append(
+                (
+                    "status",
+                    {
+                        "message": (
+                            f"Model switched after compression: {old_model} → "
+                            f"{result.new_model}"
+                        )
+                    },
+                )
             )
-            _emit("session.info", sid, _session_info(agent, session))
-            _emit(
-                "status",
-                sid,
-                {
-                    "message": (
-                        f"Model switched after compression: {old_model} → "
-                        f"{result.new_model}"
+            for method, params in notifications:
+                try:
+                    _emit(method, sid, params)
+                except Exception:
+                    logger.debug(
+                        "deferred model switch notification failed",
+                        exc_info=True,
                     )
-                },
-            )
 
         try:
             schedule_model_switch_after_compression(
@@ -12468,11 +12522,16 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
                     describe_compression_lock_skip,
                 )
                 return describe_compression_lock_skip(e.holder)
-            _sync_session_key_after_compress(sid, session)
+            _sync_session_key_after_compress(
+                sid,
+                session,
+                restart_slash_worker=False,
+            )
             finalize_context_engine_compression_notification(
                 agent,
                 committed=True,
             )
+            _restart_slash_worker(sid, session)
 
             with session["history_lock"]:
                 _after_messages = list(session.get("history", []))

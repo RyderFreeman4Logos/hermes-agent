@@ -1382,7 +1382,7 @@ def resolve_alias(
         pass
 
     # For aggregators, models are vendor/model-name format
-    aggregator = is_aggregator(current_provider)
+    aggregator = is_aggregator(current_provider, allow_network=allow_network)
 
     if aggregator:
         prefix = f"{vendor}/{family}".lower()
@@ -1410,6 +1410,8 @@ def get_authenticated_provider_slugs(
     current_provider: str = "",
     user_providers: dict = None,
     custom_providers: list | None = None,
+    *,
+    allow_network: bool = True,
 ) -> list[str]:
     """Return slugs of providers that have credentials.
 
@@ -1422,6 +1424,7 @@ def get_authenticated_provider_slugs(
             user_providers=user_providers,
             custom_providers=custom_providers,
             max_models=0,
+            allow_network=allow_network,
         )
         return [p["slug"] for p in providers]
     except Exception:
@@ -1807,6 +1810,7 @@ def switch_model(
                 current_provider=current_provider,
                 user_providers=user_providers,
                 custom_providers=custom_providers,
+                allow_network=validate_live,
             )
             if target_provider not in _authed:
                 _suggestions = [
@@ -1824,7 +1828,7 @@ def switch_model(
                     is_global=is_global,
                     error_message=(
                         f"Provider '{_explicit_norm}' is an alias that routes "
-                        f"through {get_label(target_provider)}, which "
+                        f"through {get_label(target_provider, allow_network=validate_live)}, which "
                         f"has no credentials configured.{_hint}"
                     ),
                 )
@@ -1893,6 +1897,7 @@ def switch_model(
             alias_result = resolve_switch_alias(new_model, target_provider)
             if alias_result is not None:
                 _, new_model, resolved_alias = alias_result
+                local_model_authority = not validate_live
 
     # =================================================================
     # PATH B: No explicit provider — resolve from model input
@@ -1921,6 +1926,7 @@ def switch_model(
             pass
         elif alias_result is not None:
             target_provider, new_model, resolved_alias = alias_result
+            local_model_authority = not validate_live
             logger.debug(
                 "Alias '%s' resolved to %s on %s",
                 resolved_alias, new_model, target_provider,
@@ -1933,12 +1939,14 @@ def switch_model(
                     current_provider=current_provider,
                     user_providers=user_providers,
                     custom_providers=custom_providers,
+                    allow_network=validate_live,
                 )
                 fallback_result = _resolve_alias_fallback(
                     raw_input, authed, **network_kwargs
                 )
                 if fallback_result is not None:
                     target_provider, new_model, resolved_alias = fallback_result
+                    local_model_authority = not validate_live
                     logger.debug(
                         "Alias '%s' resolved via fallback to %s on %s",
                         resolved_alias, new_model, target_provider,
@@ -1960,7 +1968,11 @@ def switch_model(
                 # is already in vendor/model format and the colon is a variant
                 # tag (:free, :extended, :fast) that must be preserved.
                 colon_pos = raw_input.find(":")
-                if colon_pos > 0 and "/" not in raw_input and is_aggregator(current_provider):
+                if (
+                    colon_pos > 0
+                    and "/" not in raw_input
+                    and is_aggregator(current_provider, **network_kwargs)
+                ):
                     left = raw_input[:colon_pos].strip().lower()
                     right = raw_input[colon_pos + 1:].strip()
                     if left and right:
@@ -1978,7 +1990,7 @@ def switch_model(
         # whose live /v1/models returns bare IDs (e.g. "deepseek-v4-flash") that
         # coincidentally match entries in native providers' static catalogs.
         resolved_in_current_catalog = False
-        if is_aggregator(target_provider) and not resolved_alias:
+        if is_aggregator(target_provider, **network_kwargs) and not resolved_alias:
             catalog = list_provider_models(target_provider, **network_kwargs)
             if catalog:
                 new_model_lower = new_model.lower()
@@ -2066,7 +2078,9 @@ def switch_model(
             and not resolved_in_current_catalog
             and not config_routed
         ):
-            detected = detect_provider_for_model(new_model, current_provider)
+            detected = detect_provider_for_model(
+                new_model, current_provider, **network_kwargs
+            )
             if detected:
                 target_provider, new_model = detected
 
@@ -2075,9 +2089,7 @@ def switch_model(
     # =================================================================
 
     provider_changed = target_provider != current_provider
-    provider_label = (
-        get_label(target_provider) if validate_live else target_provider
-    )
+    provider_label = get_label(target_provider, **network_kwargs)
     if target_provider == "custom" and current_base_url:
         provider_label = "Custom endpoint"
     if target_provider.startswith("custom:"):
@@ -2119,6 +2131,7 @@ def switch_model(
                     explicit_api_key=_ukey or None,
                     explicit_base_url=_user_pdef.base_url,
                     target_model=new_model,
+                    allow_network=validate_live,
                 )
                 api_key = runtime.get("api_key", "") or _ukey
                 base_url = runtime.get("base_url", "") or _user_pdef.base_url
@@ -2130,12 +2143,15 @@ def switch_model(
         elif target_provider == "custom" and current_base_url:
             api_key = current_api_key
             base_url = current_base_url
-            api_mode = determine_api_mode(target_provider, base_url)
+            api_mode = determine_api_mode(
+                target_provider, base_url, allow_network=validate_live
+            )
         else:
             try:
                 runtime = resolve_runtime_provider(
                     requested=target_provider,
                     target_model=new_model,
+                    allow_network=validate_live,
                 )
                 api_key = runtime.get("api_key", "")
                 base_url = runtime.get("base_url", "")
@@ -2156,6 +2172,7 @@ def switch_model(
             runtime = resolve_runtime_provider(
                 requested=current_provider,
                 target_model=new_model,
+                allow_network=validate_live,
             )
             # If resolution fell through to "custom" (e.g. named custom provider like
             # "ollama-launch" that resolve_runtime_provider doesn't know), keep existing
@@ -2189,7 +2206,7 @@ def switch_model(
     _mandated_mode = host_mandated_api_mode(base_url)
     if _mandated_mode is not None:
         api_mode = _mandated_mode
-    elif not api_mode:
+    elif not api_mode and validate_live:
         api_mode = determine_api_mode(target_provider, base_url)
 
     # --- Normalize model name for target provider ---
@@ -2313,6 +2330,17 @@ def switch_model(
 
     # --- Determine api_mode if not already set ---
     if not api_mode:
+        if not validate_live:
+            return ModelSwitchResult(
+                success=False,
+                target_provider=target_provider,
+                provider_label=provider_label,
+                is_global=is_global,
+                error_message=(
+                    f"Cannot determine an API mode for '{target_provider}' from local configuration. "
+                    "Configure api_mode before scheduling this switch."
+                ),
+            )
         api_mode = determine_api_mode(
             target_provider, base_url, model=new_model
         )
@@ -2379,7 +2407,12 @@ import threading as _threading  # noqa: E402
 _picker_prewarm_done = _threading.Event()
 
 
-def _credential_pool_is_usable(provider: str, *, raw_pool_present: bool = False) -> bool:
+def _credential_pool_is_usable(
+    provider: str,
+    *,
+    raw_pool_present: bool = False,
+    read_only: bool = False,
+) -> bool:
     """Return whether *provider* has a credential that can be selected now.
 
     ``auth.json`` historically allowed opaque token-style pool values that do
@@ -2390,7 +2423,10 @@ def _credential_pool_is_usable(provider: str, *, raw_pool_present: bool = False)
     try:
         from agent.credential_pool import load_pool
 
-        pool = load_pool(provider)
+        pool = load_pool(
+            provider,
+            **({"read_only": True} if read_only else {}),
+        )
         if pool.has_credentials():
             return pool.has_available()
     except Exception:
@@ -2468,6 +2504,7 @@ def list_authenticated_providers(
     probe_current_custom_provider: bool = False,
     for_picker: bool = False,
     excluded_providers: list | None = None,
+    allow_network: bool = True,
 ) -> List[dict]:
     """Detect which providers have credentials and list their curated models.
 
@@ -2517,6 +2554,58 @@ def list_authenticated_providers(
         _MODELS_DEV_PREFERRED, _merge_with_models_dev, cached_provider_model_ids,
         clear_provider_models_cache, get_curated_nous_model_ids,
     )
+
+    if not allow_network:
+        from hermes_cli.auth import _load_auth_store
+
+        store = _load_auth_store()
+        raw_states = store.get("providers")
+        states = raw_states if isinstance(raw_states, dict) else {}
+        raw_pool_map = store.get("credential_pool")
+        raw_pools = (
+            raw_pool_map
+            if isinstance(raw_pool_map, dict)
+            else {}
+        )
+        slugs = {
+            str(current_provider or "").strip().lower(),
+            *(
+                slug
+                for slug, config in PROVIDER_REGISTRY.items()
+                if any(os.environ.get(name, "").strip() for name in config.api_key_env_vars)
+                or isinstance(states.get(slug), dict)
+                or _credential_pool_is_usable(
+                    slug,
+                    raw_pool_present=bool(raw_pools.get(slug)),
+                    read_only=True,
+                )
+            ),
+        }
+        slugs.discard("")
+        for slug, entry in (user_providers or {}).items():
+            if isinstance(entry, dict) and entry.get("enabled", True) is not False:
+                slugs.add(str(slug).strip().lower())
+        custom_names = {
+            custom_provider_slug(str(entry.get("name") or ""))
+            for entry in (custom_providers or [])
+            if isinstance(entry, dict)
+            and str(entry.get("name") or "").strip()
+            and str(entry.get("base_url") or entry.get("url") or entry.get("api") or "").strip()
+        }
+        slugs.update(custom_names)
+        excluded = {str(item).strip().lower() for item in (excluded_providers or [])}
+        return [
+            {
+                "slug": slug,
+                "name": get_label(slug, allow_network=False),
+                "is_current": slug == str(current_provider or "").strip().lower(),
+                "is_user_defined": slug in (user_providers or {}) or slug in custom_names,
+                "models": [],
+                "total_models": 0,
+                "source": "user-config" if slug in (user_providers or {}) or slug in custom_names else "built-in",
+            }
+            for slug in sorted(slugs - excluded)
+        ]
 
     # Explicit refresh: drop every provider's cached model-id list so the
     # cached_provider_model_ids() calls below all re-fetch live. Without this

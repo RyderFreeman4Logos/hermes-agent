@@ -2447,6 +2447,8 @@ def detect_static_provider_for_model(
 def detect_provider_for_model(
     model_name: str,
     current_provider: str,
+    *,
+    allow_network: bool = True,
 ) -> Optional[tuple[str, str]]:
     """Auto-detect the best provider for a model name.
 
@@ -2471,7 +2473,7 @@ def detect_provider_for_model(
 
     # --- Step 2: check OpenRouter catalog ---
     # First try exact match (handles provider/model format)
-    or_slug = _find_openrouter_slug(name)
+    or_slug = _find_openrouter_slug(name, allow_network=allow_network)
     if or_slug:
         if current_provider != "openrouter":
             return ("openrouter", or_slug)
@@ -2483,7 +2485,11 @@ def detect_provider_for_model(
     return None
 
 
-def _find_openrouter_slug(model_name: str) -> Optional[str]:
+def _find_openrouter_slug(
+    model_name: str,
+    *,
+    allow_network: bool = True,
+) -> Optional[str]:
     """Find the full OpenRouter model slug for a bare or partial model name.
 
     Handles:
@@ -2495,13 +2501,15 @@ def _find_openrouter_slug(model_name: str) -> Optional[str]:
     if not name_lower:
         return None
 
+    catalog = model_ids() if allow_network else _provider_catalog_names("openrouter")
+
     # Exact match (already has provider/ prefix)
-    for mid in model_ids():
+    for mid in catalog:
         if name_lower == mid.lower():
             return mid
 
     # Try matching just the model part (after the /)
-    for mid in model_ids():
+    for mid in catalog:
         if "/" in mid:
             _, model_part = mid.split("/", 1)
             if name_lower == model_part.lower():

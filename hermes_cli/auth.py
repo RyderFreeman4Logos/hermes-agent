@@ -51,7 +51,7 @@ from hermes_cli.config import (
 )
 from hermes_constants import OPENROUTER_BASE_URL, secure_parent_dir
 from agent.credential_persistence import sanitize_borrowed_credential_payload
-from utils import atomic_replace, atomic_yaml_write, env_float, is_truthy_value
+from utils import atomic_replace, atomic_yaml_write, env_float, env_int, is_truthy_value
 
 logger = logging.getLogger(__name__)
 
@@ -585,11 +585,16 @@ def has_usable_secret(value: Any, *, min_length: int = 4) -> bool:
 
 
 def _resolve_api_key_provider_secret(
-    provider_id: str, pconfig: ProviderConfig
+    provider_id: str,
+    pconfig: ProviderConfig,
+    *,
+    allow_network: bool = True,
 ) -> tuple[str, str]:
     """Resolve an API-key provider's token and indicate where it came from."""
     if provider_id == "copilot":
         # Use the dedicated copilot auth module for proper token validation
+        if not allow_network:
+            return "", ""
         try:
             from hermes_cli.copilot_auth import resolve_copilot_token, get_copilot_api_token
             token, source = resolve_copilot_token()
@@ -614,7 +619,8 @@ def _resolve_api_key_provider_secret(
     # Fallback: try credential pool (e.g. zai key stored via auth.json)
     try:
         from agent.credential_pool import load_pool
-        pool = load_pool(provider_id)
+        pool_kwargs: Dict[str, Any] = {} if allow_network else {"read_only": True}
+        pool = load_pool(provider_id, **pool_kwargs)
         if pool and pool.has_credentials():
             entry = pool.peek()
             if entry:
@@ -2590,6 +2596,7 @@ def resolve_qwen_runtime_credentials(
     force_refresh: bool = False,
     refresh_if_expiring: bool = True,
     refresh_skew_seconds: int = QWEN_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
+    allow_network: bool = True,
 ) -> Dict[str, Any]:
     tokens = _read_qwen_cli_tokens()
     access_token = str(tokens.get("access_token", "") or "").strip()
@@ -2597,6 +2604,12 @@ def resolve_qwen_runtime_credentials(
     if not should_refresh and refresh_if_expiring:
         should_refresh = _qwen_access_token_is_expiring(tokens.get("expiry_date"), refresh_skew_seconds)
     if should_refresh:
+        if not allow_network:
+            raise AuthError(
+                "Qwen OAuth access token requires refresh; deferred model switching is local-only.",
+                provider="qwen-oauth",
+                code="qwen_refresh_required",
+            )
         tokens = _refresh_qwen_cli_tokens(tokens)
         access_token = str(tokens.get("access_token", "") or "").strip()
     if not access_token:
@@ -3853,6 +3866,7 @@ def resolve_codex_runtime_credentials(
     force_refresh: bool = False,
     refresh_if_expiring: bool = True,
     refresh_skew_seconds: int = CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
+    allow_network: bool = True,
 ) -> Dict[str, Any]:
     """Resolve runtime credentials from Hermes's own Codex token store.
 
@@ -3870,7 +3884,7 @@ def resolve_codex_runtime_credentials(
         data = _read_codex_tokens()
     except AuthError as exc:
         read_error = exc
-        if getattr(exc, "relogin_required", False) and getattr(exc, "code", None) in {
+        if allow_network and getattr(exc, "relogin_required", False) and getattr(exc, "code", None) in {
             "codex_auth_missing_access_token",
             "codex_auth_missing_refresh_token",
             "codex_auth_invalid_shape",
@@ -3884,6 +3898,15 @@ def resolve_codex_runtime_credentials(
             data = None
 
     if data is None:
+        if not allow_network:
+            if read_error is not None:
+                raise read_error
+            raise AuthError(
+                "No locally usable Codex credentials are cached.",
+                provider="openai-codex",
+                code="codex_auth_missing",
+                relogin_required=True,
+            )
         pool_token = _pool_codex_access_token()
         if pool_token:
             base_url = (
@@ -3963,6 +3986,12 @@ def resolve_codex_runtime_credentials(
     if (not should_refresh) and refresh_if_expiring:
         should_refresh = _codex_access_token_is_expiring(access_token, refresh_skew_seconds)
     if should_refresh:
+        if not allow_network:
+            raise AuthError(
+                "Codex access token requires refresh; deferred model switching is local-only.",
+                provider="openai-codex",
+                code="codex_refresh_required",
+            )
         # Re-read under lock to avoid racing with other Hermes processes
         with _auth_store_lock(timeout_seconds=max(float(AUTH_LOCK_TIMEOUT_SECONDS), refresh_timeout_seconds + 5.0)):
             data = _read_codex_tokens(_lock=False)
@@ -4832,6 +4861,7 @@ def resolve_xai_oauth_runtime_credentials(
     force_refresh: bool = False,
     refresh_if_expiring: bool = True,
     refresh_skew_seconds: Optional[int] = None,
+    allow_network: bool = True,
 ) -> Dict[str, Any]:
     data = _read_xai_oauth_tokens()
     tokens = dict(data["tokens"])
@@ -4850,6 +4880,12 @@ def resolve_xai_oauth_runtime_credentials(
     if (not should_refresh) and refresh_if_expiring:
         should_refresh = _xai_access_token_is_expiring(access_token, effective_skew)
     if should_refresh:
+        if not allow_network:
+            raise AuthError(
+                "xAI OAuth access token requires refresh; deferred model switching is local-only.",
+                provider="xai-oauth",
+                code="xai_refresh_required",
+            )
         with _auth_store_lock(timeout_seconds=max(float(AUTH_LOCK_TIMEOUT_SECONDS), refresh_timeout_seconds + 5.0)):
             data = _read_xai_oauth_tokens(_lock=False)
             tokens = dict(data["tokens"])
@@ -6000,6 +6036,7 @@ def resolve_nous_runtime_credentials(
     insecure: Optional[bool] = None,
     ca_bundle: Optional[str] = None,
     force_refresh: bool = False,
+    allow_network: bool = True,
 ) -> Dict[str, Any]:
     """
     Resolve Nous inference credentials for runtime use.
@@ -6010,6 +6047,28 @@ def resolve_nous_runtime_credentials(
     Returns dict with: provider, base_url, api_key, key_id, expires_at,
     expires_in, source ("invoke_jwt"), and auth_path.
     """
+    if not allow_network:
+        state = get_provider_auth_state("nous") or {}
+        min_ttl = max(60, env_int("HERMES_NOUS_MIN_KEY_TTL_SECONDS", 1800))
+        if not _agent_key_is_usable(state, min_ttl):
+            raise AuthError(
+                "Nous inference token requires refresh; deferred model switching is local-only.",
+                provider="nous",
+                code="nous_refresh_required",
+            )
+        return {
+            "provider": "nous",
+            "base_url": (
+                _nous_inference_env_override()
+                or str(state.get("inference_base_url") or DEFAULT_NOUS_INFERENCE_URL)
+            ).rstrip("/"),
+            "api_key": str(state.get("agent_key") or "").strip(),
+            "key_id": state.get("agent_key_id") or state.get("key_id"),
+            "expires_at": state.get("agent_key_expires_at") or state.get("expires_at"),
+            "source": "cached_invoke_jwt",
+            "auth_path": str(_auth_file_path()),
+        }
+
     sequence_id = uuid.uuid4().hex[:12]
 
     with _provider_state_transaction("nous") as (
@@ -6932,7 +6991,11 @@ def _get_azure_foundry_auth_status() -> Dict[str, Any]:
     return info
 
 
-def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
+def resolve_api_key_provider_credentials(
+    provider_id: str,
+    *,
+    allow_network: bool = True,
+) -> Dict[str, Any]:
     """Resolve API key and base URL for an API-key provider.
 
     Returns dict with: provider, api_key, base_url, source.
@@ -6947,7 +7010,11 @@ def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
 
     api_key = ""
     key_source = ""
-    api_key, key_source = _resolve_api_key_provider_secret(provider_id, pconfig)
+    api_key, key_source = _resolve_api_key_provider_secret(
+        provider_id,
+        pconfig,
+        **({} if allow_network else {"allow_network": False}),
+    )
 
     # No-auth LM Studio: substitute a placeholder so runtime / auxiliary_client
     # see the local server as configured. doctor still reports unconfigured
@@ -6977,7 +7044,7 @@ def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
                 get_copilot_api_token,
             )
             raw_token, _ = resolve_copilot_token()
-            if raw_token:
+            if raw_token and allow_network:
                 _, resolved = get_copilot_api_token(raw_token)
                 resolved = (resolved or "").strip()
                 if resolved:
@@ -8416,6 +8483,7 @@ def build_minimax_oauth_token_provider() -> Callable[[], str]:
 def resolve_minimax_oauth_runtime_credentials(
     *, min_token_ttl_seconds: int = MINIMAX_OAUTH_REFRESH_SKEW_SECONDS,
     as_token_provider: bool = False,
+    allow_network: bool = True,
 ) -> Dict[str, Any]:
     """Return {provider, api_key, base_url, source} for minimax-oauth.
 
@@ -8437,11 +8505,23 @@ def resolve_minimax_oauth_runtime_credentials(
             "MiniMax (OAuth).",
             provider="minimax-oauth", code="not_logged_in", relogin_required=True,
         )
-    try:
-        state = _refresh_minimax_oauth_state(state)
-    except AuthError as exc:
-        _minimax_oauth_quarantine_on_terminal_refresh(state, exc)
-        raise
+    if allow_network:
+        try:
+            state = _refresh_minimax_oauth_state(state)
+        except AuthError as exc:
+            _minimax_oauth_quarantine_on_terminal_refresh(state, exc)
+            raise
+    else:
+        try:
+            expires_at = datetime.fromisoformat(str(state.get("expires_at") or ""))
+            if expires_at.timestamp() <= time.time() + max(0, min_token_ttl_seconds):
+                raise ValueError
+        except (TypeError, ValueError):
+            raise AuthError(
+                "MiniMax OAuth access token requires refresh; deferred model switching is local-only.",
+                provider="minimax-oauth",
+                code="minimax_refresh_required",
+            ) from None
     if as_token_provider:
         api_key: Any = build_minimax_oauth_token_provider()
     else:

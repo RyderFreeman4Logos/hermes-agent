@@ -7062,7 +7062,6 @@ class AIAgent:
         persist_user_display_metadata: Optional[Dict[str, Any]] = None,
         moa_config: Optional[dict[str, Any]] = None,
         turn_origin: str = "user",
-        allow_silent_noop: bool = False,
         heartbeat_event: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
@@ -7176,9 +7175,6 @@ class AIAgent:
                     persist_user_display_kind=persist_user_display_kind,
                     persist_user_display_metadata=persist_user_display_metadata,
                     moa_config=moa_config,
-                    turn_origin=turn_origin,
-                    allow_silent_noop=allow_silent_noop,
-                    heartbeat_event=heartbeat_event,
                 )
             terminal = result if isinstance(result, dict) else {}
             if terminal.get("interrupted") is True:
@@ -7253,8 +7249,6 @@ class AIAgent:
         messages: List[Dict[str, Any]],
         effective_task_id: str,
         should_review_memory: bool = False,
-        turn_origin: str = "user",
-        allow_silent_noop: bool = False,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.codex_runtime.run_codex_app_server_turn``."""
         from agent.codex_runtime import run_codex_app_server_turn
@@ -7265,8 +7259,6 @@ class AIAgent:
             messages=messages,
             effective_task_id=effective_task_id,
             should_review_memory=should_review_memory,
-            turn_origin=turn_origin,
-            allow_silent_noop=allow_silent_noop,
         )
 
 def main(

@@ -2779,6 +2779,7 @@ class BasePlatformAdapter(ABC):
         self._active_sessions: Dict[str, asyncio.Event] = {}
         self._pending_messages: Dict[str, MessageEvent] = {}
         self._session_tasks: Dict[str, asyncio.Task] = {}
+        self._pending_drain_owners: Dict[str, Any] = {}
         # Legacy busy_text_mode env var; when unset the runner syncs the
         # resolved value (driven by busy_input_mode) onto the adapter after
         # construction (gateway/run.py). Default to "interrupt" so a stray
@@ -5449,6 +5450,9 @@ class BasePlatformAdapter(ABC):
         command was running — spawns a fresh processing task for it.
         """
         await self._flush_text_debounce_now(session_key)
+        if session_key in self._pending_drain_owners:
+            self._release_session_guard(session_key, guard=command_guard)
+            return
         pending_event = self._pending_messages.pop(session_key, None)
         self._release_session_guard(session_key, guard=command_guard)
         if pending_event is None:
@@ -6278,7 +6282,10 @@ class BasePlatformAdapter(ABC):
             await self._flush_text_debounce_now(session_key)
 
             # Check if there's a pending message that was queued during our processing
-            if session_key in self._pending_messages:
+            if (
+                session_key in self._pending_messages
+                and session_key not in self._pending_drain_owners
+            ):
                 pending_event = self._pending_messages.pop(session_key)
                 logger.debug("[%s] Processing queued follow-up message", self.name)
                 # Keep the _active_sessions entry live across the turn chain
@@ -6402,7 +6409,11 @@ class BasePlatformAdapter(ABC):
             # busy-handler path.  Without this block, we would delete the
             # active-session entry and the queued message would be silently
             # dropped (user never gets a reply).
-            late_pending = self._pending_messages.pop(session_key, None)
+            late_pending = (
+                None
+                if session_key in self._pending_drain_owners
+                else self._pending_messages.pop(session_key, None)
+            )
             if late_pending is not None:
                 current_task = asyncio.current_task()
                 existing_task = self._session_tasks.get(session_key)
@@ -6538,6 +6549,7 @@ class BasePlatformAdapter(ABC):
         except Exception:
             pass
         self._pending_messages.clear()
+        self._pending_drain_owners.clear()
         self._active_sessions.clear()
         for state in list(self._text_debounce_store().values()):
             if state.task is not None and not state.task.done():

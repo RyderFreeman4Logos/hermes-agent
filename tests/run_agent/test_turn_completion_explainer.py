@@ -26,6 +26,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from agent.copilot_acp_client import CopilotACPClient
 from run_agent import AIAgent
 
 
@@ -186,7 +187,6 @@ def test_heartbeat_silent_noop_leaves_no_durable_or_live_history(heartbeat_event
             "[HEARTBEAT] target remains ALIVE",
             conversation_history=history,
             turn_origin="heartbeat_warm",
-            allow_silent_noop=True,
             heartbeat_event=heartbeat_event,
         )
 
@@ -240,7 +240,6 @@ def test_heartbeat_uses_one_provider_response_with_tools_disabled_on_wire(
             "[HEARTBEAT] inspect target",
             conversation_history=history,
             turn_origin="heartbeat_warm",
-            allow_silent_noop=True,
             heartbeat_event=heartbeat_event,
         )
 
@@ -273,7 +272,6 @@ def test_heartbeat_matches_ordinary_effective_cache_prefix(heartbeat_event):
     heartbeat = agent.run_conversation(
         "[HEARTBEAT] inspect target",
         turn_origin="heartbeat_warm",
-        allow_silent_noop=True,
         heartbeat_event=heartbeat_event,
     )
     heartbeat_request = agent.client.chat.completions.create.call_args.kwargs
@@ -315,7 +313,6 @@ def test_heartbeat_skips_provider_at_compression_or_hard_limit(
         result = agent.run_conversation(
             "[HEARTBEAT] inspect target",
             turn_origin="heartbeat_warm",
-            allow_silent_noop=True,
             heartbeat_event=heartbeat_event,
         )
 
@@ -345,8 +342,7 @@ def test_real_caller_activity_resets_heartbeat_deadline(heartbeat_event):
             agent.run_conversation(
                 "[HEARTBEAT] inspect target",
                 turn_origin="heartbeat_warm",
-                allow_silent_noop=True,
-                heartbeat_event=heartbeat_event,
+                    heartbeat_event=heartbeat_event,
             )
             agent.run_conversation("real user turn")
     finally:
@@ -378,7 +374,6 @@ def test_heartbeat_early_error_leaves_no_unmatched_synthetic_user_row(
             "[HEARTBEAT] inspect target",
             conversation_history=history,
             turn_origin="heartbeat_warm",
-            allow_silent_noop=True,
             heartbeat_event=heartbeat_event,
         )
 
@@ -405,7 +400,6 @@ def test_heartbeat_bypasses_ordinary_lifecycle_hooks(heartbeat_event):
         result = agent.run_conversation(
             "[HEARTBEAT] inspect target",
             turn_origin="heartbeat_warm",
-            allow_silent_noop=True,
             heartbeat_event=heartbeat_event,
         )
 
@@ -444,7 +438,6 @@ def test_heartbeat_does_not_consume_user_maintenance_triggers(heartbeat_event):
         agent.run_conversation(
             "[HEARTBEAT] inspect target",
             turn_origin="heartbeat_warm",
-            allow_silent_noop=True,
             heartbeat_event=heartbeat_event,
         )
         assert agent._user_turn_count == 9
@@ -544,7 +537,6 @@ def test_heartbeat_malformed_response_never_retries_or_falls_back(heartbeat_even
         result = agent.run_conversation(
             "[HEARTBEAT] inspect target",
             turn_origin="heartbeat_warm",
-            allow_silent_noop=True,
             heartbeat_event=heartbeat_event,
         )
 
@@ -568,7 +560,6 @@ def test_heartbeat_skips_moa_fanout(heartbeat_event):
         result = agent.run_conversation(
             "[HEARTBEAT] inspect target",
             turn_origin="heartbeat_warm",
-            allow_silent_noop=True,
             heartbeat_event=heartbeat_event,
         )
 
@@ -593,7 +584,6 @@ def test_anthropic_heartbeat_skips_without_any_transport_or_fallback(
         result = agent.run_conversation(
             "[HEARTBEAT] inspect target",
             turn_origin="heartbeat_warm",
-            allow_silent_noop=True,
             heartbeat_event=heartbeat_event,
         )
 
@@ -614,7 +604,6 @@ def test_copilot_acp_heartbeat_skips_without_transport_dispatch(heartbeat_event)
     result = agent.run_conversation(
         "[HEARTBEAT] inspect target",
         turn_origin="heartbeat_warm",
-        allow_silent_noop=True,
         heartbeat_event=heartbeat_event,
     )
 
@@ -680,8 +669,7 @@ def test_heartbeat_skips_provider_switched_during_final_target_inspection(
             agent.run_conversation(
                 "[HEARTBEAT] inspect target",
                 turn_origin="heartbeat_warm",
-                allow_silent_noop=True,
-                heartbeat_event=event,
+                    heartbeat_event=event,
             )
         )
     )
@@ -727,7 +715,6 @@ def test_heartbeat_revalidates_generation_at_provider_boundary(
         result = agent.run_conversation(
             "[HEARTBEAT] inspect target",
             turn_origin="heartbeat_warm",
-            allow_silent_noop=True,
             heartbeat_event=heartbeat_event,
         )
 
@@ -749,7 +736,6 @@ def test_heartbeat_never_enters_request_middleware(heartbeat_event):
         result = agent.run_conversation(
             "[HEARTBEAT] inspect target",
             turn_origin="heartbeat_warm",
-            allow_silent_noop=True,
             heartbeat_event=heartbeat_event,
         )
 
@@ -769,7 +755,6 @@ def test_unhealthy_heartbeat_is_structured_visible_without_model_call(
     result = agent.run_conversation(
         "[HEARTBEAT] inspect target",
         turn_origin="heartbeat_warm",
-        allow_silent_noop=False,
         heartbeat_event=heartbeat_event,
     )
 
@@ -800,9 +785,41 @@ def test_heartbeat_completion_preserves_unowned_marker_and_history(heartbeat_eve
             "[HEARTBEAT] inspect target",
             conversation_history=heartbeat_history,
             turn_origin="heartbeat_warm",
-            allow_silent_noop=True,
             heartbeat_event=heartbeat_event,
         )
 
     assert agent._inflight_turn_id == "ordinary-turn"
     assert agent._session_messages is ordinary_history
+
+
+def test_heartbeat_skips_custom_alias_resolved_to_copilot_acp(heartbeat_event):
+    agent = _make_agent()
+    agent.provider = "custom"
+    agent.base_url = "acp://copilot"
+    acp_client = CopilotACPClient(base_url=agent.base_url)
+    acp_client._run_prompt = MagicMock(return_value=("", ""))
+    agent.client = acp_client
+
+    result = agent.run_conversation(
+        "[HEARTBEAT] inspect target",
+        turn_origin="heartbeat_warm",
+        heartbeat_event=heartbeat_event,
+    )
+
+    assert result["silent_noop"] is True
+    acp_client._run_prompt.assert_not_called()
+
+
+def test_heartbeat_allows_supported_custom_openai_transport(heartbeat_event):
+    agent = _make_agent()
+    agent.provider = "custom"
+    agent.base_url = "https://custom.invalid/v1"
+
+    result = agent.run_conversation(
+        "[HEARTBEAT] inspect target",
+        turn_origin="heartbeat_warm",
+        heartbeat_event=heartbeat_event,
+    )
+
+    assert result["silent_noop"] is True
+    agent.client.chat.completions.create.assert_called_once()

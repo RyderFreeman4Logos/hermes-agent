@@ -13711,7 +13711,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         persist_user_message=_persist_clean_user_message,
                         moa_config=_moa_cfg,
                         turn_origin="heartbeat_warm" if heartbeat_warm else "user",
-                        allow_silent_noop=heartbeat_warm,
                         heartbeat_event=heartbeat_event,
                     )
                     if getattr(self, "_pending_moa_disable_after_turn", False):

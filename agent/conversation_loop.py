@@ -1275,6 +1275,46 @@ def _notify_context_engine_turn_complete(
         )
 
 
+def _record_runtime_provider_activity(
+    agent,
+    activity_at: float,
+    *,
+    caller_id: str | None = None,
+    provider: str | None = None,
+    cache_context: str | None = None,
+) -> None:
+    """Rearm only the cache group reached by a successful provider call."""
+    if caller_id is None and getattr(agent, "_delegate_depth", 0):
+        return
+    try:
+        from tools.approval import get_current_session_key
+        from tools.runtime_heartbeat import (
+            canonical_runtime_cache_context_identity,
+            canonical_runtime_provider_identity,
+            runtime_heartbeat,
+        )
+
+        owner = caller_id or (get_current_session_key(default="") or "")
+        if not owner:
+            return
+        runtime_heartbeat.reset_for_caller(
+            owner,
+            provider=(
+                provider
+                if provider is not None
+                else canonical_runtime_provider_identity(agent)
+            ),
+            cache_context=(
+                cache_context
+                if cache_context is not None
+                else canonical_runtime_cache_context_identity(agent)
+            ),
+            activity_at=activity_at,
+        )
+    except Exception:
+        logger.debug("Could not reset exact heartbeat cache lease", exc_info=True)
+
+
 def run_heartbeat_warm(
     agent,
     user_message: Any,
@@ -1330,13 +1370,20 @@ def run_heartbeat_warm(
     base_url = str(getattr(agent, "base_url", "") or "").lower()
     dispatch_client = agent.client
     from agent.copilot_acp_client import CopilotACPClient
+    from agent.gemini_native_adapter import GeminiNativeClient
 
     if (
         status != "ALIVE"
         or moa_config is not None
-        or provider in {"copilot-acp", "moa", "openai-codex"}
+        or provider in {
+            "anthropic",
+            "copilot-acp",
+            "gemini",
+            "moa",
+            "openai-codex",
+        }
         or base_url.startswith(("acp://copilot", "acp+tcp://"))
-        or isinstance(dispatch_client, CopilotACPClient)
+        or isinstance(dispatch_client, (CopilotACPClient, GeminiNativeClient))
         or api_mode != "chat_completions"
     ):
         return finish(silent=True)
@@ -1436,10 +1483,19 @@ def run_heartbeat_warm(
         return finish(silent=True)
 
     api_calls = 1
+    dispatch_started_at = time.monotonic()
     try:
         dispatch_client.chat.completions.create(**api_kwargs)
     except Exception:
         logger.debug("Isolated heartbeat warm attempt failed", exc_info=True)
+    else:
+        _record_runtime_provider_activity(
+            agent,
+            dispatch_started_at,
+            caller_id=str(heartbeat_event.get("session_key") or ""),
+            provider=str(heartbeat_event.get("provider") or ""),
+            cache_context=str(heartbeat_event.get("cache_context") or ""),
+        )
     return finish(silent=True)
 
 
@@ -2588,7 +2644,11 @@ def run_conversation(
                     if isinstance(getattr(agent, "client", None), Mock):
                         _use_streaming = False
 
+                provider_dispatch_started_at = None
+                provider_dispatch_context = None
+
                 def _perform_api_call(next_api_kwargs):
+                    nonlocal provider_dispatch_started_at, provider_dispatch_context
                     if agent.api_mode == "codex_responses":
                         next_api_kwargs = agent._get_transport().preflight_kwargs(
                             next_api_kwargs,
@@ -2596,6 +2656,16 @@ def run_conversation(
                             is_github_responses=agent._is_copilot_url(),
                             sanitize_harmony_tokens=agent._is_codex_backend(),
                         )
+                    from tools.runtime_heartbeat import (
+                        canonical_runtime_cache_context_identity,
+                        canonical_runtime_provider_identity,
+                    )
+
+                    provider_dispatch_started_at = time.monotonic()
+                    provider_dispatch_context = (
+                        canonical_runtime_provider_identity(agent),
+                        canonical_runtime_cache_context_identity(agent),
+                    )
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
                             next_api_kwargs, on_first_delta=_stop_spinner
@@ -2951,6 +3021,16 @@ def run_conversation(
                         break  # rebuild this iteration from the correction
                     continue  # Retry the API call
 
+                if (
+                    provider_dispatch_started_at is not None
+                    and provider_dispatch_context is not None
+                ):
+                    _record_runtime_provider_activity(
+                        agent,
+                        provider_dispatch_started_at,
+                        provider=provider_dispatch_context[0],
+                        cache_context=provider_dispatch_context[1],
+                    )
                 agent._turn_received_provider_response = True
 
                 # Check finish_reason before proceeding

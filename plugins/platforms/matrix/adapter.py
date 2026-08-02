@@ -2594,6 +2594,7 @@ class MatrixAdapter(BasePlatformAdapter):
         session_key: str,
         on_model_selected,
         metadata: Optional[Dict[str, Any]] = None,
+        pending_model_switch: str = "",
     ) -> SendResult:
         """Send a Matrix reaction-based model picker."""
         if not self._client:
@@ -2633,9 +2634,13 @@ class MatrixAdapter(BasePlatformAdapter):
             "⚙ **Model Configuration**",
             f"Current model: `{current_model or 'unknown'}`",
             f"Provider: {provider_label or 'unknown'}",
-            "",
-            "React to choose a model:",
         ]
+        if pending_model_switch:
+            lines.append(
+                "Pending after the next successful compression: "
+                f"`{pending_model_switch}`"
+            )
+        lines.extend(("", "React to choose a model:"))
         choices: dict[str, tuple[str, str]] = {}
         for emoji, model_id, provider_slug, provider_name in flat_choices:
             choices[emoji] = (model_id, provider_slug)

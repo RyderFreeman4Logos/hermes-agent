@@ -784,6 +784,8 @@ def model_switch_after_compression_transaction(
         )
         try:
             yield transaction
+            if callable(callback):
+                callback(result, old_model, old_provider)
         except Exception as exc:
             restore_model_runtime_for_rollback(agent, runtime_snapshot)
             setattr(agent, "_session_init_model_config", old_config)
@@ -813,11 +815,6 @@ def model_switch_after_compression_transaction(
             "model": result.new_model,
             "provider": result.target_provider,
         }
-        if callable(callback):
-            try:
-                callback(result, old_model, old_provider)
-            except Exception:
-                logger.exception("deferred model-switch frontend sync failed")
         _emit_deferred_model_switch_status(
             agent,
             "Deferred model switch applied after compression: "
@@ -2120,30 +2117,21 @@ def switch_model(
     new_model = normalize_model_for_provider(new_model, target_provider)
 
     # --- Validate ---
-    if validate_live:
-        try:
-            validation = validate_requested_model(
-                new_model,
-                target_provider,
-                api_key=api_key,
-                base_url=base_url,
-                api_mode=api_mode or None,
-            )
-        except Exception as e:
-            validation = {
-                "accepted": False,
-                "persist": False,
-                "recognized": False,
-                "message": f"Could not validate `{new_model}`: {e}",
-            }
-    else:
-        # Deferred scheduling may resolve metadata and credentials, but it must
-        # not probe either live provider. Static/config routing above is enough.
+    try:
+        validation = validate_requested_model(
+            new_model,
+            target_provider,
+            api_key=api_key,
+            base_url=base_url,
+            api_mode=api_mode or None,
+            allow_network=validate_live,
+        )
+    except Exception as e:
         validation = {
-            "accepted": True,
-            "persist": True,
-            "recognized": True,
-            "message": "",
+            "accepted": False,
+            "persist": False,
+            "recognized": False,
+            "message": f"Could not validate `{new_model}`: {e}",
         }
 
     # Override rejection if model is in the user's saved provider config.
@@ -2239,11 +2227,18 @@ def switch_model(
         from hermes_cli.models import normalize_opencode_base_url
         base_url = normalize_opencode_base_url(target_provider, api_mode, base_url)
 
-    # --- Get capabilities (legacy) ---
-    capabilities = get_model_capabilities(target_provider, new_model)
+    # Deferred resolution may read the local models.dev cache but never refresh it.
+    capabilities = get_model_capabilities(
+        target_provider,
+        new_model,
+        allow_network=validate_live,
+    )
 
-    # --- Get full model info from models.dev ---
-    model_info = get_model_info(target_provider, new_model)
+    model_info = get_model_info(
+        target_provider,
+        new_model,
+        allow_network=validate_live,
+    )
 
     # --- Collect warnings ---
     warnings: list[str] = []

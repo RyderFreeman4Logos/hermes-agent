@@ -255,3 +255,121 @@ async def test_gateway_deferred_switch_waits_for_compression_boundary(
     assert restarted._session_model_overrides[session_key]["model"] == (
         "openai/gpt-5.5-pro"
     )
+
+
+@pytest.mark.asyncio
+async def test_gateway_deferred_persistence_failure_rolls_back_and_keeps_pending(
+    tmp_path, monkeypatch
+):
+    from hermes_state import SessionDB
+
+    _setup_isolated_home(tmp_path, monkeypatch, warn=False)
+    runner = _make_runner()
+
+    class _Agent:
+        def __init__(self, db):
+            self.model = "old-model"
+            self.provider = "openrouter"
+            self.base_url = "https://old.example/v1"
+            self.api_key = "old-key"
+            self.api_mode = "chat_completions"
+            self.session_id = "gateway-deferred-failure"
+            self._session_db = db
+            self._session_init_model_config = {"provider": "openrouter"}
+            self._cached_system_prompt = "old prompt"
+
+        def switch_model(
+            self,
+            new_model,
+            new_provider,
+            api_key="",
+            base_url="",
+            api_mode="",
+        ):
+            self.model = new_model
+            self.provider = new_provider
+            self.api_key = api_key
+            self.base_url = base_url
+            self.api_mode = api_mode
+            self._cached_system_prompt = "new prompt"
+
+    class _FailingStore:
+        def set_model_override(self, _key, _override):
+            raise OSError("injected override persistence failure")
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session(
+        "gateway-deferred-failure",
+        "cli",
+        model="old-model",
+        model_config={"provider": "openrouter"},
+        system_prompt="old prompt",
+    )
+    agent = _Agent(db)
+    runner._agent_cache = {}
+    runner._agent_cache_lock = __import__("threading").Lock()
+    runner._session_db = None
+    runner.session_store = _FailingStore()
+    runner._evict_cached_agent = lambda _key: None
+    event = _make_event(
+        "/model openai/gpt-5.5-pro --after-compression --provider openrouter"
+    )
+    session_key = runner._session_key_for_source(event.source)
+    runner._agent_cache[session_key] = (agent, None)
+
+    try:
+        reply = await runner._handle_model_command(event)
+        assert "successful compression" in reply
+
+        assert apply_model_switch_after_compression(agent) == "failed"
+        row = db.get_session("gateway-deferred-failure")
+        assert (agent.model, row["model"]) == ("old-model", "old-model")
+        assert get_model_switch_after_compression(agent) is not None
+        state = runner._session_state(session_key).conversation
+        assert state.after_compression_model_switch is not None
+        assert state.model_override is None
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_gateway_model_picker_exposes_pending_deferred_route(
+    tmp_path, monkeypatch
+):
+    _setup_isolated_home(tmp_path, monkeypatch, warn=False)
+    runner = _make_runner()
+    captured = {}
+
+    class _Picker:
+        async def send_model_picker(self, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(success=True)
+
+    picker = _Picker()
+    runner._normalize_source_for_session_key = lambda source: source
+    runner._adapter_for_source = lambda _source: picker
+    runner._thread_metadata_for_source = lambda *_args: {}
+    runner._reply_anchor_for_event = lambda _event: None
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.list_picker_providers",
+        lambda **_kwargs: [
+            {
+                "slug": "openrouter",
+                "name": "OpenRouter",
+                "is_current": True,
+                "models": ["old-model"],
+                "total_models": 1,
+            }
+        ],
+    )
+    event = _make_event("/model")
+    session_key = runner._session_key_for_source(event.source)
+    runner._after_compression_model_switches[session_key] = SimpleNamespace(
+        new_model="next-model",
+        target_provider="anthropic",
+        provider_label="Anthropic",
+    )
+
+    assert await runner._handle_model_command(event) is None
+    assert "next-model" in captured["pending_model_switch"]
+    assert "Anthropic" in captured["pending_model_switch"]

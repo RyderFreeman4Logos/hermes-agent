@@ -62,23 +62,47 @@ def test_after_compression_allows_explicit_session_scope():
     assert request.errors == ()
 
 
-def test_deferred_resolution_does_not_probe_provider(monkeypatch):
-    def fail_live_validation(*_args, **_kwargs):
-        raise AssertionError("live provider validation")
+def test_deferred_resolution_runs_local_validation_without_provider_discovery(
+    monkeypatch,
+):
+    def fail_network_discovery(*_args, **_kwargs):
+        raise AssertionError("network model discovery")
+
+    def cache_only_models_dev(*_args, **kwargs):
+        assert kwargs.get("allow_network") is False
+        return {}
 
     monkeypatch.setattr(
-        "hermes_cli.models.validate_requested_model",
-        fail_live_validation,
+        "hermes_cli.models.provider_model_ids",
+        fail_network_discovery,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.models.fetch_api_models",
+        fail_network_discovery,
+    )
+    monkeypatch.setattr(
+        "agent.models_dev.fetch_models_dev",
+        cache_only_models_dev,
     )
 
-    result = switch_model(
-        raw_input="openai/gpt-4o-mini",
-        current_provider="openrouter",
-        current_model="old-model",
-        current_base_url="https://openrouter.ai/api/v1",
-        current_api_key="secret",
+    invalid = switch_model(
+        raw_input="qwen3.5-4b",
+        current_provider="openai-codex",
+        current_model="gpt-5.4",
+        current_base_url="https://chatgpt.com/backend-api/codex",
+        current_api_key="test-token",
+        validate_live=False,
+    )
+    valid = switch_model(
+        raw_input="gpt-5.4",
+        current_provider="openai-codex",
+        current_model="gpt-5.3-codex",
+        current_base_url="https://chatgpt.com/backend-api/codex",
+        current_api_key="test-token",
         validate_live=False,
     )
 
-    assert result.success
-    assert result.new_model == "openai/gpt-4o-mini"
+    assert invalid.success is False
+    assert "doesn't look like" in invalid.error_message
+    assert valid.success is True
+    assert valid.new_model == "gpt-5.4"

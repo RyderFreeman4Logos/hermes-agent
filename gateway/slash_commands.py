@@ -1772,6 +1772,18 @@ class GatewaySlashCommandsMixin:
             current_base_url = override.get("base_url", current_base_url)
             current_api_key = override.get("api_key", current_api_key)
 
+        pending_switch = self._after_compression_model_switches.get(session_key)
+        pending_model_switch = ""
+        if pending_switch is not None:
+            pending_provider = (
+                pending_switch.provider_label
+                or get_label(pending_switch.target_provider)
+                or pending_switch.target_provider
+            )
+            pending_model_switch = (
+                f"{pending_switch.new_model} ({pending_provider})"
+            )
+
         # No args: show interactive picker (Telegram/Discord) or text list
         if not model_input and not explicit_provider:
             # Try interactive picker if the platform supports it
@@ -2087,13 +2099,20 @@ class GatewaySlashCommandsMixin:
                         session_key=session_key,
                         on_model_selected=_on_model_selected,
                         metadata=metadata,
+                        pending_model_switch=pending_model_switch,
                     )
                     if result.success:
                         return None  # Picker sent — adapter handles the response
 
             # Fallback: text list (for platforms without picker or if picker failed)
             provider_label = get_label(current_provider)
-            lines = [t("gateway.model.current_label", model=current_model or "unknown", provider=provider_label), ""]
+            lines = [t("gateway.model.current_label", model=current_model or "unknown", provider=provider_label)]
+            if pending_model_switch:
+                lines.append(
+                    "Pending after the next successful compression: "
+                    f"`{pending_model_switch}`"
+                )
+            lines.append("")
 
             try:
                 # Offload blocking provider-listing off the event loop so the

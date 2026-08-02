@@ -7339,6 +7339,7 @@ class DiscordAdapter(BasePlatformAdapter):
         session_key: str,
         on_model_selected,
         metadata: Optional[Dict[str, Any]] = None,
+        pending_model_switch: str = "",
     ) -> SendResult:
         """Send an interactive select-menu model picker.
 
@@ -7364,11 +7365,18 @@ class DiscordAdapter(BasePlatformAdapter):
             except Exception:
                 provider_label = current_provider
 
+            pending_line = (
+                "Pending after the next successful compression: "
+                f"`{pending_model_switch}`\n\n"
+                if pending_model_switch
+                else ""
+            )
             embed = discord.Embed(
                 title="⚙ Model Configuration",
                 description=(
                     f"Current model: `{current_model or 'unknown'}`\n"
                     f"Provider: {provider_label}\n\n"
+                    f"{pending_line}"
                     f"Select a provider:"
                 ),
                 color=discord.Color.blue(),

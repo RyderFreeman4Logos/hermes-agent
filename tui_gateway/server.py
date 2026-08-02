@@ -10831,6 +10831,28 @@ def _(rid, params: dict) -> dict:
             if session:
                 from hermes_cli.model_switch import parse_model_switch_args
 
+                parsed_flags = parse_model_switch_args(value)
+                if parsed_flags.errors:
+                    raise ValueError(parsed_flags.error_messages()[0])
+
+                # A deferred switch is safe to resolve and attach while the
+                # current turn runs. Do it before the generic immediate-switch
+                # queue so an in-flight compression can observe the intent.
+                if session.get("running") and parsed_flags.is_after_compression:
+                    if session.get("agent") is None:
+                        raise ValueError(
+                            "/model --after-compression requires a live session"
+                        )
+                    result = _apply_model_switch(
+                        params.get("session_id", ""),
+                        session,
+                        value,
+                        confirm_expensive_model=bool(
+                            params.get("confirm_expensive_model", False)
+                        ),
+                        parsed_flags=parsed_flags,
+                    )
+
                 # A live swap can't run in-place while a turn streams:
                 # agent.switch_model() mutates self.model / self.provider /
                 # self.base_url / self.client, and the worker thread running
@@ -10841,8 +10863,8 @@ def _(rid, params: dict) -> dict:
                 # (_apply_pending_model_switch), where nothing is in flight.
                 # The user gets to pick, keep typing, and send the next turn on
                 # the new model without waiting for the swap or interrupting.
-                if session.get("running"):
-                    parsed = parse_model_switch_args(value)
+                elif session.get("running"):
+                    parsed = parsed_flags
                     try:
                         pending_model = parsed.model_input
                     except Exception:
@@ -10873,25 +10895,25 @@ def _(rid, params: dict) -> dict:
                             "deferred": True,
                         },
                     )
-                parsed_flags = parse_model_switch_args(value)
-                explicit_provider = parsed_flags.explicit_provider
-                if session.get("agent") is None and not explicit_provider.strip():
-                    session_id = params.get("session_id", "")
-                    _start_agent_build(session_id, session)
-                    init_err = _wait_agent(session, rid)
-                    if init_err:
-                        return init_err
-                    if session.get("agent") is None:
-                        return _err(rid, 5032, "agent initialization failed")
-                result = _apply_model_switch(
-                    params.get("session_id", ""),
-                    session,
-                    value,
-                    confirm_expensive_model=bool(
-                        params.get("confirm_expensive_model", False)
-                    ),
-                    parsed_flags=parsed_flags,
-                )
+                else:
+                    explicit_provider = parsed_flags.explicit_provider
+                    if session.get("agent") is None and not explicit_provider.strip():
+                        session_id = params.get("session_id", "")
+                        _start_agent_build(session_id, session)
+                        init_err = _wait_agent(session, rid)
+                        if init_err:
+                            return init_err
+                        if session.get("agent") is None:
+                            return _err(rid, 5032, "agent initialization failed")
+                    result = _apply_model_switch(
+                        params.get("session_id", ""),
+                        session,
+                        value,
+                        confirm_expensive_model=bool(
+                            params.get("confirm_expensive_model", False)
+                        ),
+                        parsed_flags=parsed_flags,
+                    )
             else:
                 result = _apply_model_switch(
                     "",
@@ -10910,6 +10932,8 @@ def _(rid, params: dict) -> dict:
                     "confirm_required": result.get("confirm_required", False),
                     "confirm_message": result.get("confirm_message", ""),
                     "scope": result.get("scope", "session"),
+                    "pending": result.get("pending", False),
+                    "replaced": result.get("replaced", False),
                 },
             )
         except Exception as e:
@@ -12762,10 +12786,25 @@ def _format_live_model_output(session: dict) -> str:
     model = getattr(agent, "model", "") if agent is not None else ""
     provider = getattr(agent, "provider", "") if agent is not None else ""
     if model and provider:
-        return f"Current model: {model} ({provider})"
-    if model:
-        return f"Current model: {model}"
-    return "Current model: (unknown)"
+        output = f"Current model: {model} ({provider})"
+    elif model:
+        output = f"Current model: {model}"
+    else:
+        output = "Current model: (unknown)"
+
+    pending = session.get("after_compression_model_switch")
+    if pending is not None:
+        pending_model = getattr(pending, "new_model", "") or "unknown"
+        pending_provider = (
+            getattr(pending, "provider_label", "")
+            or getattr(pending, "target_provider", "")
+            or "unknown"
+        )
+        output += (
+            "\nPending after the next successful compression: "
+            f"{pending_model} ({pending_provider})"
+        )
+    return output
 
 
 def _live_slash_command_output(sid: str, session: Optional[dict], name: str, arg: str) -> Optional[str]:
@@ -12873,6 +12912,16 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
     try:
         if name == "model" and arg and agent:
             result = _apply_model_switch(sid, session, arg)
+            if result.get("pending"):
+                lines = [
+                    "Model switch scheduled after the next successful compression: "
+                    f"{result['value']}"
+                ]
+                if result.get("replaced"):
+                    lines.append("(replaced the previously scheduled model switch)")
+                if result.get("warning"):
+                    lines.append(result["warning"])
+                return "\n".join(lines)
             return result.get("warning", "")
         elif name == "personality" and arg and agent:
             pname, new_prompt = _validate_personality(arg, _load_cfg())

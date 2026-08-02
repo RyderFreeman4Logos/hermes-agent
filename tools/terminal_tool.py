@@ -2620,6 +2620,7 @@ def terminal_tool(
                 from tools.interrupt import clear_current_thread_interrupt
 
                 clear_current_thread_interrupt()
+            proc_session = None
             try:
                 if auto_background_candidate:
                     notify_on_complete = True
@@ -2983,12 +2984,49 @@ def terminal_tool(
                     result_data["watch_patterns"] = proc_session.watch_patterns
 
                 return json.dumps(result_data, ensure_ascii=False)
-            except Exception as e:
-                return json.dumps({
+            except BaseException as e:
+                cleanup_result = None
+                if (
+                    auto_background_candidate
+                    and proc_session is not None
+                    and process_registry.get(proc_session.id) is None
+                ):
+                    try:
+                        cleanup_result = process_registry.discard(
+                            proc_session,
+                            source="background_promotion_exception",
+                        )
+                    except BaseException as cleanup_error:
+                        # discard() registers before terminating, so even an
+                        # interrupted cleanup keeps a user-controllable owner.
+                        logger.error(
+                            "Deferred process cleanup was interrupted: %s",
+                            cleanup_error,
+                        )
+                        cleanup_result = {
+                            "status": "error",
+                            "error": str(cleanup_error),
+                            "session_id": proc_session.id,
+                        }
+                if not isinstance(e, Exception):
+                    raise
+
+                result_data = {
                     "output": "",
                     "exit_code": -1,
-                    "error": f"Failed to start background process: {str(e)}"
-                }, ensure_ascii=False)
+                    "error": f"Failed to start background process: {str(e)}",
+                }
+                if (
+                    proc_session is not None
+                    and process_registry.get(proc_session.id) is not None
+                ):
+                    result_data["session_id"] = proc_session.id
+                    if cleanup_result and cleanup_result.get("status") == "error":
+                        result_data["error"] += (
+                            "; cleanup could not be confirmed; the process remains "
+                            "managed under the returned session_id"
+                        )
+                return json.dumps(result_data, ensure_ascii=False)
         else:
             # Run foreground command with retry logic
             max_retries = 3

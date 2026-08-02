@@ -152,6 +152,7 @@ class ProcessSession:
     _started_monotonic: float = field(default_factory=time.monotonic, repr=False)
     _completion_event: threading.Event = field(default_factory=threading.Event, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock)
+    _env_poll_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
     _deadline_timer: Optional[threading.Timer] = field(default=None, repr=False)
     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (when use_pty=True)
@@ -1177,6 +1178,30 @@ class ProcessRegistry:
                 return "interrupted"
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                if session.env_ref is not None and session.pid is not None:
+                    temp_dir = self._env_temp_dir(session.env_ref)
+                    prefix = f"{temp_dir}/hermes_proc_{session.id}"
+                    with session._lock:
+                        previous_output_length = len(session.output_buffer)
+                    try:
+                        self._poll_env_once(
+                            session,
+                            session.env_ref,
+                            f"{prefix}.log",
+                            f"{prefix}.pid",
+                            f"{prefix}.exit",
+                            previous_output_length,
+                        )
+                    except Exception as exc:
+                        # No terminal backend evidence means the candidate must
+                        # remain managed, not be guessed complete.
+                        logger.debug(
+                            "Could not reconcile deferred backend process: %s",
+                            exc,
+                        )
+                    with session._lock:
+                        if session.exited:
+                            return "exited"
                 return "running"
             session._completion_event.wait(timeout=min(0.1, remaining))
 
@@ -1351,63 +1376,115 @@ class ProcessRegistry:
                     session.completion_reason = "exited"
             self._move_to_finished(session)
 
+    def _poll_env_once(
+        self,
+        session: ProcessSession,
+        env: Any,
+        log_path: str,
+        pid_path: str,
+        exit_path: str,
+        previous_output_length: int,
+    ) -> int:
+        """Reconcile one non-local process observation against backend state."""
+        quoted_log_path = shlex.quote(log_path)
+        quoted_pid_path = shlex.quote(pid_path)
+        quoted_exit_path = shlex.quote(exit_path)
+
+        with session._env_poll_lock:
+            with session._lock:
+                if session.exited:
+                    return previous_output_length
+
+            check = env.execute(
+                f"kill -0 \"$(cat {quoted_pid_path} 2>/dev/null)\" 2>/dev/null; echo $?",
+                timeout=5,
+            )
+            check_output = (
+                str(check.get("output", "")).strip()
+                if isinstance(check, dict) and check.get("returncode") == 0
+                else ""
+            )
+            process_exited = bool(
+                check_output and check_output.splitlines()[-1].strip() != "0"
+            )
+
+            result = env.execute(f"cat {quoted_log_path} 2>/dev/null", timeout=10)
+            new_output = (
+                result.get("output", "") if isinstance(result, dict) else ""
+            )
+            if new_output:
+                delta = (
+                    new_output[previous_output_length:]
+                    if len(new_output) > previous_output_length
+                    else ""
+                )
+                previous_output_length = len(new_output)
+                with session._lock:
+                    session.output_buffer = new_output
+                    session.output_size += len(delta)
+                    if len(session.output_buffer) > session.max_output_chars:
+                        session.output_buffer = session.output_buffer[
+                            -session.max_output_chars:
+                        ]
+                if delta:
+                    self._check_watch_patterns(session, delta)
+                    self._emit_output(session, delta)
+
+            if not process_exited:
+                return previous_output_length
+
+            exit_result = env.execute(
+                f"cat {quoted_exit_path} 2>/dev/null",
+                timeout=5,
+            )
+            if (
+                not isinstance(exit_result, dict)
+                or exit_result.get("returncode") != 0
+            ):
+                return previous_output_length
+            exit_str = str(exit_result.get("output", "")).strip()
+            try:
+                exit_code = int(exit_str.splitlines()[-1].strip())
+            except (ValueError, IndexError):
+                return previous_output_length
+
+            with session._lock:
+                if session.exited:
+                    return previous_output_length
+                session.exit_code = exit_code
+                session.exited = True
+                if session.completion_reason != "killed":
+                    session.completion_reason = "exited"
+            self._move_to_finished(session)
+            return previous_output_length
+
     def _env_poller_loop(
         self, session: ProcessSession, env: Any, log_path: str, pid_path: str, exit_path: str
     ):
         """Background thread: poll a sandbox log file for non-local backends."""
-        quoted_log_path = shlex.quote(log_path)
-        quoted_pid_path = shlex.quote(pid_path)
-        quoted_exit_path = shlex.quote(exit_path)
-        prev_output_len = 0  # track delta for watch pattern scanning
+        previous_output_length = 0
         while not session.exited:
-            time.sleep(2)  # Poll every 2 seconds
             try:
-                # Read new output from the log file
-                result = env.execute(f"cat {quoted_log_path} 2>/dev/null", timeout=10)
-                new_output = result.get("output", "")
-                if new_output:
-                    # Compute delta for watch pattern scanning
-                    delta = new_output[prev_output_len:] if len(new_output) > prev_output_len else ""
-                    prev_output_len = len(new_output)
-                    with session._lock:
-                        session.output_buffer = new_output
-                        session.output_size += len(delta)
-                        if len(session.output_buffer) > session.max_output_chars:
-                            session.output_buffer = session.output_buffer[-session.max_output_chars:]
-                    if delta:
-                        self._check_watch_patterns(session, delta)
-                        self._emit_output(session, delta)
-
-                # Check if process is still running
-                check = env.execute(
-                    f"kill -0 \"$(cat {quoted_pid_path} 2>/dev/null)\" 2>/dev/null; echo $?",
-                    timeout=5,
+                previous_output_length = self._poll_env_once(
+                    session,
+                    env,
+                    log_path,
+                    pid_path,
+                    exit_path,
+                    previous_output_length,
                 )
-                check_output = check.get("output", "").strip()
-                if check_output and check_output.splitlines()[-1].strip() != "0":
-                    # Process has exited -- get exit code captured by the wrapper shell.
-                    exit_result = env.execute(
-                        f"cat {quoted_exit_path} 2>/dev/null",
-                        timeout=5,
-                    )
-                    exit_str = exit_result.get("output", "").strip()
-                    try:
-                        session.exit_code = int(exit_str.splitlines()[-1].strip())
-                    except (ValueError, IndexError):
-                        session.exit_code = -1
-                    session.exited = True
-                    if session.completion_reason != "killed":
-                        session.completion_reason = "exited"
-                    self._move_to_finished(session)
-                    return
-
             except Exception:
                 # Environment might be gone (sandbox reaped, etc.)
-                session.exited = True
-                session.exit_code = -1
-                session.completion_reason = "lost"
-                session.termination_source = "backend_lost"
+                with session._lock:
+                    if session.exited:
+                        return
+                    session.exited = True
+                    session.exit_code = -1
+                    session.completion_reason = "lost"
+                    session.termination_source = "backend_lost"
                 self._move_to_finished(session)
+                return
+            if session._completion_event.wait(timeout=2):
                 return
 
     def _pty_reader_loop(self, session: ProcessSession):
@@ -1942,8 +2019,17 @@ class ProcessRegistry:
             and session.env_ref is None
             and not self._host_pid_is_ours(session.pid, session.host_start_time)
         )
+        is_remote = bool(
+            not session._pty
+            and session.process is None
+            and session.env_ref
+            and session.pid
+        )
 
         with session._lock:
+            previous_completion_reason = session.completion_reason
+            previous_termination_source = session.termination_source
+            completion_was_consumed = session_id in self._completion_consumed
             output = strip_ansi(session.output_buffer[-2000:])
             if session.exited:
                 result = {
@@ -1987,6 +2073,7 @@ class ProcessRegistry:
             return result
 
         # Kill via PTY, Popen (local), or env execute (non-local)
+        remote_returncode = None
         try:
             if session._pty:
                 # PTYs can launch descendants too; terminate the full host tree.
@@ -2011,10 +2098,27 @@ class ProcessRegistry:
                     f"sleep {grace}; "
                     f"kill -KILL -- -{session.pid} 2>/dev/null || true"
                 )
-                session.env_ref.execute(
+                remote_result = session.env_ref.execute(
                     remote_kill,
                     timeout=max(5, int(grace) + 3),
                 )
+                if not isinstance(remote_result, dict):
+                    raise RuntimeError(
+                        "Remote kill returned an invalid result; status unknown"
+                    )
+                remote_returncode = remote_result.get("returncode")
+                remote_output = strip_ansi(
+                    str(remote_result.get("output", ""))
+                ).strip()
+                if (
+                    isinstance(remote_returncode, bool)
+                    or not isinstance(remote_returncode, int)
+                    or remote_returncode != 0
+                ):
+                    detail = f"returncode={remote_returncode!r}"
+                    if remote_output:
+                        detail += f": {remote_output[-1000:]}"
+                    raise RuntimeError(f"Remote kill was not confirmed ({detail})")
             elif session.detached and session.pid_scope == "host" and session.pid:
                 self._terminate_host_pid(session.pid, session.host_start_time)
             # Capture output after termination; kill intent and consumption were
@@ -2034,7 +2138,20 @@ class ProcessRegistry:
                 "output": output,
             }
         except Exception as e:
-            return {"status": "error", "error": str(e)}
+            if is_remote:
+                with session._lock:
+                    if not session.exited:
+                        session.completion_reason = previous_completion_reason
+                        session.termination_source = previous_termination_source
+                        if consume_output and not completion_was_consumed:
+                            self._completion_consumed.discard(session_id)
+            return {
+                "status": "error",
+                "error": str(e),
+                "session_id": session.id,
+                "termination_source": source,
+                "returncode": remote_returncode,
+            }
 
     def write_stdin(self, session_id: str, data: str) -> dict:
         """Send raw data to a running process's stdin (no newline appended)."""

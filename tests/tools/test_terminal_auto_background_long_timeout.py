@@ -171,6 +171,44 @@ def _pid_is_running(pid):
         return False
 
 
+class _TimedRemoteEnvironment:
+    def __init__(self, *, done_after=30.0, kill_result=None):
+        self.done_after = done_after
+        self.kill_result = kill_result or {"output": "", "returncode": 0}
+        self.started_at = None
+        self.killed = False
+        self.poll_calls = 0
+        self.kill_calls = []
+
+    def _done(self):
+        return self.killed or (
+            self.started_at is not None
+            and time.monotonic() - self.started_at >= self.done_after
+        )
+
+    def execute(self, command, **kwargs):
+        if "nohup setsid bash -lc" in command:
+            self.started_at = time.monotonic()
+            return {"output": "4242\n", "returncode": 0}
+        if command.startswith("kill -TERM"):
+            self.kill_calls.append({"command": command, **kwargs})
+            result = dict(self.kill_result)
+            if result.get("returncode") == 0:
+                self.killed = True
+            return result
+        if command.startswith("kill -0"):
+            self.poll_calls += 1
+            return {"output": "1\n" if self._done() else "0\n", "returncode": 0}
+        if command.startswith("cat ") and ".exit" in command:
+            return {"output": "0\n" if self._done() else "", "returncode": 0}
+        if command.startswith("cat ") and ".log" in command:
+            return {
+                "output": "remote done\n" if self._done() else "",
+                "returncode": 0,
+            }
+        raise AssertionError(f"unexpected remote command: {command}")
+
+
 @pytest.mark.parametrize("requested_timeout", [2, None], ids=["requested", "configured"])
 def test_short_command_with_large_timeout_stays_inline(
     terminal_runtime, requested_timeout
@@ -247,6 +285,211 @@ def test_unsupported_async_delivery_kills_unregistered_candidate(
     assert _wait_until(lambda: not _pid_is_running(int(pid_path.read_text())))
     assert registry.list_sessions() == []
     assert registry.completion_queue.empty()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-tree regression")
+@pytest.mark.parametrize("stage", ["wait", "promote"])
+@pytest.mark.parametrize(
+    "error_type", [RuntimeError, KeyboardInterrupt, SystemExit]
+)
+def test_deferred_candidate_is_contained_on_lifecycle_exception(
+    terminal_runtime, monkeypatch, tmp_path, stage, error_type
+):
+    terminal_tool, registry = terminal_runtime
+    child_pid_path = tmp_path / f"{stage}-{error_type.__name__}.pid"
+    child_code = "import time; time.sleep(30)"
+    parent_code = (
+        "import pathlib,subprocess,sys,time; "
+        f"p=subprocess.Popen([sys.executable, '-c', {child_code!r}]); "
+        f"pathlib.Path({str(child_pid_path)!r}).write_text(str(p.pid)); "
+        "time.sleep(30)"
+    )
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(parent_code)}"
+    original_spawn = registry.spawn_local
+    original_promote = registry.promote
+    captured = []
+
+    def capture_spawn(**kwargs):
+        session = original_spawn(**kwargs)
+        captured.append(session)
+        return session
+
+    def reach_exception_point(*_args, **_kwargs):
+        assert _wait_until(child_pid_path.exists)
+        if stage == "wait":
+            raise error_type(f"injected {error_type.__name__}")
+        return "running"
+
+    promote_calls = 0
+
+    def fail_first_promotion(*args, **kwargs):
+        nonlocal promote_calls
+        promote_calls += 1
+        if stage == "promote" and promote_calls == 1:
+            raise error_type(f"injected {error_type.__name__}")
+        return original_promote(*args, **kwargs)
+
+    monkeypatch.setattr(registry, "spawn_local", capture_spawn)
+    monkeypatch.setattr(registry, "wait_for_promotion", reach_exception_point)
+    monkeypatch.setattr(registry, "promote", fail_first_promotion)
+    monkeypatch.setattr(registry, "_daemon_term_grace_seconds", lambda: 0.1)
+
+    try:
+        if issubclass(error_type, Exception):
+            result = json.loads(
+                terminal_tool.terminal_tool(command=command, timeout=2)
+            )
+            assert f"injected {error_type.__name__}" in result["error"]
+        else:
+            with pytest.raises(error_type, match=f"injected {error_type.__name__}"):
+                terminal_tool.terminal_tool(command=command, timeout=2)
+
+        session = captured[0]
+        child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+        assert _wait_until(lambda: not _pid_is_running(session.pid))
+        assert _wait_until(lambda: not _pid_is_running(child_pid))
+        assert registry.list_sessions() == []
+        assert registry.completion_queue.empty()
+    finally:
+        if captured and _pid_is_running(captured[0].pid):
+            original_promote(captured[0])
+            registry.kill_process(
+                captured[0].id,
+                source="test_emergency_cleanup",
+                consume_output=False,
+            )
+
+
+@pytest.mark.parametrize(
+    ("kill_result", "provenance"),
+    [
+        pytest.param(
+            {"output": "permission denied", "returncode": 1},
+            "permission denied",
+            id="nonzero",
+        ),
+        pytest.param(
+            {"output": "transport timed out", "returncode": 124},
+            "returncode=124",
+            id="timeout",
+        ),
+        pytest.param(
+            {"output": "transport status unknown"},
+            "status unknown",
+            id="uncertain",
+        ),
+    ],
+)
+def test_nonlocal_discard_failure_keeps_managed_identity(
+    terminal_runtime, kill_result, provenance
+):
+    from tools.process_registry import ProcessSession
+
+    _, registry = terminal_runtime
+    env = _TimedRemoteEnvironment(kill_result=kill_result)
+    session = ProcessSession(
+        id="proc_remote_kill_failure",
+        command="sleep 30",
+        pid=4242,
+        env_ref=env,
+        pid_scope="sandbox",
+    )
+
+    result = registry.discard(session, source="background_promotion_failed")
+
+    assert result["status"] == "error"
+    assert result["session_id"] == session.id
+    assert result["termination_source"] == "background_promotion_failed"
+    assert provenance in result["error"]
+    assert registry.get(session.id) is session
+    assert session.exited is False
+    assert session.completion_reason == "exited"
+    assert session.termination_source == ""
+
+    env.kill_result = {"output": "", "returncode": 0}
+    assert registry.discard(session, source="retry_cleanup")["status"] == "killed"
+    assert registry.get(session.id) is None
+
+
+def test_nonlocal_discard_success_removes_registry_ownership(terminal_runtime):
+    from tools.process_registry import ProcessSession
+
+    _, registry = terminal_runtime
+    env = _TimedRemoteEnvironment(kill_result={"output": "", "returncode": 0})
+    session = ProcessSession(
+        id="proc_remote_kill_success",
+        command="sleep 30",
+        pid=4242,
+        env_ref=env,
+        pid_scope="sandbox",
+    )
+
+    result = registry.discard(session, source="background_promotion_failed")
+
+    assert result["status"] == "killed"
+    assert result["termination_source"] == "background_promotion_failed"
+    assert session.exited is True
+    assert registry.get(session.id) is None
+    assert len(env.kill_calls) == 1
+
+
+def test_nonlocal_completion_before_minimum_threshold_stays_inline(
+    terminal_runtime, monkeypatch
+):
+    terminal_tool, registry = terminal_runtime
+    env = _TimedRemoteEnvironment(done_after=0.05)
+    terminal_tool._active_environments["default"] = env
+    monkeypatch.setattr(
+        terminal_tool,
+        "_get_env_config",
+        lambda: _config(
+            env_type="docker", timeout=2, auto_background_timeout_threshold=1
+        ),
+    )
+
+    result = json.loads(
+        terminal_tool.terminal_tool(command="printf remote", timeout=2)
+    )
+    try:
+        assert result["output"] == "remote done"
+        assert result["exit_code"] == 0
+        assert "session_id" not in result
+        assert registry.list_sessions() == []
+        assert registry.completion_queue.empty()
+        assert 1 <= env.poll_calls <= 2
+    finally:
+        registry.kill_all()
+
+
+def test_nonlocal_completion_after_threshold_promotes_and_notifies_once(
+    terminal_runtime, monkeypatch
+):
+    terminal_tool, registry = terminal_runtime
+    env = _TimedRemoteEnvironment(done_after=1.2)
+    terminal_tool._active_environments["default"] = env
+    monkeypatch.setattr(
+        terminal_tool,
+        "_get_env_config",
+        lambda: _config(
+            env_type="docker", timeout=4, auto_background_timeout_threshold=1
+        ),
+    )
+
+    result = json.loads(
+        terminal_tool.terminal_tool(command="printf remote", timeout=4)
+    )
+    session_id = result["session_id"]
+    try:
+        assert result["notify_on_complete"] is True
+        event = registry.completion_queue.get(timeout=4)
+        assert event["session_id"] == session_id
+        assert event["output"] == "remote done\n"
+        time.sleep(0.1)
+        assert registry.completion_queue.empty()
+        assert env.poll_calls <= 4
+    finally:
+        if session_id in registry._running:
+            registry.kill_process(session_id, consume_output=False)
 
 
 @pytest.mark.parametrize(

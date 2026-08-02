@@ -601,9 +601,9 @@ class TestSpawnEnvSanitization:
             def __init__(self):
                 self.commands = []
                 self._responses = iter([
-                    {"output": "hello\n"},
-                    {"output": "1\n"},
-                    {"output": "0\n"},
+                    {"output": "1\n", "returncode": 0},
+                    {"output": "hello\n", "returncode": 0},
+                    {"output": "0\n", "returncode": 0},
                 ])
 
             def execute(self, command, **kwargs):
@@ -612,18 +612,16 @@ class TestSpawnEnvSanitization:
 
         env = FakeEnv()
 
-        with patch("tools.process_registry.time.sleep", return_value=None), \
-            patch.object(registry, "_move_to_finished"):
-            registry._env_poller_loop(
-                session,
-                env,
-                "/path with spaces/hermes_bg.log",
-                "/path with spaces/hermes_bg.pid",
-                "/path with spaces/hermes_bg.exit",
-            )
+        registry._env_poller_loop(
+            session,
+            env,
+            "/path with spaces/hermes_bg.log",
+            "/path with spaces/hermes_bg.pid",
+            "/path with spaces/hermes_bg.exit",
+        )
 
-        assert env.commands[0][0] == "cat '/path with spaces/hermes_bg.log' 2>/dev/null"
-        assert env.commands[1][0] == "kill -0 \"$(cat '/path with spaces/hermes_bg.pid' 2>/dev/null)\" 2>/dev/null; echo $?"
+        assert env.commands[0][0] == "kill -0 \"$(cat '/path with spaces/hermes_bg.pid' 2>/dev/null)\" 2>/dev/null; echo $?"
+        assert env.commands[1][0] == "cat '/path with spaces/hermes_bg.log' 2>/dev/null"
         assert env.commands[2][0] == "cat '/path with spaces/hermes_bg.exit' 2>/dev/null"
 
 
@@ -830,6 +828,7 @@ class TestKillProcess:
 
     def test_kill_remote_uses_process_group(self, registry, monkeypatch):
         env = MagicMock()
+        env.execute.return_value = {"output": "", "returncode": 0}
         s = _make_session(sid="proc_remote_tree")
         s.pid = 4321
         s.pid_scope = "sandbox"

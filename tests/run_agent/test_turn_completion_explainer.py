@@ -21,6 +21,7 @@ import os
 import queue
 import threading
 import uuid
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -37,6 +38,17 @@ from run_agent import AIAgent
 def _mock_response(content="Hello", finish_reason="stop", tool_calls=None):
     msg = SimpleNamespace(content=content, tool_calls=tool_calls)
     choice = SimpleNamespace(message=msg, finish_reason=finish_reason)
+    return SimpleNamespace(choices=[choice], model="test/model", usage=None)
+
+
+def _mock_stream_chunk(content=None, finish_reason=None):
+    delta = SimpleNamespace(
+        role="assistant" if content else None,
+        content=content,
+        tool_calls=None,
+        reasoning_content=None,
+    )
+    choice = SimpleNamespace(index=0, delta=delta, finish_reason=finish_reason)
     return SimpleNamespace(choices=[choice], model="test/model", usage=None)
 
 
@@ -398,6 +410,105 @@ def test_failed_provider_calls_do_not_extend_heartbeat_lease(heartbeat_event):
         reset_current_session_key(token)
 
     reset_deadline.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("streaming", "short_circuit"),
+    [(False, False), (False, True), (True, False), (True, True)],
+    ids=[
+        "nonstream-physical",
+        "nonstream-short-circuit",
+        "stream-physical",
+        "stream-short-circuit",
+    ],
+)
+def test_provider_lease_requires_physical_relay_dispatch(
+    tmp_path, monkeypatch, streaming, short_circuit
+):
+    relay = pytest.importorskip("nemo_relay")
+    from agent import relay_llm, relay_runtime
+    from tools.approval import reset_current_session_key, set_current_session_key
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+    relay_runtime._reset_for_tests()
+    agent = _make_agent(max_iterations=10)
+    host = relay_runtime.get_runtime()
+    assert host is not None
+    host.retain_managed_execution("test.provider_lease")
+    physical_call = MagicMock()
+    intercept_name = f"provider-lease-{'stream' if streaming else 'execute'}"
+    wire_client = None
+
+    if streaming:
+        chunks = [
+            _mock_stream_chunk(content="relay reply"),
+            _mock_stream_chunk(finish_reason="stop"),
+        ]
+        physical_call.return_value = iter(chunks)
+        wire_client = MagicMock()
+        wire_client.chat.completions.create = physical_call
+        agent.client = SimpleNamespace()
+
+        def stream_intercept(request, next_call):
+            async def generate():
+                if short_circuit:
+                    for chunk in chunks:
+                        yield relay_llm._jsonable(chunk)
+                    return
+                upstream = await next_call(request)
+                async for chunk in upstream:
+                    yield chunk
+
+            return generate()
+
+        relay.intercepts.register_llm_stream_execution(
+            intercept_name, 1, stream_intercept
+        )
+    else:
+        assert agent.client is not None
+        physical_call = agent.client.chat.completions.create
+        physical_call.return_value = _mock_response(content="physical reply")
+
+        def execute_intercept(_name, request, next_call):
+            if short_circuit:
+                return relay_llm._jsonable(_mock_response(content="relay reply"))
+            return next_call(request)
+
+        relay.intercepts.register_llm_execution(intercept_name, 1, execute_intercept)
+
+    token = set_current_session_key("owner-session")
+    try:
+        with (
+            patch(
+                "tools.runtime_heartbeat.runtime_heartbeat.reset_for_caller"
+            ) as reset_deadline,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch.object(
+                agent, "_create_request_openai_client", return_value=wire_client
+            )
+            if streaming
+            else nullcontext(),
+            patch.object(agent, "_close_request_openai_client")
+            if streaming
+            else nullcontext(),
+        ):
+            result = agent.run_conversation(
+                "real user turn",
+                stream_callback=(lambda _delta: None) if streaming else None,
+            )
+        assert result["completed"] is True
+        assert physical_call.call_count == (0 if short_circuit else 1)
+        assert reset_deadline.call_count == (0 if short_circuit else 1)
+    finally:
+        reset_current_session_key(token)
+        if streaming:
+            relay.intercepts.deregister_llm_stream_execution(intercept_name)
+        else:
+            relay.intercepts.deregister_llm_execution(intercept_name)
+        host.release_managed_execution("test.provider_lease")
+        relay_runtime._reset_for_tests()
 
 
 def test_heartbeat_early_error_leaves_no_unmatched_synthetic_user_row(

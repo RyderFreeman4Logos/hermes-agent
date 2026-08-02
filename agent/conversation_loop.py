@@ -2518,33 +2518,50 @@ def run_conversation(
                 provider_dispatch_started_at = None
                 provider_dispatch_context = None
 
-                def _perform_api_call(next_api_kwargs):
+                def _mark_provider_dispatch(dispatch_started_at):
                     nonlocal provider_dispatch_started_at, provider_dispatch_context
+                    provider_dispatch_started_at = dispatch_started_at
+                    provider_dispatch_context = None
+                    if dispatch_started_at is None:
+                        return
+                    from tools.runtime_heartbeat import (
+                        canonical_runtime_cache_context_identity,
+                        canonical_runtime_provider_identity,
+                    )
+
+                    provider_dispatch_context = (
+                        canonical_runtime_provider_identity(agent),
+                        canonical_runtime_cache_context_identity(agent),
+                    )
+
+                def _perform_physical_api_call(physical_api_kwargs):
+                    dispatch_started_at = time.monotonic()
+                    _mark_provider_dispatch(dispatch_started_at)
+                    try:
+                        return agent._interruptible_api_call(physical_api_kwargs)
+                    except BaseException:
+                        _mark_provider_dispatch(None)
+                        raise
+
+                def _perform_api_call(next_api_kwargs):
+                    _mark_provider_dispatch(None)
                     if agent.api_mode == "codex_responses":
                         next_api_kwargs = agent._get_transport().preflight_kwargs(
                             next_api_kwargs,
                             allow_stream=False,
                             is_github_responses=agent._is_copilot_url(),
                         )
-                    from tools.runtime_heartbeat import (
-                        canonical_runtime_cache_context_identity,
-                        canonical_runtime_provider_identity,
-                    )
-
-                    provider_dispatch_started_at = time.monotonic()
-                    provider_dispatch_context = (
-                        canonical_runtime_provider_identity(agent),
-                        canonical_runtime_cache_context_identity(agent),
-                    )
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
-                            next_api_kwargs, on_first_delta=_stop_spinner
+                            next_api_kwargs,
+                            on_first_delta=_stop_spinner,
+                            on_provider_dispatch=_mark_provider_dispatch,
                         )
                     from agent import relay_llm
 
                     return relay_llm.execute(
                         next_api_kwargs,
-                        agent._interruptible_api_call,
+                        _perform_physical_api_call,
                         session_id=str(agent.session_id or ""),
                         name=str(agent.provider or "provider"),
                         model_name=str(agent.model or ""),

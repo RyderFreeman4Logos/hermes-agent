@@ -2513,7 +2513,13 @@ def _build_partial_stream_stub(
     )
 
 
-def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=None):
+def interruptible_streaming_api_call(
+    agent,
+    api_kwargs: dict,
+    *,
+    on_first_delta=None,
+    on_provider_dispatch=None,
+):
     """Streaming variant of _interruptible_api_call for real-time token delivery.
 
     Handles all three api_modes:
@@ -2539,7 +2545,17 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     # branch below — routing through the _interruptible_api_call method keeps the
     # outer loop's per-request retry/refresh seam intact.
     if should_use_direct_api_call(agent):
-        return agent._interruptible_api_call(api_kwargs)
+        if on_provider_dispatch is not None:
+            on_provider_dispatch(None)
+        dispatch_started_at = time.monotonic()
+        if on_provider_dispatch is not None:
+            on_provider_dispatch(dispatch_started_at)
+        try:
+            return agent._interruptible_api_call(api_kwargs)
+        except BaseException:
+            if on_provider_dispatch is not None:
+                on_provider_dispatch(None)
+            raise
 
     if agent.api_mode == "codex_responses":
         # Codex streams internally via _run_codex_stream. The main dispatch
@@ -3089,7 +3105,15 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             attempt_request_client["value"] = request_client
             last_chunk_time["t"] = time.time()
             agent._touch_activity("waiting for provider response (streaming)")
-            return request_client.chat.completions.create(**stream_kwargs)
+            dispatch_started_at = time.monotonic()
+            if on_provider_dispatch is not None:
+                on_provider_dispatch(dispatch_started_at)
+            try:
+                return request_client.chat.completions.create(**stream_kwargs)
+            except BaseException:
+                if on_provider_dispatch is not None:
+                    on_provider_dispatch(None)
+                raise
 
         def _stream_created(raw_stream: Any) -> None:
             response = getattr(raw_stream, "response", None)
@@ -3150,6 +3174,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
         from agent import relay_llm
 
+        if on_provider_dispatch is not None:
+            # A retry may follow a physical stream that failed validation.
+            on_provider_dispatch(None)
         stream = _set_managed_stream(
             relay_llm.stream(
                 api_kwargs,

@@ -73,6 +73,8 @@ class TurnState:
     # preserves that: release/rebind only match when generation is current.
     lease_token: Any = None
     lease_generation: Optional[int] = None
+    # Identity token for an isolated heartbeat reservation.
+    heartbeat_owner: Any = None
 
     def clear(self) -> None:
         """Reset the per-turn slot (agent / start ts / lease / busy-ack).
@@ -85,6 +87,7 @@ class TurnState:
         self.started_ts = 0.0
         self.lease = None
         self.busy_ack_ts = 0.0
+        self.heartbeat_owner = None
 
 
 @dataclass

@@ -123,6 +123,7 @@ def test_gateway_heartbeat_routes_to_exact_idle_owner(monkeypatch, current_heart
 
     isolated.assert_awaited_once()
     assert isolated.await_args.args[1:] == (event["session_key"], event)
+    assert not runner._is_session_running(event["session_key"])
 
 
 def test_gateway_raw_api_heartbeat_never_runs_or_self_posts(
@@ -155,6 +156,68 @@ def test_gateway_alive_heartbeat_does_not_duplicate_busy_turn(
     asyncio.run(runner._handle_heartbeat_event(event))
 
     isolated.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_gateway_heartbeat_reserves_busy_slot_and_releases_only_its_owner(
+    monkeypatch, current_heartbeat
+):
+    event = _runtime_heartbeat_event()
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter, origins={event["session_key"]: object()})
+    runner._running_agents = {}
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocked(*_args):
+        started.set()
+        await release.wait()
+
+    monkeypatch.setattr(runner, "_run_isolated_heartbeat", blocked)
+    task = asyncio.create_task(runner._handle_heartbeat_event(event))
+    await started.wait()
+
+    assert runner._is_session_running(event["session_key"])
+    ordinary_owner = object()
+    state = runner._session_state(event["session_key"])
+    state.turn.agent = ordinary_owner
+    state.turn.heartbeat_owner = None
+    release.set()
+    await task
+
+    assert state.turn.agent is ordinary_owner
+    assert state.turn.heartbeat_owner is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_kind", ["stale", "exception"])
+async def test_gateway_heartbeat_releases_its_reservation_on_early_exit(
+    monkeypatch, exit_kind
+):
+    event = _runtime_heartbeat_event()
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter, origins={event["session_key"]: object()})
+    runner._running_agents = {}
+    checks = iter((True, exit_kind != "stale"))
+    monkeypatch.setattr(
+        "tools.runtime_heartbeat.runtime_heartbeat.is_event_current",
+        lambda _event: next(checks),
+    )
+
+    async def fail(*_args):
+        raise RuntimeError("heartbeat failed")
+
+    isolated = AsyncMock(side_effect=fail if exit_kind == "exception" else None)
+    monkeypatch.setattr(runner, "_run_isolated_heartbeat", isolated)
+
+    if exit_kind == "exception":
+        with pytest.raises(RuntimeError, match="heartbeat failed"):
+            await runner._handle_heartbeat_event(event)
+    else:
+        await runner._handle_heartbeat_event(event)
+        isolated.assert_not_awaited()
+
+    assert not runner._is_session_running(event["session_key"])
 
 
 @pytest.mark.parametrize("status", ["STUCK", "UNKNOWN"])

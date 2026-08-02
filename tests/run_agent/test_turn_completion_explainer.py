@@ -18,6 +18,8 @@ pass identically in CI and locally.
 """
 
 import os
+import queue
+import threading
 import uuid
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -172,6 +174,7 @@ def test_heartbeat_silent_noop_leaves_no_durable_or_live_history(heartbeat_event
         {"role": "user", "content": "real question"},
         {"role": "assistant", "content": "real answer"},
     ]
+    agent._session_messages = history
 
     with (
         patch.object(agent, "_persist_session") as persist,
@@ -219,6 +222,7 @@ def test_heartbeat_uses_one_provider_response_with_tools_disabled_on_wire(
         {"role": "user", "content": "real question"},
         {"role": "assistant", "content": "real answer"},
     ]
+    agent._session_messages = history
     persisted = []
 
     with (
@@ -253,6 +257,39 @@ def test_heartbeat_uses_one_provider_response_with_tools_disabled_on_wire(
     assert request["tools"] == agent.tools
     assert request["tool_choice"] == "none"
     assert request["stream"] is False
+
+
+def test_heartbeat_matches_ordinary_effective_cache_prefix(heartbeat_event):
+    agent = _make_agent(max_iterations=10)
+    agent.ephemeral_system_prompt = "EPHEMERAL-SYSTEM"
+    agent.tools = [
+        {
+            "type": "function",
+            "function": {"name": "web_search", "parameters": {}},
+        }
+    ]
+    agent.client.chat.completions.create.return_value = _mock_response("ok")
+
+    heartbeat = agent.run_conversation(
+        "[HEARTBEAT] inspect target",
+        turn_origin="heartbeat_warm",
+        allow_silent_noop=True,
+        heartbeat_event=heartbeat_event,
+    )
+    heartbeat_request = agent.client.chat.completions.create.call_args.kwargs
+    agent.client.chat.completions.create.reset_mock()
+
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        agent.run_conversation("ordinary request")
+    ordinary_request = agent.client.chat.completions.create.call_args.kwargs
+
+    assert heartbeat["silent_noop"] is True
+    assert heartbeat_request["messages"][0] == ordinary_request["messages"][0]
+    assert heartbeat_request["tools"] == ordinary_request["tools"]
 
 
 @pytest.mark.parametrize(
@@ -327,6 +364,7 @@ def test_heartbeat_early_error_leaves_no_unmatched_synthetic_user_row(
         {"role": "user", "content": "real question"},
         {"role": "assistant", "content": "real answer"},
     ]
+    agent._session_messages = history
 
     with (
         patch("agent.nous_rate_guard.nous_rate_limit_remaining", return_value=60),
@@ -567,6 +605,104 @@ def test_anthropic_heartbeat_skips_without_any_transport_or_fallback(
     fallback.assert_not_called()
 
 
+def test_copilot_acp_heartbeat_skips_without_transport_dispatch(heartbeat_event):
+    agent = _make_agent(max_iterations=10)
+    agent.provider = "copilot-acp"
+    agent.requested_provider = "copilot-acp"
+    agent.api_mode = "chat_completions"
+
+    result = agent.run_conversation(
+        "[HEARTBEAT] inspect target",
+        turn_origin="heartbeat_warm",
+        allow_silent_noop=True,
+        heartbeat_event=heartbeat_event,
+    )
+
+    assert result["silent_noop"] is True
+    agent.client.chat.completions.create.assert_not_called()
+
+
+def test_heartbeat_skips_provider_switched_during_final_target_inspection(
+    monkeypatch,
+):
+    from tools.runtime_heartbeat import (
+        RuntimeHeartbeat,
+        canonical_runtime_cache_context_identity,
+        canonical_runtime_provider_identity,
+    )
+
+    timers = []
+
+    class Timer:
+        def __init__(self, _interval, callback):
+            self.callback = callback
+            timers.append(self)
+
+        def start(self):
+            pass
+
+        def cancel(self):
+            pass
+
+    inspections = 0
+    final_inspection_started = threading.Event()
+    release_final_inspection = threading.Event()
+
+    def inspect():
+        nonlocal inspections
+        inspections += 1
+        if inspections == 4:
+            final_inspection_started.set()
+            assert release_final_inspection.wait(timeout=2)
+        return {"alive": True, "progress": True}
+
+    events = queue.Queue()
+    manager = RuntimeHeartbeat(event_queue=events, timer_factory=Timer)
+    agent = _make_agent(max_iterations=10)
+    old_client = agent.client
+    old_client.chat.completions.create.return_value = _mock_response("old")
+    manager.arm(
+        "target",
+        caller_id="owner-session",
+        kind="delegation",
+        interval=1700,
+        inspect=inspect,
+        provider=canonical_runtime_provider_identity(agent),
+        cache_context=canonical_runtime_cache_context_identity(agent),
+    )
+    timers[0].callback()
+    event = events.get_nowait()
+    monkeypatch.setattr("tools.runtime_heartbeat.runtime_heartbeat", manager)
+
+    result = []
+    worker = threading.Thread(
+        target=lambda: result.append(
+            agent.run_conversation(
+                "[HEARTBEAT] inspect target",
+                turn_origin="heartbeat_warm",
+                allow_silent_noop=True,
+                heartbeat_event=event,
+            )
+        )
+    )
+    worker.start()
+    assert final_inspection_started.wait(timeout=2)
+
+    new_client = MagicMock()
+    new_client.chat.completions.create.return_value = _mock_response("new")
+    agent.provider = "openai"
+    agent.requested_provider = "openai"
+    agent.base_url = "https://api.openai.com/v1"
+    agent.client = new_client
+    release_final_inspection.set()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert result[0]["silent_noop"] is True
+    old_client.chat.completions.create.assert_not_called()
+    new_client.chat.completions.create.assert_not_called()
+
+
 def test_heartbeat_revalidates_generation_at_provider_boundary(
     heartbeat_event, monkeypatch
 ):
@@ -643,11 +779,17 @@ def test_unhealthy_heartbeat_is_structured_visible_without_model_call(
     agent.client.chat.completions.create.assert_not_called()
 
 
-def test_heartbeat_completion_clears_inflight_turn_marker(heartbeat_event):
+def test_heartbeat_completion_preserves_unowned_marker_and_history(heartbeat_event):
     agent = _make_agent(max_iterations=10)
-    agent.client.chat.completions.create.return_value = _mock_response(
-        content="", finish_reason="stop"
-    )
+    heartbeat_history = [{"role": "assistant", "content": "before heartbeat"}]
+    ordinary_history = [{"role": "user", "content": "ordinary turn"}]
+
+    def complete_heartbeat(**_kwargs):
+        agent._inflight_turn_id = "ordinary-turn"
+        agent._session_messages = ordinary_history
+        return _mock_response(content="", finish_reason="stop")
+
+    agent.client.chat.completions.create.side_effect = complete_heartbeat
 
     with (
         patch.object(agent, "_persist_session"),
@@ -656,9 +798,11 @@ def test_heartbeat_completion_clears_inflight_turn_marker(heartbeat_event):
     ):
         agent.run_conversation(
             "[HEARTBEAT] inspect target",
+            conversation_history=heartbeat_history,
             turn_origin="heartbeat_warm",
             allow_silent_noop=True,
             heartbeat_event=heartbeat_event,
         )
 
-    assert agent._inflight_turn_id is None
+    assert agent._inflight_turn_id == "ordinary-turn"
+    assert agent._session_messages is ordinary_history

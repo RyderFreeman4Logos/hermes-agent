@@ -30,6 +30,7 @@ class TestBrowserCleanup:
         self.browser_tool = browser_tool
         self.orig_active_sessions = browser_tool._active_sessions.copy()
         self.orig_session_last_activity = browser_tool._session_last_activity.copy()
+        self.orig_last_active_session_key = browser_tool._last_active_session_key.copy()
         self.orig_recording_sessions = browser_tool._recording_sessions.copy()
         self.orig_cleanup_done = browser_tool._cleanup_done
 
@@ -38,6 +39,8 @@ class TestBrowserCleanup:
         self.browser_tool._active_sessions.update(self.orig_active_sessions)
         self.browser_tool._session_last_activity.clear()
         self.browser_tool._session_last_activity.update(self.orig_session_last_activity)
+        self.browser_tool._last_active_session_key.clear()
+        self.browser_tool._last_active_session_key.update(self.orig_last_active_session_key)
         self.browser_tool._recording_sessions.clear()
         self.browser_tool._recording_sessions.update(self.orig_recording_sessions)
         self.browser_tool._cleanup_done = self.orig_cleanup_done
@@ -92,13 +95,74 @@ class TestBrowserCleanup:
         socket_dir.mkdir()
         (socket_dir / f"{session_name}.pid").write_text("12345")
         browser_tool._active_sessions["task-unknown"] = {"session_name": session_name, "bb_session_id": None}
+        browser_tool._session_last_activity["task-unknown"] = 123.0
+        browser_tool._last_active_session_key["task-unknown"] = "task-unknown"
         with (
             patch("tools.browser_tool._socket_safe_tmpdir", return_value=str(tmp_path)),
             patch("tools.browser_tool._maybe_stop_recording"),
             patch("tools.browser_tool._run_browser_command", return_value={"success": True}),
             patch("tools.process_registry.ProcessRegistry._safe_host_start_time", return_value=None),
+            patch("tools.process_registry.ProcessRegistry._is_host_pid_alive", return_value=True),
             patch("tools.process_registry.ProcessRegistry._terminate_host_pid", return_value=False) as terminate,
         ):
             browser_tool.cleanup_browser("task-unknown")
         terminate.assert_not_called()
         assert socket_dir.exists()
+        assert "task-unknown" in browser_tool._active_sessions
+        assert browser_tool._session_last_activity["task-unknown"] == 123.0
+        assert browser_tool._last_active_session_key["task-unknown"] == "task-unknown"
+
+    def test_unconfirmed_daemon_termination_retains_owner_until_retry(self, tmp_path):
+        browser_tool = self.browser_tool
+        session_name = "sess-retry"
+        socket_dir = tmp_path / f"agent-browser-{session_name}"
+        socket_dir.mkdir()
+        (socket_dir / f"{session_name}.pid").write_text("12345")
+        browser_tool._active_sessions["task-retry"] = {"session_name": session_name, "bb_session_id": None}
+        browser_tool._session_last_activity["task-retry"] = 123.0
+        browser_tool._last_active_session_key["task-retry"] = "task-retry"
+        with (
+            patch("tools.browser_tool._socket_safe_tmpdir", return_value=str(tmp_path)),
+            patch("tools.browser_tool._maybe_stop_recording"),
+            patch("tools.browser_tool._run_browser_command", return_value={"success": True}),
+            patch("tools.browser_tool._verify_reapable_browser_daemon", return_value=True),
+            patch("tools.process_registry.ProcessRegistry._safe_host_start_time", return_value=77),
+            patch("tools.process_registry.ProcessRegistry._terminate_host_pid", side_effect=[False, True]) as terminate,
+        ):
+            browser_tool.cleanup_browser("task-retry")
+            assert "task-retry" in browser_tool._active_sessions
+            assert browser_tool._session_last_activity["task-retry"] == 123.0
+            assert browser_tool._last_active_session_key["task-retry"] == "task-retry"
+            assert socket_dir.exists()
+
+            browser_tool.cleanup_browser("task-retry")
+            browser_tool.cleanup_browser("task-retry")
+
+        assert terminate.call_count == 2
+        assert "task-retry" not in browser_tool._active_sessions
+        assert "task-retry" not in browser_tool._session_last_activity
+        assert "task-retry" not in browser_tool._last_active_session_key
+        assert not socket_dir.exists()
+
+    def test_confirmed_gone_daemon_releases_owner(self, tmp_path):
+        browser_tool = self.browser_tool
+        session_name = "sess-gone"
+        socket_dir = tmp_path / f"agent-browser-{session_name}"
+        socket_dir.mkdir()
+        (socket_dir / f"{session_name}.pid").write_text("12345")
+        browser_tool._active_sessions["task-gone"] = {"session_name": session_name, "bb_session_id": None}
+        browser_tool._session_last_activity["task-gone"] = 123.0
+        browser_tool._last_active_session_key["task-gone"] = "task-gone"
+        with (
+            patch("tools.browser_tool._socket_safe_tmpdir", return_value=str(tmp_path)),
+            patch("tools.browser_tool._maybe_stop_recording"),
+            patch("tools.browser_tool._run_browser_command", return_value={"success": True}),
+            patch("tools.process_registry.ProcessRegistry._safe_host_start_time", return_value=None),
+            patch("tools.process_registry.ProcessRegistry._is_host_pid_alive", return_value=False),
+        ):
+            browser_tool.cleanup_browser("task-gone")
+
+        assert "task-gone" not in browser_tool._active_sessions
+        assert "task-gone" not in browser_tool._session_last_activity
+        assert "task-gone" not in browser_tool._last_active_session_key
+        assert not socket_dir.exists()

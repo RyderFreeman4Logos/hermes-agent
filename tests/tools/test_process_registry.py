@@ -1976,8 +1976,12 @@ def test_spawn_reader_start_baseexception_contains_child_and_propagates(
         containment.append(result)
         return result
 
-    def fail_start(_thread):
-        raise error_type("reader start failed")
+    real_thread_start = process_registry_module.threading.Thread.start
+
+    def fail_start(thread):
+        if thread.name.startswith("proc-reader-"):
+            raise error_type("reader start failed")
+        return real_thread_start(thread)
 
     monkeypatch.setattr(process_registry_module.subprocess, "Popen", capture_popen)
     monkeypatch.setattr(process_registry_module.threading.Thread, "start", fail_start)
@@ -2006,6 +2010,66 @@ def test_spawn_reader_start_baseexception_contains_child_and_propagates(
         if proc.poll() is None:
             ProcessRegistry._terminate_host_pid(proc.pid, start)
             proc.wait(timeout=5)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="uses a real POSIX child")
+def test_deferred_local_spawn_publishes_recoverable_owner(
+    registry, monkeypatch, tmp_path
+):
+    """Deferred local children are checkpointed before returning to promotion."""
+    from tools import process_registry as process_registry_module
+
+    checkpoint = tmp_path / "processes.json"
+    monkeypatch.setattr(process_registry_module, "CHECKPOINT_PATH", checkpoint)
+    session = registry.spawn_local(
+        f"{shlex.quote(sys.executable)} -c 'import time; time.sleep(30)'",
+        cwd=str(tmp_path),
+        execution_timeout=30,
+        defer_registration=True,
+    )
+    restored = ProcessRegistry()
+    try:
+        assert registry.get(session.id) is session
+        assert session._deadline_timer is not None
+        assert session._deadline_timer.is_alive()
+        assert restored.recover_from_checkpoint() == 1
+        recovered = restored.get(session.id)
+        assert recovered is not None
+        assert recovered.execution_deadline == pytest.approx(session.execution_deadline)
+    finally:
+        restored.kill_all()
+        registry.discard(session, source="test_cleanup")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="uses a real POSIX child")
+def test_deferred_local_post_dispatch_checkpoint_fault_keeps_owner(
+    registry, monkeypatch, tmp_path
+):
+    """A deferred child remains recoverable if setup faults after Popen succeeds."""
+    original_checkpoint = registry._write_checkpoint
+    original_terminate = registry._terminate_host_pid
+    monkeypatch.setattr(
+        registry,
+        "_write_checkpoint",
+        MagicMock(side_effect=RuntimeError("checkpoint boom")),
+    )
+    monkeypatch.setattr(registry, "_terminate_host_pid", lambda *_args: False)
+    try:
+        with pytest.raises(RuntimeError, match="checkpoint boom"):
+            registry.spawn_local(
+                f"{shlex.quote(sys.executable)} -c 'import time; time.sleep(30)'",
+                cwd=str(tmp_path),
+                execution_timeout=30,
+                defer_registration=True,
+            )
+        assert len(registry._running) == 1
+        session = next(iter(registry._running.values()))
+        assert session.pid is not None
+        assert registry.get(session.id) is session
+    finally:
+        monkeypatch.setattr(registry, "_write_checkpoint", original_checkpoint)
+        monkeypatch.setattr(registry, "_terminate_host_pid", original_terminate)
+        registry.kill_all()
 
 
 class _ArtifactEnv:

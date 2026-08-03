@@ -1193,7 +1193,7 @@ class ProcessRegistry:
             use_pty: If True, use a pseudo-terminal via ptyprocess for interactive
                      CLI tools (Codex, Claude Code, Python REPL). Falls back to
                      subprocess.Popen if ptyprocess is not installed.
-            defer_registration: Return the session unregistered for a caller to
+            defer_registration: Return a provisional owner for a caller to
                                 promote or discard after an inline wait.
         """
         # Guard against the `A && B &` subshell-wait trap (issue #68915).
@@ -1252,10 +1252,9 @@ class ProcessRegistry:
                 )
                 session._reader_thread = reader
 
-                if not defer_registration:
-                    self._publish_provisional_owner(session)
-                    self._write_checkpoint()
-                    self._arm_execution_deadline(session)
+                self._publish_provisional_owner(session)
+                self._write_checkpoint()
+                self._arm_execution_deadline(session)
                 reader.start()
                 return session
 
@@ -1330,10 +1329,9 @@ class ProcessRegistry:
             )
             session._reader_thread = reader
 
-            if not defer_registration:
-                self._publish_provisional_owner(session)
-                self._write_checkpoint()
-                self._arm_execution_deadline(session)
+            self._publish_provisional_owner(session)
+            self._write_checkpoint()
+            self._arm_execution_deadline(session)
             reader.start()
         except BaseException as exc:
             # A child now exists.  Reuse the public ownership/kill path so an
@@ -1557,7 +1555,7 @@ class ProcessRegistry:
         return session
 
     def wait_for_promotion(self, session: ProcessSession, threshold: float) -> str:
-        """Wait until an unregistered process exits, is interrupted, or ages out."""
+        """Wait until a deferred process exits, is interrupted, or ages out."""
         from tools.interrupt import is_interrupted as _is_interrupted
 
         deadline = session._started_monotonic + max(0.0, float(threshold))

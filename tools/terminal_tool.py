@@ -2607,7 +2607,7 @@ def terminal_tool(
 
         if background or auto_background_candidate:
             # Spawn through the managed process lifecycle. Auto-background
-            # candidates stay unregistered until their actual runtime crosses
+            # candidates stay provisional until their actual runtime crosses
             # the configured threshold.
             from tools.process_registry import process_registry
 

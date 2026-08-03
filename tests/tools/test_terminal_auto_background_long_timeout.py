@@ -396,8 +396,6 @@ def test_deferred_candidate_is_contained_on_lifecycle_exception(
     )
     command = f"{shlex.quote(sys.executable)} -c {shlex.quote(parent_code)}"
     original_spawn = registry.spawn_local
-    original_promote = registry.promote
-    original_prune = registry._prune_if_needed
     original_timer = process_module.threading.Timer
     captured = []
 
@@ -412,12 +410,8 @@ def test_deferred_candidate_is_contained_on_lifecycle_exception(
             raise error_type(f"injected {error_type.__name__}")
         return "running"
 
-    def fail_prune():
-        if stage == "promote":
-            raise error_type(f"injected {error_type.__name__}")
-        if stage == "deadline":
-            return original_prune()
-        raise RuntimeError("persistent cleanup promotion failure")
+    def fail_promote(*_args, **_kwargs):
+        raise error_type(f"injected {error_type.__name__}")
 
     class FailingDeadlineTimer:
         daemon = False
@@ -435,8 +429,10 @@ def test_deferred_candidate_is_contained_on_lifecycle_exception(
 
     monkeypatch.setattr(registry, "spawn_local", capture_spawn)
     monkeypatch.setattr(registry, "wait_for_promotion", reach_exception_point)
-    monkeypatch.setattr(registry, "_prune_if_needed", fail_prune)
-    monkeypatch.setattr(process_module.threading, "Timer", timer_factory)
+    if stage == "promote":
+        monkeypatch.setattr(registry, "promote", fail_promote)
+    if stage == "deadline":
+        monkeypatch.setattr(process_module.threading, "Timer", timer_factory)
     monkeypatch.setattr(registry, "_daemon_term_grace_seconds", lambda: 0.1)
 
     try:
@@ -449,16 +445,20 @@ def test_deferred_candidate_is_contained_on_lifecycle_exception(
             with pytest.raises(error_type, match=f"injected {error_type.__name__}"):
                 terminal_tool.terminal_tool(command=command, timeout=2)
 
+        if stage == "deadline":
+            assert captured == []
+            assert registry.list_sessions() == []
+            return
+
         session = captured[0]
         child_pid = int(child_pid_path.read_text(encoding="utf-8"))
-        assert _wait_until(lambda: not _pid_is_running(session.pid))
-        assert _wait_until(lambda: not _pid_is_running(child_pid))
-        assert registry.list_sessions() == []
-        assert registry.completion_queue.empty()
+        assert _pid_is_running(session.pid)
+        assert _pid_is_running(child_pid)
+        assert registry.get(session.id) is session
+        assert session._deadline_timer is not None
+        assert session._deadline_timer.is_alive()
     finally:
-        monkeypatch.setattr(registry, "_prune_if_needed", original_prune)
         if captured and _pid_is_running(captured[0].pid):
-            original_promote(captured[0])
             registry.kill_process(
                 captured[0].id,
                 source="test_emergency_cleanup",
@@ -470,7 +470,7 @@ def test_deferred_candidate_is_contained_on_lifecycle_exception(
 @pytest.mark.parametrize(
     "error_type", [RuntimeError, KeyboardInterrupt, SystemExit]
 )
-def test_outer_rescue_keeps_managed_identity_when_discard_and_kill_fail(
+def test_outer_exception_keeps_preowned_deferred_identity(
     terminal_runtime, monkeypatch, tmp_path, error_type
 ):
     terminal_tool, registry = terminal_runtime
@@ -484,7 +484,6 @@ def test_outer_rescue_keeps_managed_identity_when_discard_and_kill_fail(
     )
     command = f"{shlex.quote(sys.executable)} -c {shlex.quote(parent_code)}"
     original_spawn = registry.spawn_local
-    original_terminate = registry._terminate_host_pid
     captured = []
 
     def capture_spawn(**kwargs):
@@ -493,21 +492,14 @@ def test_outer_rescue_keeps_managed_identity_when_discard_and_kill_fail(
         return session
 
     def fail_wait(*_args, **_kwargs):
-        assert _wait_until(child_pid_path.exists)
+        assert _wait_until(
+            lambda: child_pid_path.exists()
+            and bool(child_pid_path.read_text(encoding="utf-8"))
+        )
         raise error_type(f"injected {error_type.__name__}")
 
     monkeypatch.setattr(registry, "spawn_local", capture_spawn)
     monkeypatch.setattr(registry, "wait_for_promotion", fail_wait)
-    monkeypatch.setattr(
-        registry,
-        "discard",
-        MagicMock(side_effect=RuntimeError("persistent discard failure")),
-    )
-    monkeypatch.setattr(
-        registry,
-        "_terminate_host_pid",
-        MagicMock(side_effect=RuntimeError("cleanup kill status unknown")),
-    )
 
     try:
         if issubclass(error_type, Exception):
@@ -515,9 +507,7 @@ def test_outer_rescue_keeps_managed_identity_when_discard_and_kill_fail(
                 terminal_tool.terminal_tool(command=command, timeout=2)
             )
             assert result["session_id"] == captured[0].id
-            assert "cleanup could not be confirmed" in result["error"]
-            assert "persistent discard failure" in result["cleanup_error"]
-            assert "cleanup kill status unknown" in result["cleanup_error"]
+            assert f"injected {error_type.__name__}" in result["error"]
         else:
             with pytest.raises(error_type, match=f"injected {error_type.__name__}"):
                 terminal_tool.terminal_tool(command=command, timeout=2)
@@ -531,7 +521,6 @@ def test_outer_rescue_keeps_managed_identity_when_discard_and_kill_fail(
         assert session._deadline_timer.is_alive()
     finally:
         if captured:
-            monkeypatch.setattr(registry, "_terminate_host_pid", original_terminate)
             if registry.get(captured[0].id) is not None:
                 registry.kill_process(
                     captured[0].id,
@@ -539,7 +528,9 @@ def test_outer_rescue_keeps_managed_identity_when_discard_and_kill_fail(
                     consume_output=False,
                 )
             if _pid_is_running(captured[0].pid):
-                original_terminate(captured[0].pid, captured[0].host_start_time)
+                ProcessRegistry._terminate_host_pid(
+                    captured[0].pid, captured[0].host_start_time
+                )
 
 
 @pytest.mark.parametrize(
@@ -948,6 +939,7 @@ def test_completion_before_spawn_returns_stays_inline_without_notification(
     def complete_before_return(**kwargs):
         session = original_spawn(**kwargs)
         assert session._completion_event.wait(3)
+        assert registry.get(session.id) is session
         return session
 
     monkeypatch.setattr(registry, "spawn_local", complete_before_return)

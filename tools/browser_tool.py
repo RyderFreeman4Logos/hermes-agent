@@ -4499,8 +4499,12 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
                 session_keys.append(sidecar_key)
         bare_task_id = task_id
 
+    cleanup_confirmed = True
     for session_key in session_keys:
-        _cleanup_single_browser_session(session_key)
+        if not _cleanup_single_browser_session(session_key):
+            cleanup_confirmed = False
+    if not cleanup_confirmed:
+        return
 
     # Drop stale last-active ownership. Cleaning a bare task drops its binding;
     # cleaning a sidecar drops the binding only if that sidecar was still the
@@ -4513,7 +4517,7 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
         _last_active_session_key.pop(bare_task_id, None)
 
 
-def _cleanup_single_browser_session(task_id: str) -> None:
+def _cleanup_single_browser_session(task_id: str) -> bool:
     """Internal: reap a single browser session by its exact session key."""
     # Stop the CDP supervisor for this task FIRST so we close our WebSocket
     # before the backend tears down the underlying CDP endpoint.
@@ -4553,11 +4557,6 @@ def _cleanup_single_browser_session(task_id: str) -> None:
         except Exception as e:
             logger.warning("agent-browser close failed for task %s: %s", task_id, e)
 
-        # Now remove from tracking under lock
-        with _cleanup_lock:
-            _active_sessions.pop(task_id, None)
-            _session_last_activity.pop(task_id, None)
-
         # Cloud mode: close the cloud browser session via provider API.
         # Local sidecars have bb_session_id=None so this no-ops for them.
         if bb_session_id:
@@ -4581,20 +4580,31 @@ def _cleanup_single_browser_session(task_id: str) -> None:
                         daemon_pid = int(Path(pid_file).read_text(encoding="utf-8").strip())
                         daemon_start = ProcessRegistry._safe_host_start_time(daemon_pid)
                         if daemon_start is None:
-                            logger.warning("Retaining browser control path for %s: daemon identity is unknown", session_name)
-                            return
-                        if not ProcessRegistry._terminate_host_pid(daemon_pid, daemon_start):
+                            if ProcessRegistry._is_host_pid_alive(daemon_pid):
+                                logger.warning("Retaining browser control path for %s: daemon identity is unknown", session_name)
+                                return False
+                        elif not _verify_reapable_browser_daemon(
+                            daemon_pid, socket_dir, session_name
+                        ):
+                            logger.warning("Retaining browser control path for %s: daemon identity is unverified", session_name)
+                            return False
+                        elif not ProcessRegistry._terminate_host_pid(daemon_pid, daemon_start):
                             logger.warning("Retaining browser control path for %s: daemon termination was unconfirmed", session_name)
-                            return
+                            return False
                         logger.debug("Killed daemon pid %s for %s", daemon_pid, session_name)
                     except (ProcessLookupError, ValueError, PermissionError, OSError):
                         logger.warning("Retaining browser control path for %s: daemon cleanup failed", session_name)
-                        return
+                        return False
                 shutil.rmtree(socket_dir, ignore_errors=True)
 
+        with _cleanup_lock:
+            _active_sessions.pop(task_id, None)
+            _session_last_activity.pop(task_id, None)
         logger.debug("Removed task %s from active sessions", task_id)
+        return True
     else:
         logger.debug("No active session found for task_id: %s", task_id)
+        return True
 
 
 def cleanup_all_browsers() -> None:

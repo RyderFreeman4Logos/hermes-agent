@@ -2728,6 +2728,7 @@ def terminal_tool(
                             pty_note=pty_disabled_reason,
                         )
                     if promotion_state == "exited":
+                        process_registry.discard(proc_session, source="foreground_complete")
                         return _inline_process_response(
                             proc_session,
                             command,

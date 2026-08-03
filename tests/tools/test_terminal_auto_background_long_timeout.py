@@ -223,10 +223,13 @@ class _TimedRemoteEnvironment:
                 result.get("output", "")
             ):
                 self.killed = True
+                result["output"] = (
+                    "__HERMES_SIGNAL_DELIVERED__\n" + result["output"]
+                )
             return result
         if "kill -0" in command:
             self._poll_stage("status")
-            return {"output": "1\n" if self._done() else "0\n", "returncode": 0}
+            return {"output": "GONE\n" if self._done() else "MATCH\n", "returncode": 0}
         if command.startswith("head -c 5 --") and ".exit" in command:
             self._poll_stage("exit")
             exit_output = "143\n" if self.killed else ("0\n" if self._done() else "")
@@ -266,10 +269,12 @@ class _ShellRemoteEnvironment:
             self.transports.append(transport)
             assert transport.stdout is not None
             ready, _, _ = select.select([transport.stdout], [], [], timeout)
-            output = transport.stdout.readline() if ready else ""
+            output = "".join(transport.stdout.readline() for _ in range(2)) if ready else ""
             return {
                 "output": output,
-                "returncode": 0 if output.strip().isdigit() else 124,
+                "returncode": 0 if len(output.splitlines()) == 2 and all(
+                    line.isdigit() for line in output.splitlines()
+                ) else 124,
             }
 
         completed = subprocess.run(

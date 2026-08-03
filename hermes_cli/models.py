@@ -5192,13 +5192,14 @@ def validate_requested_model(
             suggestion_text = "\n  Similar models: " + ", ".join(
                 f"`{catalog_lower[s]}`" for s in suggestions
             )
+        probe_note = " and the /models endpoint was unreachable" if allow_network else ""
         return {
             "accepted": True,
             "persist": True,
             "recognized": False,
             "message": (
-                f"Note: `{requested}` was not found in the {provider_label} curated catalog "
-                f"and the /models endpoint was unreachable.{suggestion_text}"
+                f"Note: `{requested}` was not found in the {provider_label} curated catalog"
+                f"{probe_note}.{suggestion_text}"
                 f"\n  The model may still work if it exists on the provider."
             ),
         }
@@ -5212,5 +5213,7 @@ def validate_requested_model(
         "message": (
             f"Note: could not reach the {provider_label} API to validate `{requested}`. "
             f"If the service isn't down, this model may not be valid."
+            if allow_network
+            else None
         ),
     }

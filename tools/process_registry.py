@@ -594,8 +594,9 @@ class ProcessRegistry:
         if not cls._is_host_pid_alive(pid):
             return cls._PID_GONE_OR_MISMATCH
         if expected_start is None:
-            # Legacy / non-/proc platforms: bare liveness is the only evidence.
-            return cls._PID_MATCH
+            # Liveness is not identity: PID-only ownership remains retryable,
+            # but must never authorize a signal.
+            return cls._PID_UNKNOWN
         current_start = cls._safe_host_start_time(pid)
         if current_start is None:
             # Live but unreadable identity — not permission to signal.
@@ -821,12 +822,16 @@ class ProcessRegistry:
                         if session._completion_event.wait(timeout=remaining):
                             return
                         continue
-                    if not self._deadline_target_is_current(session):
-                        return
+                    with self._lock:
+                        if self._running.get(session.id) is not session:
+                            return
+                        claimed_generation = session._registry_generation
                     result = self.kill_process(
                         session.id,
                         source="execution_timeout",
                         consume_output=False,
+                        expected_session=session,
+                        expected_generation=claimed_generation,
                     )
                     if result.get("status") in {
                         "killed",
@@ -858,16 +863,20 @@ class ProcessRegistry:
         expected_generation = session._registry_generation
 
         def _deadline_fire() -> None:
-            # Bind the ProcessSession object + generation: only fire when the
-            # same object still owns this registry id (N4).
-            if session._registry_generation != expected_generation:
-                return
-            if not self._deadline_target_is_current(session):
-                return
+            # Claim object+generation under the registry lock, then kill with
+            # that claim so a replacement owner at the same id is never hit.
+            with self._lock:
+                if session._registry_generation != expected_generation:
+                    return
+                if self._running.get(session.id) is not session:
+                    return
+                claimed_generation = session._registry_generation
             self.kill_process(
                 session.id,
                 source="execution_timeout",
                 consume_output=False,
+                expected_session=session,
+                expected_generation=claimed_generation,
             )
 
         with session._lock:
@@ -1820,18 +1829,19 @@ class ProcessRegistry:
                 if session.exited:
                     return previous_output_length
 
-            if session.host_start_time is None:
-                check_command = (
-                    f"pid=$(head -n 1 {quoted_pid_path} 2>/dev/null); "
-                    f'kill -0 "$pid" 2>/dev/null; echo $?'
-                )
+            with session._lock:
+                monitored_pid = session.pid
+                monitored_start = session.host_start_time
+            if monitored_pid is None or monitored_start is None:
+                # Child-writable artifacts cannot establish monitor authority.
+                check_command = "exit 2"
             else:
                 check_command = (
-                    f"pid=$(head -n 1 {quoted_pid_path} 2>/dev/null); "
-                    f"current=$(sed 's/^.*) //' \"/proc/$pid/stat\" 2>/dev/null | "
+                    f"pid={int(monitored_pid)}; "
+                    f"current=$(sed 's/^.*) //' \"/proc/{int(monitored_pid)}/stat\" 2>/dev/null | "
                     f"cut -d ' ' -f 20); "
                     f'if [ -n "$pid" ] && '
-                    f'[ "$current" = "{session.host_start_time}" ] && '
+                    f'[ "$current" = "{int(monitored_start)}" ] && '
                     f'kill -0 "$pid" 2>/dev/null; '
                     f"then echo 0; else echo 1; fi"
                 )
@@ -2468,16 +2478,44 @@ class ProcessRegistry:
         *,
         source: str = "process.kill",
         consume_output: bool = True,
+        expected_session: Optional["ProcessSession"] = None,
+        expected_generation: Optional[int] = None,
     ) -> dict:
         """Kill a process only after its owned identity is confirmed terminal."""
         from tools.ansi_strip import strip_ansi
 
-        session = self.get(session_id)
+        if expected_session is not None and expected_session.id != session_id:
+            return {
+                "status": "error",
+                "error": f"Process identity collision for {session_id}",
+                "session_id": session_id,
+            }
+        session = expected_session if expected_session is not None else self.get(session_id)
         if session is None:
             return {"status": "not_found", "error": f"No process with ID {session_id}"}
+        if (
+            expected_generation is not None
+            and session._registry_generation != expected_generation
+        ):
+            return {
+                "status": "error",
+                "error": f"Process identity collision for {session_id}",
+                "session_id": session_id,
+            }
 
         with session._termination_lock:
             current = self.get(session_id)
+            if expected_session is not None and (
+                current is not expected_session
+                or expected_generation is None
+                or current is None
+                or current._registry_generation != expected_generation
+            ):
+                return {
+                    "status": "error",
+                    "error": f"Process identity collision for {session_id}",
+                    "session_id": session_id,
+                }
             if current is not session:
                 if current is None:
                     return {

@@ -626,6 +626,8 @@ class TestSpawnEnvSanitization:
     def test_env_poller_quotes_temp_paths_with_spaces(self, registry):
         session = _make_session(sid="proc_space")
         session.exited = False
+        session.pid = 4242
+        session.host_start_time = 77
 
         class FakeEnv:
             def __init__(self):
@@ -651,8 +653,13 @@ class TestSpawnEnvSanitization:
         )
 
         assert env.commands[0][0] == (
-            "pid=$(head -n 1 '/path with spaces/hermes_bg.pid' 2>/dev/null); "
-            'kill -0 "$pid" 2>/dev/null; echo $?'
+            "pid=4242; "
+            "current=$(sed 's/^.*) //' \"/proc/4242/stat\" 2>/dev/null | "
+            "cut -d ' ' -f 20); "
+            'if [ -n "$pid" ] && '
+            '[ "$current" = "77" ] && '
+            'kill -0 "$pid" 2>/dev/null; '
+            "then echo 0; else echo 1; fi"
         )
         assert env.commands[1][0] == (
             "if [ -f '/path with spaces/hermes_bg.log' ]; then "
@@ -891,6 +898,7 @@ class TestKillProcess:
     def test_kill_detached_session_uses_host_pid(self, registry):
         s = _make_session(sid="proc_detached", command="sleep 999")
         s.pid = 424242
+        s.host_start_time = 123
         s.detached = True
         registry._running[s.id] = s
 
@@ -923,6 +931,11 @@ class TestKillProcess:
             with patch("gateway.status._pid_exists", return_value=True), \
                  patch.object(ProcessRegistry, "_daemon_term_grace_seconds",
                               staticmethod(lambda: 0.0)), \
+                 patch.object(
+                     ProcessRegistry,
+                     "_host_pid_identity",
+                     classmethod(lambda cls, pid, expected_start=None: cls._PID_MATCH),
+                 ), \
                  patch.object(_psutil, "Process", side_effect=lambda pid: FakeProcess(pid)):
                 result = registry.kill_process(s.id)
 
@@ -1246,8 +1259,13 @@ class TestTerminateHostPidPosix:
             "_is_host_pid_alive",
             staticmethod(lambda _pid: True),
         )
+        monkeypatch.setattr(
+            pr.ProcessRegistry,
+            "_host_pid_identity",
+            classmethod(lambda cls, _pid, _expected=None: cls._PID_MATCH),
+        )
 
-        confirmed = pr.ProcessRegistry._terminate_host_pid(12345)
+        confirmed = pr.ProcessRegistry._terminate_host_pid(12345, expected_start=99)
 
         assert kill_calls == [(12345, signal.SIGTERM)]
         assert confirmed is False
@@ -1330,7 +1348,9 @@ class TestSigkillEscalation:
                             staticmethod(lambda: 0.3))
         proc = self._spawn_trap()
         try:
-            ProcessRegistry._terminate_host_pid(proc.pid)
+            start = ProcessRegistry._safe_host_start_time(proc.pid)
+            assert start is not None
+            ProcessRegistry._terminate_host_pid(proc.pid, expected_start=start)
             assert _wait_until(lambda: proc.poll() is not None, timeout=4.0), \
                 "SIGTERM-ignoring daemon should be SIGKILLed after grace"
         finally:
@@ -1397,7 +1417,9 @@ class TestSigkillEscalation:
         child_pids = [int(x) for x in parent.stdout.readline().split()]
         all_pids = [parent.pid] + child_pids
         try:
-            ProcessRegistry._terminate_host_pid(parent.pid)
+            start = ProcessRegistry._safe_host_start_time(parent.pid)
+            assert start is not None
+            ProcessRegistry._terminate_host_pid(parent.pid, expected_start=start)
 
             def _pid_dead(p: int) -> bool:
                 # A pid is "dead" for our purposes if it no longer exists OR
@@ -2229,6 +2251,7 @@ def test_broken_deadline_timer_and_first_kill_retry_until_one_real_completion(
 class TestN1HostPidIdentityTriState:
     def test_unknown_identity_refuses_signal_and_retains_owner(self, monkeypatch):
         """N1: UNKNOWN must not signal; owner/deadline/retry retained."""
+        from tools import process_registry as pr
         from tools.process_registry import ProcessRegistry, ProcessSession
 
         monkeypatch.setattr(ProcessRegistry, "_is_host_pid_alive", classmethod(lambda cls, pid: True))
@@ -2239,13 +2262,35 @@ class TestN1HostPidIdentityTriState:
         # terminate must refuse signal and report not-gone
         assert ProcessRegistry._terminate_host_pid(12345, expected_start=99) is False
 
+        # Alive PID with missing start baseline is also UNKNOWN: never taskkill/kill.
+        assert ProcessRegistry._host_pid_identity(12345, None) == ProcessRegistry._PID_UNKNOWN
+        assert ProcessRegistry._host_pid_is_ours(12345, None) is False
+        signals = []
+
+        def fake_run(*args, **kwargs):
+            signals.append(("taskkill", args, kwargs))
+            return MagicMock(returncode=0, stderr="", stdout="")
+
+        monkeypatch.setattr(pr, "_IS_WINDOWS", True)
+        monkeypatch.setattr(pr.subprocess, "run", fake_run)
+        assert ProcessRegistry._terminate_host_pid(12345, expected_start=None) is False
+        assert signals == []
+        monkeypatch.setattr(pr, "_IS_WINDOWS", False)
+        monkeypatch.setattr(
+            pr.os,
+            "kill",
+            lambda *a, **k: signals.append(("kill", a, k)),
+        )
+        assert ProcessRegistry._terminate_host_pid(12345, expected_start=None) is False
+        assert signals == []
+
         registry = ProcessRegistry()
         session = ProcessSession(
             id="proc_n1_unknown",
             command="sleep 999",
             pid=12345,
             pid_scope="host",
-            host_start_time=99,
+            host_start_time=None,
             detached=True,
             execution_deadline=time.time() + 30,
         )
@@ -2337,7 +2382,7 @@ class TestN4DeadlineCallbackObjectGeneration:
         original_kill = registry.kill_process
 
         def _spy(session_id, **kwargs):
-            killed.append(session_id)
+            killed.append((session_id, kwargs.get("expected_session"), kwargs.get("expected_generation")))
             return original_kill(session_id, **kwargs)
 
         registry.kill_process = _spy  # type: ignore[method-assign]
@@ -2348,6 +2393,16 @@ class TestN4DeadlineCallbackObjectGeneration:
             timer.cancel()
             timer.function()
         assert killed == []
+        # Direct ID-only kill would hit replacement; object/generation claim must refuse.
+        result = registry.kill_process(
+            old.id,
+            source="execution_timeout",
+            consume_output=False,
+            expected_session=old,
+            expected_generation=old_gen,
+        )
+        assert result["status"] == "error"
+        assert "collision" in result["error"]
         assert registry.get("proc_deadline1") is new
         assert not new.exited
         assert old._registry_generation == old_gen
@@ -2534,7 +2589,7 @@ class TestN8ChildWritableArtifactNotTerminalAlone:
                     return {"output": "0", "returncode": 0}
                 # identity check: process still present (returncode 0)
                 if "kill -0" in command or "/proc/" in command:
-                    return {"output": "", "returncode": 0}
+                    return {"output": "0", "returncode": 0}
                 return {"output": "", "returncode": 0}
 
         registry = ProcessRegistry()
@@ -2549,9 +2604,52 @@ class TestN8ChildWritableArtifactNotTerminalAlone:
         )
         registry._publish_provisional_owner(session)
         log_path, pid_path, exit_path = registry._env_artifact_paths(env, session.id)
-        # Monkeypatch identity probe used inside poll: process_exited derived from env.execute.
-        # Force _poll_env_once path with live identity by patching the identity section via execute returns.
-        # Ensure process_exited stays False: the code uses env.execute for pid checks.
         before = registry._poll_env_once(session, env, log_path, pid_path, exit_path, 0)
         assert session.exited is False
         assert registry.get(session.id) is session
+        # Identity probe must use immutable in-memory pid/starttime, not pid_path.
+        identity_cmds = [c for c in env.calls if "kill -0" in c or "/proc/" in c]
+        assert identity_cmds
+        assert all("head -n 1" not in c for c in identity_cmds)
+        assert all(str(session.pid) in c for c in identity_cmds)
+
+    def test_forged_pid_path_and_exit_positive_cannot_terminal(self):
+        """N8 RED/GREEN: forged pid_path + positive exit artifact stays nonterminal."""
+        from tools.process_registry import ProcessRegistry, ProcessSession
+
+        class ForgedEnv:
+            def __init__(self):
+                self.calls = []
+            def execute(self, command, **kwargs):
+                self.calls.append(command)
+                if "head -c 5" in command:
+                    # Child-writable positive exit artifact.
+                    return {"output": "0\n", "returncode": 0}
+                if "tail -c" in command or "wc -c" in command:
+                    return {"output": "0", "returncode": 0}
+                # Forge pid_path identity: claim a different live pid.
+                if "head -n 1" in command:
+                    return {"output": "9999\n", "returncode": 0}
+                if "kill -0" in command or "/proc/" in command:
+                    # In-memory owned identity is still live/MATCH.
+                    return {"output": "0", "returncode": 0}
+                return {"output": "", "returncode": 0}
+
+        registry = ProcessRegistry()
+        env = ForgedEnv()
+        session = ProcessSession(
+            id="proc_n8_forge",
+            command="cmd",
+            pid=123,
+            env_ref=env,
+            host_start_time=1,
+            pid_scope="sandbox",
+        )
+        registry._publish_provisional_owner(session)
+        log_path, pid_path, exit_path = registry._env_artifact_paths(env, session.id)
+        registry._poll_env_once(session, env, log_path, pid_path, exit_path, 0)
+        assert session.exited is False
+        assert session.exit_code is None
+        assert registry.get(session.id) is session
+        # No monitor authority from child-writable pid_path.
+        assert not any("head -n 1" in c for c in env.calls if "kill -0" in c or "/proc/" in c)

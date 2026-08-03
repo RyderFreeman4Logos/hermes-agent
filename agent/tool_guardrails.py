@@ -11,7 +11,6 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
-import reprlib
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
@@ -660,7 +659,8 @@ def _compound_frame(tag: bytes, parts: list[bytes]) -> bytes:
 
 def _canonical_result_frame(value: Any) -> bytes:
     """Encode arbitrary tool results into total, typed, bounded canonical bytes."""
-    active_ids: set[int] = set()
+    active_ordinals: dict[int, int] = {}
+    next_active_ordinal = 0
     frames: list[bytes] = []
     stack: list[tuple[str, Any]] = [("visit", value)]
 
@@ -679,7 +679,7 @@ def _canonical_result_frame(value: Any) -> bytes:
             parts = frames[-count:] if count else []
             if count:
                 del frames[-count:]
-            active_ids.discard(identity)
+            active_ordinals.pop(identity, None)
             if unordered:
                 parts.sort()
             frames.append(_compound_frame(tag, parts))
@@ -690,7 +690,7 @@ def _canonical_result_frame(value: Any) -> bytes:
             parts = frames[-part_count:] if part_count else []
             if part_count:
                 del frames[-part_count:]
-            active_ids.discard(identity)
+            active_ordinals.pop(identity, None)
             pairs = [
                 _compound_frame(b"P", parts[index : index + 2])
                 for index in range(0, part_count, 2)
@@ -701,7 +701,7 @@ def _canonical_result_frame(value: Any) -> bytes:
         if operation == "finish_object":
             identity, object_type = payload
             attributes = frames.pop()
-            active_ids.discard(identity)
+            active_ordinals.pop(identity, None)
             frames.append(_compound_frame(b"O", [object_type, attributes]))
             continue
 
@@ -747,12 +747,24 @@ def _canonical_result_frame(value: Any) -> bytes:
             )
             if container_tag is not None:
                 identity = id(current)
-                if identity in active_ids:
-                    frames.append(b"C" + container_tag)
+                if identity in active_ordinals:
+                    frames.append(
+                        _compound_frame(
+                            b"C",
+                            [
+                                container_tag,
+                                _typed_frame(
+                                    b"I",
+                                    str(active_ordinals[identity]).encode("ascii"),
+                                ),
+                            ],
+                        )
+                    )
                     continue
                 if isinstance(current, Mapping):
                     items = list(current.items())
-                    active_ids.add(identity)
+                    next_active_ordinal += 1
+                    active_ordinals[identity] = next_active_ordinal
                     stack.append(
                         ("finish_mapping", (container_tag, identity, len(items)))
                     )
@@ -761,7 +773,8 @@ def _canonical_result_frame(value: Any) -> bytes:
                         stack.append(("visit", key))
                 else:
                     items = list(current)
-                    active_ids.add(identity)
+                    next_active_ordinal += 1
+                    active_ordinals[identity] = next_active_ordinal
                     stack.append(
                         (
                             "finish_sequence",
@@ -779,20 +792,33 @@ def _canonical_result_frame(value: Any) -> bytes:
 
             object_type = type_frame(current)
             identity = id(current)
-            if identity in active_ids:
-                frames.append(_compound_frame(b"C", [object_type]))
+            if identity in active_ordinals:
+                frames.append(
+                    _compound_frame(
+                        b"C",
+                        [
+                            object_type,
+                            _typed_frame(
+                                b"I", str(active_ordinals[identity]).encode("ascii")
+                            ),
+                        ],
+                    )
+                )
                 continue
             try:
                 attributes = vars(current)
             except Exception:
                 attributes = None
             if isinstance(attributes, Mapping):
-                active_ids.add(identity)
+                next_active_ordinal += 1
+                active_ordinals[identity] = next_active_ordinal
                 stack.append(("finish_object", (identity, object_type)))
                 stack.append(("visit", attributes))
                 continue
             try:
-                preview = reprlib.repr(current).encode(
+                from agent.tool_dispatch_helpers import _multimodal_text_summary
+
+                preview = _multimodal_text_summary(current).encode(
                     "utf-8", errors="backslashreplace"
                 )
             except Exception:

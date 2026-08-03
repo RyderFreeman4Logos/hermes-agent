@@ -13,6 +13,7 @@ from agent.tool_guardrails import (
     canonical_tool_args,
     classify_tool_failure,
 )
+from agent.tool_dispatch_helpers import _multimodal_text_summary
 
 
 def test_tool_call_signature_hashes_canonical_nested_unicode_args_without_exposing_raw_args():
@@ -295,3 +296,44 @@ def test_result_hash_typed_frames_prevent_nested_bytes_spoofing():
         _result_hash("x"),
         _result_hash(None),
     }) == 6
+
+
+def test_result_hash_distinguishes_opaque_provider_visible_middle_content():
+    class Opaque:
+        __slots__ = ("marker",)
+
+        def __init__(self, marker):
+            self.marker = marker
+
+        def __repr__(self):
+            return "Opaque(" + ("x" * 10_000) + self.marker + ("y" * 10_000) + ")"
+
+    first = Opaque("FIRST")
+    second = Opaque("SECOND")
+
+    assert not hasattr(first, "__dict__")
+    assert _multimodal_text_summary(first) != _multimodal_text_summary(second)
+    assert _result_hash(first) != _result_hash(second)
+
+
+def test_result_hash_distinguishes_cycle_back_reference_topology():
+    mutual_left = []
+    mutual_right = []
+    mutual_left.append(mutual_right)
+    mutual_right.append(mutual_left)
+
+    outer = []
+    inner = []
+    outer.append(inner)
+    inner.append(inner)
+
+    assert _canonical_result_frame(mutual_left) != _canonical_result_frame(outer)
+    assert _result_hash(mutual_left) != _result_hash(outer)
+
+
+def test_result_hash_preserves_equal_ordinary_provider_visible_results():
+    first = {"status": "ok", "items": [1, 2]}
+    second = {"items": [1, 2], "status": "ok"}
+
+    assert _multimodal_text_summary(first) != _multimodal_text_summary(second)
+    assert _result_hash(first) == _result_hash(second)

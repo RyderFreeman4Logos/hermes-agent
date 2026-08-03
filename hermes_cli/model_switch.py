@@ -2462,15 +2462,26 @@ def switch_model(
         from hermes_cli.models import normalize_opencode_base_url
         base_url = normalize_opencode_base_url(target_provider, api_mode, base_url)
 
+    context_length = None
     if validate_live:
         capabilities = get_model_capabilities(target_provider, new_model)
         model_info = get_model_info(target_provider, new_model)
     else:
-        # Deferred scheduling uses config/static validation only; preserve local
-        # catalog context so the committed-boundary route can activate safely.
+        # Prefer the existing configured-route authority. Only built-ins without
+        # a configured context need the local static catalog lookup.
         capabilities = None
-        model_info = get_model_info(
-            target_provider, new_model, allow_network=False
+        from hermes_cli.config import get_custom_provider_context_length
+
+        context_length = get_custom_provider_context_length(
+            model=new_model, base_url=base_url
+        )
+        model_info = (
+            None
+            if (
+                (isinstance(context_length, int) and context_length > 0)
+                or (isinstance(user_providers, dict) and target_provider in user_providers)
+            )
+            else get_model_info(target_provider, new_model, allow_network=False)
         )
 
     # --- Collect warnings ---
@@ -2495,6 +2506,7 @@ def switch_model(
         resolved_via_alias=resolved_alias,
         capabilities=capabilities,
         model_info=model_info,
+        context_length=context_length,
         is_global=is_global,
     )
 

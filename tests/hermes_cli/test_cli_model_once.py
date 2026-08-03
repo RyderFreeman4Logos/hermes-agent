@@ -67,6 +67,7 @@ def test_cli_model_once_records_restore_and_does_not_persist(monkeypatch):
             base_url="https://api.anthropic.com",
             api_mode="anthropic_messages",
             provider_label="Anthropic",
+                        context_length=128_000,
         ),
     )
     monkeypatch.setattr("hermes_cli.model_switch.resolve_display_context_length", lambda *a, **k: None)
@@ -144,6 +145,7 @@ def test_cli_model_after_compression_resolves_now_without_mutating_route(monkeyp
             base_url="https://pm.invalid/v1",
             api_mode="codex_responses",
             provider_label="pm",
+                        context_length=128_000,
         ),
     )
     monkeypatch.setattr(
@@ -187,6 +189,7 @@ def test_cli_model_picker_reports_pending_deferred_route(monkeypatch):
             success=True,
             new_model="next/model",
             target_provider="anthropic",
+            context_length=128_000,
         ),
     )
     printed = []

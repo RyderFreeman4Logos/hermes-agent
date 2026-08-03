@@ -167,6 +167,7 @@ def _schedule_codex_switch(agent):
         success=True,
         new_model="next-model",
         target_provider="next-provider",
+                 context_length=128_000,
     )
     schedule_model_switch_after_compression(agent, result)
     return result
@@ -250,6 +251,7 @@ def test_native_inline_codex_compaction_rejects_deferred_switch():
                 success=True,
                 new_model="next-model",
                 target_provider="openai-codex",
+                context_length=128_000,
             ),
         )
 
@@ -269,6 +271,7 @@ def test_codex_responses_deferred_switch_remains_supported():
         success=True,
         new_model="next-model",
         target_provider="openai-codex",
+                  context_length=128_000,
     )
 
     assert schedule_model_switch_after_compression(agent, pending) is None

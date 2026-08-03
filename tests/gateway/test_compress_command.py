@@ -149,6 +149,7 @@ async def test_outer_transcript_mirror_failure_reconciles_committed_child(
         api_key="next-key",
         base_url="https://api.anthropic.com",
         api_mode="anthropic_messages",
+                  context_length=128_000,
     )
     session_entry = runner.session_store.get_or_create_session.return_value
     session_entry.session_id = agent.session_id

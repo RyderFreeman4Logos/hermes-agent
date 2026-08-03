@@ -59,6 +59,7 @@ def _fake_switch_result():
         base_url="https://openrouter.ai/api/v1",
         api_mode="chat_completions",
         provider_label="OpenRouter",
+               context_length=128_000,
     )
 
 

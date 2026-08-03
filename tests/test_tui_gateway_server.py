@@ -944,7 +944,9 @@ def test_usage_ticker_emits_wrapped_usage_payload(monkeypatch):
     # …) silently drops every live tick on the client side.
     events: list[tuple[str, str, dict]] = []
     monkeypatch.setattr(
-        server, "_emit", lambda event_type, sid, payload: events.append((event_type, sid, payload))
+        server, "_emit", lambda event_type, sid, payload: (
+            events.append((event_type, sid, payload)) if event_type == "session.usage" else None
+        )
     )
     snapshot = {"input": 1200, "total": 1280}
     monkeypatch.setattr(server, "_get_usage", lambda agent: dict(snapshot))
@@ -975,7 +977,9 @@ def test_usage_ticker_skips_unchanged_snapshots(monkeypatch):
     # Only a changed snapshot emits.
     events: list[dict] = []
     monkeypatch.setattr(
-        server, "_emit", lambda event_type, sid, payload: events.append(payload)
+        server, "_emit", lambda event_type, sid, payload: (
+            events.append(payload) if event_type == "session.usage" else None
+        )
     )
     snapshot = {"input": 1200, "total": 1280}
     monkeypatch.setattr(server, "_get_usage", lambda agent: dict(snapshot))
@@ -3708,6 +3712,7 @@ def test_apply_model_switch_after_compression_defers_tui_route(monkeypatch):
         base_url="https://pm.invalid/v1",
         api_mode="codex_responses",
         provider_label="pm",
+                 context_length=128_000,
     )
     monkeypatch.setattr("hermes_cli.model_switch.switch_model", lambda **kw: result)
     monkeypatch.setattr(
@@ -3779,6 +3784,7 @@ def test_deferred_tui_emit_failure_does_not_rollback_authoritative_activation(
         api_key="new-key",
         base_url="https://new.invalid/v1",
         api_mode="anthropic_messages",
+                  context_length=128_000,
     )
     agent = Agent()
     session = _session(
@@ -3861,6 +3867,7 @@ def test_deferred_tui_history_failure_rolls_back_every_authoritative_mirror():
         api_key="new-key",
         base_url="https://new.invalid/v1",
         api_mode="anthropic_messages",
+                  context_length=128_000,
     )
     agent = Agent()
     old_override = {"model": "old/model", "provider": "old-provider"}
@@ -3921,6 +3928,7 @@ def test_apply_model_switch_allows_provider_only_deferred_route(monkeypatch):
         api_key="next-key",
         base_url="https://api.anthropic.com",
         api_mode="anthropic_messages",
+                 context_length=128_000,
     )
     seen = {}
 
@@ -3951,6 +3959,7 @@ def test_apply_model_switch_no_target_reports_pending_route():
         success=True,
         new_model="next/model",
         target_provider="anthropic",
+                  context_length=128_000,
     )
     session = {
         "agent": types.SimpleNamespace(model="old/model", provider="openrouter"),
@@ -3979,6 +3988,7 @@ def test_busy_config_set_schedules_after_compression_on_live_agent(monkeypatch):
         base_url="https://api.anthropic.com",
         api_mode="anthropic_messages",
         provider_label="Anthropic",
+                 context_length=128_000,
     )
     session = {"agent": agent, "running": True}
     monkeypatch.setattr(server, "_load_cfg", lambda: {"model": {}})
@@ -4014,6 +4024,7 @@ def test_tui_slash_and_status_expose_replaced_deferred_route(monkeypatch):
         new_model="next/model",
         target_provider="anthropic",
         provider_label="Anthropic",
+                  context_length=128_000,
     )
     session = {
         "agent": types.SimpleNamespace(model="old/model", provider="openrouter"),
@@ -8428,6 +8439,7 @@ def test_session_compress_reports_aborted_summary_without_success(monkeypatch):
         success=True,
         new_model="new-model",
         target_provider="new-provider",
+                  context_length=128_000,
     )
     schedule_model_switch_after_compression(agent, pending)
     history = [{"role": "user", "content": f"m{i}"} for i in range(6)]
@@ -8505,6 +8517,7 @@ def test_stale_tui_compression_reconciles_forward_and_preserves_new_input(tmp_pa
             api_key="next-key",
             base_url="https://api.anthropic.com",
             api_mode="anthropic_messages",
+                      context_length=128_000,
         )
         schedule_model_switch_after_compression(agent, pending)
         messages = [{"role": "user", "content": f"m{i}"} for i in range(10)]
@@ -8586,11 +8599,13 @@ def test_tui_deferred_replacement_holds_frontend_and_agent_lock(monkeypatch):
         success=True,
         new_model="first-deferred",
         target_provider="anthropic",
+                context_length=128_000,
     )
     second = ModelSwitchResult(
         success=True,
         new_model="replacement-deferred",
         target_provider="anthropic",
+                 context_length=128_000,
     )
     session = {
         "agent": agent,
@@ -8684,6 +8699,7 @@ def test_busy_immediate_switch_cancels_deferred_before_compression_race():
         success=True,
         new_model="deferred-model",
         target_provider="anthropic",
+                   context_length=128_000,
     )
     schedule_model_switch_after_compression(agent, deferred)
     session = {

@@ -102,6 +102,7 @@ class TestResetSessionState:
                 success=True,
                 new_model="next-model",
                 target_provider="next-provider",
+                context_length=128_000,
             ),
         )
 

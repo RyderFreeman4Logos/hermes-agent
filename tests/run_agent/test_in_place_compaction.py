@@ -154,6 +154,7 @@ class TestInPlaceCompaction:
                 api_key="new-key",
                 base_url="https://new.example/v1",
                 api_mode="responses",
+                          context_length=128_000,
             )
             schedule_model_switch_after_compression(agent, pending)
 

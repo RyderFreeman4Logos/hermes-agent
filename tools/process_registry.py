@@ -1540,7 +1540,6 @@ class ProcessRegistry:
         else:
             if not defer_registration:
                 self._write_checkpoint()
-                self._arm_execution_deadline(session)
             assert reader is not None
             try:
                 reader.start()
@@ -2120,12 +2119,12 @@ class ProcessRegistry:
             )
         checkpoint_written = self._write_checkpoint()
         # Compatibility for callers/tests that replace the historical void
-        # helper: None means their replacement completed successfully.
-        if checkpoint_written is None:
+        # helper: only an explicit False means the checkpoint is not durable.
+        if checkpoint_written is not False:
             with self._lock:
                 self._checkpoint_durable_generation = self._session_generation
             self._publish_durable_completions()
-        elif checkpoint_written is False:
+        else:
             self._schedule_checkpoint_retry(session)
 
     def _schedule_checkpoint_retry(self, session: ProcessSession) -> None:

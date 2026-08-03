@@ -61,17 +61,8 @@ class TestReapOrphanedBrowserSessions:
         assert not d.exists()
 
 
-    def test_alive_legacy_daemon_is_reaped(self, fake_tmpdir):
-        """Alive, untracked, legacy (no owner_pid) daemon is reaped.
-
-        Post-#21561 the liveness probe goes through
-        ``gateway.status._pid_exists`` (which wraps ``psutil.pid_exists``
-        because ``os.kill(pid, 0)`` is a footgun on Windows — bpo-14484).
-        With no owner_pid file and no tracked-name entry, the reaper
-        terminates the daemon (and its process tree) and removes its socket
-        dir regardless of whether termination succeeded (best-effort
-        semantics).
-        """
+    def test_alive_legacy_daemon_without_identity_is_retained(self, fake_tmpdir):
+        """An unbound legacy PID is not authority to terminate or delete state."""
         from tools.browser_tool import _reap_orphaned_browser_sessions
 
         d = _make_socket_dir(fake_tmpdir, "h_perm1234567", pid=12345)
@@ -86,8 +77,8 @@ class TestReapOrphanedBrowserSessions:
              patch("tools.process_registry.ProcessRegistry._terminate_host_pid", side_effect=mock_terminate):
             _reap_orphaned_browser_sessions()
 
-        assert 12345 in terminate_calls
-        assert not d.exists()
+        assert not terminate_calls
+        assert d.exists()
 
 
     def test_corrupt_pid_file_is_cleaned(self, fake_tmpdir):

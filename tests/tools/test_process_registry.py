@@ -633,7 +633,7 @@ class TestSpawnEnvSanitization:
             def __init__(self):
                 self.commands = []
                 self._responses = iter([
-                    {"output": "MATCH\n", "returncode": 0},
+                    {"output": "GONE\n", "returncode": 0},
                     {"output": "hello\n", "returncode": 0},
                     {"output": "0\n", "returncode": 0},
                 ])
@@ -658,7 +658,7 @@ class TestSpawnEnvSanitization:
             "else current=$(sed 's/^.*) //' \"/proc/4242/stat\" 2>/dev/null | "
             "cut -d ' ' -f 20); "
             'if [ -z "$current" ]; then echo UNKNOWN; '
-            'elif [ "$current" = "77" ]; then echo MATCH; '
+            'elif [ "$current" = "77" ]; then echo GONE; '
             "else echo GONE; fi; fi"
         )
         assert env.commands[1][0] == (

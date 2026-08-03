@@ -183,7 +183,11 @@ class _TimedRemoteEnvironment:
         poll_failures=0,
     ):
         self.done_after = done_after
-        self.kill_result = kill_result or {"output": "", "returncode": 0}
+        self.kill_result = (
+            kill_result
+            if kill_result is not None
+            else {"output": "__HERMES_TERMINATED__\n", "returncode": 0}
+        )
         self.poll_failure_stage = poll_failure_stage
         self.poll_failures = poll_failures
         self.started_at = None
@@ -211,23 +215,27 @@ class _TimedRemoteEnvironment:
     def execute(self, command, **kwargs):
         if "nohup setsid bash -lc" in command:
             self.started_at = time.monotonic()
-            return {"output": "4242\n", "returncode": 0}
-        if command.startswith("kill -TERM"):
+            return {"output": "4242\n99\n", "returncode": 0}
+        if "kill -TERM" in command:
             self.kill_calls.append({"command": command, **kwargs})
             result = dict(self.kill_result)
-            if result.get("returncode") == 0:
+            if result.get("returncode") == 0 and "__HERMES_TERMINATED__" in str(
+                result.get("output", "")
+            ):
                 self.killed = True
             return result
-        if command.startswith("kill -0"):
+        if "kill -0" in command:
             self._poll_stage("status")
             return {"output": "1\n" if self._done() else "0\n", "returncode": 0}
-        if command.startswith("cat ") and ".exit" in command:
+        if command.startswith("head -c 5 --") and ".exit" in command:
             self._poll_stage("exit")
-            return {"output": "0\n" if self._done() else "", "returncode": 0}
-        if command.startswith("cat ") and ".log" in command:
+            exit_output = "143\n" if self.killed else ("0\n" if self._done() else "")
+            return {"output": exit_output, "returncode": 0}
+        if command.startswith("if [ -f") and ".log" in command:
             self._poll_stage("log")
+            output = "remote done\n" if self._done() else ""
             return {
-                "output": "remote done\n" if self._done() else "",
+                "output": f"__HERMES_LOG_BYTES__:{len(output)}\n{output}",
                 "returncode": 0,
             }
         raise AssertionError(f"unexpected remote command: {command}")
@@ -560,6 +568,7 @@ def test_nonlocal_discard_failure_keeps_managed_identity(
         id="proc_remote_kill_failure",
         command="sleep 30",
         pid=4242,
+        host_start_time=99,
         env_ref=env,
         pid_scope="sandbox",
     )
@@ -575,7 +584,10 @@ def test_nonlocal_discard_failure_keeps_managed_identity(
     assert session.completion_reason == "exited"
     assert session.termination_source == ""
 
-    env.kill_result = {"output": "", "returncode": 0}
+    env.kill_result = {
+        "output": "__HERMES_TERMINATED__\n",
+        "returncode": 0,
+    }
     assert registry.discard(session, source="retry_cleanup")["status"] == "killed"
     assert registry.get(session.id) is None
 
@@ -584,11 +596,17 @@ def test_nonlocal_discard_success_removes_registry_ownership(terminal_runtime):
     from tools.process_registry import ProcessSession
 
     _, registry = terminal_runtime
-    env = _TimedRemoteEnvironment(kill_result={"output": "", "returncode": 0})
+    env = _TimedRemoteEnvironment(
+        kill_result={
+            "output": "__HERMES_TERMINATED__\n",
+            "returncode": 0,
+        }
+    )
     session = ProcessSession(
         id="proc_remote_kill_success",
         command="sleep 30",
         pid=4242,
+        host_start_time=99,
         env_ref=env,
         pid_scope="sandbox",
     )
@@ -816,7 +834,7 @@ def test_shell_backed_nonlocal_threshold_contract(
             assert [session["session_id"] for session in registry.list_sessions()] == [
                 session_id
             ]
-        assert sum(command.startswith("kill -0") for command in env.commands) <= 4
+        assert sum("kill -0" in command for command in env.commands) <= 4
     finally:
         registry.kill_all()
         env.cleanup()

@@ -72,6 +72,8 @@ MAX_OUTPUT_CHARS = 200_000      # 200KB rolling output buffer
 FINISHED_TTL_SECONDS = 1800     # Keep finished processes for 30 minutes
 MAX_PROCESSES = 64              # Max concurrent tracked processes (LRU pruning)
 MAX_ACTIVE_PROCESS_AGE = 86400  # 24h default — see session_reset.bg_process_max_age_hours (#29177)
+_REMOTE_KILL_CONFIRMED = "__HERMES_TERMINATED__"
+_REMOTE_LOG_BYTES_PREFIX = "__HERMES_LOG_BYTES__:"
 
 # Watch pattern rate limiting — PER SESSION.
 # Hard rule: at most ONE watch-match notification every WATCH_MIN_INTERVAL_SECONDS.
@@ -153,6 +155,9 @@ class ProcessSession:
     _started_monotonic: float = field(default_factory=time.monotonic, repr=False)
     _completion_event: threading.Event = field(default_factory=threading.Event, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock)
+    _termination_lock: threading.Lock = field(
+        default_factory=threading.Lock, repr=False
+    )
     _env_poll_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
     _deadline_timer: Optional[threading.Timer] = field(default=None, repr=False)
@@ -160,6 +165,8 @@ class ProcessSession:
     _tracked_descendants: Dict[int, Optional[int]] = field(default_factory=dict, repr=False)
     _completion_supervisor_started: bool = field(default=False, repr=False)
     _subreaper_managed: bool = field(default=False, repr=False)
+    _termination_in_progress: bool = field(default=False, repr=False)
+    _deadline_fallback_started: bool = field(default=False, repr=False)
 
 
 class ProcessRegistry:
@@ -496,7 +503,7 @@ class ProcessRegistry:
 
     @classmethod
     def _host_pid_is_ours(cls, pid: Optional[int], expected_start: Optional[int]) -> bool:
-        """True only if ``pid`` is alive AND still the process we spawned.
+        """True unless the host PID is known absent or has a mismatched identity.
 
         The kernel recycles PID/PGID numbers once a process exits and is reaped,
         so a stored PID can later name an *unrelated* process — observed in the
@@ -513,7 +520,10 @@ class ProcessRegistry:
             return False
         if expected_start is None:
             return True
-        return cls._safe_host_start_time(pid) == expected_start
+        current_start = cls._safe_host_start_time(pid)
+        # An unreadable identity is unknown, not evidence that our process is
+        # gone.  Keep ownership and let a later probe reconcile it.
+        return current_start is None or current_start == expected_start
 
     def _refresh_detached_session(self, session: Optional[ProcessSession]) -> Optional[ProcessSession]:
         """Update recovered host-PID sessions when the underlying process has exited."""
@@ -551,6 +561,18 @@ class ProcessRegistry:
         except Exception:
             return False
 
+    @staticmethod
+    def _proc_confirmed_gone(proc) -> bool:
+        """Return true only for positive no-process or zombie evidence."""
+        import psutil
+
+        try:
+            return not proc.is_running() or proc.status() == psutil.STATUS_ZOMBIE
+        except psutil.NoSuchProcess:
+            return True
+        except (psutil.AccessDenied, OSError, PermissionError, AttributeError):
+            return False
+
     def _remember_local_descendants(
         self, session: ProcessSession, *, include_subreaper: bool = False
     ) -> None:
@@ -576,21 +598,38 @@ class ProcessRegistry:
     @classmethod
     def _host_process_is_live(cls, pid: int, expected_start: Optional[int]) -> bool:
         """Return whether the same host process is alive and not a zombie."""
-        if expected_start is not None and cls._safe_host_start_time(pid) != expected_start:
-            return False
+        if expected_start is not None:
+            current_start = cls._safe_host_start_time(pid)
+            if current_start is not None and current_start != expected_start:
+                return False
         try:
             import psutil
-
-            return cls._proc_alive(psutil.Process(pid))
         except Exception:
             return cls._host_pid_is_ours(pid, expected_start)
+        try:
+            process = psutil.Process(pid)
+            if not process.is_running():
+                return False
+            return process.status() != psutil.STATUS_ZOMBIE
+        except psutil.NoSuchProcess:
+            return False
+        except Exception:
+            # Permission/start-time faults are unknown while kill(0) still
+            # sees the PID; never turn that uncertainty into terminal state.
+            return cls._host_pid_is_ours(pid, expected_start)
 
-    def _local_descendants_settled(self, session: ProcessSession) -> bool:
+    def _local_descendants_settled(
+        self, session: ProcessSession, *, include_subreaper: bool = False
+    ) -> bool:
         """True when no tracked descendant or live process-group member remains."""
-        if _IS_WINDOWS or session.process is None or session._subreaper_managed:
+        if (
+            _IS_WINDOWS
+            or session.process is None
+            or (session._subreaper_managed and not include_subreaper)
+        ):
             return True
 
-        self._remember_local_descendants(session)
+        self._remember_local_descendants(session, include_subreaper=include_subreaper)
         for pid, started_at in list(session._tracked_descendants.items()):
             if self._host_process_is_live(pid, started_at):
                 return False
@@ -665,23 +704,91 @@ class ProcessRegistry:
             name=f"proc-supervisor-{session.id}",
         ).start()
 
+    def _start_deadline_fallback(self, session: ProcessSession) -> None:
+        """Use one bounded retry worker when a deadline timer cannot own cleanup."""
+        with session._lock:
+            if (
+                session.exited
+                or session.execution_deadline is None
+                or session._deadline_fallback_started
+            ):
+                return
+            session._deadline_fallback_started = True
+
+        def _enforce() -> None:
+            try:
+                while True:
+                    with session._lock:
+                        if session.exited:
+                            return
+                        deadline = session.execution_deadline
+                    if deadline is None:
+                        return
+                    remaining = deadline - time.time()
+                    if remaining > 0:
+                        if session._completion_event.wait(timeout=remaining):
+                            return
+                        continue
+                    result = self.kill_process(
+                        session.id,
+                        source="execution_timeout",
+                        consume_output=False,
+                    )
+                    if result.get("status") in {
+                        "killed",
+                        "already_exited",
+                        "not_found",
+                    }:
+                        return
+                    # Same bounded cadence as the nonlocal poller; no busy loop.
+                    if session._completion_event.wait(timeout=2):
+                        return
+            finally:
+                with session._lock:
+                    session._deadline_fallback_started = False
+
+        worker = threading.Thread(
+            target=_enforce,
+            daemon=True,
+            name=f"proc-deadline-{session.id}",
+        )
+        try:
+            worker.start()
+        except BaseException:
+            with session._lock:
+                session._deadline_fallback_started = False
+            raise
+
     def _arm_execution_deadline(self, session: ProcessSession) -> None:
         """Terminate a managed process tree when its absolute deadline expires."""
-        if session.execution_deadline is None:
-            return
-        timer = threading.Timer(
-            max(0.0, session.execution_deadline - time.time()),
-            self.kill_process,
-            args=(session.id,),
-            kwargs={"source": "execution_timeout", "consume_output": False},
-        )
-        timer.daemon = True
-        session._deadline_timer = timer
+        with session._lock:
+            if (
+                session.execution_deadline is None
+                or session.exited
+                or session._deadline_fallback_started
+            ):
+                return
+            timer = threading.Timer(
+                max(0.0, session.execution_deadline - time.time()),
+                self.kill_process,
+                args=(session.id,),
+                kwargs={"source": "execution_timeout", "consume_output": False},
+            )
+            timer.daemon = True
+            session._deadline_timer = timer
         try:
             timer.start()
         except BaseException:
-            if session._deadline_timer is timer:
-                session._deadline_timer = None
+            try:
+                timer_alive = timer.is_alive()
+            except Exception:
+                timer_alive = False
+            if timer_alive:
+                return
+            with session._lock:
+                if session._deadline_timer is timer:
+                    session._deadline_timer = None
+            self._start_deadline_fallback(session)
             raise
 
     @staticmethod
@@ -703,8 +810,10 @@ class ProcessRegistry:
             return 2.0
 
     @classmethod
-    def _terminate_host_pid(cls, pid: int, expected_start: Optional[int] = None) -> None:
-        """Terminate a host-visible PID and its descendants.
+    def _terminate_host_pid(
+        cls, pid: int, expected_start: Optional[int] = None
+    ) -> bool:
+        """Terminate a host-visible PID tree and return confirmed-gone evidence.
 
         ``expected_start`` is the kernel start time captured when we spawned the
         process. When provided, it is re-validated against the live PID before
@@ -753,7 +862,7 @@ class ProcessRegistry:
                 "Refusing to terminate host pid %d: start-time mismatch — "
                 "PID was recycled onto an unrelated process.", pid,
             )
-            return
+            return True
         if _IS_WINDOWS:
             try:
                 subprocess.run(
@@ -769,25 +878,28 @@ class ProcessRegistry:
                     os.kill(pid, signal.SIGTERM)
                 except (OSError, ProcessLookupError, PermissionError):
                     pass
-            return
+            return not cls._host_process_is_live(pid, expected_start)
 
         import psutil
         try:
             parent = psutil.Process(pid)
         except psutil.NoSuchProcess:
-            return
+            return True
         except (OSError, PermissionError):
             try:
                 os.kill(pid, signal.SIGTERM)
             except (OSError, ProcessLookupError, PermissionError):
                 pass
-            return
+            return not cls._host_process_is_live(pid, expected_start)
 
         # Snapshot the whole tree (children before parent) and SIGTERM each.
         try:
             targets = parent.children(recursive=True)
         except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
             targets = []
+            tree_known = False
+        else:
+            tree_known = True
         targets.append(parent)
 
         for proc in targets:
@@ -803,7 +915,7 @@ class ProcessRegistry:
         # leak indefinitely.
         grace = cls._daemon_term_grace_seconds()
         if grace <= 0:
-            return
+            return tree_known and all(cls._proc_confirmed_gone(_p) for _p in targets)
         # Sleep out the grace window, then independently re-probe every target
         # and SIGKILL any survivor.  We deliberately do NOT trust
         # ``psutil.wait_procs``'s gone/alive partition here: it reaps via
@@ -830,6 +942,15 @@ class ProcessRegistry:
             except (psutil.AccessDenied, OSError):
                 pass
 
+        # SIGKILL is asynchronous. Return success only after every identity in
+        # the tree snapshot is observably gone (zombies count as dead).
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            if all(cls._proc_confirmed_gone(_p) for _p in targets):
+                break
+            time.sleep(0.02)
+        return tree_known and all(cls._proc_confirmed_gone(_p) for _p in targets)
+
     # ----- Spawn -----
 
     @staticmethod
@@ -849,6 +970,21 @@ class ProcessRegistry:
     def _env_artifact_paths(cls, env: Any, session_id: str):
         stem = f"{cls._env_temp_dir(env)}/hermes_bg_{session_id}"
         return tuple(f"{stem}.{suffix}" for suffix in ("log", "pid", "exit"))
+
+    @staticmethod
+    def _parse_exit_artifact(payload: Any) -> Optional[int]:
+        """Accept one complete canonical POSIX shell exit-code line."""
+        if not isinstance(payload, str) or not payload.endswith("\n"):
+            return None
+        if len(payload) > 4 or payload.count("\n") != 1:
+            return None
+        value = payload[:-1]
+        if not value or not value.isascii() or not value.isdecimal():
+            return None
+        if value != "0" and value.startswith("0"):
+            return None
+        code = int(value)
+        return code if 0 <= code <= 255 else None
 
     def spawn_local(
         self,
@@ -941,21 +1077,23 @@ class ProcessRegistry:
 
             except ImportError:
                 logger.warning("ptyprocess not installed, falling back to pipe mode")
-            except Exception as e:
-                if session._deadline_timer is not None:
-                    session._deadline_timer.cancel()
-                    session._deadline_timer = None
-                with self._lock:
-                    self._running.pop(session.id, None)
-                    self._finished.pop(session.id, None)
-                if session._pty is not None:
+            except BaseException as exc:
+                if session._pty is None:
+                    if not isinstance(exc, Exception):
+                        raise
+                    logger.warning(
+                        "PTY spawn failed (%s), falling back to pipe mode", exc
+                    )
+                else:
                     try:
-                        session._pty.terminate(force=True)
-                    except Exception:
-                        pass
-                    session._pty = None
-                    session.pid = None
-                logger.warning("PTY spawn failed (%s), falling back to pipe mode", e)
+                        self.rescue_discard(
+                            session,
+                            source="failed_start",
+                            cleanup_error=exc,
+                        )
+                    except BaseException:
+                        logger.exception("PTY spawn containment also failed")
+                    raise
 
         # Standard Popen path (non-PTY or PTY fallback)
         # Use the user's login shell for consistency with LocalEnvironment --
@@ -1011,32 +1149,17 @@ class ProcessRegistry:
                 self._write_checkpoint()
                 self._arm_execution_deadline(session)
             reader.start()
-        except Exception:
-            # Post-Popen setup failed — kill the orphaned subprocess (and any
-            # descendants spawned via setsid) before re-raising so they do not
-            # leak as untracked background processes.
+        except BaseException as exc:
+            # A child now exists.  Reuse the public ownership/kill path so an
+            # unconfirmed cleanup stays managed with its original deadline.
             try:
-                if not _IS_WINDOWS:
-                    try:
-                        kill_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
-                        os.killpg(os.getpgid(proc.pid), kill_signal)  # windows-footgun: ok - guarded by _IS_WINDOWS above
-                    except (ProcessLookupError, PermissionError, OSError):
-                        proc.kill()
-                else:
-                    proc.kill()
-            except Exception:
-                pass
-            try:
-                proc.wait(timeout=5)
-            except Exception:
-                pass
-            if session._deadline_timer is not None:
-                session._deadline_timer.cancel()
-                session._deadline_timer = None
-            with self._lock:
-                self._running.pop(session.id, None)
-                self._finished.pop(session.id, None)
-            self._write_checkpoint()
+                self.rescue_discard(
+                    session,
+                    source="failed_start",
+                    cleanup_error=exc,
+                )
+            except BaseException:
+                logger.exception("Local spawn containment also failed")
             raise
 
         return session
@@ -1093,11 +1216,17 @@ class ProcessRegistry:
         quoted_log_path = shlex.quote(log_path)
         quoted_pid_path = shlex.quote(pid_path)
         quoted_exit_path = shlex.quote(exit_path)
+        quoted_exit_tmp_path = shlex.quote(f"{exit_path}.tmp")
         bg_command = (
             f"mkdir -p {quoted_temp_dir} && "
             f"( nohup setsid bash -lc {quoted_command} > {quoted_log_path} 2>&1 & "
-            f"child=$!; printf '%s\\n' \"$child\" > {quoted_pid_path}; "
-            f"wait \"$child\"; rc=$?; printf '%s\\n' \"$rc\" > {quoted_exit_path} "
+            f"child=$!; "
+            f"start=$(sed 's/^.*) //' \"/proc/$child/stat\" 2>/dev/null | "
+            f"cut -d ' ' -f 20); "
+            f'printf \'%s\\n%s\\n\' "$child" "$start" > {quoted_pid_path}; '
+            f'wait "$child"; rc=$?; '
+            f"printf '%s\\n' \"$rc\" > {quoted_exit_tmp_path} && "
+            f"mv -f -- {quoted_exit_tmp_path} {quoted_exit_path} "
             f") >/dev/null 2>&1 & "
             f"while [ ! -s {quoted_pid_path} ]; do sleep 0.01; done; "
             f"cat {quoted_pid_path}"
@@ -1110,27 +1239,35 @@ class ProcessRegistry:
                 rewrite_compound_background=False,
             )
             output = result.get("output", "").strip()
-            # Try to extract the PID from the output
-            for line in output.splitlines():
-                line = line.strip()
-                if line.isdigit():
-                    session.pid = int(line)
-                    break
+            # The first numeric line is the PID; the second is its /proc
+            # start-time identity captured by the spawning wrapper.
+            identities = [
+                int(line.strip())
+                for line in output.splitlines()
+                if line.strip().isdigit()
+            ]
+            if identities:
+                session.pid = identities[0]
+            if len(identities) > 1:
+                session.host_start_time = identities[1]
             # If the wrapper couldn't produce a PID (for example, syntax
             # error or broken redirect), treat it as a failed launch instead
             # of exposing a fake running session.
             if session.pid is None:
                 session.exited = True
-                session.exit_code = int(result.get("returncode", -1))
-                if session.exit_code == 0:
-                    session.exit_code = -1
+                returncode = result.get("returncode")
+                session.exit_code = (
+                    returncode
+                    if isinstance(returncode, int) and 1 <= returncode <= 255
+                    else None
+                )
                 session.completion_reason = "failed_start"
                 session.termination_source = "failed_start"
                 session.output_buffer = result.get("output", "").strip()
                 session.output_size = len(session.output_buffer)
         except Exception as e:
             session.exited = True
-            session.exit_code = -1
+            session.exit_code = None
             session.completion_reason = "failed_start"
             session.termination_source = "failed_start"
             session.output_buffer = f"Failed to start: {e}"
@@ -1161,14 +1298,15 @@ class ProcessRegistry:
             assert reader is not None
             try:
                 reader.start()
-            except Exception:
-                if defer_registration:
-                    self.promote(session)
-                self.kill_process(
-                    session.id,
-                    source="failed_start",
-                    consume_output=False,
-                )
+            except BaseException as exc:
+                try:
+                    self.rescue_discard(
+                        session,
+                        source="failed_start",
+                        cleanup_error=exc,
+                    )
+                except BaseException:
+                    logger.exception("Nonlocal spawn containment also failed")
                 raise
 
         return session
@@ -1223,20 +1361,30 @@ class ProcessRegistry:
         notification_metadata: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """Atomically register a still-running process for background management."""
+        newly_registered = False
         with session._lock:
             if session.exited:
                 return False
-            for key, value in (notification_metadata or {}).items():
-                setattr(session, key, value)
             with self._lock:
-                if session.id in self._finished:
+                running_owner = self._running.get(session.id)
+                finished_owner = self._finished.get(session.id)
+                if (running_owner is not None and running_owner is not session) or (
+                    finished_owner is not None and finished_owner is not session
+                ):
+                    raise RuntimeError(f"Process identity collision for {session.id}")
+                if finished_owner is session:
                     return False
-                if self._running.get(session.id) is session:
+                for key, value in (notification_metadata or {}).items():
+                    setattr(session, key, value)
+                session._completion_event.clear()
+                if running_owner is session:
                     return True
                 self._prune_if_needed()
                 self._running[session.id] = session
+                newly_registered = True
+        if newly_registered:
             self._arm_execution_deadline(session)
-        self._write_checkpoint()
+            self._write_checkpoint()
         return True
 
     def _finish_discard(self, session: ProcessSession, result: dict) -> dict:
@@ -1244,12 +1392,18 @@ class ProcessRegistry:
             if session._deadline_timer is not None:
                 session._deadline_timer.cancel()
                 session._deadline_timer = None
+            removed = False
             with self._lock:
-                self._running.pop(session.id, None)
-                self._finished.pop(session.id, None)
-            self._completion_consumed.discard(session.id)
-            self._poll_observed.discard(session.id)
-            self._write_checkpoint()
+                if self._running.get(session.id) is session:
+                    self._running.pop(session.id, None)
+                    removed = True
+                if self._finished.get(session.id) is session:
+                    self._finished.pop(session.id, None)
+                    removed = True
+            if removed:
+                self._completion_consumed.discard(session.id)
+                self._poll_observed.discard(session.id)
+                self._write_checkpoint()
         else:
             result.setdefault("session_id", session.id)
         return result
@@ -1271,6 +1425,7 @@ class ProcessRegistry:
         self._silence_discard(session)
         deadline_error = None
         checkpoint_error = None
+        need_deadline = False
         with session._lock:
             if session.exited:
                 result = {
@@ -1281,21 +1436,28 @@ class ProcessRegistry:
             else:
                 with self._lock:
                     owner = self._running.get(session.id)
-                    if owner is not None and owner is not session:
+                    finished_owner = self._finished.get(session.id)
+                    if (owner is not None and owner is not session) or (
+                        finished_owner is not None and finished_owner is not session
+                    ):
                         return {
                             "status": "error",
                             "error": f"Process identity collision for {session.id}",
                             "session_id": session.id,
                         }
                     self._running[session.id] = session
-                if session._deadline_timer is None:
-                    try:
-                        self._arm_execution_deadline(session)
-                    except BaseException as exc:
-                        deadline_error = exc
+                need_deadline = (
+                    session._deadline_timer is None
+                    and not session._deadline_fallback_started
+                )
                 result = None
 
         if result is None:
+            if need_deadline:
+                try:
+                    self._arm_execution_deadline(session)
+                except BaseException as exc:
+                    deadline_error = exc
             try:
                 self._write_checkpoint()
             except BaseException as exc:
@@ -1482,10 +1644,22 @@ class ProcessRegistry:
                 if session.exited:
                     return previous_output_length
 
-            check = env.execute(
-                f"kill -0 \"$(cat {quoted_pid_path} 2>/dev/null)\" 2>/dev/null; echo $?",
-                timeout=5,
-            )
+            if session.host_start_time is None:
+                check_command = (
+                    f"pid=$(head -n 1 {quoted_pid_path} 2>/dev/null); "
+                    f'kill -0 "$pid" 2>/dev/null; echo $?'
+                )
+            else:
+                check_command = (
+                    f"pid=$(head -n 1 {quoted_pid_path} 2>/dev/null); "
+                    f"current=$(sed 's/^.*) //' \"/proc/$pid/stat\" 2>/dev/null | "
+                    f"cut -d ' ' -f 20); "
+                    f'if [ -n "$pid" ] && '
+                    f'[ "$current" = "{session.host_start_time}" ] && '
+                    f'kill -0 "$pid" 2>/dev/null; '
+                    f"then echo 0; else echo 1; fi"
+                )
+            check = env.execute(check_command, timeout=5)
             check_output = (
                 str(check.get("output", "")).strip()
                 if isinstance(check, dict) and check.get("returncode") == 0
@@ -1495,44 +1669,63 @@ class ProcessRegistry:
                 check_output and check_output.splitlines()[-1].strip() != "0"
             )
 
-            result = env.execute(f"cat {quoted_log_path} 2>/dev/null", timeout=10)
-            new_output = (
-                result.get("output", "") if isinstance(result, dict) else ""
+            log_command = (
+                f"if [ -f {quoted_log_path} ]; then "
+                f"bytes=$(wc -c < {quoted_log_path}); "
+                f"printf '{_REMOTE_LOG_BYTES_PREFIX}%s\\n' \"$bytes\"; "
+                f"tail -c {session.max_output_chars} -- {quoted_log_path}; fi"
             )
-            if new_output:
+            result = env.execute(log_command, timeout=10)
+            raw_output = result.get("output", "") if isinstance(result, dict) else ""
+            if not isinstance(raw_output, str):
+                raw_output = str(raw_output)
+            total_size = None
+            new_output = raw_output
+            if raw_output.startswith(_REMOTE_LOG_BYTES_PREFIX):
+                header, separator, new_output = raw_output.partition("\n")
+                size_text = header[len(_REMOTE_LOG_BYTES_PREFIX) :]
+                if separator and size_text.isdecimal():
+                    total_size = int(size_text)
+                else:
+                    new_output = ""
+            if total_size is None:
+                total_size = len(new_output)
+            if len(new_output) > session.max_output_chars:
+                new_output = new_output[-session.max_output_chars :]
+            if total_size < previous_output_length:
+                delta = new_output
+            else:
+                appended = total_size - previous_output_length
                 delta = (
-                    new_output[previous_output_length:]
-                    if len(new_output) > previous_output_length
-                    else ""
+                    new_output[-min(appended, len(new_output)) :] if appended else ""
                 )
-                previous_output_length = len(new_output)
-                with session._lock:
-                    session.output_buffer = new_output
-                    session.output_size += len(delta)
-                    if len(session.output_buffer) > session.max_output_chars:
-                        session.output_buffer = session.output_buffer[
-                            -session.max_output_chars:
-                        ]
-                if delta:
-                    self._check_watch_patterns(session, delta)
-                    self._emit_output(session, delta)
-
-            if not process_exited:
-                return previous_output_length
+            previous_output_length = total_size
+            with session._lock:
+                session.output_buffer = new_output
+                session.output_size = max(session.output_size + len(delta), total_size)
+            if delta:
+                self._check_watch_patterns(session, delta)
+                self._emit_output(session, delta)
 
             exit_result = env.execute(
-                f"cat {quoted_exit_path} 2>/dev/null",
+                f"head -c 5 -- {quoted_exit_path} 2>/dev/null",
                 timeout=5,
             )
-            if (
-                not isinstance(exit_result, dict)
-                or exit_result.get("returncode") != 0
-            ):
+            if not isinstance(exit_result, dict):
                 return previous_output_length
-            exit_str = str(exit_result.get("output", "")).strip()
-            try:
-                exit_code = int(exit_str.splitlines()[-1].strip())
-            except (ValueError, IndexError):
+            exit_returncode = exit_result.get("returncode")
+            exit_code = (
+                self._parse_exit_artifact(exit_result.get("output"))
+                if exit_returncode == 0
+                else None
+            )
+            exit_missing_after_identity_gone = bool(
+                process_exited
+                and isinstance(exit_returncode, int)
+                and not isinstance(exit_returncode, bool)
+                and exit_returncode == 1
+            )
+            if exit_code is None and not exit_missing_after_identity_gone:
                 return previous_output_length
 
             with session._lock:
@@ -1608,7 +1801,7 @@ class ProcessRegistry:
             logger.debug("PTY wait timed out or failed: %s", e)
         with session._lock:
             session.exited = True
-            session.exit_code = pty.exitstatus if hasattr(pty, 'exitstatus') else -1
+            session.exit_code = pty.exitstatus if hasattr(pty, "exitstatus") else None
             if session.completion_reason != "killed":
                 session.completion_reason = "exited"
         self._move_to_finished(session)
@@ -1620,6 +1813,9 @@ class ProcessRegistry:
         with the reader thread), the second call is a no-op — no duplicate
         completion notification is enqueued.
         """
+        with session._lock:
+            if session._termination_in_progress:
+                return
         if session.process is not None:
             ready, rc = self._local_completion_state(session)
             if not ready:
@@ -1635,11 +1831,16 @@ class ProcessRegistry:
                     session.completion_reason = "exited"
 
         with self._lock:
-            was_running = self._running.pop(session.id, None) is not None
+            running_owner = self._running.get(session.id)
+            finished_owner = self._finished.get(session.id)
+            was_running = running_owner is session
+            unowned = running_owner is None and finished_owner is None
             if was_running:
+                self._running.pop(session.id, None)
                 self._finished[session.id] = session
         if not was_running:
-            session._completion_event.set()
+            if unowned:
+                session._completion_event.set()
             return
         if session._deadline_timer is not None:
             session._deadline_timer.cancel()
@@ -1656,7 +1857,6 @@ class ProcessRegistry:
                 session.id,
                 exc_info=True,
             )
-        session._completion_event.set()
         self._write_checkpoint()
 
         # Only enqueue completion notification on the FIRST move.  Without
@@ -1679,6 +1879,7 @@ class ProcessRegistry:
                 # based on which watcher notices exit first.
                 "started_at": session.started_at,
             })
+        session._completion_event.set()
 
     # ----- Query Methods -----
 
@@ -2085,165 +2286,322 @@ class ProcessRegistry:
         source: str = "process.kill",
         consume_output: bool = True,
     ) -> dict:
-        """Kill a background process and return its output snapshot.
-
-        ``consume_output`` is true for explicit tool/RPC kills because their
-        caller observes the returned output. Bulk cleanup passes false: it
-        discards each result and therefore must not suppress an autonomous
-        output-bearing completion notification.
-        """
+        """Kill a process only after its owned identity is confirmed terminal."""
         from tools.ansi_strip import strip_ansi
 
         session = self.get(session_id)
         if session is None:
             return {"status": "not_found", "error": f"No process with ID {session_id}"}
 
-        can_kill = bool(
-            session._pty
-            or session.process
-            or (session.env_ref and session.pid)
-            or (session.detached and session.pid_scope == "host" and session.pid)
-        )
-        detached_already_exited = bool(
-            can_kill
-            and not session._pty
-            and session.process is None
-            and session.env_ref is None
-            and not self._host_pid_is_ours(session.pid, session.host_start_time)
-        )
-        is_remote = bool(
-            not session._pty
-            and session.process is None
-            and session.env_ref
-            and session.pid
-        )
+        with session._termination_lock:
+            current = self.get(session_id)
+            if current is not session:
+                if current is None:
+                    return {
+                        "status": "not_found",
+                        "error": f"No process with ID {session_id}",
+                    }
+                return {
+                    "status": "error",
+                    "error": f"Process identity collision for {session_id}",
+                    "session_id": session_id,
+                }
 
-        with session._lock:
-            previous_completion_reason = session.completion_reason
-            previous_termination_source = session.termination_source
-            completion_was_consumed = session_id in self._completion_consumed
-            output = strip_ansi(session.output_buffer[-2000:])
-            if session.exited:
-                result = {
+            can_kill = bool(
+                session._pty
+                or session.process
+                or (session.env_ref and session.pid)
+                or (session.detached and session.pid_scope == "host" and session.pid)
+            )
+            detached_already_exited = bool(
+                can_kill
+                and not session._pty
+                and session.process is None
+                and session.env_ref is None
+                and not self._host_pid_is_ours(session.pid, session.host_start_time)
+            )
+            is_remote = bool(
+                not session._pty
+                and session.process is None
+                and session.env_ref
+                and session.pid
+            )
+
+            with session._lock:
+                output = strip_ansi(session.output_buffer[-2000:])
+                if session.exited:
+                    if consume_output:
+                        self._completion_consumed.add(session_id)
+                    return {
+                        "status": "already_exited",
+                        "command": session.command,
+                        "exit_code": session.exit_code,
+                        "completion_reason": session.completion_reason,
+                        "termination_source": session.termination_source,
+                        "output": output,
+                    }
+                if not can_kill:
+                    return {
+                        "status": "error",
+                        "error": (
+                            "Recovered process cannot be killed after restart because "
+                            "its original runtime handle is no longer available"
+                        ),
+                    }
+                if detached_already_exited:
+                    session.exited = True
+                    session.exit_code = None
+                else:
+                    # Delay completion publication, not terminal metadata, while
+                    # physical ownership evidence is being established.
+                    session._termination_in_progress = True
+
+            if detached_already_exited:
+                if consume_output:
+                    self._completion_consumed.add(session_id)
+                self._move_to_finished(session)
+                return {
                     "status": "already_exited",
-                    "command": session.command,
-                    "exit_code": session.exit_code,
+                    "exit_code": None,
                     "completion_reason": session.completion_reason,
                     "termination_source": session.termination_source,
                     "output": output,
                 }
-            elif not can_kill:
-                result = {
-                    "status": "error",
-                    "error": (
-                        "Recovered process cannot be killed after restart because "
-                        "its original runtime handle is no longer available"
-                    ),
-                }
-            elif detached_already_exited:
-                session.exited = True
-                session.exit_code = None
-                result = {
-                    "status": "already_exited",
-                    "exit_code": None,
+
+            remote_returncode = None
+            confirmed = False
+            try:
+                if session._pty:
+                    if session.pid:
+                        confirmed = bool(
+                            self._terminate_host_pid(
+                                session.pid,
+                                session.host_start_time,
+                            )
+                        )
+                    else:
+                        session._pty.terminate(force=True)
+                        confirmed = not bool(session._pty.isalive())
+                elif session.process:
+                    self._remember_local_descendants(session, include_subreaper=True)
+                    primitive_confirmed = bool(
+                        self._terminate_host_pid(
+                            session.process.pid, session.host_start_time
+                        )
+                    )
+                    try:
+                        session.process.wait(timeout=1)
+                    except Exception:
+                        pass
+                    ready, returncode = self._local_completion_state(session)
+                    descendants_gone = self._local_descendants_settled(
+                        session, include_subreaper=True
+                    )
+                    identity_gone = not self._host_process_is_live(
+                        session.process.pid, session.host_start_time
+                    )
+                    confirmed = bool(
+                        descendants_gone
+                        and identity_gone
+                        and (primitive_confirmed or ready)
+                    )
+                    if ready:
+                        with session._lock:
+                            session.exit_code = returncode
+                            session.exited = True
+                            if session.completion_reason != "killed":
+                                session.completion_reason = "exited"
+                elif session.env_ref and session.pid:
+                    if session.host_start_time is None:
+                        raise RuntimeError(
+                            "Remote process identity is unavailable; status unknown"
+                        )
+                    grace = self._daemon_term_grace_seconds()
+                    stat_path = f"/proc/{session.pid}/stat"
+                    start_probe = (
+                        f"sed 's/^.*) //' {stat_path} 2>/dev/null | cut -d ' ' -f 20"
+                    )
+                    gone_marker = f"printf '{_REMOTE_KILL_CONFIRMED}\\n'; exit 0"
+                    remote_kill = (
+                        f"if [ ! -e {stat_path} ]; then {gone_marker}; fi; "
+                        f"current=$({start_probe}); "
+                        f'if [ -z "$current" ]; then exit 2; fi; '
+                        f'if [ "$current" != "{session.host_start_time}" ]; then '
+                        f"{gone_marker}; fi; "
+                        f"if kill -TERM -- -{session.pid} 2>/dev/null; then :; "
+                        f"elif kill -TERM {session.pid} 2>/dev/null; then :; fi; "
+                        f"sleep {grace}; "
+                        f"if [ -e {stat_path} ]; then "
+                        f"current=$({start_probe}); "
+                        f'if [ -z "$current" ]; then exit 2; fi; '
+                        f'if [ "$current" = "{session.host_start_time}" ]; then '
+                        f"if kill -KILL -- -{session.pid} 2>/dev/null; then :; "
+                        f"elif kill -KILL {session.pid} 2>/dev/null; then :; fi; "
+                        f"fi; fi; "
+                        f'i=0; while [ "$i" -lt 20 ]; do '
+                        f"if [ ! -e {stat_path} ]; then {gone_marker}; fi; "
+                        f"current=$({start_probe}); "
+                        f'if [ -z "$current" ]; then exit 2; fi; '
+                        f'if [ "$current" != "{session.host_start_time}" ]; then '
+                        f"{gone_marker}; fi; "
+                        f"i=$((i + 1)); sleep 0.05; done; exit 1"
+                    )
+                    remote_result = session.env_ref.execute(
+                        remote_kill,
+                        timeout=max(5, int(grace) + 3),
+                    )
+                    if not isinstance(remote_result, dict):
+                        raise RuntimeError(
+                            "Remote kill returned an invalid result; status unknown"
+                        )
+                    remote_returncode = remote_result.get("returncode")
+                    remote_output = strip_ansi(str(remote_result.get("output", "")))
+                    marker_seen = _REMOTE_KILL_CONFIRMED in {
+                        line.strip() for line in remote_output.splitlines()
+                    }
+                    if (
+                        isinstance(remote_returncode, bool)
+                        or not isinstance(remote_returncode, int)
+                        or remote_returncode != 0
+                        or not marker_seen
+                    ):
+                        detail = f"returncode={remote_returncode!r}"
+                        if remote_output.strip():
+                            detail += f": {remote_output.strip()[-1000:]}"
+                        raise RuntimeError(f"Remote kill was not confirmed ({detail})")
+                    confirmed = True
+                    log_path, pid_path, exit_path = self._env_artifact_paths(
+                        session.env_ref, session.id
+                    )
+                    previous_output_length = session.output_size
+                    try:
+                        # The atomic exit rename can trail PID disappearance by
+                        # a scheduling tick. Give an authoritative natural-exit
+                        # artifact a short bounded chance to win the race.
+                        for attempt in range(3):
+                            previous_output_length = self._poll_env_once(
+                                session,
+                                session.env_ref,
+                                log_path,
+                                pid_path,
+                                exit_path,
+                                previous_output_length,
+                            )
+                            if session.exited:
+                                break
+                            if attempt < 2:
+                                time.sleep(0.05)
+                    except Exception:
+                        logger.debug(
+                            "Post-kill artifact poll failed for %s",
+                            session.id,
+                            exc_info=True,
+                        )
+                elif session.detached and session.pid_scope == "host" and session.pid:
+                    confirmed = bool(
+                        self._terminate_host_pid(session.pid, session.host_start_time)
+                    )
+
+                with session._lock:
+                    authoritative_exit = session.exited
+                    signal_exit = bool(
+                        isinstance(session.exit_code, int)
+                        and (
+                            (session.process is not None and session.exit_code < 0)
+                            or (
+                                session.env_ref is not None
+                                and 129 <= session.exit_code <= 192
+                            )
+                        )
+                    )
+                    if not confirmed and not authoritative_exit:
+                        raise RuntimeError(
+                            "Process termination was not confirmed; status unknown"
+                        )
+                    if not authoritative_exit or signal_exit:
+                        session.exited = True
+                        session.completion_reason = "killed"
+                        session.termination_source = source
+                        if session.process is None and session.exit_code is None:
+                            session.exit_code = -15
+                        terminal_status = "killed"
+                    else:
+                        terminal_status = "already_exited"
+                    session._termination_in_progress = False
+                    output = strip_ansi(session.output_buffer[-2000:])
+
+                if consume_output:
+                    self._completion_consumed.add(session_id)
+                self._move_to_finished(session)
+                if terminal_status == "already_exited":
+                    return {
+                        "status": terminal_status,
+                        "command": session.command,
+                        "exit_code": session.exit_code,
+                        "completion_reason": session.completion_reason,
+                        "termination_source": session.termination_source,
+                        "output": output,
+                    }
+                return {
+                    "status": terminal_status,
+                    "session_id": session.id,
+                    "completion_reason": session.completion_reason,
+                    "termination_source": session.termination_source,
                     "output": output,
                 }
-            else:
-                # Completion readers may observe the numeric return code while
-                # tree termination is still waiting, so kill intent comes first.
-                session.completion_reason = "killed"
-                session.termination_source = source
-                result = None
-            if consume_output and (
-                result is None or result["status"] == "already_exited"
-            ):
-                self._completion_consumed.add(session_id)
-
-        if result is not None:
-            if detached_already_exited and result["status"] == "already_exited":
-                self._move_to_finished(session)
-            return result
-
-        # Kill via PTY, Popen (local), or env execute (non-local)
-        remote_returncode = None
-        try:
-            if session._pty:
-                # PTYs can launch descendants too; terminate the full host tree.
-                if session.pid:
-                    self._terminate_host_pid(
-                        session.pid,
-                        session.host_start_time,
-                    )
-                else:
-                    session._pty.terminate(force=True)
-            elif session.process:
-                # Local process -- kill the process tree. On Windows this
-                # must be taskkill /T /F; Popen.terminate() only kills the
-                # shell wrapper and leaves Git Bash descendants behind.
-                self._terminate_host_pid(session.process.pid, session.host_start_time)
-            elif session.env_ref and session.pid:
-                # Non-local -- the wrapper starts a dedicated process group.
-                grace = self._daemon_term_grace_seconds()
-                remote_kill = (
-                    f"kill -TERM -- -{session.pid} 2>/dev/null || "
-                    f"kill {session.pid} 2>/dev/null; "
-                    f"sleep {grace}; "
-                    f"kill -KILL -- -{session.pid} 2>/dev/null || true"
-                )
-                remote_result = session.env_ref.execute(
-                    remote_kill,
-                    timeout=max(5, int(grace) + 3),
-                )
-                if not isinstance(remote_result, dict):
-                    raise RuntimeError(
-                        "Remote kill returned an invalid result; status unknown"
-                    )
-                remote_returncode = remote_result.get("returncode")
-                remote_output = strip_ansi(
-                    str(remote_result.get("output", ""))
-                ).strip()
-                if (
-                    isinstance(remote_returncode, bool)
-                    or not isinstance(remote_returncode, int)
-                    or remote_returncode != 0
-                ):
-                    detail = f"returncode={remote_returncode!r}"
-                    if remote_output:
-                        detail += f": {remote_output[-1000:]}"
-                    raise RuntimeError(f"Remote kill was not confirmed ({detail})")
-            elif session.detached and session.pid_scope == "host" and session.pid:
-                self._terminate_host_pid(session.pid, session.host_start_time)
-            # Capture output after termination; kill intent and consumption were
-            # published before signaling so completion cannot race ahead of them.
-            with session._lock:
-                output = strip_ansi(session.output_buffer[-2000:])
-                session.exited = True
-                if session.process is None:
-                    session.exit_code = -15  # SIGTERM
-            self._move_to_finished(session)
-            self._write_checkpoint()
-            return {
-                "status": "killed",
-                "session_id": session.id,
-                "completion_reason": session.completion_reason,
-                "termination_source": session.termination_source,
-                "output": output,
-            }
-        except Exception as e:
-            if is_remote:
+            except Exception as exc:
+                # A signal primitive may report unknown just before the owned
+                # Popen publishes an authoritative exit. Reap once more before
+                # deciding the session must stay nonterminal.
+                if session.process is not None:
+                    try:
+                        session.process.wait(timeout=0.5)
+                    except Exception:
+                        pass
+                    ready, returncode = self._local_completion_state(session)
+                    if ready:
+                        with session._lock:
+                            session.exit_code = returncode
+                            session.exited = True
+                            if session.completion_reason != "killed":
+                                session.completion_reason = "exited"
                 with session._lock:
-                    if not session.exited:
-                        session.completion_reason = previous_completion_reason
-                        session.termination_source = previous_termination_source
-                        if consume_output and not completion_was_consumed:
-                            self._completion_consumed.discard(session_id)
-            return {
-                "status": "error",
-                "error": str(e),
-                "session_id": session.id,
-                "termination_source": source,
-                "returncode": remote_returncode,
-            }
+                    session._termination_in_progress = False
+                    completed_during_kill = session.exited
+                    output = strip_ansi(session.output_buffer[-2000:])
+                    if source == "execution_timeout":
+                        session._deadline_timer = None
+                    deadline_due = bool(
+                        session.execution_deadline is not None
+                        and session.execution_deadline <= time.time()
+                    )
+                if completed_during_kill:
+                    if consume_output:
+                        self._completion_consumed.add(session_id)
+                    self._move_to_finished(session)
+                    return {
+                        "status": "already_exited",
+                        "command": session.command,
+                        "exit_code": session.exit_code,
+                        "completion_reason": session.completion_reason,
+                        "termination_source": session.termination_source,
+                        "output": output,
+                    }
+                if source == "execution_timeout" or deadline_due:
+                    try:
+                        self._start_deadline_fallback(session)
+                    except BaseException:
+                        logger.exception(
+                            "Could not retain deadline enforcement for process %s",
+                            session.id,
+                        )
+                return {
+                    "status": "error",
+                    "error": str(exc),
+                    "session_id": session.id,
+                    "termination_source": source,
+                    "returncode": remote_returncode if is_remote else None,
+                }
 
     def write_stdin(self, session_id: str, data: str) -> dict:
         """Send raw data to a running process's stdin (no newline appended)."""

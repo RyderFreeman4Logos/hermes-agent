@@ -79,6 +79,36 @@ def test_terminal_claim_cancels_heartbeat_before_completion_publication(
     ]
 
 
+def test_completion_event_fences_checkpoint_and_notification_publication(
+    registry, monkeypatch
+):
+    session = _make_session(sid="proc-publication-fence", exited=True, exit_code=0)
+    session.notify_on_complete = True
+    registry._running[session.id] = session
+    checkpoint_started = threading.Event()
+    release_checkpoint = threading.Event()
+
+    def blocking_checkpoint():
+        checkpoint_started.set()
+        assert release_checkpoint.wait(2)
+
+    monkeypatch.setattr(registry, "_write_checkpoint", blocking_checkpoint)
+    worker = threading.Thread(target=registry._move_to_finished, args=(session,))
+    worker.start()
+    assert checkpoint_started.wait(2)
+    try:
+        assert not session._completion_event.is_set()
+        assert registry.completion_queue.empty()
+    finally:
+        release_checkpoint.set()
+        worker.join(2)
+
+    assert not worker.is_alive()
+    assert session._completion_event.is_set()
+    assert registry.completion_queue.get_nowait()["session_id"] == session.id
+    assert registry.completion_queue.empty()
+
+
 def _spawn_python_sleep(seconds: float) -> subprocess.Popen:
     """Spawn a portable short-lived Python sleep process."""
     return subprocess.Popen(
@@ -620,9 +650,19 @@ class TestSpawnEnvSanitization:
             "/path with spaces/hermes_bg.exit",
         )
 
-        assert env.commands[0][0] == "kill -0 \"$(cat '/path with spaces/hermes_bg.pid' 2>/dev/null)\" 2>/dev/null; echo $?"
-        assert env.commands[1][0] == "cat '/path with spaces/hermes_bg.log' 2>/dev/null"
-        assert env.commands[2][0] == "cat '/path with spaces/hermes_bg.exit' 2>/dev/null"
+        assert env.commands[0][0] == (
+            "pid=$(head -n 1 '/path with spaces/hermes_bg.pid' 2>/dev/null); "
+            'kill -0 "$pid" 2>/dev/null; echo $?'
+        )
+        assert env.commands[1][0] == (
+            "if [ -f '/path with spaces/hermes_bg.log' ]; then "
+            "bytes=$(wc -c < '/path with spaces/hermes_bg.log'); "
+            "printf '__HERMES_LOG_BYTES__:%s\\n' \"$bytes\"; "
+            "tail -c 200000 -- '/path with spaces/hermes_bg.log'; fi"
+        )
+        assert env.commands[2][0] == (
+            "head -c 5 -- '/path with spaces/hermes_bg.exit' 2>/dev/null"
+        )
 
 
 # =========================================================================
@@ -634,40 +674,37 @@ class TestPopenLeakOnSetupFailure:
 
     def test_popen_killed_when_thread_creation_fails(self, registry):
         """If Thread() raises after Popen, proc must be killed — not orphaned."""
-        killed = []
-
         proc = MagicMock()
         proc.pid = 9999
         proc.stdout = iter([])
         proc.stdin = MagicMock()
-        proc.poll.return_value = None
+        proc.returncode = None
+        proc.poll.side_effect = lambda: proc.returncode
 
-        def fake_kill():
-            killed.append(True)
+        def reap(**_kwargs):
+            proc.returncode = -15
+            return -15
 
-        proc.kill = fake_kill
-        proc.wait = MagicMock()
+        proc.wait.side_effect = reap
+        terminate = MagicMock(return_value=True)
 
         def boom(*args, **kwargs):
             raise RuntimeError("Thread creation failed")
 
-        # proc.pid is a MagicMock-backed fake; os.getpgid(fake_pid) would query
-        # the real OS for an arbitrary PID. On a busy host that PID may exist,
-        # in which case spawn_local's primary cleanup path
-        # (os.killpg(os.getpgid(pid), SIGKILL)) succeeds against an UNRELATED
-        # real process group and proc.kill() is never reached — flaky failure,
-        # and a real risk of SIGKILLing an innocent process group. Force the
-        # ProcessLookupError fallback so the test deterministically exercises
-        # proc.kill() and never issues a real killpg.
-        with patch("tools.process_registry._find_shell", return_value="/bin/bash"), \
-             patch("subprocess.Popen", return_value=proc), \
-             patch("threading.Thread", side_effect=boom), \
-             patch("os.getpgid", side_effect=ProcessLookupError), \
-             patch.object(registry, "_write_checkpoint"):
+        with (
+            patch("tools.process_registry._find_shell", return_value="/bin/bash"),
+            patch("subprocess.Popen", return_value=proc),
+            patch("threading.Thread", side_effect=boom),
+            patch.object(registry, "_terminate_host_pid", terminate),
+            patch.object(registry, "_write_checkpoint"),
+        ):
             with pytest.raises(RuntimeError, match="Thread creation failed"):
                 registry.spawn_local("echo hello", cwd="/tmp")
 
-        assert killed, "proc.kill() must be called when post-Popen setup raises"
+        terminate.assert_called_once_with(9999, None)
+        assert not registry._running
+        assert not registry._finished
+
 
 # =========================================================================
 # Spawn rewrite regression (issue #68915)
@@ -828,9 +865,13 @@ class TestKillProcess:
 
     def test_kill_remote_uses_process_group(self, registry, monkeypatch):
         env = MagicMock()
-        env.execute.return_value = {"output": "", "returncode": 0}
+        env.execute.return_value = {
+            "output": "__HERMES_TERMINATED__\n",
+            "returncode": 0,
+        }
         s = _make_session(sid="proc_remote_tree")
         s.pid = 4321
+        s.host_start_time = 99
         s.pid_scope = "sandbox"
         s.env_ref = env
         registry._running[s.id] = s
@@ -839,7 +880,11 @@ class TestKillProcess:
         result = registry.kill_process(s.id)
 
         assert result["status"] == "killed"
-        command = env.execute.call_args.args[0]
+        command = next(
+            call.args[0]
+            for call in env.execute.call_args_list
+            if "kill -TERM" in call.args[0]
+        )
         assert "kill -TERM -- -4321" in command
         assert "kill -KILL -- -4321" in command
 
@@ -858,6 +903,12 @@ class TestKillProcess:
                 return []
             def terminate(self):
                 terminate_calls.append(("terminate", self.pid))
+
+            def is_running(self):
+                return False
+
+            def status(self):
+                return _psutil.STATUS_ZOMBIE
 
         import psutil as _psutil
 
@@ -915,18 +966,24 @@ class TestKillProcess:
         try:
             assert terminate_entered.wait(2)
             proc.returncode = -15
-            assert _wait_until(lambda: not registry.completion_queue.empty())
-
-            event = registry.completion_queue.get_nowait()
-            assert event["completion_reason"] == "killed"
-            assert event["exit_code"] == -15
+            # Completion publication is delayed until the signal outcome is
+            # known; terminal reason/source are not pre-written.
+            time.sleep(0.1)
             assert registry.completion_queue.empty()
+            assert s.completion_reason == "exited"
+            assert s.termination_source == ""
+            release_terminate.set()
+            thread.join(5)
         finally:
             release_terminate.set()
             thread.join(5)
 
         assert not thread.is_alive()
         assert result["status"] == "killed"
+        event = registry.completion_queue.get_nowait()
+        assert event["completion_reason"] == "killed"
+        assert event["exit_code"] == -15
+        assert registry.completion_queue.empty()
         assert s.completion_reason == "killed"
         assert s.exit_code == -15
         assert registry.is_completion_consumed(s.id)
@@ -1147,8 +1204,13 @@ class TestTerminateHostPidPosix:
         # fakes) by setting the grace to 0.
         monkeypatch.setattr(pr.ProcessRegistry, "_daemon_term_grace_seconds",
                             staticmethod(lambda: 0.0))
+        monkeypatch.setattr(
+            pr.ProcessRegistry,
+            "_proc_confirmed_gone",
+            staticmethod(lambda _proc: True),
+        )
 
-        pr.ProcessRegistry._terminate_host_pid(12345)
+        assert pr.ProcessRegistry._terminate_host_pid(12345) is True
 
         assert terminate_order == [101, 102, 103, 12345], (
             "Children must be terminated before the parent"
@@ -1169,10 +1231,16 @@ class TestTerminateHostPidPosix:
         monkeypatch.setattr(pr, "_IS_WINDOWS", False)
         monkeypatch.setattr(psutil, "Process", boom)
         monkeypatch.setattr(pr.os, "kill", fake_kill)
+        monkeypatch.setattr(
+            pr.ProcessRegistry,
+            "_is_host_pid_alive",
+            staticmethod(lambda _pid: True),
+        )
 
-        pr.ProcessRegistry._terminate_host_pid(12345)
+        confirmed = pr.ProcessRegistry._terminate_host_pid(12345)
 
         assert kill_calls == [(12345, signal.SIGTERM)]
+        assert confirmed is False
 
 
 # =========================================================================
@@ -1611,3 +1679,533 @@ class TestReaderLoopOrphanedPipe:
         item = registry.completion_queue.get_nowait()
         assert item["exit_code"] == 4
         assert registry.completion_queue.empty()
+
+
+# =========================================================================
+# Tier-4 stale lifecycle ownership / termination regressions
+# =========================================================================
+
+
+def _detached_host_session(registry, proc, sid, *, deadline=None):
+    session = _make_session(sid=sid)
+    session.pid = proc.pid
+    session.pid_scope = "host"
+    session.host_start_time = registry._safe_host_start_time(proc.pid)
+    session.detached = True
+    session.execution_deadline = deadline
+    registry._running[session.id] = session
+    return session
+
+
+def test_local_kill_noop_retains_owner_deadline_and_nonterminal_metadata(
+    registry, monkeypatch
+):
+    proc = _spawn_python_sleep(30)
+    original_terminate = registry._terminate_host_pid
+    deadline = time.time() + 30
+    session = _detached_host_session(
+        registry, proc, "proc_local_noop", deadline=deadline
+    )
+    timer = MagicMock()
+    session._deadline_timer = timer
+    reason_before = session.completion_reason
+    source_before = session.termination_source
+    monkeypatch.setattr(registry, "_terminate_host_pid", lambda *_args: False)
+
+    try:
+        result = registry.kill_process(session.id, source="manual_noop")
+
+        assert result["status"] == "error"
+        assert registry._running[session.id] is session
+        assert session.exited is False
+        assert session.exit_code is None
+        assert session.completion_reason == reason_before
+        assert session.termination_source == source_before
+        assert session.execution_deadline == deadline
+        assert session._deadline_timer is timer
+        timer.cancel.assert_not_called()
+        assert proc.poll() is None
+    finally:
+        original_terminate(proc.pid, session.host_start_time)
+        proc.wait(timeout=5)
+
+
+def test_local_kill_confirms_physical_exit_before_terminal_commit(registry):
+    proc = _spawn_python_sleep(30)
+    session = _detached_host_session(registry, proc, "proc_local_confirmed")
+
+    try:
+        result = registry.kill_process(session.id, source="manual_confirmed")
+
+        assert result["status"] == "killed"
+        assert _wait_until(lambda: proc.poll() is not None)
+        assert session.id not in registry._running
+        assert registry._finished[session.id] is session
+        assert session.exited is True
+        assert session.completion_reason == "killed"
+        assert session.termination_source == "manual_confirmed"
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=5)
+
+
+class _RemoteKillEnv:
+    def __init__(self, output="", returncode=0, on_kill=None):
+        self.output = output
+        self.returncode = returncode
+        self.on_kill = on_kill
+        self.commands = []
+
+    def execute(self, command, timeout=None):
+        self.commands.append((command, timeout))
+        if "kill -TERM" in command:
+            if self.on_kill is not None:
+                self.on_kill()
+            return {"output": self.output, "returncode": self.returncode}
+        if "kill -0" in command:
+            return {"output": "1\n", "returncode": 0}
+        return {"output": "", "returncode": 0}
+
+
+def _remote_session(registry, env, sid="proc_remote_confirm"):
+    session = _make_session(sid=sid)
+    session.env_ref = env
+    session.pid = 4321
+    session.host_start_time = 99
+    session.pid_scope = "sandbox"
+    registry._running[session.id] = session
+    return session
+
+
+def test_remote_kill_transport_rc_zero_without_marker_retains_owner(registry):
+    env = _RemoteKillEnv(output="", returncode=0)
+    session = _remote_session(registry, env, "proc_remote_false_success")
+    reason_before = session.completion_reason
+    source_before = session.termination_source
+
+    result = registry.kill_process(session.id, source="remote_false_success")
+
+    assert result["status"] == "error"
+    assert registry._running[session.id] is session
+    assert session.exited is False
+    assert session.completion_reason == reason_before
+    assert session.termination_source == source_before
+
+
+def test_remote_kill_transport_124_with_marker_retains_owner(registry):
+    env = _RemoteKillEnv(output="__HERMES_TERMINATED__\n", returncode=124)
+    session = _remote_session(registry, env, "proc_remote_transport_timeout")
+
+    result = registry.kill_process(session.id, source="remote_transport_timeout")
+
+    assert result["status"] == "error"
+    assert registry._running[session.id] is session
+    assert session.exited is False
+    assert session.termination_source == ""
+
+
+def test_remote_kill_requires_gone_marker_and_avoids_shell_false_success(registry):
+    env = _RemoteKillEnv(output="__HERMES_TERMINATED__\n", returncode=0)
+    session = _remote_session(registry, env, "proc_remote_gone")
+
+    result = registry.kill_process(session.id, source="remote_confirmed")
+
+    command = env.commands[0][0]
+    assert result["status"] == "killed"
+    assert "|| true" not in command
+    assert "__HERMES_TERMINATED__" in command
+    assert "/proc/4321/stat" in command
+    assert '"$current" != "99"' in command
+    assert session.id not in registry._running
+    assert registry._finished[session.id] is session
+
+
+def test_remote_kill_without_spawn_identity_retains_owner(registry):
+    env = _RemoteKillEnv(output="__HERMES_TERMINATED__\n", returncode=0)
+    session = _remote_session(registry, env, "proc_remote_missing_identity")
+    session.host_start_time = None
+
+    result = registry.kill_process(session.id, source="remote_missing_identity")
+
+    assert result["status"] == "error"
+    assert registry._running[session.id] is session
+    assert session.exited is False
+    assert env.commands == []
+
+
+def test_remote_natural_exit_during_kill_keeps_exit_metadata_and_one_completion(
+    registry, monkeypatch
+):
+    monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+    holder = {}
+
+    def finish_naturally():
+        session = holder["session"]
+        with session._lock:
+            session.exit_code = 124
+            session.exited = True
+            session.completion_reason = "exited"
+            session.termination_source = ""
+        registry._move_to_finished(session)
+
+    env = _RemoteKillEnv(output="__HERMES_TERMINATED__\n", on_kill=finish_naturally)
+    session = _remote_session(registry, env, "proc_remote_natural_race")
+    holder["session"] = session
+    session.notify_on_complete = True
+
+    result = registry.kill_process(session.id, source="remote_racing_kill")
+
+    assert result["status"] == "already_exited"
+    assert session.exit_code == 124
+    assert session.completion_reason == "exited"
+    assert session.termination_source == ""
+    assert registry.completion_queue.qsize() == 1
+
+
+def test_promote_collision_never_overwrites_owner_or_arms_candidate_deadline(
+    registry, monkeypatch
+):
+    owner = _make_session(sid="proc_collision", command="owner")
+    candidate = _make_session(sid=owner.id, command="candidate")
+    candidate.execution_deadline = time.time() + 60
+    registry._running[owner.id] = owner
+    arm = MagicMock()
+    monkeypatch.setattr(registry, "_arm_execution_deadline", arm)
+
+    with pytest.raises(RuntimeError, match="collision"):
+        registry.promote(
+            candidate,
+            notification_metadata={"notify_on_complete": True},
+        )
+
+    assert registry._running[owner.id] is owner
+    assert candidate.notify_on_complete is False
+    assert candidate._deadline_timer is None
+    arm.assert_not_called()
+
+
+def test_unregistered_completion_collision_never_removes_existing_owner(
+    registry, monkeypatch
+):
+    owner = _make_session(sid="proc_finish_collision", command="owner")
+    candidate = _make_session(
+        sid=owner.id, command="candidate", exited=True, exit_code=0
+    )
+    registry._running[owner.id] = owner
+    monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+
+    registry._move_to_finished(candidate)
+
+    assert registry._running[owner.id] is owner
+    assert owner.id not in registry._finished
+    assert registry.completion_queue.empty()
+    assert not candidate._completion_event.is_set()
+
+
+def test_promote_clears_stale_completion_event_for_live_session(registry, monkeypatch):
+    session = _make_session(sid="proc_stale_completion_event")
+    session._completion_event.set()
+    monkeypatch.setattr(registry, "_arm_execution_deadline", lambda _session: None)
+
+    assert registry.promote(session)
+
+    assert registry._running[session.id] is session
+    assert not session._completion_event.is_set()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-tree regression")
+@pytest.mark.parametrize("error_type", [RuntimeError, KeyboardInterrupt, SystemExit])
+def test_spawn_reader_start_baseexception_contains_child_and_propagates(
+    registry, monkeypatch, tmp_path, error_type
+):
+    from tools import process_registry as process_registry_module
+
+    created = []
+    containment = []
+    real_popen = subprocess.Popen
+    real_rescue_discard = registry.rescue_discard
+
+    def capture_popen(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        created.append(proc)
+        return proc
+
+    def capture_rescue(*args, **kwargs):
+        result = real_rescue_discard(*args, **kwargs)
+        containment.append(result)
+        return result
+
+    def fail_start(_thread):
+        raise error_type("reader start failed")
+
+    monkeypatch.setattr(process_registry_module.subprocess, "Popen", capture_popen)
+    monkeypatch.setattr(process_registry_module.threading.Thread, "start", fail_start)
+    monkeypatch.setattr(registry, "rescue_discard", capture_rescue)
+
+    with pytest.raises(error_type, match="reader start failed"):
+        registry.spawn_local(
+            f"{shlex.quote(sys.executable)} -c 'import time; time.sleep(30)'",
+            cwd=str(tmp_path),
+            execution_timeout=30,
+            defer_registration=True,
+        )
+
+    assert len(created) == 1
+    proc = created[0]
+    start = registry._safe_host_start_time(proc.pid)
+    try:
+        assert _wait_until(lambda: proc.poll() is not None)
+        assert containment and containment[0]["status"] in {
+            "killed",
+            "already_exited",
+        }
+        assert not registry._running
+        assert not registry._finished
+    finally:
+        if proc.poll() is None:
+            ProcessRegistry._terminate_host_pid(proc.pid, start)
+            proc.wait(timeout=5)
+
+
+class _ArtifactEnv:
+    def __init__(self, payload, exit_returncode=0):
+        self.payload = payload
+        self.exit_returncode = exit_returncode
+        self.commands = []
+
+    def execute(self, command, timeout=None):
+        self.commands.append(command)
+        if "kill -0" in command:
+            return {"output": "1\n", "returncode": 0}
+        if ".exit" in command:
+            return {"output": self.payload, "returncode": self.exit_returncode}
+        return {"output": "", "returncode": 0}
+
+
+@pytest.mark.parametrize(
+    ("payload", "accepted"),
+    [
+        pytest.param("1", False, id="partial-no-newline"),
+        pytest.param("-1\n", False, id="negative"),
+        pytest.param("x" * 1024 + "\n1\n", False, id="oversize"),
+        pytest.param("124\n", True, id="valid-posix-code"),
+    ],
+)
+def test_nonlocal_exit_artifact_is_strict_complete_and_bounded(
+    registry, monkeypatch, payload, accepted
+):
+    env = _ArtifactEnv(payload)
+    session = _remote_session(registry, env, f"proc_artifact_{accepted}_{len(payload)}")
+    monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+    log_path, pid_path, exit_path = registry._env_artifact_paths(env, session.id)
+
+    registry._poll_env_once(
+        session,
+        env,
+        log_path,
+        pid_path,
+        exit_path,
+        0,
+    )
+
+    assert session.exited is accepted
+    assert session.exit_code == (124 if accepted else None)
+    assert (session.id in registry._finished) is accepted
+    exit_commands = [command for command in env.commands if ".exit" in command]
+    assert len(exit_commands) == 1
+    assert "cat " not in exit_commands[0]
+
+
+def test_nonlocal_exit_artifact_transport_124_is_unknown(registry, monkeypatch):
+    env = _ArtifactEnv("124\n", exit_returncode=124)
+    session = _remote_session(registry, env, "proc_artifact_transport_timeout")
+    monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+    paths = registry._env_artifact_paths(env, session.id)
+
+    registry._poll_env_once(session, env, *paths, 0)
+
+    assert session.exited is False
+    assert registry._running[session.id] is session
+
+
+def test_nonlocal_exit_artifact_is_written_by_atomic_rename(registry, monkeypatch):
+    class LaunchEnv:
+        def __init__(self):
+            self.commands = []
+
+        def execute(self, command, timeout=None, **_kwargs):
+            self.commands.append(command)
+            return {"output": "4321\n", "returncode": 0}
+
+    env = LaunchEnv()
+    fake_reader = MagicMock()
+    monkeypatch.setattr(
+        "tools.process_registry.threading.Thread", lambda **_kw: fake_reader
+    )
+
+    registry.spawn_via_env(env, "echo hello", defer_registration=True)
+
+    launch = env.commands[0]
+    assert ".exit.tmp" in launch
+    assert "mv -f" in launch
+    fake_reader.start.assert_called_once()
+
+
+def test_nonlocal_log_transport_and_payload_stay_bounded_after_retention_limit(
+    registry, monkeypatch
+):
+    payload = ["x" * (2 * 1024 * 1024)]
+    responses = []
+    commands = []
+
+    class LogEnv:
+        def execute(self, command, timeout=None):
+            commands.append(command)
+            if "kill -0" in command:
+                return {"output": "0\n", "returncode": 0}
+            if ".log" in command:
+                if "tail -c" in command:
+                    output = (
+                        f"__HERMES_LOG_BYTES__:{len(payload[0].encode())}\n"
+                        + payload[0][-session.max_output_chars :]
+                    )
+                else:
+                    output = payload[0]
+                responses.append(len(output))
+                return {"output": output, "returncode": 0}
+            return {"output": "", "returncode": 0}
+
+    env = LogEnv()
+    session = _remote_session(registry, env, "proc_large_remote_log")
+    log_path, pid_path, exit_path = registry._env_artifact_paths(env, session.id)
+    emitted = []
+    monkeypatch.setattr(
+        registry, "_emit_output", lambda _session, chunk: emitted.append(chunk)
+    )
+
+    previous = registry._poll_env_once(
+        session,
+        env,
+        log_path,
+        pid_path,
+        exit_path,
+        0,
+    )
+    payload[0] += "END"
+    registry._poll_env_once(
+        session,
+        env,
+        log_path,
+        pid_path,
+        exit_path,
+        previous,
+    )
+
+    log_commands = [command for command in commands if ".log" in command]
+    assert all(
+        f"tail -c {session.max_output_chars}" in command for command in log_commands
+    )
+    assert max(responses) <= session.max_output_chars + 64
+    assert len(session.output_buffer) <= session.max_output_chars
+    assert emitted[-1] == "END"
+
+
+def test_local_kill_exception_restores_nonterminal_metadata_and_owner(
+    registry, monkeypatch
+):
+    proc = _spawn_python_sleep(30)
+    original_terminate = registry._terminate_host_pid
+    session = _detached_host_session(
+        registry,
+        proc,
+        "proc_local_kill_fault",
+        deadline=time.time() + 30,
+    )
+    timer = MagicMock()
+    session._deadline_timer = timer
+    reason_before = session.completion_reason
+    source_before = session.termination_source
+    monkeypatch.setattr(
+        registry,
+        "_terminate_host_pid",
+        MagicMock(side_effect=PermissionError("signal denied")),
+    )
+
+    try:
+        result = registry.kill_process(session.id, source="faulting_kill")
+
+        assert result["status"] == "error"
+        assert registry._running[session.id] is session
+        assert session.exited is False
+        assert session.exit_code is None
+        assert session.completion_reason == reason_before
+        assert session.termination_source == source_before
+        assert session._deadline_timer is timer
+        timer.cancel.assert_not_called()
+    finally:
+        if proc.poll() is None:
+            original_terminate(proc.pid, session.host_start_time)
+        proc.wait(timeout=5)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-tree regression")
+def test_broken_deadline_timer_and_first_kill_retry_until_one_real_completion(
+    registry, monkeypatch
+):
+    proc = _spawn_python_sleep(30)
+    deadline = time.time() + 0.4
+    session = _detached_host_session(
+        registry, proc, "proc_deadline_fallback", deadline=deadline
+    )
+    registry._running.pop(session.id)
+    session.notify_on_complete = True
+    reason_before = session.completion_reason
+    source_before = session.termination_source
+    original_terminate = registry._terminate_host_pid
+    terminate_calls = []
+
+    def fail_once_then_terminate(pid, expected_start=None):
+        terminate_calls.append((pid, expected_start))
+        if len(terminate_calls) == 1:
+            return False
+        return original_terminate(pid, expected_start)
+
+    class BrokenTimer:
+        def __init__(self, *_args, **_kwargs):
+            self.daemon = False
+
+        def start(self):
+            raise RuntimeError("timer start failed")
+
+        def cancel(self):
+            pass
+
+    monkeypatch.setattr(registry, "_terminate_host_pid", fail_once_then_terminate)
+    monkeypatch.setattr("tools.process_registry.threading.Timer", BrokenTimer)
+    monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+
+    try:
+        with pytest.raises(RuntimeError, match="timer start failed"):
+            registry.promote(session)
+
+        first = registry.kill_process(session.id, source="first_kill_fault")
+        assert first["status"] == "error"
+        assert registry._running[session.id] is session
+        assert session.exited is False
+        assert session.completion_reason == reason_before
+        assert session.termination_source == source_before
+        assert session.execution_deadline == deadline
+        assert not session._completion_event.is_set()
+
+        assert session._completion_event.wait(timeout=5)
+        assert _wait_until(lambda: proc.poll() is not None)
+        assert len(terminate_calls) >= 2
+        assert registry._finished[session.id] is session
+        assert session.completion_reason == "killed"
+        assert session.termination_source == "execution_timeout"
+        assert registry.completion_queue.qsize() == 1
+    finally:
+        if proc.poll() is None:
+            original_terminate(proc.pid, session.host_start_time)
+        proc.wait(timeout=5)

@@ -162,3 +162,59 @@ def test_sanitize_model_override():
         "provider": "openai",
         "base_url": "https://api.openai.example/v1",
     }
+
+
+def test_primary_db_write_failure_keeps_memory_and_legacy_mirror(tmp_path, monkeypatch):
+    """state.db primary failure must not advance memory or sessions.json."""
+    from hermes_state import SessionDB
+
+    store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+    assert store._db is not None
+    entry = store.get_or_create_session(_make_source())
+    store.set_model_override(entry.session_key, OVERRIDE)
+
+    def fail_primary(*_args, **_kwargs):
+        raise OSError("injected primary routing write failure")
+
+    monkeypatch.setattr(store._db, "replace_gateway_routing_entries", fail_primary)
+    with pytest.raises(OSError, match="primary routing write failure"):
+        store.set_model_override(
+            entry.session_key,
+            {"model": "replacement", "provider": "anthropic"},
+        )
+
+    assert store.get_model_override(entry.session_key) == sanitize_model_override(OVERRIDE)
+    raw = json.loads((tmp_path / "sessions.json").read_text(encoding="utf-8"))
+    assert raw[entry.session_key]["model_override"]["model"] == "gpt-5o"
+    restarted = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+    assert restarted.get_model_override(entry.session_key) == sanitize_model_override(
+        OVERRIDE
+    )
+
+
+def test_primary_db_success_survives_legacy_mirror_failure(tmp_path, monkeypatch):
+    """Legacy mirror failure after state.db success must keep the new override."""
+    store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+    entry = store.get_or_create_session(_make_source())
+    store.set_model_override(entry.session_key, OVERRIDE)
+    real_json = store._save_sessions_json
+
+    def fail_mirror(data):
+        real_json(data)
+        raise OSError("injected legacy mirror failure")
+
+    monkeypatch.setattr(store, "_save_sessions_json", fail_mirror)
+    store.set_model_override(
+        entry.session_key,
+        {"model": "replacement", "provider": "anthropic"},
+    )
+
+    assert store.get_model_override(entry.session_key) == {
+        "model": "replacement",
+        "provider": "anthropic",
+    }
+    restarted = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+    assert restarted.get_model_override(entry.session_key) == {
+        "model": "replacement",
+        "provider": "anthropic",
+    }

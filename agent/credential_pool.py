@@ -2991,7 +2991,7 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
 
 def load_pool(provider: str, *, read_only: bool = False) -> CredentialPool:
     provider = (provider or "").strip().lower()
-    raw_entries = read_credential_pool(provider)
+    raw_entries = read_credential_pool(provider, read_only=read_only)
     disk_ids = {
         entry.get("id")
         for entry in raw_entries

@@ -356,3 +356,59 @@ def test_deferred_apply_without_destination_context_fails_closed():
     assert (agent.model, agent.provider) == ("x-ai/grok-4", "openrouter")
     assert agent.context_compressor.context_length == 200_000
     assert get_model_switch_after_compression(agent) is pending
+
+
+def test_deferred_authoritative_callback_failure_restores_plugin_compressor():
+    """Plugin compressor fields mutated by switch_model must restore exactly."""
+    from hermes_cli.model_switch import apply_model_switch_after_compression
+
+    class PluginCompressor:
+        def __init__(self):
+            self.model = "old-model"
+            self.context_length = 32_000
+            self.threshold_tokens = 24_000
+            self.extra_marker = "plugin-old"
+
+        def update_model(self, *, model, context_length=None, **_kwargs):
+            self.model = model
+            if context_length is not None:
+                self.context_length = context_length
+                self.threshold_tokens = int(context_length * 0.75)
+            self.extra_marker = "plugin-new"
+
+    agent = _make_agent_openrouter()
+    agent.context_compressor = PluginCompressor()
+    agent._invalidate_system_prompt = lambda: None
+    agent._build_system_prompt = lambda system_message=None: f"prompt:{agent.model}"
+    agent._create_openai_client = lambda *_args, **_kwargs: MagicMock()
+    agent._session_init_model_config = {
+        "model": agent.model,
+        "provider": agent.provider,
+    }
+    pending = ModelSwitchResult(
+        success=True,
+        new_model="new-model",
+        target_provider="openrouter",
+        api_key="new-key",
+        base_url="https://openrouter.ai/api/v1",
+        api_mode="chat_completions",
+        context_length=128_000,
+        reasoning_config={},
+    )
+
+    def fail_callback(*_args):
+        raise RuntimeError("injected authoritative callback failure")
+
+    schedule_model_switch_after_compression(
+        agent, pending, on_applied=fail_callback
+    )
+    with patch("hermes_cli.timeouts.get_provider_request_timeout", return_value=None):
+        status = apply_model_switch_after_compression(agent)
+
+    assert status == "failed"
+    assert agent.model == "x-ai/grok-4"
+    assert get_model_switch_after_compression(agent) is pending
+    assert agent.context_compressor.model == "old-model"
+    assert agent.context_compressor.context_length == 32_000
+    assert agent.context_compressor.threshold_tokens == 24_000
+    assert agent.context_compressor.extra_marker == "plugin-old"

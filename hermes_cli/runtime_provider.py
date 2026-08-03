@@ -2166,9 +2166,11 @@ def resolve_runtime_provider(
         # When the user explicitly selected bedrock (not auto-detected),
         # trust boto3's credential chain — it handles IMDS, ECS task roles,
         # Lambda execution roles, SSO, and other implicit sources that our
-        # env-var check can't detect.
+        # env-var check can't detect. Local-only resolution never enters that
+        # chain: only explicit env/config authority may succeed.
         is_explicit = requested_provider in {"bedrock", "aws", "aws-bedrock", "amazon-bedrock", "amazon"}
-        if not is_explicit and not has_aws_credentials():
+        aws_auth_kwargs = {} if allow_network else {"allow_network": False}
+        if not is_explicit and not has_aws_credentials(**aws_auth_kwargs):
             raise AuthError(
                 "No AWS credentials found for Bedrock. Configure one of:\n"
                 "  - AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY\n"
@@ -2177,11 +2179,21 @@ def resolve_runtime_provider(
                 "Or run 'aws configure' to set up credentials.",
                 code="no_aws_credentials",
             )
+        if not allow_network and not has_aws_credentials(**aws_auth_kwargs):
+            raise AuthError(
+                "No local AWS credentials found for Bedrock under "
+                "allow_network=False. Provide explicit env/config credentials "
+                "instead of relying on the AWS SDK default chain.",
+                code="no_aws_credentials",
+            )
         # Read bedrock-specific config from config.yaml
         _bedrock_cfg = load_config().get("bedrock", {})
         # Region priority: config.yaml bedrock.region → env var → us-east-1
-        region = (_bedrock_cfg.get("region") or "").strip() or resolve_bedrock_region()
-        auth_source = resolve_aws_auth_env_var() or "aws-sdk-default-chain"
+        region = (_bedrock_cfg.get("region") or "").strip() or resolve_bedrock_region(**aws_auth_kwargs)
+        auth_source = (
+            resolve_aws_auth_env_var(**aws_auth_kwargs)
+            or ("local-explicit" if not allow_network else "aws-sdk-default-chain")
+        )
         # Build guardrail config if configured
         _gr = _bedrock_cfg.get("guardrail", {})
         guardrail_config = None

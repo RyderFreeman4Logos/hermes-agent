@@ -10106,14 +10106,20 @@ def _run_prompt_submit(
             if display_kind and "persist_user_display_kind" in _run_params:
                 run_kwargs["persist_user_display_kind"] = display_kind
                 run_kwargs["persist_user_display_metadata"] = display_metadata
-            _usage_stop, _usage_thread = _start_usage_ticker(sid, agent)
+            # Auto-compression must activate only after the outer TUI
+            # publication fence reanchors the session.
+            agent._defer_host_compression_publication = True
             try:
-                result = agent.run_conversation(run_message, **run_kwargs)
+                _usage_stop, _usage_thread = _start_usage_ticker(sid, agent)
+                try:
+                    result = agent.run_conversation(run_message, **run_kwargs)
+                finally:
+                    # Stop and join before terminal events so a stale live tick
+                    # cannot arrive after message.complete.
+                    _usage_stop.set()
+                    _usage_thread.join()
             finally:
-                # Stop and join before terminal events so a stale live tick
-                # cannot arrive after message.complete.
-                _usage_stop.set()
-                _usage_thread.join()
+                agent._defer_host_compression_publication = False
             heartbeat_silent_noop = bool(
                 heartbeat_turn
                 and isinstance(result, dict)
@@ -10247,14 +10253,27 @@ def _run_prompt_submit(
                                 )
 
                 # If auto-compression fired inside run_conversation(), agent.session_id
-                # may have rotated. Sync session_key before downstream title/goal/finalize
-                # handling uses it. Preserve pending_title (user intent) so it can be
-                # applied to the continuation. Restart slash worker so subsequent
-                # worker-backed commands (/title etc.) target the live session.
-                # Fix for #20001.
-                _sync_session_key_after_compress(
-                    sid, session, clear_pending_title=False, restart_slash_worker=True,
+                # may have rotated. Match the three manual compression callers:
+                # re-anchor first, finalize deferred activation on the outer
+                # commit, then restart the slash worker against the final route
+                # before any commit-success notification / next provider request.
+                # Preserve pending_title (user intent) so it can be applied to
+                # the continuation. Fix for #20001 / #49 F2.
+                from agent.conversation_compression import (
+                    finalize_context_engine_compression_notification,
                 )
+
+                _sync_session_key_after_compress(
+                    sid, session, clear_pending_title=False, restart_slash_worker=False,
+                )
+                finalize_context_engine_compression_notification(
+                    agent,
+                    committed=True,
+                )
+                try:
+                    _restart_slash_worker(sid, session)
+                except Exception:
+                    pass
 
                 raw = result.get("final_response", "")
                 status = (

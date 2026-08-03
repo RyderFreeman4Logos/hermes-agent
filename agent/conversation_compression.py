@@ -2198,6 +2198,11 @@ def compress_context(
         prompt — the session is NOT rotated.  Callers should detect the
         no-op via ``len(returned) == len(input)`` and stop the retry loop.
     """
+    # Hosts may defer activation until their outer publication fence commits.
+    if not defer_context_engine_notification:
+        defer_context_engine_notification = bool(
+            getattr(agent, "_defer_host_compression_publication", False)
+        )
     _compressor_attempt_snapshot = _snapshot_compressor_attempt_state(
         agent.context_compressor
     )

@@ -2482,23 +2482,28 @@ def capture_model_runtime_for_rollback(agent) -> dict:
         for name in _MODEL_RUNTIME_ROLLBACK_FIELDS
     }
     compressor = getattr(agent, "context_compressor", None)
-    if (
-        compressor is not None
-        and type(compressor).__module__.startswith("agent.")
-        and hasattr(compressor, "__dict__")
-    ):
+    # Capture exact compressor state for any mutable object that exposes
+    # instance fields. Plugin compressors must restore the same fields
+    # switch_model mutates; avoid deepcopying external references beyond
+    # the shallow field map already used for agent route fields.
+    if compressor is not None and hasattr(compressor, "__dict__"):
         snapshot["__context_compressor_state__"] = {
             name: _rollback_copy(value)
             for name, value in compressor.__dict__.items()
         }
+        snapshot["__context_compressor_identity__"] = compressor
     return snapshot
 
 
 def restore_model_runtime_for_rollback(agent, snapshot: dict) -> None:
     """Restore a captured route after deferred durable publication fails."""
     compressor_state = snapshot.get("__context_compressor_state__")
+    compressor_identity = snapshot.get("__context_compressor_identity__")
     for name, value in snapshot.items():
-        if name == "__context_compressor_state__":
+        if name in {
+            "__context_compressor_state__",
+            "__context_compressor_identity__",
+        }:
             continue
         if value is _MODEL_RUNTIME_MISSING:
             try:
@@ -2507,8 +2512,10 @@ def restore_model_runtime_for_rollback(agent, snapshot: dict) -> None:
                 pass
             continue
         setattr(agent, name, value)
+    if compressor_identity is not None:
+        agent.context_compressor = compressor_identity
     compressor = getattr(agent, "context_compressor", None)
-    if compressor_state is not None and compressor is not None:
+    if compressor_state is not None and compressor is not None and hasattr(compressor, "__dict__"):
         compressor.__dict__.clear()
         compressor.__dict__.update(compressor_state)
 

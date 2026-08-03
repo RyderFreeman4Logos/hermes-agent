@@ -1496,7 +1496,13 @@ class SessionStore:
         )
 
     def _persist_routing_data(self, data: Dict[str, Any], generation: int) -> None:
-        """Serialize all whole-index writers through one durable write lock."""
+        """Serialize all whole-index writers through one durable write lock.
+
+        When state.db is available it is the sole authority. Primary write
+        failures must fail closed without advancing the legacy sessions.json
+        mirror. After a successful primary write, a legacy mirror failure is
+        best-effort only and must not reverse the authoritative DB state.
+        """
         save_lock = getattr(self, "_save_lock", None)
         if save_lock is None:
             save_lock = threading.Lock()
@@ -1519,18 +1525,26 @@ class SessionStore:
             if _db:
                 replacer = getattr(_db, "replace_gateway_routing_entries", None)
                 if callable(replacer):
-                    try:
-                        replacer(
-                            {k: json.dumps(v) for k, v in data.items()},
-                            scope=self._routing_scope(),
-                        )
-                        db_saved = True
-                    except Exception as exc:
-                        logger.warning(
-                            "gateway.session: state.db routing save failed: %s", exc
-                        )
+                    # Primary authority: surface the original exception so
+                    # setters can restore in-memory state and leave the
+                    # legacy mirror untouched.
+                    replacer(
+                        {k: json.dumps(v) for k, v in data.items()},
+                        scope=self._routing_scope(),
+                    )
+                    db_saved = True
             if getattr(self, "_write_sessions_json", True) or not db_saved:
-                self._save_sessions_json(data)
+                try:
+                    self._save_sessions_json(data)
+                except Exception as exc:
+                    if db_saved:
+                        logger.warning(
+                            "gateway.session: sessions.json mirror failed after "
+                            "authoritative state.db write: %s",
+                            exc,
+                        )
+                    else:
+                        raise
             self._persisted_routing_generation = generation
             # This rewrite supersedes fast records at or below its
             # generation; newer ones stay for the next delayed full writer.

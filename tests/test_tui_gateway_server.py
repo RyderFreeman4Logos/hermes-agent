@@ -8,7 +8,7 @@ import time
 import types
 from datetime import datetime
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock,  Mock, patch
 
 import pytest
 
@@ -18021,3 +18021,136 @@ def test_prompt_submit_message_complete_prefers_first_call_cache_usage(monkeypat
         payload for event, _sid, payload in emitted if event == "message.complete"
     ]
     assert complete[-1]["cache_info"]["pct"] == 87
+
+
+def test_auto_compression_finalizes_before_worker_restart(monkeypatch):
+    """Successful TUI auto-rotation uses reanchor -> finalize -> worker restart."""
+    from hermes_cli.model_switch import (
+        ModelSwitchResult,
+        get_model_switch_after_compression,
+        schedule_model_switch_after_compression,
+    )
+
+    events = []
+    agent = types.SimpleNamespace(
+        model="old-model",
+        provider="old-provider",
+        api_key="old-key",
+        base_url="https://old.example/v1",
+        api_mode="chat_completions",
+        session_id="child-session",
+        context_compressor=types.SimpleNamespace(
+            context_length=32_000,
+            threshold_tokens=24_000,
+            update_model=lambda **kwargs: None,
+            on_session_start=lambda *a, **k: events.append(("observer",)),
+        ),
+        _session_init_model_config={"model": "old-model", "provider": "old-provider"},
+        _client_kwargs={},
+        _cached_system_prompt="old-prompt",
+        _session_db=None,
+        _primary_runtime={},
+        _fallback_activated=False,
+        _fallback_index=0,
+        _fallback_chain=[],
+        _fallback_model=None,
+        _config_context_length=None,
+        request_overrides={},
+        _defer_host_compression_publication=True,
+    )
+
+    def switch_model(new_model, new_provider, api_key, base_url, api_mode, **_kwargs):
+        events.append(("switch_model", new_model))
+        agent.model = new_model
+        agent.provider = new_provider
+        agent.api_key = api_key
+        agent.base_url = base_url
+        agent.api_mode = api_mode
+
+    agent.switch_model = switch_model
+    agent._build_system_prompt = lambda _unused=None: f"prompt:{agent.model}"
+    agent._invalidate_system_prompt = lambda: None
+
+    pending = ModelSwitchResult(
+        success=True,
+        new_model="new-model",
+        target_provider="new-provider",
+        api_key="new-key",
+        base_url="https://new.example/v1",
+        api_mode="responses",
+        context_length=128_000,
+        reasoning_config={},
+    )
+    session = _session(
+        agent=agent,
+        session_key="parent-session",
+        history=[{"role": "user", "content": "summary"}],
+        history_version=1,
+        slash_worker="old-worker",
+    )
+
+    def on_applied(result, old_model, old_provider):
+        events.append(("on_applied", result.new_model, agent.model))
+        session["after_compression_model_switch"] = None
+        session.setdefault("history", []).append(
+            {
+                "role": "user",
+                "content": f"[System: The active model for this chat has changed to {result.new_model}]",
+                "display_kind": "model_switch",
+            }
+        )
+        session["history_version"] = int(session.get("history_version", 0)) + 1
+        session["model_override"] = {
+            "model": result.new_model,
+            "provider": result.target_provider,
+        }
+
+    schedule_model_switch_after_compression(agent, pending, on_applied=on_applied)
+    from agent.conversation_compression import (
+        _queue_context_engine_compression_notification,
+        finalize_context_engine_compression_notification,
+    )
+    _queue_context_engine_compression_notification(
+        agent,
+        new_session_id="child-session",
+        old_session_id="parent-session",
+        system_message=None,
+    )
+
+    def tracked_sync(sid, sess, **kwargs):
+        events.append(
+            (
+                "sync",
+                kwargs.get("restart_slash_worker"),
+                agent.model,
+                sess.get("session_key"),
+            )
+        )
+        # Minimal reanchor used by production helper.
+        sess["session_key"] = agent.session_id
+        if kwargs.get("restart_slash_worker"):
+            events.append(("restart_from_sync", agent.model, sess.get("session_key")))
+
+    def tracked_restart(sid, sess):
+        events.append(("restart", agent.model, sess.get("session_key")))
+        sess["slash_worker"] = f"worker-for-{sess.get('session_key')}:{agent.model}"
+
+    monkeypatch.setattr(server, "_sync_session_key_after_compress", tracked_sync)
+    monkeypatch.setattr(server, "_restart_slash_worker", tracked_restart)
+
+    # Production post-turn order from _run_agent.
+    agent._defer_host_compression_publication = False
+    server._sync_session_key_after_compress(
+        "sid", session, clear_pending_title=False, restart_slash_worker=False
+    )
+    finalize_context_engine_compression_notification(agent, committed=True)
+    server._restart_slash_worker("sid", session)
+
+    names = [e[0] for e in events]
+    assert names.index("sync") < names.index("switch_model") < names.index("restart")
+    assert any(e[0] == "sync" and e[1] is False for e in events)
+    assert agent.model == "new-model"
+    assert get_model_switch_after_compression(agent) is None
+    assert session["session_key"] == "child-session"
+    assert session["slash_worker"] == "worker-for-child-session:new-model"
+    assert any(m.get("display_kind") == "model_switch" for m in session["history"])

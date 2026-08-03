@@ -1175,7 +1175,11 @@ def _auth_store_lock(
         yield
 
 
-def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
+def _load_auth_store(
+    auth_file: Optional[Path] = None,
+    *,
+    read_only: bool = False,
+) -> Dict[str, Any]:
     auth_file = auth_file or _auth_file_path()
     if not auth_file.exists():
         return {"version": AUTH_STORE_VERSION, "providers": {}}
@@ -1197,6 +1201,12 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
         raise
     except Exception as exc:
         # Genuine corruption: unparseable JSON, or bytes that are not UTF-8.
+        if read_only:
+            logger.warning(
+                "auth: failed to parse %s (%s) — read-only path returns empty store",
+                auth_file, exc,
+            )
+            return {"version": AUTH_STORE_VERSION, "providers": {}}
         corrupt_path = auth_file.with_suffix(".json.corrupt")
         preserved = False
         try:
@@ -1496,7 +1506,11 @@ def is_runtime_provider_routable(provider_id: str) -> bool:
     return True
 
 
-def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
+def read_credential_pool(
+    provider_id: Optional[str] = None,
+    *,
+    read_only: bool = False,
+) -> Dict[str, Any]:
     """Return the persisted credential pool, or one provider slice.
 
     In profile mode, the profile's credential pool is authoritative. If a
@@ -1512,7 +1526,7 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
     Writes always go to the profile (``write_credential_pool`` is unchanged).
     See issue #18594 follow-up.
     """
-    auth_store = _load_auth_store()
+    auth_store = _load_auth_store(read_only=read_only)
     pool = auth_store.get("credential_pool")
     if not isinstance(pool, dict):
         pool = {}
@@ -1720,7 +1734,11 @@ def unsuppress_credential_source(provider_id: str, source: str) -> bool:
         return True
 
 
-def get_provider_auth_state(provider_id: str) -> Optional[Dict[str, Any]]:
+def get_provider_auth_state(
+    provider_id: str,
+    *,
+    read_only: bool = False,
+) -> Optional[Dict[str, Any]]:
     """Return persisted auth state for a provider, or None.
 
     In profile mode, ``_load_provider_state`` already falls back to the
@@ -1733,7 +1751,7 @@ def get_provider_auth_state(provider_id: str) -> Optional[Dict[str, Any]]:
     global-scope provider state (e.g. a globally-authenticated Anthropic
     OAuth or Nous device-code session). See issue #18594 follow-up.
     """
-    auth_store = _load_auth_store()
+    auth_store = _load_auth_store(read_only=read_only)
     return _load_provider_state(auth_store, provider_id)
 
 

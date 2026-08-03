@@ -2,6 +2,8 @@
 
 import json
 
+import pytest
+
 from agent.tool_guardrails import (
     ToolCallGuardrailConfig,
     ToolCallGuardrailController,
@@ -130,6 +132,40 @@ def test_mutating_or_unknown_tools_are_not_blocked_for_repeated_identical_succes
         assert controller.after_call("write_file", {"path": "/tmp/x", "content": "x"}, "ok", failed=False).action == "allow"
         assert controller.before_call("custom_tool", {"x": 1}).action == "allow"
         assert controller.after_call("custom_tool", {"x": 1}, "ok", failed=False).action == "allow"
+
+
+def test_batch_result_fence_carries_a_four_result_streak_only_into_the_first_call():
+    controller = ToolCallGuardrailController()
+    repeated = ("web_search", {"query": "same"})
+    different = ("web_search", {"query": "different"})
+    for _ in range(4):
+        controller.after_call(*repeated, "same result", failed=False)
+
+    assert controller.batch_requires_result_fence([repeated, different]) is True
+    assert controller.batch_requires_result_fence([different, repeated]) is False
+
+
+@pytest.mark.parametrize(
+    "results",
+    [
+        pytest.param(["null", " null ", None, "null", " null "], id="null"),
+        pytest.param(["false", " false ", False, "false", " false "], id="false"),
+        pytest.param(["0", " 0 ", 0, "0", " 0 "], id="zero"),
+        pytest.param(['""', ' "" ', '""', ' "" ', '""'], id="empty-string"),
+        pytest.param(["[1,2]", "[1, 2]", [1, 2], "[1,2]", " [1, 2] "], id="list"),
+    ],
+)
+def test_no_progress_result_hash_canonicalizes_json_scalars(results):
+    controller = ToolCallGuardrailController(ToolCallGuardrailConfig())
+
+    decisions = [
+        controller.after_call("custom_tool", {"x": 1}, result, failed=False)
+        for result in results
+    ]
+
+    assert all(decision.code != "no_progress_loop" for decision in decisions[:4])
+    assert decisions[-1].code == "no_progress_loop"
+    assert decisions[-1].count == 5
 
 
 

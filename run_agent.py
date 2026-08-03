@@ -6874,10 +6874,10 @@ class AIAgent:
         self,
         tool_name: str,
         function_args: dict,
-        function_result: str,
+        function_result: Any,
         *,
         failed: bool,
-    ) -> str:
+    ) -> Any:
         decision = self._tool_guardrails.after_call(
             tool_name,
             function_args,

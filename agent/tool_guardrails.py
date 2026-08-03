@@ -8,6 +8,8 @@ turn halts.
 
 from __future__ import annotations
 
+import base64
+import copy
 import hashlib
 import json
 from dataclasses import dataclass, field
@@ -237,10 +239,10 @@ def canonical_tool_args(args: Mapping[str, Any]) -> str:
     )
 
 
-def classify_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str]:
+def classify_tool_failure(tool_name: str, result: Any) -> tuple[bool, str]:
     """Safety-fallback classifier used only when callers don't pass ``failed``.
 
-    Mirrors ``agent.display._detect_tool_failure`` exactly so the guardrail
+    Mirrors ``agent.display._detect_tool_fail...[truncated]
     never disagrees with the CLI's user-visible ``[error]`` tag. Production
     callers in ``run_agent.py`` always pass an explicit ``failed=`` derived
     from ``_detect_tool_failure``; this function exists so standalone callers
@@ -307,8 +309,10 @@ class ToolCallGuardrailController:
         if len(signatures) != len(set(signatures)):
             return True
         return bool(
-            self._last_observation is not None
-            and self._last_observation[0] in signatures
+            signatures
+            and self._last_observation is not None
+            and self._last_observation[2] >= _NO_PROGRESS_LOOP_HALT_AFTER - 1
+            and self._last_observation[0] == signatures[0]
         )
 
     def before_call(self, tool_name: str, args: Mapping[str, Any] | None) -> ToolGuardrailDecision:
@@ -370,7 +374,7 @@ class ToolCallGuardrailController:
         self,
         tool_name: str,
         args: Mapping[str, Any] | None,
-        result: str | None,
+        result: Any,
         *,
         failed: bool | None = None,
     ) -> ToolGuardrailDecision:
@@ -563,7 +567,7 @@ def toolguard_synthetic_result(decision: ToolGuardrailDecision) -> str:
     )
 
 
-def append_toolguard_guidance(result: str, decision: ToolGuardrailDecision) -> str:
+def append_toolguard_guidance(result: Any, decision: ToolGuardrailDecision) -> Any:
     """Append runtime guidance to the current tool result content."""
     if decision.action not in {"warn", "halt"} or not decision.message:
         return result
@@ -572,7 +576,28 @@ def append_toolguard_guidance(result: str, decision: ToolGuardrailDecision) -> s
         f"\n\n[{label}: "
         f"{decision.code}; count={decision.count}; {decision.message}]"
     )
-    return (result or "") + suffix
+    if isinstance(result, str):
+        return result + suffix
+
+    # Preserve multimodal envelopes/content parts so screenshots still reach
+    # vision-capable models; normalize every other result through the existing
+    # type-safe text helper before adding guidance.
+    from agent.tool_dispatch_helpers import (
+        _append_subdir_hint_to_multimodal,
+        _is_multimodal_tool_result,
+        _multimodal_text_summary,
+    )
+
+    if _is_multimodal_tool_result(result):
+        result = copy.deepcopy(result)
+        _append_subdir_hint_to_multimodal(result, suffix)
+        return result
+    if isinstance(result, list) and all(
+        isinstance(part, dict) and isinstance(part.get("type"), str)
+        for part in result
+    ):
+        return [*copy.deepcopy(result), {"type": "text", "text": suffix.strip()}]
+    return _multimodal_text_summary(result) + suffix
 
 
 def _tool_failure_recovery_hint(tool_name: str, count: int) -> str:
@@ -599,22 +624,46 @@ def _coerce_args(args: Mapping[str, Any] | None) -> Mapping[str, Any]:
     return args if isinstance(args, Mapping) else {}
 
 
-def _result_hash(result: str | None) -> str:
-    parsed = safe_json_loads(result or "")
-    if parsed is not None:
+_JSON_PARSE_FAILED = object()
+
+
+def _result_hash(result: Any) -> str:
+    """Hash canonical final-result bytes without retaining raw tool output."""
+    parsed: Any = _JSON_PARSE_FAILED
+    if isinstance(result, str):
         try:
-            canonical = json.dumps(
-                parsed,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-                default=str,
+            parsed = json.loads(result)
+        except (json.JSONDecodeError, TypeError):
+            pass
+        if parsed is _JSON_PARSE_FAILED:
+            return _sha256_bytes(
+                result.encode("utf-8", "surrogatepass"),
+                prefix=b"text\0",
             )
-        except TypeError:
-            canonical = str(parsed)
+    elif isinstance(result, bytes):
+        return _sha256_bytes(result, prefix=b"bytes\0")
+    elif isinstance(result, bytearray):
+        return _sha256_bytes(bytes(result), prefix=b"bytes\0")
     else:
-        canonical = result or ""
-    return _sha256(canonical)
+        parsed = result
+
+    canonical = json.dumps(
+        parsed,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=_json_hash_default,
+    ).encode("utf-8", "surrogatepass")
+    return _sha256_bytes(canonical, prefix=b"json\0")
+
+
+def _json_hash_default(value: Any) -> Any:
+    if isinstance(value, (bytes, bytearray)):
+        return {
+            "__hermes_type__": "bytes",
+            "base64": base64.b64encode(bytes(value)).decode("ascii"),
+        }
+    return str(value)
 
 
 def _as_bool(value: Any, default: bool) -> bool:
@@ -675,3 +724,10 @@ def _sha256(value: str) -> str:
     # encode raises and takes down the whole conversation loop. The hash only
     # needs deterministic bytes, not valid UTF-8.
     return hashlib.sha256(value.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def _sha256_bytes(value: bytes, *, prefix: bytes = b"") -> str:
+    digest = hashlib.sha256()
+    digest.update(prefix)
+    digest.update(value)
+    return digest.hexdigest()

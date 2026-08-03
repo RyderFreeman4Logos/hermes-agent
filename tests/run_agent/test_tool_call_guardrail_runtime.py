@@ -242,13 +242,19 @@ def test_relay_rewrite_precedes_sequential_policy_approval_checkpoint_and_dispat
         "checkpoint": [],
         "start": [],
         "dispatch": [],
+        "observation": [],
     }
 
     original_before_call = agent._tool_guardrails.before_call
+    original_observe = agent._append_guardrail_observation
 
     def observe_guardrail(name, args):
         observed["guardrail"].append((name, dict(args)))
         return original_before_call(name, args)
+
+    def observe_result(name, args, result, *, failed):
+        observed["observation"].append((name, dict(args)))
+        return original_observe(name, args, result, failed=failed)
 
     def relay_execute(name, args, callback, **kwargs):
         del name, args, kwargs
@@ -286,6 +292,11 @@ def test_relay_rewrite_precedes_sequential_policy_approval_checkpoint_and_dispat
             side_effect=observe_plugin,
         ),
         patch.object(agent._tool_guardrails, "before_call", side_effect=observe_guardrail),
+        patch.object(
+            agent,
+            "_append_guardrail_observation",
+            side_effect=observe_result,
+        ),
         patch(
             "acp_adapter.edit_approval.maybe_require_edit_approval",
             side_effect=observe_approval,
@@ -300,6 +311,7 @@ def test_relay_rewrite_precedes_sequential_policy_approval_checkpoint_and_dispat
     assert observed["approval"] == expected
     assert observed["start"] == expected
     assert observed["dispatch"] == expected
+    assert observed["observation"] == expected
     assert observed["checkpoint"] == [
         ("/approved/path", "before write_file")
     ]
@@ -723,3 +735,261 @@ def test_no_progress_loop_state_resets_for_a_real_new_user_turn():
     assert second["turn_exit_reason"].startswith("text_response")
     assert "guardrail" not in first
     assert "guardrail" not in second
+
+
+def test_multimodal_result_is_observed_without_losing_tool_message_identity():
+    agent = _make_agent("vision_analyze", max_iterations=200)
+    calls = [
+        _mock_tool_call(
+            "vision_analyze",
+            '{"image_url":"x"}',
+            f"vision-{index}",
+        )
+        for index in range(1, 7)
+    ]
+    envelope = {
+        "_multimodal": True,
+        "content": [
+            {"type": "text", "text": "same screenshot"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+        ],
+        "text_summary": "same screenshot",
+    }
+    messages = []
+
+    with (
+        patch.object(agent, "_model_supports_vision", return_value=True),
+        patch("run_agent.handle_function_call", return_value=envelope) as dispatch,
+    ):
+        agent._execute_tool_calls(
+            SimpleNamespace(content="", tool_calls=calls), messages, "task-1"
+        )
+
+    assert dispatch.call_count == 5
+    assert [message["tool_call_id"] for message in messages] == [
+        f"vision-{index}" for index in range(1, 7)
+    ]
+    assert all(message["role"] == "tool" for message in messages)
+    assert all(isinstance(message["content"], list) for message in messages[:5])
+    assert messages[4]["content"][1]["type"] == "image_url"
+    assert "no_progress_loop" in messages[4]["content"][0]["text"]
+    assert _json_payload(messages[5]["content"])["skipped"] is True
+
+
+def test_multimodal_guardrail_observes_envelope_before_nonvision_transport_fallback():
+    agent = _make_agent("vision_analyze", max_iterations=200)
+    envelope = {
+        "_multimodal": True,
+        "content": [
+            {"type": "text", "text": "same screenshot"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+        ],
+        "text_summary": "same screenshot",
+    }
+    messages = []
+    guardrails = getattr(agent, "_tool_guardrails")
+
+    with (
+        patch.object(agent, "_model_supports_vision", return_value=False),
+        patch.object(
+            guardrails,
+            "after_call",
+            wraps=guardrails.after_call,
+        ) as observe,
+        patch("run_agent.handle_function_call", return_value=envelope),
+    ):
+        agent._execute_tool_calls_sequential(
+            SimpleNamespace(
+                content="",
+                tool_calls=[_mock_tool_call("vision_analyze", "{}", "vision-text")],
+            ),
+            messages,
+            "task-1",
+        )
+
+    assert observe.call_args.args[2] is envelope
+    assert messages == [
+        {
+            "role": "tool",
+            "name": "vision_analyze",
+            "tool_name": "vision_analyze",
+            "content": "same screenshot",
+            "tool_call_id": "vision-text",
+        }
+    ]
+
+
+def test_non_string_results_are_normalized_without_losing_tool_ids():
+    agent = _make_agent("custom_tool", max_iterations=200)
+    calls = [
+        _mock_tool_call("custom_tool", json.dumps({"index": index}), f"typed-{index}")
+        for index in range(6)
+    ]
+    messages = []
+    raw_results = [
+        {"ok": True},
+        [1, 2],
+        b"bytes",
+        None,
+        False,
+        0,
+    ]
+
+    with patch("run_agent.handle_function_call", side_effect=raw_results):
+        agent._execute_tool_calls_sequential(
+            SimpleNamespace(content="", tool_calls=calls), messages, "task-1"
+        )
+
+    assert [message["tool_call_id"] for message in messages] == [
+        f"typed-{index}" for index in range(6)
+    ]
+    assert all(message["role"] == "tool" for message in messages)
+    assert all(isinstance(message["content"], str) for message in messages)
+
+
+def test_request_middleware_convergence_fences_sixth_physical_call():
+    agent = _make_agent("web_search", max_iterations=200)
+    calls = [
+        _mock_tool_call("web_search", json.dumps({"raw": i}), f"mw-same-{i}")
+        for i in range(1, 7)
+    ]
+    messages = []
+    middleware_inputs = []
+    starts = []
+    progress = []
+    agent.tool_start_callback = lambda *args: starts.append(args)
+    agent.tool_progress_callback = lambda *args, **kwargs: progress.append((args, kwargs))
+
+    def converge(_name, args, **_context):
+        middleware_inputs.append(dict(args))
+        return SimpleNamespace(
+            payload={"query": "same-effective"},
+            original_payload=args,
+            changed=True,
+            trace=[{"source": "test"}],
+        )
+
+    with (
+        patch("hermes_cli.middleware.apply_tool_request_middleware", side_effect=converge),
+        patch(
+            "run_agent.handle_function_call",
+            return_value=json.dumps({"ok": "same-result"}),
+        ) as dispatch,
+    ):
+        agent._execute_tool_calls(
+            SimpleNamespace(content="", tool_calls=calls), messages, "task-1"
+        )
+
+    assert len(middleware_inputs) == 6
+    assert dispatch.call_count == 5
+    assert [call.args[1] for call in dispatch.call_args_list] == [
+        {"query": "same-effective"}
+    ] * 5
+    assert [event[0] for event in starts] == [f"mw-same-{i}" for i in range(1, 6)]
+    assert sum(event[0][0] == "tool.completed" for event in progress) == 5
+    assert [message["tool_call_id"] for message in messages] == [
+        f"mw-same-{i}" for i in range(1, 7)
+    ]
+    assert _json_payload(messages[-1]["content"])["skipped"] is True
+
+
+def test_effective_distinct_request_middleware_keeps_parallel_execution():
+    agent = _make_agent("web_search", max_iterations=200)
+    calls = [
+        _mock_tool_call("web_search", json.dumps({"raw": i}), f"mw-distinct-{i}")
+        for i in range(1, 7)
+    ]
+    active = 0
+    max_active = 0
+    lock = threading.Lock()
+    rendezvous = threading.Barrier(6)
+
+    def keep_distinct(_name, args, **_context):
+        return SimpleNamespace(
+            payload={"query": f"effective-{args['raw']}"},
+            original_payload=args,
+            changed=True,
+            trace=[{"source": "test"}],
+        )
+
+    def dispatch(_name, args, _task_id, **_kwargs):
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        rendezvous.wait(timeout=3)
+        with lock:
+            active -= 1
+        return json.dumps({"result": args["query"]})
+
+    with (
+        patch("hermes_cli.middleware.apply_tool_request_middleware", side_effect=keep_distinct),
+        patch("run_agent.handle_function_call", side_effect=dispatch),
+    ):
+        agent._execute_tool_calls(
+            SimpleNamespace(content="", tool_calls=calls), [], "task-1"
+        )
+
+    assert not rendezvous.broken
+    assert max_active > 1
+
+
+def test_repeated_plugin_block_result_halts_before_sixth_provider_or_notification():
+    agent = _make_agent("custom_tool", max_iterations=200)
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call("custom_tool", '{"x":1}', f"blocked-{i}")],
+        )
+        for i in range(1, 7)
+    ] + [_mock_response(content="done", finish_reason="stop", tool_calls=None)]
+    notifications = []
+
+    with (
+        patch("hermes_cli.plugins.resolve_pre_tool_block", return_value="blocked by policy") as block,
+        patch(
+            "model_tools._emit_post_tool_call_hook",
+            side_effect=lambda **kwargs: notifications.append(kwargs),
+        ),
+        patch("run_agent.handle_function_call") as dispatch,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("repeat blocked call")
+
+    assert result["turn_exit_reason"] == "no_progress_loop"
+    assert result["api_calls"] == 5
+    assert block.call_count == 5
+    dispatch.assert_not_called()
+    assert len(notifications) == 5
+
+
+def test_repeated_non_object_arguments_halt_after_five_results():
+    agent = _make_agent("custom_tool", max_iterations=200)
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call("custom_tool", " [1, 2] ", f"invalid-{i}")],
+        )
+        for i in range(1, 7)
+    ] + [_mock_response(content="done", finish_reason="stop", tool_calls=None)]
+
+    with (
+        patch("run_agent.handle_function_call") as dispatch,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("repeat invalid call")
+
+    assert result["turn_exit_reason"] == "no_progress_loop"
+    assert result["api_calls"] == 5
+    dispatch.assert_not_called()
+    assert [
+        message["tool_call_id"]
+        for message in result["messages"]
+        if message.get("role") == "tool"
+    ] == [f"invalid-{i}" for i in range(1, 6)]

@@ -384,6 +384,97 @@ async def test_gateway_deferred_persistence_failure_rolls_back_and_keeps_pending
         db.close()
 
 
+def test_gateway_indeterminate_callback_blocks_without_restore_or_provider_dispatch(
+    tmp_path,
+):
+    from hermes_state import SessionDB
+    from hermes_state_common import AuthorityWriteIndeterminateError
+
+    runner = _make_runner()
+    session_key = "agent:main:telegram:dm:indeterminate"
+    pending = _fake_switch_result()
+    pending.new_model = "new-model"
+
+    class _Agent:
+        def __init__(self, db):
+            self.model = "old-model"
+            self.provider = "openrouter"
+            self.api_key = "old-key"
+            self.base_url = "https://old.example/v1"
+            self.api_mode = "chat_completions"
+            self.session_id = "gateway-indeterminate"
+            self._session_db = db
+            self._session_init_model_config = {"provider": "openrouter"}
+            self._cached_system_prompt = "old prompt"
+            self.statuses = []
+
+        def _emit_status(self, message):
+            self.statuses.append(message)
+
+        def switch_model(
+            self,
+            new_model,
+            new_provider,
+            api_key="",
+            base_url="",
+            api_mode="",
+        ):
+            self.model = new_model
+            self.provider = new_provider
+            self.api_key = api_key
+            self.base_url = base_url
+            self.api_mode = api_mode
+            self._cached_system_prompt = "new prompt"
+
+    class _IndeterminateStore:
+        def __init__(self):
+            self.calls = []
+
+        def get_model_override(self, _key):
+            return {"model": "old-model", "provider": "openrouter"}
+
+        def set_model_override(self, _key, override):
+            self.calls.append(dict(override) if override else None)
+            raise AuthorityWriteIndeterminateError("gateway override indeterminate")
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session(
+        "gateway-indeterminate",
+        "cli",
+        model="old-model",
+        model_config={"provider": "openrouter"},
+        system_prompt="old prompt",
+    )
+    agent = _Agent(db)
+    state = runner._session_state(session_key).conversation
+    state.after_compression_model_switch = pending
+    state.model_override = {"model": "old-model", "provider": "openrouter"}
+    store = _IndeterminateStore()
+    runner.session_store = store
+    runner._pending_model_notes = {}
+    runner._attach_model_switch_after_compression(session_key, agent)
+    provider_dispatches = []
+
+    try:
+        with pytest.raises(AuthorityWriteIndeterminateError, match="indeterminate"):
+            apply_model_switch_after_compression(agent)
+            provider_dispatches.append("first compressed-context request")
+
+        row = db.get_session("gateway-indeterminate")
+        assert row["model"] == "new-model"
+        assert (agent.model, agent.provider) == ("old-model", "openrouter")
+        assert get_model_switch_after_compression(agent) is pending
+        assert state.after_compression_model_switch is pending
+        assert state.model_override == {"model": "old-model", "provider": "openrouter"}
+        assert len(store.calls) == 1
+        assert store.calls[0]["model"] == "new-model"
+        assert provider_dispatches == []
+        assert any("blocked" in status.lower() for status in agent.statuses)
+        assert all("restored" not in status.lower() for status in agent.statuses)
+    finally:
+        db.close()
+
+
 def test_gateway_callback_failure_restores_all_frontend_mirrors():
     runner = _make_runner()
     session_key = "agent:main:telegram:dm:mirror-rollback"

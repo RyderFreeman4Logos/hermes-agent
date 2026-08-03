@@ -2622,6 +2622,7 @@ def resolve_qwen_runtime_credentials(
     refresh_if_expiring: bool = True,
     refresh_skew_seconds: int = QWEN_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
     allow_network: bool = True,
+    read_only: bool = False,
 ) -> Dict[str, Any]:
     tokens = _read_qwen_cli_tokens()
     access_token = str(tokens.get("access_token", "") or "").strip()
@@ -3480,7 +3481,9 @@ def _print_loopback_ssh_hint(redirect_uri: str, *, docs_url: str | None = None) 
 # where one app's refresh invalidates the other's session.
 # =============================================================================
 
-def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
+def _read_codex_tokens(
+    *, _lock: bool = True, read_only: bool = False
+) -> Dict[str, Any]:
     """Read Codex OAuth tokens from Hermes auth store (~/.hermes/auth.json).
     
     Returns dict with 'tokens' (access_token, refresh_token) and 'last_refresh'.
@@ -3488,10 +3491,12 @@ def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
     """
     if _lock:
         with _auth_store_lock():
-            auth_store = _load_auth_store()
+            auth_store = _load_auth_store(read_only=read_only)
     else:
-        auth_store = _load_auth_store()
-    state = _load_provider_state(auth_store, "openai-codex")
+        auth_store = _load_auth_store(read_only=read_only)
+    state = _load_provider_state(
+        auth_store, "openai-codex", read_only=read_only
+    )
     if not state:
         raise AuthError(
             "No Codex credentials stored. Run `hermes auth` to authenticate.",
@@ -3892,6 +3897,7 @@ def resolve_codex_runtime_credentials(
     refresh_if_expiring: bool = True,
     refresh_skew_seconds: int = CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
     allow_network: bool = True,
+    read_only: bool = False,
 ) -> Dict[str, Any]:
     """Resolve runtime credentials from Hermes's own Codex token store.
 
@@ -3904,9 +3910,10 @@ def resolve_codex_runtime_credentials(
     HTTP 401 ``Missing Authentication header`` from the wire instead of a usable
     credential. See issue #32992.
     """
+    read_only = read_only or not allow_network
     read_error: Optional[AuthError] = None
     try:
-        data = _read_codex_tokens()
+        data = _read_codex_tokens(read_only=read_only)
     except AuthError as exc:
         read_error = exc
         if allow_network and getattr(exc, "relogin_required", False) and getattr(exc, "code", None) in {
@@ -4349,9 +4356,11 @@ def _pool_codex_access_token() -> str:
 # xAI Grok OAuth — tokens stored in ~/.hermes/auth.json
 # =============================================================================
 
-def _xai_oauth_state_from_store(auth_store: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def _xai_oauth_state_from_store(
+    auth_store: Dict[str, Any], *, read_only: bool = False
+) -> Optional[Dict[str, Any]]:
     """Return usable xAI OAuth state from provider state or credential pool."""
-    state = _load_provider_state(auth_store, "xai-oauth")
+    state = _load_provider_state(auth_store, "xai-oauth", read_only=read_only)
     tokens = state.get("tokens") if isinstance(state, dict) else None
     if isinstance(tokens, dict):
         access_token = str(tokens.get("access_token", "") or "").strip()
@@ -4396,15 +4405,19 @@ def _xai_oauth_state_has_usable_tokens(state: Optional[Dict[str, Any]]) -> bool:
     )
 
 
-def _read_xai_oauth_tokens(*, _lock: bool = True) -> Dict[str, Any]:
+def _read_xai_oauth_tokens(
+    *, _lock: bool = True, read_only: bool = False
+) -> Dict[str, Any]:
     if _lock:
         with _auth_store_lock():
-            auth_store = _load_auth_store()
+            auth_store = _load_auth_store(read_only=True) if read_only else _load_auth_store()
     else:
-        auth_store = _load_auth_store()
-    state = _xai_oauth_state_from_store(auth_store)
+        auth_store = _load_auth_store(read_only=True) if read_only else _load_auth_store()
+    state = _xai_oauth_state_from_store(auth_store, read_only=read_only)
     if not _xai_oauth_state_has_usable_tokens(state):
-        global_state = _xai_oauth_state_from_store(_load_global_auth_store())
+        global_state = _xai_oauth_state_from_store(
+            _load_global_auth_store(read_only=read_only), read_only=read_only
+        )
         if _xai_oauth_state_has_usable_tokens(global_state):
             state = global_state
     if not state:
@@ -4887,8 +4900,10 @@ def resolve_xai_oauth_runtime_credentials(
     refresh_if_expiring: bool = True,
     refresh_skew_seconds: Optional[int] = None,
     allow_network: bool = True,
+    read_only: bool = False,
 ) -> Dict[str, Any]:
-    data = _read_xai_oauth_tokens()
+    read_only = read_only or not allow_network
+    data = _read_xai_oauth_tokens(read_only=read_only)
     tokens = dict(data["tokens"])
     access_token = str(tokens.get("access_token", "") or "").strip()
     refresh_timeout_seconds = env_float("HERMES_XAI_REFRESH_TIMEOUT_SECONDS", 20)
@@ -6062,6 +6077,7 @@ def resolve_nous_runtime_credentials(
     ca_bundle: Optional[str] = None,
     force_refresh: bool = False,
     allow_network: bool = True,
+    read_only: bool = False,
 ) -> Dict[str, Any]:
     """
     Resolve Nous inference credentials for runtime use.
@@ -6072,8 +6088,9 @@ def resolve_nous_runtime_credentials(
     Returns dict with: provider, base_url, api_key, key_id, expires_at,
     expires_in, source ("invoke_jwt"), and auth_path.
     """
+    read_only = read_only or not allow_network
     if not allow_network:
-        state = get_provider_auth_state("nous") or {}
+        state = get_provider_auth_state("nous", read_only=read_only) or {}
         min_ttl = max(60, env_int("HERMES_NOUS_MIN_KEY_TTL_SECONDS", 1800))
         if not _agent_key_is_usable(state, min_ttl):
             raise AuthError(
@@ -8509,6 +8526,7 @@ def resolve_minimax_oauth_runtime_credentials(
     *, min_token_ttl_seconds: int = MINIMAX_OAUTH_REFRESH_SKEW_SECONDS,
     as_token_provider: bool = False,
     allow_network: bool = True,
+    read_only: bool = False,
 ) -> Dict[str, Any]:
     """Return {provider, api_key, base_url, source} for minimax-oauth.
 
@@ -8523,7 +8541,8 @@ def resolve_minimax_oauth_runtime_credentials(
     diagnostic call sites like ``hermes status`` that just want to know
     whether a valid token exists right now.
     """
-    state = get_provider_auth_state("minimax-oauth")
+    read_only = read_only or not allow_network
+    state = get_provider_auth_state("minimax-oauth", read_only=read_only)
     if not state or not state.get("access_token"):
         raise AuthError(
             "Not logged into MiniMax OAuth. Run `hermes model` and select "

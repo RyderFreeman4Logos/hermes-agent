@@ -30,6 +30,8 @@ from dataclasses import dataclass
 from typing import Any, Callable, Iterator, List, NamedTuple, Optional
 
 from hermes_state_common import (
+    AUTHORITY_WRITE_INDETERMINATE_ATTR,
+    AUTHORITY_WRITE_OUTCOME_ATTR,
     AuthorityWriteIndeterminateError,
     reconcile_authoritative_write,
 )
@@ -491,15 +493,23 @@ def get_model_switch_after_compression(agent: Any) -> Optional[ModelSwitchResult
     return pending if isinstance(pending, ModelSwitchResult) else None
 
 
+def _read_session_route_snapshot(session_db: Any, session_id: str) -> Optional[dict]:
+    reader = getattr(session_db, "read_session_route_snapshot", None)
+    if callable(reader):
+        return reader(session_id)
+    getter = getattr(session_db, "get_session", None)
+    return getter(session_id) if callable(getter) else None
+
+
 def _session_model_config(agent: Any) -> dict[str, Any]:
     """Return the current durable model config, falling back to init state."""
     config = getattr(agent, "_session_init_model_config", None)
     config = copy.deepcopy(config) if isinstance(config, dict) else {}
     session_db = getattr(agent, "_session_db", None)
     session_id = getattr(agent, "session_id", None)
-    if session_db is None or not session_id or not hasattr(session_db, "get_session"):
+    if session_db is None or not session_id:
         return config
-    row = session_db.get_session(session_id)
+    row = _read_session_route_snapshot(session_db, session_id)
     if not row:
         return config
     raw = row.get("model_config")
@@ -531,8 +541,9 @@ def _persist_session_model_config(
     model: Optional[str] = None,
     system_prompt: Optional[str] = None,
     result: Optional[ModelSwitchResult] = None,
-) -> None:
+) -> Optional[BaseException]:
     """Publish secret-free route metadata before updating the live mirror."""
+    authority_interrupt = None
     session_db = getattr(agent, "_session_db", None)
     session_id = getattr(agent, "session_id", None)
     if session_db is not None and session_id:
@@ -547,17 +558,22 @@ def _persist_session_model_config(
                 result.base_url,
                 result.api_mode,
             )
-            get_session = getattr(session_db, "get_session", None)
-            if callable(get_session):
-                preimage = _session_route_state(get_session(session_id))
-                readback = lambda: _session_route_state(get_session(session_id))
+            reader = getattr(session_db, "read_session_route_snapshot", None)
+            getter = getattr(session_db, "get_session", None)
+            if callable(reader) or callable(getter):
+                preimage = _session_route_state(
+                    _read_session_route_snapshot(session_db, session_id)
+                )
+                readback = lambda: _session_route_state(
+                    _read_session_route_snapshot(session_db, session_id)
+                )
             else:
                 preimage = object()
 
                 def readback():
                     raise RuntimeError("session route authority readback unavailable")
 
-            reconcile_authoritative_write(
+            outcome = reconcile_authoritative_write(
                 write=lambda: publish(
                     session_id,
                     model_config_json=config_json,
@@ -572,6 +588,8 @@ def _persist_session_model_config(
                 preimage=preimage,
                 label="session route authority",
             )
+            if isinstance(outcome, BaseException):
+                authority_interrupt = outcome
         else:
             session_db.update_session_meta(
                 session_id,
@@ -590,6 +608,7 @@ def _persist_session_model_config(
                     billing_mode=result.api_mode or None,
                 )
     setattr(agent, "_session_init_model_config", copy.deepcopy(config))
+    return authority_interrupt
 
 
 def _applied_model_config(
@@ -622,9 +641,9 @@ def _applied_model_config(
 def _snapshot_durable_session_route(agent: Any) -> tuple[Any, Optional[str], Any]:
     session_db = getattr(agent, "_session_db", None)
     session_id = getattr(agent, "session_id", None)
-    if session_db is None or not session_id or not hasattr(session_db, "get_session"):
+    if session_db is None or not session_id:
         return session_db, session_id, None
-    row = session_db.get_session(session_id)
+    row = _read_session_route_snapshot(session_db, session_id)
     return session_db, session_id, copy.deepcopy(row) if row else None
 
 
@@ -805,7 +824,7 @@ def model_switch_after_compression_transaction(
                 result.base_url,
                 result.api_mode,
             )
-        except Exception as exc:
+        except BaseException as exc:
             restore_model_runtime_for_rollback(agent, runtime_snapshot)
             agent._model_switch_after_compression_state = {
                 "state": "failed",
@@ -842,37 +861,52 @@ def model_switch_after_compression_transaction(
             "_session_init_model_config",
             copy.deepcopy(transaction.model_config),
         )
+        activation_interrupt = None
         try:
             yield transaction
             if callable(callback):
                 callback(result, old_model, old_provider)
-        except Exception as exc:
-            restore_model_runtime_for_rollback(agent, runtime_snapshot)
-            setattr(agent, "_session_init_model_config", old_config)
-            if getattr(transaction, "authority_publication_in_flight", False):
-                indeterminate = isinstance(exc, AuthorityWriteIndeterminateError)
-                transaction.status = "blocked" if indeterminate else "failed"
-                description = (
-                    "blocked by indeterminate durable publication"
-                    if indeterminate
-                    else "failed before durable commit; previous route retained"
-                )
+        except BaseException as exc:
+            if getattr(exc, AUTHORITY_WRITE_OUTCOME_ATTR, None) == "commit-confirmed":
+                activation_interrupt = exc
             else:
-                try:
-                    _restore_durable_session_route(durable_snapshot)
-                except Exception:
-                    logger.exception("deferred model-switch durable rollback failed")
-                transaction.status = "failed"
-                description = "failed; restored previous route"
-            agent._model_switch_after_compression_state = {
-                "state": transaction.status,
-                "model": result.new_model,
-                "provider": result.target_provider,
-            }
-            _emit_deferred_model_switch_status(
-                agent, f"Deferred model switch {description}: {exc}"
-            )
-            raise
+                restore_model_runtime_for_rollback(agent, runtime_snapshot)
+                setattr(agent, "_session_init_model_config", old_config)
+                indeterminate = (
+                    exc
+                    if isinstance(exc, AuthorityWriteIndeterminateError)
+                    else getattr(exc, AUTHORITY_WRITE_INDETERMINATE_ATTR, None)
+                )
+                restore_error = None
+                if isinstance(indeterminate, AuthorityWriteIndeterminateError):
+                    transaction.status = "blocked"
+                    description = "blocked by indeterminate durable publication"
+                else:
+                    if (
+                        getattr(exc, AUTHORITY_WRITE_OUTCOME_ATTR, None)
+                        != "preimage-confirmed"
+                    ):
+                        try:
+                            _restore_durable_session_route(durable_snapshot)
+                        except BaseException as secondary:
+                            restore_error = secondary
+                    transaction.status = "blocked" if restore_error else "failed"
+                    description = (
+                        "blocked because durable rollback failed"
+                        if restore_error
+                        else "failed; restored previous route"
+                    )
+                agent._model_switch_after_compression_state = {
+                    "state": transaction.status,
+                    "model": result.new_model,
+                    "provider": result.target_provider,
+                }
+                _emit_deferred_model_switch_status(
+                    agent, f"Deferred model switch {description}: {exc}"
+                )
+                if restore_error is not None:
+                    raise restore_error from exc
+                raise
 
         # Consume only after runtime and durable route publication both succeed.
         setattr(agent, _AFTER_COMPRESSION_ATTR, None)
@@ -888,6 +922,8 @@ def model_switch_after_compression_transaction(
             "Deferred model switch applied after compression: "
             f"{result.new_model} via {result.provider_label or result.target_provider}",
         )
+        if activation_interrupt is not None:
+            raise activation_interrupt
 
 
 def apply_model_switch_after_compression(
@@ -897,6 +933,7 @@ def apply_model_switch_after_compression(
 ) -> str:
     """Apply and durably publish a pending route at a committed boundary."""
     transaction = DeferredModelSwitchTransaction()
+    publication_interrupt = None
     try:
         with model_switch_after_compression_transaction(agent) as transaction:
             if transaction.active:
@@ -910,20 +947,23 @@ def apply_model_switch_after_compression(
                 if callable(build_prompt):
                     prompt = build_prompt(system_message)
                     agent._cached_system_prompt = prompt
-                session_db = getattr(agent, "_session_db", None)
-                transaction.authority_publication_in_flight = callable(
-                    getattr(session_db, "publish_session_route", None)
-                )
-                _persist_session_model_config(
+                publication_interrupt = _persist_session_model_config(
                     agent,
                     transaction.model_config or {},
                     model=result.new_model,
                     system_prompt=prompt,
                     result=result,
                 )
-                transaction.authority_publication_in_flight = False
-    except Exception:
-        return "failed"
+        if publication_interrupt is not None:
+            raise publication_interrupt
+    except BaseException as exc:
+        if publication_interrupt is not None and exc is not publication_interrupt:
+            raise publication_interrupt from exc
+        if isinstance(exc, AuthorityWriteIndeterminateError):
+            raise
+        if not isinstance(exc, Exception):
+            raise
+        return transaction.status if transaction.status != "none" else "failed"
     return transaction.status
 
 

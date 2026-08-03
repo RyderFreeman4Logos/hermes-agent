@@ -20,7 +20,10 @@ from datetime import datetime, timedelta
 from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Any
 
-from hermes_state_common import reconcile_authoritative_write
+from hermes_state_common import (
+    AUTHORITY_WRITE_OUTCOME_ATTR,
+    reconcile_authoritative_write,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1451,6 +1454,7 @@ class SessionStore:
             if generation <= getattr(self, "_persisted_routing_generation", 0):
                 return
             db_saved = False
+            authority_interrupt = None
             _db = getattr(self, "_db", None)
             if _db:
                 replacer = getattr(_db, "replace_gateway_routing_entries", None)
@@ -1468,7 +1472,7 @@ class SessionStore:
                                 "gateway routing authority readback unavailable"
                             )
 
-                    reconcile_authoritative_write(
+                    outcome = reconcile_authoritative_write(
                         write=lambda: replacer(
                             intended, scope=self._routing_scope()
                         ),
@@ -1477,6 +1481,13 @@ class SessionStore:
                         preimage=preimage,
                         label="gateway routing authority",
                     )
+                    if isinstance(outcome, BaseException):
+                        if (
+                            getattr(outcome, AUTHORITY_WRITE_OUTCOME_ATTR, None)
+                            != "commit-confirmed"
+                        ):
+                            raise outcome
+                        authority_interrupt = outcome
                     db_saved = True
             if getattr(self, "_write_sessions_json", True) or not db_saved:
                 try:
@@ -1491,6 +1502,8 @@ class SessionStore:
                     else:
                         raise
             self._persisted_routing_generation = generation
+            if authority_interrupt is not None:
+                raise authority_interrupt
 
     def _save_sessions_json(self, data: Dict[str, Any]) -> None:
         """Write the legacy sessions.json mirror of the routing index."""
@@ -2574,11 +2587,16 @@ class SessionStore:
             entry.model_override = cleaned
             try:
                 self._save()
-            except BaseException:
-                entry.model_override = previous
+            except BaseException as exc:
+                if getattr(exc, AUTHORITY_WRITE_OUTCOME_ATTR, None) != "commit-confirmed":
+                    entry.model_override = previous
                 # SQLite failures were reconciled against authority above.
                 # Preserve compensation only for SQLite-disabled legacy mode.
-                if self._db is None:
+                if (
+                    self._db is None
+                    and getattr(exc, AUTHORITY_WRITE_OUTCOME_ATTR, None)
+                    != "commit-confirmed"
+                ):
                     try:
                         self._save()
                     except BaseException:

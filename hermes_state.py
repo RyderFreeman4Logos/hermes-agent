@@ -4835,6 +4835,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return self._execute_write(_do) or 0
 
+    def read_session_route_snapshot(
+        self, session_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Read route authority fields without flushing accounting writes."""
+        with self._read_ctx() as conn:
+            row = conn.execute(
+                """SELECT model_config, model, system_prompt,
+                          billing_provider, billing_base_url, billing_mode
+                   FROM sessions WHERE id = ?""",
+                (session_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
     def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Get a session by ID."""
         # Cost/usage readers (/status, /usage, gateway endpoints) reach the

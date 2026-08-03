@@ -252,6 +252,51 @@ def test_post_commit_db_error_commits_override_forward(tmp_path, monkeypatch):
     ).get_model_override(entry.session_key) == target
 
 
+@pytest.mark.parametrize("interrupt_type", [KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("committed", [True, False], ids=["target", "preimage"])
+def test_authority_baseexception_converges_memory_db_and_legacy_then_rethrows(
+    tmp_path,
+    monkeypatch,
+    interrupt_type,
+    committed,
+):
+    store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+    store._write_sessions_json = True
+    entry = store.get_or_create_session(_make_source())
+    store.set_model_override(entry.session_key, OVERRIDE)
+    real_replace = store._db.replace_gateway_routing_entries
+    interrupt = interrupt_type("injected authority interruption")
+    calls = 0
+
+    def interrupted_replace(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if committed:
+            real_replace(*args, **kwargs)
+        raise interrupt
+
+    monkeypatch.setattr(
+        store._db,
+        "replace_gateway_routing_entries",
+        interrupted_replace,
+    )
+    target = {"model": "replacement", "provider": "anthropic"}
+
+    with pytest.raises(interrupt_type) as caught:
+        store.set_model_override(entry.session_key, target)
+
+    assert caught.value is interrupt
+    assert calls == 1
+    expected = target if committed else sanitize_model_override(OVERRIDE)
+    assert store.get_model_override(entry.session_key) == expected
+    raw = json.loads((tmp_path / "sessions.json").read_text(encoding="utf-8"))
+    assert raw[entry.session_key]["model_override"] == expected
+    assert SessionStore(
+        sessions_dir=tmp_path,
+        config=GatewayConfig(),
+    ).get_model_override(entry.session_key) == expected
+
+
 @pytest.mark.parametrize("readback", ["unavailable", "third-state"])
 def test_indeterminate_db_write_is_explicit_and_does_not_compensate(
     tmp_path, monkeypatch, readback

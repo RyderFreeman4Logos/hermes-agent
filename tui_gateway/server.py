@@ -4110,7 +4110,7 @@ def _attach_model_switch_after_compression(
                     provider=result.target_provider,
                     require_durable=True,
                 )
-            except Exception:
+            except BaseException:
                 for key, value in old_values.items():
                     if value is missing:
                         session.pop(key, None)

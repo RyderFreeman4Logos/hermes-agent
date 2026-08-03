@@ -106,28 +106,51 @@ class AuthorityWriteIndeterminateError(RuntimeError):
     """The durable outcome of an authority write could not be proven."""
 
 
+AUTHORITY_WRITE_OUTCOME_ATTR = "_hermes_authority_write_outcome"
+AUTHORITY_WRITE_INDETERMINATE_ATTR = "_hermes_authority_write_indeterminate"
+
+
 def reconcile_authoritative_write(*, write, readback, intended, preimage, label):
     """Run an authority write and resolve post-error commit ambiguity exactly."""
     try:
         write()
-    except Exception as write_error:  # noqa: BLE001 - authority failures vary by backend
+    except BaseException as write_error:  # noqa: BLE001 - includes turn interrupts
         try:
             authority = readback()
-        except Exception as readback_error:  # noqa: BLE001
-            raise AuthorityWriteIndeterminateError(
+        except BaseException as readback_error:  # noqa: BLE001
+            indeterminate = AuthorityWriteIndeterminateError(
                 f"{label} write outcome indeterminate: "
                 f"{type(write_error).__name__}: {write_error}; "
                 "authority readback failed: "
                 f"{type(readback_error).__name__}: {readback_error}"
-            ) from readback_error
+            )
+            fatal = (
+                write_error
+                if not isinstance(write_error, Exception)
+                else readback_error
+                if not isinstance(readback_error, Exception)
+                else None
+            )
+            if fatal is not None:
+                setattr(fatal, AUTHORITY_WRITE_INDETERMINATE_ATTR, indeterminate)
+                raise fatal from indeterminate
+            raise indeterminate from readback_error
         if authority == intended:
+            if not isinstance(write_error, Exception):
+                setattr(write_error, AUTHORITY_WRITE_OUTCOME_ATTR, "commit-confirmed")
+                return write_error
             return "commit-confirmed"
         if authority == preimage:
+            setattr(write_error, AUTHORITY_WRITE_OUTCOME_ATTR, "preimage-confirmed")
             raise
-        raise AuthorityWriteIndeterminateError(
+        indeterminate = AuthorityWriteIndeterminateError(
             f"{label} write outcome indeterminate: authority differs from "
             "both intended state and exact preimage"
-        ) from write_error
+        )
+        if not isinstance(write_error, Exception):
+            setattr(write_error, AUTHORITY_WRITE_INDETERMINATE_ATTR, indeterminate)
+            raise write_error from indeterminate
+        raise indeterminate from write_error
     return "committed"
 
 

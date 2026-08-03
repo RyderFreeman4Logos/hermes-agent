@@ -57,6 +57,7 @@ import os
 import re
 import subprocess
 import shutil
+import stat
 import sys
 import tempfile
 import threading
@@ -1164,6 +1165,8 @@ def _run_chrome_fallback_command(
 
     task_socket_dir = os.path.join(_socket_safe_tmpdir(), f"agent-browser-{tmp_session}")
     os.makedirs(task_socket_dir, mode=0o700, exist_ok=True)
+    if not _write_owner_pid(task_socket_dir, tmp_session):
+        raise RuntimeError("Could not publish safe browser control ownership")
     browser_env = _build_browser_env()
     browser_env["AGENT_BROWSER_SOCKET_DIR"] = task_socket_dir
     browser_env["PATH"] = _merge_browser_path(browser_env.get("PATH", ""))
@@ -1259,9 +1262,40 @@ def _run_chrome_fallback_command(
             _run_tmp("close", [])
         except Exception:
             pass
-        # Clean up socket directory
-        import shutil as _shutil
-        _shutil.rmtree(task_socket_dir, ignore_errors=True)
+        opened = _open_browser_control_dir(task_socket_dir, tmp_session)
+        if opened is not None:
+            root_fd, dir_fd, dir_name, dir_stat = opened
+            try:
+                from tools.process_registry import ProcessRegistry
+
+                owner = _owner_record_matches_dir(dir_fd, dir_stat, tmp_session)
+                daemon = _read_browser_control_numbers(
+                    dir_fd, f"{tmp_session}.pid", 1
+                )
+                if owner is None or daemon is None:
+                    continue_cleanup = False
+                else:
+                    owner_start = ProcessRegistry._safe_host_start_time(owner[0])
+                    continue_cleanup = owner[0] == os.getpid() and owner_start == owner[1]
+                if continue_cleanup:
+                    daemon_pid = daemon[0]
+                    daemon_start = ProcessRegistry._safe_host_start_time(daemon_pid)
+                    daemon_gone = daemon_start is None and not ProcessRegistry._is_host_pid_alive(
+                        daemon_pid
+                    )
+                    if daemon_start is not None:
+                        daemon_gone = _verify_reapable_browser_daemon(
+                            daemon_pid, task_socket_dir, tmp_session
+                        ) and ProcessRegistry._terminate_host_pid(
+                            daemon_pid, daemon_start
+                        )
+                    if daemon_gone:
+                        _remove_browser_control_dir(
+                            root_fd, dir_fd, dir_name, dir_stat, tmp_session
+                        )
+            finally:
+                os.close(dir_fd)
+                os.close(root_fd)
 
 
 def _chrome_fallback_screenshot(
@@ -1580,8 +1614,6 @@ def _emergency_cleanup_all_sessions():
     global _cleanup_done
     if _cleanup_done:
         return
-    _cleanup_done = True
-
     # Clean up this process's own sessions first, so their owner_pid files
     # are removed before the reaper scans.
     if _active_sessions:
@@ -1591,11 +1623,6 @@ def _emergency_cleanup_all_sessions():
             cleanup_all_browsers()
         except Exception as e:
             logger.error("Emergency cleanup error: %s", e)
-        finally:
-            with _cleanup_lock:
-                _active_sessions.clear()
-                _session_last_activity.clear()
-                _recording_sessions.clear()
 
     # Sweep orphans from other crashed hermes processes.  Safe even if we
     # never used the browser — uses owner_pid liveness to avoid reaping
@@ -1604,6 +1631,8 @@ def _emergency_cleanup_all_sessions():
         _reap_orphaned_browser_sessions()
     except Exception as e:
         logger.debug("Orphan reap on exit failed: %s", e)
+    with _cleanup_lock:
+        _cleanup_done = not bool(_active_sessions)
 
 
 # Register cleanup via atexit only.  Previous versions installed SIGINT/SIGTERM
@@ -1640,29 +1669,176 @@ def _cleanup_inactive_browser_sessions():
             elapsed = int(current_time - _session_last_activity.get(task_id, current_time))
             logger.info("Cleaning up inactive session for task: %s (inactive for %ss)", task_id, elapsed)
             cleanup_browser(task_id)
-            with _cleanup_lock:
-                if task_id in _session_last_activity:
-                    del _session_last_activity[task_id]
         except Exception as e:
             logger.warning("Error cleaning up inactive session %s: %s", task_id, e)
 
 
-def _write_owner_pid(socket_dir: str, session_name: str) -> None:
-    """Record the current hermes PID as the owner of a browser socket dir.
+def _open_browser_control_dir(
+    socket_dir: str, session_name: str
+) -> Optional[Tuple[int, int, str, os.stat_result]]:
+    """Open an expected browser control directory without following symlinks."""
+    dir_name = f"agent-browser-{session_name}"
+    root = os.path.abspath(_socket_safe_tmpdir())
+    if (
+        not session_name
+        or os.path.basename(socket_dir) != dir_name
+        or os.path.abspath(socket_dir) != os.path.join(root, dir_name)
+    ):
+        return None
 
-    Written atomically to ``<socket_dir>/<session_name>.owner_pid`` so the
-    orphan reaper can distinguish daemons owned by a live hermes process
-    (don't reap) from daemons whose owner crashed (reap).  Best-effort —
-    an OSError here just falls back to the legacy ``tracked_names``
-    heuristic in the reaper.
-    """
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    root_fd = dir_fd = -1
     try:
-        path = os.path.join(socket_dir, f"{session_name}.owner_pid")
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(str(os.getpid()))
+        root_fd = os.open(root, flags)
+        if not stat.S_ISDIR(os.fstat(root_fd).st_mode):
+            raise OSError("browser control root is not a directory")
+        dir_fd = os.open(dir_name, flags, dir_fd=root_fd)
+        dir_stat = os.fstat(dir_fd)
+        if not stat.S_ISDIR(dir_stat.st_mode):
+            raise OSError("browser control path is not a directory")
+        if hasattr(os, "getuid") and dir_stat.st_uid != os.getuid():
+            raise OSError("browser control path has the wrong owner")
+        if dir_stat.st_mode & 0o077:
+            raise OSError("browser control path has unsafe permissions")
+        return root_fd, dir_fd, dir_name, dir_stat
     except OSError as exc:
-        logger.debug("Could not write owner_pid file for %s: %s",
-                     session_name, exc)
+        if dir_fd >= 0:
+            os.close(dir_fd)
+        if root_fd >= 0:
+            os.close(root_fd)
+        logger.warning("Retaining unsafe browser control path for %s: %s", session_name, exc)
+        return None
+
+
+def _read_browser_control_numbers(
+    dir_fd: int, name: str, count: int
+) -> Optional[Tuple[int, ...]]:
+    """Read one bounded, no-follow regular control record."""
+    fd = -1
+    try:
+        fd = os.open(
+            name,
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=dir_fd,
+        )
+        file_stat = os.fstat(fd)
+        if not stat.S_ISREG(file_stat.st_mode) or file_stat.st_size > 128:
+            return None
+        if hasattr(os, "getuid") and file_stat.st_uid != os.getuid():
+            return None
+        payload = os.read(fd, 129).decode("ascii")
+        values = payload.splitlines()
+        if len(values) != count or any(
+            not value.isdecimal() or int(value) <= 0 for value in values
+        ):
+            return None
+        return tuple(int(value) for value in values)
+    except (OSError, UnicodeDecodeError):
+        return None
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def _owner_record_matches_dir(
+    dir_fd: int, dir_stat: os.stat_result, session_name: str
+) -> Optional[Tuple[int, int]]:
+    record = _read_browser_control_numbers(
+        dir_fd, f"{session_name}.owner_pid", 4
+    )
+    if record is None or record[2:] != (dir_stat.st_dev, dir_stat.st_ino):
+        return None
+    return record[0], record[1]
+
+
+def _remove_browser_control_dir(
+    root_fd: int,
+    dir_fd: int,
+    dir_name: str,
+    dir_stat: os.stat_result,
+    session_name: str,
+) -> bool:
+    """Delete only known regular leaves from the pinned control directory."""
+    owner_name = f"{session_name}.owner_pid"
+    pid_name = f"{session_name}.pid"
+    try:
+        entries = os.listdir(dir_fd)
+        for name in entries:
+            if name not in {owner_name, pid_name} and not name.startswith(
+                ("_stdout_", "_stderr_")
+            ):
+                return False
+            leaf = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+            if not stat.S_ISREG(leaf.st_mode):
+                return False
+
+        current = os.stat(dir_name, dir_fd=root_fd, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != (dir_stat.st_dev, dir_stat.st_ino):
+            return False
+
+        for name in entries:
+            os.unlink(name, dir_fd=dir_fd)
+        if os.listdir(dir_fd):
+            return False
+
+        current = os.stat(dir_name, dir_fd=root_fd, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != (dir_stat.st_dev, dir_stat.st_ino):
+            return False
+        os.rmdir(dir_name, dir_fd=root_fd)
+        return True
+    except OSError:
+        return False
+
+
+def _write_owner_pid(socket_dir: str, session_name: str) -> bool:
+    """Publish the owner identity and pinned control-directory inode."""
+    opened = _open_browser_control_dir(socket_dir, session_name)
+    if opened is None:
+        return False
+    root_fd, dir_fd, _dir_name, dir_stat = opened
+    fd = -1
+    try:
+        from tools.process_registry import ProcessRegistry
+
+        owner_pid = os.getpid()
+        owner_start = ProcessRegistry._safe_host_start_time(owner_pid)
+        if owner_start is None:
+            return False
+        expected = (owner_pid, owner_start, dir_stat.st_dev, dir_stat.st_ino)
+        owner_name = f"{session_name}.owner_pid"
+        existing = _read_browser_control_numbers(dir_fd, owner_name, 4)
+        if existing is not None:
+            return existing == expected
+        try:
+            fd = os.open(
+                owner_name,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=dir_fd,
+            )
+        except FileExistsError:
+            return False
+        payload = ("\n".join(str(value) for value in expected) + "\n").encode(
+            "ascii"
+        )
+        return stat.S_ISREG(os.fstat(fd).st_mode) and os.write(fd, payload) == len(
+            payload
+        )
+    except OSError as exc:
+        logger.warning("Could not publish browser owner for %s: %s", session_name, exc)
+        return False
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        os.close(dir_fd)
+        os.close(root_fd)
 
 
 def _verify_reapable_browser_daemon(daemon_pid: int, socket_dir: str,
@@ -1762,15 +1938,7 @@ def _reap_orphaned_browser_sessions():
     left behind by previous runs, reads the daemon PID files, and kills any
     daemons whose owning hermes process is no longer alive.
 
-    Ownership detection priority:
-      1. ``<session>.owner_pid`` file (written by current code) — if the
-         referenced hermes PID is alive, leave the daemon alone regardless
-         of whether it's in *this* process's ``_active_sessions``.  This is
-         cross-process safe: two concurrent hermes instances won't reap each
-         other's daemons.
-      2. Fallback for daemons that predate owner_pid: check
-         ``_active_sessions`` in the current process.  If not tracked here,
-         treat as orphan (legacy behavior).
+    Missing, unreadable, or corrupt ownership evidence is retained as UNKNOWN.
 
     Safe to call from any context — atexit, cleanup thread, or on demand.
     """
@@ -1787,14 +1955,6 @@ def _reap_orphaned_browser_sessions():
     if not socket_dirs:
         return
 
-    # Build set of session_names currently tracked by this process (fallback path)
-    with _cleanup_lock:
-        tracked_names = {
-            info.get("session_name")
-            for info in _active_sessions.values()
-            if info.get("session_name")
-        }
-
     reaped = 0
     for socket_dir in socket_dirs:
         dir_name = os.path.basename(socket_dir)
@@ -1803,81 +1963,62 @@ def _reap_orphaned_browser_sessions():
         if not session_name:
             continue
 
-        # Ownership check: prefer owner_pid file (cross-process safe).
-        owner_pid_file = os.path.join(socket_dir, f"{session_name}.owner_pid")
-        owner_alive: Optional[bool] = None  # None = owner_pid missing/unreadable
-        if os.path.isfile(owner_pid_file):
-            try:
-                owner_pid = int(Path(owner_pid_file).read_text(encoding="utf-8").strip())
-                # ``os.kill(pid, 0)`` is NOT a no-op on Windows (bpo-14484).
-                # Use the cross-platform existence check.
-                from gateway.status import _pid_exists
-                owner_alive = _pid_exists(owner_pid)
-            except (ValueError, OSError):
-                owner_alive = None  # corrupt file — fall through
-
-        if owner_alive is True:
-            # Owner is alive — this session belongs to a live hermes process.
+        opened = _open_browser_control_dir(socket_dir, session_name)
+        if opened is None:
             continue
-
-        if owner_alive is None:
-            # No owner_pid file (legacy daemon).  Fall back to in-process
-            # tracking: if this process knows about the session, leave alone.
-            if session_name in tracked_names:
-                continue
-
-        # owner_alive is False (dead owner) OR legacy daemon not tracked here.
-        pid_file = os.path.join(socket_dir, f"{session_name}.pid")
-        if not os.path.isfile(pid_file):
-            # No daemon PID file — just a stale dir, remove it
-            shutil.rmtree(socket_dir, ignore_errors=True)
-            continue
-
-        try:
-            daemon_pid = int(Path(pid_file).read_text(encoding="utf-8").strip())
-        except (ValueError, OSError):
-            shutil.rmtree(socket_dir, ignore_errors=True)
-            continue
-
-        # Check if the daemon is still alive. ``os.kill(pid, 0)`` on Windows
-        # is NOT a no-op — use the handle-based existence check.
-        from gateway.status import _pid_exists
-        if not _pid_exists(daemon_pid):
-            shutil.rmtree(socket_dir, ignore_errors=True)
-            continue
-
-        # The PID is live — but the .pid file lives in a world-writable,
-        # predictably-named temp dir we don't write ourselves, and PIDs get
-        # recycled after the real daemon exits.  Verify the process really is
-        # *this* session's agent-browser daemon before tree-killing it; refuse
-        # otherwise (don't touch the process, leave the socket dir for a later
-        # sweep once the imposter PID is gone).  Fixes the arbitrary same-user
-        # process DoS in issue #14073.
-        if not _verify_reapable_browser_daemon(
-                daemon_pid, socket_dir, session_name):
-            continue
-
-        # Daemon is alive and its owner is dead (or legacy + untracked).  Reap.
-        # Use the process-tree termination helper so Chromium children
-        # (renderer, GPU, etc.) are cleaned up, not just the daemon parent.
+        root_fd, dir_fd, dir_name, dir_stat = opened
         try:
             from tools.process_registry import ProcessRegistry
+
+            owner = _owner_record_matches_dir(dir_fd, dir_stat, session_name)
+            if owner is None:
+                continue
+            owner_pid, owner_start = owner
+            current_owner_start = ProcessRegistry._safe_host_start_time(owner_pid)
+            if current_owner_start is None:
+                if ProcessRegistry._is_host_pid_alive(owner_pid):
+                    continue
+            elif current_owner_start == owner_start:
+                continue
+
+            daemon = _read_browser_control_numbers(
+                dir_fd, f"{session_name}.pid", 1
+            )
+            if daemon is None:
+                continue
+            daemon_pid = daemon[0]
             daemon_start = ProcessRegistry._safe_host_start_time(daemon_pid)
             if daemon_start is None:
-                logger.warning("Retaining browser control path for pid %d: identity is unknown", daemon_pid)
-                continue
-            if not ProcessRegistry._terminate_host_pid(daemon_pid, daemon_start):
-                logger.warning("Retaining browser control path for pid %d: termination was unconfirmed", daemon_pid)
-                continue
-            logger.info("Reaped orphaned browser daemon PID %d (session %s)",
-                        daemon_pid, session_name)
-            reaped += 1
-        except (ProcessLookupError, PermissionError, OSError):
-            logger.warning("Retaining browser control path for pid %d: termination failed", daemon_pid)
-            continue
+                if ProcessRegistry._is_host_pid_alive(daemon_pid):
+                    continue
+            else:
+                if not _verify_reapable_browser_daemon(
+                    daemon_pid, socket_dir, session_name
+                ):
+                    if ProcessRegistry._is_host_pid_alive(daemon_pid):
+                        continue
+                elif not ProcessRegistry._terminate_host_pid(
+                    daemon_pid, daemon_start
+                ):
+                    continue
+                else:
+                    reaped += 1
 
-        # Only a confirmed identity-bound termination may remove control state.
-        shutil.rmtree(socket_dir, ignore_errors=True)
+            if not _remove_browser_control_dir(
+                root_fd, dir_fd, dir_name, dir_stat, session_name
+            ):
+                logger.warning(
+                    "Retaining browser control path for %s: artifact cleanup was unconfirmed",
+                    session_name,
+                )
+        except (ProcessLookupError, PermissionError, OSError):
+            logger.warning(
+                "Retaining browser control path for %s: cleanup failed",
+                session_name,
+            )
+        finally:
+            os.close(dir_fd)
+            os.close(root_fd)
 
     if reaped:
         logger.info("Reaped %d orphaned browser session(s) from previous run(s)", reaped)
@@ -2508,7 +2649,8 @@ def _run_browser_command(
         os.makedirs(task_socket_dir, mode=0o700, exist_ok=True)
         # Record this hermes PID as the session owner (cross-process safe
         # orphan detection — see _write_owner_pid).
-        _write_owner_pid(task_socket_dir, session_info['session_name'])
+        if not _write_owner_pid(task_socket_dir, session_info['session_name']):
+            raise RuntimeError("Could not publish safe browser control ownership")
         logger.debug("browser cmd=%s task=%s socket_dir=%s (%d chars)",
                      command, task_id, task_socket_dir, len(task_socket_dir))
 
@@ -4467,7 +4609,7 @@ def _cleanup_old_recordings(max_age_hours=72):
 # Cleanup and Management Functions
 # ============================================================================
 
-def cleanup_browser(task_id: Optional[str] = None) -> None:
+def cleanup_browser(task_id: Optional[str] = None) -> bool:
     """
     Clean up browser session(s) for a task.
 
@@ -4504,7 +4646,7 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
         if not _cleanup_single_browser_session(session_key):
             cleanup_confirmed = False
     if not cleanup_confirmed:
-        return
+        return False
 
     # Drop stale last-active ownership. Cleaning a bare task drops its binding;
     # cleaning a sidecar drops the binding only if that sidecar was still the
@@ -4515,6 +4657,7 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
             _last_active_session_key.pop(bare_task_id, None)
     else:
         _last_active_session_key.pop(bare_task_id, None)
+    return True
 
 
 def _cleanup_single_browser_session(task_id: str) -> bool:
@@ -4550,52 +4693,72 @@ def _cleanup_single_browser_session(task_id: str) -> bool:
         # Stop auto-recording before closing (saves the file)
         _maybe_stop_recording(task_id)
 
-        # Try to close via agent-browser first (needs session in _active_sessions)
-        try:
-            _run_browser_command(task_id, "close", [], timeout=10)
-            logger.debug("agent-browser close command completed for task %s", task_id)
-        except Exception as e:
-            logger.warning("agent-browser close failed for task %s: %s", task_id, e)
-
-        # Cloud mode: close the cloud browser session via provider API.
-        # Local sidecars have bb_session_id=None so this no-ops for them.
-        if bb_session_id:
-            provider = _get_cloud_provider()
-            if provider is not None:
-                try:
-                    provider.close_session(bb_session_id)
-                except Exception as e:
-                    logger.warning("Could not close cloud browser session: %s", e)
-
-        # Kill the daemon process and clean up socket directory
         session_name = session_info.get("session_name", "")
-        if session_name:
-            socket_dir = os.path.join(_socket_safe_tmpdir(), f"agent-browser-{session_name}")
-            if os.path.exists(socket_dir):
-                # agent-browser writes {session}.pid in the socket dir
-                pid_file = os.path.join(socket_dir, f"{session_name}.pid")
-                if os.path.isfile(pid_file):
+        socket_dir = os.path.join(
+            _socket_safe_tmpdir(), f"agent-browser-{session_name}"
+        )
+        opened = _open_browser_control_dir(socket_dir, session_name)
+        if opened is None:
+            return False
+        root_fd, dir_fd, dir_name, dir_stat = opened
+        daemon_pid = daemon_start = None
+        daemon_gone = False
+        try:
+            from tools.process_registry import ProcessRegistry
+
+            owner = _owner_record_matches_dir(dir_fd, dir_stat, session_name)
+            if owner is None or owner[0] != os.getpid():
+                return False
+            current_owner_start = ProcessRegistry._safe_host_start_time(owner[0])
+            if current_owner_start is None or current_owner_start != owner[1]:
+                return False
+
+            daemon = _read_browser_control_numbers(
+                dir_fd, f"{session_name}.pid", 1
+            )
+            if daemon is None:
+                return False
+            daemon_pid = daemon[0]
+            daemon_start = ProcessRegistry._safe_host_start_time(daemon_pid)
+            if daemon_start is None:
+                if ProcessRegistry._is_host_pid_alive(daemon_pid):
+                    return False
+                daemon_gone = True
+            elif not _verify_reapable_browser_daemon(
+                daemon_pid, socket_dir, session_name
+            ):
+                if ProcessRegistry._is_host_pid_alive(daemon_pid):
+                    return False
+                daemon_gone = True
+
+            # Try to close via agent-browser first (needs session in _active_sessions)
+            try:
+                _run_browser_command(task_id, "close", [], timeout=10)
+                logger.debug("agent-browser close command completed for task %s", task_id)
+            except Exception as e:
+                logger.warning("agent-browser close failed for task %s: %s", task_id, e)
+
+            # Cloud mode: close the cloud browser session via provider API.
+            # Local sidecars have bb_session_id=None so this no-ops for them.
+            if bb_session_id:
+                provider = _get_cloud_provider()
+                if provider is not None:
                     try:
-                        from tools.process_registry import ProcessRegistry
-                        daemon_pid = int(Path(pid_file).read_text(encoding="utf-8").strip())
-                        daemon_start = ProcessRegistry._safe_host_start_time(daemon_pid)
-                        if daemon_start is None:
-                            if ProcessRegistry._is_host_pid_alive(daemon_pid):
-                                logger.warning("Retaining browser control path for %s: daemon identity is unknown", session_name)
-                                return False
-                        elif not _verify_reapable_browser_daemon(
-                            daemon_pid, socket_dir, session_name
-                        ):
-                            logger.warning("Retaining browser control path for %s: daemon identity is unverified", session_name)
-                            return False
-                        elif not ProcessRegistry._terminate_host_pid(daemon_pid, daemon_start):
-                            logger.warning("Retaining browser control path for %s: daemon termination was unconfirmed", session_name)
-                            return False
-                        logger.debug("Killed daemon pid %s for %s", daemon_pid, session_name)
-                    except (ProcessLookupError, ValueError, PermissionError, OSError):
-                        logger.warning("Retaining browser control path for %s: daemon cleanup failed", session_name)
-                        return False
-                shutil.rmtree(socket_dir, ignore_errors=True)
+                        provider.close_session(bb_session_id)
+                    except Exception as e:
+                        logger.warning("Could not close cloud browser session: %s", e)
+
+            if not daemon_gone and not ProcessRegistry._terminate_host_pid(
+                daemon_pid, daemon_start
+            ):
+                return False
+            if not _remove_browser_control_dir(
+                root_fd, dir_fd, dir_name, dir_stat, session_name
+            ):
+                return False
+        finally:
+            os.close(dir_fd)
+            os.close(root_fd)
 
         with _cleanup_lock:
             _active_sessions.pop(task_id, None)

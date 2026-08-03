@@ -1238,10 +1238,10 @@ class ProcessRegistry:
                     env=pty_env,
                     dimensions=(30, 120),
                 )
+                # Own the returned handle before any fallible identity work.
+                session._pty = pty_proc
                 session.pid = pty_proc.pid
                 session.host_start_time = self._safe_host_start_time(session.pid)
-                # Store the pty handle on the session for read/write
-                session._pty = pty_proc
 
                 # PTY reader thread
                 reader = threading.Thread(
@@ -1253,8 +1253,9 @@ class ProcessRegistry:
                 session._reader_thread = reader
 
                 self._publish_provisional_owner(session)
-                self._write_checkpoint()
                 self._arm_execution_deadline(session)
+                if self._write_checkpoint() is False:
+                    raise RuntimeError("Process checkpoint failed after PTY spawn")
                 reader.start()
                 return session
 
@@ -1268,6 +1269,13 @@ class ProcessRegistry:
                         "PTY spawn failed (%s), falling back to pipe mode", exc
                     )
                 else:
+                    if session.pid and session.host_start_time is None:
+                        try:
+                            session.host_start_time = type(self)._safe_host_start_time(
+                                session.pid
+                            )
+                        except BaseException:
+                            pass
                     try:
                         self.rescue_discard(
                             session,
@@ -1310,16 +1318,15 @@ class ProcessRegistry:
             self._release_session_id(session.id)
             raise
 
-        session.process = proc
-        session.pid = proc.pid
-        session.host_start_time = self._safe_host_start_time(session.pid)
-        if not _IS_WINDOWS:
-            session.process_group_id = proc.pid  # start_new_session=True makes pid == pgid
-            session._subreaper_managed = (
-                not _IS_WINDOWS and sys.platform.startswith("linux")
-            )
-
         try:
+            # Own the returned handle before any fallible identity work.
+            session.process = proc
+            session.pid = proc.pid
+            if not _IS_WINDOWS:
+                session.process_group_id = proc.pid  # start_new_session=True makes pid == pgid
+                session._subreaper_managed = sys.platform.startswith("linux")
+            session.host_start_time = self._safe_host_start_time(session.pid)
+
             # Start output reader thread
             reader = threading.Thread(
                 target=self._reader_loop,
@@ -1330,12 +1337,20 @@ class ProcessRegistry:
             session._reader_thread = reader
 
             self._publish_provisional_owner(session)
-            self._write_checkpoint()
             self._arm_execution_deadline(session)
+            if self._write_checkpoint() is False:
+                raise RuntimeError("Process checkpoint failed after local spawn")
             reader.start()
         except BaseException as exc:
             # A child now exists.  Reuse the public ownership/kill path so an
             # unconfirmed cleanup stays managed with its original deadline.
+            if session.pid and session.host_start_time is None:
+                try:
+                    session.host_start_time = type(self)._safe_host_start_time(
+                        session.pid
+                    )
+                except BaseException:
+                    pass
             try:
                 self.rescue_discard(
                     session,
@@ -1421,9 +1436,22 @@ class ProcessRegistry:
 
         # N2: every nonlocal launch gets a recoverable owner before dispatch,
         # including inline/deferred launches whose caller has not received session yet.
-        self._publish_provisional_owner(session)
-        self._write_checkpoint()
-        self._arm_execution_deadline(session)
+        try:
+            self._publish_provisional_owner(session)
+            if self._write_checkpoint() is False:
+                raise RuntimeError("Process checkpoint failed before nonlocal launch")
+            self._arm_execution_deadline(session)
+        except BaseException:
+            if session._deadline_timer is not None:
+                session._deadline_timer.cancel()
+                session._deadline_timer = None
+            with self._lock:
+                if self._running.get(session.id) is session:
+                    self._running.pop(session.id, None)
+                    self._session_generation += 1
+                self._reserved_ids.discard(session.id)
+            self._write_checkpoint()
+            raise
 
         try:
             result = env.execute(
@@ -1536,10 +1564,12 @@ class ProcessRegistry:
             else:
                 self._release_session_id(session.id)
         else:
-            if not defer_registration:
-                self._write_checkpoint()
             assert reader is not None
             try:
+                if self._write_checkpoint() is False:
+                    raise RuntimeError(
+                        "Process checkpoint failed after nonlocal launch"
+                    )
                 reader.start()
             except BaseException as exc:
                 try:
@@ -1620,17 +1650,17 @@ class ProcessRegistry:
                 for key, value in (notification_metadata or {}).items():
                     setattr(session, key, value)
                 session._completion_event.clear()
-                if running_owner is session:
-                    return True
-                self._session_generation += 1
-                session._registry_generation = self._session_generation
-                self._prune_if_needed()
-                self._running[session.id] = session
-                self._reserved_ids.discard(session.id)
-                newly_registered = True
+                if running_owner is not session:
+                    self._session_generation += 1
+                    session._registry_generation = self._session_generation
+                    self._prune_if_needed()
+                    self._running[session.id] = session
+                    self._reserved_ids.discard(session.id)
+                    newly_registered = True
         if newly_registered:
             self._arm_execution_deadline(session)
-            self._write_checkpoint()
+        if self._write_checkpoint() is False:
+            raise RuntimeError("Process promotion checkpoint failed")
         return True
 
     def _finish_discard(self, session: ProcessSession, result: dict) -> dict:
@@ -1691,10 +1721,11 @@ class ProcessRegistry:
                             "error": f"Process identity collision for {session.id}",
                             "session_id": session.id,
                         }
-                    self._session_generation += 1
-                    session._registry_generation = self._session_generation
-                    self._running[session.id] = session
-                    self._reserved_ids.discard(session.id)
+                    if owner is not session:
+                        self._session_generation += 1
+                        session._registry_generation = self._session_generation
+                        self._running[session.id] = session
+                        self._reserved_ids.discard(session.id)
                 need_deadline = (
                     session._deadline_timer is None
                     and not session._deadline_fallback_started
@@ -1708,7 +1739,8 @@ class ProcessRegistry:
                 except BaseException as exc:
                     deadline_error = exc
             try:
-                self._write_checkpoint()
+                if self._write_checkpoint() is False:
+                    checkpoint_error = RuntimeError("Process checkpoint failed")
             except BaseException as exc:
                 checkpoint_error = exc
             result = self.kill_process(
@@ -2706,10 +2738,15 @@ class ProcessRegistry:
                             )
                         )
                         delivery_confirmed = self._host_kill_delivery_confirmed()
-                    else:
+                    if not confirmed:
                         session._pty.terminate(force=True)
                         delivery_confirmed = True
                         confirmed = not bool(session._pty.isalive())
+                    if confirmed:
+                        try:
+                            session._pty.wait()
+                        except Exception:
+                            pass
                 elif session.process:
                     self._remember_local_descendants(session, include_subreaper=True)
                     primitive_confirmed = bool(
@@ -2718,6 +2755,18 @@ class ProcessRegistry:
                         )
                     )
                     delivery_confirmed = self._host_kill_delivery_confirmed()
+                    if (
+                        not primitive_confirmed
+                        and session.host_start_time is None
+                        and session.process.poll() is None
+                    ):
+                        session.process.terminate()
+                        delivery_confirmed = True
+                        for child_pid, child_start in list(
+                            session._tracked_descendants.items()
+                        ):
+                            self._terminate_host_pid(child_pid, child_start)
+                        primitive_confirmed = True
                     try:
                         session.process.wait(timeout=1)
                     except Exception:

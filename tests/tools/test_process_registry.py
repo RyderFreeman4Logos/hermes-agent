@@ -2072,6 +2072,258 @@ def test_deferred_local_post_dispatch_checkpoint_fault_keeps_owner(
         registry.kill_all()
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="uses a real POSIX child")
+def test_real_post_popen_keyboardinterrupt_contains_child(
+    registry, monkeypatch, tmp_path
+):
+    """An interrupt during identity capture cannot strand the real child."""
+    from tools import process_registry as process_registry_module
+
+    created = []
+    real_popen = subprocess.Popen
+
+    def capture_popen(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        created.append(proc)
+        return proc
+
+    monkeypatch.setattr(process_registry_module.subprocess, "Popen", capture_popen)
+    monkeypatch.setattr(
+        ProcessRegistry,
+        "_safe_host_start_time",
+        classmethod(lambda _cls, _pid: None),
+    )
+    monkeypatch.setattr(
+        registry,
+        "_safe_host_start_time",
+        MagicMock(side_effect=KeyboardInterrupt("identity interrupted")),
+    )
+
+    try:
+        with pytest.raises(KeyboardInterrupt, match="identity interrupted"):
+            registry.spawn_local(
+                f"{shlex.quote(sys.executable)} -c 'import time; time.sleep(30)'",
+                cwd=str(tmp_path),
+                execution_timeout=30,
+                defer_registration=True,
+            )
+
+        assert len(created) == 1
+        assert created[0].poll() is not None
+        assert not registry._running
+        assert not registry._finished
+        assert not registry._reserved_ids
+    finally:
+        for proc in created:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=5)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="uses a real POSIX PTY")
+@pytest.mark.live_system_guard_bypass
+def test_real_post_pty_identity_keyboardinterrupt_contains_child(
+    registry, monkeypatch, tmp_path
+):
+    from ptyprocess import PtyProcess
+
+    created = []
+    containment = []
+    real_spawn = PtyProcess.spawn
+    real_rescue = registry.rescue_discard
+
+    def capture_spawn(_cls, *args, **kwargs):
+        proc = real_spawn(*args, **kwargs)
+        created.append(proc)
+        return proc
+
+    monkeypatch.setattr(PtyProcess, "spawn", classmethod(capture_spawn))
+
+    def capture_rescue(*args, **kwargs):
+        result = real_rescue(*args, **kwargs)
+        containment.append(result)
+        return result
+
+    monkeypatch.setattr(registry, "rescue_discard", capture_rescue)
+    monkeypatch.setattr(
+        registry,
+        "_safe_host_start_time",
+        MagicMock(side_effect=KeyboardInterrupt("pty identity interrupted")),
+    )
+
+    try:
+        with pytest.raises(KeyboardInterrupt, match="pty identity interrupted"):
+            registry.spawn_local(
+                f"{shlex.quote(sys.executable)} -c 'import time; time.sleep(30)'",
+                cwd=str(tmp_path),
+                use_pty=True,
+                execution_timeout=30,
+                defer_registration=True,
+            )
+
+        assert len(created) == 1
+        assert containment and containment[0]["status"] in {
+            "killed",
+            "already_exited",
+        }
+        assert not created[0].isalive()
+        assert not registry._running
+        assert not registry._finished
+        assert not registry._reserved_ids
+    finally:
+        for proc in created:
+            if proc.isalive():
+                proc.terminate(force=True)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="uses a real POSIX child")
+def test_real_atomic_checkpoint_false_aborts_local_spawn(
+    registry, monkeypatch, tmp_path
+):
+    """The real checkpoint producer's False result is a launch failure."""
+    from tools import process_registry as process_registry_module
+    import utils
+
+    created = []
+    real_popen = subprocess.Popen
+
+    def capture_popen(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        created.append(proc)
+        return proc
+
+    monkeypatch.setattr(
+        process_registry_module, "CHECKPOINT_PATH", tmp_path / "processes.json"
+    )
+    monkeypatch.setattr(process_registry_module.subprocess, "Popen", capture_popen)
+    monkeypatch.setattr(
+        utils,
+        "atomic_json_write",
+        MagicMock(side_effect=OSError("disk full")),
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="checkpoint"):
+            registry.spawn_local(
+                f"{shlex.quote(sys.executable)} -c 'import time; time.sleep(30)'",
+                cwd=str(tmp_path),
+                execution_timeout=30,
+                defer_registration=True,
+            )
+
+        assert len(created) == 1
+        assert created[0].poll() is not None
+        assert not registry._running
+        assert not registry._finished
+    finally:
+        for proc in created:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=5)
+
+
+def test_provisional_checkpoint_false_prevents_remote_side_effect(
+    registry, monkeypatch, tmp_path
+):
+    from tools import process_registry as process_registry_module
+    import utils
+
+    class RecordingEnv:
+        def __init__(self):
+            self.commands = []
+
+        def execute(self, command, **_kwargs):
+            self.commands.append(command)
+            return {"output": "4242\n99\n", "returncode": 0}
+
+    env = RecordingEnv()
+    monkeypatch.setattr(
+        process_registry_module, "CHECKPOINT_PATH", tmp_path / "processes.json"
+    )
+    monkeypatch.setattr(
+        utils,
+        "atomic_json_write",
+        MagicMock(side_effect=OSError("disk full")),
+    )
+
+    with pytest.raises(RuntimeError, match="checkpoint"):
+        registry.spawn_via_env(env, "echo hello", defer_registration=True)
+
+    assert env.commands == []
+    assert not registry._running
+    assert not registry._finished
+
+
+def test_rescue_keeps_existing_deadline_generation_effective(registry, monkeypatch):
+    callbacks = []
+
+    class Timer:
+        def __init__(self, _delay, callback):
+            self.callback = callback
+            self.daemon = False
+            callbacks.append(callback)
+
+        def start(self):
+            return None
+
+        def cancel(self):
+            return None
+
+        def is_alive(self):
+            return True
+
+    session = _make_session(sid="proc_rescue_deadline")
+    session.execution_deadline = time.time() + 60
+    monkeypatch.setattr("tools.process_registry.threading.Timer", Timer)
+    monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+    assert registry.promote(session)
+    original_generation = session._registry_generation
+
+    calls = []
+
+    def kill_process(_session_id, *, source, **_kwargs):
+        calls.append(source)
+        return (
+            {"status": "error", "error": "containment unknown"}
+            if len(calls) == 1
+            else {"status": "killed"}
+        )
+
+    monkeypatch.setattr(registry, "kill_process", kill_process)
+
+    result = registry.rescue_discard(session, source="failed_start")
+    assert result["status"] == "error"
+    assert registry.get(session.id) is session
+    assert session._registry_generation == original_generation
+
+    callbacks[0]()
+    assert calls == ["failed_start", "execution_timeout"]
+
+
+def test_promoting_provisional_owner_checkpoints_notification_metadata(
+    registry, monkeypatch, tmp_path
+):
+    from tools import process_registry as process_registry_module
+
+    checkpoint = tmp_path / "processes.json"
+    monkeypatch.setattr(process_registry_module, "CHECKPOINT_PATH", checkpoint)
+    session = _make_session(sid="proc_promote_metadata")
+    registry._publish_provisional_owner(session)
+    assert registry._write_checkpoint() is True
+
+    assert registry.promote(
+        session,
+        notification_metadata={
+            "notify_on_complete": True,
+            "watch_patterns": ["READY"],
+        },
+    )
+
+    [entry] = json.loads(checkpoint.read_text(encoding="utf-8"))
+    assert entry["notify_on_complete"] is True
+    assert entry["watch_patterns"] == ["READY"]
+
+
 class _ArtifactEnv:
     def __init__(self, payload, exit_returncode=0):
         self.payload = payload

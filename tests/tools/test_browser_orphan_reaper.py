@@ -36,12 +36,20 @@ def _make_socket_dir(tmpdir, session_name, pid=None, owner_pid=None):
                    (None = no file; tests the legacy path)
     """
     d = tmpdir / f"agent-browser-{session_name}"
-    d.mkdir()
+    d.mkdir(mode=0o700)
     if pid is not None:
         (d / f"{session_name}.pid").write_text(str(pid))
     if owner_pid is not None:
         (d / f"{session_name}.owner_pid").write_text(str(owner_pid))
     return d
+
+
+def _write_bound_owner(directory, session_name, pid=111, start=1):
+    st = directory.stat()
+    (directory / f"{session_name}.owner_pid").write_text(
+        f"{pid}\n{start}\n{st.st_dev}\n{st.st_ino}\n",
+        encoding="utf-8",
+    )
 
 
 class TestReapOrphanedBrowserSessions:
@@ -52,13 +60,19 @@ class TestReapOrphanedBrowserSessions:
         from tools.browser_tool import _reap_orphaned_browser_sessions
         _reap_orphaned_browser_sessions()  # should not raise
 
-    def test_stale_dir_without_pid_file_is_removed(self, fake_tmpdir):
-        """Socket dir with no PID file is cleaned up."""
+    def test_stale_dir_without_pid_file_is_retained(self, fake_tmpdir):
+        """Missing ownership and daemon evidence is UNKNOWN, not stale proof."""
         from tools.browser_tool import _reap_orphaned_browser_sessions
-        d = _make_socket_dir(fake_tmpdir, "h_abc1234567")
+        session_name = "h_abc1234567"
+        d = _make_socket_dir(fake_tmpdir, session_name)
+        _write_bound_owner(d, session_name)
         assert d.exists()
-        _reap_orphaned_browser_sessions()
-        assert not d.exists()
+        with patch(
+            "tools.process_registry.ProcessRegistry._safe_host_start_time",
+            return_value=2,
+        ):
+            _reap_orphaned_browser_sessions()
+        assert d.exists()
 
 
     def test_alive_legacy_daemon_without_identity_is_retained(self, fake_tmpdir):
@@ -81,15 +95,91 @@ class TestReapOrphanedBrowserSessions:
         assert d.exists()
 
 
-    def test_corrupt_pid_file_is_cleaned(self, fake_tmpdir):
-        """PID file with non-integer content is cleaned up."""
+    def test_corrupt_pid_file_is_retained(self, fake_tmpdir):
+        """Corrupt daemon evidence is UNKNOWN and remains retryable."""
         from tools.browser_tool import _reap_orphaned_browser_sessions
 
-        d = _make_socket_dir(fake_tmpdir, "h_corrupt1234")
-        (d / "h_corrupt1234.pid").write_text("not-a-number")
+        session_name = "h_corrupt1234"
+        d = _make_socket_dir(fake_tmpdir, session_name)
+        _write_bound_owner(d, session_name)
+        (d / f"{session_name}.pid").write_text("not-a-number")
+
+        with patch(
+            "tools.process_registry.ProcessRegistry._safe_host_start_time",
+            return_value=2,
+        ):
+            _reap_orphaned_browser_sessions()
+        assert d.exists()
+
+    def test_corrupt_owner_record_is_retained(self, fake_tmpdir):
+        from tools.browser_tool import _reap_orphaned_browser_sessions
+
+        session_name = "h_corrupt_owner"
+        d = _make_socket_dir(fake_tmpdir, session_name, pid=12345)
+        (d / f"{session_name}.owner_pid").write_text("not-an-identity")
+        with patch(
+            "tools.process_registry.ProcessRegistry._terminate_host_pid"
+        ) as terminate:
+            _reap_orphaned_browser_sessions()
+
+        terminate.assert_not_called()
+        assert d.exists()
+
+    def test_symlinked_control_directory_cannot_delete_target(self, fake_tmpdir):
+        from tools.browser_tool import _reap_orphaned_browser_sessions
+
+        target = fake_tmpdir / "unrelated"
+        target.mkdir()
+        (target / "keep.txt").write_text("keep", encoding="utf-8")
+        link = fake_tmpdir / "agent-browser-h_symlink_root"
+        link.symlink_to(target, target_is_directory=True)
 
         _reap_orphaned_browser_sessions()
-        assert not d.exists()
+
+        assert link.is_symlink()
+        assert (target / "keep.txt").read_text(encoding="utf-8") == "keep"
+
+    def test_pid_identity_is_captured_before_binding_verification(self, fake_tmpdir):
+        from tools.browser_tool import _reap_orphaned_browser_sessions
+
+        session_name = "h_reuse_order"
+        d = _make_socket_dir(fake_tmpdir, session_name, pid=12345)
+        _write_bound_owner(d, session_name)
+        state = {"daemon_start": 77}
+        termination_identities = []
+
+        def safe_start(pid):
+            if pid == 111:
+                return 2
+            return state["daemon_start"]
+
+        def verify(*_args):
+            state["daemon_start"] = 88
+            return True
+
+        def terminate(pid, expected_start):
+            termination_identities.append((pid, expected_start))
+            return False
+
+        with (
+            patch("gateway.status._pid_exists", side_effect=[False, True]),
+            patch(
+                "tools.process_registry.ProcessRegistry._safe_host_start_time",
+                side_effect=safe_start,
+            ),
+            patch(
+                "tools.browser_tool._verify_reapable_browser_daemon",
+                side_effect=verify,
+            ),
+            patch(
+                "tools.process_registry.ProcessRegistry._terminate_host_pid",
+                side_effect=terminate,
+            ),
+        ):
+            _reap_orphaned_browser_sessions()
+
+        assert termination_identities == [(12345, 77)]
+        assert d.exists()
 
 
 class TestOwnerPidCrossProcess:
@@ -109,8 +199,14 @@ class TestOwnerPidCrossProcess:
         from tools.browser_tool import _reap_orphaned_browser_sessions
 
         # Use our own PID as the "owner" — guaranteed alive
-        d = _make_socket_dir(
-            fake_tmpdir, "h_alive_owner", pid=12345, owner_pid=os.getpid()
+        session_name = "h_alive_owner"
+        d = _make_socket_dir(fake_tmpdir, session_name, pid=12345)
+        from tools.process_registry import ProcessRegistry
+        _write_bound_owner(
+            d,
+            session_name,
+            pid=os.getpid(),
+            start=ProcessRegistry._safe_host_start_time(os.getpid()),
         )
 
         kill_calls = []
@@ -119,8 +215,7 @@ class TestOwnerPidCrossProcess:
             kill_calls.append(pid)
 
         # Owner alive → reaper skips without ever probing the daemon.
-        with patch("gateway.status._pid_exists", return_value=True), \
-             patch("tools.process_registry.ProcessRegistry._terminate_host_pid", side_effect=mock_terminate):
+        with patch("tools.process_registry.ProcessRegistry._terminate_host_pid", side_effect=mock_terminate):
             _reap_orphaned_browser_sessions()
 
         assert 12345 not in kill_calls
@@ -156,19 +251,10 @@ class TestOwnerPidCrossProcess:
         assert d.exists()
 
 
-    def test_write_owner_pid_swallows_oserror(self, fake_tmpdir, monkeypatch):
-        """OSError (e.g. permission denied) doesn't propagate — the reaper
-        falls back to the legacy tracked_names heuristic in that case.
-        """
+    def test_write_owner_pid_rejects_unbound_directory(self, fake_tmpdir):
         import tools.browser_tool as bt
 
-        def raise_oserror(*a, **kw):
-            raise OSError("permission denied")
-
-        monkeypatch.setattr("builtins.open", raise_oserror)
-
-        # Must not raise
-        bt._write_owner_pid(str(fake_tmpdir), "h_readonly123")
+        assert bt._write_owner_pid(str(fake_tmpdir), "h_readonly123") is False
 
     def test_run_browser_command_calls_write_owner_pid(
         self, fake_tmpdir, monkeypatch
@@ -351,10 +437,15 @@ class TestEmergencyCleanupRunsReaper:
     def test_identity_bound_termination_only_reaps_after_success(self, fake_tmpdir):
         from tools.browser_tool import _reap_orphaned_browser_sessions
 
-        d = _make_socket_dir(fake_tmpdir, "h_identity_bound", pid=12345)
-        with patch("gateway.status._pid_exists", return_value=True), \
-             patch("tools.browser_tool._verify_reapable_browser_daemon", return_value=True), \
-             patch("tools.process_registry.ProcessRegistry._safe_host_start_time", return_value=77), \
+        session_name = "h_identity_bound"
+        d = _make_socket_dir(fake_tmpdir, session_name, pid=12345)
+        _write_bound_owner(d, session_name)
+
+        def safe_start(pid):
+            return 2 if pid == 111 else 77
+
+        with patch("tools.browser_tool._verify_reapable_browser_daemon", return_value=True), \
+             patch("tools.process_registry.ProcessRegistry._safe_host_start_time", side_effect=safe_start), \
              patch("tools.process_registry.ProcessRegistry._terminate_host_pid", side_effect=lambda pid, expected: pid == 12345 and expected == 77):
             _reap_orphaned_browser_sessions()
         assert not d.exists()
@@ -362,10 +453,15 @@ class TestEmergencyCleanupRunsReaper:
     def test_unknown_identity_retains_orphan_control_path(self, fake_tmpdir):
         from tools.browser_tool import _reap_orphaned_browser_sessions
 
-        d = _make_socket_dir(fake_tmpdir, "h_identity_unknown", pid=12345)
-        with patch("gateway.status._pid_exists", return_value=True), \
-             patch("tools.browser_tool._verify_reapable_browser_daemon", return_value=True), \
-             patch("tools.process_registry.ProcessRegistry._safe_host_start_time", return_value=None), \
+        session_name = "h_identity_unknown"
+        d = _make_socket_dir(fake_tmpdir, session_name, pid=12345)
+        _write_bound_owner(d, session_name)
+
+        def safe_start(pid):
+            return 2 if pid == 111 else None
+
+        with patch("tools.process_registry.ProcessRegistry._safe_host_start_time", side_effect=safe_start), \
+             patch("tools.process_registry.ProcessRegistry._is_host_pid_alive", return_value=True), \
              patch("tools.process_registry.ProcessRegistry._terminate_host_pid") as terminate:
             _reap_orphaned_browser_sessions()
         terminate.assert_not_called()

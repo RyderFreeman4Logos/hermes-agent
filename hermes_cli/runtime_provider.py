@@ -353,6 +353,7 @@ def _copilot_runtime_api_mode(
     api_key: str,
     *,
     target_model: Optional[str] = None,
+    allow_network: bool = True,
 ) -> str:
     configured_provider = str(model_cfg.get("provider") or "").strip().lower()
     configured_mode = _parse_api_mode(model_cfg.get("api_mode"))
@@ -372,6 +373,10 @@ def _copilot_runtime_api_mode(
     try:
         from hermes_cli.models import copilot_model_api_mode
 
+        if not allow_network:
+            return copilot_model_api_mode(
+                model_name, api_key=api_key, allow_network=False
+            )
         return copilot_model_api_mode(model_name, api_key=api_key)
     except Exception:
         return "chat_completions"
@@ -445,6 +450,7 @@ def _resolve_runtime_from_pool_entry(
     model_cfg: Optional[Dict[str, Any]] = None,
     pool: Optional[CredentialPool] = None,
     target_model: Optional[str] = None,
+    allow_network: bool = True,
 ) -> Dict[str, Any]:
     model_cfg = model_cfg or _get_model_config()
     # When the caller is resolving for a specific target model (e.g. a /model
@@ -497,6 +503,7 @@ def _resolve_runtime_from_pool_entry(
             model_cfg,
             getattr(entry, "runtime_api_key", ""),
             target_model=effective_model,
+            allow_network=allow_network,
         )
         base_url = base_url or PROVIDER_REGISTRY["copilot"].inference_base_url
     elif provider == "azure-foundry":
@@ -1657,6 +1664,7 @@ def _resolve_explicit_runtime(
                 model_cfg,
                 api_key,
                 target_model=target_model,
+                allow_network=allow_network,
             )
         elif provider == "xai":
             api_mode = "codex_responses"
@@ -1974,6 +1982,7 @@ def resolve_runtime_provider(
                 model_cfg=model_cfg,
                 pool=pool,
                 target_model=target_model,
+                allow_network=allow_network,
             )
 
     if provider == "nous":
@@ -2280,6 +2289,7 @@ def resolve_runtime_provider(
                 model_cfg,
                 creds.get("api_key", ""),
                 target_model=target_model,
+                allow_network=allow_network,
             )
         elif provider == "xai":
             api_mode = "codex_responses"

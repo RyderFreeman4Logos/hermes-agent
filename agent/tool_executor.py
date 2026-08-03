@@ -479,7 +479,16 @@ def _run_agent_tool_execution_middleware(
             agent._iters_since_skill = 0
 
         _advance_start_order(_begin)
-        return execute(final_args)
+        from tools.runtime_heartbeat import (
+            bind_agent_provider,
+            reset_current_provider,
+        )
+
+        provider_token = bind_agent_provider(agent)
+        try:
+            return execute(final_args)
+        finally:
+            reset_current_provider(provider_token)
 
     def _hermes_pipeline(relay_args: dict[str, Any]) -> Any:
         request_result = apply_tool_request_middleware(

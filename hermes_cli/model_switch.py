@@ -29,6 +29,10 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Callable, Iterator, List, NamedTuple, Optional
 
+from hermes_state_common import (
+    AuthorityWriteIndeterminateError,
+    reconcile_authoritative_write,
+)
 from hermes_cli.providers import (
     ProviderDef,
     custom_provider_aliases,
@@ -507,6 +511,20 @@ def _session_model_config(agent: Any) -> dict[str, Any]:
     return copy.deepcopy(stored) if isinstance(stored, dict) else config
 
 
+_SESSION_ROUTE_FIELDS = (
+    "model_config",
+    "model",
+    "system_prompt",
+    "billing_provider",
+    "billing_base_url",
+    "billing_mode",
+)
+
+
+def _session_route_state(row: Optional[dict]) -> Optional[tuple]:
+    return None if row is None else tuple(row.get(key) for key in _SESSION_ROUTE_FIELDS)
+
+
 def _persist_session_model_config(
     agent: Any,
     config: dict[str, Any],
@@ -521,14 +539,39 @@ def _persist_session_model_config(
     if session_db is not None and session_id:
         publish = getattr(session_db, "publish_session_route", None)
         if callable(publish) and result is not None:
-            publish(
-                session_id,
-                model_config_json=json.dumps(config, sort_keys=True),
-                model=model,
-                system_prompt=system_prompt,
-                billing_provider=result.target_provider,
-                billing_base_url=result.base_url,
-                billing_mode=result.api_mode,
+            config_json = json.dumps(config, sort_keys=True)
+            intended = (
+                config_json,
+                model,
+                system_prompt,
+                result.target_provider,
+                result.base_url,
+                result.api_mode,
+            )
+            get_session = getattr(session_db, "get_session", None)
+            if callable(get_session):
+                preimage = _session_route_state(get_session(session_id))
+                readback = lambda: _session_route_state(get_session(session_id))
+            else:
+                preimage = object()
+
+                def readback():
+                    raise RuntimeError("session route authority readback unavailable")
+
+            reconcile_authoritative_write(
+                write=lambda: publish(
+                    session_id,
+                    model_config_json=config_json,
+                    model=model,
+                    system_prompt=system_prompt,
+                    billing_provider=result.target_provider,
+                    billing_base_url=result.base_url,
+                    billing_mode=result.api_mode,
+                ),
+                readback=readback,
+                intended=intended,
+                preimage=preimage,
+                label="session route authority",
             )
         else:
             session_db.update_session_meta(
@@ -807,20 +850,28 @@ def model_switch_after_compression_transaction(
         except Exception as exc:
             restore_model_runtime_for_rollback(agent, runtime_snapshot)
             setattr(agent, "_session_init_model_config", old_config)
-            try:
-                _restore_durable_session_route(durable_snapshot)
-            except Exception:
-                logger.exception("deferred model-switch durable rollback failed")
-            transaction.status = "failed"
+            if getattr(transaction, "authority_publication_in_flight", False):
+                indeterminate = isinstance(exc, AuthorityWriteIndeterminateError)
+                transaction.status = "blocked" if indeterminate else "failed"
+                description = (
+                    "blocked by indeterminate durable publication"
+                    if indeterminate
+                    else "failed before durable commit; previous route retained"
+                )
+            else:
+                try:
+                    _restore_durable_session_route(durable_snapshot)
+                except Exception:
+                    logger.exception("deferred model-switch durable rollback failed")
+                transaction.status = "failed"
+                description = "failed; restored previous route"
             agent._model_switch_after_compression_state = {
-                "state": "failed",
+                "state": transaction.status,
                 "model": result.new_model,
                 "provider": result.target_provider,
             }
             _emit_deferred_model_switch_status(
-                agent,
-                "Deferred model switch failed after compression; "
-                f"still using {old_model}: {exc}",
+                agent, f"Deferred model switch {description}: {exc}"
             )
             raise
 
@@ -860,6 +911,10 @@ def apply_model_switch_after_compression(
                 if callable(build_prompt):
                     prompt = build_prompt(system_message)
                     agent._cached_system_prompt = prompt
+                session_db = getattr(agent, "_session_db", None)
+                transaction.authority_publication_in_flight = callable(
+                    getattr(session_db, "publish_session_route", None)
+                )
                 _persist_session_model_config(
                     agent,
                     transaction.model_config or {},
@@ -867,6 +922,7 @@ def apply_model_switch_after_compression(
                     system_prompt=prompt,
                     result=result,
                 )
+                transaction.authority_publication_in_flight = False
     except Exception:
         return "failed"
     return transaction.status

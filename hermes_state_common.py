@@ -152,6 +152,35 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
     )
 
 
+class AuthorityWriteIndeterminateError(RuntimeError):
+    """The durable outcome of an authority write could not be proven."""
+
+
+def reconcile_authoritative_write(*, write, readback, intended, preimage, label):
+    """Run an authority write and resolve post-error commit ambiguity exactly."""
+    try:
+        write()
+    except Exception as write_error:  # noqa: BLE001 - authority failures vary by backend
+        try:
+            authority = readback()
+        except Exception as readback_error:  # noqa: BLE001
+            raise AuthorityWriteIndeterminateError(
+                f"{label} write outcome indeterminate: "
+                f"{type(write_error).__name__}: {write_error}; "
+                "authority readback failed: "
+                f"{type(readback_error).__name__}: {readback_error}"
+            ) from readback_error
+        if authority == intended:
+            return "commit-confirmed"
+        if authority == preimage:
+            raise
+        raise AuthorityWriteIndeterminateError(
+            f"{label} write outcome indeterminate: authority differs from "
+            "both intended state and exact preimage"
+        ) from write_error
+    return "committed"
+
+
 SCHEMA_VERSION = 25
 
 

@@ -86,6 +86,35 @@ def test_override_persists_and_survives_restart(store_factory, tmp_path):
     }
 
 
+def test_override_save_failure_restores_memory_and_disk(
+    store_factory, tmp_path, monkeypatch
+):
+    store = store_factory()
+    entry = store.get_or_create_session(_make_source())
+    store.set_model_override(entry.session_key, OVERRIDE)
+    real_save = store._save
+    calls = 0
+
+    def fail_after_first_write():
+        nonlocal calls
+        calls += 1
+        real_save()
+        if calls == 1:
+            raise OSError("injected post-write mirror failure")
+
+    monkeypatch.setattr(store, "_save", fail_after_first_write)
+    with pytest.raises(OSError, match="post-write mirror failure"):
+        store.set_model_override(
+            entry.session_key,
+            {"model": "replacement", "provider": "anthropic"},
+        )
+
+    assert store.get_model_override(entry.session_key) == sanitize_model_override(OVERRIDE)
+    assert store_factory().get_model_override(entry.session_key) == sanitize_model_override(
+        OVERRIDE
+    )
+
+
 def _make_runner(store):
     from gateway.run import GatewayRunner
 
@@ -133,3 +162,174 @@ def test_sanitize_model_override():
         "provider": "openai",
         "base_url": "https://api.openai.example/v1",
     }
+
+
+def test_primary_db_write_failure_keeps_memory_and_legacy_mirror(tmp_path, monkeypatch):
+    """state.db primary failure must not advance memory or sessions.json."""
+    from hermes_state import SessionDB
+
+    store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+    assert store._db is not None
+    entry = store.get_or_create_session(_make_source())
+    store.set_model_override(entry.session_key, OVERRIDE)
+
+    calls = 0
+
+    def fail_primary(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise OSError("injected primary routing write failure")
+
+    monkeypatch.setattr(store._db, "replace_gateway_routing_entries", fail_primary)
+    with pytest.raises(OSError, match="primary routing write failure"):
+        store.set_model_override(
+            entry.session_key,
+            {"model": "replacement", "provider": "anthropic"},
+        )
+
+    assert store.get_model_override(entry.session_key) == sanitize_model_override(OVERRIDE)
+    assert calls == 1
+    raw = json.loads((tmp_path / "sessions.json").read_text(encoding="utf-8"))
+    assert raw[entry.session_key]["model_override"]["model"] == "gpt-5o"
+    restarted = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+    assert restarted.get_model_override(entry.session_key) == sanitize_model_override(
+        OVERRIDE
+    )
+
+
+def test_primary_db_success_survives_legacy_mirror_failure(tmp_path, monkeypatch):
+    """Legacy mirror failure after state.db success must keep the new override."""
+    store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+    entry = store.get_or_create_session(_make_source())
+    store.set_model_override(entry.session_key, OVERRIDE)
+    real_json = store._save_sessions_json
+
+    def fail_mirror(data):
+        real_json(data)
+        raise OSError("injected legacy mirror failure")
+
+    monkeypatch.setattr(store, "_save_sessions_json", fail_mirror)
+    store.set_model_override(
+        entry.session_key,
+        {"model": "replacement", "provider": "anthropic"},
+    )
+
+    assert store.get_model_override(entry.session_key) == {
+        "model": "replacement",
+        "provider": "anthropic",
+    }
+    restarted = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+    assert restarted.get_model_override(entry.session_key) == {
+        "model": "replacement",
+        "provider": "anthropic",
+    }
+
+
+def test_post_commit_db_error_commits_override_forward(tmp_path, monkeypatch):
+    store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+    entry = store.get_or_create_session(_make_source())
+    store.set_model_override(entry.session_key, OVERRIDE)
+    real_replace = store._db.replace_gateway_routing_entries
+    calls = 0
+
+    def commit_then_raise(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        real_replace(*args, **kwargs)
+        raise OSError("injected post-commit primary failure")
+
+    monkeypatch.setattr(store._db, "replace_gateway_routing_entries", commit_then_raise)
+    target = {"model": "replacement", "provider": "anthropic"}
+
+    store.set_model_override(entry.session_key, target)
+
+    assert calls == 1
+    assert store.get_model_override(entry.session_key) == target
+    raw = json.loads((tmp_path / "sessions.json").read_text(encoding="utf-8"))
+    assert raw[entry.session_key]["model_override"] == target
+    assert SessionStore(
+        sessions_dir=tmp_path, config=GatewayConfig()
+    ).get_model_override(entry.session_key) == target
+
+
+@pytest.mark.parametrize("interrupt_type", [KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("committed", [True, False], ids=["target", "preimage"])
+def test_authority_baseexception_converges_memory_db_and_legacy_then_rethrows(
+    tmp_path,
+    monkeypatch,
+    interrupt_type,
+    committed,
+):
+    store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+    store._write_sessions_json = True
+    entry = store.get_or_create_session(_make_source())
+    store.set_model_override(entry.session_key, OVERRIDE)
+    real_replace = store._db.replace_gateway_routing_entries
+    interrupt = interrupt_type("injected authority interruption")
+    calls = 0
+
+    def interrupted_replace(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if committed:
+            real_replace(*args, **kwargs)
+        raise interrupt
+
+    monkeypatch.setattr(
+        store._db,
+        "replace_gateway_routing_entries",
+        interrupted_replace,
+    )
+    target = {"model": "replacement", "provider": "anthropic"}
+
+    with pytest.raises(interrupt_type) as caught:
+        store.set_model_override(entry.session_key, target)
+
+    assert caught.value is interrupt
+    assert calls == 1
+    expected = target if committed else sanitize_model_override(OVERRIDE)
+    assert store.get_model_override(entry.session_key) == expected
+    raw = json.loads((tmp_path / "sessions.json").read_text(encoding="utf-8"))
+    assert raw[entry.session_key]["model_override"] == expected
+    assert SessionStore(
+        sessions_dir=tmp_path,
+        config=GatewayConfig(),
+    ).get_model_override(entry.session_key) == expected
+
+
+@pytest.mark.parametrize("readback", ["unavailable", "third-state"])
+def test_indeterminate_db_write_is_explicit_and_does_not_compensate(
+    tmp_path, monkeypatch, readback
+):
+    store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+    entry = store.get_or_create_session(_make_source())
+    store.set_model_override(entry.session_key, OVERRIDE)
+    real_load = store._db.load_gateway_routing_entries
+    reads = 0
+    writes = 0
+
+    def fail_before_commit(*_args, **_kwargs):
+        nonlocal writes
+        writes += 1
+        raise OSError("injected primary routing write failure")
+
+    def uncertain_readback(*args, **kwargs):
+        nonlocal reads
+        reads += 1
+        if reads == 1:
+            return real_load(*args, **kwargs)
+        if readback == "unavailable":
+            raise OSError("injected authority readback failure")
+        return {"third-party": "{}"}
+
+    monkeypatch.setattr(store._db, "replace_gateway_routing_entries", fail_before_commit)
+    monkeypatch.setattr(store._db, "load_gateway_routing_entries", uncertain_readback)
+
+    with pytest.raises(RuntimeError, match="indeterminate"):
+        store.set_model_override(
+            entry.session_key,
+            {"model": "replacement", "provider": "anthropic"},
+        )
+
+    assert writes == 1
+    assert store.get_model_override(entry.session_key) == sanitize_model_override(OVERRIDE)

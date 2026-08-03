@@ -562,6 +562,111 @@ async def test_session_hygiene_timeout_continues_to_agent_and_sets_cooldown(monk
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("marker_attached", [False, True], ids=["direct", "marker-attached"])
+async def test_session_hygiene_authority_indeterminate_finalizer_aborts_after_cleanup(
+    monkeypatch, tmp_path, marker_attached
+):
+    """Authority uncertainty aborts the turn but never skips helper cleanup."""
+    from hermes_state_common import (
+        AUTHORITY_WRITE_INDETERMINATE_ATTR,
+        AuthorityWriteIndeterminateError,
+    )
+
+    class FinalizerAgent:
+        last_instance = None
+
+        def __init__(self, **kwargs):
+            self.session_id = kwargs["session_id"]
+            self._last_compaction_in_place = False
+            self.context_compressor = SimpleNamespace(
+                bind_session_state=MagicMock(),
+                _last_compress_aborted=False,
+                _last_aux_model_failure_model=None,
+            )
+            self.shutdown_memory_provider = MagicMock()
+            self.close = MagicMock()
+            self.pending = object()
+            type(self).last_instance = self
+
+        def _compress_context(self, messages, *_args, **_kwargs):
+            return (messages, None)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = FinalizerAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+    gateway_run = importlib.import_module("gateway.run")
+    GatewayRunner = gateway_run.GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")}
+    )
+    runner.adapters = {Platform.TELEGRAM: HygieneCaptureAdapter()}
+    runner._voice_mode = {}
+    runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
+    runner.session_store = MagicMock()
+    runner.session_store.get_or_create_session.return_value = SessionEntry(
+        session_key="agent:main:telegram:dm:12345",
+        session_id="sess-authority",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner.session_store.load_transcript.return_value = _make_history(6, content_size=400)
+    runner.session_store.has_any_sessions.return_value = True
+    runner.session_store.append_to_transcript = MagicMock()
+    runner._running_agents = {}
+    runner._pending_messages = {}
+    runner._pending_approvals = {}
+    runner._session_db = None
+    runner._is_user_authorized = lambda _source: True
+    runner._set_session_env = lambda _context: None
+    runner._run_agent = AsyncMock()
+    runner._attach_model_switch_after_compression = MagicMock()
+    runner._evict_cached_agent = MagicMock()
+    runner._cleanup_agent_resources_off_loop = AsyncMock()
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"})
+    monkeypatch.setattr("agent.model_metadata.get_model_context_length", lambda *_a, **_kw: 100)
+    if marker_attached:
+        failure = RuntimeError("authority carrier")
+        setattr(
+            failure,
+            AUTHORITY_WRITE_INDETERMINATE_ATTR,
+            AuthorityWriteIndeterminateError("authority indeterminate"),
+        )
+    else:
+        failure = AuthorityWriteIndeterminateError("authority indeterminate")
+
+    def fail_finalizer(agent, *, committed):
+        assert agent.pending is FinalizerAgent.last_instance.pending
+        raise failure
+
+    monkeypatch.setattr(
+        "agent.conversation_compression.finalize_context_engine_compression_notification",
+        fail_finalizer,
+    )
+    event = MessageEvent(
+        text="hello",
+        source=SessionSource(
+            platform=Platform.TELEGRAM, chat_id="12345", chat_type="dm", user_id="12345"
+        ),
+        message_id="1",
+    )
+
+    with pytest.raises(type(failure), match="authority"):
+        await runner._handle_message(event)
+
+    runner._run_agent.assert_not_awaited()
+    runner._evict_cached_agent.assert_called_once_with("agent:main:telegram:dm:12345")
+    runner._cleanup_agent_resources_off_loop.assert_awaited_once_with(
+        FinalizerAgent.last_instance, context="session hygiene"
+    )
+
+
+@pytest.mark.asyncio
 async def test_session_hygiene_forces_in_place_compaction_with_bound_session_db(
     monkeypatch, tmp_path
 ):

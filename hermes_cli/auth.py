@@ -51,7 +51,7 @@ from hermes_cli.config import (
 )
 from hermes_constants import OPENROUTER_BASE_URL, secure_parent_dir
 from agent.credential_persistence import sanitize_borrowed_credential_payload
-from utils import atomic_replace, atomic_yaml_write, env_float, is_truthy_value
+from utils import atomic_replace, atomic_yaml_write, env_float, env_int, is_truthy_value
 
 logger = logging.getLogger(__name__)
 
@@ -585,11 +585,16 @@ def has_usable_secret(value: Any, *, min_length: int = 4) -> bool:
 
 
 def _resolve_api_key_provider_secret(
-    provider_id: str, pconfig: ProviderConfig
+    provider_id: str,
+    pconfig: ProviderConfig,
+    *,
+    allow_network: bool = True,
 ) -> tuple[str, str]:
     """Resolve an API-key provider's token and indicate where it came from."""
     if provider_id == "copilot":
         # Use the dedicated copilot auth module for proper token validation
+        if not allow_network:
+            return "", ""
         try:
             from hermes_cli.copilot_auth import resolve_copilot_token, get_copilot_api_token
             token, source = resolve_copilot_token()
@@ -614,7 +619,8 @@ def _resolve_api_key_provider_secret(
     # Fallback: try credential pool (e.g. zai key stored via auth.json)
     try:
         from agent.credential_pool import load_pool
-        pool = load_pool(provider_id)
+        pool_kwargs: Dict[str, Any] = {} if allow_network else {"read_only": True}
+        pool = load_pool(provider_id, **pool_kwargs)
         if pool and pool.has_credentials():
             entry = pool.peek()
             if entry:
@@ -955,7 +961,7 @@ def _global_auth_file_path() -> Optional[Path]:
     return global_root / "auth.json"
 
 
-def _load_global_auth_store() -> Dict[str, Any]:
+def _load_global_auth_store(*, read_only: bool = False) -> Dict[str, Any]:
     """Load the global-root auth store (read-only fallback).
 
     Returns an empty dict when no global fallback exists (classic mode,
@@ -984,7 +990,7 @@ def _load_global_auth_store() -> Dict[str, Any]:
             except Exception:
                 pass
     try:
-        return _load_auth_store(global_path)
+        return _load_auth_store(global_path, read_only=read_only)
     except Exception:
         # A malformed global store must not break profile reads. The
         # profile's own auth store is still authoritative.
@@ -1117,7 +1123,11 @@ def _auth_store_lock(
         yield
 
 
-def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
+def _load_auth_store(
+    auth_file: Optional[Path] = None,
+    *,
+    read_only: bool = False,
+) -> Dict[str, Any]:
     auth_file = auth_file or _auth_file_path()
     if not auth_file.exists():
         return {"version": AUTH_STORE_VERSION, "providers": {}}
@@ -1125,6 +1135,12 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
     try:
         raw = json.loads(auth_file.read_text(encoding="utf-8"))
     except Exception as exc:
+        if read_only:
+            logger.warning(
+                "auth: failed to parse %s (%s) — read-only path returns empty store",
+                auth_file, exc,
+            )
+            return {"version": AUTH_STORE_VERSION, "providers": {}}
         corrupt_path = auth_file.with_suffix(".json.corrupt")
         try:
             import shutil
@@ -1216,6 +1232,7 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
 def _load_provider_state_with_source(
     auth_store: Dict[str, Any],
     provider_id: str,
+    read_only: bool = False,
 ) -> tuple[Optional[Dict[str, Any]], Optional[Path]]:
     """Return a provider state plus the auth.json path it came from.
 
@@ -1233,7 +1250,7 @@ def _load_provider_state_with_source(
             return dict(state), _auth_file_path()
 
     global_path = _global_auth_file_path()
-    global_store = _load_global_auth_store()
+    global_store = _load_global_auth_store(read_only=read_only)
     if global_store:
         global_providers = global_store.get("providers")
         if isinstance(global_providers, dict):
@@ -1274,7 +1291,11 @@ def _provider_state_transaction(provider_id: str):
             yield auth_store, source_state, source_path
 
 
-def _load_provider_state(auth_store: Dict[str, Any], provider_id: str) -> Optional[Dict[str, Any]]:
+def _load_provider_state(
+    auth_store: Dict[str, Any],
+    provider_id: str,
+    read_only: bool = False,
+) -> Optional[Dict[str, Any]]:
     """Return a provider's persisted state.
 
     In profile mode, falls back to the global-root ``auth.json`` when the
@@ -1285,7 +1306,9 @@ def _load_provider_state(auth_store: Dict[str, Any], provider_id: str) -> Option
     the profile, the profile state fully shadows the global state on the next
     read. See issue #18594 follow-up.
     """
-    state, _source_path = _load_provider_state_with_source(auth_store, provider_id)
+    state, _source_path = _load_provider_state_with_source(
+        auth_store, provider_id, read_only=read_only
+    )
     return state
 
 
@@ -1411,7 +1434,11 @@ def is_runtime_provider_routable(provider_id: str) -> bool:
     return True
 
 
-def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
+def read_credential_pool(
+    provider_id: Optional[str] = None,
+    *,
+    read_only: bool = False,
+) -> Dict[str, Any]:
     """Return the persisted credential pool, or one provider slice.
 
     In profile mode, the profile's credential pool is authoritative. If a
@@ -1427,13 +1454,13 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
     Writes always go to the profile (``write_credential_pool`` is unchanged).
     See issue #18594 follow-up.
     """
-    auth_store = _load_auth_store()
+    auth_store = _load_auth_store(read_only=read_only)
     pool = auth_store.get("credential_pool")
     if not isinstance(pool, dict):
         pool = {}
 
     global_pool: Dict[str, Any] = {}
-    global_store = _load_global_auth_store()
+    global_store = _load_global_auth_store(read_only=read_only)
     maybe_global_pool = global_store.get("credential_pool") if global_store else None
     if isinstance(maybe_global_pool, dict):
         global_pool = maybe_global_pool
@@ -1635,7 +1662,11 @@ def unsuppress_credential_source(provider_id: str, source: str) -> bool:
         return True
 
 
-def get_provider_auth_state(provider_id: str) -> Optional[Dict[str, Any]]:
+def get_provider_auth_state(
+    provider_id: str,
+    *,
+    read_only: bool = False,
+) -> Optional[Dict[str, Any]]:
     """Return persisted auth state for a provider, or None.
 
     In profile mode, ``_load_provider_state`` already falls back to the
@@ -1648,8 +1679,8 @@ def get_provider_auth_state(provider_id: str) -> Optional[Dict[str, Any]]:
     global-scope provider state (e.g. a globally-authenticated Anthropic
     OAuth or Nous device-code session). See issue #18594 follow-up.
     """
-    auth_store = _load_auth_store()
-    return _load_provider_state(auth_store, provider_id)
+    auth_store = _load_auth_store(read_only=read_only)
+    return _load_provider_state(auth_store, provider_id, read_only=read_only)
 
 
 def get_active_provider() -> Optional[str]:
@@ -2590,6 +2621,8 @@ def resolve_qwen_runtime_credentials(
     force_refresh: bool = False,
     refresh_if_expiring: bool = True,
     refresh_skew_seconds: int = QWEN_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
+    allow_network: bool = True,
+    read_only: bool = False,
 ) -> Dict[str, Any]:
     tokens = _read_qwen_cli_tokens()
     access_token = str(tokens.get("access_token", "") or "").strip()
@@ -2597,6 +2630,12 @@ def resolve_qwen_runtime_credentials(
     if not should_refresh and refresh_if_expiring:
         should_refresh = _qwen_access_token_is_expiring(tokens.get("expiry_date"), refresh_skew_seconds)
     if should_refresh:
+        if not allow_network:
+            raise AuthError(
+                "Qwen OAuth access token requires refresh; deferred model switching is local-only.",
+                provider="qwen-oauth",
+                code="qwen_refresh_required",
+            )
         tokens = _refresh_qwen_cli_tokens(tokens)
         access_token = str(tokens.get("access_token", "") or "").strip()
     if not access_token:
@@ -3442,7 +3481,9 @@ def _print_loopback_ssh_hint(redirect_uri: str, *, docs_url: str | None = None) 
 # where one app's refresh invalidates the other's session.
 # =============================================================================
 
-def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
+def _read_codex_tokens(
+    *, _lock: bool = True, read_only: bool = False
+) -> Dict[str, Any]:
     """Read Codex OAuth tokens from Hermes auth store (~/.hermes/auth.json).
     
     Returns dict with 'tokens' (access_token, refresh_token) and 'last_refresh'.
@@ -3450,10 +3491,12 @@ def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
     """
     if _lock:
         with _auth_store_lock():
-            auth_store = _load_auth_store()
+            auth_store = _load_auth_store(read_only=read_only)
     else:
-        auth_store = _load_auth_store()
-    state = _load_provider_state(auth_store, "openai-codex")
+        auth_store = _load_auth_store(read_only=read_only)
+    state = _load_provider_state(
+        auth_store, "openai-codex", read_only=read_only
+    )
     if not state:
         raise AuthError(
             "No Codex credentials stored. Run `hermes auth` to authenticate.",
@@ -3853,6 +3896,8 @@ def resolve_codex_runtime_credentials(
     force_refresh: bool = False,
     refresh_if_expiring: bool = True,
     refresh_skew_seconds: int = CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
+    allow_network: bool = True,
+    read_only: bool = False,
 ) -> Dict[str, Any]:
     """Resolve runtime credentials from Hermes's own Codex token store.
 
@@ -3865,12 +3910,13 @@ def resolve_codex_runtime_credentials(
     HTTP 401 ``Missing Authentication header`` from the wire instead of a usable
     credential. See issue #32992.
     """
+    read_only = read_only or not allow_network
     read_error: Optional[AuthError] = None
     try:
-        data = _read_codex_tokens()
+        data = _read_codex_tokens(read_only=read_only)
     except AuthError as exc:
         read_error = exc
-        if getattr(exc, "relogin_required", False) and getattr(exc, "code", None) in {
+        if allow_network and getattr(exc, "relogin_required", False) and getattr(exc, "code", None) in {
             "codex_auth_missing_access_token",
             "codex_auth_missing_refresh_token",
             "codex_auth_invalid_shape",
@@ -3884,6 +3930,15 @@ def resolve_codex_runtime_credentials(
             data = None
 
     if data is None:
+        if not allow_network:
+            if read_error is not None:
+                raise read_error
+            raise AuthError(
+                "No locally usable Codex credentials are cached.",
+                provider="openai-codex",
+                code="codex_auth_missing",
+                relogin_required=True,
+            )
         pool_token = _pool_codex_access_token()
         if pool_token:
             base_url = (
@@ -3963,6 +4018,12 @@ def resolve_codex_runtime_credentials(
     if (not should_refresh) and refresh_if_expiring:
         should_refresh = _codex_access_token_is_expiring(access_token, refresh_skew_seconds)
     if should_refresh:
+        if not allow_network:
+            raise AuthError(
+                "Codex access token requires refresh; deferred model switching is local-only.",
+                provider="openai-codex",
+                code="codex_refresh_required",
+            )
         # Re-read under lock to avoid racing with other Hermes processes
         with _auth_store_lock(timeout_seconds=max(float(AUTH_LOCK_TIMEOUT_SECONDS), refresh_timeout_seconds + 5.0)):
             data = _read_codex_tokens(_lock=False)
@@ -4295,9 +4356,11 @@ def _pool_codex_access_token() -> str:
 # xAI Grok OAuth — tokens stored in ~/.hermes/auth.json
 # =============================================================================
 
-def _xai_oauth_state_from_store(auth_store: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def _xai_oauth_state_from_store(
+    auth_store: Dict[str, Any], *, read_only: bool = False
+) -> Optional[Dict[str, Any]]:
     """Return usable xAI OAuth state from provider state or credential pool."""
-    state = _load_provider_state(auth_store, "xai-oauth")
+    state = _load_provider_state(auth_store, "xai-oauth", read_only=read_only)
     tokens = state.get("tokens") if isinstance(state, dict) else None
     if isinstance(tokens, dict):
         access_token = str(tokens.get("access_token", "") or "").strip()
@@ -4342,15 +4405,19 @@ def _xai_oauth_state_has_usable_tokens(state: Optional[Dict[str, Any]]) -> bool:
     )
 
 
-def _read_xai_oauth_tokens(*, _lock: bool = True) -> Dict[str, Any]:
+def _read_xai_oauth_tokens(
+    *, _lock: bool = True, read_only: bool = False
+) -> Dict[str, Any]:
     if _lock:
         with _auth_store_lock():
-            auth_store = _load_auth_store()
+            auth_store = _load_auth_store(read_only=True) if read_only else _load_auth_store()
     else:
-        auth_store = _load_auth_store()
-    state = _xai_oauth_state_from_store(auth_store)
+        auth_store = _load_auth_store(read_only=True) if read_only else _load_auth_store()
+    state = _xai_oauth_state_from_store(auth_store, read_only=read_only)
     if not _xai_oauth_state_has_usable_tokens(state):
-        global_state = _xai_oauth_state_from_store(_load_global_auth_store())
+        global_state = _xai_oauth_state_from_store(
+            _load_global_auth_store(read_only=read_only), read_only=read_only
+        )
         if _xai_oauth_state_has_usable_tokens(global_state):
             state = global_state
     if not state:
@@ -4832,8 +4899,11 @@ def resolve_xai_oauth_runtime_credentials(
     force_refresh: bool = False,
     refresh_if_expiring: bool = True,
     refresh_skew_seconds: Optional[int] = None,
+    allow_network: bool = True,
+    read_only: bool = False,
 ) -> Dict[str, Any]:
-    data = _read_xai_oauth_tokens()
+    read_only = read_only or not allow_network
+    data = _read_xai_oauth_tokens(read_only=read_only)
     tokens = dict(data["tokens"])
     access_token = str(tokens.get("access_token", "") or "").strip()
     refresh_timeout_seconds = env_float("HERMES_XAI_REFRESH_TIMEOUT_SECONDS", 20)
@@ -4850,6 +4920,12 @@ def resolve_xai_oauth_runtime_credentials(
     if (not should_refresh) and refresh_if_expiring:
         should_refresh = _xai_access_token_is_expiring(access_token, effective_skew)
     if should_refresh:
+        if not allow_network:
+            raise AuthError(
+                "xAI OAuth access token requires refresh; deferred model switching is local-only.",
+                provider="xai-oauth",
+                code="xai_refresh_required",
+            )
         with _auth_store_lock(timeout_seconds=max(float(AUTH_LOCK_TIMEOUT_SECONDS), refresh_timeout_seconds + 5.0)):
             data = _read_xai_oauth_tokens(_lock=False)
             tokens = dict(data["tokens"])
@@ -6000,6 +6076,8 @@ def resolve_nous_runtime_credentials(
     insecure: Optional[bool] = None,
     ca_bundle: Optional[str] = None,
     force_refresh: bool = False,
+    allow_network: bool = True,
+    read_only: bool = False,
 ) -> Dict[str, Any]:
     """
     Resolve Nous inference credentials for runtime use.
@@ -6010,6 +6088,29 @@ def resolve_nous_runtime_credentials(
     Returns dict with: provider, base_url, api_key, key_id, expires_at,
     expires_in, source ("invoke_jwt"), and auth_path.
     """
+    read_only = read_only or not allow_network
+    if not allow_network:
+        state = get_provider_auth_state("nous", read_only=read_only) or {}
+        min_ttl = max(60, env_int("HERMES_NOUS_MIN_KEY_TTL_SECONDS", 1800))
+        if not _agent_key_is_usable(state, min_ttl):
+            raise AuthError(
+                "Nous inference token requires refresh; deferred model switching is local-only.",
+                provider="nous",
+                code="nous_refresh_required",
+            )
+        return {
+            "provider": "nous",
+            "base_url": (
+                _nous_inference_env_override()
+                or str(state.get("inference_base_url") or DEFAULT_NOUS_INFERENCE_URL)
+            ).rstrip("/"),
+            "api_key": str(state.get("agent_key") or "").strip(),
+            "key_id": state.get("agent_key_id") or state.get("key_id"),
+            "expires_at": state.get("agent_key_expires_at") or state.get("expires_at"),
+            "source": "cached_invoke_jwt",
+            "auth_path": str(_auth_file_path()),
+        }
+
     sequence_id = uuid.uuid4().hex[:12]
 
     with _provider_state_transaction("nous") as (
@@ -6932,7 +7033,11 @@ def _get_azure_foundry_auth_status() -> Dict[str, Any]:
     return info
 
 
-def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
+def resolve_api_key_provider_credentials(
+    provider_id: str,
+    *,
+    allow_network: bool = True,
+) -> Dict[str, Any]:
     """Resolve API key and base URL for an API-key provider.
 
     Returns dict with: provider, api_key, base_url, source.
@@ -6947,7 +7052,11 @@ def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
 
     api_key = ""
     key_source = ""
-    api_key, key_source = _resolve_api_key_provider_secret(provider_id, pconfig)
+    api_key, key_source = _resolve_api_key_provider_secret(
+        provider_id,
+        pconfig,
+        **({} if allow_network else {"allow_network": False}),
+    )
 
     # No-auth LM Studio: substitute a placeholder so runtime / auxiliary_client
     # see the local server as configured. doctor still reports unconfigured
@@ -6977,7 +7086,7 @@ def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
                 get_copilot_api_token,
             )
             raw_token, _ = resolve_copilot_token()
-            if raw_token:
+            if raw_token and allow_network:
                 _, resolved = get_copilot_api_token(raw_token)
                 resolved = (resolved or "").strip()
                 if resolved:
@@ -8416,6 +8525,8 @@ def build_minimax_oauth_token_provider() -> Callable[[], str]:
 def resolve_minimax_oauth_runtime_credentials(
     *, min_token_ttl_seconds: int = MINIMAX_OAUTH_REFRESH_SKEW_SECONDS,
     as_token_provider: bool = False,
+    allow_network: bool = True,
+    read_only: bool = False,
 ) -> Dict[str, Any]:
     """Return {provider, api_key, base_url, source} for minimax-oauth.
 
@@ -8430,18 +8541,31 @@ def resolve_minimax_oauth_runtime_credentials(
     diagnostic call sites like ``hermes status`` that just want to know
     whether a valid token exists right now.
     """
-    state = get_provider_auth_state("minimax-oauth")
+    read_only = read_only or not allow_network
+    state = get_provider_auth_state("minimax-oauth", read_only=read_only)
     if not state or not state.get("access_token"):
         raise AuthError(
             "Not logged into MiniMax OAuth. Run `hermes model` and select "
             "MiniMax (OAuth).",
             provider="minimax-oauth", code="not_logged_in", relogin_required=True,
         )
-    try:
-        state = _refresh_minimax_oauth_state(state)
-    except AuthError as exc:
-        _minimax_oauth_quarantine_on_terminal_refresh(state, exc)
-        raise
+    if allow_network:
+        try:
+            state = _refresh_minimax_oauth_state(state)
+        except AuthError as exc:
+            _minimax_oauth_quarantine_on_terminal_refresh(state, exc)
+            raise
+    else:
+        try:
+            expires_at = datetime.fromisoformat(str(state.get("expires_at") or ""))
+            if expires_at.timestamp() <= time.time() + max(0, min_token_ttl_seconds):
+                raise ValueError
+        except (TypeError, ValueError):
+            raise AuthError(
+                "MiniMax OAuth access token requires refresh; deferred model switching is local-only.",
+                provider="minimax-oauth",
+                code="minimax_refresh_required",
+            ) from None
     if as_token_provider:
         api_key: Any = build_minimax_oauth_token_provider()
     else:

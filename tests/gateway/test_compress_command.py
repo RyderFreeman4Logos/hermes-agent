@@ -103,6 +103,93 @@ async def test_compress_command_works_when_auto_compaction_disabled():
 
 
 @pytest.mark.asyncio
+async def test_outer_transcript_mirror_failure_reconciles_committed_child(
+    tmp_path,
+):
+    from hermes_cli.model_switch import (
+        ModelSwitchResult,
+        get_model_switch_after_compression,
+        schedule_model_switch_after_compression,
+    )
+    from hermes_state import AsyncSessionDB, SessionDB
+    from tests.run_agent.test_compression_boundary_hook import (
+        TestCompressionBoundaryHook,
+    )
+
+    history = [{"role": "user", "content": f"m{i}"} for i in range(10)]
+    runner = _make_runner(history)
+    db = SessionDB(db_path=tmp_path / "gateway-outer-write.db")
+    agent = TestCompressionBoundaryHook()._make_agent(db)
+    agent._ensure_db_session()
+    compressor = MagicMock()
+    compressor.compress.return_value = [
+        {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
+        {"role": "user", "content": "tail question"},
+    ]
+    compressor.compression_count = 1
+    compressor.last_prompt_tokens = 0
+    compressor.last_completion_tokens = 0
+    compressor._last_summary_error = None
+    compressor._last_compress_aborted = False
+    compressor.has_content_to_compress.return_value = True
+    agent.context_compressor = compressor
+
+    def switch_model(model, provider, api_key="", base_url="", api_mode=""):
+        agent.model = model
+        agent.provider = provider
+        agent.api_key = api_key
+        agent.base_url = base_url
+        agent.api_mode = api_mode
+
+    agent.switch_model = switch_model
+    pending = ModelSwitchResult(
+        success=True,
+        new_model="next-model",
+        target_provider="anthropic",
+        api_key="next-key",
+        base_url="https://api.anthropic.com",
+        api_mode="anthropic_messages",
+    )
+    session_entry = runner.session_store.get_or_create_session.return_value
+    session_entry.session_id = agent.session_id
+    session_key = session_entry.session_key
+    runner._session_db = AsyncSessionDB(db)
+    runner._after_compression_model_switches = {session_key: pending}
+
+    def advance(_key, expected_session_id, target_session_id):
+        assert session_entry.session_id == expected_session_id
+        session_entry.session_id = target_session_id
+        return session_entry
+
+    runner.session_store.advance_compression_session.side_effect = advance
+    runner.session_store.rewrite_transcript.side_effect = OSError(
+        "obsolete outer mirror must not own the committed boundary"
+    )
+
+    try:
+        with (
+            patch(
+                "gateway.run._resolve_runtime_agent_kwargs",
+                return_value={"api_key": "test-key"},
+            ),
+            patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+            patch("run_agent.AIAgent", return_value=agent),
+        ):
+            result = await runner._handle_compress_command(_make_event())
+
+        assert "Compressed:" in result
+        assert session_entry.session_id == agent.session_id
+        assert session_entry.session_id != "original-session"
+        assert db.get_session("original-session")["end_reason"] == "compression"
+        assert db.get_session(agent.session_id)["model"] == "next-model"
+        assert agent.model == "next-model"
+        assert get_model_switch_after_compression(agent) is None
+        assert session_key not in runner._after_compression_model_switches
+        runner.session_store.rewrite_transcript.assert_not_called()
+    finally:
+        db.close()
+
+@pytest.mark.asyncio
 async def test_compress_command_surfaces_aux_model_failure_even_when_recovered():
     """When the user's configured ``auxiliary.compression.model`` errors out
     but compression recovers by retrying on the main model, /compress must

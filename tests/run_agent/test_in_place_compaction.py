@@ -124,6 +124,91 @@ class TestInPlaceCompaction:
             # Live transcript actually shrank.
             assert len(compressed) == 2
 
+    def test_in_place_reconciles_route_after_committed_history(self):
+        import json
+
+        from agent.conversation_compression import compress_context
+        from hermes_cli.model_switch import (
+            ModelSwitchResult,
+            get_model_switch_after_compression,
+            schedule_model_switch_after_compression,
+        )
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "atomic-route"
+            _seed(db, sid, "atomic")
+            db.update_system_prompt(sid, "old prompt")
+            db.update_session_billing_route(
+                sid,
+                provider="old-provider",
+                base_url="https://old.example/v1",
+                billing_mode="chat_completions",
+            )
+            agent = _make_agent(db, sid, in_place=True)
+            pending = ModelSwitchResult(
+                success=True,
+                new_model="new-model",
+                target_provider="new-provider",
+                api_key="new-key",
+                base_url="https://new.example/v1",
+                api_mode="responses",
+            )
+            schedule_model_switch_after_compression(agent, pending)
+
+            def switch_model(model, provider, api_key, base_url, api_mode):
+                agent.model = model
+                agent.provider = provider
+                agent.api_key = api_key
+                agent.base_url = base_url
+                agent.api_mode = api_mode
+
+            agent.switch_model = switch_model
+            original_publish = db.archive_and_compact
+            observed = {}
+
+            def observe_publish(*args, **kwargs):
+                result = original_publish(*args, **kwargs)
+                row = db.get_session(sid)
+                observed.update(
+                    model=row["model"],
+                    config=json.loads(row["model_config"]),
+                    prompt=row["system_prompt"],
+                    billing_provider=row["billing_provider"],
+                    billing_base_url=row["billing_base_url"],
+                    billing_mode=row["billing_mode"],
+                    messages=db.get_messages_as_conversation(sid),
+                )
+                return result
+
+            with patch.object(db, "archive_and_compact", side_effect=observe_publish):
+                compress_context(
+                    agent,
+                    [{"role": "user", "content": f"m{i}"} for i in range(8)],
+                    approx_tokens=100_000,
+                    system_message="sys",
+                )
+
+            # The transcript is irreversible here, so it still carries the old
+            # route. Deferred activation is post-commit reconciliation and may
+            # not make this publication claim rollback on a later callback error.
+            assert observed["model"] == "test/model"
+            assert observed["config"].get("provider") != "new-provider"
+            assert "Model: new-model" not in observed["prompt"]
+            assert observed["billing_provider"] == "old-provider"
+            assert observed["billing_base_url"] == "https://old.example/v1"
+            assert observed["billing_mode"] == "chat_completions"
+            assert len(observed["messages"]) == 2
+            published = db.get_session(sid)
+            assert published["model"] == "new-model"
+            assert json.loads(published["model_config"])["provider"] == "new-provider"
+            assert "Model: new-model" in published["system_prompt"]
+            assert published["billing_provider"] == "new-provider"
+            assert published["billing_base_url"] == "https://new.example/v1"
+            assert published["billing_mode"] == "responses"
+            assert get_model_switch_after_compression(agent) is None
+
     def test_in_place_alternation_preserved(self):
         """The compacted list must not introduce consecutive same-role messages."""
         from hermes_state import SessionDB

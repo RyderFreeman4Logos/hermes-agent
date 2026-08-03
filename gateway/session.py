@@ -20,6 +20,11 @@ from datetime import datetime, timedelta
 from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Any
 
+from hermes_state_common import (
+    AUTHORITY_WRITE_OUTCOME_ATTR,
+    reconcile_authoritative_write,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -1434,7 +1439,13 @@ class SessionStore:
         )
 
     def _persist_routing_data(self, data: Dict[str, Any], generation: int) -> None:
-        """Serialize all whole-index writers through one durable write lock."""
+        """Serialize all whole-index writers through one durable write lock.
+
+        When state.db is available it is the sole authority. Primary write
+        failures must fail closed without advancing the legacy sessions.json
+        mirror. After a successful primary write, a legacy mirror failure is
+        best-effort only and must not reverse the authoritative DB state.
+        """
         save_lock = getattr(self, "_save_lock", None)
         if save_lock is None:
             save_lock = threading.Lock()
@@ -1443,23 +1454,56 @@ class SessionStore:
             if generation <= getattr(self, "_persisted_routing_generation", 0):
                 return
             db_saved = False
+            authority_interrupt = None
             _db = getattr(self, "_db", None)
             if _db:
                 replacer = getattr(_db, "replace_gateway_routing_entries", None)
+                loader = getattr(_db, "load_gateway_routing_entries", None)
                 if callable(replacer):
-                    try:
-                        replacer(
-                            {k: json.dumps(v) for k, v in data.items()},
-                            scope=self._routing_scope(),
-                        )
-                        db_saved = True
-                    except Exception as exc:
-                        logger.warning(
-                            "gateway.session: state.db routing save failed: %s", exc
-                        )
+                    intended = {k: json.dumps(v) for k, v in data.items()}
+                    if callable(loader):
+                        preimage = loader(scope=self._routing_scope())
+                        readback = lambda: loader(scope=self._routing_scope())
+                    else:
+                        preimage = object()
+
+                        def readback():
+                            raise RuntimeError(
+                                "gateway routing authority readback unavailable"
+                            )
+
+                    outcome = reconcile_authoritative_write(
+                        write=lambda: replacer(
+                            intended, scope=self._routing_scope()
+                        ),
+                        readback=readback,
+                        intended=intended,
+                        preimage=preimage,
+                        label="gateway routing authority",
+                    )
+                    if isinstance(outcome, BaseException):
+                        if (
+                            getattr(outcome, AUTHORITY_WRITE_OUTCOME_ATTR, None)
+                            != "commit-confirmed"
+                        ):
+                            raise outcome
+                        authority_interrupt = outcome
+                    db_saved = True
             if getattr(self, "_write_sessions_json", True) or not db_saved:
-                self._save_sessions_json(data)
+                try:
+                    self._save_sessions_json(data)
+                except Exception as exc:
+                    if db_saved:
+                        logger.warning(
+                            "gateway.session: sessions.json mirror failed after "
+                            "authoritative state.db write: %s",
+                            exc,
+                        )
+                    else:
+                        raise
             self._persisted_routing_generation = generation
+            if authority_interrupt is not None:
+                raise authority_interrupt
 
     def _save_sessions_json(self, data: Dict[str, Any]) -> None:
         """Write the legacy sessions.json mirror of the routing index."""
@@ -2539,8 +2583,28 @@ class SessionStore:
             cleaned = sanitize_model_override(override)
             if entry.model_override == cleaned:
                 return
+            previous = entry.model_override
             entry.model_override = cleaned
-            self._save()
+            try:
+                self._save()
+            except BaseException as exc:
+                if getattr(exc, AUTHORITY_WRITE_OUTCOME_ATTR, None) != "commit-confirmed":
+                    entry.model_override = previous
+                # SQLite failures were reconciled against authority above.
+                # Preserve compensation only for SQLite-disabled legacy mode.
+                if (
+                    self._db is None
+                    and getattr(exc, AUTHORITY_WRITE_OUTCOME_ATTR, None)
+                    != "commit-confirmed"
+                ):
+                    try:
+                        self._save()
+                    except BaseException:
+                        logger.exception(
+                            "gateway.session: failed to restore legacy model "
+                            "override after save error"
+                        )
+                raise
 
     def get_model_override(self, session_key: str) -> Optional[Dict[str, str]]:
         """Return the persisted /model override for *session_key*, if any."""

@@ -455,6 +455,22 @@ def get_provider(name: str, *, allow_network: bool = True) -> Optional[ProviderD
     Returns a fully-resolved ProviderDef or None.
     """
     canonical = normalize_provider(name)
+    overlay = HERMES_OVERLAYS.get(canonical)
+
+    if not allow_network:
+        if overlay is None:
+            return None
+        return ProviderDef(
+            id=canonical,
+            name=_LABEL_OVERRIDES.get(canonical, canonical),
+            transport=overlay.transport,
+            api_key_env_vars=overlay.extra_env_vars,
+            base_url=overlay.base_url_override,
+            base_url_env_var=overlay.base_url_env_var,
+            is_aggregator=overlay.is_aggregator,
+            auth_type=overlay.auth_type,
+            source="hermes",
+        )
 
     # Try to get models.dev data
     try:
@@ -468,8 +484,6 @@ def get_provider(name: str, *, allow_network: bool = True) -> Optional[ProviderD
         )
     except Exception:
         mdev_info = None
-
-    overlay = HERMES_OVERLAYS.get(canonical)
 
     if mdev_info is not None:
         # Merge models.dev + overlay
@@ -516,7 +530,7 @@ def get_provider(name: str, *, allow_network: bool = True) -> Optional[ProviderD
     return None
 
 
-def get_label(provider_id: str) -> str:
+def get_label(provider_id: str, *, allow_network: bool = True) -> str:
     """Get a human-readable display name for a provider."""
     canonical = normalize_provider(provider_id)
 
@@ -525,7 +539,7 @@ def get_label(provider_id: str) -> str:
         return _LABEL_OVERRIDES[canonical]
 
     # Try models.dev
-    pdef = get_provider(canonical)
+    pdef = get_provider(canonical, allow_network=allow_network)
     if pdef:
         return pdef.name
 
@@ -534,12 +548,12 @@ def get_label(provider_id: str) -> str:
 
 
 
-def is_aggregator(provider: str) -> bool:
+def is_aggregator(provider: str, *, allow_network: bool = True) -> bool:
     """Return True when the provider is a multi-model aggregator."""
     provider_norm = normalize_provider(provider or "")
     if provider_norm.startswith("custom:"):
         return True
-    pdef = get_provider(provider_norm)
+    pdef = get_provider(provider_norm, allow_network=allow_network)
     return pdef.is_aggregator if pdef else False
 
 
@@ -560,7 +574,7 @@ _FLAT_NAMESPACE_RESELLERS: frozenset[str] = frozenset({
 })
 
 
-def is_routing_aggregator(provider: str) -> bool:
+def is_routing_aggregator(provider: str, *, allow_network: bool = True) -> bool:
     """Return True only for TRUE routing aggregators (e.g. OpenRouter, named
     ``custom:*`` proxies) — those that route bare/vendor-slugged model names
     to *other* providers' endpoints.
@@ -575,7 +589,7 @@ def is_routing_aggregator(provider: str) -> bool:
     provider_norm = normalize_provider(provider or "")
     if provider_norm in _FLAT_NAMESPACE_RESELLERS:
         return False
-    return is_aggregator(provider_norm)
+    return is_aggregator(provider_norm, allow_network=allow_network)
 
 
 def host_mandated_api_mode(base_url: str = "") -> Optional[str]:
@@ -631,7 +645,13 @@ def nous_api_mode(model: str = "") -> str:
     return "chat_completions"
 
 
-def determine_api_mode(provider: str, base_url: str = "", model: str = "") -> str:
+def determine_api_mode(
+    provider: str,
+    base_url: str = "",
+    model: str = "",
+    *,
+    allow_network: bool = True,
+) -> str:
     """Determine the API mode (wire protocol) for a provider/endpoint.
 
     Resolution order:
@@ -656,7 +676,7 @@ def determine_api_mode(provider: str, base_url: str = "", model: str = "") -> st
     if provider_norm in {"nous", "nous-portal", "nousresearch"}:
         return nous_api_mode(model)
 
-    pdef = get_provider(provider)
+    pdef = get_provider(provider, allow_network=allow_network)
     if pdef is not None:
         return TRANSPORT_TO_API_MODE.get(pdef.transport, "chat_completions")
 
@@ -796,6 +816,8 @@ def resolve_provider_full(
     name: str,
     user_providers: Optional[Dict[str, Any]] = None,
     custom_providers: Optional[List[Dict[str, Any]]] = None,
+    *,
+    allow_network: bool = True,
 ) -> Optional[ProviderDef]:
     """Full resolution chain: built-in → models.dev → user config.
 
@@ -805,12 +827,14 @@ def resolve_provider_full(
         name: Provider name or alias.
         user_providers: The ``providers:`` dict from config.yaml (optional).
         custom_providers: The ``custom_providers:`` list from config.yaml (optional).
+        allow_network: Whether models.dev provider metadata may refresh.
 
     Returns:
         ProviderDef if found, else None.
     """
     canonical = normalize_provider(name)
     raw = name.strip().lower()
+    network_kwargs = {} if allow_network else {"allow_network": False}
 
     # 0. User-defined config providers win over the built-in alias table.
     #    A user who declares ``providers.<name>`` in config.yaml has stated
@@ -856,7 +880,7 @@ def resolve_provider_full(
             pass
 
     # 1. Built-in (models.dev + overlays)
-    pdef = get_provider(canonical)
+    pdef = get_provider(canonical, **network_kwargs)
     if pdef is not None:
         return pdef
 
@@ -879,7 +903,7 @@ def resolve_provider_full(
     # 3. Try models.dev directly (for providers not in our ALIASES)
     try:
         from agent.models_dev import get_provider_info as _mdev_provider
-        mdev_info = _mdev_provider(canonical)
+        mdev_info = _mdev_provider(canonical, **network_kwargs)
         if mdev_info is not None:
             return ProviderDef(
                 id=canonical,

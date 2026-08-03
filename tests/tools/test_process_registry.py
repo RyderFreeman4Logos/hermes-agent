@@ -1161,6 +1161,11 @@ class TestTerminateHostPidWindows:
 
         monkeypatch.setattr(pr, "_IS_WINDOWS", True)
         monkeypatch.setattr(pr.subprocess, "run", fake_run)
+        monkeypatch.setattr(
+            pr.ProcessRegistry,
+            "_host_pid_identity",
+            classmethod(lambda cls, _pid, _expected: cls._PID_MATCH),
+        )
 
         pr.ProcessRegistry._terminate_host_pid(12345)
 
@@ -1199,6 +1204,11 @@ class TestTerminateHostPidPosix:
 
         monkeypatch.setattr(pr, "_IS_WINDOWS", False)
         monkeypatch.setattr(psutil, "Process", _FakeParent)
+        monkeypatch.setattr(
+            pr.ProcessRegistry,
+            "_host_pid_identity",
+            classmethod(lambda cls, _pid, _expected: cls._PID_MATCH),
+        )
         # This test covers only the SIGTERM tree-walk ordering; disable the
         # SIGKILL-escalation step (which would call psutil.wait_procs on the
         # fakes) by setting the grace to 0.

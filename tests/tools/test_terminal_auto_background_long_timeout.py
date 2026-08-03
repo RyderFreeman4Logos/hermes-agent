@@ -174,12 +174,23 @@ def _pid_is_running(pid):
 
 
 class _TimedRemoteEnvironment:
-    def __init__(self, *, done_after=30.0, kill_result=None):
+    def __init__(
+        self,
+        *,
+        done_after=30.0,
+        kill_result=None,
+        poll_failure_stage=None,
+        poll_failures=0,
+    ):
         self.done_after = done_after
         self.kill_result = kill_result or {"output": "", "returncode": 0}
+        self.poll_failure_stage = poll_failure_stage
+        self.poll_failures = poll_failures
         self.started_at = None
         self.killed = False
         self.poll_calls = 0
+        self.poll_times = []
+        self.stage_calls = {"status": 0, "log": 0, "exit": 0}
         self.kill_calls = []
 
     def _done(self):
@@ -187,6 +198,15 @@ class _TimedRemoteEnvironment:
             self.started_at is not None
             and time.monotonic() - self.started_at >= self.done_after
         )
+
+    def _poll_stage(self, stage):
+        self.stage_calls[stage] += 1
+        if stage == "status":
+            self.poll_calls += 1
+            self.poll_times.append(time.monotonic())
+        if self.poll_failure_stage == stage and self.poll_failures:
+            self.poll_failures -= 1
+            raise RuntimeError(f"transient {stage} transport failure")
 
     def execute(self, command, **kwargs):
         if "nohup setsid bash -lc" in command:
@@ -199,11 +219,13 @@ class _TimedRemoteEnvironment:
                 self.killed = True
             return result
         if command.startswith("kill -0"):
-            self.poll_calls += 1
+            self._poll_stage("status")
             return {"output": "1\n" if self._done() else "0\n", "returncode": 0}
         if command.startswith("cat ") and ".exit" in command:
+            self._poll_stage("exit")
             return {"output": "0\n" if self._done() else "", "returncode": 0}
         if command.startswith("cat ") and ".log" in command:
+            self._poll_stage("log")
             return {
                 "output": "remote done\n" if self._done() else "",
                 "returncode": 0,
@@ -341,13 +363,15 @@ def test_unsupported_async_delivery_kills_unregistered_candidate(
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-tree regression")
-@pytest.mark.parametrize("stage", ["wait", "promote"])
+@pytest.mark.parametrize("stage", ["wait", "promote", "deadline"])
 @pytest.mark.parametrize(
     "error_type", [RuntimeError, KeyboardInterrupt, SystemExit]
 )
 def test_deferred_candidate_is_contained_on_lifecycle_exception(
     terminal_runtime, monkeypatch, tmp_path, stage, error_type
 ):
+    import tools.process_registry as process_module
+
     terminal_tool, registry = terminal_runtime
     child_pid_path = tmp_path / f"{stage}-{error_type.__name__}.pid"
     child_code = "import time; time.sleep(30)"
@@ -360,6 +384,8 @@ def test_deferred_candidate_is_contained_on_lifecycle_exception(
     command = f"{shlex.quote(sys.executable)} -c {shlex.quote(parent_code)}"
     original_spawn = registry.spawn_local
     original_promote = registry.promote
+    original_prune = registry._prune_if_needed
+    original_timer = process_module.threading.Timer
     captured = []
 
     def capture_spawn(**kwargs):
@@ -373,18 +399,31 @@ def test_deferred_candidate_is_contained_on_lifecycle_exception(
             raise error_type(f"injected {error_type.__name__}")
         return "running"
 
-    promote_calls = 0
-
-    def fail_first_promotion(*args, **kwargs):
-        nonlocal promote_calls
-        promote_calls += 1
-        if stage == "promote" and promote_calls == 1:
+    def fail_prune():
+        if stage == "promote":
             raise error_type(f"injected {error_type.__name__}")
-        return original_promote(*args, **kwargs)
+        if stage == "deadline":
+            return original_prune()
+        raise RuntimeError("persistent cleanup promotion failure")
+
+    class FailingDeadlineTimer:
+        daemon = False
+
+        def start(self):
+            raise error_type(f"injected {error_type.__name__}")
+
+        def cancel(self):
+            pass
+
+    def timer_factory(*args, **kwargs):
+        if stage == "deadline":
+            return FailingDeadlineTimer()
+        return original_timer(*args, **kwargs)
 
     monkeypatch.setattr(registry, "spawn_local", capture_spawn)
     monkeypatch.setattr(registry, "wait_for_promotion", reach_exception_point)
-    monkeypatch.setattr(registry, "promote", fail_first_promotion)
+    monkeypatch.setattr(registry, "_prune_if_needed", fail_prune)
+    monkeypatch.setattr(process_module.threading, "Timer", timer_factory)
     monkeypatch.setattr(registry, "_daemon_term_grace_seconds", lambda: 0.1)
 
     try:
@@ -404,6 +443,7 @@ def test_deferred_candidate_is_contained_on_lifecycle_exception(
         assert registry.list_sessions() == []
         assert registry.completion_queue.empty()
     finally:
+        monkeypatch.setattr(registry, "_prune_if_needed", original_prune)
         if captured and _pid_is_running(captured[0].pid):
             original_promote(captured[0])
             registry.kill_process(
@@ -411,6 +451,82 @@ def test_deferred_candidate_is_contained_on_lifecycle_exception(
                 source="test_emergency_cleanup",
                 consume_output=False,
             )
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-tree regression")
+@pytest.mark.parametrize(
+    "error_type", [RuntimeError, KeyboardInterrupt, SystemExit]
+)
+def test_outer_rescue_keeps_managed_identity_when_discard_and_kill_fail(
+    terminal_runtime, monkeypatch, tmp_path, error_type
+):
+    terminal_tool, registry = terminal_runtime
+    child_pid_path = tmp_path / f"outer-rescue-{error_type.__name__}.pid"
+    child_code = "import time; time.sleep(30)"
+    parent_code = (
+        "import pathlib,subprocess,sys,time; "
+        f"p=subprocess.Popen([sys.executable, '-c', {child_code!r}]); "
+        f"pathlib.Path({str(child_pid_path)!r}).write_text(str(p.pid)); "
+        "time.sleep(30)"
+    )
+    command = f"{shlex.quote(sys.executable)} -c {shlex.quote(parent_code)}"
+    original_spawn = registry.spawn_local
+    original_terminate = registry._terminate_host_pid
+    captured = []
+
+    def capture_spawn(**kwargs):
+        session = original_spawn(**kwargs)
+        captured.append(session)
+        return session
+
+    def fail_wait(*_args, **_kwargs):
+        assert _wait_until(child_pid_path.exists)
+        raise error_type(f"injected {error_type.__name__}")
+
+    monkeypatch.setattr(registry, "spawn_local", capture_spawn)
+    monkeypatch.setattr(registry, "wait_for_promotion", fail_wait)
+    monkeypatch.setattr(
+        registry,
+        "discard",
+        MagicMock(side_effect=RuntimeError("persistent discard failure")),
+    )
+    monkeypatch.setattr(
+        registry,
+        "_terminate_host_pid",
+        MagicMock(side_effect=RuntimeError("cleanup kill status unknown")),
+    )
+
+    try:
+        if issubclass(error_type, Exception):
+            result = json.loads(
+                terminal_tool.terminal_tool(command=command, timeout=2)
+            )
+            assert result["session_id"] == captured[0].id
+            assert "cleanup could not be confirmed" in result["error"]
+            assert "persistent discard failure" in result["cleanup_error"]
+            assert "cleanup kill status unknown" in result["cleanup_error"]
+        else:
+            with pytest.raises(error_type, match=f"injected {error_type.__name__}"):
+                terminal_tool.terminal_tool(command=command, timeout=2)
+
+        session = captured[0]
+        child_pid = int(child_pid_path.read_text(encoding="utf-8"))
+        assert _pid_is_running(session.pid)
+        assert _pid_is_running(child_pid)
+        assert registry.get(session.id) is session
+        assert session._deadline_timer is not None
+        assert session._deadline_timer.is_alive()
+    finally:
+        if captured:
+            monkeypatch.setattr(registry, "_terminate_host_pid", original_terminate)
+            if registry.get(captured[0].id) is not None:
+                registry.kill_process(
+                    captured[0].id,
+                    source="test_emergency_cleanup",
+                    consume_output=False,
+                )
+            if _pid_is_running(captured[0].pid):
+                original_terminate(captured[0].pid, captured[0].host_start_time)
 
 
 @pytest.mark.parametrize(
@@ -543,6 +659,116 @@ def test_nonlocal_completion_after_threshold_promotes_and_notifies_once(
     finally:
         if session_id in registry._running:
             registry.kill_process(session_id, consume_output=False)
+
+
+@pytest.mark.parametrize("poll_stage", ["status", "log", "exit"])
+@pytest.mark.parametrize(
+    ("done_after", "promoted"),
+    [(0.0, False), (1.2, True)],
+    ids=["before-threshold-inline", "after-threshold-promoted"],
+)
+def test_nonlocal_transient_poll_error_recovers_without_forging_exit(
+    terminal_runtime, monkeypatch, poll_stage, done_after, promoted
+):
+    terminal_tool, registry = terminal_runtime
+    env = _TimedRemoteEnvironment(
+        done_after=done_after,
+        poll_failure_stage=poll_stage,
+        poll_failures=1,
+    )
+    terminal_tool._active_environments["default"] = env
+    monkeypatch.setattr(
+        terminal_tool,
+        "_get_env_config",
+        lambda: _config(
+            env_type="docker", timeout=6, auto_background_timeout_threshold=1
+        ),
+    )
+
+    result = json.loads(
+        terminal_tool.terminal_tool(command="printf remote", timeout=6)
+    )
+    try:
+        if not promoted:
+            assert result["output"] == "remote done"
+            assert result["exit_code"] == 0
+            assert "session_id" not in result
+            assert registry.list_sessions() == []
+            assert registry.completion_queue.empty()
+        else:
+            session_id = result["session_id"]
+            session = registry.get(session_id)
+            assert session is not None
+            assert session.exited is False
+            assert session.execution_deadline == pytest.approx(
+                session.started_at + 6, abs=0.05
+            )
+            assert session._deadline_timer is not None
+            event = registry.completion_queue.get(timeout=6)
+            assert event["session_id"] == session_id
+            assert event["exit_code"] == 0
+            assert event["output"] == "remote done\n"
+            final = registry.poll(session_id)
+            assert final["status"] == "exited"
+            assert poll_stage in final["poll_error"]
+            assert registry.completion_queue.empty()
+        assert env.poll_failures == 0
+        assert env.poll_calls <= 4
+        assert all(
+            later - earlier >= 0.5
+            for earlier, later in zip(env.poll_times, env.poll_times[1:])
+        )
+    finally:
+        registry.kill_all()
+
+
+def test_continuous_nonlocal_poll_errors_stay_managed_and_killable(
+    terminal_runtime, monkeypatch
+):
+    terminal_tool, registry = terminal_runtime
+    env = _TimedRemoteEnvironment(
+        done_after=30,
+        poll_failure_stage="status",
+        poll_failures=50,
+    )
+    terminal_tool._active_environments["default"] = env
+    monkeypatch.setattr(
+        terminal_tool,
+        "_get_env_config",
+        lambda: _config(
+            env_type="docker", timeout=4, auto_background_timeout_threshold=1
+        ),
+    )
+
+    result = json.loads(
+        terminal_tool.terminal_tool(command="sleep 30", timeout=4)
+    )
+    session_id = result["session_id"]
+    try:
+        session = registry.get(session_id)
+        assert session is not None
+        assert session.exited is False
+        assert session.execution_deadline == pytest.approx(
+            session.started_at + 4, abs=0.05
+        )
+        assert session._deadline_timer is not None
+        assert session._deadline_timer.is_alive()
+        assert "status" in result["poll_error"]
+        assert "status" in registry.poll(session_id)["poll_error"]
+        assert env.poll_calls <= 2
+
+        killed = registry.kill_process(
+            session_id,
+            source="test_continuous_poll_cleanup",
+            consume_output=False,
+        )
+        assert killed["status"] == "killed"
+        event = registry.completion_queue.get(timeout=2)
+        assert event["session_id"] == session_id
+        assert event["termination_source"] == "test_continuous_poll_cleanup"
+        assert registry.completion_queue.empty()
+    finally:
+        registry.kill_all()
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX nonlocal shell contract")

@@ -119,6 +119,7 @@ class ProcessSession:
     exit_code: Optional[int] = None             # Exit code (None if still running)
     completion_reason: str = "exited"           # exited|killed|lost|failed_start|already_exited
     termination_source: str = ""                # process.kill|kill_all|backend_lost|failed_start
+    poll_error: str = ""                        # Latest nonlocal transport error; not terminal evidence
     output_buffer: str = ""                     # Rolling output (last MAX_OUTPUT_CHARS)
     output_size: int = 0                         # Monotonic emitted character count
     max_output_chars: int = MAX_OUTPUT_CHARS
@@ -676,7 +677,12 @@ class ProcessRegistry:
         )
         timer.daemon = True
         session._deadline_timer = timer
-        timer.start()
+        try:
+            timer.start()
+        except BaseException:
+            if session._deadline_timer is timer:
+                session._deadline_timer = None
+            raise
 
     @staticmethod
     def _daemon_term_grace_seconds() -> float:
@@ -1199,6 +1205,8 @@ class ProcessRegistry:
                     except Exception as exc:
                         # No terminal backend evidence means the candidate must
                         # remain managed, not be guessed complete.
+                        with session._lock:
+                            session.poll_error = f"{type(exc).__name__}: {exc}"
                         logger.debug(
                             "Could not reconcile deferred backend process: %s",
                             exc,
@@ -1231,21 +1239,7 @@ class ProcessRegistry:
         self._write_checkpoint()
         return True
 
-    def discard(self, session: ProcessSession, *, source: str) -> dict:
-        """Terminate an unregistered candidate without leaving an orphan."""
-        if self.promote(session):
-            result = self.kill_process(
-                session.id,
-                source=source,
-                consume_output=False,
-            )
-        else:
-            result = {
-                "status": "already_exited",
-                "exit_code": session.exit_code,
-                "output": session.output_buffer,
-            }
-
+    def _finish_discard(self, session: ProcessSession, result: dict) -> dict:
         if result.get("status") in {"killed", "already_exited"}:
             if session._deadline_timer is not None:
                 session._deadline_timer.cancel()
@@ -1259,6 +1253,95 @@ class ProcessRegistry:
         else:
             result.setdefault("session_id", session.id)
         return result
+
+    @staticmethod
+    def _silence_discard(session: ProcessSession) -> None:
+        with session._lock:
+            session.notify_on_complete = False
+            session.watch_patterns = []
+
+    def rescue_discard(
+        self,
+        session: ProcessSession,
+        *,
+        source: str,
+        cleanup_error: Optional[BaseException] = None,
+    ) -> dict:
+        """Own then contain a candidate without reusing the promotion seam."""
+        self._silence_discard(session)
+        deadline_error = None
+        checkpoint_error = None
+        with session._lock:
+            if session.exited:
+                result = {
+                    "status": "already_exited",
+                    "exit_code": session.exit_code,
+                    "output": session.output_buffer,
+                }
+            else:
+                with self._lock:
+                    owner = self._running.get(session.id)
+                    if owner is not None and owner is not session:
+                        return {
+                            "status": "error",
+                            "error": f"Process identity collision for {session.id}",
+                            "session_id": session.id,
+                        }
+                    self._running[session.id] = session
+                if session._deadline_timer is None:
+                    try:
+                        self._arm_execution_deadline(session)
+                    except BaseException as exc:
+                        deadline_error = exc
+                result = None
+
+        if result is None:
+            try:
+                self._write_checkpoint()
+            except BaseException as exc:
+                checkpoint_error = exc
+            result = self.kill_process(
+                session.id,
+                source=source,
+                consume_output=False,
+            )
+        if result.get("status") == "error":
+            details = []
+            if cleanup_error is not None:
+                details.append(f"promotion cleanup failed: {cleanup_error}")
+            if deadline_error is not None:
+                details.append(f"deadline setup failed: {deadline_error}")
+            if checkpoint_error is not None:
+                details.append(f"checkpoint failed: {checkpoint_error}")
+            if details:
+                result["error"] = f"{result.get('error', '')}; {'; '.join(details)}".strip("; ")
+        return self._finish_discard(session, result)
+
+    def discard(self, session: ProcessSession, *, source: str) -> dict:
+        """Terminate an unregistered candidate without leaving an orphan."""
+        self._silence_discard(session)
+        try:
+            promoted = self.promote(session)
+        except BaseException as exc:
+            return self.rescue_discard(
+                session,
+                source=source,
+                cleanup_error=exc,
+            )
+
+        if promoted:
+            result = self.kill_process(
+                session.id,
+                source=source,
+                consume_output=False,
+            )
+        else:
+            result = {
+                "status": "already_exited",
+                "exit_code": session.exit_code,
+                "output": session.output_buffer,
+            }
+        return self._finish_discard(session, result)
 
     # ----- Reader / Poller Threads -----
 
@@ -1477,17 +1560,20 @@ class ProcessRegistry:
                     exit_path,
                     previous_output_length,
                 )
-            except Exception:
-                # Environment might be gone (sandbox reaped, etc.)
+            except Exception as exc:
+                # A transport error is unknown state, not evidence that the
+                # remote process exited. Preserve the identity and retry on the
+                # existing bounded cadence; its execution deadline still owns
+                # eventual containment after promotion.
                 with session._lock:
                     if session.exited:
                         return
-                    session.exited = True
-                    session.exit_code = -1
-                    session.completion_reason = "lost"
-                    session.termination_source = "backend_lost"
-                self._move_to_finished(session)
-                return
+                    session.poll_error = f"{type(exc).__name__}: {exc}"
+                logger.debug(
+                    "Nonlocal process poll failed for %s; state remains unknown: %s",
+                    session.id,
+                    exc,
+                )
             if session._completion_event.wait(timeout=2):
                 return
 
@@ -1846,6 +1932,8 @@ class ProcessRegistry:
             "uptime_seconds": int(time.time() - session.started_at),
             "output_preview": output_preview,
         }
+        if session.poll_error:
+            result["poll_error"] = session.poll_error
         if session.exited:
             result["exit_code"] = session.exit_code
             result["completion_reason"] = session.completion_reason

@@ -2813,6 +2813,9 @@ def terminal_tool(
                     "exit_code": 0,
                     "error": None,
                 }
+                poll_error = getattr(proc_session, "poll_error", "")
+                if isinstance(poll_error, str) and poll_error:
+                    result_data["poll_error"] = poll_error
                 # Background spawns detached and returns exit_code 0 immediately;
                 # it never inline-polls is_interrupted(), so the stale-bit kill
                 # cannot occur here and this note never co-occurs with rc=130.
@@ -2989,7 +2992,13 @@ def terminal_tool(
                 if (
                     auto_background_candidate
                     and proc_session is not None
-                    and process_registry.get(proc_session.id) is None
+                    and (
+                        process_registry.get(proc_session.id) is None
+                        or (
+                            getattr(proc_session, "execution_deadline", None) is not None
+                            and getattr(proc_session, "_deadline_timer", None) is None
+                        )
+                    )
                 ):
                     try:
                         cleanup_result = process_registry.discard(
@@ -2997,17 +3006,35 @@ def terminal_tool(
                             source="background_promotion_exception",
                         )
                     except BaseException as cleanup_error:
-                        # discard() registers before terminating, so even an
-                        # interrupted cleanup keeps a user-controllable owner.
                         logger.error(
                             "Deferred process cleanup was interrupted: %s",
                             cleanup_error,
                         )
-                        cleanup_result = {
-                            "status": "error",
-                            "error": str(cleanup_error),
-                            "session_id": proc_session.id,
-                        }
+                        try:
+                            cleanup_result = process_registry.rescue_discard(
+                                proc_session,
+                                source="background_promotion_exception",
+                                cleanup_error=cleanup_error,
+                            )
+                        except BaseException as rescue_error:
+                            logger.critical(
+                                "Deferred process rescue failed: %s",
+                                rescue_error,
+                            )
+                            cleanup_result = {
+                                "status": "error",
+                                "error": str(rescue_error),
+                                "session_id": proc_session.id,
+                            }
+                    if (
+                        cleanup_result.get("status") == "error"
+                        and process_registry.get(proc_session.id) is None
+                    ):
+                        cleanup_result = process_registry.rescue_discard(
+                            proc_session,
+                            source="background_promotion_exception",
+                            cleanup_error=RuntimeError(cleanup_result.get("error", "cleanup failed")),
+                        )
                 if not isinstance(e, Exception):
                     raise
 
@@ -3026,6 +3053,7 @@ def terminal_tool(
                             "; cleanup could not be confirmed; the process remains "
                             "managed under the returned session_id"
                         )
+                        result_data["cleanup_error"] = cleanup_result.get("error", "")
                 return json.dumps(result_data, ensure_ascii=False)
         else:
             # Run foreground command with retry logic

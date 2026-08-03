@@ -17381,20 +17381,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         finalize_context_engine_compression_notification,
                                     )
 
-                                    finalize_context_engine_compression_notification(
-                                        _hyg_agent,
-                                        committed=_hyg_boundary_committed,
-                                    )
-                                    # Evict the cached agent so the next turn
-                                    # rebuilds its system prompt from current
-                                    # SOUL.md, memory, and skills.
-                                    self._evict_cached_agent(session_key)
-                                    if not _hyg_cleanup_deferred:
-                                        await self._cleanup_agent_resources_off_loop(
-                                            _hyg_agent, context="session hygiene"
+                                    try:
+                                        finalize_context_engine_compression_notification(
+                                            _hyg_agent,
+                                            committed=_hyg_boundary_committed,
                                         )
+                                    finally:
+                                        # Evict the cached agent so the next turn
+                                        # rebuilds its system prompt from current
+                                        # SOUL.md, memory, and skills.
+                                        try:
+                                            self._evict_cached_agent(session_key)
+                                        finally:
+                                            if not _hyg_cleanup_deferred:
+                                                await self._cleanup_agent_resources_off_loop(
+                                                    _hyg_agent, context="session hygiene"
+                                                )
 
-                    except Exception as e:
+                    except BaseException as e:
+                        indeterminate = (
+                            e
+                            if isinstance(e, AuthorityWriteIndeterminateError)
+                            else getattr(e, AUTHORITY_WRITE_INDETERMINATE_ATTR, None)
+                        )
+                        if isinstance(indeterminate, AuthorityWriteIndeterminateError):
+                            raise
+                        if not isinstance(e, Exception):
+                            raise
                         logger.warning(
                             "Session hygiene auto-compress failed: %s", e
                         )

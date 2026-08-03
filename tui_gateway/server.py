@@ -4635,25 +4635,48 @@ def _compress_session_history(
 
     if partial and tail:
         compressed = rejoin_compressed_head_and_tail(compressed, tail)
+    newer_messages = []
     with session["history_lock"]:
-        if int(session.get("history_version", 0)) != history_version:
-            # External mutation during compaction — drop the compressed
-            # result so we don't clobber concurrent edits.
-            finalize_context_engine_compression_notification(
-                agent,
-                committed=False,
-            )
-            agent._awaiting_cache_usage_after_compression = (
-                cache_attribution_pending_before
-            )
-            if compressor is not None and hasattr(
-                compressor, "awaiting_real_usage_after_compression"
+        current_history = list(session.get("history", []))
+        current_version = int(session.get("history_version", 0))
+        pending_notification = getattr(agent, "__dict__", {}).get(
+            "_pending_context_engine_compression_notification"
+        )
+        if current_version != history_version:
+            if (
+                current_history[: len(history)] == history
+                and callable(pending_notification)
             ):
-                compressor.awaiting_real_usage_after_compression = real_usage_pending_before
-            usage = _get_usage(agent)
-            return 0, usage
-        session["history"] = compressed
-        session["history_version"] = history_version + 1
+                # A real boundary committed under the deferred host fence;
+                # retain append-only input that arrived while it ran.
+                newer_messages = current_history[len(history) :]
+            else:
+                # No durable boundary (or a non-append mutation): keep the
+                # live transcript and discard the queued boundary effects.
+                finalize_context_engine_compression_notification(
+                    agent,
+                    committed=False,
+                )
+                agent._awaiting_cache_usage_after_compression = (
+                    cache_attribution_pending_before
+                )
+                if compressor is not None and hasattr(
+                    compressor, "awaiting_real_usage_after_compression"
+                ):
+                    compressor.awaiting_real_usage_after_compression = real_usage_pending_before
+                usage = _get_usage(agent)
+                return 0, usage
+        session["history"] = [*compressed, *newer_messages]
+        session["history_version"] = current_version + 1
+    if newer_messages:
+        flush_messages = getattr(agent, "_flush_messages_to_session_db", None)
+        if callable(flush_messages):
+            try:
+                for message in newer_messages:
+                    message.pop("_db_persisted", None)
+                flush_messages(newer_messages, None)
+            except Exception:
+                logger.exception("Failed to persist messages that arrived during compression")
     usage = _get_usage(agent)
     return len(history) - len(compressed), usage
 

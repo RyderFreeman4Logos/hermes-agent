@@ -1513,7 +1513,7 @@ def _resolve_explicit_runtime(
     allow_network: bool = True,
 ) -> Optional[Dict[str, Any]]:
     network_kwargs: Dict[str, Any] = (
-        {} if allow_network else {"allow_network": False}
+        {} if allow_network else {"allow_network": False, "read_only": True}
     )
     explicit_api_key = str(explicit_api_key or "").strip()
     explicit_base_url = str(explicit_base_url or "").strip().rstrip("/")
@@ -1576,7 +1576,9 @@ def _resolve_explicit_runtime(
     if provider == "nous":
         from hermes_cli.providers import nous_api_mode
 
-        state = auth_mod.get_provider_auth_state("nous") or {}
+        state = auth_mod.get_provider_auth_state(
+            "nous", read_only=not allow_network
+        ) or {}
         base_url = (
             explicit_base_url
             or _nous_inference_base_url_override()
@@ -1701,9 +1703,10 @@ def resolve_runtime_provider(
     behavior (api_mode derived from config).
     """
     requested_provider = resolve_requested_provider(requested)
-    network_kwargs: Dict[str, Any] = (
-        {} if allow_network else {"allow_network": False}
-    )
+    network_kwargs: Dict[str, Any] = {
+        "allow_network": allow_network,
+        "read_only": not allow_network,
+    }
 
     # Honour ``providers.<name>.enabled: false`` for BOTH user-defined
     # custom providers and the built-in ones (openai / anthropic /
@@ -1896,10 +1899,7 @@ def resolve_runtime_provider(
 
     try:
         pool = (
-            load_pool(
-                provider,
-                **({} if allow_network else {"read_only": True}),
-            )
+            load_pool(provider, **({"read_only": True} if not allow_network else {}))
             if should_use_pool
             else None
         )

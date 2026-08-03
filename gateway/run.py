@@ -62,6 +62,11 @@ from agent.i18n import t
 from agent.interrupt_compat import request_hard_interrupt
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
+from hermes_state_common import (
+    AUTHORITY_WRITE_INDETERMINATE_ATTR,
+    AUTHORITY_WRITE_OUTCOME_ATTR,
+    AuthorityWriteIndeterminateError,
+)
 
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
@@ -5788,6 +5793,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 else missing
             )
             store_touched = False
+            callback_interrupt = None
             try:
                 if store is not None:
                     old_persisted = {
@@ -5803,7 +5809,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 "failed to snapshot gateway model override"
                             )
                     store_touched = True
-                    store.set_model_override(session_key, persisted_override)
+                    try:
+                        store.set_model_override(session_key, persisted_override)
+                    except BaseException as exc:
+                        if (
+                            getattr(exc, AUTHORITY_WRITE_OUTCOME_ATTR, None)
+                            == "commit-confirmed"
+                        ):
+                            callback_interrupt = exc
+                        else:
+                            raise
                 current.conversation.after_compression_model_switch = None
                 current.conversation.model_override = {
                     "model": result.new_model,
@@ -5819,30 +5834,47 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         f"{result.provider_label or result.target_provider}. "
                         "Adjust your self-identification accordingly.]"
                     )
-            except BaseException:
+                if callback_interrupt is not None:
+                    raise callback_interrupt
+            except BaseException as exc:
+                if (
+                    getattr(exc, AUTHORITY_WRITE_OUTCOME_ATTR, None)
+                    == "commit-confirmed"
+                ):
+                    raise
+                indeterminate = (
+                    exc
+                    if isinstance(exc, AuthorityWriteIndeterminateError)
+                    else getattr(exc, AUTHORITY_WRITE_INDETERMINATE_ATTR, None)
+                )
                 current.conversation.after_compression_model_switch = old_pending
                 current.conversation.model_override = old_override
+                secondary_error = None
                 if pending_notes is not None:
                     try:
                         if old_note is missing:
                             pending_notes.pop(session_key, None)
                         else:
                             pending_notes[session_key] = old_note
-                    except BaseException:
-                        logger.exception(
-                            "failed to restore gateway model note after callback error"
-                        )
+                    except BaseException as secondary:
+                        secondary_error = secondary
                 if (
-                    store_touched
+                    not isinstance(indeterminate, AuthorityWriteIndeterminateError)
+                    and store_touched
                     and old_persisted is not missing
                     and store is not None
                 ):
                     try:
                         store.set_model_override(session_key, old_persisted)
-                    except BaseException:
-                        logger.exception(
-                            "failed to restore gateway model override after callback error"
-                        )
+                    except BaseException as secondary:
+                        secondary_error = secondary
+                if secondary_error is not None:
+                    if (
+                        getattr(secondary_error, AUTHORITY_WRITE_OUTCOME_ATTR, None)
+                        == "commit-confirmed"
+                    ):
+                        delattr(secondary_error, AUTHORITY_WRITE_OUTCOME_ATTR)
+                    raise secondary_error from exc
                 raise
 
         schedule_model_switch_after_compression(

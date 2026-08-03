@@ -1582,24 +1582,32 @@ def test_resolve_named_custom_runtime_pool_result_includes_extra_headers(monkeyp
                 "base_url": "https://portal.qwen.ai/v1",
             },
         ),
+        (
+            "xai-oauth",
+            "resolve_xai_oauth_runtime_credentials",
+            {
+                "api_key": "cached-xai",
+                "base_url": "https://api.x.ai/v1",
+            },
+        ),
     ],
 )
 def test_local_only_runtime_propagates_no_refresh_policy(
     monkeypatch, provider, resolver_name, credentials
 ):
     seen = []
+    pool_reads = []
 
     class EmptyPool:
         def has_credentials(self):
             return False
 
     def load_pool(_provider, *, read_only=False):
-        assert read_only is True
+        pool_reads.append(read_only)
         return EmptyPool()
 
     def resolve(**kwargs):
         seen.append(kwargs)
-        assert kwargs["allow_network"] is False
         return credentials
 
     monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: provider)
@@ -1610,7 +1618,36 @@ def test_local_only_runtime_propagates_no_refresh_policy(
     resolved = rp.resolve_runtime_provider(requested=provider, allow_network=False)
 
     assert resolved["provider"] == provider
-    assert seen
+    assert seen[0]["allow_network"] is False
+    assert seen[0]["read_only"] is True
+    assert pool_reads == [True]
+
+    seen.clear()
+    pool_reads.clear()
+    resolved = rp.resolve_runtime_provider(requested=provider, allow_network=True)
+
+    assert resolved["provider"] == provider
+    assert seen[0]["allow_network"] is True
+    assert seen[0]["read_only"] is False
+    assert pool_reads == [False]
+
+
+def test_minimax_resolver_marks_direct_local_reads_read_only(monkeypatch):
+    from hermes_cli import auth
+
+    reads = []
+    monkeypatch.setattr(
+        auth,
+        "get_provider_auth_state",
+        lambda _provider, *, read_only=False: reads.append(read_only) or None,
+    )
+
+    with pytest.raises(auth.AuthError):
+        auth.resolve_minimax_oauth_runtime_credentials(allow_network=False)
+    with pytest.raises(auth.AuthError):
+        auth.resolve_minimax_oauth_runtime_credentials(allow_network=True)
+
+    assert reads == [True, False]
 
 
 def test_local_only_qwen_expired_token_fails_without_refresh(monkeypatch):
@@ -1644,7 +1681,7 @@ def test_local_only_nous_keeps_runtime_minimum_ttl(monkeypatch):
     monkeypatch.setattr(
         auth,
         "get_provider_auth_state",
-        lambda _provider: {
+        lambda _provider, **_kwargs: {
             "agent_key": _fake_invoke_jwt(ttl_seconds=600),
             "scope": "inference:invoke",
         },
@@ -1687,7 +1724,11 @@ def test_local_only_nous_expired_pool_key_falls_back_without_refresh(monkeypatch
     resolved = rp.resolve_runtime_provider(requested="nous", allow_network=False)
 
     assert resolved["api_key"] == fresh
-    assert singleton_calls == [{"timeout_seconds": 15.0, "allow_network": False}]
+    assert singleton_calls == [{
+        "timeout_seconds": 15.0,
+        "allow_network": False,
+        "read_only": True,
+    }]
     assert refreshed == []
 
 
@@ -1720,7 +1761,11 @@ def test_local_only_explicit_nous_base_url_disables_refresh(monkeypatch):
 
     assert resolved["api_key"] == token
     assert resolved["base_url"] == "https://custom.invalid/v1"
-    assert calls == [{"timeout_seconds": 15.0, "allow_network": False}]
+    assert calls == [{
+        "timeout_seconds": 15.0,
+        "allow_network": False,
+        "read_only": True,
+    }]
 
 
 def test_local_only_vertex_expired_token_fails_without_refresh(monkeypatch):

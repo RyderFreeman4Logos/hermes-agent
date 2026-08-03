@@ -17,6 +17,7 @@ from hermes_cli.model_switch import (
     get_model_switch_after_compression,
     schedule_model_switch_after_compression,
 )
+from hermes_state_common import AuthorityWriteIndeterminateError
 
 
 class _Agent:
@@ -389,12 +390,187 @@ def test_indeterminate_route_publication_is_explicitly_blocked(readback):
     result = _result()
     schedule_model_switch_after_compression(agent, result)
 
-    assert apply_model_switch_after_compression(agent) == "failed"
+    with pytest.raises(AuthorityWriteIndeterminateError, match="indeterminate"):
+        apply_model_switch_after_compression(agent)
     assert (agent.model, agent.provider) == ("old-model", "old-provider")
     assert agent._session_db.row["model"] == "old-model"
     assert agent._session_db.writes == 1
     assert get_model_switch_after_compression(agent) is result
     assert any("indeterminate" in status for status in agent.statuses)
+
+
+def test_session_route_snapshot_is_a_pure_complete_read(tmp_path, monkeypatch):
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session(
+            "pure-read",
+            "cli",
+            model="old-model",
+            model_config={"max_iterations": 7},
+            system_prompt="old prompt",
+        )
+        db.publish_session_route(
+            "pure-read",
+            model_config_json=json.dumps({"max_iterations": 9}),
+            model="new-model",
+            system_prompt="new prompt",
+            billing_provider="new-provider",
+            billing_base_url="https://new.example/v1",
+            billing_mode="responses",
+        )
+        monkeypatch.setattr(
+            db,
+            "flush_token_counts",
+            lambda *_a, **_k: (_ for _ in ()).throw(
+                AssertionError("pure route read must not flush accounting")
+            ),
+        )
+        monkeypatch.setattr(
+            db,
+            "_execute_write",
+            lambda *_a, **_k: (_ for _ in ()).throw(
+                AssertionError("pure route read must not execute writes")
+            ),
+        )
+
+        assert db.read_session_route_snapshot("pure-read") == {
+            "model_config": json.dumps({"max_iterations": 9}),
+            "model": "new-model",
+            "system_prompt": "new prompt",
+            "billing_provider": "new-provider",
+            "billing_base_url": "https://new.example/v1",
+            "billing_mode": "responses",
+        }
+    finally:
+        db.close()
+
+
+def test_route_classifier_uses_pure_snapshot_not_get_session(tmp_path, monkeypatch):
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session(
+            "pure-classifier",
+            "cli",
+            model="old-model",
+            model_config={"max_iterations": 7},
+            system_prompt="old prompt",
+        )
+        agent = _Agent()
+        agent.session_id = "pure-classifier"
+        agent._session_db = db
+        agent._session_init_model_config = {"max_iterations": 7}
+        agent._build_system_prompt = lambda _message: "new prompt"
+        real_publish = db.publish_session_route
+        real_flush = db.flush_token_counts
+        flush_calls = 0
+        publish_calls = 0
+
+        def flush_once():
+            nonlocal flush_calls
+            flush_calls += 1
+            return real_flush()
+
+        def commit_then_raise(*args, **kwargs):
+            nonlocal publish_calls
+            publish_calls += 1
+            real_publish(*args, **kwargs)
+            raise OSError("injected post-commit route failure")
+
+        monkeypatch.setattr(db, "flush_token_counts", flush_once)
+        monkeypatch.setattr(db, "publish_session_route", commit_then_raise)
+        monkeypatch.setattr(
+            db,
+            "get_session",
+            lambda *_a, **_k: (_ for _ in ()).throw(
+                AssertionError("route classifier must use the pure snapshot reader")
+            ),
+        )
+        result = _result()
+        schedule_model_switch_after_compression(agent, result)
+
+        assert apply_model_switch_after_compression(agent) == "applied"
+        assert flush_calls == 1
+        assert publish_calls == 1
+        assert db.read_session_route_snapshot("pure-classifier")["model"] == "new-model"
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("interrupt_type", [KeyboardInterrupt, SystemExit])
+@pytest.mark.parametrize("committed", [True, False], ids=["target", "preimage"])
+def test_route_publication_baseexception_converges_then_rethrows(
+    interrupt_type,
+    committed,
+):
+    agent = _Agent()
+    agent.session_id = "session-1"
+    agent._session_db = _SessionDB()
+    agent._session_init_model_config = {"max_iterations": 7}
+    agent._build_system_prompt = lambda _message: "new prompt"
+    real_publish = agent._session_db.publish_session_route
+    interrupt = interrupt_type("injected authority interruption")
+    calls = 0
+
+    def interrupted_publish(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            if committed:
+                real_publish(*args, **kwargs)
+            raise interrupt
+        return real_publish(*args, **kwargs)
+
+    agent._session_db.publish_session_route = interrupted_publish
+    result = _result()
+    schedule_model_switch_after_compression(agent, result)
+
+    with pytest.raises(interrupt_type) as caught:
+        apply_model_switch_after_compression(agent)
+
+    assert caught.value is interrupt
+    assert calls == 1
+    if committed:
+        assert (agent.model, agent.provider) == ("new-model", "new-provider")
+        assert agent._session_db.row["model"] == "new-model"
+        assert get_model_switch_after_compression(agent) is None
+    else:
+        assert (agent.model, agent.provider) == ("old-model", "old-provider")
+        assert agent._session_db.row["model"] == "old-model"
+        assert get_model_switch_after_compression(agent) is result
+
+
+def test_indeterminate_route_publication_keyboard_interrupt_stays_blocked():
+    agent = _Agent()
+    agent.session_id = "session-1"
+    agent._session_db = _SessionDB()
+    agent._session_init_model_config = {"max_iterations": 7}
+    agent._build_system_prompt = lambda _message: "new prompt"
+    real_publish = agent._session_db.publish_session_route
+    interrupt = KeyboardInterrupt("injected indeterminate authority interruption")
+
+    def commit_third_then_interrupt(*args, **kwargs):
+        real_publish(*args, **kwargs)
+        agent._session_db.row["model"] = "third-model"
+        raise interrupt
+
+    agent._session_db.publish_session_route = commit_third_then_interrupt
+    result = _result()
+    schedule_model_switch_after_compression(agent, result)
+
+    with pytest.raises(KeyboardInterrupt) as caught:
+        apply_model_switch_after_compression(agent)
+
+    assert caught.value is interrupt
+    assert isinstance(caught.value.__cause__, AuthorityWriteIndeterminateError)
+    assert agent._session_db.row["model"] == "third-model"
+    assert (agent.model, agent.provider) == ("old-model", "old-provider")
+    assert get_model_switch_after_compression(agent) is result
+    assert any("blocked" in status for status in agent.statuses)
+    assert all("restored" not in status for status in agent.statuses)
 
 
 def test_status_observer_failure_does_not_rollback_committed_switch():

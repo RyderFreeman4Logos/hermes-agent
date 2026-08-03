@@ -83,3 +83,22 @@ class TestBrowserCleanup:
         assert browser_tool._session_last_activity == {}
         assert browser_tool._recording_sessions == set()
         assert browser_tool._cleanup_done is True
+
+
+    def test_unknown_daemon_identity_retains_session_control_path(self, tmp_path):
+        browser_tool = self.browser_tool
+        session_name = "sess-unknown"
+        socket_dir = tmp_path / f"agent-browser-{session_name}"
+        socket_dir.mkdir()
+        (socket_dir / f"{session_name}.pid").write_text("12345")
+        browser_tool._active_sessions["task-unknown"] = {"session_name": session_name, "bb_session_id": None}
+        with (
+            patch("tools.browser_tool._socket_safe_tmpdir", return_value=str(tmp_path)),
+            patch("tools.browser_tool._maybe_stop_recording"),
+            patch("tools.browser_tool._run_browser_command", return_value={"success": True}),
+            patch("tools.process_registry.ProcessRegistry._safe_host_start_time", return_value=None),
+            patch("tools.process_registry.ProcessRegistry._terminate_host_pid", return_value=False) as terminate,
+        ):
+            browser_tool.cleanup_browser("task-unknown")
+        terminate.assert_not_called()
+        assert socket_dir.exists()

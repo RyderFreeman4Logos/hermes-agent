@@ -1862,14 +1862,21 @@ def _reap_orphaned_browser_sessions():
         # (renderer, GPU, etc.) are cleaned up, not just the daemon parent.
         try:
             from tools.process_registry import ProcessRegistry
-            ProcessRegistry._terminate_host_pid(daemon_pid)
+            daemon_start = ProcessRegistry._safe_host_start_time(daemon_pid)
+            if daemon_start is None:
+                logger.warning("Retaining browser control path for pid %d: identity is unknown", daemon_pid)
+                continue
+            if not ProcessRegistry._terminate_host_pid(daemon_pid, daemon_start):
+                logger.warning("Retaining browser control path for pid %d: termination was unconfirmed", daemon_pid)
+                continue
             logger.info("Reaped orphaned browser daemon PID %d (session %s)",
                         daemon_pid, session_name)
             reaped += 1
         except (ProcessLookupError, PermissionError, OSError):
-            pass
+            logger.warning("Retaining browser control path for pid %d: termination failed", daemon_pid)
+            continue
 
-        # Clean up the socket directory
+        # Only a confirmed identity-bound termination may remove control state.
         shutil.rmtree(socket_dir, ignore_errors=True)
 
     if reaped:
@@ -4572,10 +4579,17 @@ def _cleanup_single_browser_session(task_id: str) -> None:
                     try:
                         from tools.process_registry import ProcessRegistry
                         daemon_pid = int(Path(pid_file).read_text(encoding="utf-8").strip())
-                        ProcessRegistry._terminate_host_pid(daemon_pid)
+                        daemon_start = ProcessRegistry._safe_host_start_time(daemon_pid)
+                        if daemon_start is None:
+                            logger.warning("Retaining browser control path for %s: daemon identity is unknown", session_name)
+                            return
+                        if not ProcessRegistry._terminate_host_pid(daemon_pid, daemon_start):
+                            logger.warning("Retaining browser control path for %s: daemon termination was unconfirmed", session_name)
+                            return
                         logger.debug("Killed daemon pid %s for %s", daemon_pid, session_name)
                     except (ProcessLookupError, ValueError, PermissionError, OSError):
-                        logger.debug("Could not kill daemon pid for %s (already dead or inaccessible)", session_name)
+                        logger.warning("Retaining browser control path for %s: daemon cleanup failed", session_name)
+                        return
                 shutil.rmtree(socket_dir, ignore_errors=True)
 
         logger.debug("Removed task %s from active sessions", task_id)

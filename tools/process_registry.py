@@ -173,6 +173,8 @@ class ProcessSession:
     _signal_delivery_confirmed: bool = field(default=False, repr=False)
     _terminal_generation: int = field(default=0, repr=False)
     _completion_published: bool = field(default=False, repr=False)
+    _completion_durable: bool = field(default=False, repr=False)
+    _checkpoint_retry_attempts: int = field(default=0, repr=False)
 
 
 class ProcessRegistry:
@@ -696,7 +698,6 @@ class ProcessRegistry:
         MATCH and UNKNOWN both retain live ownership. Only explicit
         GONE_OR_MISMATCH (or confirmed dead) is non-live.
         """
-        cls._host_kill_delivery.delivered = False
         identity = cls._host_pid_identity(pid, expected_start)
         if identity == cls._PID_GONE_OR_MISMATCH:
             return False
@@ -1016,6 +1017,9 @@ class ProcessRegistry:
         POSIX and a missing ``taskkill.exe`` on Windows (effectively
         unreachable on real Windows installs, but cheap insurance).
         """
+        # Delivery evidence belongs to this attempt only; never let a prior signal
+        # attribute a later mismatch, UNKNOWN, or natural exit as killed.
+        cls._host_kill_delivery.delivered = False
         identity = cls._host_pid_identity(pid, expected_start)
         if identity is cls._PID_GONE_OR_MISMATCH or identity == cls._PID_GONE_OR_MISMATCH:
             # PID was recycled (start time changed) or is gone — never signal a
@@ -1286,21 +1290,26 @@ class ProcessRegistry:
         bg_env["PYTHONUNBUFFERED"] = "1"
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
 
-        proc = subprocess.Popen(
-            _supervised_local_argv(
-                [user_shell, "-lic", f"set +m; {safe_command}"]
-            ),
-            text=True,
-            cwd=session.cwd,
-            env=bg_env,
-            encoding="utf-8",
-            errors="replace",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
-            **_popen_kwargs,
-        )
+        try:
+            proc = subprocess.Popen(
+                _supervised_local_argv(
+                    [user_shell, "-lic", f"set +m; {safe_command}"]
+                ),
+                text=True,
+                cwd=session.cwd,
+                env=bg_env,
+                encoding="utf-8",
+                errors="replace",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+                **_popen_kwargs,
+            )
+        except BaseException:
+            # No child exists, so ownership was never consumed: release it exactly once.
+            self._release_session_id(session.id)
+            raise
 
         session.process = proc
         session.pid = proc.pid
@@ -1412,10 +1421,11 @@ class ProcessRegistry:
             f"cat {quoted_pid_path}"
         )
 
-        # N2: provisional public owner BEFORE nonlocal side effects so a
-        # post-dispatch fault cannot orphan an untracked sandbox child.
-        if not defer_registration:
-            self._publish_provisional_owner(session)
+        # N2: every nonlocal launch gets a recoverable owner before dispatch,
+        # including inline/deferred launches whose caller has not received session yet.
+        self._publish_provisional_owner(session)
+        self._write_checkpoint()
+        self._arm_execution_deadline(session)
 
         try:
             result = env.execute(
@@ -1423,6 +1433,8 @@ class ProcessRegistry:
                 timeout=timeout,
                 rewrite_compound_background=False,
             )
+            if not isinstance(result, dict):
+                raise TypeError("nonlocal launch returned no result mapping")
         except BaseException as e:
             # Post-dispatch Exception/BaseException: launch state is unknown.
             # Publish provisional owner when deferred, try one bounded recovery
@@ -1889,25 +1901,24 @@ class ProcessRegistry:
                 monitored_start = session.host_start_time
             if monitored_pid is None or monitored_start is None:
                 # Child-writable artifacts cannot establish monitor authority.
-                check_command = "exit 2"
+                check_command = "echo UNKNOWN"
             else:
                 check_command = (
                     f"pid={int(monitored_pid)}; "
-                    f"current=$(sed 's/^.*) //' \"/proc/{int(monitored_pid)}/stat\" 2>/dev/null | "
+                    f"if ! kill -0 \"$pid\" 2>/dev/null; then echo GONE; "
+                    f"else current=$(sed 's/^.*) //' \"/proc/{int(monitored_pid)}/stat\" 2>/dev/null | "
                     f"cut -d ' ' -f 20); "
-                    f'if [ -n "$pid" ] && '
-                    f'[ "$current" = "{int(monitored_start)}" ] && '
-                    f'kill -0 "$pid" 2>/dev/null; '
-                    f"then echo 0; else echo 1; fi"
+                    f"if [ -z \"$current\" ]; then echo UNKNOWN; "
+                    f"elif [ \"$current\" = \"{int(monitored_start)}\" ]; then echo MATCH; "
+                    f"else echo GONE; fi; fi"
                 )
             check = env.execute(check_command, timeout=5)
-            check_output = (
-                str(check.get("output", "")).strip()
-                if isinstance(check, dict) and check.get("returncode") == 0
-                else ""
-            )
-            process_exited = bool(
-                check_output and check_output.splitlines()[-1].strip() != "0"
+            identity_state = (
+                str(check.get("output", "")).strip().splitlines()[-1].strip()
+                if isinstance(check, dict)
+                and check.get("returncode") == 0
+                and str(check.get("output", "")).strip() in {"MATCH", "GONE", "UNKNOWN"}
+                else "UNKNOWN"
             )
 
             log_command = (
@@ -1961,7 +1972,7 @@ class ProcessRegistry:
                 else None
             )
             exit_missing_after_identity_gone = bool(
-                process_exited
+                identity_state == "GONE"
                 and isinstance(exit_returncode, int)
                 and not isinstance(exit_returncode, bool)
                 and exit_returncode == 1
@@ -1969,7 +1980,7 @@ class ProcessRegistry:
             # N8: child-writable exit/pid artifacts cannot alone prove terminal.
             # Require identity gone/mismatch (or confirmed missing exit after
             # identity gone). If identity is still alive/unknown, refuse.
-            identity_gone = bool(process_exited)
+            identity_gone = identity_state == "GONE"
             if not identity_gone:
                 # Live identity: never promote child-writable exit artifact alone.
                 return previous_output_length
@@ -2114,18 +2125,42 @@ class ProcessRegistry:
             with self._lock:
                 self._checkpoint_durable_generation = self._session_generation
             self._publish_durable_completions()
-        session._completion_event.set()
+        elif checkpoint_written is False:
+            self._schedule_checkpoint_retry(session)
+
+    def _schedule_checkpoint_retry(self, session: ProcessSession) -> None:
+        """Retry a terminal checkpoint a few times without publishing early."""
+        with session._lock:
+            if session._checkpoint_retry_attempts >= 3:
+                logger.warning(
+                    "Terminal checkpoint for %s is still not durable after 3 retries; "
+                    "completion remains withheld and the finished owner is retained.",
+                    session.id,
+                )
+                return
+            session._checkpoint_retry_attempts += 1
+
+        def retry() -> None:
+            if self._write_checkpoint():
+                return
+            self._schedule_checkpoint_retry(session)
+
+        timer = threading.Timer(0.05, retry)
+        timer.daemon = True
+        timer.start()
 
     def _publish_durable_completions(self) -> None:
-        """Publish terminal notifications only after their absence is durable."""
+        """Release completion events and fanout only after a durable terminal snapshot."""
         with self._lock:
-            sessions = [
-                session
-                for session in self._finished.values()
-                if session.notify_on_complete
-                and not session._completion_published
+            durable = [
+                session for session in self._finished.values()
+                if not session._completion_durable
                 and session._terminal_generation <= self._checkpoint_durable_generation
             ]
+            for session in durable:
+                session._completion_durable = True
+                session._completion_event.set()
+            sessions = [session for session in durable if session.notify_on_complete]
             for session in sessions:
                 session._completion_published = True
 

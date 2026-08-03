@@ -633,7 +633,7 @@ class TestSpawnEnvSanitization:
             def __init__(self):
                 self.commands = []
                 self._responses = iter([
-                    {"output": "1\n", "returncode": 0},
+                    {"output": "MATCH\n", "returncode": 0},
                     {"output": "hello\n", "returncode": 0},
                     {"output": "0\n", "returncode": 0},
                 ])
@@ -654,12 +654,12 @@ class TestSpawnEnvSanitization:
 
         assert env.commands[0][0] == (
             "pid=4242; "
-            "current=$(sed 's/^.*) //' \"/proc/4242/stat\" 2>/dev/null | "
+            'if ! kill -0 "$pid" 2>/dev/null; then echo GONE; '
+            "else current=$(sed 's/^.*) //' \"/proc/4242/stat\" 2>/dev/null | "
             "cut -d ' ' -f 20); "
-            'if [ -n "$pid" ] && '
-            '[ "$current" = "77" ] && '
-            'kill -0 "$pid" 2>/dev/null; '
-            "then echo 0; else echo 1; fi"
+            'if [ -z "$current" ]; then echo UNKNOWN; '
+            'elif [ "$current" = "77" ]; then echo MATCH; '
+            "else echo GONE; fi; fi"
         )
         assert env.commands[1][0] == (
             "if [ -f '/path with spaces/hermes_bg.log' ]; then "
@@ -2017,7 +2017,7 @@ class _ArtifactEnv:
     def execute(self, command, timeout=None):
         self.commands.append(command)
         if "kill -0" in command:
-            return {"output": "1\n", "returncode": 0}
+            return {"output": "GONE\n", "returncode": 0}
         if ".exit" in command:
             return {"output": self.payload, "returncode": self.exit_returncode}
         return {"output": "", "returncode": 0}
@@ -2103,7 +2103,7 @@ def test_nonlocal_log_transport_and_payload_stay_bounded_after_retention_limit(
         def execute(self, command, timeout=None):
             commands.append(command)
             if "kill -0" in command:
-                return {"output": "0\n", "returncode": 0}
+                return {"output": "MATCH\n", "returncode": 0}
             if ".log" in command:
                 if "tail -c" in command:
                     output = (
@@ -2624,7 +2624,7 @@ class TestN8ChildWritableArtifactNotTerminalAlone:
                     return {"output": "0", "returncode": 0}
                 # identity check: process still present (returncode 0)
                 if "kill -0" in command or "/proc/" in command:
-                    return {"output": "0", "returncode": 0}
+                    return {"output": "MATCH", "returncode": 0}
                 return {"output": "", "returncode": 0}
 
         registry = ProcessRegistry()
@@ -2667,7 +2667,7 @@ class TestN8ChildWritableArtifactNotTerminalAlone:
                     return {"output": "9999\n", "returncode": 0}
                 if "kill -0" in command or "/proc/" in command:
                     # In-memory owned identity is still live/MATCH.
-                    return {"output": "0", "returncode": 0}
+                    return {"output": "MATCH", "returncode": 0}
                 return {"output": "", "returncode": 0}
 
         registry = ProcessRegistry()
@@ -2688,3 +2688,117 @@ class TestN8ChildWritableArtifactNotTerminalAlone:
         assert registry.get(session.id) is session
         # No monitor authority from child-writable pid_path.
         assert not any("head -n 1" in c for c in env.calls if "kill -0" in c or "/proc/" in c)
+
+
+class TestStaleTier4FinalLifecycleRegressions:
+    def test_n2_deferred_none_result_keeps_owned_reservation_consumed(self, monkeypatch):
+        class NoneEnv:
+            def execute(self, *_args, **_kwargs):
+                return None
+
+        registry = ProcessRegistry()
+        monkeypatch.setattr(registry, "_poll_env_once", lambda *_args: 0)
+        monkeypatch.setattr("tools.process_registry.threading.Thread", MagicMock())
+        with pytest.raises(Exception):
+            registry.spawn_via_env(NoneEnv(), "echo hi", defer_registration=True)
+        assert len(registry._running) + len(registry._finished) == 1
+        assert not registry._reserved_ids
+
+    def test_n3_local_popen_error_releases_unowned_reservation(self, monkeypatch):
+        registry = ProcessRegistry()
+        monkeypatch.setattr("tools.process_registry._find_shell", lambda: "/bin/sh")
+        monkeypatch.setattr("tools.process_registry.subprocess.Popen", MagicMock(side_effect=OSError("no slots")))
+        with pytest.raises(OSError, match="no slots"):
+            registry.spawn_local("echo hi", cwd="/tmp")
+        assert not registry._running
+        assert not registry._finished
+        assert not registry._reserved_ids
+
+    def test_n7_transient_checkpoint_failure_retries_before_event_and_fanout(self, tmp_path, monkeypatch):
+        from tools import process_registry as pr
+        import utils
+
+        monkeypatch.setattr(pr, "CHECKPOINT_PATH", tmp_path / "checkpoint.json")
+        writes = []
+        real_write = utils.atomic_json_write
+        def flaky_write(path, data):
+            writes.append(data)
+            if len(writes) == 1:
+                raise OSError("transient disk full")
+            return real_write(path, data)
+        monkeypatch.setattr(utils, "atomic_json_write", flaky_write)
+        registry = ProcessRegistry()
+        while not registry.completion_queue.empty():
+            registry.completion_queue.get_nowait()
+        session = ProcessSession(id="proc_n7_retry", command="done", notify_on_complete=True)
+        registry._publish_provisional_owner(session)
+        registry._move_to_finished(session)
+        assert not session._completion_event.is_set()
+        assert registry.completion_queue.empty()
+        assert session._completion_event.wait(2)
+        assert len(writes) >= 2
+        assert registry.completion_queue.get(timeout=2)["session_id"] == session.id
+        assert registry.completion_queue.empty()
+
+    def test_n7_permanent_checkpoint_failure_is_bounded_without_publication(self, tmp_path, monkeypatch):
+        from tools import process_registry as pr
+        import utils
+
+        monkeypatch.setattr(pr, "CHECKPOINT_PATH", tmp_path / "checkpoint.json")
+        writes = []
+        def failing_write(*_args):
+            writes.append(1)
+            raise OSError("disk full")
+        monkeypatch.setattr(utils, "atomic_json_write", failing_write)
+        registry = ProcessRegistry()
+        while not registry.completion_queue.empty():
+            registry.completion_queue.get_nowait()
+        session = ProcessSession(id="proc_n7_permanent", command="done", notify_on_complete=True)
+        registry._publish_provisional_owner(session)
+        registry._move_to_finished(session)
+        time.sleep(0.35)
+        assert not session._completion_event.is_set()
+        assert registry.completion_queue.empty()
+        assert len(writes) <= 4
+        assert registry._finished[session.id] is session
+
+    def test_n6_attempt_resets_stale_delivery_and_live_probe_preserves_new_evidence(self, monkeypatch):
+        from tools import process_registry as pr
+
+        pr.ProcessRegistry._host_kill_delivery.delivered = True
+        monkeypatch.setattr(pr.ProcessRegistry, "_host_pid_identity", classmethod(lambda cls, *_args: cls._PID_UNKNOWN))
+        assert pr.ProcessRegistry._terminate_host_pid(9876, 1) is False
+        assert not pr.ProcessRegistry._host_kill_delivery_confirmed()
+        pr.ProcessRegistry._host_kill_delivery.delivered = True
+        monkeypatch.setattr(pr.ProcessRegistry, "_host_pid_identity", classmethod(lambda cls, *_args: cls._PID_GONE_OR_MISMATCH))
+        assert not pr.ProcessRegistry._host_process_is_live(9876, 1)
+        assert pr.ProcessRegistry._host_kill_delivery_confirmed()
+
+    def test_n6_windows_delivery_survives_real_live_probe(self, monkeypatch):
+        from tools import process_registry as pr
+
+        states = iter([pr.ProcessRegistry._PID_MATCH, pr.ProcessRegistry._PID_GONE_OR_MISMATCH])
+        monkeypatch.setattr(pr, "_IS_WINDOWS", True)
+        monkeypatch.setattr(pr.ProcessRegistry, "_host_pid_identity", classmethod(lambda cls, *_args: next(states)))
+        monkeypatch.setattr(pr.subprocess, "run", lambda *_args, **_kwargs: MagicMock(returncode=0))
+        assert pr.ProcessRegistry._terminate_host_pid(9877, 1) is True
+        assert pr.ProcessRegistry._host_kill_delivery_confirmed()
+
+    def test_n8_ambiguous_identity_with_exit_artifact_stays_running(self):
+        class AmbiguousEnv:
+            def execute(self, command, **_kwargs):
+                if "head -c 5" in command:
+                    return {"output": "0\\n", "returncode": 0}
+                if "tail -c" in command or "wc -c" in command:
+                    return {"output": "", "returncode": 0}
+                if "kill -0" in command or "/proc/" in command:
+                    return {"output": "1\\n", "returncode": 0}
+                return {"output": "", "returncode": 0}
+
+        registry = ProcessRegistry()
+        env = AmbiguousEnv()
+        session = ProcessSession(id="proc_n8_ambiguous", command="cmd", pid=123, host_start_time=1, env_ref=env, pid_scope="sandbox")
+        registry._publish_provisional_owner(session)
+        registry._poll_env_once(session, env, *registry._env_artifact_paths(env, session.id), 0)
+        assert not session.exited
+        assert registry.get(session.id) is session

@@ -355,3 +355,27 @@ class TestEmergencyCleanupRunsReaper:
         assert reaper_called, (
             "Reaper must run on exit even with no active sessions"
         )
+
+
+    def test_identity_bound_termination_only_reaps_after_success(self, fake_tmpdir):
+        from tools.browser_tool import _reap_orphaned_browser_sessions
+
+        d = _make_socket_dir(fake_tmpdir, "h_identity_bound", pid=12345)
+        with patch("gateway.status._pid_exists", return_value=True), \
+             patch("tools.browser_tool._verify_reapable_browser_daemon", return_value=True), \
+             patch("tools.process_registry.ProcessRegistry._safe_host_start_time", return_value=77), \
+             patch("tools.process_registry.ProcessRegistry._terminate_host_pid", side_effect=lambda pid, expected: pid == 12345 and expected == 77):
+            _reap_orphaned_browser_sessions()
+        assert not d.exists()
+
+    def test_unknown_identity_retains_orphan_control_path(self, fake_tmpdir):
+        from tools.browser_tool import _reap_orphaned_browser_sessions
+
+        d = _make_socket_dir(fake_tmpdir, "h_identity_unknown", pid=12345)
+        with patch("gateway.status._pid_exists", return_value=True), \
+             patch("tools.browser_tool._verify_reapable_browser_daemon", return_value=True), \
+             patch("tools.process_registry.ProcessRegistry._safe_host_start_time", return_value=None), \
+             patch("tools.process_registry.ProcessRegistry._terminate_host_pid") as terminate:
+            _reap_orphaned_browser_sessions()
+        terminate.assert_not_called()
+        assert d.exists()

@@ -167,6 +167,8 @@ class ProcessSession:
     _subreaper_managed: bool = field(default=False, repr=False)
     _termination_in_progress: bool = field(default=False, repr=False)
     _deadline_fallback_started: bool = field(default=False, repr=False)
+    _registry_generation: int = field(default=0, repr=False)
+    _signal_delivery_confirmed: bool = field(default=False, repr=False)
 
 
 class ProcessRegistry:
@@ -242,6 +244,11 @@ class ProcessRegistry:
         # terminal tab. Distinct from kill — the process keeps running; only the
         # UI view is dropped (the user can reopen it from the status stack).
         self.on_close = None
+        # Monotonic generation for deadline callbacks and checkpoint fencing.
+        self._session_generation = 0
+        self._checkpoint_lock = threading.Lock()
+        self._checkpoint_generation = 0
+        self._reserved_ids: set = set()
 
     @staticmethod
     def _clean_shell_noise(text: str) -> str:
@@ -250,6 +257,65 @@ class ProcessRegistry:
         while lines and any(noise in lines[0] for noise in ProcessRegistry._SHELL_NOISE_SUBSTRINGS):
             lines.pop(0)
         return "\n".join(lines)
+
+    def _allocate_session_id(self) -> str:
+        """Atomically reserve a unique session id before any side effect.
+
+        Collision must not leak a candidate or return a foreign id; retry with
+        a fresh uuid under the registry lock until the id is free in both
+        running and finished maps and not already reserved.
+        """
+        with self._lock:
+            for _ in range(64):
+                candidate = f"proc_{uuid.uuid4().hex[:12]}"
+                if (
+                    candidate in self._running
+                    or candidate in self._finished
+                    or candidate in self._reserved_ids
+                ):
+                    continue
+                self._reserved_ids.add(candidate)
+                return candidate
+            raise RuntimeError("Could not allocate a unique process session id")
+
+    def _release_session_id(self, session_id: str) -> None:
+        with self._lock:
+            self._reserved_ids.discard(session_id)
+
+    def _publish_provisional_owner(
+        self,
+        session: ProcessSession,
+        *,
+        allow_finished: bool = False,
+    ) -> None:
+        """Publish a still-unfinished session before nonlocal side effects.
+
+        Callers that perform sandbox execute/spawn after this point must already
+        own a registry slot so post-dispatch faults can keep or contain the
+        identity rather than orphaning an untracked child.
+        """
+        with session._lock:
+            with self._lock:
+                running_owner = self._running.get(session.id)
+                finished_owner = self._finished.get(session.id)
+                if running_owner is not None and running_owner is not session:
+                    raise RuntimeError(f"Process identity collision for {session.id}")
+                if finished_owner is not None and finished_owner is not session:
+                    raise RuntimeError(f"Process identity collision for {session.id}")
+                if finished_owner is session and not allow_finished:
+                    return
+                if running_owner is session:
+                    return
+                self._session_generation += 1
+                session._registry_generation = self._session_generation
+                self._prune_if_needed()
+                self._running[session.id] = session
+                self._reserved_ids.discard(session.id)
+
+    def _deadline_target_is_current(self, session: ProcessSession) -> bool:
+        """True only when the expected session object still owns its registry id."""
+        with self._lock:
+            return self._running.get(session.id) is session
 
     def _emit_output(self, session: ProcessSession, chunk: str) -> None:
         """Forward a freshly-read chunk to the live-output sink, if one is set.
@@ -501,29 +567,47 @@ class ProcessRegistry:
         except Exception:
             return None
 
+    # Host PID identity outcomes for signal/terminal decisions.
+    _PID_MATCH = "MATCH"
+    _PID_GONE_OR_MISMATCH = "GONE_OR_MISMATCH"
+    _PID_UNKNOWN = "UNKNOWN"
+
     @classmethod
-    def _host_pid_is_ours(cls, pid: Optional[int], expected_start: Optional[int]) -> bool:
-        """True unless the host PID is known absent or has a mismatched identity.
+    def _host_pid_identity(
+        cls, pid: Optional[int], expected_start: Optional[int]
+    ) -> str:
+        """Classify host PID ownership without collapsing UNKNOWN into MATCH.
 
         The kernel recycles PID/PGID numbers once a process exits and is reaped,
-        so a stored PID can later name an *unrelated* process — observed in the
-        wild as a recycled number landing on a desktop browser's session leader,
-        which our tree-kill then SIGTERMs (Firefox dying at irregular intervals).
-        We compare the kernel start time captured at spawn against the live one;
-        a mismatch means the number was recycled and must never be signalled.
+        so a stored PID can later name an *unrelated* process.  Compare the
+        kernel start time captured at spawn against the live one; a mismatch
+        means the number was recycled and must never be signalled.
 
-        When no baseline was captured (legacy checkpoints, or platforms without
-        ``/proc``) we degrade to a bare liveness check rather than refusing to
-        act, preserving prior best-effort behaviour.
+        Returns one of:
+          MATCH — live and identity matches (or no baseline on platforms
+                  without start-time support where liveness is the only probe)
+          GONE_OR_MISMATCH — known absent or start-time mismatch
+          UNKNOWN — live but identity unreadable / ambiguous; never signal
         """
+        if not pid:
+            return cls._PID_GONE_OR_MISMATCH
         if not cls._is_host_pid_alive(pid):
-            return False
+            return cls._PID_GONE_OR_MISMATCH
         if expected_start is None:
-            return True
+            # Legacy / non-/proc platforms: bare liveness is the only evidence.
+            return cls._PID_MATCH
         current_start = cls._safe_host_start_time(pid)
-        # An unreadable identity is unknown, not evidence that our process is
-        # gone.  Keep ownership and let a later probe reconcile it.
-        return current_start is None or current_start == expected_start
+        if current_start is None:
+            # Live but unreadable identity — not permission to signal.
+            return cls._PID_UNKNOWN
+        if current_start == expected_start:
+            return cls._PID_MATCH
+        return cls._PID_GONE_OR_MISMATCH
+
+    @classmethod
+    def _host_pid_is_ours(cls, pid: Optional[int], expected_start: Optional[int]) -> bool:
+        """Compatibility shim: True only on explicit MATCH (signal-safe)."""
+        return cls._host_pid_identity(pid, expected_start) == cls._PID_MATCH
 
     def _refresh_detached_session(self, session: Optional[ProcessSession]) -> Optional[ProcessSession]:
         """Update recovered host-PID sessions when the underlying process has exited."""
@@ -533,7 +617,9 @@ class ProcessRegistry:
         # Identity-aware liveness: a recycled PID (alive but a different process
         # than we spawned) must be treated as "our process exited", so it is
         # moved to finished and can never be tree-killed by a later kill().
-        if self._host_pid_is_ours(session.pid, session.host_start_time):
+        # UNKNOWN identity retains ownership (N1) — never treat unreadable as gone.
+        identity = self._host_pid_identity(session.pid, session.host_start_time)
+        if identity in (self._PID_MATCH, self._PID_UNKNOWN):
             return session
 
         with session._lock:
@@ -597,15 +683,22 @@ class ProcessRegistry:
 
     @classmethod
     def _host_process_is_live(cls, pid: int, expected_start: Optional[int]) -> bool:
-        """Return whether the same host process is alive and not a zombie."""
-        if expected_start is not None:
-            current_start = cls._safe_host_start_time(pid)
-            if current_start is not None and current_start != expected_start:
-                return False
+        """Return whether the same host process is still a live ownership risk.
+
+        MATCH and UNKNOWN both retain live ownership. Only explicit
+        GONE_OR_MISMATCH (or confirmed dead) is non-live.
+        """
+        identity = cls._host_pid_identity(pid, expected_start)
+        if identity == cls._PID_GONE_OR_MISMATCH:
+            return False
+        if identity == cls._PID_UNKNOWN:
+            # Unreadable identity while PID appears present: retain as live.
+            return True
+        # MATCH — still require non-zombie when psutil can answer.
         try:
             import psutil
         except Exception:
-            return cls._host_pid_is_ours(pid, expected_start)
+            return True
         try:
             process = psutil.Process(pid)
             if not process.is_running():
@@ -614,9 +707,8 @@ class ProcessRegistry:
         except psutil.NoSuchProcess:
             return False
         except Exception:
-            # Permission/start-time faults are unknown while kill(0) still
-            # sees the PID; never turn that uncertainty into terminal state.
-            return cls._host_pid_is_ours(pid, expected_start)
+            # Permission/status faults are unknown; never forge terminal gone.
+            return True
 
     def _local_descendants_settled(
         self, session: ProcessSession, *, include_subreaper: bool = False
@@ -729,6 +821,8 @@ class ProcessRegistry:
                         if session._completion_event.wait(timeout=remaining):
                             return
                         continue
+                    if not self._deadline_target_is_current(session):
+                        return
                     result = self.kill_process(
                         session.id,
                         source="execution_timeout",
@@ -761,6 +855,21 @@ class ProcessRegistry:
 
     def _arm_execution_deadline(self, session: ProcessSession) -> None:
         """Terminate a managed process tree when its absolute deadline expires."""
+        expected_generation = session._registry_generation
+
+        def _deadline_fire() -> None:
+            # Bind the ProcessSession object + generation: only fire when the
+            # same object still owns this registry id (N4).
+            if session._registry_generation != expected_generation:
+                return
+            if not self._deadline_target_is_current(session):
+                return
+            self.kill_process(
+                session.id,
+                source="execution_timeout",
+                consume_output=False,
+            )
+
         with session._lock:
             if (
                 session.execution_deadline is None
@@ -770,9 +879,7 @@ class ProcessRegistry:
                 return
             timer = threading.Timer(
                 max(0.0, session.execution_deadline - time.time()),
-                self.kill_process,
-                args=(session.id,),
-                kwargs={"source": "execution_timeout", "consume_output": False},
+                _deadline_fire,
             )
             timer.daemon = True
             session._deadline_timer = timer
@@ -854,15 +961,26 @@ class ProcessRegistry:
         POSIX and a missing ``taskkill.exe`` on Windows (effectively
         unreachable on real Windows installs, but cheap insurance).
         """
-        if expected_start is not None and not cls._host_pid_is_ours(pid, expected_start):
+        identity = cls._host_pid_identity(pid, expected_start)
+        if identity is cls._PID_GONE_OR_MISMATCH or identity == cls._PID_GONE_OR_MISMATCH:
             # PID was recycled (start time changed) or is gone — never signal a
             # stranger. A leaked orphan is strictly preferable to killing e.g.
             # a browser whose session leader reused this dead session's PID.
+            # Confirmed-gone for callers that treat return True as "nothing left".
+            if not cls._is_host_pid_alive(pid):
+                return True
             logger.warning(
                 "Refusing to terminate host pid %d: start-time mismatch — "
                 "PID was recycled onto an unrelated process.", pid,
             )
             return True
+        if identity is cls._PID_UNKNOWN or identity == cls._PID_UNKNOWN:
+            # Live but identity unreadable: do not signal; unknown is not gone.
+            logger.warning(
+                "Refusing to terminate host pid %d: process identity is unknown.",
+                pid,
+            )
+            return False
         if _IS_WINDOWS:
             try:
                 subprocess.run(
@@ -1020,8 +1138,9 @@ class ProcessRegistry:
         safe_command = _rewrite_bg(command)
 
         started_at = time.time()
+        session_id = self._allocate_session_id()
         session = ProcessSession(
-            id=f"proc_{uuid.uuid4().hex[:12]}",
+            id=session_id,
             command=command,
             task_id=task_id,
             session_key=session_key,
@@ -1066,10 +1185,7 @@ class ProcessRegistry:
                 session._reader_thread = reader
 
                 if not defer_registration:
-                    with self._lock:
-                        self._prune_if_needed()
-                        self._running[session.id] = session
-
+                    self._publish_provisional_owner(session)
                     self._write_checkpoint()
                     self._arm_execution_deadline(session)
                 reader.start()
@@ -1142,10 +1258,7 @@ class ProcessRegistry:
             session._reader_thread = reader
 
             if not defer_registration:
-                with self._lock:
-                    self._prune_if_needed()
-                    self._running[session.id] = session
-
+                self._publish_provisional_owner(session)
                 self._write_checkpoint()
                 self._arm_execution_deadline(session)
             reader.start()
@@ -1160,6 +1273,8 @@ class ProcessRegistry:
                 )
             except BaseException:
                 logger.exception("Local spawn containment also failed")
+            if self._running.get(session.id) is not session:
+                self._release_session_id(session.id)
             raise
 
         return session
@@ -1191,8 +1306,9 @@ class ProcessRegistry:
         discard after an inline wait.
         """
         started_at = time.time()
+        session_id = self._allocate_session_id()
         session = ProcessSession(
-            id=f"proc_{uuid.uuid4().hex[:12]}",
+            id=session_id,
             command=command,
             task_id=task_id,
             session_key=session_key,
@@ -1232,45 +1348,101 @@ class ProcessRegistry:
             f"cat {quoted_pid_path}"
         )
 
+        # N2: provisional public owner BEFORE nonlocal side effects so a
+        # post-dispatch fault cannot orphan an untracked sandbox child.
+        if not defer_registration:
+            self._publish_provisional_owner(session)
+
         try:
             result = env.execute(
                 bg_command,
                 timeout=timeout,
                 rewrite_compound_background=False,
             )
-            output = result.get("output", "").strip()
-            # The first numeric line is the PID; the second is its /proc
-            # start-time identity captured by the spawning wrapper.
-            identities = [
-                int(line.strip())
-                for line in output.splitlines()
-                if line.strip().isdigit()
-            ]
-            if identities:
-                session.pid = identities[0]
-            if len(identities) > 1:
-                session.host_start_time = identities[1]
-            # If the wrapper couldn't produce a PID (for example, syntax
-            # error or broken redirect), treat it as a failed launch instead
-            # of exposing a fake running session.
-            if session.pid is None:
-                session.exited = True
-                returncode = result.get("returncode")
-                session.exit_code = (
-                    returncode
-                    if isinstance(returncode, int) and 1 <= returncode <= 255
-                    else None
+        except BaseException as e:
+            # Post-dispatch Exception/BaseException: launch state is unknown.
+            # Publish provisional owner when deferred, try one bounded recovery
+            # poll, retain owner/deadline when a child may exist, then rethrow.
+            with session._lock:
+                session.poll_error = f"{type(e).__name__}: {e}"
+            if self._running.get(session.id) is not session:
+                try:
+                    self._publish_provisional_owner(session)
+                except BaseException:
+                    logger.exception(
+                        "Could not publish provisional owner after nonlocal launch fault"
+                    )
+            try:
+                with session._lock:
+                    previous_output_length = len(session.output_buffer)
+                self._poll_env_once(
+                    session, env, log_path, pid_path, exit_path, previous_output_length
                 )
-                session.completion_reason = "failed_start"
-                session.termination_source = "failed_start"
-                session.output_buffer = result.get("output", "").strip()
-                session.output_size = len(session.output_buffer)
-        except Exception as e:
+            except Exception as poll_exc:
+                logger.debug(
+                    "Bounded launch-unknown recovery poll failed for %s: %s",
+                    session.id,
+                    poll_exc,
+                )
+            if not session.exited:
+                try:
+                    self._write_checkpoint()
+                    self._arm_execution_deadline(session)
+                except BaseException:
+                    logger.exception(
+                        "Could not retain deadline after nonlocal launch fault for %s",
+                        session.id,
+                    )
+                if session._reader_thread is None:
+                    try:
+                        reader = threading.Thread(
+                            target=self._env_poller_loop,
+                            args=(session, env, log_path, pid_path, exit_path),
+                            daemon=True,
+                            name=f"proc-poller-{session.id}",
+                        )
+                        session._reader_thread = reader
+                        reader.start()
+                    except BaseException:
+                        logger.exception(
+                            "Nonlocal poller start failed after launch-unknown"
+                        )
+            else:
+                try:
+                    self._move_to_finished(session)
+                except Exception:
+                    logger.debug(
+                        "Could not finish recovered session after launch fault",
+                        exc_info=True,
+                    )
+            raise
+
+        output = result.get("output", "").strip()
+        # The first numeric line is the PID; the second is its /proc
+        # start-time identity captured by the spawning wrapper.
+        identities = [
+            int(line.strip())
+            for line in output.splitlines()
+            if line.strip().isdigit()
+        ]
+        if identities:
+            session.pid = identities[0]
+        if len(identities) > 1:
+            session.host_start_time = identities[1]
+        # If the wrapper couldn't produce a PID (for example, syntax
+        # error or broken redirect), treat it as a failed launch instead
+        # of exposing a fake running session.
+        if session.pid is None:
             session.exited = True
-            session.exit_code = None
+            returncode = result.get("returncode")
+            session.exit_code = (
+                returncode
+                if isinstance(returncode, int) and 1 <= returncode <= 255
+                else None
+            )
             session.completion_reason = "failed_start"
             session.termination_source = "failed_start"
-            session.output_buffer = f"Failed to start: {e}"
+            session.output_buffer = result.get("output", "").strip()
             session.output_size = len(session.output_buffer)
 
         reader = None
@@ -1284,13 +1456,11 @@ class ProcessRegistry:
             )
             session._reader_thread = reader
 
-        if not defer_registration:
-            with self._lock:
-                self._prune_if_needed()
-                self._running[session.id] = session
-
         if session.exited:
-            self._move_to_finished(session)
+            if not defer_registration or self._running.get(session.id) is session:
+                self._move_to_finished(session)
+            else:
+                self._release_session_id(session.id)
         else:
             if not defer_registration:
                 self._write_checkpoint()
@@ -1379,8 +1549,11 @@ class ProcessRegistry:
                 session._completion_event.clear()
                 if running_owner is session:
                     return True
+                self._session_generation += 1
+                session._registry_generation = self._session_generation
                 self._prune_if_needed()
                 self._running[session.id] = session
+                self._reserved_ids.discard(session.id)
                 newly_registered = True
         if newly_registered:
             self._arm_execution_deadline(session)
@@ -1445,7 +1618,10 @@ class ProcessRegistry:
                             "error": f"Process identity collision for {session.id}",
                             "session_id": session.id,
                         }
+                    self._session_generation += 1
+                    session._registry_generation = self._session_generation
                     self._running[session.id] = session
+                    self._reserved_ids.discard(session.id)
                 need_deadline = (
                     session._deadline_timer is None
                     and not session._deadline_fallback_started
@@ -1725,6 +1901,13 @@ class ProcessRegistry:
                 and not isinstance(exit_returncode, bool)
                 and exit_returncode == 1
             )
+            # N8: child-writable exit/pid artifacts cannot alone prove terminal.
+            # Require identity gone/mismatch (or confirmed missing exit after
+            # identity gone). If identity is still alive/unknown, refuse.
+            identity_gone = bool(process_exited)
+            if not identity_gone:
+                # Live identity: never promote child-writable exit artifact alone.
+                return previous_output_length
             if exit_code is None and not exit_missing_after_identity_gone:
                 return previous_output_length
 
@@ -2318,7 +2501,8 @@ class ProcessRegistry:
                 and not session._pty
                 and session.process is None
                 and session.env_ref is None
-                and not self._host_pid_is_ours(session.pid, session.host_start_time)
+                and self._host_pid_identity(session.pid, session.host_start_time)
+                == self._PID_GONE_OR_MISMATCH
             )
             is_remote = bool(
                 not session._pty
@@ -2504,6 +2688,15 @@ class ProcessRegistry:
 
                 with session._lock:
                     authoritative_exit = session.exited
+                    # N6: "killed" requires positive signal-delivery evidence.
+                    # Numeric 143/-15 alone never invents kill attribution.
+                    if confirmed:
+                        session._signal_delivery_confirmed = True
+                    positive_signal = bool(session._signal_delivery_confirmed)
+                    if not confirmed and not authoritative_exit:
+                        raise RuntimeError(
+                            "Process termination was not confirmed; status unknown"
+                        )
                     signal_exit = bool(
                         isinstance(session.exit_code, int)
                         and (
@@ -2514,11 +2707,7 @@ class ProcessRegistry:
                             )
                         )
                     )
-                    if not confirmed and not authoritative_exit:
-                        raise RuntimeError(
-                            "Process termination was not confirmed; status unknown"
-                        )
-                    if not authoritative_exit or signal_exit:
+                    if not authoritative_exit or (positive_signal and signal_exit):
                         session.exited = True
                         session.completion_reason = "killed"
                         session.termination_source = source
@@ -2549,10 +2738,9 @@ class ProcessRegistry:
                     "termination_source": session.termination_source,
                     "output": output,
                 }
-            except Exception as exc:
-                # A signal primitive may report unknown just before the owned
-                # Popen publishes an authoritative exit. Reap once more before
-                # deciding the session must stay nonterminal.
+            except BaseException as exc:
+                # N5: restore nonterminal/checkpoint/real fallback, then rethrow
+                # BaseException; Exception still returns structured error.
                 if session.process is not None:
                     try:
                         session.process.wait(timeout=0.5)
@@ -2579,6 +2767,8 @@ class ProcessRegistry:
                     if consume_output:
                         self._completion_consumed.add(session_id)
                     self._move_to_finished(session)
+                    if not isinstance(exc, Exception):
+                        raise
                     return {
                         "status": "already_exited",
                         "command": session.command,
@@ -2587,6 +2777,15 @@ class ProcessRegistry:
                         "termination_source": session.termination_source,
                         "output": output,
                     }
+                # Restore nonterminal ownership + real deadline fallback.
+                try:
+                    self._write_checkpoint()
+                except Exception:
+                    logger.debug(
+                        "Checkpoint restore after kill fault failed for %s",
+                        session.id,
+                        exc_info=True,
+                    )
                 if source == "execution_timeout" or deadline_due:
                     try:
                         self._start_deadline_fallback(session)
@@ -2595,6 +2794,8 @@ class ProcessRegistry:
                             "Could not retain deadline enforcement for process %s",
                             session.id,
                         )
+                if not isinstance(exc, Exception):
+                    raise
                 return {
                     "status": "error",
                     "error": str(exc),
@@ -2882,9 +3083,16 @@ class ProcessRegistry:
     # ----- Checkpoint (crash recovery) -----
 
     def _write_checkpoint(self):
-        """Write running process metadata to checkpoint file atomically."""
+        """Write running process metadata to checkpoint file atomically.
+
+        N7: snapshot under the registry lock, then write under a dedicated
+        checkpoint lock with a monotonic generation so an older snapshot can
+        never overwrite a newer terminal state on disk.
+        """
         try:
             with self._lock:
+                self._checkpoint_generation += 1
+                generation = self._checkpoint_generation
                 entries = []
                 for s in self._running.values():
                     if not s.exited:
@@ -2914,10 +3122,14 @@ class ProcessRegistry:
                             "notify_on_complete": s.notify_on_complete,
                             "watch_patterns": s.watch_patterns,
                         })
-            
-            # Atomic write to avoid corruption on crash
-            from utils import atomic_json_write
-            atomic_json_write(CHECKPOINT_PATH, entries)
+
+            with self._checkpoint_lock:
+                if generation < self._checkpoint_generation:
+                    # A newer snapshot was published while we prepared this one.
+                    return
+                # Atomic write to avoid corruption on crash
+                from utils import atomic_json_write
+                atomic_json_write(CHECKPOINT_PATH, entries)
         except Exception as e:
             logger.debug("Failed to write checkpoint file: %s", e, exc_info=True)
 
@@ -2994,7 +3206,10 @@ class ProcessRegistry:
                 watch_patterns=entry.get("watch_patterns", []),
             )
             with self._lock:
+                self._session_generation += 1
+                session._registry_generation = self._session_generation
                 self._running[session.id] = session
+                self._reserved_ids.discard(session.id)
             recovered += 1
             logger.info("Recovered detached process: %s (pid=%d)", session.command[:60], pid)
 

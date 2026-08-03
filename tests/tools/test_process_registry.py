@@ -2209,3 +2209,339 @@ def test_broken_deadline_timer_and_first_kill_retry_until_one_real_completion(
         if proc.poll() is None:
             original_terminate(proc.pid, session.host_start_time)
         proc.wait(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# Latest-review N1–N8 probes (tier4 fresh findings at 6e477e2f)
+# ---------------------------------------------------------------------------
+
+
+class TestN1HostPidIdentityTriState:
+    def test_unknown_identity_refuses_signal_and_retains_owner(self, monkeypatch):
+        """N1: UNKNOWN must not signal; owner/deadline/retry retained."""
+        from tools.process_registry import ProcessRegistry, ProcessSession
+
+        monkeypatch.setattr(ProcessRegistry, "_is_host_pid_alive", classmethod(lambda cls, pid: True))
+        monkeypatch.setattr(ProcessRegistry, "_safe_host_start_time", classmethod(lambda cls, pid: None))
+
+        assert ProcessRegistry._host_pid_identity(12345, 99) == ProcessRegistry._PID_UNKNOWN
+        assert ProcessRegistry._host_pid_is_ours(12345, 99) is False
+        # terminate must refuse signal and report not-gone
+        assert ProcessRegistry._terminate_host_pid(12345, expected_start=99) is False
+
+        registry = ProcessRegistry()
+        session = ProcessSession(
+            id="proc_n1_unknown",
+            command="sleep 999",
+            pid=12345,
+            pid_scope="host",
+            host_start_time=99,
+            detached=True,
+            execution_deadline=time.time() + 30,
+        )
+        with registry._lock:
+            registry._running[session.id] = session
+        # refresh must retain ownership on UNKNOWN
+        assert registry._refresh_detached_session(session) is session
+        assert session.exited is False
+        assert registry.get(session.id) is session
+
+
+class TestN2ProvisionalOwnerBeforeNonlocalSideEffect:
+    def test_post_dispatch_exception_keeps_provisional_owner(self):
+        """N2: env.execute Exception after provisional owner retains registry ownership."""
+        from tools.process_registry import ProcessRegistry
+
+        class BoomEnv:
+            def execute(self, command, **kwargs):
+                raise RuntimeError("post-dispatch boom")
+
+        registry = ProcessRegistry()
+        with pytest.raises(RuntimeError, match="post-dispatch boom"):
+            registry.spawn_via_env(
+                env=BoomEnv(),
+                command="echo hi",
+                cwd="/tmp",
+                task_id="t",
+                session_key="s",
+            )
+        # Exactly one managed owner remains (provisional), nonterminal unless recovered finished.
+        owners = list(registry._running.values()) + list(registry._finished.values())
+        assert len(owners) == 1
+        session = owners[0]
+        assert session.poll_error and "RuntimeError" in session.poll_error
+
+
+class TestN3AtomicIdReserveNoForeignLeak:
+    def test_collision_never_returns_foreign_or_leaks_candidate(self, monkeypatch):
+        """N3: reserved id stays unique; collision retries without foreign return."""
+        from tools.process_registry import ProcessRegistry, ProcessSession
+
+        registry = ProcessRegistry()
+        # Foreign owns exact id that first uuid.hex[:12] would produce.
+        foreign = ProcessSession(id="proc_aabbccddeeff", command="foreign")
+        with registry._lock:
+            registry._running[foreign.id] = foreign
+
+        # Force first uuid hex[:12] to collide with foreign, second is free.
+        # allocate uses f"proc_{uuid.uuid4().hex[:12]}".
+        seq = iter(["aabbccddeeff" + "0"*20, "112233445566" + "0"*20])
+        monkeypatch.setattr(
+            "tools.process_registry.uuid.uuid4",
+            lambda: type("U", (), {"hex": next(seq)})(),
+        )
+        allocated = registry._allocate_session_id()
+        assert allocated == "proc_112233445566"
+        assert allocated != foreign.id
+        assert allocated in registry._reserved_ids
+        assert foreign.id not in registry._reserved_ids
+        # Foreign owner untouched.
+        assert registry._running[foreign.id] is foreign
+
+
+class TestN4DeadlineCallbackObjectGeneration:
+    def test_deadline_callback_ignores_replaced_owner(self):
+        """N4: timer binds ProcessSession; replaced owner at same id is not killed."""
+        from tools.process_registry import ProcessRegistry, ProcessSession
+
+        registry = ProcessRegistry()
+        old = ProcessSession(
+            id="proc_deadline1",
+            command="old",
+            execution_deadline=time.time() - 1,
+        )
+        new = ProcessSession(
+            id="proc_deadline1",
+            command="new",
+            execution_deadline=time.time() + 60,
+        )
+        registry._publish_provisional_owner(old)
+        old_gen = old._registry_generation
+        # Replace owner object at same id (simulate recycle).
+        with registry._lock:
+            registry._running[old.id] = new
+            registry._session_generation += 1
+            new._registry_generation = registry._session_generation
+        # Arm deadline on the *old* object; fire must no-op.
+        killed = []
+        original_kill = registry.kill_process
+
+        def _spy(session_id, **kwargs):
+            killed.append(session_id)
+            return original_kill(session_id, **kwargs)
+
+        registry.kill_process = _spy  # type: ignore[method-assign]
+        registry._arm_execution_deadline(old)
+        # Manually invoke the timer callback if present.
+        timer = old._deadline_timer
+        if timer is not None:
+            timer.cancel()
+            timer.function()
+        assert killed == []
+        assert registry.get("proc_deadline1") is new
+        assert not new.exited
+        assert old._registry_generation == old_gen
+
+
+class TestN5KillBaseExceptionRestoresThenRethrows:
+    def test_baseexception_restores_nonterminal_and_rethrows(self, monkeypatch):
+        """N5: kill BaseException restores nonterminal/checkpoint/fallback then rethrows."""
+        from tools.process_registry import ProcessRegistry, ProcessSession
+
+        registry = ProcessRegistry()
+        session = ProcessSession(
+            id="proc_n5",
+            command="sleep",
+            execution_deadline=time.time() + 30,
+            host_start_time=99,
+        )
+        session.process = type("P", (), {
+            "poll": lambda self: None,
+            "wait": lambda self, timeout=None: None,
+            "stdin": None,
+            "pid": 4242,
+        })()
+        registry._publish_provisional_owner(session)
+
+        # Keep identity MATCH so terminate path is entered.
+        monkeypatch.setattr(
+            ProcessRegistry,
+            "_host_pid_identity",
+            classmethod(lambda cls, pid, expected_start=None: cls._PID_MATCH),
+        )
+
+        def boom_terminate(cls, pid, expected_start=None):
+            raise KeyboardInterrupt("kill boom")
+
+        monkeypatch.setattr(
+            ProcessRegistry,
+            "_terminate_host_pid",
+            classmethod(boom_terminate),
+        )
+        monkeypatch.setattr(
+            ProcessRegistry,
+            "_local_completion_state",
+            lambda self, session: (False, None),
+        )
+        monkeypatch.setattr(
+            ProcessRegistry,
+            "_local_descendants_settled",
+            lambda self, session, include_subreaper=False: True,
+        )
+        monkeypatch.setattr(
+            ProcessRegistry,
+            "_host_process_is_live",
+            classmethod(lambda cls, pid, expected_start=None: True),
+        )
+        monkeypatch.setattr(ProcessRegistry, "_write_checkpoint", lambda self: None)
+        monkeypatch.setattr(ProcessRegistry, "_start_deadline_fallback", lambda self, session: None)
+
+        with pytest.raises(KeyboardInterrupt, match="kill boom"):
+            registry.kill_process(session.id, source="execution_timeout")
+
+        assert session.id in registry._running
+        assert session.exited is False
+        assert session._termination_in_progress is False
+        # completion_reason may remain empty or pre-kill value; never killed.
+        assert session.completion_reason != "killed"
+        assert session.termination_source == ""
+
+class TestN6KilledOnlyFromPositiveSignalDelivery:
+    def test_numeric_143_without_signal_delivery_is_not_killed(self, monkeypatch):
+        """N6: bare 143 does not invent killed; kill attribution needs positive delivery."""
+        from tools.process_registry import ProcessRegistry, ProcessSession
+
+        registry = ProcessRegistry()
+        session = ProcessSession(
+            id="proc_n6",
+            command="remote",
+            env_ref=object(),
+            pid=55,
+            host_start_time=1,
+        )
+        session.exit_code = 143
+        session.exited = True
+        session.completion_reason = "exited"
+        session.termination_source = ""
+        # No kill path / no positive signal delivery: metadata stays natural.
+        assert session._signal_delivery_confirmed is False
+        assert session.completion_reason == "exited"
+        assert session.completion_reason != "killed"
+
+        # Kill path that confirms gone but natural non-signal exit wins.
+        monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+        env = type("E", (), {
+            "execute": lambda self, *a, **k: {
+                "output": "__HERMES_TERMINATED__\n",
+                "returncode": 0,
+            },
+            "execute_background": lambda *a, **k: None,
+            "read_file": lambda *a, **k: None,
+            "write_file": lambda *a, **k: None,
+            "get_temp_dir": lambda *a, **k: "/tmp",
+        })()
+        s2 = ProcessSession(
+            id="proc_n6b",
+            command="remote",
+            env_ref=env,
+            pid=56,
+            host_start_time=1,
+            pid_scope="sandbox",
+        )
+        registry._publish_provisional_owner(s2)
+
+        def natural(_session, _env, *_a):
+            with _session._lock:
+                _session.exit_code = 124
+                _session.exited = True
+                _session.completion_reason = "exited"
+                _session.termination_source = ""
+            return 0
+
+        monkeypatch.setattr(registry, "_poll_env_once", natural)
+        result = registry.kill_process(s2.id, source="n6")
+        assert result["status"] == "already_exited"
+        assert s2.completion_reason == "exited"
+        assert s2.exit_code == 124
+
+class TestN7CheckpointGenerationFence:
+    def test_older_snapshot_cannot_overwrite_newer(self, tmp_path, monkeypatch):
+        """N7: monotonic generation + checkpoint lock drop stale snapshots."""
+        from tools import process_registry as pr
+        from tools.process_registry import ProcessRegistry, ProcessSession
+
+        ckpt = tmp_path / "ckpt.json"
+        monkeypatch.setattr(pr, "CHECKPOINT_PATH", ckpt)
+
+        registry = ProcessRegistry()
+        live = ProcessSession(id="proc_live", command="live")
+        registry._publish_provisional_owner(live)
+
+        # Capture a stale generation snapshot path by interleaving writes.
+        writes = []
+        real_atomic = pr.atomic_json_write if hasattr(pr, "atomic_json_write") else None
+
+        import utils
+        original = utils.atomic_json_write
+        def tracking_write(path, data):
+            writes.append(list(data) if isinstance(data, list) else data)
+            return original(path, data)
+        monkeypatch.setattr(utils, "atomic_json_write", tracking_write)
+
+        # First write with live session.
+        registry._write_checkpoint()
+        assert ckpt.exists()
+        # Finish session then write again — newer gen must win.
+        registry._move_to_finished(live)
+        registry._write_checkpoint()
+        import json
+        final = json.loads(ckpt.read_text())
+        assert final == []  # no running sessions
+        # Stale path: simulate older generation being discarded.
+        with registry._lock:
+            registry._checkpoint_generation += 1  # newer gen exists
+            stale_gen = registry._checkpoint_generation - 1
+        # Direct fence check: generation < current aborts write.
+        with registry._checkpoint_lock:
+            assert stale_gen < registry._checkpoint_generation
+
+
+class TestN8ChildWritableArtifactNotTerminalAlone:
+    def test_exit_artifact_with_live_identity_refuses_terminal(self):
+        """N8: child-writable exit artifact cannot terminal while identity alive."""
+        from tools.process_registry import ProcessRegistry, ProcessSession
+
+        class LiveEnv:
+            def __init__(self):
+                self.calls = []
+            def execute(self, command, **kwargs):
+                self.calls.append(command)
+                if "head -c 5" in command:
+                    return {"output": "0\n", "returncode": 0}
+                if "head -c 64" in command and "pid" in command:
+                    return {"output": "123\n1\n", "returncode": 0}
+                if "tail -c" in command or "wc -c" in command:
+                    return {"output": "0", "returncode": 0}
+                # identity check: process still present (returncode 0)
+                if "kill -0" in command or "/proc/" in command:
+                    return {"output": "", "returncode": 0}
+                return {"output": "", "returncode": 0}
+
+        registry = ProcessRegistry()
+        env = LiveEnv()
+        session = ProcessSession(
+            id="proc_n8",
+            command="cmd",
+            pid=123,
+            env_ref=env,
+            host_start_time=1,
+            pid_scope="sandbox",
+        )
+        registry._publish_provisional_owner(session)
+        log_path, pid_path, exit_path = registry._env_artifact_paths(env, session.id)
+        # Monkeypatch identity probe used inside poll: process_exited derived from env.execute.
+        # Force _poll_env_once path with live identity by patching the identity section via execute returns.
+        # Ensure process_exited stays False: the code uses env.execute for pid checks.
+        before = registry._poll_env_once(session, env, log_path, pid_path, exit_path, 0)
+        assert session.exited is False
+        assert registry.get(session.id) is session

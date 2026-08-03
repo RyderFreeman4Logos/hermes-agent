@@ -73,6 +73,7 @@ FINISHED_TTL_SECONDS = 1800     # Keep finished processes for 30 minutes
 MAX_PROCESSES = 64              # Max concurrent tracked processes (LRU pruning)
 MAX_ACTIVE_PROCESS_AGE = 86400  # 24h default — see session_reset.bg_process_max_age_hours (#29177)
 _REMOTE_KILL_CONFIRMED = "__HERMES_TERMINATED__"
+_REMOTE_SIGNAL_DELIVERED = "__HERMES_SIGNAL_DELIVERED__"
 _REMOTE_LOG_BYTES_PREFIX = "__HERMES_LOG_BYTES__:"
 
 # Watch pattern rate limiting — PER SESSION.
@@ -167,11 +168,14 @@ class ProcessSession:
     _subreaper_managed: bool = field(default=False, repr=False)
     _termination_in_progress: bool = field(default=False, repr=False)
     _deadline_fallback_started: bool = field(default=False, repr=False)
+    _deadline_retry_scheduled: bool = field(default=False, repr=False)
     _registry_generation: int = field(default=0, repr=False)
     _signal_delivery_confirmed: bool = field(default=False, repr=False)
 
 
 class ProcessRegistry:
+    _host_kill_delivery = threading.local()
+
     """
     In-memory registry of running and finished background processes.
 
@@ -689,6 +693,7 @@ class ProcessRegistry:
         MATCH and UNKNOWN both retain live ownership. Only explicit
         GONE_OR_MISMATCH (or confirmed dead) is non-live.
         """
+        cls._host_kill_delivery.delivered = False
         identity = cls._host_pid_identity(pid, expected_start)
         if identity == cls._PID_GONE_OR_MISMATCH:
             return False
@@ -858,6 +863,44 @@ class ProcessRegistry:
                 session._deadline_fallback_started = False
             raise
 
+    def _schedule_deadline_retry(self, session: ProcessSession) -> None:
+        """Persist and schedule one delayed retry when fallback startup faults."""
+        with session._lock:
+            if session.exited or session._deadline_retry_scheduled:
+                return
+            session._deadline_retry_scheduled = True
+
+        def _retry() -> None:
+            with session._lock:
+                session._deadline_retry_scheduled = False
+                if session._deadline_timer is timer:
+                    session._deadline_timer = None
+            try:
+                self._start_deadline_fallback(session)
+            except BaseException:
+                try:
+                    self._write_checkpoint()
+                except Exception:
+                    logger.debug("Deadline retry checkpoint failed for %s", session.id, exc_info=True)
+                logger.exception("Deadline fallback retry failed for process %s", session.id)
+
+        timer = threading.Timer(0.1, _retry)
+        timer.daemon = True
+        with session._lock:
+            session._deadline_timer = timer
+        try:
+            timer.start()
+        except BaseException:
+            with session._lock:
+                if session._deadline_timer is timer:
+                    session._deadline_timer = None
+                session._deadline_retry_scheduled = False
+            try:
+                self._write_checkpoint()
+            except Exception:
+                logger.debug("Deadline retry checkpoint failed for %s", session.id, exc_info=True)
+            logger.exception("Could not schedule deadline fallback retry for process %s", session.id)
+
     def _arm_execution_deadline(self, session: ProcessSession) -> None:
         """Terminate a managed process tree when its absolute deadline expires."""
         expected_generation = session._registry_generation
@@ -992,7 +1035,7 @@ class ProcessRegistry:
             return False
         if _IS_WINDOWS:
             try:
-                subprocess.run(
+                taskkill = subprocess.run(
                     ["taskkill", "/PID", str(pid), "/T", "/F"],
                     capture_output=True,
                     text=True, encoding='utf-8', errors='replace',
@@ -1000,9 +1043,11 @@ class ProcessRegistry:
                     creationflags=windows_hide_flags(),
                     stdin=subprocess.DEVNULL,
                 )
+                cls._host_kill_delivery.delivered = taskkill.returncode == 0
             except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
                 try:
                     os.kill(pid, signal.SIGTERM)
+                    cls._host_kill_delivery.delivered = True
                 except (OSError, ProcessLookupError, PermissionError):
                     pass
             return not cls._host_process_is_live(pid, expected_start)
@@ -1015,6 +1060,7 @@ class ProcessRegistry:
         except (OSError, PermissionError):
             try:
                 os.kill(pid, signal.SIGTERM)
+                cls._host_kill_delivery.delivered = True
             except (OSError, ProcessLookupError, PermissionError):
                 pass
             return not cls._host_process_is_live(pid, expected_start)
@@ -1032,6 +1078,7 @@ class ProcessRegistry:
         for proc in targets:
             try:
                 proc.terminate()
+                cls._host_kill_delivery.delivered = True
             except psutil.NoSuchProcess:
                 pass
             except (psutil.AccessDenied, OSError):
@@ -1060,6 +1107,7 @@ class ProcessRegistry:
                 if not cls._proc_alive(proc):
                     continue
                 proc.kill()  # SIGKILL on POSIX
+                cls._host_kill_delivery.delivered = True
                 logger.info(
                     "Escalated to SIGKILL for pid %d (ignored SIGTERM within "
                     "%.1fs grace)", proc.pid, grace,
@@ -1077,6 +1125,10 @@ class ProcessRegistry:
                 break
             time.sleep(0.02)
         return tree_known and all(cls._proc_confirmed_gone(_p) for _p in targets)
+
+    @classmethod
+    def _host_kill_delivery_confirmed(cls) -> bool:
+        return bool(getattr(cls._host_kill_delivery, "delivered", False))
 
     # ----- Spawn -----
 
@@ -2592,6 +2644,7 @@ class ProcessRegistry:
 
             remote_returncode = None
             confirmed = False
+            delivery_confirmed = False
             try:
                 if session._pty:
                     if session.pid:
@@ -2601,8 +2654,10 @@ class ProcessRegistry:
                                 session.host_start_time,
                             )
                         )
+                        delivery_confirmed = self._host_kill_delivery_confirmed()
                     else:
                         session._pty.terminate(force=True)
+                        delivery_confirmed = True
                         confirmed = not bool(session._pty.isalive())
                 elif session.process:
                     self._remember_local_descendants(session, include_subreaper=True)
@@ -2611,6 +2666,7 @@ class ProcessRegistry:
                             session.process.pid, session.host_start_time
                         )
                     )
+                    delivery_confirmed = self._host_kill_delivery_confirmed()
                     try:
                         session.process.wait(timeout=1)
                     except Exception:
@@ -2644,21 +2700,22 @@ class ProcessRegistry:
                         f"sed 's/^.*) //' {stat_path} 2>/dev/null | cut -d ' ' -f 20"
                     )
                     gone_marker = f"printf '{_REMOTE_KILL_CONFIRMED}\\n'; exit 0"
+                    signal_marker = f"printf '{_REMOTE_SIGNAL_DELIVERED}\\n'; "
                     remote_kill = (
                         f"if [ ! -e {stat_path} ]; then {gone_marker}; fi; "
                         f"current=$({start_probe}); "
                         f'if [ -z "$current" ]; then exit 2; fi; '
                         f'if [ "$current" != "{session.host_start_time}" ]; then '
                         f"{gone_marker}; fi; "
-                        f"if kill -TERM -- -{session.pid} 2>/dev/null; then :; "
-                        f"elif kill -TERM {session.pid} 2>/dev/null; then :; fi; "
+                        f"if kill -TERM -- -{session.pid} 2>/dev/null; then {signal_marker} "
+                        f"elif kill -TERM {session.pid} 2>/dev/null; then {signal_marker} else exit 1; fi; "
                         f"sleep {grace}; "
                         f"if [ -e {stat_path} ]; then "
                         f"current=$({start_probe}); "
                         f'if [ -z "$current" ]; then exit 2; fi; '
                         f'if [ "$current" = "{session.host_start_time}" ]; then '
-                        f"if kill -KILL -- -{session.pid} 2>/dev/null; then :; "
-                        f"elif kill -KILL {session.pid} 2>/dev/null; then :; fi; "
+                        f"if kill -KILL -- -{session.pid} 2>/dev/null; then {signal_marker} "
+                        f"elif kill -KILL {session.pid} 2>/dev/null; then {signal_marker} else exit 1; fi; "
                         f"fi; fi; "
                         f'i=0; while [ "$i" -lt 20 ]; do '
                         f"if [ ! -e {stat_path} ]; then {gone_marker}; fi; "
@@ -2678,9 +2735,9 @@ class ProcessRegistry:
                         )
                     remote_returncode = remote_result.get("returncode")
                     remote_output = strip_ansi(str(remote_result.get("output", "")))
-                    marker_seen = _REMOTE_KILL_CONFIRMED in {
-                        line.strip() for line in remote_output.splitlines()
-                    }
+                    markers = {line.strip() for line in remote_output.splitlines()}
+                    marker_seen = _REMOTE_KILL_CONFIRMED in markers
+                    delivery_confirmed = _REMOTE_SIGNAL_DELIVERED in markers
                     if (
                         isinstance(remote_returncode, bool)
                         or not isinstance(remote_returncode, int)
@@ -2723,12 +2780,13 @@ class ProcessRegistry:
                     confirmed = bool(
                         self._terminate_host_pid(session.pid, session.host_start_time)
                     )
+                    delivery_confirmed = self._host_kill_delivery_confirmed()
 
                 with session._lock:
                     authoritative_exit = session.exited
                     # N6: "killed" requires positive signal-delivery evidence.
                     # Numeric 143/-15 alone never invents kill attribution.
-                    if confirmed:
+                    if delivery_confirmed:
                         session._signal_delivery_confirmed = True
                     positive_signal = bool(session._signal_delivery_confirmed)
                     if not confirmed and not authoritative_exit:
@@ -2745,7 +2803,7 @@ class ProcessRegistry:
                             )
                         )
                     )
-                    if not authoritative_exit or (positive_signal and signal_exit):
+                    if positive_signal and (not authoritative_exit or signal_exit):
                         session.exited = True
                         session.completion_reason = "killed"
                         session.termination_source = source
@@ -2753,6 +2811,10 @@ class ProcessRegistry:
                             session.exit_code = -15
                         terminal_status = "killed"
                     else:
+                        if not authoritative_exit:
+                            session.exited = True
+                            session.completion_reason = "exited"
+                            session.termination_source = ""
                         terminal_status = "already_exited"
                     session._termination_in_progress = False
                     output = strip_ansi(session.output_buffer[-2000:])
@@ -2832,6 +2894,7 @@ class ProcessRegistry:
                             "Could not retain deadline enforcement for process %s",
                             session.id,
                         )
+                        self._schedule_deadline_retry(session)
                 if not isinstance(exc, Exception):
                     raise
                 return {

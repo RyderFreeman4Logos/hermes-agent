@@ -861,7 +861,11 @@ class TestKillProcess:
         s.host_start_time = 99
         s._pty = MagicMock()
         registry._running[s.id] = s
-        terminate = MagicMock()
+        def terminate(*_args):
+            ProcessRegistry._host_kill_delivery.delivered = True
+            return True
+
+        terminate = MagicMock(side_effect=terminate)
         monkeypatch.setattr(registry, "_terminate_host_pid", terminate)
 
         result = registry.kill_process(s.id)
@@ -873,7 +877,7 @@ class TestKillProcess:
     def test_kill_remote_uses_process_group(self, registry, monkeypatch):
         env = MagicMock()
         env.execute.return_value = {
-            "output": "__HERMES_TERMINATED__\n",
+            "output": "__HERMES_SIGNAL_DELIVERED__\n__HERMES_TERMINATED__\n",
             "returncode": 0,
         }
         s = _make_session(sid="proc_remote_tree")
@@ -970,6 +974,8 @@ class TestKillProcess:
         def terminate(*_args):
             terminate_entered.set()
             assert release_terminate.wait(5)
+            ProcessRegistry._host_kill_delivery.delivered = True
+            return True
 
         monkeypatch.setattr(registry, "_terminate_host_pid", terminate)
         thread = threading.Thread(
@@ -1838,7 +1844,9 @@ def test_remote_kill_transport_124_with_marker_retains_owner(registry):
 
 
 def test_remote_kill_requires_gone_marker_and_avoids_shell_false_success(registry):
-    env = _RemoteKillEnv(output="__HERMES_TERMINATED__\n", returncode=0)
+    env = _RemoteKillEnv(
+        output="__HERMES_SIGNAL_DELIVERED__\n__HERMES_TERMINATED__\n", returncode=0
+    )
     session = _remote_session(registry, env, "proc_remote_gone")
 
     result = registry.kill_process(session.id, source="remote_confirmed")
@@ -2409,125 +2417,130 @@ class TestN4DeadlineCallbackObjectGeneration:
 
 
 class TestN5KillBaseExceptionRestoresThenRethrows:
-    def test_baseexception_restores_nonterminal_and_rethrows(self, monkeypatch):
-        """N5: kill BaseException restores nonterminal/checkpoint/fallback then rethrows."""
-        from tools.process_registry import ProcessRegistry, ProcessSession
+    @pytest.mark.skipif(sys.platform == "win32", reason="uses a real POSIX child")
+    def test_double_fault_rethrows_and_retries_from_durable_checkpoint(self, tmp_path, monkeypatch):
+        """N5: interrupt + failed fallback start preserves owner and retries once."""
+        from tools import process_registry as pr
 
-        registry = ProcessRegistry()
-        session = ProcessSession(
-            id="proc_n5",
-            command="sleep",
-            execution_deadline=time.time() + 30,
-            host_start_time=99,
+        registry = pr.ProcessRegistry()
+        proc = _spawn_python_sleep(30)
+        session = _detached_host_session(
+            registry, proc, "proc_n5", deadline=time.time() - 0.1
         )
-        session.process = type("P", (), {
-            "poll": lambda self: None,
-            "wait": lambda self, timeout=None: None,
-            "stdin": None,
-            "pid": 4242,
-        })()
-        registry._publish_provisional_owner(session)
+        session._deadline_timer = None  # the deadline callback has consumed its timer
+        original_terminate = registry._terminate_host_pid
+        calls = []
+        original_start = threading.Thread.start
+        failed_fallback_start = False
+        monkeypatch.setattr(pr, "CHECKPOINT_PATH", tmp_path / "n5.json")
 
-        # Keep identity MATCH so terminate path is entered.
-        monkeypatch.setattr(
-            ProcessRegistry,
-            "_host_pid_identity",
-            classmethod(lambda cls, pid, expected_start=None: cls._PID_MATCH),
-        )
+        def interrupt_once(pid, expected_start=None):
+            calls.append(pid)
+            if len(calls) == 1:
+                raise KeyboardInterrupt("kill boom")
+            return original_terminate(pid, expected_start)
 
-        def boom_terminate(cls, pid, expected_start=None):
-            raise KeyboardInterrupt("kill boom")
+        def fail_one_fallback_worker(worker, *args, **kwargs):
+            nonlocal failed_fallback_start
+            if worker.name.startswith("proc-deadline-") and not failed_fallback_start:
+                failed_fallback_start = True
+                raise RuntimeError("fallback start failed")
+            return original_start(worker, *args, **kwargs)
 
-        monkeypatch.setattr(
-            ProcessRegistry,
-            "_terminate_host_pid",
-            classmethod(boom_terminate),
-        )
-        monkeypatch.setattr(
-            ProcessRegistry,
-            "_local_completion_state",
-            lambda self, session: (False, None),
-        )
-        monkeypatch.setattr(
-            ProcessRegistry,
-            "_local_descendants_settled",
-            lambda self, session, include_subreaper=False: True,
-        )
-        monkeypatch.setattr(
-            ProcessRegistry,
-            "_host_process_is_live",
-            classmethod(lambda cls, pid, expected_start=None: True),
-        )
-        monkeypatch.setattr(ProcessRegistry, "_write_checkpoint", lambda self: None)
-        monkeypatch.setattr(ProcessRegistry, "_start_deadline_fallback", lambda self, session: None)
+        monkeypatch.setattr(registry, "_terminate_host_pid", interrupt_once)
+        monkeypatch.setattr(threading.Thread, "start", fail_one_fallback_worker)
+        try:
+            with pytest.raises(KeyboardInterrupt, match="kill boom"):
+                registry.kill_process(session.id, source="execution_timeout")
+            assert registry._running[session.id] is session
+            assert not session.exited
+            assert not session._termination_in_progress
+            assert failed_fallback_start
+            assert session._deadline_retry_scheduled
+            assert session.id in (tmp_path / "n5.json").read_text()
+            assert session._completion_event.wait(5)
+            assert _wait_until(lambda: proc.poll() is not None)
+            assert len(calls) >= 2
+            assert registry._finished[session.id] is session
+            assert session.completion_reason == "killed"
+        finally:
+            if proc.poll() is None:
+                original_terminate(proc.pid, session.host_start_time)
+            proc.wait(timeout=5)
 
-        with pytest.raises(KeyboardInterrupt, match="kill boom"):
-            registry.kill_process(session.id, source="execution_timeout")
-
-        assert session.id in registry._running
-        assert session.exited is False
-        assert session._termination_in_progress is False
-        # completion_reason may remain empty or pre-kill value; never killed.
-        assert session.completion_reason != "killed"
-        assert session.termination_source == ""
 
 class TestN6KilledOnlyFromPositiveSignalDelivery:
-    def test_numeric_143_without_signal_delivery_is_not_killed(self, monkeypatch):
-        """N6: bare 143 does not invent killed; kill attribution needs positive delivery."""
-        from tools.process_registry import ProcessRegistry, ProcessSession
-
+    def test_remote_natural_143_has_no_signal_attribution(self, monkeypatch):
+        """N6: a gone marker is not proof that the remote signal was delivered."""
         registry = ProcessRegistry()
-        session = ProcessSession(
-            id="proc_n6",
-            command="remote",
-            env_ref=object(),
-            pid=55,
-            host_start_time=1,
-        )
-        session.exit_code = 143
-        session.exited = True
-        session.completion_reason = "exited"
-        session.termination_source = ""
-        # No kill path / no positive signal delivery: metadata stays natural.
-        assert session._signal_delivery_confirmed is False
-        assert session.completion_reason == "exited"
-        assert session.completion_reason != "killed"
+        env = _RemoteKillEnv(output="__HERMES_TERMINATED__\n")
+        session = _remote_session(registry, env, "proc_n6_natural_143")
 
-        # Kill path that confirms gone but natural non-signal exit wins.
-        monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
-        env = type("E", (), {
-            "execute": lambda self, *a, **k: {
-                "output": "__HERMES_TERMINATED__\n",
-                "returncode": 0,
-            },
-            "execute_background": lambda *a, **k: None,
-            "read_file": lambda *a, **k: None,
-            "write_file": lambda *a, **k: None,
-            "get_temp_dir": lambda *a, **k: "/tmp",
-        })()
-        s2 = ProcessSession(
-            id="proc_n6b",
-            command="remote",
-            env_ref=env,
-            pid=56,
-            host_start_time=1,
-            pid_scope="sandbox",
-        )
-        registry._publish_provisional_owner(s2)
-
-        def natural(_session, _env, *_a):
+        def natural(_session, _env, *_args):
             with _session._lock:
-                _session.exit_code = 124
+                _session.exit_code = 143
                 _session.exited = True
                 _session.completion_reason = "exited"
-                _session.termination_source = ""
             return 0
 
         monkeypatch.setattr(registry, "_poll_env_once", natural)
-        result = registry.kill_process(s2.id, source="n6")
+        result = registry.kill_process(session.id, source="n6")
+
         assert result["status"] == "already_exited"
-        assert s2.completion_reason == "exited"
-        assert s2.exit_code == 124
+        assert session.exit_code == 143
+        assert session.completion_reason == "exited"
+        assert not session._signal_delivery_confirmed
+
+    def test_remote_signal_marker_is_positive_delivery(self):
+        registry = ProcessRegistry()
+        env = _RemoteKillEnv(
+            output="__HERMES_SIGNAL_DELIVERED__\n__HERMES_TERMINATED__\n"
+        )
+        session = _remote_session(registry, env, "proc_n6_remote_signal")
+
+        result = registry.kill_process(session.id, source="n6")
+
+        assert result["status"] == "killed"
+        assert session.completion_reason == "killed"
+        assert session._signal_delivery_confirmed
+
+    @pytest.mark.parametrize("returncode, expected", [(1, False), (0, True)])
+    def test_windows_taskkill_rc_controls_delivery(self, monkeypatch, returncode, expected):
+        from tools import process_registry as pr
+
+        registry = pr.ProcessRegistry()
+        session = _make_session(sid=f"proc_n6_windows_{returncode}")
+        session.process = type("P", (), {"pid": 4242, "wait": lambda *_a, **_k: None})()
+        session.host_start_time = 9
+        registry._publish_provisional_owner(session)
+        monkeypatch.setattr(pr, "_IS_WINDOWS", True)
+        monkeypatch.setattr(pr.subprocess, "run", lambda *_a, **_k: MagicMock(returncode=returncode))
+        monkeypatch.setattr(pr.ProcessRegistry, "_host_pid_identity", classmethod(lambda cls, *_a: cls._PID_MATCH))
+        monkeypatch.setattr(pr.ProcessRegistry, "_host_process_is_live", classmethod(lambda cls, *_a: False))
+        monkeypatch.setattr(registry, "_local_completion_state", lambda *_a: (False, None))
+        monkeypatch.setattr(registry, "_local_descendants_settled", lambda *_a, **_k: True)
+
+        result = registry.kill_process(session.id, source="n6")
+
+        assert session._signal_delivery_confirmed is expected
+        assert (result["status"] == "killed") is expected
+        assert (session.completion_reason == "killed") is expected
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="uses a real POSIX child")
+    def test_local_signal_delivery_is_positive(self):
+        registry = ProcessRegistry()
+        proc = _spawn_python_sleep(30)
+        session = _detached_host_session(registry, proc, "proc_n6_local")
+        try:
+            result = registry.kill_process(session.id, source="n6")
+            assert result["status"] == "killed"
+            assert session.completion_reason == "killed"
+            assert session._signal_delivery_confirmed
+        finally:
+            if proc.poll() is None:
+                registry._terminate_host_pid(proc.pid, session.host_start_time)
+            proc.wait(timeout=5)
+
 
 class TestN7CheckpointGenerationFence:
     def test_older_snapshot_cannot_overwrite_newer(self, tmp_path, monkeypatch):

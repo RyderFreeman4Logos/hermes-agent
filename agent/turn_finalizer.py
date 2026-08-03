@@ -90,7 +90,9 @@ def finalize_turn(
         and budget_fallback_eligible
     )
 
-    iteration_limit_fallback = False
+    iteration_limit_fallback = str(_turn_exit_reason).startswith(
+        "terminal_slot_exhausted("
+    )
     preserved_verification_fallback = False
     if continuation_budget_exhausted:
         # A verification/continuation gate deliberately withheld a composed
@@ -108,27 +110,25 @@ def finalize_turn(
         iteration_limit_fallback = True
         preserved_verification_fallback = True
     elif final_response is None and budget_fallback_eligible:
-        # Budget exhausted — ask the model for a summary via one extra
-        # API call with tools stripped.  _handle_max_iterations injects a
-        # user message and makes a single toolless request.
         _turn_exit_reason = f"max_iterations_reached({api_call_count}/{agent.max_iterations})"
         agent._emit_status(
-            f"⚠️ Iteration budget exhausted ({api_call_count}/{agent.max_iterations}) "
-            "— asking model to summarise"
+            f"⚠️ Iteration budget exhausted ({api_call_count}/{agent.max_iterations})"
         )
         if not agent.quiet_mode:
             agent._safe_print(
-                f"\n⚠️  Iteration budget exhausted ({api_call_count}/{agent.max_iterations}) "
-                "— requesting summary..."
+                f"\n⚠️  Iteration budget exhausted "
+                f"({api_call_count}/{agent.max_iterations})"
             )
-        final_response = agent._handle_max_iterations(messages, api_call_count)
+        final_response = (
+            "I reached the iteration limit before producing a final response."
+        )
         iteration_limit_fallback = True
 
     if iteration_limit_fallback:
         # If running as a kanban worker, signal the dispatcher that the
         # worker could not complete (rather than treating it as a
         # protocol violation). This applies whether the user-facing fallback
-        # came from the summary call or an explicitly pending continuation;
+        # came from the terminal slot or an explicitly pending continuation;
         # both exhausted the task budget and must advance the failure circuit.
         #
         # We route through ``_record_task_failure(outcome="timed_out")``

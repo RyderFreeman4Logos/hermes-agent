@@ -156,6 +156,12 @@ _API_CALL_MODULES = frozenset({
 })
 
 
+def _disable_tools(api_kwargs: Dict[str, Any]) -> None:
+    """Make one provider request text-only without changing transports."""
+    for key in ("tools", "tool_choice", "parallel_tool_calls", "toolConfig"):
+        api_kwargs.pop(key, None)
+
+
 def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text: str) -> None:
     """Append a provider-safe checkpoint and correction to the live turn.
 
@@ -1536,6 +1542,10 @@ def run_conversation(
         )
 
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
+        terminal_text_only = min(
+            agent.max_iterations - api_call_count,
+            agent.iteration_budget.remaining,
+        ) == 1
         _redirect_text = agent._drain_pending_redirect()
         if _redirect_text:
             _apply_active_turn_redirect(agent, messages, _redirect_text)
@@ -2272,7 +2282,7 @@ def run_conversation(
         
         api_start_time = time.time()
         retry_count = 0
-        max_retries = agent._api_max_retries
+        max_retries = 1 if terminal_text_only else agent._api_max_retries
         _retry = TurnRetryState()
 
         finish_reason = "stop"
@@ -2363,6 +2373,8 @@ def run_conversation(
                         allow_stream=False,
                         is_github_responses=agent._is_copilot_url(),
                     )
+                if terminal_text_only:
+                    _disable_tools(api_kwargs)
                 # Copilot x-initiator: the first API call of a user turn is
                 # marked "user" so Copilot bills a premium request; tool-loop
                 # follow-ups keep the default "agent" header (#3040).
@@ -2545,6 +2557,9 @@ def run_conversation(
 
                 def _perform_api_call(next_api_kwargs):
                     _mark_provider_dispatch(None)
+                    if terminal_text_only:
+                        next_api_kwargs = dict(next_api_kwargs)
+                        _disable_tools(next_api_kwargs)
                     if agent.api_mode == "codex_responses":
                         next_api_kwargs = agent._get_transport().preflight_kwargs(
                             next_api_kwargs,
@@ -5904,6 +5919,22 @@ def run_conversation(
             # Reset incomplete scratchpad counter on clean response
             agent._incomplete_scratchpad_retries = 0
 
+            if terminal_text_only and (
+                not agent._strip_think_blocks(assistant_message.content or "").strip()
+                or assistant_message.tool_calls
+                or finish_reason in {"incomplete", "length", "tool_calls"}
+            ):
+                _turn_exit_reason = (
+                    f"terminal_slot_exhausted({api_call_count}/{agent.max_iterations})"
+                )
+                final_response = (
+                    "I reached the iteration limit before producing a final response."
+                )
+                agent._emit_status(
+                    "⚠️ Final iteration did not produce terminal text; stopping"
+                )
+                break
+
             if agent.api_mode == "codex_responses" and finish_reason == "incomplete":
                 agent._codex_incomplete_retries += 1
 
@@ -6949,7 +6980,8 @@ def run_conversation(
 
                 _ack_mode = intent_ack_continuation_mode(agent)
                 if (
-                    _ack_mode != "off"
+                    not terminal_text_only
+                    and _ack_mode != "off"
                     and agent.valid_tool_names
                     and codex_ack_continuations < 2
                     and agent._looks_like_codex_intermediate_ack(

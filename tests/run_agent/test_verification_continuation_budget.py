@@ -105,7 +105,7 @@ def test_pre_verify_preserves_composed_report_at_budget_limit(agent, monkeypatch
     assert not result["messages"][1].get("_pre_verify_synthetic")
 
 
-def test_intermediate_ack_uses_summary_instead_of_premature_text(agent, monkeypatch):
+def test_terminal_slot_does_not_retry_intermediate_ack(agent, monkeypatch):
     agent.valid_tool_names = ["web_search"]
     agent._intent_ack_continuation = True
     agent._looks_like_codex_intermediate_ack = MagicMock(return_value=True)
@@ -119,9 +119,10 @@ def test_intermediate_ack_uses_summary_instead_of_premature_text(agent, monkeypa
     ):
         result = agent.run_conversation("inspect /tmp/project")
 
-    assert result["final_response"] == "verified summary."
-    assert result["turn_exit_reason"] == "max_iterations_reached(1/1)"
-    agent._handle_max_iterations.assert_called_once()
+    assert result["final_response"] == "I'll inspect the files now"
+    assert result["turn_exit_reason"] == "text_response(finish_reason=stop)"
+    assert result["completed"] is True
+    agent._handle_max_iterations.assert_not_called()
 
 
 def test_later_verified_response_supersedes_pending_report(agent, monkeypatch):
@@ -219,17 +220,7 @@ def test_verify_on_stop_emits_interim_response_to_ui(agent, monkeypatch):
     assert result["final_response"] == "composed report"
 
 
-def test_streamed_interim_then_different_summary_not_marked_previewed(agent, monkeypatch):
-    """Ordinary interim narration followed by a different non-streamed summary.
-
-    The model streams "I'll inspect the files now" as an intermediate ack.
-    _emit_interim_assistant_message is called for this ordinary narration,
-    which must NOT set _response_was_previewed. Then _handle_max_iterations
-    produces a different summary through the non-streaming Chat Completions
-    path. The final result must NOT be marked as previewed — the interim was
-    unrelated mid-turn commentary, not the final response — so the CLI renders
-    the summary instead of suppressing it. (#65919 review: response-loss blocker)
-    """
+def test_terminal_slot_ack_is_not_emitted_as_interim(agent, monkeypatch):
     agent.valid_tool_names = ["web_search"]
     agent._intent_ack_continuation = True
     agent._looks_like_codex_intermediate_ack = MagicMock(return_value=True)
@@ -246,10 +237,8 @@ def test_streamed_interim_then_different_summary_not_marked_previewed(agent, mon
     ):
         result = agent.run_conversation("inspect /tmp/project")
 
-    # The final response is the different summary from _handle_max_iterations.
-    assert result["final_response"] == "Here is the summary of what I found."
-    # CRITICAL: response_previewed must be False — the interim narration was
-    # NOT the final response, so the CLI must render the summary.
+    assert result["final_response"] == "I'll inspect the files now"
+    assert emitted == []
     assert result["response_previewed"] is False
-
+    agent._handle_max_iterations.assert_not_called()
 

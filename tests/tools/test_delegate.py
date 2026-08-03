@@ -466,12 +466,7 @@ class TestDelegateObservability(unittest.TestCase):
             self.assertEqual(trace[2]["status"], "ok")
             self.assertIn("result_bytes", trace[2])
 
-    def test_empty_sentinel_marks_status_failed(self):
-        """Regression: a child that returns the literal '(empty)' sentinel
-        (emitted by run_agent.py when the LLM returns empty responses after
-        retries — e.g. transport misrouting) must be reported as failed, not
-        silently accepted as a completed delegation. Otherwise the parent
-        surfaces an empty string as if the subagent succeeded."""
+    def test_incomplete_child_with_error_summary_marks_status_failed(self):
         parent = _make_mock_parent(depth=0)
 
         with patch("run_agent.AIAgent") as MockAgent:
@@ -481,7 +476,8 @@ class TestDelegateObservability(unittest.TestCase):
             mock_child.session_completion_tokens = 0
             mock_child.run_conversation.return_value = {
                 "final_response": "(empty)",
-                "completed": True,
+                "completed": False,
+                "turn_exit_reason": "empty_response_exhausted",
                 "interrupted": False,
                 "api_calls": 4,
                 "messages": [],
@@ -490,6 +486,11 @@ class TestDelegateObservability(unittest.TestCase):
 
             result = json.loads(delegate_task(goal="Test empty sentinel", parent_agent=parent))
             self.assertEqual(result["results"][0]["status"], "failed")
+            self.assertFalse(result["results"][0]["completed"])
+            self.assertEqual(
+                result["results"][0]["turn_exit_reason"],
+                "empty_response_exhausted",
+            )
 
 
 class TestSubagentCostRollup(unittest.TestCase):

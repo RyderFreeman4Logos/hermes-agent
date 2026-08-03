@@ -3779,12 +3779,8 @@ class TestRunConversation:
         tool_resp = _mock_response(
             content="", finish_reason="tool_calls", tool_calls=[tc],
         )
-        # Final summary response from _handle_max_iterations.
-        summary_resp = _mock_response(
-            content="Could not finish — budget exhausted.", finish_reason="stop",
-        )
         agent.client.chat.completions.create.side_effect = [
-            tool_resp, tool_resp, summary_resp,
+            tool_resp, tool_resp,
         ]
 
         mock_record_failure = MagicMock(return_value=False)
@@ -3803,6 +3799,8 @@ class TestRunConversation:
 
         # The agent should have reported the task as not completed.
         assert result["completed"] is False
+        assert agent.client.chat.completions.create.call_count == 2
+        assert result["turn_exit_reason"] == "terminal_slot_exhausted(2/2)"
 
         # _record_task_failure should have been called exactly once for
         # the exhaustion event, with outcome="timed_out".
@@ -3831,11 +3829,8 @@ class TestRunConversation:
         tool_resp = _mock_response(
             content="", finish_reason="tool_calls", tool_calls=[tc],
         )
-        summary_resp = _mock_response(
-            content="Summary.", finish_reason="stop",
-        )
         agent.client.chat.completions.create.side_effect = [
-            tool_resp, tool_resp, summary_resp,
+            tool_resp, tool_resp,
         ]
 
         mock_record_failure = MagicMock(return_value=False)
@@ -3848,8 +3843,10 @@ class TestRunConversation:
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
         ):
-            agent.run_conversation("do stuff")
+            result = agent.run_conversation("do stuff")
 
+        assert agent.client.chat.completions.create.call_count == 2
+        assert result["turn_exit_reason"] == "terminal_slot_exhausted(2/2)"
         assert mock_record_failure.call_count == 0, (
             "_record_task_failure should not be called outside kanban mode"
         )
@@ -5712,5 +5709,4 @@ class TestMemoryContextSanitization:
         assert "memory-context" not in result.lower()
         assert "stale observation" not in result
         assert "how is the honcho working" in result
-
 

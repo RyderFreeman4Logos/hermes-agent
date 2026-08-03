@@ -26,6 +26,7 @@ from hermes_cli.model_switch import (
     get_model_switch_after_compression,
     schedule_model_switch_after_compression,
 )
+from hermes_state_common import AuthorityWriteIndeterminateError
 
 class TestCompressionBoundaryHook:
     def _make_agent(self, session_db):
@@ -351,6 +352,41 @@ class TestCompressionBoundaryHook:
                 assert db.get_session(original_sid)["end_reason"] is None
             else:
                 assert db.get_session(original_sid)["end_reason"] == "compression"
+
+    def test_auto_compression_aborts_on_authority_indeterminate_finalizer(self):
+        """The automatic path must not continue to a post-compression request."""
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+            agent = self._make_agent(db)
+            compressor = MagicMock()
+            compressor.compress.return_value = [{"role": "user", "content": "summary"}]
+            compressor.compression_count = 1
+            compressor.last_prompt_tokens = 0
+            compressor.last_completion_tokens = 0
+            compressor._last_summary_error = None
+            compressor._last_compress_aborted = False
+            agent.context_compressor = compressor
+            pending = ModelSwitchResult(
+                success=True,
+                new_model="target-model",
+                target_provider="target-provider",
+            )
+            schedule_model_switch_after_compression(agent, pending)
+
+            with patch(
+                "hermes_cli.model_switch.apply_model_switch_after_compression",
+                side_effect=AuthorityWriteIndeterminateError("authority indeterminate"),
+            ), pytest.raises(AuthorityWriteIndeterminateError, match="indeterminate"):
+                agent._compress_context(
+                    [{"role": "user", "content": "request"}],
+                    "sys",
+                    approx_tokens=100,
+                )
+
+            assert get_model_switch_after_compression(agent) is pending
+            compressor.on_session_start.assert_not_called()
 
     def test_apply_failure_after_rotation_keeps_pending_and_old_route(self):
         from hermes_state import SessionDB

@@ -2210,7 +2210,9 @@ def compress_context(
     # Hosts may defer activation until their outer publication fence commits.
     if not defer_context_engine_notification:
         defer_context_engine_notification = bool(
-            getattr(agent, "_defer_host_compression_publication", False)
+            getattr(agent, "__dict__", {}).get(
+                "_defer_host_compression_publication", False
+            )
         )
     _compressor_attempt_snapshot = _snapshot_compressor_attempt_state(
         agent.context_compressor

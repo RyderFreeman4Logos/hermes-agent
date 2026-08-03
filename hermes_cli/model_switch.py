@@ -2488,7 +2488,7 @@ def switch_model(
 
     # --- Collect warnings ---
     warnings: list[str] = []
-    if validation.get("message"):
+    if validate_live and validation.get("message"):
         warnings.append(validation["message"])
     hermes_warn = _check_hermes_model_warning(new_model)
     if hermes_warn:

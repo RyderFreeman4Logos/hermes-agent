@@ -338,6 +338,7 @@ def test_deferred_custom_current_direct_alias_propagates_local_only_policy(monke
 
     assert result.success is True
     assert (result.target_provider, result.new_model) == ("pm", "gpt-5.6-sol")
+    assert result.warning_message == ""
     assert calls == []
 
 

@@ -1281,7 +1281,16 @@ def finalize_context_engine_compression_notification(
         return False
     try:
         return bool(pending())
-    except Exception:
+    except Exception as exc:
+        from hermes_state_common import (
+            AUTHORITY_WRITE_INDETERMINATE_ATTR,
+            AuthorityWriteIndeterminateError,
+        )
+
+        if isinstance(exc, AuthorityWriteIndeterminateError) or getattr(
+            exc, AUTHORITY_WRITE_INDETERMINATE_ATTR, False
+        ):
+            raise
         # This is post-commit reconciliation. Never claim transcript rollback
         # after the durable compression boundary has already closed.
         logger.exception("post-compression commit reconciliation failed")

@@ -8472,7 +8472,7 @@ def test_compress_session_history_passes_force():
     assert agent._compress_context.call_args.kwargs.get("force") is True
 
 
-def test_compress_session_history_reconciles_cache_attribution_on_append_race():
+def test_compress_session_history_restores_cache_attribution_on_outer_rollback():
     original = [
         {"role": "user", "content": "one"},
         {"role": "assistant", "content": "two"},
@@ -8485,7 +8485,6 @@ def test_compress_session_history_reconciles_cache_attribution_on_append_race():
         _awaiting_cache_usage_after_compression=False,
         _compression_skipped_due_to_lock=False,
         context_compressor=compressor,
-        _flush_messages_to_session_db=Mock(),
     )
 
     def compress(*_args, **_kwargs):
@@ -8504,17 +8503,10 @@ def test_compress_session_history_reconciles_cache_attribution_on_append_race():
             history_version=1,
         )
 
-    assert removed == 3
-    assert session["history"] == [
-        {"role": "user", "content": "summary"},
-        {"role": "user", "content": "typed during compression"},
-    ]
-    assert session["history_version"] == 3
-    assert compressor.awaiting_real_usage_after_compression is True
-    assert agent._awaiting_cache_usage_after_compression is True
-    agent._flush_messages_to_session_db.assert_called_once_with(
-        [{"role": "user", "content": "typed during compression"}], None
-    )
+    assert removed == 0
+    assert session["history"] == current
+    assert compressor.awaiting_real_usage_after_compression is False
+    assert agent._awaiting_cache_usage_after_compression is False
 
 
 def test_compress_session_history_works_when_auto_compaction_disabled():

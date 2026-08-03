@@ -702,7 +702,8 @@ def schedule_model_switch_after_compression(
             "deferred model switching is unavailable with Codex inline "
             "auto-compaction; set compression.codex_app_server_auto to hermes"
         )
-    if result.context_length is None:
+    model_context = result.context_length
+    if not isinstance(model_context, int) or model_context <= 0:
         model_context = getattr(result.model_info, "context_window", 0)
         if not isinstance(model_context, int) or model_context <= 0:
             try:
@@ -716,6 +717,10 @@ def schedule_model_switch_after_compression(
                 model_context = None
         if isinstance(model_context, int) and model_context > 0:
             result.context_length = model_context
+    if not isinstance(result.context_length, int) or result.context_length <= 0:
+        raise ValueError(
+            "deferred model switch requires a positive destination context length"
+        )
     if result.reasoning_config is None:
         try:
             from hermes_constants import resolve_reasoning_config
@@ -734,6 +739,7 @@ def schedule_model_switch_after_compression(
             "state": "pending",
             "model": result.new_model,
             "provider": result.target_provider,
+            "context_length": result.context_length,
         }
         return previous
 
@@ -2505,10 +2511,12 @@ def switch_model(
         capabilities = get_model_capabilities(target_provider, new_model)
         model_info = get_model_info(target_provider, new_model)
     else:
-        # Deferred scheduling uses config/static validation only; live metadata
-        # discovery remains immediate-switch behavior.
+        # Deferred scheduling uses config/static validation only; preserve local
+        # catalog context so the committed-boundary route can activate safely.
         capabilities = None
-        model_info = None
+        model_info = get_model_info(
+            target_provider, new_model, allow_network=False
+        )
 
     # --- Collect warnings ---
     warnings: list[str] = []

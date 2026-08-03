@@ -19,8 +19,10 @@ import pytest
 
 from hermes_cli.model_switch import (
     ModelSwitchResult,
+    apply_model_switch_after_compression,
     get_model_switch_after_compression,
     schedule_model_switch_after_compression,
+    switch_model,
 )
 from run_agent import AIAgent
 
@@ -217,6 +219,7 @@ def _schedule_deferred(agent):
         api_key="later-key",
         base_url="https://later.example/v1",
         api_mode="chat_completions",
+        context_length=128_000,
     )
     schedule_model_switch_after_compression(agent, result)
     return result
@@ -319,7 +322,6 @@ def test_deferred_apply_without_destination_context_fails_closed():
     agent = _make_agent_openrouter()
     agent._invalidate_system_prompt = lambda: None
     agent._build_system_prompt = lambda system_message=None: "prompt"
-    agent._create_openai_client = lambda *_args, **_kwargs: MagicMock()
     agent.context_compressor = SimpleNamespace(
         context_length=200_000,
         threshold_tokens=160_000,
@@ -349,13 +351,12 @@ def test_deferred_apply_without_destination_context_fails_closed():
             create=True,
         ),
     ):
-        schedule_model_switch_after_compression(agent, pending)
-        status = apply_model_switch_after_compression(agent)
+        with pytest.raises(ValueError, match="destination context length"):
+            schedule_model_switch_after_compression(agent, pending)
 
-    assert status == "failed"
     assert (agent.model, agent.provider) == ("x-ai/grok-4", "openrouter")
     assert agent.context_compressor.context_length == 200_000
-    assert get_model_switch_after_compression(agent) is pending
+    assert get_model_switch_after_compression(agent) is None
 
 
 def test_deferred_authoritative_callback_failure_restores_plugin_compressor():
@@ -412,3 +413,82 @@ def test_deferred_authoritative_callback_failure_restores_plugin_compressor():
     assert agent.context_compressor.context_length == 32_000
     assert agent.context_compressor.threshold_tokens == 24_000
     assert agent.context_compressor.extra_marker == "plugin-old"
+
+
+def test_deferred_builtin_static_context_activates_without_network(monkeypatch):
+    """A locally recognized built-in route carries its static context to apply."""
+    from types import SimpleNamespace
+    import socket
+
+    fetch_calls = []
+
+    def local_catalog(*, allow_network=True):
+        fetch_calls.append(allow_network)
+        assert allow_network is False
+        return {
+            "anthropic": {
+                "models": {
+                    "claude-sonnet-4-6": {
+                        "name": "Claude Sonnet 4.6",
+                        "tool_call": True,
+                        "limit": {"context": 128_000, "output": 16_384},
+                    }
+                }
+            }
+        }
+
+    def no_network(*_args, **_kwargs):
+        raise AssertionError("network access")
+
+    monkeypatch.setattr("agent.models_dev.fetch_models_dev", local_catalog)
+    monkeypatch.setattr(socket, "getaddrinfo", no_network)
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **_kwargs: {
+            "provider": "anthropic",
+            "api_key": "new-key",
+            "base_url": "https://anthropic.invalid/v1",
+            "api_mode": "anthropic_messages",
+        },
+    )
+
+    result = switch_model(
+        raw_input="claude-sonnet-4-6",
+        explicit_provider="anthropic",
+        current_provider="anthropic",
+        current_model="claude-sonnet-4-5",
+        current_base_url="https://anthropic.invalid/v1",
+        current_api_key="old-key",
+        validate_live=False,
+    )
+
+    assert result.success is True
+    assert result.model_info is not None
+    assert result.model_info.context_window == 128_000
+    result.reasoning_config = {}
+
+    agent = _make_agent_anthropic()
+    agent.base_url = "https://anthropic.invalid/v1"
+    agent._invalidate_system_prompt = lambda: None
+    agent._build_system_prompt = lambda system_message=None: "prompt"
+    agent._create_openai_client = lambda *_args, **_kwargs: MagicMock()
+    agent.context_compressor = SimpleNamespace(
+        context_length=32_000,
+        threshold_tokens=24_000,
+        update_model=lambda **values: agent.context_compressor.__dict__.update(values),
+    )
+
+    schedule_model_switch_after_compression(agent, result)
+    assert result.context_length == 128_000
+    assert agent._model_switch_after_compression_state["context_length"] == 128_000
+    with (
+        patch("agent.anthropic_adapter.build_anthropic_client", return_value=MagicMock()),
+        patch("agent.anthropic_adapter.resolve_anthropic_token", return_value="new-key"),
+        patch("agent.anthropic_adapter._is_oauth_token", return_value=False),
+        patch("hermes_cli.timeouts.get_provider_request_timeout", return_value=None),
+    ):
+        assert apply_model_switch_after_compression(agent) == "applied"
+
+    assert (agent.model, agent.provider) == ("claude-sonnet-4-6", "anthropic")
+    assert agent.context_compressor.context_length == 128_000
+    assert fetch_calls and all(call is False for call in fetch_calls)

@@ -2543,6 +2543,28 @@ class TestN6KilledOnlyFromPositiveSignalDelivery:
 
 
 class TestN7CheckpointGenerationFence:
+    def test_terminal_notification_waits_for_durable_checkpoint(self, tmp_path, monkeypatch):
+        """N7: a failed terminal checkpoint cannot publish completion early."""
+        from tools import process_registry as pr
+        from tools.process_registry import ProcessRegistry, ProcessSession
+        import utils
+
+        monkeypatch.setattr(pr, "CHECKPOINT_PATH", tmp_path / "ckpt.json")
+        registry = ProcessRegistry()
+        session = ProcessSession(id="proc_n7_durable", command="done", notify_on_complete=True)
+        registry._publish_provisional_owner(session)
+        original = utils.atomic_json_write
+        monkeypatch.setattr(
+            utils, "atomic_json_write", lambda *_a: (_ for _ in ()).throw(OSError("disk full"))
+        )
+
+        registry._move_to_finished(session)
+
+        assert registry.completion_queue.empty()
+        monkeypatch.setattr(utils, "atomic_json_write", original)
+        assert registry._write_checkpoint() is True
+        assert registry.completion_queue.get_nowait()["session_id"] == session.id
+
     def test_older_snapshot_cannot_overwrite_newer(self, tmp_path, monkeypatch):
         """N7: monotonic generation + checkpoint lock drop stale snapshots."""
         from tools import process_registry as pr

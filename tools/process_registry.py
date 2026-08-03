@@ -171,6 +171,8 @@ class ProcessSession:
     _deadline_retry_scheduled: bool = field(default=False, repr=False)
     _registry_generation: int = field(default=0, repr=False)
     _signal_delivery_confirmed: bool = field(default=False, repr=False)
+    _terminal_generation: int = field(default=0, repr=False)
+    _completion_published: bool = field(default=False, repr=False)
 
 
 class ProcessRegistry:
@@ -252,6 +254,7 @@ class ProcessRegistry:
         self._session_generation = 0
         self._checkpoint_lock = threading.Lock()
         self._checkpoint_generation = 0
+        self._checkpoint_durable_generation = 0
         self._reserved_ids: set = set()
 
     @staticmethod
@@ -2083,6 +2086,8 @@ class ProcessRegistry:
             if was_running:
                 self._running.pop(session.id, None)
                 self._finished[session.id] = session
+                self._session_generation += 1
+                session._terminal_generation = self._session_generation
         if not was_running:
             if unowned:
                 session._completion_event.set()
@@ -2102,13 +2107,31 @@ class ProcessRegistry:
                 session.id,
                 exc_info=True,
             )
-        self._write_checkpoint()
+        checkpoint_written = self._write_checkpoint()
+        # Compatibility for callers/tests that replace the historical void
+        # helper: None means their replacement completed successfully.
+        if checkpoint_written is None:
+            with self._lock:
+                self._checkpoint_durable_generation = self._session_generation
+            self._publish_durable_completions()
+        session._completion_event.set()
 
-        # Only enqueue completion notification on the FIRST move.  Without
-        # this guard, kill_process() and the reader thread can both call
-        # _move_to_finished(), producing duplicate [IMPORTANT: ...] messages.
-        if session.notify_on_complete:
+    def _publish_durable_completions(self) -> None:
+        """Publish terminal notifications only after their absence is durable."""
+        with self._lock:
+            sessions = [
+                session
+                for session in self._finished.values()
+                if session.notify_on_complete
+                and not session._completion_published
+                and session._terminal_generation <= self._checkpoint_durable_generation
+            ]
+            for session in sessions:
+                session._completion_published = True
+
+        for session in sessions:
             from tools.ansi_strip import strip_ansi
+
             output_tail = strip_ansi(session.output_buffer[-2000:]) if session.output_buffer else ""
             self.completion_queue.put({
                 "type": "completion",
@@ -2119,12 +2142,8 @@ class ProcessRegistry:
                 "completion_reason": session.completion_reason,
                 "termination_source": session.termination_source,
                 "output": output_tail,
-                # Stable producer identity across checkpoint recovery; unlike
-                # a consumer-observed completion timestamp, this does not vary
-                # based on which watcher notices exit first.
                 "started_at": session.started_at,
             })
-        session._completion_event.set()
 
     # ----- Query Methods -----
 
@@ -3183,56 +3202,53 @@ class ProcessRegistry:
 
     # ----- Checkpoint (crash recovery) -----
 
-    def _write_checkpoint(self):
-        """Write running process metadata to checkpoint file atomically.
-
-        N7: snapshot under the registry lock, then write under a dedicated
-        checkpoint lock with a monotonic generation so an older snapshot can
-        never overwrite a newer terminal state on disk.
-        """
+    def _write_checkpoint(self) -> bool:
+        """Write running process metadata atomically, then publish durable terminals."""
         try:
-            with self._lock:
-                self._checkpoint_generation += 1
-                generation = self._checkpoint_generation
-                entries = []
-                for s in self._running.values():
-                    if not s.exited:
-                        # Lazily backfill the kernel start time for host PIDs so
-                        # recovery after restart can detect PID recycling even
-                        # for sessions spawned before this field existed.
-                        if s.host_start_time is None and s.pid_scope == "host" and s.pid:
-                            s.host_start_time = self._safe_host_start_time(s.pid)
-                        entries.append({
-                            "session_id": s.id,
-                            "command": s.command,
-                            "pid": s.pid,
-                            "pid_scope": s.pid_scope,
-                            "host_start_time": s.host_start_time,
-                            "cwd": s.cwd,
-                            "started_at": s.started_at,
-                            "execution_deadline": s.execution_deadline,
-                            "task_id": s.task_id,
-                            "session_key": s.session_key,
-                            "watcher_platform": s.watcher_platform,
-                            "watcher_chat_id": s.watcher_chat_id,
-                            "watcher_user_id": s.watcher_user_id,
-                            "watcher_user_name": s.watcher_user_name,
-                            "watcher_thread_id": s.watcher_thread_id,
-                            "watcher_message_id": s.watcher_message_id,
-                            "watcher_interval": s.watcher_interval,
-                            "notify_on_complete": s.notify_on_complete,
-                            "watch_patterns": s.watch_patterns,
-                        })
-
+            # Lock before snapshotting: a delayed old snapshot must never write
+            # after a newer terminal transition.
             with self._checkpoint_lock:
-                if generation < self._checkpoint_generation:
-                    # A newer snapshot was published while we prepared this one.
-                    return
-                # Atomic write to avoid corruption on crash
-                from utils import atomic_json_write
-                atomic_json_write(CHECKPOINT_PATH, entries)
+                with self._lock:
+                    self._checkpoint_generation += 1
+                    generation = self._session_generation
+                    entries = []
+                    for s in self._running.values():
+                        if not s.exited:
+                            # Lazily backfill the kernel start time for host PIDs so
+                            # recovery after restart can detect PID recycling even
+                            # for sessions spawned before this field existed.
+                            if s.host_start_time is None and s.pid_scope == "host" and s.pid:
+                                s.host_start_time = self._safe_host_start_time(s.pid)
+                            entries.append({
+                                "session_id": s.id,
+                                "command": s.command,
+                                "pid": s.pid,
+                                "pid_scope": s.pid_scope,
+                                "host_start_time": s.host_start_time,
+                                "cwd": s.cwd,
+                                "started_at": s.started_at,
+                                "execution_deadline": s.execution_deadline,
+                                "task_id": s.task_id,
+                                "session_key": s.session_key,
+                                "watcher_platform": s.watcher_platform,
+                                "watcher_chat_id": s.watcher_chat_id,
+                                "watcher_user_id": s.watcher_user_id,
+                                "watcher_user_name": s.watcher_user_name,
+                                "watcher_thread_id": s.watcher_thread_id,
+                                "watcher_message_id": s.watcher_message_id,
+                                "watcher_interval": s.watcher_interval,
+                                "notify_on_complete": s.notify_on_complete,
+                                "watch_patterns": s.watch_patterns,
+                            })
+                    # Atomic write to avoid corruption on crash.
+                    from utils import atomic_json_write
+                    atomic_json_write(CHECKPOINT_PATH, entries)
+                    self._checkpoint_durable_generation = generation
+            self._publish_durable_completions()
+            return True
         except Exception as e:
             logger.debug("Failed to write checkpoint file: %s", e, exc_info=True)
+            return False
 
     def recover_from_checkpoint(self) -> int:
         """

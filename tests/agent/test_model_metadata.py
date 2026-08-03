@@ -11,6 +11,7 @@ Coverage levels:
 """
 
 import time
+from functools import partial
 
 import pytest
 import yaml
@@ -82,6 +83,71 @@ class TestEstimateMessagesTokensRough:
 
 
 class TestEstimateRequestTokensRough:
+    def test_codex_responses_estimates_projected_wire_messages(self):
+        visible = "v" * 40_000
+        baseline = [{"role": "assistant", "content": "ok"}]
+        codex_estimate = partial(
+            estimate_request_tokens_rough, api_mode="codex_responses"
+        )
+
+        inflated = [{
+            **baseline[0],
+            "reasoning": "r" * 40_000,
+            "reasoning_content": "c" * 40_000,
+            "display_metadata": {"internal": "m" * 40_000},
+        }]
+        assert codex_estimate(inflated) == codex_estimate(baseline)
+
+        replay_only = [{
+            "role": "assistant",
+            "content": "",
+            "codex_message_items": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": visible}],
+            }],
+        }]
+        replay_and_visible = [{**replay_only[0], "content": visible}]
+        assert codex_estimate(replay_and_visible) == codex_estimate(replay_only)
+
+        def encrypted(size):
+            return [{
+                **baseline[0],
+                "codex_reasoning_items": [{
+                    "type": "reasoning",
+                    "encrypted_content": "e" * size,
+                }],
+            }]
+        assert codex_estimate(encrypted(40_000)) == codex_estimate(encrypted(80_000))
+
+        api_content = [{"role": "user", "content": "stored", "api_content": visible}]
+        wire_content = [{"role": "user", "content": visible}]
+        assert codex_estimate(api_content) == codex_estimate(wire_content)
+
+        with_system_message = [
+            {"role": "system", "content": visible},
+            {"role": "user", "content": "hello"},
+        ]
+        assert codex_estimate(with_system_message) == estimate_request_tokens_rough(
+            with_system_message[1:],
+            system_prompt=visible,
+            api_mode="codex_responses",
+        )
+
+        tool_image = [{
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": [{
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{'a' * 40_000}"},
+            }],
+        }]
+        assert 1_500 <= codex_estimate(tool_image) < 2_000
+
+        malformed = ["m" * 40_000]
+        assert codex_estimate(malformed) == estimate_request_tokens_rough(malformed)
+        assert estimate_request_tokens_rough(inflated) == estimate_messages_tokens_rough(inflated)
+
     def test_caches_tools_estimate(self):
         messages = [{"role": "user", "content": "hello"}]
         tools = [
@@ -1076,4 +1142,3 @@ class TestMoAContextLength:
         assert compressor.context_length == configured_context
         assert compressor.threshold_tokens == configured_context // 2
         endpoint_probe.assert_not_called()
-

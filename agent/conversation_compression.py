@@ -2409,6 +2409,7 @@ def compress_context(
             compressed,
             system_prompt=new_system_prompt or "",
             tools=agent.tools or None,
+            api_mode=getattr(agent, "api_mode", None),
         )
         agent.context_compressor.last_compression_rough_tokens = _compressed_est
         agent.context_compressor.last_prompt_tokens = -1

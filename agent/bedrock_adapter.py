@@ -280,15 +280,17 @@ _AWS_CREDENTIAL_ENV_VARS = [
 ]
 
 
-def resolve_aws_auth_env_var(env: Optional[Dict[str, str]] = None) -> Optional[str]:
+def resolve_aws_auth_env_var(
+    env: Optional[Dict[str, str]] = None,
+    *,
+    allow_network: bool = True,
+) -> Optional[str]:
     """Return the name of the AWS auth source that is active, or None.
 
     Checks environment variables first, then falls back to boto3's credential
-    chain for implicit sources (EC2 IMDS, ECS task role, etc.).
-
-    This mirrors OpenClaw's ``resolveAwsSdkEnvVarName()`` — used to detect
-    whether the user has any AWS credentials configured without actually
-    attempting to authenticate.
+    chain for implicit sources (EC2 IMDS, ECS task role, etc.) when network
+    is allowed. Local-only callers must pass ``allow_network=False`` so no
+    botocore credential chain, IMDS, DNS, or connect attempt can run.
     """
     env = env if env is not None else os.environ
     # Bearer token takes highest priority
@@ -307,6 +309,8 @@ def resolve_aws_auth_env_var(env: Optional[Dict[str, str]] = None) -> Optional[s
     # Web identity (EKS IRSA)
     if env.get("AWS_WEB_IDENTITY_TOKEN_FILE", "").strip():
         return "AWS_WEB_IDENTITY_TOKEN_FILE"
+    if not allow_network:
+        return None
     # No env vars — check if boto3 can resolve credentials via IMDS or other
     # implicit sources (EC2 instance role, ECS task role, Lambda, etc.)
     try:
@@ -322,21 +326,22 @@ def resolve_aws_auth_env_var(env: Optional[Dict[str, str]] = None) -> Optional[s
     return None
 
 
-def has_aws_credentials(env: Optional[Dict[str, str]] = None) -> bool:
+def has_aws_credentials(
+    env: Optional[Dict[str, str]] = None,
+    *,
+    allow_network: bool = True,
+) -> bool:
     """Return True if any AWS credential source is detected.
 
-    Checks environment variables first (fast, no I/O), then falls back to
-    boto3's credential chain which covers EC2 instance roles, ECS task roles,
-    Lambda execution roles, and other IMDS-based sources that don't set
-    environment variables.
-
-    This two-tier approach mirrors the pattern from OpenClaw PR #62673:
-    cloud environments (EC2, ECS, Lambda) provide credentials via instance
-    metadata, not environment variables. The env-var check is a fast path
-    for local development; the boto3 fallback covers all cloud deployments.
+    Checks environment variables first (fast, no I/O). When network is
+    allowed, falls back to boto3's credential chain for EC2/ECS/Lambda
+    IMDS-based sources. Local-only resolution stays fail-closed on the
+    explicit env/config surface and never probes botocore.
     """
-    if resolve_aws_auth_env_var(env) is not None:
+    if resolve_aws_auth_env_var(env, allow_network=allow_network) is not None:
         return True
+    if not allow_network:
+        return False
     # Fall back to boto3's credential resolver — this covers EC2 instance
     # metadata (IMDS), ECS container credentials, and other implicit sources
     # that don't set environment variables.
@@ -353,7 +358,11 @@ def has_aws_credentials(env: Optional[Dict[str, str]] = None) -> bool:
     return False
 
 
-def resolve_bedrock_region(env: Optional[Dict[str, str]] = None) -> str:
+def resolve_bedrock_region(
+    env: Optional[Dict[str, str]] = None,
+    *,
+    allow_network: bool = True,
+) -> str:
     """Resolve the AWS region for Bedrock API calls.
 
     Priority:
@@ -362,10 +371,8 @@ def resolve_bedrock_region(env: Optional[Dict[str, str]] = None) -> str:
       3. boto3/botocore configured region (from ~/.aws/config or SSO profile)
       4. us-east-1 (hard fallback)
 
-    The boto3 fallback is critical for EU/AP users who configure their region
-    in ~/.aws/config via a named profile rather than env vars — without it,
-    live model discovery would always return us.* profile IDs regardless of
-    the user's actual region.
+    Local-only callers skip botocore entirely and use the hard fallback when
+    no explicit env region is present.
     """
     env = env if env is not None else os.environ
     explicit = (
@@ -374,6 +381,8 @@ def resolve_bedrock_region(env: Optional[Dict[str, str]] = None) -> str:
     )
     if explicit:
         return explicit
+    if not allow_network:
+        return "us-east-1"
     try:
         import botocore.session
         region = botocore.session.get_session().get_config_variable("region")

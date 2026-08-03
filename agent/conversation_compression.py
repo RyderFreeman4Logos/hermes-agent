@@ -1330,6 +1330,13 @@ def compress_context(
         prompt — the session is NOT rotated.  Callers should detect the
         no-op via ``len(returned) == len(input)`` and stop the retry loop.
     """
+    # Hosts (TUI post-turn publication, gateway outer transcript rewrite)
+    # may arm a one-shot defer on the agent so auto-compression reuses the
+    # same outer finalize fence as manual /compress callers.
+    if not defer_context_engine_notification:
+        defer_context_engine_notification = bool(
+            getattr(agent, "_defer_host_compression_publication", False)
+        )
     if (
         defer_context_engine_notification
         and callable(getattr(agent, _PENDING_CONTEXT_ENGINE_NOTIFICATION, None))

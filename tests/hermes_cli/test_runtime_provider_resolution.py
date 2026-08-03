@@ -1731,7 +1731,7 @@ def test_read_only_pool_selection_never_refreshes_or_persists(monkeypatch):
     monkeypatch.setattr(
         cp,
         "read_credential_pool",
-        lambda _provider: [expiring.to_dict(), live.to_dict(), dead.to_dict()],
+        lambda _provider, **_kwargs: [expiring.to_dict(), live.to_dict(), dead.to_dict()],
     )
     monkeypatch.setattr(
         cp,
@@ -1779,7 +1779,7 @@ def test_read_only_pool_does_not_exchange_copilot_token(monkeypatch):
     from hermes_cli import copilot_auth
 
     exchanges = []
-    monkeypatch.setattr(cp, "read_credential_pool", lambda _provider: [])
+    monkeypatch.setattr(cp, "read_credential_pool", lambda _provider, **_kwargs: [])
     monkeypatch.setattr(
         copilot_auth,
         "resolve_copilot_token",
@@ -1859,3 +1859,64 @@ def test_local_only_copilot_resolution_skips_token_exchange(monkeypatch):
     live = auth.resolve_api_key_provider_credentials("copilot")
     assert live["base_url"] == "https://copilot.example.test"
     assert exchanges
+
+
+def test_bedrock_allow_network_false_skips_botocore_chain(monkeypatch):
+    """Local-only Bedrock resolve must not enter botocore credential chain."""
+    import agent.bedrock_adapter as ba
+    import hermes_cli.runtime_provider as rp
+
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAEXAMPLE")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "secret-example")
+    monkeypatch.setenv("AWS_REGION", "us-east-1")
+    monkeypatch.setattr(rp, "load_config", lambda: {"bedrock": {"region": "us-east-1"}})
+    monkeypatch.setattr(rp, "_get_model_config", lambda: {"default": "amazon.nova-pro-v1:0"})
+
+    def boom(*_a, **_k):
+        raise AssertionError("botocore chain must not run under allow_network=False")
+
+    monkeypatch.setattr(ba, "botocore", type("B", (), {"session": type("S", (), {"get_session": staticmethod(boom)})()})(), raising=False)
+    # Also patch the import path used inside helpers.
+    import builtins
+    real_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name.startswith("botocore"):
+            raise AssertionError(f"botocore import forbidden under local-only: {name}")
+        return real_import(name, *args, **kwargs)
+
+    # Prefer direct helper flags over import patching: helpers must short-circuit.
+    assert ba.has_aws_credentials(allow_network=False) is True
+    assert ba.resolve_aws_auth_env_var(allow_network=False) == "AWS_ACCESS_KEY_ID"
+    runtime = rp.resolve_runtime_provider(
+        requested="bedrock",
+        target_model="amazon.nova-pro-v1:0",
+        allow_network=False,
+    )
+    assert runtime["provider"] == "bedrock"
+    assert runtime["region"] == "us-east-1"
+
+
+def test_bedrock_allow_network_false_without_explicit_creds_fails_closed(monkeypatch):
+    from hermes_cli.auth import AuthError
+    import agent.bedrock_adapter as ba
+    import hermes_cli.runtime_provider as rp
+
+    for key in (
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_PROFILE",
+        "AWS_BEARER_TOKEN_BEDROCK",
+        "AWS_WEB_IDENTITY_TOKEN_FILE",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(rp, "load_config", lambda: {"bedrock": {"region": "us-east-1"}})
+    monkeypatch.setattr(rp, "_get_model_config", lambda: {"default": "amazon.nova-pro-v1:0"})
+    assert ba.has_aws_credentials(allow_network=False) is False
+    with pytest.raises(AuthError):
+        rp.resolve_runtime_provider(
+            requested="bedrock",
+            target_model="amazon.nova-pro-v1:0",
+            allow_network=False,
+        )

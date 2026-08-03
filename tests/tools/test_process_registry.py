@@ -658,7 +658,7 @@ class TestSpawnEnvSanitization:
             "else current=$(sed 's/^.*) //' \"/proc/4242/stat\" 2>/dev/null | "
             "cut -d ' ' -f 20); "
             'if [ -z "$current" ]; then echo UNKNOWN; '
-            'elif [ "$current" = "77" ]; then echo GONE; '
+            'elif [ "$current" = "77" ]; then echo MATCH; '
             "else echo GONE; fi; fi"
         )
         assert env.commands[1][0] == (

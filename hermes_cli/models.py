@@ -3361,9 +3361,15 @@ def _copilot_catalog_item_is_text_model(item: dict[str, Any]) -> bool:
 
 
 def fetch_github_model_catalog(
-    api_key: Optional[str] = None, timeout: float = 5.0
+    api_key: Optional[str] = None,
+    timeout: float = 5.0,
+    *,
+    allow_network: bool = True,
 ) -> Optional[list[dict[str, Any]]]:
     """Fetch the live GitHub Copilot model catalog for this account."""
+    if not allow_network:
+        return None
+
     attempts: list[dict[str, str]] = []
     if api_key:
         attempts.append({
@@ -3839,8 +3845,10 @@ _COPILOT_MODEL_ALIASES = {
 def _copilot_catalog_ids(
     catalog: Optional[list[dict[str, Any]]] = None,
     api_key: Optional[str] = None,
+    *,
+    allow_network: bool = True,
 ) -> set[str]:
-    if catalog is None and api_key:
+    if catalog is None and api_key and allow_network:
         catalog = fetch_github_model_catalog(api_key=api_key)
     if not catalog:
         return set()
@@ -3856,12 +3864,15 @@ def normalize_copilot_model_id(
     *,
     catalog: Optional[list[dict[str, Any]]] = None,
     api_key: Optional[str] = None,
+    allow_network: bool = True,
 ) -> str:
     raw = str(model_id or "").strip()
     if not raw:
         return ""
 
-    catalog_ids = _copilot_catalog_ids(catalog=catalog, api_key=api_key)
+    catalog_ids = _copilot_catalog_ids(
+        catalog=catalog, api_key=api_key, allow_network=allow_network
+    )
     alias = _COPILOT_MODEL_ALIASES.get(raw)
     if alias:
         return alias
@@ -3924,6 +3935,7 @@ def copilot_model_api_mode(
     *,
     catalog: Optional[list[dict[str, Any]]] = None,
     api_key: Optional[str] = None,
+    allow_network: bool = True,
 ) -> str:
     """Determine the API mode for a Copilot model.
 
@@ -3933,10 +3945,15 @@ def copilot_model_api_mode(
     """
     # Fetch the catalog once so normalize + endpoint check share it
     # (avoids two redundant network calls for non-GPT-5 models).
-    if catalog is None and api_key:
+    if catalog is None and api_key and allow_network:
         catalog = fetch_github_model_catalog(api_key=api_key)
 
-    normalized = normalize_copilot_model_id(model_id, catalog=catalog, api_key=api_key)
+    normalized = normalize_copilot_model_id(
+        model_id,
+        catalog=catalog,
+        api_key=api_key,
+        allow_network=allow_network,
+    )
     if not normalized:
         return "chat_completions"
 
@@ -4668,6 +4685,7 @@ def validate_requested_model(
         requested_for_lookup = normalize_copilot_model_id(
             requested,
             api_key=api_key,
+            allow_network=allow_network,
         ) or requested
 
     if not requested:

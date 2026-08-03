@@ -106,6 +106,94 @@ def _install_network_tripwires(monkeypatch):
     return calls
 
 
+def _install_copilot_catalog_tripwire(monkeypatch):
+    requests = []
+
+    def trip(request, **_kwargs):
+        requests.append((request.full_url, request.get_header("Authorization")))
+        raise AssertionError("Copilot catalog network request")
+
+    monkeypatch.setattr("hermes_cli.models._urlopen_model_catalog_request", trip)
+    return requests
+
+
+def _install_copilot_runtime(monkeypatch):
+    config = {
+        "model": {"provider": "copilot"},
+        "providers": {
+            "copilot": {
+                "base_url": "https://api.githubcopilot.com",
+                "api_key": "copilot-secret",
+            }
+        },
+    }
+    monkeypatch.setattr("hermes_cli.runtime_provider.load_config", lambda: config)
+    return config
+
+
+def test_deferred_copilot_switch_never_fetches_catalog_or_forwards_token(monkeypatch):
+    requests = _install_copilot_catalog_tripwire(monkeypatch)
+    config = _install_copilot_runtime(monkeypatch)
+
+    result = switch_model(
+        raw_input="gpt-5.4",
+        explicit_provider="copilot",
+        current_provider="openai-codex",
+        current_model="gpt-5.3-codex",
+        user_providers=config["providers"],
+        validate_live=False,
+    )
+
+    assert result.success is True
+    assert result.api_mode == "codex_responses"
+    assert requests == []
+
+
+def test_deferred_unknown_copilot_model_fails_before_scheduling(monkeypatch):
+    requests = _install_copilot_catalog_tripwire(monkeypatch)
+    config = _install_copilot_runtime(monkeypatch)
+
+    result = switch_model(
+        raw_input="copilot-future-unknown",
+        explicit_provider="copilot",
+        current_provider="openai-codex",
+        current_model="gpt-5.3-codex",
+        user_providers=config["providers"],
+        validate_live=False,
+    )
+
+    assert result.success is False
+    assert "local" in result.error_message.lower()
+    assert requests == []
+
+
+def test_live_copilot_switch_still_uses_injected_catalog(monkeypatch):
+    calls = []
+    config = _install_copilot_runtime(monkeypatch)
+    monkeypatch.setattr(
+        "hermes_cli.models.fetch_github_model_catalog",
+        lambda api_key=None, **kwargs: calls.append((api_key, kwargs)) or [
+            {"id": "gpt-5.4", "capabilities": {"type": "chat"}}
+        ],
+    )
+    monkeypatch.setattr("hermes_cli.model_switch.get_model_capabilities", lambda *_args: None)
+    monkeypatch.setattr("hermes_cli.model_switch.get_model_info", lambda *_args: None)
+
+    result = switch_model(
+        raw_input="gpt-5.4",
+        explicit_provider="copilot",
+        current_provider="openai-codex",
+        current_model="gpt-5.3-codex",
+        user_providers=config["providers"],
+        validate_live=True,
+    )
+
+    assert result.success is True
+    assert result.api_mode == "codex_responses"
+    assert calls
+    assert all(api_key == "copilot-secret" for api_key, _kwargs in calls)
+
+
 def test_deferred_exact_configured_model_is_strictly_local(monkeypatch):
     config = _pm_config()
     calls = _install_network_tripwires(monkeypatch)

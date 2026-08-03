@@ -2414,7 +2414,9 @@ def switch_model(
 
     # --- Copilot api_mode override ---
     if target_provider in {"copilot", "github-copilot"}:
-        api_mode = copilot_model_api_mode(new_model, api_key=api_key)
+        api_mode = copilot_model_api_mode(
+            new_model, api_key=api_key, allow_network=validate_live
+        )
 
     # --- OpenCode api_mode override ---
     if target_provider in {"opencode-zen", "opencode-go", "opencode"}:

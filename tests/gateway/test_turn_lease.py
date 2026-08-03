@@ -175,6 +175,7 @@ def test_queued_completion_cannot_call_provider_before_deferred_switch():
                 success=True,
                 new_model="new-model",
                 target_provider="new-provider",
+                context_length=128_000,
             ),
         )
         _queue_context_engine_compression_notification(

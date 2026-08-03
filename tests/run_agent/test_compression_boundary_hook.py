@@ -181,6 +181,7 @@ class TestCompressionBoundaryHook:
                     success=True,
                     new_model="new-model",
                     target_provider="new-provider",
+                    context_length=128_000,
                 ),
                 on_applied=lambda *_args: events.append("frontend-sync"),
             )
@@ -233,6 +234,7 @@ class TestCompressionBoundaryHook:
                 api_key="new-key",
                 base_url="https://new.example/v1",
                 api_mode="responses",
+                          context_length=128_000,
             )
             schedule_model_switch_after_compression(agent, pending)
 
@@ -307,6 +309,7 @@ class TestCompressionBoundaryHook:
                 api_key="new-key",
                 base_url="https://new.example/v1",
                 api_mode="responses",
+                          context_length=128_000,
             )
 
             def fail_callback(*_args):
@@ -372,6 +375,7 @@ class TestCompressionBoundaryHook:
                 success=True,
                 new_model="target-model",
                 target_provider="target-provider",
+                          context_length=128_000,
             )
             schedule_model_switch_after_compression(agent, pending)
 
@@ -408,6 +412,7 @@ class TestCompressionBoundaryHook:
                 success=True,
                 new_model="broken-model",
                 target_provider="broken-provider",
+                          context_length=128_000,
             )
             schedule_model_switch_after_compression(agent, pending)
             agent.switch_model = MagicMock(side_effect=RuntimeError("switch failed"))
@@ -451,6 +456,7 @@ class TestCompressionBoundaryHook:
                 target_provider="new-provider",
                 api_key="new-key",
                 base_url="https://new.example/v1",
+                          context_length=128_000,
             )
             on_applied = MagicMock()
             schedule_model_switch_after_compression(
@@ -501,6 +507,7 @@ class TestCompressionBoundaryHook:
                 success=True,
                 new_model="later-model",
                 target_provider="later-provider",
+                          context_length=128_000,
             )
             schedule_model_switch_after_compression(agent, pending)
 

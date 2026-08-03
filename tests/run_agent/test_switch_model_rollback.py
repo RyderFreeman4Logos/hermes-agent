@@ -333,7 +333,7 @@ def test_deferred_apply_without_destination_context_fails_closed():
         target_provider="custom-provider",
         api_key="new-key",
         base_url="https://custom.example/v1",
-    )
+          )
 
     with (
         patch(

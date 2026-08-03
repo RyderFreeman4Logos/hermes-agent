@@ -4903,18 +4903,32 @@ def _compress_session_history(
 
     if partial and tail:
         compressed = rejoin_compressed_head_and_tail(compressed, tail)
+    newer_messages = []
     with session["history_lock"]:
         current_history = list(session.get("history", []))
         current_version = int(session.get("history_version", 0))
-        newer_messages = []
         if current_version != history_version:
             if current_history[: len(history)] == history:
                 newer_messages = current_history[len(history) :]
             else:
+                # External non-append mutation during compaction — drop the
+                # compressed result so we don't clobber concurrent edits.
                 logger.warning(
                     "Compression history changed non-append-only; preserving current history"
                 )
-                newer_messages = current_history
+                finalize_context_engine_compression_notification(
+                    agent,
+                    committed=False,
+                )
+                agent._awaiting_cache_usage_after_compression = (
+                    cache_attribution_pending_before
+                )
+                if compressor is not None and hasattr(
+                    compressor, "awaiting_real_usage_after_compression"
+                ):
+                    compressor.awaiting_real_usage_after_compression = real_usage_pending_before
+                usage = _get_usage(agent)
+                return 0, usage
         session["history"] = [*compressed, *newer_messages]
         session["history_version"] = current_version + 1
     if newer_messages:

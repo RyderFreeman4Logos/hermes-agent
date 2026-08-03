@@ -4907,15 +4907,20 @@ def _compress_session_history(
     with session["history_lock"]:
         current_history = list(session.get("history", []))
         current_version = int(session.get("history_version", 0))
+        pending_notification = getattr(agent, "__dict__", {}).get(
+            "_pending_context_engine_compression_notification"
+        )
         if current_version != history_version:
-            if current_history[: len(history)] == history:
+            if (
+                current_history[: len(history)] == history
+                and callable(pending_notification)
+            ):
+                # A real boundary committed under the deferred host fence;
+                # retain append-only input that arrived while it ran.
                 newer_messages = current_history[len(history) :]
             else:
-                # External non-append mutation during compaction — drop the
-                # compressed result so we don't clobber concurrent edits.
-                logger.warning(
-                    "Compression history changed non-append-only; preserving current history"
-                )
+                # No durable boundary (or a non-append mutation): keep the
+                # live transcript and discard the queued boundary effects.
                 finalize_context_engine_compression_notification(
                     agent,
                     committed=False,
@@ -4932,12 +4937,14 @@ def _compress_session_history(
         session["history"] = [*compressed, *newer_messages]
         session["history_version"] = current_version + 1
     if newer_messages:
-        try:
-            for message in newer_messages:
-                message.pop("_db_persisted", None)
-            agent._flush_messages_to_session_db(newer_messages, None)
-        except Exception:
-            logger.exception("Failed to persist messages that arrived during compression")
+        flush_messages = getattr(agent, "_flush_messages_to_session_db", None)
+        if callable(flush_messages):
+            try:
+                for message in newer_messages:
+                    message.pop("_db_persisted", None)
+                flush_messages(newer_messages, None)
+            except Exception:
+                logger.exception("Failed to persist messages that arrived during compression")
     usage = _get_usage(agent)
     return len(history) - len(compressed), usage
 

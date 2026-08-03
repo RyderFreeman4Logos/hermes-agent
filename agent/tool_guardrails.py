@@ -8,10 +8,10 @@ turn halts.
 
 from __future__ import annotations
 
-import base64
 import copy
 import hashlib
 import json
+import reprlib
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
@@ -377,9 +377,12 @@ class ToolCallGuardrailController:
         result: Any,
         *,
         failed: bool | None = None,
+        counts_for_progress: bool = True,
     ) -> ToolGuardrailDecision:
         """Record a tool result and return any warning/halt decision."""
         signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
+        if not counts_for_progress:
+            return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
         if failed is None:
             failed, _ = classify_tool_failure(tool_name, result)
 
@@ -627,43 +630,203 @@ def _coerce_args(args: Mapping[str, Any] | None) -> Mapping[str, Any]:
 _JSON_PARSE_FAILED = object()
 
 
+_MAX_CANONICAL_FRAME_BYTES = 4096
+
+
+def _typed_frame(tag: bytes, payload: bytes) -> bytes:
+    """Return a bounded, self-delimiting type frame."""
+    size = len(payload)
+    if size > _MAX_CANONICAL_FRAME_BYTES:
+        return (
+            tag
+            + b"H"
+            + str(size).encode("ascii")
+            + b":"
+            + hashlib.sha256(payload).digest()
+        )
+    return tag + b"V" + str(size).encode("ascii") + b":" + payload
+
+
+def _compound_frame(tag: bytes, parts: list[bytes]) -> bytes:
+    tag += str(len(parts)).encode("ascii") + b";"
+    size = sum(len(part) for part in parts)
+    if size > _MAX_CANONICAL_FRAME_BYTES:
+        digest = hashlib.sha256()
+        for part in parts:
+            digest.update(part)
+        return tag + b"H" + str(size).encode("ascii") + b":" + digest.digest()
+    return tag + b"V" + str(size).encode("ascii") + b":" + b"".join(parts)
+
+
+def _canonical_result_frame(value: Any) -> bytes:
+    """Encode arbitrary tool results into total, typed, bounded canonical bytes."""
+    active_ids: set[int] = set()
+    frames: list[bytes] = []
+    stack: list[tuple[str, Any]] = [("visit", value)]
+
+    def type_frame(item: Any) -> bytes:
+        try:
+            item_type = type(item)
+            name = f"{item_type.__module__}.{item_type.__qualname__}"
+            return _typed_frame(b"Q", name.encode("utf-8", "backslashreplace"))
+        except Exception:
+            return _typed_frame(b"Q", b"<unknown>")
+
+    while stack:
+        operation, payload = stack.pop()
+        if operation == "finish_sequence":
+            tag, identity, count, unordered = payload
+            parts = frames[-count:] if count else []
+            if count:
+                del frames[-count:]
+            active_ids.discard(identity)
+            if unordered:
+                parts.sort()
+            frames.append(_compound_frame(tag, parts))
+            continue
+        if operation == "finish_mapping":
+            tag, identity, count = payload
+            part_count = count * 2
+            parts = frames[-part_count:] if part_count else []
+            if part_count:
+                del frames[-part_count:]
+            active_ids.discard(identity)
+            pairs = [
+                _compound_frame(b"P", parts[index : index + 2])
+                for index in range(0, part_count, 2)
+            ]
+            pairs.sort()
+            frames.append(_compound_frame(tag, pairs))
+            continue
+        if operation == "finish_object":
+            identity, object_type = payload
+            attributes = frames.pop()
+            active_ids.discard(identity)
+            frames.append(_compound_frame(b"O", [object_type, attributes]))
+            continue
+
+        current = payload
+        try:
+            if current is None:
+                frames.append(b"N")
+                continue
+            if isinstance(current, bool):
+                frames.append(b"B1" if current else b"B0")
+                continue
+            if isinstance(current, int):
+                frames.append(_typed_frame(b"I", str(current).encode("ascii")))
+                continue
+            if isinstance(current, float):
+                frames.append(_typed_frame(b"F", current.hex().encode("ascii")))
+                continue
+            if isinstance(current, str):
+                frames.append(
+                    _typed_frame(b"S", current.encode("utf-8", "surrogatepass"))
+                )
+                continue
+            if isinstance(current, (bytes, bytearray, memoryview)):
+                try:
+                    raw = bytes(current)
+                except Exception:
+                    raw = b"<unavailable>"
+                frames.append(_typed_frame(b"Y", raw))
+                continue
+
+            container_tag = (
+                b"D"
+                if isinstance(current, Mapping)
+                else b"L"
+                if isinstance(current, list)
+                else b"T"
+                if isinstance(current, tuple)
+                else b"E"
+                if isinstance(current, set)
+                else b"R"
+                if isinstance(current, frozenset)
+                else None
+            )
+            if container_tag is not None:
+                identity = id(current)
+                if identity in active_ids:
+                    frames.append(b"C" + container_tag)
+                    continue
+                if isinstance(current, Mapping):
+                    items = list(current.items())
+                    active_ids.add(identity)
+                    stack.append(
+                        ("finish_mapping", (container_tag, identity, len(items)))
+                    )
+                    for key, item_value in reversed(items):
+                        stack.append(("visit", item_value))
+                        stack.append(("visit", key))
+                else:
+                    items = list(current)
+                    active_ids.add(identity)
+                    stack.append(
+                        (
+                            "finish_sequence",
+                            (
+                                container_tag,
+                                identity,
+                                len(items),
+                                isinstance(current, (set, frozenset)),
+                            ),
+                        )
+                    )
+                    for item in reversed(items):
+                        stack.append(("visit", item))
+                continue
+
+            object_type = type_frame(current)
+            identity = id(current)
+            if identity in active_ids:
+                frames.append(_compound_frame(b"C", [object_type]))
+                continue
+            try:
+                attributes = vars(current)
+            except Exception:
+                attributes = None
+            if isinstance(attributes, Mapping):
+                active_ids.add(identity)
+                stack.append(("finish_object", (identity, object_type)))
+                stack.append(("visit", attributes))
+                continue
+            try:
+                preview = reprlib.repr(current).encode(
+                    "utf-8", errors="backslashreplace"
+                )
+            except Exception:
+                preview = b"<unrepresentable>"
+            frames.append(
+                _compound_frame(
+                    b"O", [object_type, _typed_frame(b"V", preview)]
+                )
+            )
+        except Exception as exc:
+            frames.append(_compound_frame(b"X", [type_frame(current), type_frame(exc)]))
+
+    return frames[0]
+
 def _result_hash(result: Any) -> str:
-    """Hash canonical final-result bytes without retaining raw tool output."""
+    """Hash a total canonical encoding without retaining raw tool output."""
+    from agent.tool_dispatch_helpers import (
+        _is_multimodal_tool_result,
+        _multimodal_text_summary,
+    )
+
+    try:
+        if _is_multimodal_tool_result(result):
+            result = _multimodal_text_summary(result)
+    except Exception:
+        pass
     parsed: Any = _JSON_PARSE_FAILED
     if isinstance(result, str):
         try:
             parsed = json.loads(result)
-        except (json.JSONDecodeError, TypeError):
+        except (json.JSONDecodeError, TypeError, ValueError):
             pass
-        if parsed is _JSON_PARSE_FAILED:
-            return _sha256_bytes(
-                result.encode("utf-8", "surrogatepass"),
-                prefix=b"text\0",
-            )
-    elif isinstance(result, bytes):
-        return _sha256_bytes(result, prefix=b"bytes\0")
-    elif isinstance(result, bytearray):
-        return _sha256_bytes(bytes(result), prefix=b"bytes\0")
-    else:
-        parsed = result
-
-    canonical = json.dumps(
-        parsed,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        default=_json_hash_default,
-    ).encode("utf-8", "surrogatepass")
-    return _sha256_bytes(canonical, prefix=b"json\0")
-
-
-def _json_hash_default(value: Any) -> Any:
-    if isinstance(value, (bytes, bytearray)):
-        return {
-            "__hermes_type__": "bytes",
-            "base64": base64.b64encode(bytes(value)).decode("ascii"),
-        }
-    return str(value)
+    canonical = result if parsed is _JSON_PARSE_FAILED else parsed
+    return hashlib.sha256(_canonical_result_frame(canonical)).hexdigest()
 
 
 def _as_bool(value: Any, default: bool) -> bool:

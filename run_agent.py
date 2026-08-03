@@ -47,6 +47,10 @@ import threading
 import uuid
 import warnings
 from typing import List, Dict, Any, Optional, Callable
+
+# ponytail: global lock only guards tiny ID bookkeeping; make it per-agent if profiled hot.
+_TOOL_RESULT_OBSERVATION_LOCK = threading.Lock()
+
 # NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
 # SDK pulls ~240 ms of imports. We expose `OpenAI` as a thin proxy object
 # that imports the SDK on first call/isinstance check. This preserves:
@@ -6877,18 +6881,99 @@ class AIAgent:
         function_result: Any,
         *,
         failed: bool,
+        tool_call_id: str | None = None,
+        counts_for_progress: bool = True,
     ) -> Any:
+        if tool_call_id:
+            turn_id = str(getattr(self, "_current_turn_id", "") or "")
+            with _TOOL_RESULT_OBSERVATION_LOCK:
+                state = getattr(self, "_tool_result_observation_state", None)
+                if state is None or state[0] != turn_id:
+                    state = (turn_id, set())
+                    self._tool_result_observation_state = state
+                if tool_call_id in state[1]:
+                    return function_result
+                state[1].add(tool_call_id)
+        observation_kwargs = {"failed": failed}
+        if not counts_for_progress:
+            observation_kwargs["counts_for_progress"] = False
         decision = self._tool_guardrails.after_call(
             tool_name,
             function_args,
             function_result,
-            failed=failed,
+            **observation_kwargs,
         )
         if decision.action in {"warn", "halt"}:
             function_result = append_toolguard_guidance(function_result, decision)
         if decision.should_halt:
             self._set_tool_guardrail_halt(decision)
         return function_result
+
+    def _tool_result_observation_seen(self, tool_call_id: str) -> bool:
+        if not tool_call_id:
+            return False
+        turn_id = str(getattr(self, "_current_turn_id", "") or "")
+        with _TOOL_RESULT_OBSERVATION_LOCK:
+            state = getattr(self, "_tool_result_observation_state", None)
+            return bool(
+                state is not None
+                and state[0] == turn_id
+                and tool_call_id in state[1]
+            )
+
+    def _append_tool_result_observation(
+        self,
+        messages: list,
+        *,
+        function_name: str,
+        function_args: Any,
+        function_result: Any,
+        tool_call_id: str,
+        failed: bool,
+        counts_for_progress: bool = True,
+        effect_disposition: str | None = None,
+        plain_transport: bool = False,
+    ) -> bool:
+        """Append one legal tool result and observe its ID at most once."""
+        if any(
+            isinstance(message, dict)
+            and message.get("role") == "tool"
+            and message.get("tool_call_id") == tool_call_id
+            for message in messages
+        ):
+            return False
+        if not isinstance(function_args, dict):
+            from agent.tool_executor import _parse_tool_arguments
+
+            function_args = _parse_tool_arguments(function_args)[2]
+        if not self._tool_result_observation_seen(tool_call_id):
+            function_result = self._append_guardrail_observation(
+                function_name,
+                function_args,
+                function_result,
+                failed=failed,
+                tool_call_id=tool_call_id,
+                counts_for_progress=counts_for_progress,
+            )
+        from agent.tool_dispatch_helpers import make_tool_result_message
+
+        if plain_transport:
+            messages.append({
+                "role": "tool",
+                "name": function_name,
+                "tool_call_id": tool_call_id,
+                "content": function_result,
+            })
+        else:
+            messages.append(
+                make_tool_result_message(
+                    function_name,
+                    function_result,
+                    tool_call_id,
+                    effect_disposition=effect_disposition,
+                )
+            )
+        return True
 
     def _guardrail_block_result(self, decision: ToolGuardrailDecision) -> str:
         self._set_tool_guardrail_halt(decision)

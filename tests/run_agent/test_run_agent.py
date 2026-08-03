@@ -2481,6 +2481,68 @@ class TestHandleMaxIterations:
         assert tool_ids == ["call_good", "call_bad"]
 
 
+    @pytest.mark.parametrize(
+        ("executor", "interrupt_before_first"),
+        (("sequential", True), ("sequential", False), ("concurrent", True)),
+    )
+    def test_interrupt_tool_results_are_observed_once_per_id(
+        self, agent, executor, interrupt_before_first
+    ):
+        calls = [
+            _mock_tool_call(name="web_search", arguments='{"query":"one"}', call_id="c1"),
+            _mock_tool_call(name="web_search", arguments='{"query":"two"}', call_id="c2"),
+        ]
+        response = _mock_assistant_msg(content="", tool_calls=calls)
+        messages = []
+        physical = []
+
+        if interrupt_before_first:
+            agent._interrupt_requested = True
+
+        def handle(*_args, **_kwargs):
+            physical.append("called")
+            agent._interrupt_requested = True
+            return '{"ok": true}'
+
+        with (
+            patch("run_agent._interrupted", return_value=False, create=True),
+            patch("run_agent.handle_function_call", side_effect=handle),
+            patch.object(
+                agent._tool_guardrails,
+                "after_call",
+                wraps=agent._tool_guardrails.after_call,
+            ) as observed,
+        ):
+            getattr(agent, f"_execute_tool_calls_{executor}")(
+                response, messages, "task-1"
+            )
+
+        assert len(physical) == (0 if interrupt_before_first else 1)
+        assert observed.call_count == 2
+        assert [message["tool_call_id"] for message in messages] == ["c1", "c2"]
+
+
+    def test_duplicate_tool_result_id_is_appended_and_observed_once(self, agent):
+        messages = []
+        with patch.object(
+            agent._tool_guardrails,
+            "after_call",
+            wraps=agent._tool_guardrails.after_call,
+        ) as after_call:
+            for _ in range(2):
+                agent._append_tool_result_observation(
+                    messages,
+                    function_name="web_search",
+                    function_args={"query": "same"},
+                    function_result='{"ok": true}',
+                    tool_call_id="duplicate-id",
+                    failed=False,
+                )
+
+        assert [message["tool_call_id"] for message in messages] == ["duplicate-id"]
+        assert after_call.call_count == 1
+
+
 class TestRunConversation:
     """Tests for the main run_conversation method.
 
@@ -3946,6 +4008,126 @@ class TestRunConversation:
 
 
 
+
+
+    @pytest.mark.parametrize("mixed", [False, True])
+    def test_invalid_name_results_are_observed_once_per_id(self, agent, mixed):
+        self._setup_agent(agent)
+        tool_calls = [
+            _mock_tool_call(name="not_a_tool", arguments='{"value":1}', call_id="bad")
+        ]
+        if mixed:
+            tool_calls.append(
+                _mock_tool_call(
+                    name="web_search",
+                    arguments='{"query":"valid"}',
+                    call_id="valid",
+                )
+            )
+        agent.client.chat.completions.create.side_effect = [
+            _mock_response(content="", finish_reason="tool_calls", tool_calls=tool_calls),
+            _mock_response(content="done", finish_reason="stop"),
+        ]
+        observation_ids = []
+        original_observe = agent._append_guardrail_observation
+
+        def observe(*args, **kwargs):
+            observation_ids.append(kwargs.get("tool_call_id"))
+            return original_observe(*args, **kwargs)
+
+        with (
+            patch.object(agent, "_append_guardrail_observation", side_effect=observe),
+            patch.object(
+                agent._tool_guardrails,
+                "after_call",
+                wraps=agent._tool_guardrails.after_call,
+            ) as after_call,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            agent.run_conversation("hello")
+
+        expected_ids = [tool_call.id for tool_call in tool_calls]
+        assert observation_ids == expected_ids
+        assert after_call.call_count == len(expected_ids)
+
+    def test_malformed_retry_ceiling_observes_each_result_once(self, agent):
+        self._setup_agent(agent)
+        tool_calls = [
+            _mock_tool_call(
+                name="web_search",
+                arguments="{not-json}",
+                call_id=f"malformed-{index}",
+            )
+            for index in range(3)
+        ]
+        agent.client.chat.completions.create.side_effect = [
+            _mock_response(content="", finish_reason="tool_calls", tool_calls=[tool_call])
+            for tool_call in tool_calls
+        ]
+        observation_ids = []
+        original_observe = agent._append_guardrail_observation
+
+        def observe(*args, **kwargs):
+            observation_ids.append(kwargs.get("tool_call_id"))
+            return original_observe(*args, **kwargs)
+
+        with (
+            patch.object(agent, "_append_guardrail_observation", side_effect=observe),
+            patch.object(
+                agent._tool_guardrails,
+                "after_call",
+                wraps=agent._tool_guardrails.after_call,
+            ) as after_call,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            agent.run_conversation("hello")
+
+        assert observation_ids == ["malformed-2"]
+        assert after_call.call_count == 1
+
+    def test_outer_tool_exception_observes_each_pending_result_once(self, agent):
+        self._setup_agent(agent)
+        agent.max_iterations = 1
+        tool_calls = [
+            _mock_tool_call(
+                name="web_search",
+                arguments=json.dumps({"query": str(index)}),
+                call_id=f"outer-{index}",
+            )
+            for index in range(2)
+        ]
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=tool_calls,
+        )
+        observation_ids = []
+        original_observe = agent._append_guardrail_observation
+
+        def observe(*args, **kwargs):
+            observation_ids.append(kwargs.get("tool_call_id"))
+            return original_observe(*args, **kwargs)
+
+        with (
+            patch.object(agent, "_execute_tool_calls", side_effect=RuntimeError("boom")),
+            patch.object(agent, "_append_guardrail_observation", side_effect=observe),
+            patch.object(
+                agent._tool_guardrails,
+                "after_call",
+                wraps=agent._tool_guardrails.after_call,
+            ) as after_call,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            agent.run_conversation("hello")
+
+        assert observation_ids == [tool_call.id for tool_call in tool_calls]
+        assert after_call.call_count == 2
 
 
 class TestHookPayloadSanitizesSimpleNamespace:

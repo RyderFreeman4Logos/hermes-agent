@@ -33,13 +33,13 @@ from agent.display import (
     redact_tool_args_for_display as _redact_tool_args_for_display,
     _detect_tool_failure,
 )
+from agent.tool_guardrails import ToolCallSignature
 from agent.tool_dispatch_helpers import (
     _is_destructive_command,
     _is_multimodal_tool_result,
     _multimodal_text_summary,
     _append_subdir_hint_to_multimodal,
     _plan_tool_batch_segments,
-    make_tool_result_message,
 )
 from tools.terminal_tool import (
     get_active_env,
@@ -190,12 +190,8 @@ def _no_progress_halt_decision(agent):
     )
 
 
-def _append_no_progress_skipped_results(agent, messages: list, tool_calls) -> bool:
-    """Preserve every provider call id without starting post-halt work."""
-    decision = _no_progress_halt_decision(agent)
-    if decision is None:
-        return False
-    content = json.dumps(
+def _no_progress_skipped_result(decision) -> str:
+    return json.dumps(
         {
             "error": "Tool call skipped because the no-progress guardrail halted this turn",
             "status": "skipped",
@@ -204,15 +200,25 @@ def _append_no_progress_skipped_results(agent, messages: list, tool_calls) -> bo
         },
         ensure_ascii=False,
     )
+
+
+def _append_no_progress_skipped_results(agent, messages: list, tool_calls) -> bool:
+    """Preserve every provider call id without starting post-halt work."""
+    decision = _no_progress_halt_decision(agent)
+    if decision is None:
+        return False
+    content = _no_progress_skipped_result(decision)
     for tool_call in tool_calls:
         function_name = tool_call.function.name
-        messages.append(
-            make_tool_result_message(
-                function_name,
-                content,
-                tool_call.id,
-                effect_disposition="none",
-            )
+        agent._append_tool_result_observation(
+            messages,
+            function_name=function_name,
+            function_args=tool_call.function.arguments,
+            function_result=content,
+            tool_call_id=tool_call.id,
+            failed=False,
+            counts_for_progress=False,
+            effect_disposition="none",
         )
         _flush_session_db_after_tool_progress(
             agent,
@@ -356,6 +362,22 @@ def _tool_search_scoped_names(agent) -> frozenset:
     return names
 
 
+class _FinalEffectiveResultFence:
+    """Serialize only calls with the same post-middleware/Relay signature."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._lanes: dict[ToolCallSignature, threading.Lock] = {}
+        self.observation_lock = threading.Lock()
+
+    def acquire(self, tool_name: str, args: dict) -> threading.Lock:
+        signature = ToolCallSignature.from_call(tool_name, args)
+        with self._lock:
+            lane = self._lanes.setdefault(signature, threading.Lock())
+        lane.acquire()
+        return lane
+
+
 @dataclass
 class _ManagedToolResult:
     result: Any
@@ -471,6 +493,7 @@ def _run_agent_tool_execution_middleware(
     prepared_request: _PreparedToolRequest | None = None,
     begin_execution=None,
     authorization_gate: _ConcurrentToolAuthorizationGate | None = None,
+    result_fence: _FinalEffectiveResultFence | None = None,
 ) -> _ManagedToolResult:
     """Run Relay rewrites before Hermes policy and dispatch exactly once."""
     from agent import relay_tools
@@ -491,6 +514,8 @@ def _run_agent_tool_execution_middleware(
         "middleware_trace": trace,
         "blocked": False,
         "dispatched": False,
+        "lane": None,
+        "no_progress_skipped": False,
     }
     dispatch_lock = threading.Lock()
 
@@ -503,6 +528,7 @@ def _run_agent_tool_execution_middleware(
             state["dispatched"] = True
             state["blocked"] = False
             state["args"] = final_args
+            state["observation_args"] = final_args
 
         def _begin() -> None:
             _begin_tool_execution(
@@ -520,6 +546,15 @@ def _run_agent_tool_execution_middleware(
                     callback()
                 return
             begin_execution(callback)
+
+        if result_fence is not None:
+            _advance_start_order()
+            state["lane"] = result_fence.acquire(function_name, final_args)
+            halt_decision = _no_progress_halt_decision(agent)
+            if halt_decision is not None:
+                state["blocked"] = True
+                state["no_progress_skipped"] = True
+                return _no_progress_skipped_result(halt_decision)
 
         block_message = scope_block
         block_error_type = "tool_scope_block"
@@ -591,7 +626,10 @@ def _run_agent_tool_execution_middleware(
         elif function_name == "skill_manage":
             agent._iters_since_skill = 0
 
-        _advance_start_order(_begin)
+        if result_fence is None:
+            _advance_start_order(_begin)
+        else:
+            _begin()
         return execute(final_args)
 
     def _hermes_pipeline(relay_args: dict[str, Any]) -> Any:
@@ -635,25 +673,49 @@ def _run_agent_tool_execution_middleware(
             api_request_id=getattr(agent, "_current_api_request_id", "") or "",
         )
 
-    result, _relay_args = relay_tools.execute(
-        function_name,
-        prepared_request.args if prepared_request is not None else function_args,
-        _hermes_pipeline,
-        session_id=str(getattr(agent, "session_id", "") or ""),
-        metadata={
-            "task_id": effective_task_id or "",
-            "turn_id": getattr(agent, "_current_turn_id", "") or "",
-            "api_request_id": getattr(agent, "_current_api_request_id", "") or "",
-            "tool_call_id": tool_call_id or "",
-        },
-    )
-    return _ManagedToolResult(
-        result=result,
-        args=state["args"],
-        observation_args=state["observation_args"],
-        middleware_trace=state["middleware_trace"],
-        blocked=bool(state["blocked"]),
-    )
+    try:
+        result, _relay_args = relay_tools.execute(
+            function_name,
+            prepared_request.args if prepared_request is not None else function_args,
+            _hermes_pipeline,
+            session_id=str(getattr(agent, "session_id", "") or ""),
+            metadata={
+                "task_id": effective_task_id or "",
+                "turn_id": getattr(agent, "_current_turn_id", "") or "",
+                "api_request_id": getattr(agent, "_current_api_request_id", "") or "",
+                "tool_call_id": tool_call_id or "",
+            },
+        )
+        if result_fence is not None:
+            if state["lane"] is None:
+                _advance_start_order()
+                state["lane"] = result_fence.acquire(
+                    function_name, state["observation_args"]
+                )
+                halt_decision = _no_progress_halt_decision(agent)
+                if halt_decision is not None:
+                    state["blocked"] = True
+                    state["no_progress_skipped"] = True
+                    result = _no_progress_skipped_result(halt_decision)
+            with result_fence.observation_lock:
+                result = agent._append_guardrail_observation(
+                    function_name,
+                    state["observation_args"],
+                    result,
+                    failed=_detect_tool_failure(function_name, result)[0],
+                    tool_call_id=tool_call_id,
+                    counts_for_progress=not state["no_progress_skipped"],
+                )
+        return _ManagedToolResult(
+            result=result,
+            args=state["args"],
+            observation_args=state["observation_args"],
+            middleware_trace=state["middleware_trace"],
+            blocked=bool(state["blocked"]),
+        )
+    finally:
+        if state["lane"] is not None:
+            state["lane"].release()
 
 
 def _begin_tool_execution(
@@ -770,12 +832,19 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     if agent._interrupt_requested:
         print(f"{agent.log_prefix}⚡ Interrupt: skipping {num_tools} tool call(s)")
         for tc in tool_calls:
-            messages.append(make_tool_result_message(
-                tc.function.name,
-                f"[Tool execution cancelled — {tc.function.name} was skipped due to user interrupt]",
-                tc.id,
+            agent._append_tool_result_observation(
+                messages,
+                function_name=tc.function.name,
+                function_args=tc.function.arguments,
+                function_result=(
+                    f"[Tool execution cancelled — {tc.function.name} "
+                    "was skipped due to user interrupt]"
+                ),
+                tool_call_id=tc.id,
+                failed=False,
+                counts_for_progress=False,
                 effect_disposition="none",
-            ))
+            )
             _flush_session_db_after_tool_progress(
                 agent,
                 messages,
@@ -867,24 +936,15 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             )
         )
 
-    # A result-dependent halt cannot fence already-submitted futures. Reuse the
-    # sequential executor only for batches that repeat a canonical signature or
-    # could continue the current turn's streak; unrelated calls keep concurrency.
-    if agent._tool_guardrails.batch_requires_result_fence([
-        (name, observation_args)
-        for _, name, _, observation_args, _, _, _ in parsed_calls
-    ]):
-        return execute_tool_calls_sequential(
-            agent,
-            assistant_message,
-            messages,
-            effective_task_id,
-            api_call_count,
-            finalize=finalize,
-            prepared_requests=[
-                prepared for _, _, _, _, prepared, _, _ in parsed_calls
-            ],
+    guardrail_cfg = getattr(getattr(agent, "_tool_guardrails", None), "config", None)
+    result_fence = (
+        _FinalEffectiveResultFence()
+        if (
+            getattr(agent, "max_iterations", 0) > 100
+            or bool(getattr(guardrail_cfg, "hard_stop_enabled", False))
         )
+        else None
+    )
 
     # ── Logging / callbacks ──────────────────────────────────────────
     tool_names_str = ", ".join(
@@ -1018,6 +1078,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     prepared_request=prepared_request,
                     begin_execution=_advance_start,
                     authorization_gate=authorization_gate,
+                    result_fence=result_fence,
                 )
                 result = managed.result
                 function_args = managed.args
@@ -1397,12 +1458,14 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             if blocked:
                 effect_disposition = "none"
 
-        function_result = agent._append_guardrail_observation(
-            name,
-            observation_args,
-            function_result,
-            failed=is_error,
-        )
+        if not agent._tool_result_observation_seen(tc.id):
+            function_result = agent._append_guardrail_observation(
+                name,
+                observation_args,
+                function_result,
+                failed=is_error,
+                tool_call_id=tc.id,
+            )
 
         if is_error:
             _err_text = _multimodal_text_summary(function_result)
@@ -1462,13 +1525,16 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # image tool result never poisons canonical session history.
         # String results pass through unchanged.
         _tool_content = agent._tool_result_content_for_active_model(name, function_result)
-        tool_message = make_tool_result_message(
-            name,
-            _tool_content,
-            tc.id,
+        agent._append_tool_result_observation(
+            messages,
+            function_name=name,
+            function_args=observation_args,
+            function_result=_tool_content,
+            tool_call_id=tc.id,
+            failed=is_error,
             effect_disposition=effect_disposition,
         )
-        messages.append(tool_message)
+        tool_message = messages[-1]
         risk_metadata = tool_message.get("_tool_output_risk")
         if not _flush_session_db_after_tool_progress(
             agent,
@@ -1585,12 +1651,19 @@ def execute_tool_calls_sequential(
                 agent._vprint(f"{agent.log_prefix}⚡ Interrupt: skipping {len(remaining_calls)} tool call(s)", force=True)
             for skipped_tc in remaining_calls:
                 skipped_name = skipped_tc.function.name
-                messages.append(make_tool_result_message(
-                    skipped_name,
-                    f"[Tool execution cancelled — {skipped_name} was skipped due to user interrupt]",
-                    skipped_tc.id,
+                agent._append_tool_result_observation(
+                    messages,
+                    function_name=skipped_name,
+                    function_args=skipped_tc.function.arguments,
+                    function_result=(
+                        f"[Tool execution cancelled — {skipped_name} "
+                        "was skipped due to user interrupt]"
+                    ),
+                    tool_call_id=skipped_tc.id,
+                    failed=False,
+                    counts_for_progress=False,
                     effect_disposition="none",
-                ))
+                )
                 if not _flush_session_db_after_tool_progress(
                     agent,
                     messages,
@@ -1605,18 +1678,13 @@ def execute_tool_calls_sequential(
             tool_call.function.arguments
         )
         if malformed_args_result is not None:
-            malformed_args_result = agent._append_guardrail_observation(
-                function_name,
-                observation_args,
-                malformed_args_result,
+            agent._append_tool_result_observation(
+                messages,
+                function_name=function_name,
+                function_args=observation_args,
+                function_result=malformed_args_result,
+                tool_call_id=tool_call.id,
                 failed=True,
-            )
-            messages.append(
-                make_tool_result_message(
-                    function_name,
-                    malformed_args_result,
-                    tool_call.id,
-                )
             )
             if not _flush_session_db_after_tool_progress(
                 agent,
@@ -2106,12 +2174,14 @@ def execute_tool_calls_sequential(
                 duration_ms=int(tool_duration * 1000),
                 middleware_trace=list(middleware_trace),
             )
-        function_result = agent._append_guardrail_observation(
-            function_name,
-            observation_args,
-            function_result,
-            failed=_is_error_result,
-        )
+        if not agent._tool_result_observation_seen(tool_call.id):
+            function_result = agent._append_guardrail_observation(
+                function_name,
+                observation_args,
+                function_result,
+                failed=_is_error_result,
+                tool_call_id=tool_call.id,
+            )
         _result_text = _multimodal_text_summary(function_result)
         result_preview = _result_text if agent.verbose_logging else (
             _result_text[:200] if len(_result_text) > 200 else _result_text
@@ -2164,8 +2234,15 @@ def execute_tool_calls_sequential(
         # Unwrap _multimodal dicts to an OpenAI-style content list
         # (see parallel path for rationale). String results pass through.
         _tool_content = agent._tool_result_content_for_active_model(function_name, function_result)
-        tool_message = make_tool_result_message(function_name, _tool_content, tool_call.id)
-        messages.append(tool_message)
+        agent._append_tool_result_observation(
+            messages,
+            function_name=function_name,
+            function_args=observation_args,
+            function_result=_tool_content,
+            tool_call_id=tool_call.id,
+            failed=_is_error_result,
+        )
+        tool_message = messages[-1]
         risk_metadata = tool_message.get("_tool_output_risk")
         if not _flush_session_db_after_tool_progress(
             agent,
@@ -2238,12 +2315,19 @@ def execute_tool_calls_sequential(
             agent._vprint(f"{agent.log_prefix}⚡ Interrupt: skipping {remaining} remaining tool call(s)", force=True)
             for skipped_tc in assistant_message.tool_calls[i:]:
                 skipped_name = skipped_tc.function.name
-                messages.append(make_tool_result_message(
-                    skipped_name,
-                    f"[Tool execution skipped — {skipped_name} was not started. User sent a new message]",
-                    skipped_tc.id,
+                agent._append_tool_result_observation(
+                    messages,
+                    function_name=skipped_name,
+                    function_args=skipped_tc.function.arguments,
+                    function_result=(
+                        f"[Tool execution skipped — {skipped_name} was not started. "
+                        "User sent a new message]"
+                    ),
+                    tool_call_id=skipped_tc.id,
+                    failed=False,
+                    counts_for_progress=False,
                     effect_disposition="none",
-                ))
+                )
                 if not _flush_session_db_after_tool_progress(
                     agent,
                     messages,

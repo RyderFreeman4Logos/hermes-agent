@@ -8,6 +8,8 @@ from agent.tool_guardrails import (
     ToolCallGuardrailConfig,
     ToolCallGuardrailController,
     ToolCallSignature,
+    _canonical_result_frame,
+    _result_hash,
     canonical_tool_args,
     classify_tool_failure,
 )
@@ -214,3 +216,82 @@ def test_web_search_cap_blocks_after_limit_regardless_of_hard_stop():
 
 
 
+
+
+def test_result_hash_is_total_and_stable_for_hostile_structures():
+    class BrokenRepr:
+        def __repr__(self):
+            raise RuntimeError("repr is unavailable")
+
+    class HugePreview:
+        def __repr__(self):
+            return "raw-preview-secret-" + ("x" * 20_000)
+
+    class BrokenGet(dict):
+        def get(self, *_args, **_kwargs):
+            raise RuntimeError("get is unavailable")
+
+    first = {}
+    first["self"] = first
+    second = {}
+    second["self"] = second
+    list_cycle = []
+    list_cycle.append(list_cycle)
+
+    deep = "leaf-a"
+    deep_other = "leaf-b"
+    for _ in range(200):
+        deep = [deep]
+        deep_other = [deep_other]
+
+    shared_leaf = {"value": 1}
+    shared = [shared_leaf, shared_leaf]
+    copied = [{"value": 1}, {"value": 1}]
+    mixed_one = {1: "integer", "1": "string"}
+    mixed_two = {"1": "string", 1: "integer"}
+    broken = BrokenRepr()
+
+    mixed_hash = _result_hash(mixed_one)
+    cycle_hash = _result_hash(first)
+    broken_hash = _result_hash(broken)
+    deep_hash = _result_hash(deep)
+    deep_other_hash = _result_hash(deep_other)
+
+    assert mixed_hash == _result_hash(mixed_two)
+    assert cycle_hash == _result_hash(second)
+    assert broken_hash == _result_hash(broken)
+    assert _result_hash(shared) == _result_hash(copied)
+    assert _result_hash(BrokenGet({"value": 1})) == _result_hash({"value": 1})
+    assert len(
+        {
+            mixed_hash,
+            cycle_hash,
+            _result_hash(list_cycle),
+            broken_hash,
+            deep_hash,
+            deep_other_hash,
+        }
+    ) == 6
+    assert len(_canonical_result_frame(HugePreview())) < 256
+
+    controller = ToolCallGuardrailController(ToolCallGuardrailConfig())
+    raw_secret = "raw-result-secret-never-retained"
+    controller.after_call(
+        "web_search", {"query": "q"}, {"value": raw_secret}, failed=False
+    )
+    assert raw_secret not in repr(vars(controller))
+
+
+def test_result_hash_typed_frames_prevent_nested_bytes_spoofing():
+    real_bytes = {"value": [b"x"]}
+    spoofed_bytes = {"value": [{"__bytes__": "eA=="}]}
+
+    assert _result_hash(real_bytes) != _result_hash(spoofed_bytes)
+    assert len({
+        _result_hash(b"x"),
+        _result_hash(("x",)),
+        _result_hash(["x"]),
+        _result_hash({"0": "x"}),
+        _result_hash("x"),
+        _result_hash(None),
+    }) == 6

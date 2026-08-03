@@ -252,9 +252,9 @@ def test_relay_rewrite_precedes_sequential_policy_approval_checkpoint_and_dispat
         observed["guardrail"].append((name, dict(args)))
         return original_before_call(name, args)
 
-    def observe_result(name, args, result, *, failed):
+    def observe_result(name, args, result, *, failed, **kwargs):
         observed["observation"].append((name, dict(args)))
-        return original_observe(name, args, result, failed=failed)
+        return original_observe(name, args, result, failed=failed, **kwargs)
 
     def relay_execute(name, args, callback, **kwargs):
         del name, args, kwargs
@@ -572,6 +572,11 @@ def test_identical_tool_batch_fences_sixth_dispatch_and_preserves_every_result_i
         patch.object(agent, "_persist_session"),
         patch.object(agent, "_save_trajectory"),
         patch.object(agent, "_cleanup_task_resources"),
+        patch.object(
+            agent._tool_guardrails,
+            "after_call",
+            wraps=agent._tool_guardrails.after_call,
+        ) as observed,
     ):
         result = agent.run_conversation("run one repeated batch")
 
@@ -582,6 +587,8 @@ def test_identical_tool_batch_fences_sixth_dispatch_and_preserves_every_result_i
     assert agent.client.chat.completions.create.call_count == 1
     expected_physical_ids = [f"batch-{i}" for i in range(1, 6)]
     assert dispatch.call_count == 5
+    assert observed.call_count == 6
+    assert agent._tool_guardrails._last_observation[2] == 5
     assert [call.kwargs["tool_call_id"] for call in dispatch.call_args_list] == (
         expected_physical_ids
     )
@@ -593,6 +600,10 @@ def test_identical_tool_batch_fences_sixth_dispatch_and_preserves_every_result_i
     assert [m["tool_call_id"] for m in tool_messages] == [
         f"batch-{i}" for i in range(1, 7)
     ]
+    assert all(
+        _json_payload(message["content"]).get("ok") == "same-result"
+        for message in tool_messages[:5]
+    )
     skipped = _json_payload(tool_messages[-1]["content"])
     assert skipped["skipped"] is True
     assert skipped["guardrail"]["code"] == "no_progress_loop"
@@ -893,7 +904,8 @@ def test_request_middleware_convergence_fences_sixth_physical_call():
     assert _json_payload(messages[-1]["content"])["skipped"] is True
 
 
-def test_effective_distinct_request_middleware_keeps_parallel_execution():
+@pytest.mark.parametrize("rewrite_stage", ("request", "execution", "relay"))
+def test_effective_distinct_final_arguments_keep_parallel_execution(rewrite_stage):
     agent = _make_agent("web_search", max_iterations=200)
     calls = [
         _mock_tool_call("web_search", json.dumps({"raw": i}), f"mw-distinct-{i}")
@@ -904,13 +916,23 @@ def test_effective_distinct_request_middleware_keeps_parallel_execution():
     lock = threading.Lock()
     rendezvous = threading.Barrier(6)
 
-    def keep_distinct(_name, args, **_context):
+    def effective(args):
+        return {"query": f"effective-{args['raw']}"}
+
+    def keep_request(_name, args, **_context):
         return SimpleNamespace(
-            payload={"query": f"effective-{args['raw']}"},
+            payload=effective(args),
             original_payload=args,
             changed=True,
             trace=[{"source": "test"}],
         )
+
+    def keep_execution(_name, args, callback, **_context):
+        return callback(effective(args))
+
+    def keep_relay(_name, args, callback, **_context):
+        final_args = effective(args)
+        return callback(final_args), final_args
 
     def dispatch(_name, args, _task_id, **_kwargs):
         nonlocal active, max_active
@@ -922,10 +944,18 @@ def test_effective_distinct_request_middleware_keeps_parallel_execution():
             active -= 1
         return json.dumps({"result": args["query"]})
 
-    with (
-        patch("hermes_cli.middleware.apply_tool_request_middleware", side_effect=keep_distinct),
-        patch("run_agent.handle_function_call", side_effect=dispatch),
-    ):
+    rewrite = {
+        "request": patch(
+            "hermes_cli.middleware.apply_tool_request_middleware",
+            side_effect=keep_request,
+        ),
+        "execution": patch(
+            "hermes_cli.middleware.run_tool_execution_middleware",
+            side_effect=keep_execution,
+        ),
+        "relay": patch("agent.relay_tools.execute", side_effect=keep_relay),
+    }[rewrite_stage]
+    with rewrite, patch("run_agent.handle_function_call", side_effect=dispatch):
         agent._execute_tool_calls(
             SimpleNamespace(content="", tool_calls=calls), [], "task-1"
         )
@@ -993,3 +1023,116 @@ def test_repeated_non_object_arguments_halt_after_five_results():
         for message in result["messages"]
         if message.get("role") == "tool"
     ] == [f"invalid-{i}" for i in range(1, 6)]
+
+
+def test_concurrent_fence_uses_execution_middleware_final_args_once(monkeypatch):
+    agent = _make_agent("web_search", max_iterations=200)
+    starts = []
+    progress = []
+    agent.tool_start_callback = lambda *args: starts.append(args)
+    agent.tool_progress_callback = lambda *args, **kwargs: progress.append((args, kwargs))
+    middleware_args = []
+    physical_args = []
+
+    def execution_middleware(_name, args, callback, **_kwargs):
+        middleware_args.append(dict(args))
+        return callback({"query": "same-effective"})
+
+    def fake_handle(_name, args, *_rest, **_kwargs):
+        physical_args.append(dict(args))
+        return '{"value": "same"}'
+
+    monkeypatch.setattr(
+        "hermes_cli.middleware.run_tool_execution_middleware",
+        execution_middleware,
+    )
+    response = SimpleNamespace(
+        content="",
+        tool_calls=[
+            _mock_tool_call(
+                "web_search",
+                json.dumps({"query": f"raw-{index}"}),
+                f"call-{index}",
+            )
+            for index in range(6)
+        ],
+    )
+    messages = []
+
+    with (
+        patch("hermes_cli.plugins.resolve_pre_tool_block", return_value=None) as pre_hook,
+        patch.object(
+            agent._tool_guardrails,
+            "before_call",
+            wraps=agent._tool_guardrails.before_call,
+        ) as approval,
+        patch.object(
+            agent._tool_guardrails,
+            "after_call",
+            wraps=agent._tool_guardrails.after_call,
+        ) as observed,
+        patch("run_agent.handle_function_call", side_effect=fake_handle),
+    ):
+        agent._execute_tool_calls(response, messages, "task-1")
+
+    assert len(middleware_args) == 6
+    assert {args["query"] for args in middleware_args} == {
+        f"raw-{index}" for index in range(6)
+    }
+    assert physical_args == [{"query": "same-effective"}] * 5
+    assert pre_hook.call_count == approval.call_count == 5
+    assert len(starts) == 5
+    assert sum(event[0][0] == "tool.completed" for event in progress) == 5
+    assert observed.call_count == 6
+    assert [call.kwargs.get("counts_for_progress", True) for call in observed.call_args_list] == [
+        True,
+        True,
+        True,
+        True,
+        True,
+        False,
+    ]
+    assert [message["tool_call_id"] for message in messages] == [
+        f"call-{index}" for index in range(6)
+    ]
+
+
+def test_concurrent_fence_uses_relay_final_args(monkeypatch):
+    from agent import relay_tools
+
+    agent = _make_agent("web_search", max_iterations=200)
+    starts = []
+    agent.tool_start_callback = lambda *args: starts.append(args)
+    relay_args = []
+    physical_args = []
+
+    def relay_execute(_name, args, callback, **_kwargs):
+        relay_args.append(dict(args))
+        effective = {"query": "same-effective"}
+        return callback(effective), effective
+
+    def fake_handle(_name, args, *_rest, **_kwargs):
+        physical_args.append(dict(args))
+        return '{"value": "same"}'
+
+    monkeypatch.setattr(relay_tools, "execute", relay_execute)
+    response = SimpleNamespace(
+        content="",
+        tool_calls=[
+            _mock_tool_call(
+                "web_search",
+                json.dumps({"query": f"raw-{index}"}),
+                f"relay-{index}",
+            )
+            for index in range(6)
+        ],
+    )
+    messages = []
+
+    with patch("run_agent.handle_function_call", side_effect=fake_handle):
+        agent._execute_tool_calls(response, messages, "task-1")
+
+    assert len(relay_args) == 6
+    assert physical_args == [{"query": "same-effective"}] * 5
+    assert len(starts) == 5
+    assert len(messages) == 6

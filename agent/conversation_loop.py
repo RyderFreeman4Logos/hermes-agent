@@ -6131,12 +6131,15 @@ def run_conversation(
                             )
                         else:
                             content = "Skipped: another tool call in this turn used an invalid name. Please retry this tool call."
-                        messages.append({
-                            "role": "tool",
-                            "name": tc.function.name,
-                            "tool_call_id": tc.id,
-                            "content": content,
-                        })
+                        agent._append_tool_result_observation(
+                            messages,
+                            function_name=tc.function.name,
+                            function_args=tc.function.arguments,
+                            function_result=content,
+                            tool_call_id=tc.id,
+                            failed=True,
+                            plain_transport=True,
+                        )
                     continue
                 # Reset retry counter on successful tool call validation
                 agent._invalid_tool_retries = 0
@@ -6235,12 +6238,15 @@ def run_conversation(
                                 )
                             else:
                                 tool_result = "Skipped: other tool call in this response had invalid JSON."
-                            messages.append({
-                                "role": "tool",
-                                "name": tc.function.name,
-                                "tool_call_id": tc.id,
-                                "content": tool_result,
-                            })
+                            agent._append_tool_result_observation(
+                                messages,
+                                function_name=tc.function.name,
+                                function_args=tc.function.arguments,
+                                function_result=tool_result,
+                                tool_call_id=tc.id,
+                                failed=True,
+                                plain_transport=True,
+                            )
                         continue
                 
                 # Reset retry counter on successful JSON validation
@@ -6367,14 +6373,17 @@ def run_conversation(
                 # provider-side tool_call/result pairing stays intact.
                 if _invalid_batch_calls:
                     for tc in _invalid_batch_calls:
-                        messages.append({
-                            "role": "tool",
-                            "name": tc.function.name,
-                            "tool_call_id": tc.id,
-                            "content": _invalid_tool_name_error_content(
+                        agent._append_tool_result_observation(
+                            messages,
+                            function_name=tc.function.name,
+                            function_args=tc.function.arguments,
+                            function_result=_invalid_tool_name_error_content(
                                 tc.function.name, agent.valid_tool_names
                             ),
-                        })
+                            tool_call_id=tc.id,
+                            failed=True,
+                            plain_transport=True,
+                        )
                     assistant_message.tool_calls = [
                         tc for tc in assistant_message.tool_calls
                         if tc.function.name in agent.valid_tool_names
@@ -7309,13 +7318,16 @@ def run_conversation(
                     for tc in msg["tool_calls"]:
                         if not tc or not isinstance(tc, dict): continue
                         if tc["id"] not in answered_ids:
-                            err_msg = {
-                                "role": "tool",
-                                "name": _ra().AIAgent._get_tool_call_name_static(tc),
-                                "tool_call_id": tc["id"],
-                                "content": f"Error executing tool: {error_msg}",
-                            }
-                            messages.append(err_msg)
+                            function = tc.get("function") or {}
+                            agent._append_tool_result_observation(
+                                messages,
+                                function_name=_ra().AIAgent._get_tool_call_name_static(tc),
+                                function_args=function.get("arguments", "{}"),
+                                function_result=f"Error executing tool: {error_msg}",
+                                tool_call_id=tc["id"],
+                                failed=True,
+                                plain_transport=True,
+                            )
                 break
             
             # Non-tool errors don't need a synthetic message injected.

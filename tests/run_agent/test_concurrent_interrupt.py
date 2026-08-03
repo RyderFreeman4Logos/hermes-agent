@@ -71,8 +71,17 @@ def _make_agent(monkeypatch):
         def _has_stream_consumers(self):
             return False
 
+        def _append_guardrail_observation(
+            self, tool_name, function_args, function_result, **kwargs
+        ):
+            self.observations.append((tool_name, kwargs["tool_call_id"]))
+            return function_result
+
     stub = _Stub()
-    # Bind the real methods under test
+    stub.observations = []
+    # Bind the real methods under test, including the production append path.
+    stub._tool_result_observation_seen = _ra.AIAgent._tool_result_observation_seen.__get__(stub)
+    stub._append_tool_result_observation = _ra.AIAgent._append_tool_result_observation.__get__(stub)
     stub._execute_tool_calls_concurrent = _ra.AIAgent._execute_tool_calls_concurrent.__get__(stub)
     stub.interrupt = _ra.AIAgent.interrupt.__get__(stub)
     stub.clear_interrupt = _ra.AIAgent.clear_interrupt.__get__(stub)
@@ -112,8 +121,13 @@ def test_concurrent_preflight_interrupt_skips_all(monkeypatch):
     agent._execute_tool_calls_concurrent(msg, messages, "test_task")
 
     assert len(messages) == 2
+    assert [(message["role"], message["tool_call_id"]) for message in messages] == [
+        ("tool", "tc_a"),
+        ("tool", "tc_b"),
+    ]
     assert "skipped due to user interrupt" in messages[0]["content"]
     assert "skipped due to user interrupt" in messages[1]["content"]
+    assert agent.observations == [("tool_a", "tc_a"), ("tool_b", "tc_b")]
     # _invoke_tool should never have been called
     agent._invoke_tool.assert_not_called()
 

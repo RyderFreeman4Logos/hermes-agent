@@ -385,9 +385,8 @@ def _cwd_marker(session_id: str) -> str:
 # Per-session variables that the gateway bridges freshly onto every command's
 # process environment (via tools/environments/local._inject_session_context_env,
 # reading gateway.session_context._VAR_MAP). They must NEVER be persisted into
-# the shared bash session snapshot: a single long-lived backend serves many
-# concurrent sessions (the messaging gateway, TUI, desktop/web dashboard all
-# collapse the terminal to one "default" environment), so ``export -p`` dumping
+# a bash session snapshot: one physical backend can serve many concurrent
+# logical environments, so ``export -p`` dumping
 # the FIRST session's HERMES_SESSION_ID into the snapshot makes every LATER
 # session ``source`` that stale value and see a FOREIGN session's identity —
 # overriding the correct per-command Popen env (issue: cross-session

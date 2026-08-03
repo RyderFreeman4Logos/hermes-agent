@@ -253,11 +253,8 @@ def _configured_terminal_cwd() -> str | None:
 def _registered_task_cwd_override(task_id: str = "default") -> str | None:
     """Return a registered cwd override for the raw task id, when available.
 
-    ``terminal_tool`` intentionally collapses CWD-only task overrides to the
-    shared ``"default"`` environment so TUI/dashboard/ACP sessions do not spin
-    up isolated sandboxes just because they have different workspaces. The cwd
-    value itself is still keyed by the raw session/task id, so file tools must
-    read that raw override before falling back to the collapsed container key.
+    File tools use the same logical task key as terminal tools so delegated
+    tasks cannot inherit a sibling's working directory.
     """
     try:
         from tools.terminal_tool import resolve_task_overrides
@@ -935,10 +932,8 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
     Thread-safe: uses the same per-task creation locks as terminal_tool to
     prevent duplicate sandbox creation from concurrent tool calls.
 
-    Note: subagent task_ids are collapsed to "default" via
-    ``_resolve_container_task_id`` so delegate_task children share the
-    parent's container and its cached file_ops. RL/benchmark task_ids with
-    a registered env override keep their isolation.
+    ``_resolve_container_task_id`` preserves non-empty task IDs so each
+    delegate_task child gets its own logical environment and cached file_ops.
     """
     from tools.terminal_tool import (
         _active_environments, _env_lock, _create_environment,

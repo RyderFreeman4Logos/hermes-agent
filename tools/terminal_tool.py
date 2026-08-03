@@ -1141,11 +1141,8 @@ _task_env_overrides: Dict[str, Dict[str, Any]] = {}
 # ── Per-session cwd records (cwd rearchitecture, step 1) ────────────────────
 #
 # The durable source of truth for "which directory is THIS session working
-# in". Keyed by the raw session/task key (NOT the collapsed container id):
-# the terminal env is shared across sessions, so any cwd state stored on the
-# env is a global mutable timeshared between sessions — the root cause of the
-# wrong-worktree bug class (env.cwd_owner stamping, _last_known_cwd, and the
-# ownership ladder in file_tools are all patches over that misplacement).
+# in". Keyed by the raw session/task key so each delegated task retains its
+# own logical cwd even when a backend reuses one physical container.
 #
 # Step 1 (this change): dual-write only. Every site that learns a session's
 # live cwd (post-command tracking, cwd-override registration) also records it
@@ -1219,11 +1216,8 @@ def register_task_env_overrides(task_id: str, overrides: Dict[str, Any]):
         # A registered workspace cwd IS the session's working directory until
         # a `cd` changes it.
         record_session_cwd(task_id, new_cwd)
-        # The live env is cached under the raw task_id for per-session surfaces
-        # (ACP/gateway/dashboard) and under the collapsed container id for
-        # isolation-keyed rollouts. Try the raw id first, then the container id,
-        # so a CWD-only override (which collapses to "default") still finds and
-        # updates the originating session's env.
+        # Try the raw id first, then the resolved id for compatibility with
+        # environments cached before the override was registered.
         container_id = _resolve_container_task_id(task_id)
         with _env_lock:
             env = _active_environments.get(task_id) or _active_environments.get(container_id)
@@ -1242,52 +1236,12 @@ def clear_task_env_overrides(task_id: str):
 
 
 def _resolve_container_task_id(task_id: Optional[str]) -> str:
-    """
-    Map a tool-call ``task_id`` to the container/sandbox key used by
-    ``_active_environments``.
-
-    The top-level agent passes ``task_id=None`` and lands on ``"default"``.
-    ``delegate_task`` children pass their own subagent ID so that
-    file-state tracking, the active-subagents registry, and TUI events stay
-    distinct per child -- but we deliberately collapse that ID back to
-    ``"default"`` here so subagents share the parent's long-lived container
-    (one bash, one /workspace, one set of installed packages).
-
-    Exception: RL / benchmark environments (TerminalBench2, HermesSweEnv, ...)
-    call ``register_task_env_overrides(task_id, {...})`` to request a
-    per-task Docker/Modal image. When an override is registered for a
-    task_id, we honour it by returning the task_id unchanged -- those
-    rollouts need their own isolated sandbox, which is the whole point of
-    the override.
-
-    CWD-only overrides (registered by the ACP adapter for workspace
-    tracking) are *not* isolation signals — they should not cause each
-    session to spin up its own container.  Only overrides containing
-    backend-specific image keys or ``env_type`` trigger isolation.
-    """
-    _ISOLATION_KEYS = frozenset({
-        "docker_image", "modal_image", "singularity_image",
-        "daytona_image", "env_type",
-    })
-    if task_id and task_id in _task_env_overrides:
-        overrides = _task_env_overrides[task_id]
-        if set(overrides.keys()) & _ISOLATION_KEYS:
-            return task_id
-    return "default"
+    """Return the logical environment key for a tool-call task."""
+    return str(task_id or "default")
 
 
 def resolve_task_overrides(task_id: Optional[str]) -> Dict[str, Any]:
-    """Return the env overrides for *task_id*, raw key first then collapsed.
-
-    ``register_task_env_overrides`` writes under the *raw* task/session id, but
-    a CWD-only override collapses (:func:`_resolve_container_task_id`) to the
-    shared ``"default"`` container so per-session surfaces (ACP/gateway/
-    dashboard) don't each spin up their own sandbox. Callers that need the
-    override (terminal command setup, file-tool cwd resolution) must therefore
-    read the raw id FIRST and only fall back to the collapsed container id, or
-    the originating session's override is silently dropped. This is the single
-    source of that lookup so the terminal and file layers can't drift apart.
-    """
+    """Return environment overrides for the task's logical environment key."""
     raw = task_id or "default"
     return (
         _task_env_overrides.get(raw)
@@ -2260,18 +2214,12 @@ def terminal_tool(
         config = _get_env_config()
         env_type = config["env_type"]
 
-        # Use task_id for environment isolation. By default all subagent
-        # task_ids collapse back to "default" so the top-level agent and
-        # every delegate_task child share one container; only task_ids with
-        # a registered env override (RL benchmarks) get isolated sandboxes.
+        # Preserve task_id for logical shell/file state isolation. Backends may
+        # still reuse a physical container through their own persistence layer.
         effective_task_id = _resolve_container_task_id(task_id)
 
         # Check per-task overrides (set by environments like TerminalBench2Env)
-        # before falling back to global env var config. ``resolve_task_overrides``
-        # reads the raw task id first then the collapsed container id, so a
-        # CWD-only override (which collapses ``effective_task_id`` to
-        # ``"default"``) is still found under its originating session id while
-        # isolation-keyed RL/benchmark overrides keep resolving as before.
+        # before falling back to global env var config.
         overrides = resolve_task_overrides(task_id)
         
         # Select image based on env type, with per-task override support
@@ -2371,11 +2319,8 @@ def terminal_tool(
         # instead of each creating their own (wasting Modal resources).
         env = None
         with _env_lock:
-            # Prefer the collapsed container id, but fall back to an env cached
-            # under the raw task_id. Per-session surfaces (ACP/gateway/dashboard)
-            # with a CWD-only override collapse to "default" for container
-            # sharing, yet an env may already be cached under the originating
-            # task_id; honor it instead of spawning a duplicate.
+            # Prefer the resolved id, but accept an environment cached under
+            # the raw id for compatibility with existing callers.
             _existing_key = (
                 effective_task_id if effective_task_id in _active_environments
                 else (task_id if task_id and task_id in _active_environments else None)

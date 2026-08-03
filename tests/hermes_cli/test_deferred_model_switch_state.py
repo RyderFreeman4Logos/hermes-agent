@@ -122,6 +122,7 @@ def _result(model="new-model", provider="new-provider"):
         base_url="https://new.example/v1",
         api_mode="responses",
         provider_label="New Provider",
+        context_length=128_000,
     )
 
 
@@ -147,6 +148,7 @@ def test_scheduling_uses_destination_custom_context_without_source_fallback(
     agent = _Agent()
     agent.context_compressor.context_length = 200_000
     result = _result("custom-model", "custom-provider")
+    result.context_length = None
     result.model_info = None
     result.base_url = "https://custom.example/v1"
     calls = []
@@ -171,6 +173,7 @@ def test_scheduling_prefers_destination_metadata_context(monkeypatch):
     agent = _Agent()
     agent.context_compressor.context_length = 200_000
     result = _result()
+    result.context_length = None
     result.model_info = ModelInfo(
         id="new-model",
         name="New Model",
@@ -583,4 +586,19 @@ def test_status_observer_failure_does_not_rollback_committed_switch():
 
     assert apply_model_switch_after_compression(agent) == "applied"
     assert (agent.model, agent.provider) == ("new-model", "new-provider")
+    assert get_model_switch_after_compression(agent) is None
+
+
+def test_scheduling_rejects_unknown_destination_context(monkeypatch):
+    agent = _Agent()
+    result = _result("unknown-model", "unknown-provider")
+    result.model_info = None
+    result.context_length = None
+    monkeypatch.setattr(
+        "hermes_cli.config.get_custom_provider_context_length", lambda *_args, **_kwargs: None
+    )
+
+    with pytest.raises(ValueError, match="destination context length"):
+        schedule_model_switch_after_compression(agent, result)
+
     assert get_model_switch_after_compression(agent) is None

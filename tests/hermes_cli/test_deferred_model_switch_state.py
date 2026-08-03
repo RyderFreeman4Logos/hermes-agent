@@ -1,8 +1,9 @@
 """Deferred model-switch state and committed compression seam tests."""
 
 import json
-
 from types import SimpleNamespace
+
+import pytest
 
 from agent.models_dev import ModelInfo
 from agent.conversation_compression import (
@@ -261,6 +262,7 @@ def test_durable_publication_failure_rolls_back_runtime_and_keeps_pending():
     assert get_model_switch_after_compression(agent) is result
     assert agent._session_db.row["model"] == "old-model"
     assert agent._session_db.row["model_config"] == scheduled_config
+    assert agent._session_db.writes == 1
 
 
 def test_billing_publication_failure_rolls_back_runtime_and_keeps_pending():
@@ -336,3 +338,73 @@ def test_clear_reports_cancelled_without_switching():
     assert clear_model_switch_after_compression(agent) is result
     assert get_model_switch_after_compression(agent) is None
     assert agent.calls == []
+
+
+def test_post_commit_publication_error_commits_deferred_switch_forward():
+    agent = _Agent()
+    agent.session_id = "session-1"
+    agent._session_db = _SessionDB()
+    agent._session_init_model_config = {"max_iterations": 7}
+    agent._build_system_prompt = lambda _message: "new prompt"
+    real_publish = agent._session_db.publish_session_route
+
+    def commit_then_raise(*args, **kwargs):
+        real_publish(*args, **kwargs)
+        raise OSError("injected post-commit route failure")
+
+    agent._session_db.publish_session_route = commit_then_raise
+    result = _result()
+    schedule_model_switch_after_compression(agent, result)
+
+    assert apply_model_switch_after_compression(agent) == "applied"
+    assert (agent.model, agent.provider) == ("new-model", "new-provider")
+    assert agent._session_db.row["model"] == "new-model"
+    assert agent._session_db.writes == 1
+    assert get_model_switch_after_compression(agent) is None
+
+
+@pytest.mark.parametrize("readback", ["unavailable", "third-state"])
+def test_indeterminate_route_publication_is_explicitly_blocked(readback):
+    agent = _Agent()
+    agent.session_id = "session-1"
+    agent._session_db = _SessionDB()
+    agent._session_init_model_config = {"max_iterations": 7}
+    agent._build_system_prompt = lambda _message: "new prompt"
+    agent._session_db.fail_route_publication = True
+    real_get = agent._session_db.get_session
+    reads = 0
+
+    def uncertain_readback(*args, **kwargs):
+        nonlocal reads
+        reads += 1
+        if reads <= 3:
+            return real_get(*args, **kwargs)
+        if readback == "unavailable":
+            raise OSError("injected route readback failure")
+        row = real_get(*args, **kwargs)
+        row["model"] = "third-model"
+        return row
+
+    agent._session_db.get_session = uncertain_readback
+    result = _result()
+    schedule_model_switch_after_compression(agent, result)
+
+    assert apply_model_switch_after_compression(agent) == "failed"
+    assert (agent.model, agent.provider) == ("old-model", "old-provider")
+    assert agent._session_db.row["model"] == "old-model"
+    assert agent._session_db.writes == 1
+    assert get_model_switch_after_compression(agent) is result
+    assert any("indeterminate" in status for status in agent.statuses)
+
+
+def test_status_observer_failure_does_not_rollback_committed_switch():
+    agent = _Agent()
+    agent._emit_status = lambda _message: (_ for _ in ()).throw(
+        OSError("injected observer failure")
+    )
+    result = _result()
+    schedule_model_switch_after_compression(agent, result)
+
+    assert apply_model_switch_after_compression(agent) == "applied"
+    assert (agent.model, agent.provider) == ("new-model", "new-provider")
+    assert get_model_switch_after_compression(agent) is None

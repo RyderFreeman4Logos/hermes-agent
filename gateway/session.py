@@ -20,6 +20,8 @@ from datetime import datetime, timedelta
 from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Any
 
+from hermes_state_common import reconcile_authoritative_write
+
 logger = logging.getLogger(__name__)
 
 
@@ -1452,13 +1454,28 @@ class SessionStore:
             _db = getattr(self, "_db", None)
             if _db:
                 replacer = getattr(_db, "replace_gateway_routing_entries", None)
+                loader = getattr(_db, "load_gateway_routing_entries", None)
                 if callable(replacer):
-                    # Primary authority: surface the original exception so
-                    # setters can restore in-memory state and leave the
-                    # legacy mirror untouched.
-                    replacer(
-                        {k: json.dumps(v) for k, v in data.items()},
-                        scope=self._routing_scope(),
+                    intended = {k: json.dumps(v) for k, v in data.items()}
+                    if callable(loader):
+                        preimage = loader(scope=self._routing_scope())
+                        readback = lambda: loader(scope=self._routing_scope())
+                    else:
+                        preimage = object()
+
+                        def readback():
+                            raise RuntimeError(
+                                "gateway routing authority readback unavailable"
+                            )
+
+                    reconcile_authoritative_write(
+                        write=lambda: replacer(
+                            intended, scope=self._routing_scope()
+                        ),
+                        readback=readback,
+                        intended=intended,
+                        preimage=preimage,
+                        label="gateway routing authority",
                     )
                     db_saved = True
             if getattr(self, "_write_sessions_json", True) or not db_saved:
@@ -2559,12 +2576,16 @@ class SessionStore:
                 self._save()
             except BaseException:
                 entry.model_override = previous
-                try:
-                    self._save()
-                except BaseException:
-                    logger.exception(
-                        "gateway.session: failed to restore model override after save error"
-                    )
+                # SQLite failures were reconciled against authority above.
+                # Preserve compensation only for SQLite-disabled legacy mode.
+                if self._db is None:
+                    try:
+                        self._save()
+                    except BaseException:
+                        logger.exception(
+                            "gateway.session: failed to restore legacy model "
+                            "override after save error"
+                        )
                 raise
 
     def get_model_override(self, session_key: str) -> Optional[Dict[str, str]]:

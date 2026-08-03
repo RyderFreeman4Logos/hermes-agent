@@ -83,7 +83,7 @@ def test_missing_global_auth_file_is_safe(profile_env):
     assert read_credential_pool("anthropic") == []
 
 
-def test_malformed_global_auth_file_does_not_break_profile_read(profile_env):
+def test_read_only_profile_fallback_never_repairs_malformed_global_auth(profile_env):
     (profile_env["global"] / "auth.json").write_text("{not valid json")
     _write(profile_env["profile"] / "auth.json", _make_auth_store(pool={
         "openrouter": [{
@@ -96,12 +96,22 @@ def test_malformed_global_auth_file_does_not_break_profile_read(profile_env):
         }],
     }))
 
+    from hermes_cli import auth
+
+    assert auth.read_credential_pool("openrouter", read_only=True)[0]["id"] == "prof-1"
+    assert auth.read_credential_pool("anthropic", read_only=True) == []
+    assert auth.get_provider_auth_state("nous", read_only=True) is None
+    assert not list(profile_env["global"].glob("auth.json.corrupt*"))
+
+
+def test_normal_profile_fallback_still_backs_up_malformed_global_auth(profile_env):
+    (profile_env["global"] / "auth.json").write_text("{not valid json")
+    _write(profile_env["profile"] / "auth.json", _make_auth_store(pool={}))
+
     from hermes_cli.auth import read_credential_pool
 
-    # Profile reads still work; malformed global is silently ignored.
-    assert read_credential_pool("openrouter")[0]["id"] == "prof-1"
-    # And no fallback for anthropic since global is unreadable.
-    assert read_credential_pool("anthropic") == []
+    assert read_credential_pool("anthropic", read_only=False) == []
+    assert list(profile_env["global"].glob("auth.json.corrupt*"))
 
 
 # ---------------------------------------------------------------------------

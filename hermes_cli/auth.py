@@ -961,7 +961,7 @@ def _global_auth_file_path() -> Optional[Path]:
     return global_root / "auth.json"
 
 
-def _load_global_auth_store() -> Dict[str, Any]:
+def _load_global_auth_store(*, read_only: bool = False) -> Dict[str, Any]:
     """Load the global-root auth store (read-only fallback).
 
     Returns an empty dict when no global fallback exists (classic mode,
@@ -990,7 +990,7 @@ def _load_global_auth_store() -> Dict[str, Any]:
             except Exception:
                 pass
     try:
-        return _load_auth_store(global_path)
+        return _load_auth_store(global_path, read_only=read_only)
     except Exception:
         # A malformed global store must not break profile reads. The
         # profile's own auth store is still authoritative.
@@ -1232,6 +1232,7 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
 def _load_provider_state_with_source(
     auth_store: Dict[str, Any],
     provider_id: str,
+    read_only: bool = False,
 ) -> tuple[Optional[Dict[str, Any]], Optional[Path]]:
     """Return a provider state plus the auth.json path it came from.
 
@@ -1249,7 +1250,7 @@ def _load_provider_state_with_source(
             return dict(state), _auth_file_path()
 
     global_path = _global_auth_file_path()
-    global_store = _load_global_auth_store()
+    global_store = _load_global_auth_store(read_only=read_only)
     if global_store:
         global_providers = global_store.get("providers")
         if isinstance(global_providers, dict):
@@ -1290,7 +1291,11 @@ def _provider_state_transaction(provider_id: str):
             yield auth_store, source_state, source_path
 
 
-def _load_provider_state(auth_store: Dict[str, Any], provider_id: str) -> Optional[Dict[str, Any]]:
+def _load_provider_state(
+    auth_store: Dict[str, Any],
+    provider_id: str,
+    read_only: bool = False,
+) -> Optional[Dict[str, Any]]:
     """Return a provider's persisted state.
 
     In profile mode, falls back to the global-root ``auth.json`` when the
@@ -1301,7 +1306,9 @@ def _load_provider_state(auth_store: Dict[str, Any], provider_id: str) -> Option
     the profile, the profile state fully shadows the global state on the next
     read. See issue #18594 follow-up.
     """
-    state, _source_path = _load_provider_state_with_source(auth_store, provider_id)
+    state, _source_path = _load_provider_state_with_source(
+        auth_store, provider_id, read_only=read_only
+    )
     return state
 
 
@@ -1453,7 +1460,7 @@ def read_credential_pool(
         pool = {}
 
     global_pool: Dict[str, Any] = {}
-    global_store = _load_global_auth_store()
+    global_store = _load_global_auth_store(read_only=read_only)
     maybe_global_pool = global_store.get("credential_pool") if global_store else None
     if isinstance(maybe_global_pool, dict):
         global_pool = maybe_global_pool
@@ -1673,7 +1680,7 @@ def get_provider_auth_state(
     OAuth or Nous device-code session). See issue #18594 follow-up.
     """
     auth_store = _load_auth_store(read_only=read_only)
-    return _load_provider_state(auth_store, provider_id)
+    return _load_provider_state(auth_store, provider_id, read_only=read_only)
 
 
 def get_active_provider() -> Optional[str]:

@@ -14,6 +14,7 @@ from agent.credential_pool import (
     CUSTOM_POOL_PREFIX,
     SOURCE_MANUAL,
     SOURCE_MANUAL_DEVICE_CODE,
+    STATUS_DEAD,
     STATUS_EXHAUSTED,
     STRATEGY_FILL_FIRST,
     STRATEGY_ROUND_ROBIN,
@@ -22,6 +23,7 @@ from agent.credential_pool import (
     PooledCredential,
     _exhausted_until,
     _normalize_custom_pool_name,
+    chatgpt_account_id_from_entry,
     get_pool_strategy,
     label_from_token,
     list_custom_pool_providers,
@@ -123,17 +125,43 @@ def _classify_exhausted_status(entry) -> tuple[str, bool]:
     ):
         return "rate-limited", True
 
-    if code in {401, 403} or any(token in reason for token in ("invalid_token", "invalid_grant", "unauthorized", "forbidden", "auth")) or any(
-        token in message for token in ("unauthorized", "forbidden", "expired", "revoked", "invalid token", "authentication")
+    if code in {401, 403} or any(token in reason for token in ("invalid_token", "invalid_grant", "unauthorized", "forbidden", "auth", "token_revoked", "token_invalidated")) or any(
+        token in message for token in ("unauthorized", "forbidden", "expired", "revoked", "invalid token", "authentication", "invalidated")
     ):
         return "auth failed", False
 
     return "exhausted", True
 
 
+def _format_remaining(exhausted_until: float) -> str:
+    remaining = max(0, int(math.ceil(exhausted_until - time.time())))
+    if remaining <= 0:
+        return "ready to retry"
+    minutes, seconds = divmod(remaining, 60)
+    hours, minutes = divmod(minutes, 60)
+    days, hours = divmod(hours, 24)
+    if days:
+        return f"{days}d {hours}h left"
+    if hours:
+        return f"{hours}h {minutes}m left"
+    if minutes:
+        return f"{minutes}m {seconds}s left"
+    return f"{seconds}s left"
 
-def _format_exhausted_status(entry) -> str:
-    if entry.last_status != STATUS_EXHAUSTED:
+
+def _format_entry_status(entry) -> str:
+    """Human-readable per-credential status suffix for list/status output.
+
+    Covers exhausted (with retry window) and dead (terminal) states. Never
+    includes token material.
+    """
+    status = getattr(entry, "last_status", None)
+    if status == STATUS_DEAD:
+        reason = getattr(entry, "last_error_reason", None)
+        reason_text = f" {reason}" if isinstance(reason, str) and reason.strip() else ""
+        code = f" ({entry.last_error_code})" if entry.last_error_code else ""
+        return f" DEAD{reason_text}{code} (re-auth required — will not rotate)"
+    if status != STATUS_EXHAUSTED:
         return ""
     label, show_retry_window = _classify_exhausted_status(entry)
     reason = getattr(entry, "last_error_reason", None)
@@ -144,21 +172,55 @@ def _format_exhausted_status(entry) -> str:
     exhausted_until = _exhausted_until(entry)
     if exhausted_until is None:
         return f" {label}{reason_text}{code}"
-    remaining = max(0, int(math.ceil(exhausted_until - time.time())))
-    if remaining <= 0:
+    window = _format_remaining(exhausted_until)
+    if window == "ready to retry":
         return f" {label}{reason_text}{code} (ready to retry)"
-    minutes, seconds = divmod(remaining, 60)
-    hours, minutes = divmod(minutes, 60)
-    days, hours = divmod(hours, 24)
-    if days:
-        wait = f"{days}d {hours}h"
-    elif hours:
-        wait = f"{hours}h {minutes}m"
-    elif minutes:
-        wait = f"{minutes}m {seconds}s"
-    else:
-        wait = f"{seconds}s"
-    return f" {label}{reason_text}{code} ({wait} left)"
+    return f" {label}{reason_text}{code} ({window})"
+
+
+def _format_exhausted_status(entry) -> str:
+    """Back-compat alias used by older call sites/tests."""
+    return _format_entry_status(entry)
+
+
+def _account_fp_for_entry(entry) -> str | None:
+    """Short non-secret fingerprint of chatgpt_account_id for display only."""
+    import hashlib
+
+    acct = chatgpt_account_id_from_entry(entry)
+    if not acct:
+        return None
+    return hashlib.sha256(acct.encode("utf-8")).hexdigest()[:12]
+
+
+def _duplicate_account_groups(entries) -> list[tuple[str, list]]:
+    """Return (acct_fp, [entries]) groups where ≥2 entries share an account."""
+    groups: dict[str, list] = {}
+    fps: dict[str, str] = {}
+    for entry in entries:
+        acct = chatgpt_account_id_from_entry(entry)
+        if not acct:
+            continue
+        fp = _account_fp_for_entry(entry)
+        if not fp:
+            continue
+        groups.setdefault(acct, []).append(entry)
+        fps[acct] = fp
+    return [(fps[acct], items) for acct, items in groups.items() if len(items) >= 2]
+
+
+def _print_duplicate_account_warning(entries) -> None:
+    dupes = _duplicate_account_groups(entries)
+    if not dupes:
+        return
+    for acct_fp, items in dupes:
+        labels = ", ".join(f"\"{e.label}\"" for e in items)
+        print(
+            f"  warning: {len(items)} credentials share one ChatGPT account "
+            f"(acct_fp={acct_fp}): {labels}. They share one usage-limit bucket — "
+            f"this is NOT multi-subscription failover. Add a distinct account "
+            f"to get real rotation."
+        )
 
 
 def auth_add_command(args) -> None:
@@ -455,9 +517,14 @@ def auth_list_command(args) -> None:
             marker = "  "
             if current is not None and entry.id == current.id:
                 marker = "← "
-            status = _format_exhausted_status(entry)
+            status = _format_entry_status(entry)
             source = _display_source(entry.source)
-            print(f"  #{idx}  {entry.label:<20} {entry.auth_type:<7} {source}{status} {marker}".rstrip())
+            acct_fp = _account_fp_for_entry(entry)
+            acct_note = f" acct_fp={acct_fp}" if acct_fp else ""
+            print(
+                f"  #{idx}  {entry.label:<20} {entry.auth_type:<7} {source}{status}{acct_note} {marker}".rstrip()
+            )
+        _print_duplicate_account_warning(entries)
         print()
 
 
@@ -504,6 +571,10 @@ def auth_reset_command(args) -> None:
     pool = load_pool(provider)
     count = pool.reset_statuses()
     print(f"Reset status on {count} {provider} credentials")
+    print(
+        "note: reset clears LOCAL exhaustion/dead flags only. "
+        "It does not restore provider quota. A live probe may still 429."
+    )
 
 
 def auth_status_command(args) -> None:
@@ -517,13 +588,58 @@ def auth_status_command(args) -> None:
             print(f"{provider}: logged out ({reason})")
         else:
             print(f"{provider}: logged out")
+        # Still show pool rows when present — a pool can hold dead/exhausted
+        # credentials while the provider-level status says logged out.
+        _print_pool_credential_status(provider)
         return
 
     print(f"{provider}: logged in")
-    for key in ("auth_type", "client_id", "redirect_uri", "scope", "expires_at", "api_base_url"):
+    # Never print secrets (api_key / access_token / refresh_token).
+    safe_keys = (
+        "auth_type",
+        "client_id",
+        "redirect_uri",
+        "scope",
+        "expires_at",
+        "api_base_url",
+        "source",
+        "auth_mode",
+        "rate_limited",
+        "error_code",
+        "error",
+        "reset_at",
+        "last_refresh",
+    )
+    for key in safe_keys:
         value = status.get(key)
-        if value:
-            print(f"  {key}: {value}")
+        if value is None or value == "" or value is False:
+            continue
+        print(f"  {key}: {value}")
+    _print_pool_credential_status(provider)
+
+
+def _print_pool_credential_status(provider: str) -> None:
+    """Print per-credential pool rows for ``hermes auth status``."""
+    try:
+        pool = load_pool(provider)
+    except Exception:
+        return
+    entries = pool.entries()
+    if not entries:
+        return
+    current = pool.peek()
+    print(f"  pool: {len(entries)} credential(s), has_available={pool.has_available()}")
+    for idx, entry in enumerate(entries, start=1):
+        marker = " (active)" if current is not None and entry.id == current.id else ""
+        status = _format_entry_status(entry).strip() or "ok"
+        source = _display_source(entry.source)
+        acct_fp = _account_fp_for_entry(entry)
+        acct_note = f" acct_fp={acct_fp}" if acct_fp else ""
+        print(
+            f"  #{idx} {entry.label}  {entry.auth_type}/{source}  "
+            f"status={status}{acct_note}{marker}"
+        )
+    _print_duplicate_account_warning(entries)
 
 
 def auth_logout_command(args) -> None:

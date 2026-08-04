@@ -769,3 +769,140 @@ def test_auth_remove_copilot_suppresses_all_variants(tmp_path, monkeypatch):
     assert is_source_suppressed("copilot", "env:GITHUB_TOKEN")
 
 
+
+
+def _jwt_with_account(account_id: str, *, jti: str = "x") -> str:
+    header = base64.urlsafe_b64encode(b'{"alg":"RS256","typ":"JWT"}').rstrip(b"=").decode()
+    payload = base64.urlsafe_b64encode(
+        json.dumps(
+            {
+                "https://api.openai.com/auth": {"chatgpt_account_id": account_id},
+                "sub": f"auth0|{account_id}",
+                "jti": jti,
+            }
+        ).encode()
+    ).rstrip(b"=").decode()
+    return f"{header}.{payload}.signature"
+
+
+def test_auth_list_shows_dead_status(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "codex-alive",
+                        "label": "alive",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": _jwt_with_account("acct-a", jti="1"),
+                        "refresh_token": "rt-1",
+                    },
+                    {
+                        "id": "codex-dead",
+                        "label": "dead-session",
+                        "auth_type": "oauth",
+                        "priority": 1,
+                        "source": "manual:device_code",
+                        "access_token": _jwt_with_account("acct-a", jti="2"),
+                        "refresh_token": "rt-2",
+                        "last_status": "dead",
+                        "last_status_at": time.time(),
+                        "last_error_code": 401,
+                        "last_error_reason": "token_revoked",
+                        "last_error_message": "Encountered invalidated oauth token for user",
+                    },
+                ]
+            },
+        },
+    )
+
+    from types import SimpleNamespace
+    from hermes_cli.auth_commands import auth_list_command
+
+    auth_list_command(SimpleNamespace(provider="openai-codex"))
+    out = capsys.readouterr().out
+    assert "DEAD" in out
+    assert "token_revoked" in out
+    assert "will not rotate" in out
+    assert "share one ChatGPT account" in out
+
+
+def test_auth_status_lists_per_credential_pool_rows(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
+    reset_at = time.time() + 7200
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "codex-1",
+                        "label": "primary",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": _jwt_with_account("acct-z", jti="1"),
+                        "refresh_token": "rt-1",
+                        "last_status": "exhausted",
+                        "last_status_at": time.time(),
+                        "last_error_code": 429,
+                        "last_error_reason": "usage_limit_reached",
+                        "last_error_message": "The usage limit has been reached",
+                        "last_error_reset_at": reset_at,
+                    },
+                    {
+                        "id": "codex-2",
+                        "label": "secondary",
+                        "auth_type": "oauth",
+                        "priority": 1,
+                        "source": "manual:device_code",
+                        "access_token": _jwt_with_account("acct-z", jti="2"),
+                        "refresh_token": "rt-2",
+                        "last_status": "exhausted",
+                        "last_status_at": time.time(),
+                        "last_error_code": 429,
+                        "last_error_reason": "usage_limit_reached",
+                        "last_error_message": "The usage limit has been reached",
+                        "last_error_reset_at": reset_at,
+                    },
+                ]
+            },
+        },
+    )
+
+    from types import SimpleNamespace
+    from hermes_cli.auth_commands import auth_status_command
+
+    auth_status_command(SimpleNamespace(provider="openai-codex"))
+    out = capsys.readouterr().out
+    assert "openai-codex: logged in" in out or "pool:" in out
+    assert "pool: 2 credential(s)" in out
+    assert "usage_limit_reached" in out
+    assert "acct_fp=" in out
+    assert "share one ChatGPT account" in out
+    # Must never dump token material
+    assert "rt-1" not in out
+    assert "rt-2" not in out
+    assert ".signature" not in out
+
+
+def test_auth_reset_prints_local_only_note(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
+    _write_auth_store(tmp_path, _codex_pool_only_store(exhausted=True))
+
+    from types import SimpleNamespace
+    from hermes_cli.auth_commands import auth_reset_command
+
+    auth_reset_command(SimpleNamespace(provider="openai-codex"))
+    out = capsys.readouterr().out
+    assert "Reset status on 1" in out
+    assert "LOCAL" in out

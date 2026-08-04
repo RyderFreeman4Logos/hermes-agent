@@ -298,6 +298,68 @@ def label_from_token(token: str, fallback: str) -> str:
     return fallback
 
 
+def chatgpt_account_id_from_token(token: Optional[str]) -> Optional[str]:
+    """Return the ChatGPT account id claim from a Codex OAuth access token.
+
+    Used to detect when multiple pool entries are distinct OAuth *sessions*
+    of the same ChatGPT account (they share one usage-limit bucket). Returns
+    None for non-JWT tokens or when the claim is absent. Never logs the
+    raw token.
+    """
+    if not token or not isinstance(token, str):
+        return None
+    try:
+        claims = _decode_jwt_claims(token)
+    except Exception:
+        return None
+    if not isinstance(claims, dict):
+        return None
+    auth_blob = claims.get("https://api.openai.com/auth")
+    acct = None
+    if isinstance(auth_blob, dict):
+        acct = auth_blob.get("chatgpt_account_id")
+    if not acct:
+        acct = claims.get("chatgpt_account_id")
+    if isinstance(acct, str) and acct.strip():
+        return acct.strip()
+    return None
+
+
+def chatgpt_account_id_from_entry(entry: "PooledCredential") -> Optional[str]:
+    """Best-effort chatgpt_account_id for a pool entry (runtime key first)."""
+    token = getattr(entry, "runtime_api_key", None) or getattr(entry, "access_token", None)
+    return chatgpt_account_id_from_token(token)
+
+
+def _error_context_is_account_quota_wall(
+    status_code: Optional[int],
+    error_context: Optional[Dict[str, Any]],
+) -> bool:
+    """True when the failure is an account-level quota/billing wall.
+
+    These failures are shared by every OAuth session of the same ChatGPT
+    account, so rotating to another token for that account is a no-op.
+    """
+    if status_code == 402:
+        return True
+    reason = ""
+    message = ""
+    if isinstance(error_context, dict):
+        reason = str(error_context.get("reason") or "").strip().lower()
+        message = str(error_context.get("message") or "").strip().lower()
+    if status_code == 429 and (
+        "usage_limit" in reason
+        or "usage_limit_reached" in reason
+        or "usage limit" in message
+        or "quota" in reason
+        or "quota" in message
+    ):
+        return True
+    if "usage_limit_reached" in reason or "usage limit has been reached" in message:
+        return True
+    return False
+
+
 def _next_priority(entries: List[PooledCredential]) -> int:
     return max((entry.priority for entry in entries), default=-1) + 1
 
@@ -2160,9 +2222,16 @@ class CredentialPool:
             # disconnects (a ~2.5min hang with no error surfaced to the user).
             # Mark every entry sharing the failed key so the pool can reach the
             # "no available entries" state and let the error propagate.
+            #
+            # Account-level quota walls (Codex ``usage_limit_reached``, 402
+            # billing) are also shared across every OAuth *session* of the
+            # same ChatGPT account. Two pool entries with different tokens but
+            # the same ``chatgpt_account_id`` are not two subscriptions — they
+            # share one quota bucket. Mark those siblings exhausted too so we
+            # don't burn a rotate hop that is guaranteed to 429 identically.
+            siblings_marked = False
             failed_runtime_key = getattr(entry, "runtime_api_key", None)
             if identity_supplied and failed_runtime_key:
-                siblings_marked = False
                 for sibling in self._entries:
                     if sibling.id == entry.id:
                         continue
@@ -2175,8 +2244,38 @@ class CredentialPool:
                             failure_reason=failure_reason,
                         )
                         siblings_marked = True
-                if siblings_marked:
-                    self._persist()
+            if _error_context_is_account_quota_wall(status_code, error_context):
+                failed_account_id = chatgpt_account_id_from_entry(entry)
+                if failed_account_id:
+                    for sibling in self._entries:
+                        if sibling.id == entry.id:
+                            continue
+                        # Never downgrade a terminal DEAD entry back to
+                        # exhausted — DEAD is a stronger signal.
+                        if sibling.last_status == STATUS_DEAD:
+                            continue
+                        sibling_account_id = chatgpt_account_id_from_entry(sibling)
+                        if sibling_account_id and sibling_account_id == failed_account_id:
+                            if (
+                                sibling.last_status == STATUS_EXHAUSTED
+                                and sibling.last_error_code == status_code
+                                and sibling.last_error_reason
+                                == (error_context or {}).get("reason")
+                            ):
+                                continue
+                            self._mark_exhausted(
+                                sibling, status_code, error_context, persist=False
+                            )
+                            siblings_marked = True
+                            logger.info(
+                                "credential pool: marking %s exhausted "
+                                "(same chatgpt_account_id as %s; account-level "
+                                "quota wall)",
+                                sibling.label or sibling.id[:8],
+                                _label,
+                            )
+            if siblings_marked:
+                self._persist()
             # Re-read the updated entry to log the correct terminal state.
             updated_entry = next(
                 (e for e in self._entries if e.id == entry.id), entry,

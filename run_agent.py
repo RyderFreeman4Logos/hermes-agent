@@ -286,8 +286,15 @@ def _pool_may_recover_from_rate_limit(pool) -> bool:
     retrying against the same exhausted quota — the daily-quota 429 will recur
     immediately, and the retry budget is burned.
 
+    Additionally, multiple OAuth sessions of the *same* ChatGPT account share
+    one usage-limit bucket.  If every still-available entry maps to the same
+    ``chatgpt_account_id`` as the currently selected entry (or there is only
+    one distinct account among available entries after a quota wall), rotation
+    cannot multiply capacity — treat the pool as non-recoverable so fallback
+    fires instead of thrashing.
+
     In that case we must fall back to the configured ``fallback_model``
-    instead.  Returns True only when rotation has somewhere to go.
+    instead.  Returns True only when rotation has somewhere useful to go.
 
     See issues #11314 and #13636.
     """
@@ -295,7 +302,33 @@ def _pool_may_recover_from_rate_limit(pool) -> bool:
         return False
     if not pool.has_available():
         return False
-    return len(pool.entries()) > 1
+    entries = pool.entries()
+    if len(entries) <= 1:
+        return False
+    # Distinct ChatGPT accounts among non-exhausted entries. If we can't
+    # read claims (non-JWT keys), fall back to the classic "more than one
+    # entry" signal so API-key pools keep rotating.
+    try:
+        from agent.credential_pool import (
+            STATUS_DEAD,
+            STATUS_EXHAUSTED,
+            chatgpt_account_id_from_entry,
+        )
+        candidates = [
+            e
+            for e in entries
+            if getattr(e, "last_status", None) not in (STATUS_EXHAUSTED, STATUS_DEAD)
+        ]
+        if not candidates:
+            return False
+        account_ids = [chatgpt_account_id_from_entry(e) for e in candidates]
+        if account_ids and all(account_ids) and len(set(account_ids)) <= 1:
+            # Every still-usable session is the same ChatGPT account — rotating
+            # cannot multiply quota.
+            return False
+    except Exception:
+        pass
+    return True
 
 
 def _qwen_portal_headers() -> dict:

@@ -1326,6 +1326,41 @@ def test_completion_visibility_judge_prompt_redacts_secrets(monkeypatch, output,
     assert canary not in captured["prompt"]
 
 
+def test_completion_visibility_judge_prompt_redacts_combined_multiline_secrets(monkeypatch):
+    from types import SimpleNamespace
+
+    canaries = (
+        "SYNTHETIC_ENV_SECRET_7f3a",
+        "SYNTHETIC_JSON_SECRET_1a6f",
+        "SYNTHETIC_YAML_SECRET_5e0c",
+        "SYNTHETIC_DOTTED_SECRET_3d7a",
+        "SYNTHETIC_QUERY_SECRET_9c2d",
+        "SYNTHETIC_USERINFO_SECRET_4b8e",
+    )
+    output = "\n".join((
+        f"SYNTHETIC_API_KEY={canaries[0]}",
+        f'{{"api_key": "{canaries[1]}"}}',
+        f"spring.datasource.password: {canaries[2]}",
+        f"service.auth.token={canaries[3]}",
+        f"https://example.invalid/result?token={canaries[4]}",
+        f"https://user:{canaries[5]}@example.invalid/result",
+    ))
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", _visibility_config)
+    captured = {}
+
+    def judge(**kwargs):
+        captured["messages"] = kwargs["messages"]
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content='{"deliver": false, "reason": "routine"}'))]
+        )
+
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", judge)
+
+    assert completion_delivery_prompt(_completion_event(output=output), "payload") is None
+    final_judge_messages = "\n".join(message["content"] for message in captured["messages"])
+    assert all(canary not in final_judge_messages for canary in canaries)
+
+
 def test_completion_visibility_fails_open_on_judge_error(monkeypatch):
     monkeypatch.setattr(
         "hermes_cli.config.load_config_readonly", _visibility_config

@@ -918,6 +918,16 @@ DEFAULT_CONFIG = {
             "extra_body": {},
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
         },
+        # Optional fail-open gate for routine successful background-process
+        # completions. Disabled until the configured route is smoke-proven.
+        "completion_visibility": {
+            "enabled": False,
+            "provider": "pm",
+            "model": "gpt-5.6-luna",
+            "timeout": 20,
+            "extra_body": {},
+            "reasoning_effort": "max",
+        },
         "mcp": {
             "provider": "auto",
             "model": "",

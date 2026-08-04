@@ -1260,7 +1260,91 @@ class TestProcessToolHandler:
 # format_process_notification + drain_notifications (shared helpers)
 # =========================================================================
 
-from tools.process_registry import format_process_notification
+from tools.process_registry import completion_delivery_prompt, format_process_notification
+
+
+def _completion_event(**overrides):
+    event = {
+        "type": "completion",
+        "session_id": "proc_visibility",
+        "session_key": "session-a",
+        "command": "safe-test-command",
+        "exit_code": 0,
+        "output": "done",
+    }
+    event.update(overrides)
+    return event
+
+
+def _visibility_config():
+    return {"auxiliary": {"completion_visibility": {"enabled": True}}}
+
+
+def test_completion_visibility_explicit_false_skips_delivery(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly", _visibility_config
+    )
+    monkeypatch.setattr(
+        "agent.auxiliary_client.call_llm",
+        lambda **_kwargs: SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content='{"deliver": false, "reason": "routine success"}'))]
+        ),
+    )
+
+    assert completion_delivery_prompt(_completion_event(), "payload") is None
+
+
+def test_completion_visibility_fails_open_on_judge_error(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly", _visibility_config
+    )
+    monkeypatch.setattr(
+        "agent.auxiliary_client.call_llm", lambda **_kwargs: (_ for _ in ()).throw(TimeoutError())
+    )
+
+    assert completion_delivery_prompt(_completion_event(), "payload") is not None
+
+
+def test_completion_visibility_fails_open_on_invalid_json(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly", _visibility_config
+    )
+    monkeypatch.setattr(
+        "agent.auxiliary_client.call_llm",
+        lambda **_kwargs: SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="not json"))]
+        ),
+    )
+
+    assert completion_delivery_prompt(_completion_event(), "payload") is not None
+
+
+def test_completion_visibility_nonzero_exit_forces_delivery(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly", _visibility_config
+    )
+    monkeypatch.setattr(
+        "agent.auxiliary_client.call_llm",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("must not judge failure")),
+    )
+
+    assert completion_delivery_prompt(_completion_event(exit_code=1), "payload") is not None
+
+
+def test_completion_visibility_missing_fields_fails_open(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly", _visibility_config
+    )
+    monkeypatch.setattr(
+        "agent.auxiliary_client.call_llm",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("must not judge incomplete event")),
+    )
+
+    assert completion_delivery_prompt(_completion_event(output=None), "payload") is not None
 
 
 def test_drain_notifications_completion_callback_exception_fails_closed(registry):

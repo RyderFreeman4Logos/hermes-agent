@@ -2758,11 +2758,11 @@ def _completion_visibility_should_deliver(evt: dict) -> bool:
             return True
 
         from agent.auxiliary_client import call_llm, extract_content_or_reasoning
-        from agent.redact import redact_terminal_output
+        from agent.redact import redact_sensitive_text
 
         output = str(evt.get("output") or "")
-        safe_output = redact_terminal_output(
-            output, str(evt.get("command") or ""), force=True
+        safe_output = redact_sensitive_text(
+            output, force=True, redact_url_credentials=True
         )[-1200:]
         event = {
             "type": "completion",

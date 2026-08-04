@@ -1178,7 +1178,7 @@ auxiliary:
     provider: pm
     model: gpt-5.6-luna
     reasoning_effort: max
-    timeout: 20
+    timeout: 20               # total single-request budget; no retry or fallback
 
   # Gemini 3.1 TTS hidden audio-tag insertion
   tts_audio_tags:

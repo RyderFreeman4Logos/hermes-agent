@@ -22109,7 +22109,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         from tools.process_registry import completion_delivery_prompt
 
-        synth_text = completion_delivery_prompt(evt, synth_text)
+        synth_text = await asyncio.to_thread(completion_delivery_prompt, evt, synth_text)
         if synth_text is None:
             return None
         identity = self._completion_delivery_identity(evt)

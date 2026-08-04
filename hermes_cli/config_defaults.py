@@ -924,7 +924,7 @@ DEFAULT_CONFIG = {
             "enabled": False,
             "provider": "pm",
             "model": "gpt-5.6-luna",
-            "timeout": 20,
+            "timeout": 20,  # total single-request budget; no retry or fallback
             "extra_body": {},
             "reasoning_effort": "max",
         },

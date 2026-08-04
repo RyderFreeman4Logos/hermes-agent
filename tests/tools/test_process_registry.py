@@ -1296,6 +1296,36 @@ def test_completion_visibility_explicit_false_skips_delivery(monkeypatch):
     assert completion_delivery_prompt(_completion_event(), "payload") is None
 
 
+@pytest.mark.parametrize(
+    ("output", "canary"),
+    [
+        ("SYNTHETIC_API_KEY=SYNTHETIC_ENV_SECRET_7f3a", "SYNTHETIC_ENV_SECRET_7f3a"),
+        ("https://example.invalid/result?token=SYNTHETIC_QUERY_SECRET_9c2d", "SYNTHETIC_QUERY_SECRET_9c2d"),
+        ("https://user:SYNTHETIC_USERINFO_SECRET_4b8e@example.invalid/result", "SYNTHETIC_USERINFO_SECRET_4b8e"),
+        ('{"api_key": "SYNTHETIC_JSON_SECRET_1a6f"}', "SYNTHETIC_JSON_SECRET_1a6f"),
+        ("api_key: SYNTHETIC_YAML_SECRET_5e0c", "SYNTHETIC_YAML_SECRET_5e0c"),
+    ],
+)
+def test_completion_visibility_judge_prompt_redacts_secrets(monkeypatch, output, canary):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly", _visibility_config
+    )
+    captured = {}
+
+    def judge(**kwargs):
+        captured["prompt"] = kwargs["messages"][1]["content"]
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content='{"deliver": false, "reason": "routine"}'))]
+        )
+
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", judge)
+
+    assert completion_delivery_prompt(_completion_event(output=output), "payload") is None
+    assert canary not in captured["prompt"]
+
+
 def test_completion_visibility_fails_open_on_judge_error(monkeypatch):
     monkeypatch.setattr(
         "hermes_cli.config.load_config_readonly", _visibility_config

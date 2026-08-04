@@ -9,6 +9,8 @@ state (when available) is acknowledged through its authoritative SQLite API.
 import asyncio
 import json
 import queue
+import threading
+import time
 from collections import OrderedDict
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -363,6 +365,37 @@ def test_numeric_completion_gets_nudge_and_none_gets_no_turn(monkeypatch):
         runner._deliver_completion_notification("not complete", none_event)
     ) is None
     assert injected.await_count == 1
+
+
+def test_completion_judge_runs_off_loop_and_delivers_after_timeout(monkeypatch):
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    injected = AsyncMock(return_value=True)
+    monkeypatch.setattr(runner, "_inject_watch_notification", injected)
+    entered = threading.Event()
+
+    def timed_out_judge(_event, payload):
+        entered.set()
+        time.sleep(0.05)
+        return payload
+
+    monkeypatch.setattr(
+        "tools.process_registry.completion_delivery_prompt", timed_out_judge
+    )
+    async def exercise():
+        delivery = asyncio.create_task(
+            runner._deliver_completion_notification(
+                "payload", _completion_event(started_at=3.0)
+            )
+        )
+        await asyncio.wait_for(asyncio.to_thread(entered.wait), timeout=1)
+        tick = asyncio.Event()
+        asyncio.get_running_loop().call_later(0.01, tick.set)
+        await asyncio.wait_for(tick.wait(), timeout=0.1)
+        assert not delivery.done()
+        return await delivery
+
+    assert asyncio.run(exercise()) is True
 
 
 def test_failed_async_injection_is_retried_and_only_success_is_acked(

@@ -391,6 +391,146 @@ def test_429_rate_limit_still_uses_exhausted_not_dead(tmp_path, monkeypatch):
     assert persisted["last_error_code"] == 429
 
 
+def test_usage_limit_marks_same_chatgpt_account_siblings(tmp_path, monkeypatch):
+    """usage_limit_reached is account-scoped: same chatgpt_account_id siblings exhaust together.
+
+    Two OAuth sessions of one ChatGPT account are not two subscriptions. Rotating
+    between them after a usage_limit_reached 429 is a guaranteed no-op.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
+    same_acct = {
+        "https://api.openai.com/auth": {"chatgpt_account_id": "acct-shared-001"},
+        "sub": "auth0|shared",
+    }
+    other_acct = {
+        "https://api.openai.com/auth": {"chatgpt_account_id": "acct-other-002"},
+        "sub": "auth0|other",
+    }
+    tok_a = _jwt_with_claims({**same_acct, "jti": "a"})
+    tok_b = _jwt_with_claims({**same_acct, "jti": "b"})
+    tok_c = _jwt_with_claims({**other_acct, "jti": "c"})
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "cred-a",
+                        "label": "session-a",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": tok_a,
+                        "refresh_token": "rt-a",
+                    },
+                    {
+                        "id": "cred-b",
+                        "label": "session-b-same-account",
+                        "auth_type": "oauth",
+                        "priority": 1,
+                        "source": "manual:device_code",
+                        "access_token": tok_b,
+                        "refresh_token": "rt-b",
+                    },
+                    {
+                        "id": "cred-c",
+                        "label": "other-account",
+                        "auth_type": "oauth",
+                        "priority": 2,
+                        "source": "manual:device_code",
+                        "access_token": tok_c,
+                        "refresh_token": "rt-c",
+                    },
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import STATUS_EXHAUSTED, load_pool
+
+    pool = load_pool("openai-codex")
+    selected = pool.select()
+    assert selected is not None
+    assert selected.id == "cred-a"
+
+    next_entry = pool.mark_exhausted_and_rotate(
+        status_code=429,
+        error_context={
+            "reason": "usage_limit_reached",
+            "message": "The usage limit has been reached",
+            "resets_at": time.time() + 3600,
+        },
+        credential_id="cred-a",
+        api_key_hint=tok_a,
+    )
+    # Same-account sibling B is also exhausted; rotate lands on distinct account C.
+    assert next_entry is not None
+    assert next_entry.id == "cred-c"
+
+    by_id = {e.id: e for e in pool.entries()}
+    assert by_id["cred-a"].last_status == STATUS_EXHAUSTED
+    assert by_id["cred-b"].last_status == STATUS_EXHAUSTED
+    assert by_id["cred-c"].last_status != STATUS_EXHAUSTED
+
+
+def test_usage_limit_same_account_only_pool_rotates_to_none(tmp_path, monkeypatch):
+    """When every pool entry is the same ChatGPT account, usage_limit exhausts all."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
+    claims = {
+        "https://api.openai.com/auth": {"chatgpt_account_id": "acct-only"},
+        "sub": "auth0|only",
+    }
+    tok_1 = _jwt_with_claims({**claims, "jti": "1"})
+    tok_2 = _jwt_with_claims({**claims, "jti": "2"})
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "cred-1",
+                        "label": "oauth-1",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": tok_1,
+                        "refresh_token": "rt-1",
+                    },
+                    {
+                        "id": "cred-2",
+                        "label": "Account 2",
+                        "auth_type": "oauth",
+                        "priority": 1,
+                        "source": "manual:device_code",
+                        "access_token": tok_2,
+                        "refresh_token": "rt-2",
+                    },
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import STATUS_EXHAUSTED, load_pool
+
+    pool = load_pool("openai-codex")
+    next_entry = pool.mark_exhausted_and_rotate(
+        status_code=429,
+        error_context={
+            "reason": "usage_limit_reached",
+            "message": "The usage limit has been reached",
+        },
+        credential_id="cred-1",
+        api_key_hint=tok_1,
+    )
+    assert next_entry is None
+    assert pool.has_available() is False
+    assert all(e.last_status == STATUS_EXHAUSTED for e in pool.entries())
+
+
 def test_generic_401_without_terminal_reason_still_uses_exhausted(tmp_path, monkeypatch):
     """A 401 with no specific code/reason should keep TTL semantics.
 

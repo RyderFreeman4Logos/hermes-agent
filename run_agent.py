@@ -141,7 +141,7 @@ from model_tools import (
     handle_function_call,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.handle_function_call")
     check_toolset_requirements,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.check_toolset_requirements")
 )
-from tools.terminal_tool import cleanup_vm, get_active_env
+from tools.terminal_tool import cleanup_vm, get_active_env, _resolve_container_task_id
 from tools.interrupt import set_interrupt as _set_interrupt
 from tools.browser_tool import cleanup_browser
 
@@ -4257,9 +4257,21 @@ class AIAgent:
         except Exception:
             pass
 
-        # 2. Clean terminal sandbox environments
+        # 2. Clean terminal sandbox environments. Delegate children share the
+        # parent's default sandbox, so only a child with an explicit isolated
+        # backend owns an environment to close.
         try:
-            cleanup_vm(task_id)
+            terminal_task_id = getattr(self, "_current_task_id", None)
+            environment_key = (
+                _resolve_container_task_id(terminal_task_id)
+                if terminal_task_id
+                else task_id
+            )
+            if (
+                getattr(self, "platform", None) != "subagent"
+                or environment_key != "default"
+            ):
+                cleanup_vm(environment_key)
         except Exception:
             pass
 

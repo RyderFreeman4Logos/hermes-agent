@@ -201,6 +201,83 @@ class TestGetAndPoll:
         assert result["exit_code"] == 0
 
 
+class TestProcessPollStrike:
+    def _install(self, monkeypatch, session):
+        from tools import process_registry as process_module
+
+        registry = ProcessRegistry()
+        registry._running[session.id] = session
+        monkeypatch.setattr(process_module, "process_registry", registry)
+        monkeypatch.setattr(
+            process_module, "_get_process_poll_strike_config", lambda: (3, 120)
+        )
+        return process_module
+
+    def test_poll_strike_trips_after_three_no_progress_repolls(self, monkeypatch):
+        process_module = self._install(monkeypatch, _make_session())
+        args = {"action": "poll", "session_id": "proc_test123"}
+
+        replies = [json.loads(process_module._handle_process(args)) for _ in range(4)]
+
+        assert all("error" not in reply for reply in replies[:3])
+        assert "error" in replies[3]
+        assert "notify_on_complete" in replies[3]["error"]
+
+    def test_poll_strike_resets_when_output_arrives(self, monkeypatch):
+        session = _make_session()
+        process_module = self._install(monkeypatch, session)
+        args = {"action": "poll", "session_id": session.id}
+
+        for _ in range(3):
+            assert "error" not in json.loads(process_module._handle_process(args))
+        with session._lock:
+            session.output_buffer += "progress\n"
+            session.output_size += len("progress\n")
+        assert "error" not in json.loads(process_module._handle_process(args))
+        for _ in range(2):
+            assert "error" not in json.loads(process_module._handle_process(args))
+        assert "error" in json.loads(process_module._handle_process(args))
+
+    def test_second_poll_of_exited_process_is_a_short_final_note(self, monkeypatch):
+        session = _make_session(exited=True, exit_code=0, output="done")
+        process_module = self._install(monkeypatch, session)
+        process_module.process_registry._running.clear()
+        process_module.process_registry._finished[session.id] = session
+        args = {"action": "poll", "session_id": session.id}
+
+        first = json.loads(process_module._handle_process(args))
+        second = json.loads(process_module._handle_process(args))
+
+        assert first["status"] == "exited"
+        assert first["output_preview"] == "done"
+        assert second["status"] == "exited"
+        assert "output_preview" not in second
+        assert "already exited" in second["note"].lower()
+
+
+def test_process_poll_strike_config_is_hot_read(monkeypatch):
+    import hermes_cli.config as config_module
+    from tools.process_registry import _get_process_poll_strike_config
+
+    configs = iter([
+        {"terminal": {"process_poll_strike_limit": 2, "process_poll_strike_window_s": 4}},
+        {"terminal": {"process_poll_strike_limit": 5, "process_poll_strike_window_s": 8}},
+    ])
+    monkeypatch.setattr(config_module, "load_config_readonly", lambda: next(configs))
+
+    assert _get_process_poll_strike_config() == (2, 4)
+    assert _get_process_poll_strike_config() == (5, 8)
+
+
+def test_completion_delivery_requires_a_literally_empty_final_response():
+    from tools.process_registry import completion_delivery_prompt
+
+    prompt = completion_delivery_prompt({"type": "completion", "exit_code": 0}, "done")
+
+    assert "literally empty" in prompt
+    assert "no parentheses" in prompt
+
+
 def test_request_close_terminal_invokes_sink_without_killing(registry):
     """With a sink wired, close routes (session, process_id) to the UI and leaves
     the process running — close is a view drop, not a kill."""

@@ -2725,7 +2725,7 @@ def completion_delivery_prompt(evt: dict, payload: str) -> "str | None":
     if evt.get("type", "completion") != "completion":
         return payload
     if type(evt.get("exit_code")) is not int:
-        return payload
+        return None
     if not _completion_visibility_should_deliver(evt):
         return None
     return (

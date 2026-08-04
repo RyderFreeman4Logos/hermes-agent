@@ -357,7 +357,7 @@ def test_numeric_completion_gets_nudge_and_none_gets_no_turn(monkeypatch):
     assert asyncio.run(runner._deliver_completion_notification("payload", event)) is True
     prompt = injected.await_args.args[0]
     assert prompt.startswith("payload")
-    assert "If no user-visible action is needed, emit no response." in prompt
+    assert "final assistant message must be literally empty (zero characters)" in prompt
 
     none_event = _completion_event(started_at=2.0)
     none_event["exit_code"] = None

@@ -691,6 +691,7 @@ def build_turn_context(
                 messages,
                 system_prompt=active_system_prompt or "",
                 tools=agent.tools or None,
+                api_mode=getattr(agent, "api_mode", None),
             )
             # Post-compression target size: don't summarise a thread already
             # below what compaction would reduce it to.
@@ -773,6 +774,7 @@ def build_turn_context(
             messages,
             system_prompt=active_system_prompt or "",
             tools=agent.tools or None,
+            api_mode=getattr(agent, "api_mode", None),
         )
         _compressor = agent.context_compressor
         # getattr guard: minimal compressor doubles (SimpleNamespace in the
@@ -937,6 +939,7 @@ def build_turn_context(
                     messages,
                     system_prompt=active_system_prompt or "",
                     tools=agent.tools or None,
+                    api_mode=getattr(agent, "api_mode", None),
                 )
                 if not _compression_made_progress(
                     _orig_len, len(messages), _orig_tokens, _preflight_tokens

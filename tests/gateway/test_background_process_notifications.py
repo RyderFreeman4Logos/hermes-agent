@@ -36,6 +36,15 @@ class _FakeRegistry:
     def is_completion_consumed(self, session_id):
         return self._consumed
 
+    def claim_completion_delivery(self, _event):
+        return not self._consumed
+
+    def complete_completion_delivery(self, _event):
+        pass
+
+    def release_completion_delivery(self, _event):
+        pass
+
 
 def _build_runner(monkeypatch, tmp_path, mode: str) -> GatewayRunner:
     """Create a GatewayRunner with a fake config for the given mode."""

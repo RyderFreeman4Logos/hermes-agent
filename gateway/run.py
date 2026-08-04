@@ -22107,12 +22107,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         event or the event has no gateway route. No cross-process exactly-once
         guarantee is claimed.
         """
-        from tools.process_registry import completion_delivery_prompt
+        from tools.process_registry import completion_delivery_prompt, process_registry
 
-        synth_text = await asyncio.to_thread(completion_delivery_prompt, evt, synth_text)
-        if synth_text is None:
+        process_claimed = False
+        if evt.get("type", "completion") == "completion":
+            process_claimed = process_registry.claim_completion_delivery(evt)
+            if not process_claimed:
+                return None
+
+        try:
+            model_text = await asyncio.to_thread(
+                completion_delivery_prompt, evt, synth_text
+            )
+        except BaseException:
+            if process_claimed:
+                process_registry.release_completion_delivery(evt)
+            raise
+        if model_text is None:
+            if process_claimed:
+                process_registry.complete_completion_delivery(evt)
             return None
-        identity = self._completion_delivery_identity(evt)
+        synth_text = model_text
+        identity = None if process_claimed else self._completion_delivery_identity(evt)
         durable_claim_id = ""
         durable_delegation_id = ""
         if evt.get("type") == "async_delegation":
@@ -22200,6 +22216,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         > self._completion_delivery_retention
                     ):
                         self._completion_deliveries_delivered.popitem(last=False)
+            if process_claimed:
+                process_registry.complete_completion_delivery(evt)
 
             # If the durable async-delegation producer branch is present, its
             # SQLite row remains the authoritative replay state. Acknowledge it
@@ -22221,6 +22239,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if identity is not None and not accepted:
                 with self._completion_delivery_lock:
                     self._completion_deliveries_inflight.discard(identity)
+            if process_claimed and not accepted:
+                process_registry.release_completion_delivery(evt)
             if durable_claim_id and not accepted:
                 try:
                     from tools.async_delegation import release_completion_delivery
@@ -22477,11 +22497,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             if session.exited:
                 # --- Agent-triggered completion: inject synthetic message ---
-                # Skip if the agent already consumed the result via wait/log.
-                # poll() is read-only and intentionally does NOT mark consumed
-                # (#10156) — a status check must not suppress this delivery turn.
+                # The shared registry claim suppresses only a normal success
+                # already observed by this owner; failures and unknown shapes
+                # remain fail-open.
                 from tools.process_registry import format_process_notification, process_registry as _pr_check
-                if agent_notify and not _pr_check.is_completion_consumed(session_id):
+                if agent_notify:
                     from agent.redact import redact_terminal_output
                     from tools.ansi_strip import strip_ansi
                     _command = getattr(session, "command", "") or ""
@@ -22531,16 +22551,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     break
 
                 # --- Normal text-only notification ---
-                # Skip when the agent already consumed this completion via
-                # wait/log (#65379): process(wait) returned the exit code and
-                # output inline, so the raw "[Background process ... finished
-                # with exit code ...]" message would be a duplicate delivery
-                # of the same completion. The agent_notify branch above
-                # already honors _completion_consumed; without this check its
-                # skip FALLS THROUGH to this block and re-delivers the output
-                # the agent is actively summarizing. poll() is read-only and
-                # intentionally does not mark consumed (#10156), so a status
-                # check never suppresses this message.
+                # Raw text-only notifications keep the legacy wait/log
+                # suppression (#65379). Agent-triggered model turns above use
+                # the stricter lifecycle identity and fail-open classification.
                 if _pr_check.is_completion_consumed(session_id):
                     logger.debug(
                         "Process watcher: completion for %s already consumed "

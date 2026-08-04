@@ -73,6 +73,7 @@ MAX_OUTPUT_CHARS = 200_000      # 200KB rolling output buffer
 FINISHED_TTL_SECONDS = 1800     # Keep finished processes for 30 minutes
 MAX_PROCESSES = 64              # Max concurrent tracked processes (LRU pruning)
 MAX_ACTIVE_PROCESS_AGE = 86400  # 24h default — see session_reset.bg_process_max_age_hours (#29177)
+COMPLETION_DISPOSITION_RETENTION = 2048
 
 # Watch pattern rate limiting — PER SESSION.
 # Hard rule: at most ONE watch-match notification every WATCH_MIN_INTERVAL_SECONDS.
@@ -206,21 +207,21 @@ class ProcessRegistry:
         except Exception as exc:
             logger.warning("Could not restore async delegation completions: %s", exc)
 
-        # Track sessions whose completion was already consumed by the agent
-        # via wait/log.  Drain loops AND gateway/tui watchers skip notifications
-        # for these — a blocking wait() or a full read_log() means the agent
-        # has the output in hand and is acting on it this turn.
+        # Legacy session-id views used by raw notification paths and callers of
+        # is_completion_consumed(). Model-turn delivery uses the stable ledger
+        # below because these sets are pruned with finished process records.
         self._completion_consumed: set = set()
 
-        # Track sessions the agent merely *observed* exited via poll().  poll()
-        # is a read-only status check, so it does NOT mark _completion_consumed
-        # (that would let a status check suppress the gateway/tui watcher's
-        # autonomous delivery turn — #10156).  But on the CLI the poll result
-        # is returned inline in the same turn, so the idle/post-turn drain must
-        # still skip the queued completion to avoid a duplicate [SYSTEM: ...]
-        # injection (the bug #8228 originally fixed).  drain_notifications()
-        # consults this set; the gateway/tui watchers deliberately do NOT.
+        # poll() remains distinct from full output consumption for legacy raw
+        # notifications, while its stable identity is also recorded below so
+        # every model-turn consumer sees the same once-per-lifecycle decision.
         self._poll_observed: set = set()
+
+        # Stable per-incarnation state that outlives finished-session pruning.
+        # This arbitrates queue/poller races without replacing the durable
+        # async-delegation claim store.
+        self._completion_disposition_lock = threading.Lock()
+        self._completion_dispositions: dict[tuple, str] = {}
 
         # Global watch-match circuit breaker — across all sessions.
         # Prevents sibling processes from collectively flooding the user even
@@ -1617,6 +1618,130 @@ class ProcessRegistry:
         """Check if a completion notification was already consumed via wait/log."""
         return session_id in self._completion_consumed
 
+    @staticmethod
+    def _completion_identity(evt: dict) -> "tuple | None":
+        """Return a stable ordinary-completion identity, or None to fail open."""
+        session_id = evt.get("session_id")
+        session_key = evt.get("session_key", "")
+        started_at = evt.get("started_at")
+        if (
+            evt.get("type", "completion") != "completion"
+            or not isinstance(session_id, str)
+            or not session_id
+            or not isinstance(session_key, str)
+            or isinstance(started_at, bool)
+            or not isinstance(started_at, (int, float))
+            or started_at <= 0
+        ):
+            return None
+        return ("completion", session_id, started_at, session_key)
+
+    @staticmethod
+    def _is_observed_completion_noop(evt: dict) -> bool:
+        """Only a fully-known normal success may reuse an inline receipt."""
+        return (
+            type(evt.get("exit_code")) is int
+            and evt["exit_code"] == 0
+            and str(evt.get("completion_reason") or "").lower() == "exited"
+            and not evt.get("termination_source")
+            and isinstance(evt.get("command"), str)
+            and bool(evt["command"])
+            and isinstance(evt.get("output"), str)
+            and not any(
+                evt.get(key)
+                for key in (
+                    "error", "stderr", "error_message", "exception",
+                    "warning", "safety_alert", "timed_out", "cancelled",
+                )
+            )
+        )
+
+    def _set_completion_disposition(self, identity: tuple, state: str) -> None:
+        self._completion_dispositions.pop(identity, None)
+        self._completion_dispositions[identity] = state
+        # ponytail: retain every queued/inflight identity; only accepted
+        # history is capped, and persistence is unnecessary unless ordinary
+        # completions become durable across process restarts.
+        while len(self._completion_dispositions) > COMPLETION_DISPOSITION_RETENTION:
+            accepted = next(
+                (
+                    key for key, value in self._completion_dispositions.items()
+                    if value == "delivered"
+                ),
+                None,
+            )
+            if accepted is None:
+                break
+            self._completion_dispositions.pop(accepted)
+
+    def _record_completion_observed(self, session: ProcessSession) -> bool:
+        """Record an inline receipt only for the process-owning session."""
+        try:
+            from tools.approval import get_current_session_key
+
+            observer_session_key = get_current_session_key(default="") or ""
+        except Exception:
+            observer_session_key = ""
+        if (
+            not session.notify_on_complete
+            or observer_session_key != session.session_key
+        ):
+            return False
+        identity = self._completion_identity({
+            "type": "completion",
+            "session_id": session.id,
+            "session_key": session.session_key,
+            "started_at": session.started_at,
+        })
+        if identity is None:
+            return False
+        with self._completion_disposition_lock:
+            if self._completion_dispositions.get(identity) not in {"inflight", "delivered"}:
+                self._set_completion_disposition(identity, "observed")
+        return True
+
+    def completion_event_should_deliver(self, evt: dict) -> bool:
+        """Fail open except for an observed no-op or claimed/delivered identity."""
+        identity = self._completion_identity(evt)
+        if identity is None:
+            return True
+        with self._completion_disposition_lock:
+            state = self._completion_dispositions.get(identity)
+            if state in {"inflight", "delivered"}:
+                return False
+            if state == "observed" and self._is_observed_completion_noop(evt):
+                self._set_completion_disposition(identity, "delivered")
+                return False
+        return True
+
+    def claim_completion_delivery(self, evt: dict) -> bool:
+        """Atomically claim an ordinary completion; unknown identities fail open."""
+        identity = self._completion_identity(evt)
+        if identity is None:
+            return True
+        with self._completion_disposition_lock:
+            state = self._completion_dispositions.get(identity)
+            if state in {"inflight", "delivered"}:
+                return False
+            if state == "observed" and self._is_observed_completion_noop(evt):
+                self._set_completion_disposition(identity, "delivered")
+                return False
+            self._set_completion_disposition(identity, "inflight")
+        return True
+
+    def complete_completion_delivery(self, evt: dict) -> None:
+        identity = self._completion_identity(evt)
+        if identity is not None:
+            with self._completion_disposition_lock:
+                self._set_completion_disposition(identity, "delivered")
+
+    def release_completion_delivery(self, evt: dict) -> None:
+        identity = self._completion_identity(evt)
+        if identity is not None:
+            with self._completion_disposition_lock:
+                if self._completion_dispositions.get(identity) == "inflight":
+                    self._completion_dispositions.pop(identity, None)
+
     def is_session_waiting(self, session_id: str) -> bool:
         """Whether a goal loop parked on this session should still be parked.
 
@@ -1653,22 +1778,14 @@ class ProcessRegistry:
                 return False
         return True
 
-    def _drain_should_skip(
-        self, session_id: str, *, skip_poll_observed: bool = True
-    ) -> bool:
+    def _drain_should_skip(self, evt: dict) -> bool:
         """Whether this drain should skip a completion event for this session.
 
-        Skips when the agent has either truly consumed the output (wait/log →
-        ``_completion_consumed``) or observed the exit inline via poll()
-        (``_poll_observed``).  In both cases the CLI agent already has the
-        result this turn, so injecting a [SYSTEM: ...] completion would be a
-        duplicate (#8228).  The gateway/tui watchers do NOT use this — they
-        check only ``is_completion_consumed`` so a read-only poll never
-        suppresses their autonomous delivery turn (#10156).
+        The lifecycle ledger suppresses only a fully-known normal success that
+        its owner already observed inline, plus an identity already claimed or
+        delivered. Failure and incomplete event shapes fail open.
         """
-        return session_id in self._completion_consumed or (
-            skip_poll_observed and session_id in self._poll_observed
-        )
+        return not self.completion_event_should_deliver(evt)
 
     def drain_notifications(
         self,
@@ -1681,10 +1798,10 @@ class ProcessRegistry:
         """Pop all pending notification events and return formatted pairs.
 
         Returns a list of (raw_event, formatted_text) tuples.
-        Skips completion events the agent already consumed via wait/log or
-        observed inline via poll() (see ``_drain_should_skip``). Gateway/TUI
-        callers pass ``skip_poll_observed=False`` because read-only polling must
-        not suppress autonomous delivery there.
+        Skips completion identities already dispositioned by the shared
+        lifecycle ledger (see ``_drain_should_skip``). ``skip_poll_observed``
+        remains for call compatibility; a stable owner observation is no
+        longer bypassed by TUI/gateway drains.
 
         When a routing filter is supplied, addressed notifications must not be
         drained into the wrong session. Async-delegation events always require
@@ -1749,10 +1866,7 @@ class ProcessRegistry:
             # Local consumed/observed state may suppress only events this
             # session owns (or legacy ownerless ordinary events). Routing must
             # happen first so a foreign session cannot drop the owner's event.
-            _evt_sid = evt.get("session_id", "")
-            if evt.get("type") == "completion" and self._drain_should_skip(
-                _evt_sid, skip_poll_observed=skip_poll_observed
-            ):
+            if evt.get("type") == "completion" and self._drain_should_skip(evt):
                 continue
 
             text = (
@@ -1875,17 +1989,12 @@ class ProcessRegistry:
                 result["exit_code"] = session.exit_code
                 result["completion_reason"] = session.completion_reason
                 result["termination_source"] = session.termination_source
-                # NOTE: poll() is a read-only status query and deliberately does
-                # NOT mark the session _completion_consumed. wait()/read_log()
-                # represent actual output consumption and do mark it. Marking
-                # consumed here would let a status check silently suppress the
-                # notify_on_complete watcher's autonomous delivery turn (#10156).
-                #
-                # We DO record it in _poll_observed so the CLI's inline drain still
-                # dedups (the agent already saw the exit in this turn's poll result)
-                # without affecting the gateway/tui watchers, which only consult
-                # _completion_consumed.
-                self._poll_observed.add(session_id)
+                # poll() remains a read-only status query for legacy raw
+                # notifications, but its stable identity is observed for every
+                # model-turn delivery path: the owner already received this
+                # terminal receipt inline.
+                if self._record_completion_observed(session):
+                    self._poll_observed.add(session_id)
             if session.detached:
                 result["detached"] = True
                 result["note"] = "Process recovered after restart -- output history unavailable"
@@ -1929,7 +2038,8 @@ class ProcessRegistry:
             "showing": f"{len(selected)} lines",
         }
         if session.exited and observed_completion_output:
-            self._completion_consumed.add(session_id)
+            if self._record_completion_observed(session):
+                self._completion_consumed.add(session_id)
         return result
 
     def wait(self, session_id: str, timeout: Optional[int] = None) -> dict:
@@ -1979,7 +2089,8 @@ class ProcessRegistry:
             # child has already exited (issue #17327).
             self._reconcile_local_exit(session)
             if session.exited:
-                self._completion_consumed.add(session_id)
+                if self._record_completion_observed(session):
+                    self._completion_consumed.add(session_id)
                 result = {
                     "status": "exited",
                     "command": session.command,
@@ -2113,7 +2224,8 @@ class ProcessRegistry:
             if consume_output and (
                 result is None or result["status"] == "already_exited"
             ):
-                self._completion_consumed.add(session_id)
+                if self._record_completion_observed(session):
+                    self._completion_consumed.add(session_id)
 
         if result is not None:
             if detached_already_exited and result["status"] == "already_exited":
@@ -2864,7 +2976,7 @@ def completion_delivery_prompt(evt: dict, payload: str) -> "str | None":
     if evt.get("type", "completion") != "completion":
         return payload
     if type(evt.get("exit_code")) is not int:
-        return None
+        return payload
     if not _completion_visibility_should_deliver(evt):
         return None
     return (

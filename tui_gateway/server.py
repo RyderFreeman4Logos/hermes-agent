@@ -9389,8 +9389,7 @@ def _notification_poller_loop(
             )
             continue
 
-        _evt_sid = evt.get("session_id", "")
-        if evt.get("type") == "completion" and process_registry.is_completion_consumed(_evt_sid):
+        if not process_registry.completion_event_should_deliver(evt):
             continue
 
         if evt.get("type") == "heartbeat":
@@ -9402,6 +9401,7 @@ def _notification_poller_loop(
             continue
         model_text = completion_delivery_prompt(evt, text)
         if model_text is None:
+            process_registry.complete_completion_delivery(evt)
             continue
 
         # Only emit the same notification identity to TUI once — re-queued
@@ -9427,12 +9427,20 @@ def _notification_poller_loop(
             time.sleep(0.25)
             continue
 
+        if not process_registry.claim_completion_delivery(evt):
+            with session["history_lock"]:
+                session["running"] = False
+            continue
+
         rid = f"__notif__{int(time.time() * 1000)}"
         from tools.async_delegation import (
             claim_event_delivery, complete_event_delivery, release_event_delivery,
         )
         _claim = claim_event_delivery(evt, "tui-poller")
         if _claim is None:
+            process_registry.release_completion_delivery(evt)
+            with session["history_lock"]:
+                session["running"] = False
             continue
         try:
             _emit("message.start", sid)
@@ -9458,8 +9466,11 @@ def _notification_poller_loop(
                     ),
                 )
             complete_event_delivery(evt, _claim)
+            process_registry.complete_completion_delivery(evt)
         except Exception as exc:
             release_event_delivery(evt, _claim)
+            process_registry.release_completion_delivery(evt)
+            process_registry.completion_queue.put(evt)
             print(
                 f"[tui_gateway] notification poller dispatch failed: "
                 f"{type(exc).__name__}: {exc}",
@@ -9497,8 +9508,7 @@ def _notification_poller_loop(
                     str(evt.get("session_key") or ""),
                 )
             continue
-        _evt_sid = evt.get("session_id", "")
-        if evt.get("type") == "completion" and process_registry.is_completion_consumed(_evt_sid):
+        if not process_registry.completion_event_should_deliver(evt):
             continue
         if evt.get("type") == "heartbeat":
             _handle_heartbeat_event(sid, session, evt)
@@ -9508,6 +9518,7 @@ def _notification_poller_loop(
             continue
         model_text = completion_delivery_prompt(evt, text)
         if model_text is None:
+            process_registry.complete_completion_delivery(evt)
             continue
 
         _dedup_key = _notification_event_dedup_key(evt)
@@ -9521,12 +9532,20 @@ def _notification_poller_loop(
                 break
             session["running"] = True
 
+        if not process_registry.claim_completion_delivery(evt):
+            with session["history_lock"]:
+                session["running"] = False
+            continue
+
         rid = f"__notif__{int(time.time() * 1000)}"
         from tools.async_delegation import (
             claim_event_delivery, complete_event_delivery, release_event_delivery,
         )
         _claim = claim_event_delivery(evt, "tui-poller")
         if _claim is None:
+            process_registry.release_completion_delivery(evt)
+            with session["history_lock"]:
+                session["running"] = False
             continue
         try:
             _emit("message.start", sid)
@@ -9552,8 +9571,11 @@ def _notification_poller_loop(
                     ),
                 )
             complete_event_delivery(evt, _claim)
+            process_registry.complete_completion_delivery(evt)
         except Exception as exc:
             release_event_delivery(evt, _claim)
+            process_registry.release_completion_delivery(evt)
+            process_registry.completion_queue.put(evt)
             print(
                 f"[tui_gateway] notification poller dispatch failed: "
                 f"{type(exc).__name__}: {exc}",
@@ -10701,11 +10723,18 @@ def _run_prompt_submit(
                             process_registry.completion_queue.put(pending_evt)
                         break
                     session["running"] = True
+                if not process_registry.claim_completion_delivery(_evt):
+                    with session["history_lock"]:
+                        session["running"] = False
+                    continue
                 from tools.async_delegation import (
                     claim_event_delivery, complete_event_delivery, release_event_delivery,
                 )
                 _claim = claim_event_delivery(_evt, "tui-post-turn")
                 if _claim is None:
+                    process_registry.release_completion_delivery(_evt)
+                    with session["history_lock"]:
+                        session["running"] = False
                     continue
                 try:
                     _emit("message.start", sid)
@@ -10721,8 +10750,11 @@ def _run_prompt_submit(
                         ),
                     )
                     complete_event_delivery(_evt, _claim)
+                    process_registry.complete_completion_delivery(_evt)
                 except Exception as _n_exc:
                     release_event_delivery(_evt, _claim)
+                    process_registry.release_completion_delivery(_evt)
+                    process_registry.completion_queue.put(_evt)
                     print(
                         f"[tui_gateway] completion notification dispatch failed: "
                         f"{type(_n_exc).__name__}: {_n_exc}",

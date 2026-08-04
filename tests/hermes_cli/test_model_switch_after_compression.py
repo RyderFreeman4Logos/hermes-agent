@@ -338,6 +338,64 @@ def test_deferred_custom_current_direct_alias_propagates_local_only_policy(monke
 
     assert result.success is True
     assert (result.target_provider, result.new_model) == ("pm", "gpt-5.6-sol")
+    assert result.warning_message == ""
+    assert calls == []
+
+
+def test_deferred_local_auto_correction_queues_warning(monkeypatch):
+    from types import SimpleNamespace
+
+    from hermes_cli.model_switch import (
+        get_model_switch_after_compression,
+        schedule_model_switch_after_compression,
+    )
+
+    config = {
+        "providers": {
+            "openai-codex": {
+                "api_key": "test-token",
+                "base_url": "https://chatgpt.com/backend-api/codex",
+                "api_mode": "codex_responses",
+                "models": {"gpt-5.3-codex": {"context_length": 400_000}},
+            }
+        }
+    }
+    calls = _install_network_tripwires(monkeypatch)
+    monkeypatch.setattr("hermes_cli.runtime_provider.load_config", lambda: config)
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **_kwargs: {
+            "provider": "openai-codex",
+            "api_key": "test-token",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_mode": "codex_responses",
+        },
+    )
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: config)
+
+    result = switch_model(
+        raw_input="gpt5.3-codex",
+        current_provider="openai-codex",
+        current_model="gpt-5.4",
+        current_base_url="https://chatgpt.com/backend-api/codex",
+        current_api_key="test-token",
+        user_providers=config["providers"],
+        validate_live=False,
+    )
+    assert result.success, result.error_message
+    agent = SimpleNamespace(
+        model="gpt-5.4",
+        provider="openai-codex",
+        api_mode="codex_responses",
+    )
+    schedule_model_switch_after_compression(agent, result)
+
+    pending = get_model_switch_after_compression(agent)
+    assert pending is not None
+    assert pending.new_model == "gpt-5.3-codex"
+    assert result.warning_message == (
+        "Auto-corrected `gpt5.3-codex` → `gpt-5.3-codex`"
+    )
     assert calls == []
 
 

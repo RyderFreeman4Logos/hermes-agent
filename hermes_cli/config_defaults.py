@@ -267,6 +267,8 @@ DEFAULT_CONFIG = {
         # it here without patching the built desktop app.
         "font_family": "",
         "timeout": 180,
+        "process_poll_strike_limit": 3,
+        "process_poll_strike_window_s": 120,
         # Foreground calls whose real execution budget exceeds this are
         # promoted to managed background execution so the turn stays steerable.
         "auto_background_timeout_threshold": 200,

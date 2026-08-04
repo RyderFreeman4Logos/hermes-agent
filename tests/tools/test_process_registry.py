@@ -254,6 +254,74 @@ class TestProcessPollStrike:
         assert "output_preview" not in second
         assert "already exited" in second["note"].lower()
 
+    def test_running_snapshot_cannot_consume_a_later_terminal_result(self, monkeypatch):
+        session = _make_session(output="partial")
+        session.output_size = len(session.output_buffer)
+        process_module = self._install(monkeypatch, session)
+        registry = process_module.process_registry
+        real_snapshot = registry._poll_snapshot
+
+        def running_snapshot_then_exit(session_id):
+            snapshot = real_snapshot(session_id)
+            with session._lock:
+                session.output_buffer = "final"
+                session.output_size = len(session.output_buffer)
+                session.exited = True
+                session.exit_code = 0
+                session.completion_reason = "exited"
+            return snapshot
+
+        monkeypatch.setattr(registry, "_poll_snapshot", running_snapshot_then_exit)
+        args = {"action": "poll", "session_id": session.id}
+
+        first = json.loads(process_module._handle_process(args))
+
+        assert first["status"] == "running"
+        assert first["output_preview"] == "partial"
+        assert not session._poll_terminal_reported
+
+        monkeypatch.setattr(registry, "_poll_snapshot", real_snapshot)
+        second = json.loads(process_module._handle_process(args))
+        third = json.loads(process_module._handle_process(args))
+
+        assert second["status"] == "exited"
+        assert second["output_preview"] == "final"
+        assert session._poll_terminal_reported
+        assert "output_preview" not in third
+
+    def test_poll_strike_only_resets_for_output_in_the_returned_snapshot(self, monkeypatch):
+        session = _make_session(output="partial")
+        session.output_size = len(session.output_buffer)
+        process_module = self._install(monkeypatch, session)
+        registry = process_module.process_registry
+        real_snapshot = registry._poll_snapshot
+        with session._lock:
+            session._poll_last_status = "running"
+            session._poll_last_output_size = session.output_size
+            session._poll_last_at = time.monotonic()
+            session._poll_consecutive_strikes = 1
+
+        def old_snapshot_then_new_output(session_id):
+            snapshot = real_snapshot(session_id)
+            with session._lock:
+                session.output_buffer += "\nnew output"
+                session.output_size = len(session.output_buffer)
+            return snapshot
+
+        monkeypatch.setattr(registry, "_poll_snapshot", old_snapshot_then_new_output)
+        args = {"action": "poll", "session_id": session.id}
+
+        first = json.loads(process_module._handle_process(args))
+
+        assert first["output_preview"] == "partial"
+        assert session._poll_consecutive_strikes == 2
+
+        monkeypatch.setattr(registry, "_poll_snapshot", real_snapshot)
+        second = json.loads(process_module._handle_process(args))
+
+        assert second["output_preview"].endswith("new output")
+        assert session._poll_consecutive_strikes == 0
+
 
 def test_process_poll_strike_config_is_hot_read(monkeypatch):
     import hermes_cli.config as config_module

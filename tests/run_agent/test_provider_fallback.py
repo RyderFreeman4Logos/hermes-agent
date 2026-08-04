@@ -5,9 +5,12 @@ the new list-based ``fallback_providers`` config format and chain
 advancement through multiple providers.
 """
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from agent.credential_pool import STATUS_EXHAUSTED
 from run_agent import AIAgent, _pool_may_recover_from_rate_limit
+from tests.run_agent.test_run_agent import _mock_response
 
 
 def _make_agent(fallback_model=None):
@@ -246,6 +249,146 @@ def _pool(n_entries: int, has_available: bool = True):
 class TestPoolRotationRoom:
     def test_none_pool_returns_false(self):
         assert _pool_may_recover_from_rate_limit(None) is False
+
+
+class _UsageLimitError(Exception):
+    status_code = 429
+
+    def __init__(self):
+        super().__init__("The usage limit has been reached")
+        self.body = {
+            "error": {
+                "type": "usage_limit_reached",
+                "message": "The usage limit has been reached",
+            }
+        }
+        self.response = SimpleNamespace(headers={})
+
+
+class _QuotaPool:
+    def __init__(self, api_key: str, *, distinct_account_available: bool):
+        self.primary = SimpleNamespace(
+            id="primary",
+            label="primary",
+            runtime_api_key=api_key,
+            last_status=None,
+        )
+        self.secondary = SimpleNamespace(
+            id="secondary",
+            label="secondary",
+            runtime_api_key="secondary-key",
+            last_status=None,
+        )
+        self._distinct_account_available = distinct_account_available
+        self.rotate_calls = 0
+
+    def current(self):
+        return self.primary
+
+    def entries(self):
+        return [self.primary, self.secondary]
+
+    def has_available(self):
+        return any(row.last_status != STATUS_EXHAUSTED for row in self.entries())
+
+    def mark_exhausted_and_rotate(self, **_kwargs):
+        self.rotate_calls += 1
+        self.primary.last_status = STATUS_EXHAUSTED
+        if self._distinct_account_available:
+            return self.secondary
+        self.secondary.last_status = STATUS_EXHAUSTED
+        return None
+
+
+def _run_usage_limit_turn(agent, api_side_effect):
+    agent._api_max_retries = 3
+    agent._interruptible_api_call = MagicMock(side_effect=api_side_effect)
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch("agent.agent_runtime_helpers.time.sleep") as helper_sleep,
+        patch("agent.conversation_loop.time.sleep") as loop_sleep,
+    ):
+        result = agent.run_conversation("hello")
+    return result, helper_sleep, loop_sleep
+
+
+class TestUsageLimitResolutionChain:
+    def test_distinct_account_rotation_precedes_fallback(self):
+        agent = _make_agent(
+            fallback_model=[{"provider": "fallback", "model": "fallback-model"}]
+        )
+        pool = _QuotaPool(agent.api_key, distinct_account_available=True)
+        agent._credential_pool = pool
+        responses = [_UsageLimitError(), _mock_response(content="rotated account")]
+
+        def api_call(_kwargs):
+            response = responses.pop(0)
+            if isinstance(response, Exception):
+                raise response
+            return response
+
+        with (
+            patch.object(agent, "_swap_credential") as swap,
+            patch.object(agent, "_try_activate_fallback") as fallback,
+        ):
+            result, helper_sleep, loop_sleep = _run_usage_limit_turn(agent, api_call)
+
+        assert result["final_response"] == "rotated account"
+        assert agent._interruptible_api_call.call_count == 2
+        swap.assert_called_once_with(pool.secondary)
+        fallback.assert_not_called()
+        helper_sleep.assert_not_called()
+        loop_sleep.assert_not_called()
+
+    def test_same_account_quota_wall_activates_fallback_before_backoff(self):
+        agent = _make_agent(
+            fallback_model=[{"provider": "fallback", "model": "fallback-model"}]
+        )
+        pool = _QuotaPool(agent.api_key, distinct_account_available=False)
+        agent._credential_pool = pool
+        responses = [_UsageLimitError(), _mock_response(content="fallback answer")]
+
+        def api_call(_kwargs):
+            response = responses.pop(0)
+            if isinstance(response, Exception):
+                raise response
+            return response
+
+        def activate(reason=None):
+            agent._fallback_index = len(agent._fallback_chain)
+            agent._fallback_activated = True
+            agent.provider = "fallback"
+            agent.model = "fallback-model"
+            return True
+
+        with patch.object(
+            agent, "_try_activate_fallback", side_effect=activate
+        ) as fallback:
+            result, helper_sleep, loop_sleep = _run_usage_limit_turn(agent, api_call)
+
+        assert result["final_response"] == "fallback answer"
+        assert agent._interruptible_api_call.call_count == 2
+        fallback.assert_called_once()
+        helper_sleep.assert_not_called()
+        loop_sleep.assert_not_called()
+
+    def test_same_account_quota_wall_without_fallback_terminates_immediately(self):
+        agent = _make_agent(fallback_model=None)
+        pool = _QuotaPool(agent.api_key, distinct_account_available=False)
+        agent._credential_pool = pool
+
+        result, helper_sleep, loop_sleep = _run_usage_limit_turn(
+            agent, lambda _kwargs: (_ for _ in ()).throw(_UsageLimitError())
+        )
+
+        assert result["completed"] is False
+        assert result["failed"] is True
+        assert agent._interruptible_api_call.call_count == 1
+        assert pool.rotate_calls == 1
+        helper_sleep.assert_not_called()
+        loop_sleep.assert_not_called()
 
 
 

@@ -93,9 +93,12 @@ def test_exact_1700_ignores_family_default_ratio_and_clamps():
     assert resolve_heartbeat_interval(_runtime(), "openai-codex") == 1700
 
 
-def test_bound_custom_identity_reaches_tool_worker_with_exact_interval(monkeypatch):
+def test_bound_custom_identity_reaches_live_target_with_exact_interval(monkeypatch):
     from tools.runtime_heartbeat import (
+        RuntimeHeartbeat,
         bind_agent_provider,
+        canonical_runtime_cache_context_identity,
+        get_current_cache_context,
         get_current_provider,
         preflight_current_heartbeat,
         reset_current_provider,
@@ -107,21 +110,59 @@ def test_bound_custom_identity_reaches_tool_worker_with_exact_interval(monkeypat
         requested_provider="custom:pm",
         base_url="https://pm.invalid/v1",
         model="gpt-5.4-mini",
+        api_mode="chat_completions",
     )
     monkeypatch.setattr("tools.runtime_heartbeat._runtime_config", _runtime)
+    events = queue.Queue()
+    FakeTimer.created = []
+    manager = RuntimeHeartbeat(event_queue=events, timer_factory=FakeTimer)
+
+    def arm_from_worker():
+        interval = preflight_current_heartbeat()
+        assert manager.arm(
+            "proc",
+            caller_id="owner",
+            kind="process",
+            interval=interval,
+            inspect=lambda: {"alive": True, "progress": True},
+        )
+        return get_current_provider(), get_current_cache_context(), interval
+
     token = bind_agent_provider(agent)
     try:
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            provider, interval = executor.submit(
-                propagate_context_to_thread(
-                    lambda: (get_current_provider(), preflight_current_heartbeat())
-                )
+            provider, cache_context, interval = executor.submit(
+                propagate_context_to_thread(arm_from_worker)
             ).result(timeout=5)
     finally:
         reset_current_provider(token)
 
     assert provider == "custom:pm"
+    assert cache_context == canonical_runtime_cache_context_identity(agent)
     assert interval == 1700
+    FakeTimer.created[0].callback()
+    event = events.get_nowait()
+    assert (event["provider"], event["cache_context"]) == (
+        provider,
+        cache_context,
+    )
+
+
+def test_inactive_target_stays_unarmed():
+    from tools.runtime_heartbeat import RuntimeHeartbeat
+
+    FakeTimer.created = []
+    manager = RuntimeHeartbeat(event_queue=queue.Queue(), timer_factory=FakeTimer)
+
+    assert manager.arm(
+        "done",
+        caller_id="owner",
+        kind="process",
+        interval=1700,
+        inspect=lambda: {"alive": False},
+    ) is False
+    assert manager.outstanding_for_caller("owner") == []
+    assert FakeTimer.created == []
 
 
 @pytest.mark.parametrize(

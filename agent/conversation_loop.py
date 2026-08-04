@@ -5186,6 +5186,35 @@ def run_conversation(
                             _retry.primary_recovery_attempted = False
                             continue
 
+                # Hard usage-limit wall with no remaining pool recovery and no
+                # fallback activation above: skip the remaining same-provider
+                # backoff retries (they thrash the same exhausted ChatGPT
+                # account for ~attempt 1/3..3/3). Jump straight to the
+                # max_retries terminal path so the structured quota error
+                # surfaces immediately.
+                if (
+                    is_rate_limited
+                    and classified.reason == FailoverReason.rate_limit
+                    and not _ra()._pool_may_recover_from_rate_limit(
+                        agent._credential_pool,
+                    )
+                ):
+                    _ctx = error_context or {}
+                    _usage_wall = (
+                        "usage_limit_reached" in str(_ctx.get("reason") or "").lower()
+                        or "usage limit has been reached" in str(_ctx.get("message") or "").lower()
+                        or "usage limit reached" in str(_ctx.get("message") or "").lower()
+                    )
+                    if _usage_wall and retry_count < max_retries:
+                        logger.info(
+                            "usage_limit_reached with no recoverable pool entry — "
+                            "skipping remaining same-provider retries "
+                            "(%s/%s → terminal)",
+                            retry_count,
+                            max_retries,
+                        )
+                        retry_count = max_retries
+
                 # ── Auth-failure provider failover ───────────────────────
                 # A 401/403 that survives the per-provider credential-refresh
                 # attempt above (each guarded by its own

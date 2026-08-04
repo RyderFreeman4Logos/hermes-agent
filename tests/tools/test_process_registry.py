@@ -79,6 +79,29 @@ def test_terminal_claim_cancels_heartbeat_before_completion_publication(
     ]
 
 
+def test_remote_threshold_refreshes_status_before_promotion(registry, monkeypatch):
+    class FinishedEnv:
+        def execute(self, command, **_kwargs):
+            if "kill -0" in command:
+                return {"output": "1\n", "returncode": 0}
+            if command.endswith(".log 2>/dev/null"):
+                return {"output": "finished\n", "returncode": 0}
+            return {"output": "0\n", "returncode": 0}
+
+    session = _make_session(sid="proc_remote_short")
+    session.env_ref = FinishedEnv()
+    session.pid_scope = "sandbox"
+    session._started_monotonic = time.monotonic() - 1.1
+    monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+    monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False)
+
+    assert registry.wait_for_promotion(session, 1) == "exited"
+    assert session.output_buffer == "finished\n"
+    assert session.exit_code == 0
+    assert registry.promote(session) is False
+    assert session.id not in registry._running
+
+
 def _spawn_python_sleep(seconds: float) -> subprocess.Popen:
     """Spawn a portable short-lived Python sleep process."""
     return subprocess.Popen(

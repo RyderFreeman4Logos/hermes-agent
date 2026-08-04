@@ -754,7 +754,7 @@ def redact_sensitive_text(
             # text.
             if _CFG_SECRET_WORD_RE.search(text):
                 text = "".join(
-                    line if "://" in line else _CFG_ANCHORED_RE.sub(
+                    line if "://" in line and not redact_url_credentials else _CFG_ANCHORED_RE.sub(
                         _redact_env, _CFG_DOTTED_RE.sub(_redact_env, line)
                     )
                     for line in text.splitlines(keepends=True)
@@ -790,7 +790,7 @@ def redact_sensitive_text(
                     return m.group(0)
                 return f"{key}{sep}{_mask_token(value)}"
             text = "".join(
-                line if "://" in line else _YAML_ASSIGN_RE.sub(_redact_yaml, line)
+                line if "://" in line and not redact_url_credentials else _YAML_ASSIGN_RE.sub(_redact_yaml, line)
                 for line in text.splitlines(keepends=True)
             )
 

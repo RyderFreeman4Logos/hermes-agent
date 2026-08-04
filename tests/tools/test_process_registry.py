@@ -1361,6 +1361,34 @@ def test_completion_visibility_judge_prompt_redacts_combined_multiline_secrets(m
     assert all(canary not in final_judge_messages for canary in canaries)
 
 
+def test_completion_visibility_judge_prompt_redacts_same_line_url_secrets(monkeypatch):
+    from types import SimpleNamespace
+
+    canaries = (
+        "SYNTHETIC_SAME_LINE_YAML_8a1d",
+        "SYNTHETIC_SAME_LINE_DOTTED_4b2e",
+        "SYNTHETIC_SAME_LINE_QUERY_9c3f",
+    )
+    output = "\n".join((
+        f"api_key: {canaries[0]} see https://example.invalid/docs",
+        f"service.auth.token={canaries[1]} url=https://example.invalid/result?token={canaries[2]}",
+    ))
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", _visibility_config)
+    captured = {}
+
+    def judge(**kwargs):
+        captured["messages"] = kwargs["messages"]
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content='{"deliver": false, "reason": "routine"}'))]
+        )
+
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", judge)
+
+    assert completion_delivery_prompt(_completion_event(output=output), "payload") is None
+    final_judge_messages = "\n".join(message["content"] for message in captured["messages"])
+    assert all(canary not in final_judge_messages for canary in canaries)
+
+
 def test_completion_visibility_fails_open_on_judge_error(monkeypatch):
     monkeypatch.setattr(
         "hermes_cli.config.load_config_readonly", _visibility_config

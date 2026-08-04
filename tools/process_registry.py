@@ -1701,13 +1701,20 @@ class ProcessRegistry:
         )
         self._move_to_finished(session)
 
-    def poll(self, session_id: str) -> dict:
-        """Check status and get new output for a background process."""
+    def _poll_snapshot(
+        self, session_id: str
+    ) -> tuple[dict, Optional[ProcessSession], bool, int]:
+        """Return one locked status/output snapshot for a model poll."""
         from tools.ansi_strip import strip_ansi
 
         session = self.get(session_id)
         if session is None:
-            return {"status": "not_found", "error": f"No process with ID {session_id}"}
+            return (
+                {"status": "not_found", "error": f"No process with ID {session_id}"},
+                None,
+                False,
+                -1,
+            )
 
         # Reconcile against real child state before reading session.exited.
         # Guards against orphaned-pipe reader hangs (issue #17327).
@@ -1715,34 +1722,39 @@ class ProcessRegistry:
 
         with session._lock:
             output_preview = strip_ansi(session.output_buffer[-1000:]) if session.output_buffer else ""
+            exited = session.exited
+            output_size = session.output_size
+            result = {
+                "session_id": session.id,
+                "command": session.command,
+                "status": "exited" if exited else "running",
+                "pid": session.pid,
+                "uptime_seconds": int(time.time() - session.started_at),
+                "output_preview": output_preview,
+            }
+            if exited:
+                result["exit_code"] = session.exit_code
+                result["completion_reason"] = session.completion_reason
+                result["termination_source"] = session.termination_source
+                # NOTE: poll() is a read-only status query and deliberately does
+                # NOT mark the session _completion_consumed. wait()/read_log()
+                # represent actual output consumption and do mark it. Marking
+                # consumed here would let a status check silently suppress the
+                # notify_on_complete watcher's autonomous delivery turn (#10156).
+                #
+                # We DO record it in _poll_observed so the CLI's inline drain still
+                # dedups (the agent already saw the exit in this turn's poll result)
+                # without affecting the gateway/tui watchers, which only consult
+                # _completion_consumed.
+                self._poll_observed.add(session_id)
+            if session.detached:
+                result["detached"] = True
+                result["note"] = "Process recovered after restart -- output history unavailable"
+        return result, session, exited, output_size
 
-        result = {
-            "session_id": session.id,
-            "command": session.command,
-            "status": "exited" if session.exited else "running",
-            "pid": session.pid,
-            "uptime_seconds": int(time.time() - session.started_at),
-            "output_preview": output_preview,
-        }
-        if session.exited:
-            result["exit_code"] = session.exit_code
-            result["completion_reason"] = session.completion_reason
-            result["termination_source"] = session.termination_source
-            # NOTE: poll() is a read-only status query and deliberately does
-            # NOT mark the session _completion_consumed. wait()/read_log()
-            # represent actual output consumption and do mark it. Marking
-            # consumed here would let a status check silently suppress the
-            # notify_on_complete watcher's autonomous delivery turn (#10156).
-            #
-            # We DO record it in _poll_observed so the CLI's inline drain still
-            # dedups (the agent already saw the exit in this turn's poll result)
-            # without affecting the gateway/tui watchers, which only consult
-            # _completion_consumed.
-            self._poll_observed.add(session_id)
-        if session.detached:
-            result["detached"] = True
-            result["note"] = "Process recovered after restart -- output history unavailable"
-        return result
+    def poll(self, session_id: str) -> dict:
+        """Check status and get new output for a background process."""
+        return self._poll_snapshot(session_id)[0]
 
     def read_log(self, session_id: str, offset: int = 0, limit: int = 200) -> dict:
         """Read the full output log with optional pagination by lines."""
@@ -2830,15 +2842,14 @@ def _reset_process_poll_strikes(session_id: str) -> None:
 
 def _poll_process_for_model(session_id: str) -> tuple[dict, "str | None"]:
     """Poll once and detect unproductive consecutive model polls."""
-    result = process_registry.poll(session_id)
-    session = process_registry.get(session_id)
+    result, session, exited, output_size = process_registry._poll_snapshot(session_id)
     if session is None or result.get("status") not in {"running", "exited"}:
         return result, None
 
     limit, window_s = _get_process_poll_strike_config()
     now = time.monotonic()
     with session._lock:
-        if session.exited:
+        if exited:
             if session._poll_terminal_reported:
                 return {
                     "session_id": session.id,
@@ -2852,7 +2863,6 @@ def _poll_process_for_model(session_id: str) -> tuple[dict, "str | None"]:
             session._poll_terminal_reported = True
             return result, None
 
-        output_size = session.output_size
         unchanged = (
             session._poll_last_status == result["status"]
             and session._poll_last_output_size == output_size

@@ -2375,8 +2375,9 @@ def _run_single_child(
         duration = round(time.monotonic() - child_start, 2)
 
         summary = result.get("final_response") or ""
-        completed = result.get("completed", False)
+        completed = result.get("completed") is True
         interrupted = result.get("interrupted", False)
+        turn_exit_reason = result.get("turn_exit_reason")
         api_calls = result.get("api_calls", 0)
 
         # The child emits the literal "(empty)" sentinel (see run_agent.py) when
@@ -2388,10 +2389,7 @@ def _run_single_child(
 
         if interrupted:
             status = "interrupted"
-        elif summary and not _empty_sentinel:
-            # A summary means the subagent produced usable output.
-            # exit_reason ("completed" vs "max_iterations") already
-            # tells the parent *how* the task ended.
+        elif completed and summary and not _empty_sentinel:
             status = "completed"
         else:
             status = "failed"
@@ -2435,7 +2433,9 @@ def _run_single_child(
                         tool_trace[-1].update(result_meta)
 
         # Determine exit reason
-        if interrupted:
+        if turn_exit_reason:
+            exit_reason = turn_exit_reason
+        elif interrupted:
             exit_reason = "interrupted"
         elif completed:
             exit_reason = "completed"
@@ -2451,6 +2451,8 @@ def _run_single_child(
             "task_index": task_index,
             "status": status,
             "summary": summary,
+            "completed": completed,
+            "turn_exit_reason": turn_exit_reason,
             "api_calls": api_calls,
             "duration_seconds": duration,
             "model": _model if isinstance(_model, str) else None,
@@ -2549,6 +2551,8 @@ def _run_single_child(
         complete_kwargs: Dict[str, Any] = {
             "preview": summary[:160] if summary else entry.get("error", ""),
             "status": status,
+            "completed": completed,
+            "turn_exit_reason": turn_exit_reason,
             "duration_seconds": duration,
             "summary": summary[:500] if summary else entry.get("error", ""),
             "input_tokens": (

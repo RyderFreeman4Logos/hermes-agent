@@ -541,6 +541,33 @@ class TestDelegateObservability(unittest.TestCase):
             result = json.loads(delegate_task(goal="Test empty sentinel", parent_agent=parent))
             self.assertEqual(result["results"][0]["status"], "failed")
 
+    def test_incomplete_child_with_summary_marks_status_failed(self):
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "test-model"
+            mock_child.session_prompt_tokens = 0
+            mock_child.session_completion_tokens = 0
+            mock_child.run_conversation.return_value = {
+                "final_response": (
+                    "I reached the iteration limit before producing a final response."
+                ),
+                "completed": False,
+                "turn_exit_reason": "terminal_slot_exhausted(2/2)",
+                "interrupted": False,
+                "api_calls": 2,
+                "messages": [],
+            }
+            MockAgent.return_value = mock_child
+
+            result = json.loads(delegate_task(goal="Test exhausted child", parent_agent=parent))
+            entry = result["results"][0]
+            self.assertEqual(entry["status"], "failed")
+            self.assertFalse(entry["completed"])
+            self.assertEqual(entry["turn_exit_reason"], "terminal_slot_exhausted(2/2)")
+            self.assertEqual(entry["exit_reason"], "terminal_slot_exhausted(2/2)")
+
 
 class TestSubagentCostRollup(unittest.TestCase):
     """Port of Kilo-Org/kilocode#9448 — parent's session_estimated_cost_usd

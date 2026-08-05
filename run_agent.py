@@ -7661,16 +7661,25 @@ class AIAgent:
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         if turn_origin == "heartbeat_warm":
+            from agent.auxiliary_client import (
+                _normalize_main_runtime,
+                scoped_runtime_main,
+            )
             from agent.conversation_loop import run_heartbeat_warm
 
-            return run_heartbeat_warm(
-                self,
-                user_message,
-                system_message,
-                conversation_history,
-                moa_config=moa_config,
-                heartbeat_event=heartbeat_event,
+            heartbeat_runtime = _normalize_main_runtime(None)
+            heartbeat_runtime["cache_scope"] = (
+                AIAgent._prompt_cache_scope_id(self) or ""
             )
+            with scoped_runtime_main(heartbeat_runtime):
+                return run_heartbeat_warm(
+                    self,
+                    user_message,
+                    system_message,
+                    conversation_history,
+                    moa_config=moa_config,
+                    heartbeat_event=heartbeat_event,
+                )
         from agent.aux_accounting import (
             reset_accounting_context,
             set_accounting_context,

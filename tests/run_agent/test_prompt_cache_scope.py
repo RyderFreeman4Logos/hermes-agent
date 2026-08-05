@@ -136,6 +136,65 @@ def test_main_runtime_refresh_preserves_scoped_cache_namespace():
     assert _runtime_main_value("cache_scope") == ""
 
 
+@pytest.mark.parametrize("terminal", ["return", "exception"])
+def test_heartbeat_warm_binds_logical_scope_without_leaking(
+    tmp_path, monkeypatch, terminal
+):
+    from agent.auxiliary_client import _runtime_main_value, scoped_runtime_main
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session("root", source="cli")
+        db.end_session("root", "compression")
+        db.create_session("continuation", source="cli", parent_session_id="root")
+        agent = AIAgent.__new__(AIAgent)
+        agent.session_id = "continuation"
+        agent.platform = "cli"
+        agent._session_db = db
+        agent._parent_session_id = None
+        observed = []
+        runtime_fields = ("provider", "model", "base_url", "api_mode", "cache_scope")
+
+        def runtime_snapshot():
+            return {field: _runtime_main_value(field) for field in runtime_fields}
+
+        def fake_warm(*_args, **_kwargs):
+            observed.append(runtime_snapshot())
+            if terminal == "exception":
+                raise RuntimeError("heartbeat failed")
+            return {"final_response": "ok"}
+
+        monkeypatch.setattr("agent.conversation_loop.run_heartbeat_warm", fake_warm)
+        caller_runtime = {
+            "provider": "custom",
+            "model": "chat-model",
+            "base_url": "https://example.invalid/v1",
+            "api_mode": "chat_completions",
+            "cache_scope": "caller",
+        }
+        with scoped_runtime_main(caller_runtime):
+            if terminal == "exception":
+                with pytest.raises(RuntimeError, match="heartbeat failed"):
+                    AIAgent.run_conversation(
+                        agent,
+                        "warm",
+                        turn_origin="heartbeat_warm",
+                    )
+            else:
+                result = AIAgent.run_conversation(
+                    agent,
+                    "warm",
+                    turn_origin="heartbeat_warm",
+                )
+                assert result == {"final_response": "ok"}
+            assert runtime_snapshot() == caller_runtime
+
+        assert observed == [{**caller_runtime, "cache_scope": "root"}]
+        assert runtime_snapshot() == {field: "" for field in runtime_fields}
+    finally:
+        db.close()
+
+
 def test_direct_compression_binds_scope_in_sync_and_bare_executor(
     tmp_path, monkeypatch
 ):

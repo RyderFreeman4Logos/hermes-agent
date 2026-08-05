@@ -280,6 +280,7 @@ _COMPRESSOR_ATTEMPT_STATE_FIELDS = (
     "_last_compression_telemetry",
     "_active_compression_telemetry",
     "_compression_telemetry_seed",
+    "_proactive_prune_rearm_tokens",
 )
 
 _COMPRESSOR_COOLDOWN_STATE_FIELDS = (
@@ -3262,12 +3263,19 @@ def compress_context(
                     # for search/recovery (Teknium review — keep one durable id
                     # WITHOUT destroying history, unlike a hard replace_messages).
                     # See #38763.
+                    from agent.context_compressor import (
+                        PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY,
+                    )
+
                     agent._session_db.archive_and_compact(
                         agent.session_id,
                         persisted_compressed,
                         model_config_json=json.dumps(published_config, sort_keys=True),
                         model=agent.model,
                         system_prompt=new_system_prompt,
+                        model_config_patch={
+                            PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None,
+                        },
                     )
                     split_status = "in_place_committed"
                     # Reset the flush identity set so the next turn's appends are
@@ -3404,6 +3412,12 @@ def compress_context(
                 new_system_prompt = _system_prompt_before_route
                 _compression_made_progress = False
                 compacted_in_place = False
+                if "_proactive_prune_rearm_tokens" in _compressor_attempt_snapshot:
+                    agent.context_compressor._proactive_prune_rearm_tokens = (
+                        _compressor_attempt_snapshot[
+                            "_proactive_prune_rearm_tokens"
+                        ]
+                    )
                 split_status = (
                     "aborted"
                     if locals().get("old_session_id") is None and not in_place

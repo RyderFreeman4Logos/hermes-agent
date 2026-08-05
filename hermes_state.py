@@ -7083,6 +7083,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         compacted_messages: List[Dict[str, Any]],
         *,
         model_config_json: Optional[str] = None,
+        model_config_patch: Optional[Dict[str, Any]] = None,
         model: Optional[str] = None,
         system_prompt: Optional[str] = None,
         billing_provider: Optional[str] = None,
@@ -7110,13 +7111,45 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         This is the durability-preserving alternative to :meth:`replace_messages`
         for compaction. ``message_count`` is set to the ACTIVE (compacted) count,
-        matching what the live load returns. Returns the new active count.
+        matching what the live load returns. ``model_config_patch`` is merged
+        into the session's JSON config in the same transaction; a ``None``
+        value removes that key. Returns the new active count.
         """
 
         if billing_provider is not None:
             self.flush_token_counts()
 
         def _do(conn):
+            patched_model_config_json = model_config_json
+            if model_config_patch is not None:
+                raw = model_config_json
+                if raw is None:
+                    row = conn.execute(
+                        "SELECT model_config FROM sessions WHERE id = ?",
+                        (session_id,),
+                    ).fetchone()
+                    if row is None:
+                        raise ValueError(f"Session not found: {session_id}")
+                    raw = row["model_config"] if isinstance(row, sqlite3.Row) else row[0]
+                config: Dict[str, Any] = {}
+                if isinstance(raw, str) and raw.strip():
+                    try:
+                        parsed = json.loads(raw)
+                        if isinstance(parsed, dict):
+                            config = parsed
+                    except (json.JSONDecodeError, TypeError):
+                        config = {}
+                elif isinstance(raw, dict):
+                    config = dict(raw)
+                for key, value in model_config_patch.items():
+                    if value is None:
+                        config.pop(key, None)
+                    else:
+                        config[key] = value
+                patched_model_config_json = (
+                    json.dumps(config, sort_keys=True) if config else None
+                )
+
             if model_config_json is not None:
                 conn.execute(
                     """UPDATE sessions SET
@@ -7128,7 +7161,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                        billing_mode = COALESCE(?, billing_mode)
                        WHERE id = ?""",
                     (
-                        model_config_json,
+                        patched_model_config_json,
                         model,
                         system_prompt,
                         billing_provider,
@@ -7136,6 +7169,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         billing_mode,
                         session_id,
                     ),
+                )
+            elif model_config_patch is not None:
+                conn.execute(
+                    "UPDATE sessions SET model_config = ? WHERE id = ?",
+                    (patched_model_config_json, session_id),
                 )
             # Soft-archive the live turns: active=0 hides them from the live
             # context load, compacted=1 marks them as "summarized away" (vs

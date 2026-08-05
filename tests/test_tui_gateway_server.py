@@ -5617,7 +5617,7 @@ def test_notification_poller_live_loop_requeues_foreign_completion_for_owner(
 
         assert len(delivered["a"]) == 1
         assert "proc-live-handoff completed normally" in delivered["a"][0]
-        assert "If no user-visible action is needed, emit no response." in delivered["a"][0]
+        assert "final assistant message must be literally empty (zero characters)" in delivered["a"][0]
         assert delivered["kwargs"] == [{"completion_delivery": True}]
         assert delivered["b"] == []
         assert isolated_queue.empty()
@@ -15271,15 +15271,21 @@ def test_notification_poller_delivers_completion(monkeypatch):
         # Should have triggered an agent turn
         assert len(turns) == 1
         assert "[IMPORTANT: Background process proc_poller_test completed normally" in turns[0]
-        assert "If no user-visible action is needed, emit no response." in turns[0]
+        assert "final assistant message must be literally empty (zero characters)" in turns[0]
     finally:
         server._sessions.pop("sid_poll", None)
         while not process_registry.completion_queue.empty():
             process_registry.completion_queue.get_nowait()
 
 
-def test_notification_poller_ignores_nonterminal_none_completion(monkeypatch):
-    """A producer's transient exit_code=None cannot create a model turn."""
+@pytest.mark.parametrize(
+    ("exit_code", "session_id"),
+    [(None, "proc_unknown_exit"), ("unknown", "proc_noninteger_exit")],
+)
+def test_notification_poller_delivers_unknown_exit_code(
+    monkeypatch, exit_code, session_id
+):
+    """Unknown completion shapes fail open to the positively matched owner."""
     import queue as _queue_mod
 
     from tools.process_registry import process_registry
@@ -15290,9 +15296,13 @@ def test_notification_poller_ignores_nonterminal_none_completion(monkeypatch):
     isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
     isolated_queue.put({
         "type": "completion",
-        "session_id": "proc_not_done",
+        "session_id": session_id,
+        "session_key": sess["session_key"],
+        "started_at": 1.0,
         "command": "sleep 1",
-        "exit_code": None,
+        "exit_code": exit_code,
+        "completion_reason": "exited",
+        "termination_source": "",
         "output": "still running",
     })
     monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
@@ -15300,73 +15310,62 @@ def test_notification_poller_ignores_nonterminal_none_completion(monkeypatch):
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda *_args, **_kwargs: delivered.append(True),
+        lambda _rid, _sid, _session, text, **kwargs: delivered.append((text, kwargs)),
     )
 
     stop = threading.Event()
     stop.set()
-    server._sessions["sid_none_completion"] = sess
+    server._sessions["sid_unknown_completion"] = sess
     try:
-        server._notification_poller_loop(stop, "sid_none_completion", sess)
-        assert delivered == []
-        assert emitted == []
+        server._notification_poller_loop(stop, "sid_unknown_completion", sess)
+        assert len(delivered) == 1
+        assert "still running" in delivered[0][0]
+        assert "literally empty" not in delivered[0][0]
+        assert delivered[0][1] == {"completion_delivery": True}
+        assert any(event[0] == "status.update" for event in emitted)
     finally:
-        server._sessions.pop("sid_none_completion", None)
+        server._sessions.pop("sid_unknown_completion", None)
+        while not process_registry.completion_queue.empty():
+            process_registry.completion_queue.get_nowait()
 
 
-def test_notification_poller_skips_consumed(monkeypatch):
-    """Already-consumed completions are not dispatched by the poller."""
+def test_notification_poller_skips_completed_lifecycle(monkeypatch):
+    """An accepted known lifecycle is not dispatched again by the poller."""
     import queue as _queue_mod
 
     from tools.process_registry import process_registry
 
-    turns = []
-
-    class _Agent:
-        def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
-            turns.append(prompt)
-            return {"final_response": "ok", "messages": []}
-
-    class _ImmediateThread:
-        def __init__(self, target=None, daemon=None):
-            self._target = target
-        def start(self):
-            self._target()
-
-    sess = _session(agent=_Agent())
-    server._sessions["sid_skip"] = sess
-    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
-    monkeypatch.setattr(server, "_emit", lambda *a, **kw: None)
-    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
-    monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
-
-    # Isolate the completion queue so a concurrent/leaked poller in the same
-    # xdist worker can't dequeue this session_key-less event before our poller
-    # does. monkeypatch restores the shared singleton on teardown. (Same
-    # pattern as test_notification_poller_requeues_when_busy.)
-    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
-    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
-
-    process_registry._completion_consumed.add("proc_already_done")
-    isolated_queue.put({
+    event = {
         "type": "completion",
-        "session_id": "proc_already_done",
+        "session_id": "proc_completed_lifecycle",
+        "session_key": "session-key",
+        "started_at": 1.0,
         "command": "echo x",
         "exit_code": 0,
+        "completion_reason": "exited",
+        "termination_source": "",
         "output": "x",
-    })
-
+    }
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    isolated_queue.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    process_registry.complete_completion_delivery(event)
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("completed lifecycle must not be dispatched")
+        ),
+    )
     stop = threading.Event()
     stop.set()
-
+    sess = _session()
+    server._sessions["sid_skip"] = sess
     try:
         server._notification_poller_loop(stop, "sid_skip", sess)
-        assert len(turns) == 0
+        assert isolated_queue.empty()
     finally:
         server._sessions.pop("sid_skip", None)
-        process_registry._completion_consumed.discard("proc_already_done")
-        while not process_registry.completion_queue.empty():
-            process_registry.completion_queue.get_nowait()
 
 
 def test_notification_poller_requeues_when_busy(monkeypatch):

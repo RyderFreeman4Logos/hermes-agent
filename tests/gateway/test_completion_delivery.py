@@ -347,7 +347,7 @@ def test_concurrent_claims_share_the_same_narrow_delivery_seam():
     adapter.handle_message.assert_awaited_once()
 
 
-def test_numeric_completion_gets_nudge_and_none_gets_no_turn(monkeypatch):
+def test_numeric_completion_gets_nudge_and_unknown_fails_open(monkeypatch):
     adapter = SimpleNamespace(handle_message=AsyncMock())
     runner = _runner(adapter)
     injected = AsyncMock(return_value=True)
@@ -363,8 +363,66 @@ def test_numeric_completion_gets_nudge_and_none_gets_no_turn(monkeypatch):
     none_event["exit_code"] = None
     assert asyncio.run(
         runner._deliver_completion_notification("not complete", none_event)
+    ) is True
+    assert injected.await_count == 2
+    assert injected.await_args.args[0] == "not complete"
+
+
+def test_owner_observed_success_skips_gateway_turn(monkeypatch, isolated_registry):
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    injected = AsyncMock(return_value=True)
+    monkeypatch.setattr(runner, "_inject_watch_notification", injected)
+    monkeypatch.setattr(
+        "tools.approval.get_current_session_key",
+        lambda default="": "agent:main:telegram:dm:123",
+    )
+    event = _completion_event(started_at=3.0)
+    isolated_registry._record_completion_observed(ProcessSession(
+        id=event["session_id"], command=event["command"],
+        session_key=event["session_key"], started_at=event["started_at"],
+        notify_on_complete=True,
+    ))
+
+    assert asyncio.run(
+        runner._deliver_completion_notification("payload", event)
     ) is None
-    assert injected.await_count == 1
+    injected.assert_not_awaited()
+
+
+def test_failed_process_injection_releases_lifecycle_claim(monkeypatch):
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    injected = AsyncMock(side_effect=[False, True])
+    monkeypatch.setattr(runner, "_inject_watch_notification", injected)
+    event = _completion_event(started_at=4.0)
+
+    assert asyncio.run(
+        runner._deliver_completion_notification("payload", event)
+    ) is False
+    assert asyncio.run(
+        runner._deliver_completion_notification("payload", event)
+    ) is True
+    assert injected.await_count == 2
+
+
+def test_failed_completion_prompt_releases_lifecycle_claim_for_retry(monkeypatch):
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    injected = AsyncMock(return_value=True)
+    monkeypatch.setattr(runner, "_inject_watch_notification", injected)
+    monkeypatch.setattr(
+        "tools.process_registry.completion_delivery_prompt",
+        MagicMock(side_effect=[RuntimeError("judge failed"), "payload"]),
+    )
+    event = _completion_event(started_at=5.0)
+
+    with pytest.raises(RuntimeError, match="judge failed"):
+        asyncio.run(runner._deliver_completion_notification("payload", event))
+    assert asyncio.run(
+        runner._deliver_completion_notification("payload", event)
+    ) is True
+    injected.assert_awaited_once_with("payload", event)
 
 
 def test_completion_judge_runs_off_loop_and_delivers_after_timeout(monkeypatch):
@@ -443,7 +501,7 @@ def _persist_pending_completion(event):
     })
 
 
-def test_explicit_kill_returns_output_before_consuming_notification(monkeypatch):
+def test_explicit_kill_returns_output_and_completion_still_fails_open(monkeypatch):
     import tools.process_registry as pr_module
 
     registry = ProcessRegistry()
@@ -485,7 +543,7 @@ def test_explicit_kill_returns_output_before_consuming_notification(monkeypatch)
         "notify_on_complete": True,
     }))
 
-    adapter.handle_message.assert_not_awaited()
+    adapter.handle_message.assert_awaited_once()
 
 
 def test_process_tool_redacts_explicit_kill_output(monkeypatch):

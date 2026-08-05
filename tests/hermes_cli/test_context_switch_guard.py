@@ -64,6 +64,37 @@ def test_merge_appends_to_existing_warning(monkeypatch):
     assert "preflight compression" in result.warning_message
 
 
+def test_responses_switch_warning_uses_target_wire_shape(monkeypatch):
+    cc = _compressor(monkeypatch)
+    agent = SimpleNamespace(
+        api_mode="chat_completions",
+        context_compressor=cc,
+        compression_enabled=True,
+        base_url="",
+        api_key="",
+        _cached_system_prompt="",
+        tools=None,
+        session_prompt_tokens=0,
+    )
+    messages = [
+        {"role": "assistant", "content": "ok", "reasoning": "r" * 100_000}
+        for _ in range(25)
+    ]
+
+    chat_result = _result()
+    merge_preflight_compression_warning(chat_result, agent=agent, messages=messages)
+    assert "preflight compression" in chat_result.warning_message
+
+    responses_result = _result()
+    responses_result.api_mode = "codex_responses"
+    merge_preflight_compression_warning(
+        responses_result,
+        agent=agent,
+        messages=messages,
+    )
+    assert not responses_result.warning_message
+
+
 
 
 def test_custom_provider_context_avoids_false_shrink_warning(monkeypatch):

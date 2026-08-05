@@ -11128,6 +11128,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 self.conversation_history,
                 system_prompt=_sys_prompt,
                 tools=_tools,
+                api_mode=getattr(self.agent, "api_mode", None),
             )
             report = summarize_compress_preview(
                 self.conversation_history,
@@ -11172,6 +11173,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     original_history,
                     system_prompt=_sys_prompt,
                     tools=_tools,
+                    api_mode=getattr(self.agent, "api_mode", None),
                 )
                 if partial:
                     print(f"🗜️  Summarizing up to here: compressing {len(head)} of "
@@ -11257,6 +11259,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     self.conversation_history,
                     system_prompt=_sys_prompt,
                     tools=_tools,
+                    api_mode=getattr(self.agent, "api_mode", None),
                 )
                 summary = summarize_manual_compression(
                     original_history,

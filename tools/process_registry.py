@@ -89,6 +89,10 @@ WATCH_GLOBAL_MAX_PER_WINDOW = 15
 WATCH_GLOBAL_WINDOW_SECONDS = 10
 WATCH_GLOBAL_COOLDOWN_SECONDS = 30
 
+_REMOTE_KILL_CONFIRMED = "__HERMES_TERMINATED__"
+_REMOTE_PROBE_FAILURE_LIMIT = 3
+_COMPLETION_SUPERVISOR_UNKNOWN_LIMIT = 50
+
 
 def format_uptime_short(seconds: int) -> str:
     s = max(0, int(seconds))
@@ -164,6 +168,7 @@ class ProcessSession:
     _tracked_descendants: Dict[int, Optional[int]] = field(default_factory=dict, repr=False)
     _completion_supervisor_started: bool = field(default=False, repr=False)
     _subreaper_managed: bool = field(default=False, repr=False)
+    _termination_in_progress: bool = field(default=False, repr=False)
 
 
 class ProcessRegistry:
@@ -498,26 +503,30 @@ class ProcessRegistry:
         except Exception:
             return None
 
+    _PID_MATCH = "MATCH"
+    _PID_GONE_OR_MISMATCH = "GONE_OR_MISMATCH"
+    _PID_UNKNOWN = "UNKNOWN"
+
+    @classmethod
+    def _host_pid_identity(
+        cls, pid: Optional[int], expected_start: Optional[int]
+    ) -> str:
+        """Classify a host PID without treating unreadable identity as ownership."""
+        if not pid or not cls._is_host_pid_alive(pid):
+            return cls._PID_GONE_OR_MISMATCH
+        if expected_start is None:
+            return cls._PID_UNKNOWN
+        current_start = cls._safe_host_start_time(pid)
+        if current_start is None:
+            return cls._PID_UNKNOWN
+        if current_start == expected_start:
+            return cls._PID_MATCH
+        return cls._PID_GONE_OR_MISMATCH
+
     @classmethod
     def _host_pid_is_ours(cls, pid: Optional[int], expected_start: Optional[int]) -> bool:
-        """True only if ``pid`` is alive AND still the process we spawned.
-
-        The kernel recycles PID/PGID numbers once a process exits and is reaped,
-        so a stored PID can later name an *unrelated* process — observed in the
-        wild as a recycled number landing on a desktop browser's session leader,
-        which our tree-kill then SIGTERMs (Firefox dying at irregular intervals).
-        We compare the kernel start time captured at spawn against the live one;
-        a mismatch means the number was recycled and must never be signalled.
-
-        When no baseline was captured (legacy checkpoints, or platforms without
-        ``/proc``) we degrade to a bare liveness check rather than refusing to
-        act, preserving prior best-effort behaviour.
-        """
-        if not cls._is_host_pid_alive(pid):
-            return False
-        if expected_start is None:
-            return True
-        return cls._safe_host_start_time(pid) == expected_start
+        """Return true only for an explicit live identity match."""
+        return cls._host_pid_identity(pid, expected_start) == cls._PID_MATCH
 
     def _refresh_detached_session(self, session: Optional[ProcessSession]) -> Optional[ProcessSession]:
         """Update recovered host-PID sessions when the underlying process has exited."""
@@ -527,7 +536,10 @@ class ProcessRegistry:
         # Identity-aware liveness: a recycled PID (alive but a different process
         # than we spawned) must be treated as "our process exited", so it is
         # moved to finished and can never be tree-killed by a later kill().
-        if self._host_pid_is_ours(session.pid, session.host_start_time):
+        if self._host_pid_identity(session.pid, session.host_start_time) in {
+            self._PID_MATCH,
+            self._PID_UNKNOWN,
+        }:
             return session
 
         with session._lock:
@@ -542,18 +554,28 @@ class ProcessRegistry:
         return session
 
     @staticmethod
-    def _proc_alive(proc) -> bool:
-        """True if a psutil.Process is running and not a zombie.
+    def _proc_live_state(proc) -> Optional[bool]:
+        """True if live, false if gone, and None if psutil cannot prove either."""
+        import psutil
 
-        A zombie is already dead (just unreaped), so there's nothing to SIGKILL.
-        """
         try:
-            import psutil
             if not proc.is_running():
                 return False
             return proc.status() != psutil.STATUS_ZOMBIE
-        except Exception:
+        except psutil.NoSuchProcess:
             return False
+        except (psutil.AccessDenied, OSError, PermissionError, AttributeError):
+            return None
+
+    @classmethod
+    def _proc_alive(cls, proc) -> bool:
+        """True only for positive live evidence; zombies are already dead."""
+        return cls._proc_live_state(proc) is True
+
+    @staticmethod
+    def _proc_confirmed_gone(proc) -> bool:
+        """Return true only for positive no-process or zombie evidence."""
+        return ProcessRegistry._proc_live_state(proc) is False
 
     def _remember_local_descendants(
         self, session: ProcessSession, *, include_subreaper: bool = False
@@ -573,30 +595,42 @@ class ProcessRegistry:
         except Exception:
             return
         for child in descendants:
-            if not self._proc_alive(child):
+            if self._proc_live_state(child) is False:
                 continue
             session._tracked_descendants[child.pid] = self._safe_host_start_time(child.pid)
 
     @classmethod
-    def _host_process_is_live(cls, pid: int, expected_start: Optional[int]) -> bool:
-        """Return whether the same host process is alive and not a zombie."""
-        if expected_start is not None and cls._safe_host_start_time(pid) != expected_start:
+    def _host_process_state(
+        cls, pid: int, expected_start: Optional[int]
+    ) -> Optional[bool]:
+        identity = cls._host_pid_identity(pid, expected_start)
+        if identity == cls._PID_GONE_OR_MISMATCH:
             return False
+        if identity == cls._PID_UNKNOWN:
+            return None
         try:
             import psutil
 
-            return cls._proc_alive(psutil.Process(pid))
+            return cls._proc_live_state(psutil.Process(pid))
         except Exception:
-            return cls._host_pid_is_ours(pid, expected_start)
+            return None
 
-    def _local_descendants_settled(self, session: ProcessSession) -> bool:
-        """True when no tracked descendant or live process-group member remains."""
+    @classmethod
+    def _host_process_is_live(cls, pid: int, expected_start: Optional[int]) -> bool:
+        """Treat unknown identity/liveness as an ownership risk."""
+        return cls._host_process_state(pid, expected_start) is not False
+
+    def _local_descendants_settled(self, session: ProcessSession) -> Optional[bool]:
+        """True when settled, false when live, and None when status is unknown."""
         if _IS_WINDOWS or session.process is None or session._subreaper_managed:
             return True
 
         self._remember_local_descendants(session)
         for pid, started_at in list(session._tracked_descendants.items()):
-            if self._host_process_is_live(pid, started_at):
+            state = self._host_process_state(pid, started_at)
+            if state is None:
+                return None
+            if state:
                 return False
             session._tracked_descendants.pop(pid, None)
 
@@ -607,17 +641,25 @@ class ProcessRegistry:
             import psutil
 
             for proc in psutil.process_iter(["pid"]):
-                if proc.pid == session.pid or not self._proc_alive(proc):
+                if proc.pid == session.pid:
                     continue
+                # _IS_WINDOWS returns above; os.getpgid is POSIX-only.
                 try:
-                    if os.getpgid(proc.pid) == pgid:
-                        return False
-                except (ProcessLookupError, PermissionError, OSError):
+                    if os.getpgid(proc.pid) != pgid:
+                        continue
+                except ProcessLookupError:
                     continue
+                except (PermissionError, OSError):
+                    return None
+                state = self._proc_live_state(proc)
+                if state is None:
+                    return None
+                if state:
+                    return False
         except Exception:
             # Unknown is non-terminal: a premature model turn is worse than a
             # delayed completion when the host process table cannot be read.
-            return False
+            return None
         return True
 
     def _local_completion_state(self, session: ProcessSession) -> tuple[bool, Optional[int]]:
@@ -648,6 +690,7 @@ class ProcessRegistry:
             session._completion_supervisor_started = True
 
         def _supervise() -> None:
+            unknown_polls = 0
             while True:
                 ready, rc = self._local_completion_state(session)
                 if ready:
@@ -661,6 +704,19 @@ class ProcessRegistry:
                 with self._lock:
                     if session.id in self._finished:
                         return
+                if isinstance(rc, int) and self._local_descendants_settled(session) is None:
+                    unknown_polls += 1
+                    if unknown_polls >= _COMPLETION_SUPERVISOR_UNKNOWN_LIMIT:
+                        with session._lock:
+                            session._completion_supervisor_started = False
+                        self._publish_termination_failure(
+                            session,
+                            "completion_probe",
+                            "process ownership remained unknown",
+                        )
+                        return
+                else:
+                    unknown_polls = 0
                 time.sleep(0.1)
 
         threading.Thread(
@@ -675,13 +731,41 @@ class ProcessRegistry:
             return
         timer = threading.Timer(
             max(0.0, session.execution_deadline - time.time()),
-            self.kill_process,
+            self._kill_for_deadline,
             args=(session.id,),
-            kwargs={"source": "execution_timeout", "consume_output": False},
         )
         timer.daemon = True
         session._deadline_timer = timer
         timer.start()
+
+    def _kill_for_deadline(self, session_id: str) -> None:
+        self.kill_process(
+            session_id, source="execution_timeout", consume_output=False
+        )
+
+    def _publish_termination_failure(
+        self, session: ProcessSession, source: str, error: str
+    ) -> None:
+        """Persist a warning and notify the owning conversation without releasing it."""
+        message = (
+            f"Process {session.id} termination failed during {source}: {error}. "
+            "Ownership was retained for retry."
+        )
+        logger.warning(message)
+        self.completion_queue.put({
+            "type": "termination_failed",
+            "session_id": session.id,
+            "session_key": session.session_key,
+            "command": session.command,
+            "termination_source": source,
+            "message": message,
+            "platform": session.watcher_platform,
+            "chat_id": session.watcher_chat_id,
+            "user_id": session.watcher_user_id,
+            "user_name": session.watcher_user_name,
+            "thread_id": session.watcher_thread_id,
+            "message_id": session.watcher_message_id,
+        })
 
     @staticmethod
     def _daemon_term_grace_seconds() -> float:
@@ -702,8 +786,10 @@ class ProcessRegistry:
             return 2.0
 
     @classmethod
-    def _terminate_host_pid(cls, pid: int, expected_start: Optional[int] = None) -> None:
-        """Terminate a host-visible PID and its descendants.
+    def _terminate_host_pid(
+        cls, pid: int, expected_start: Optional[int] = None
+    ) -> bool:
+        """Terminate an identity-bound host PID tree and confirm it is gone.
 
         ``expected_start`` is the kernel start time captured when we spawned the
         process. When provided, it is re-validated against the live PID before
@@ -744,15 +830,18 @@ class ProcessRegistry:
         POSIX and a missing ``taskkill.exe`` on Windows (effectively
         unreachable on real Windows installs, but cheap insurance).
         """
-        if expected_start is not None and not cls._host_pid_is_ours(pid, expected_start):
-            # PID was recycled (start time changed) or is gone — never signal a
-            # stranger. A leaked orphan is strictly preferable to killing e.g.
-            # a browser whose session leader reused this dead session's PID.
+        identity = cls._host_pid_identity(pid, expected_start)
+        if identity == cls._PID_GONE_OR_MISMATCH:
+            if not cls._is_host_pid_alive(pid):
+                return True
             logger.warning(
                 "Refusing to terminate host pid %d: start-time mismatch — "
                 "PID was recycled onto an unrelated process.", pid,
             )
-            return
+            return True
+        if identity == cls._PID_UNKNOWN:
+            logger.warning("Refusing to terminate host pid %d: process identity is unknown.", pid)
+            return False
         if _IS_WINDOWS:
             try:
                 subprocess.run(
@@ -768,25 +857,28 @@ class ProcessRegistry:
                     os.kill(pid, signal.SIGTERM)
                 except (OSError, ProcessLookupError, PermissionError):
                     pass
-            return
+            return not cls._host_process_is_live(pid, expected_start)
 
         import psutil
         try:
             parent = psutil.Process(pid)
         except psutil.NoSuchProcess:
-            return
+            return True
         except (OSError, PermissionError):
             try:
                 os.kill(pid, signal.SIGTERM)
             except (OSError, ProcessLookupError, PermissionError):
                 pass
-            return
+            return not cls._host_process_is_live(pid, expected_start)
 
         # Snapshot the whole tree (children before parent) and SIGTERM each.
         try:
             targets = parent.children(recursive=True)
         except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
             targets = []
+            tree_known = False
+        else:
+            tree_known = True
         targets.append(parent)
 
         for proc in targets:
@@ -802,7 +894,7 @@ class ProcessRegistry:
         # leak indefinitely.
         grace = cls._daemon_term_grace_seconds()
         if grace <= 0:
-            return
+            return tree_known and all(cls._proc_confirmed_gone(proc) for proc in targets)
         # Sleep out the grace window, then independently re-probe every target
         # and SIGKILL any survivor.  We deliberately do NOT trust
         # ``psutil.wait_procs``'s gone/alive partition here: it reaps via
@@ -829,7 +921,37 @@ class ProcessRegistry:
             except (psutil.AccessDenied, OSError):
                 pass
 
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            if all(cls._proc_confirmed_gone(proc) for proc in targets):
+                break
+            time.sleep(0.02)
+        return tree_known and all(cls._proc_confirmed_gone(proc) for proc in targets)
+
     # ----- Spawn -----
+
+    def _contain_failed_spawn(
+        self, session: ProcessSession, *, source: str = "failed_start"
+    ) -> bool:
+        """Terminate a spawned handle, retaining ownership until confirmed."""
+        with self._lock:
+            self._running.setdefault(session.id, session)
+        result = self.kill_process(
+            session.id, source=source, consume_output=True
+        )
+        if result.get("status") not in {"killed", "already_exited"}:
+            self._write_checkpoint()
+            return False
+        if session._deadline_timer is not None:
+            session._deadline_timer.cancel()
+            session._deadline_timer = None
+        with self._lock:
+            self._running.pop(session.id, None)
+            self._finished.pop(session.id, None)
+        self._completion_consumed.discard(session.id)
+        self._poll_observed.discard(session.id)
+        self._write_checkpoint()
+        return True
 
     @staticmethod
     def _env_temp_dir(env: Any) -> str:
@@ -843,6 +965,16 @@ class ProcessRegistry:
             except Exception as exc:
                 logger.debug("Could not resolve environment temp dir: %s", exc)
         return "/tmp"
+
+    @staticmethod
+    def _checked_remote_output(result: Any, operation: str) -> str:
+        """Return output only from a successful remote state probe."""
+        if not isinstance(result, dict):
+            raise RuntimeError(f"{operation} returned an invalid result")
+        returncode = result.get("returncode", 0)
+        if returncode != 0:
+            raise RuntimeError(f"{operation} failed (returncode={returncode!r})")
+        return str(result.get("output", "") or "")
 
     def spawn_local(
         self,
@@ -909,10 +1041,10 @@ class ProcessRegistry:
                     env=pty_env,
                     dimensions=(30, 120),
                 )
+                # Own the returned handle before any fallible identity probe.
+                session._pty = pty_proc
                 session.pid = pty_proc.pid
                 session.host_start_time = self._safe_host_start_time(session.pid)
-                # Store the pty handle on the session for read/write
-                session._pty = pty_proc
 
                 # PTY reader thread
                 reader = threading.Thread(
@@ -928,27 +1060,22 @@ class ProcessRegistry:
                         self._prune_if_needed()
                         self._running[session.id] = session
 
-                    self._write_checkpoint()
                     self._arm_execution_deadline(session)
+                    if self._write_checkpoint() is False:
+                        raise RuntimeError("Process checkpoint failed after PTY spawn")
                 reader.start()
                 return session
 
             except ImportError:
                 logger.warning("ptyprocess not installed, falling back to pipe mode")
-            except Exception as e:
-                if session._deadline_timer is not None:
-                    session._deadline_timer.cancel()
-                    session._deadline_timer = None
-                with self._lock:
-                    self._running.pop(session.id, None)
-                    self._finished.pop(session.id, None)
-                if session._pty is not None:
-                    try:
-                        session._pty.terminate(force=True)
-                    except Exception:
-                        pass
-                    session._pty = None
-                    session.pid = None
+            except BaseException as e:
+                contained = self._contain_failed_spawn(session)
+                if not isinstance(e, Exception):
+                    raise
+                if not contained:
+                    raise RuntimeError(
+                        "PTY setup failed and process termination was not confirmed"
+                    ) from e
                 logger.warning("PTY spawn failed (%s), falling back to pipe mode", e)
 
         # Standard Popen path (non-PTY or PTY fallback)
@@ -963,9 +1090,7 @@ class ProcessRegistry:
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
 
         proc = subprocess.Popen(
-            _supervised_local_argv(
-                [user_shell, "-lic", f"set +m; {safe_command}"]
-            ),
+            _supervised_local_argv([user_shell, "-lic", f"set +m; {safe_command}"]),
             text=True,
             cwd=session.cwd,
             env=bg_env,
@@ -978,16 +1103,15 @@ class ProcessRegistry:
             **_popen_kwargs,
         )
 
-        session.process = proc
-        session.pid = proc.pid
-        session.host_start_time = self._safe_host_start_time(session.pid)
-        if not _IS_WINDOWS:
-            session.process_group_id = proc.pid  # start_new_session=True makes pid == pgid
-            session._subreaper_managed = (
-                not _IS_WINDOWS and sys.platform.startswith("linux")
-            )
-
         try:
+            # Own the returned handle before any fallible identity probe.
+            session.process = proc
+            session.pid = proc.pid
+            if not _IS_WINDOWS:
+                session.process_group_id = proc.pid  # start_new_session=True makes pid == pgid
+                session._subreaper_managed = sys.platform.startswith("linux")
+            session.host_start_time = self._safe_host_start_time(session.pid)
+
             # Start output reader thread
             reader = threading.Thread(
                 target=self._reader_loop,
@@ -1002,35 +1126,12 @@ class ProcessRegistry:
                     self._prune_if_needed()
                     self._running[session.id] = session
 
-                self._write_checkpoint()
                 self._arm_execution_deadline(session)
+                if self._write_checkpoint() is False:
+                    raise RuntimeError("Process checkpoint failed after local spawn")
             reader.start()
-        except Exception:
-            # Post-Popen setup failed — kill the orphaned subprocess (and any
-            # descendants spawned via setsid) before re-raising so they do not
-            # leak as untracked background processes.
-            try:
-                if not _IS_WINDOWS:
-                    try:
-                        kill_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
-                        os.killpg(os.getpgid(proc.pid), kill_signal)  # windows-footgun: ok - guarded by _IS_WINDOWS above
-                    except (ProcessLookupError, PermissionError, OSError):
-                        proc.kill()
-                else:
-                    proc.kill()
-            except Exception:
-                pass
-            try:
-                proc.wait(timeout=5)
-            except Exception:
-                pass
-            if session._deadline_timer is not None:
-                session._deadline_timer.cancel()
-                session._deadline_timer = None
-            with self._lock:
-                self._running.pop(session.id, None)
-                self._finished.pop(session.id, None)
-            self._write_checkpoint()
+        except BaseException:
+            self._contain_failed_spawn(session)
             raise
 
         return session
@@ -1096,7 +1197,8 @@ class ProcessRegistry:
             f"wait \"$child\"; rc=$?; printf '%s\\n' \"$rc\" > {quoted_exit_path} "
             f") >/dev/null 2>&1 & "
             f"while [ ! -s {quoted_pid_path} ]; do sleep 0.01; done; "
-            f"cat {quoted_pid_path}"
+            f"child=$(cat {quoted_pid_path}); printf '%s\\n' \"$child\"; "
+            f"sed 's/^.*) //' \"/proc/$child/stat\" 2>/dev/null | cut -d ' ' -f 20"
         )
 
         try:
@@ -1107,11 +1209,15 @@ class ProcessRegistry:
             )
             output = result.get("output", "").strip()
             # Try to extract the PID from the output
+            numeric_lines = []
             for line in output.splitlines():
                 line = line.strip()
                 if line.isdigit():
-                    session.pid = int(line)
-                    break
+                    numeric_lines.append(int(line))
+            if numeric_lines:
+                session.pid = numeric_lines[0]
+            if len(numeric_lines) > 1:
+                session.host_start_time = numeric_lines[1]
             # If the wrapper couldn't produce a PID (for example, syntax
             # error or broken redirect), treat it as a failed launch instead
             # of exposing a fake running session.
@@ -1205,16 +1311,21 @@ class ProcessRegistry:
                 f"kill -0 \"$(cat {pid_path} 2>/dev/null)\" 2>/dev/null; echo $?",
                 timeout=5,
             )
-            check_output = check.get("output", "").strip()
+            check_output = self._checked_remote_output(
+                check, "Remote liveness probe"
+            ).strip()
             if not check_output or check_output.splitlines()[-1].strip() == "0":
                 return
 
             output = env.execute(
                 f"cat {log_path} 2>/dev/null", timeout=10
             ).get("output", "")
-            exit_str = env.execute(
+            exit_result = env.execute(
                 f"cat {exit_path} 2>/dev/null", timeout=5
-            ).get("output", "").strip()
+            )
+            exit_str = self._checked_remote_output(
+                exit_result, "Remote exit-code read"
+            ).strip()
             try:
                 exit_code = int(exit_str.splitlines()[-1].strip())
             except (ValueError, IndexError):
@@ -1244,20 +1355,35 @@ class ProcessRegistry:
         """Atomically register a still-running process for background management."""
         self._reconcile_local_exit(session)
         self._reconcile_env_exit(session)
-        with session._lock:
-            if session.exited:
-                return False
-            for key, value in (notification_metadata or {}).items():
-                setattr(session, key, value)
-            with self._lock:
-                if session.id in self._finished:
+        try:
+            with session._lock:
+                if session.exited:
                     return False
-                if self._running.get(session.id) is session:
-                    return True
-                self._prune_if_needed()
-                self._running[session.id] = session
-            self._arm_execution_deadline(session)
-        self._write_checkpoint()
+                for key, value in (notification_metadata or {}).items():
+                    setattr(session, key, value)
+                with self._lock:
+                    if session.id in self._finished:
+                        return False
+                    if self._running.get(session.id) is session:
+                        return True
+                    self._prune_if_needed()
+                    self._running[session.id] = session
+                self._arm_execution_deadline(session)
+            if self._write_checkpoint() is False:
+                raise RuntimeError(
+                    "Process checkpoint failed during background promotion"
+                )
+        except BaseException as exc:
+            contained = self._contain_failed_spawn(
+                session, source="background_promotion_failed"
+            )
+            if not isinstance(exc, Exception):
+                raise
+            if not contained:
+                raise RuntimeError(
+                    "Background promotion failed and process termination was not confirmed"
+                ) from exc
+            raise
         return True
 
     def discard(self, session: ProcessSession, *, source: str) -> dict:
@@ -1440,6 +1566,7 @@ class ProcessRegistry:
         quoted_pid_path = shlex.quote(pid_path)
         quoted_exit_path = shlex.quote(exit_path)
         prev_output_len = 0  # track delta for watch pattern scanning
+        probe_failures = 0
         while not session.exited:
             time.sleep(2)  # Poll every 2 seconds
             try:
@@ -1464,14 +1591,20 @@ class ProcessRegistry:
                     f"kill -0 \"$(cat {quoted_pid_path} 2>/dev/null)\" 2>/dev/null; echo $?",
                     timeout=5,
                 )
-                check_output = check.get("output", "").strip()
+                check_output = self._checked_remote_output(
+                    check, "Remote liveness probe"
+                ).strip()
+                if not check_output:
+                    raise RuntimeError("Remote liveness probe returned no status")
                 if check_output and check_output.splitlines()[-1].strip() != "0":
                     # Process has exited -- get exit code captured by the wrapper shell.
                     exit_result = env.execute(
                         f"cat {quoted_exit_path} 2>/dev/null",
                         timeout=5,
                     )
-                    exit_str = exit_result.get("output", "").strip()
+                    exit_str = self._checked_remote_output(
+                        exit_result, "Remote exit-code read"
+                    ).strip()
                     try:
                         session.exit_code = int(exit_str.splitlines()[-1].strip())
                     except (ValueError, IndexError):
@@ -1481,15 +1614,15 @@ class ProcessRegistry:
                         session.completion_reason = "exited"
                     self._move_to_finished(session)
                     return
+                probe_failures = 0
 
-            except Exception:
-                # Environment might be gone (sandbox reaped, etc.)
-                session.exited = True
-                session.exit_code = -1
-                session.completion_reason = "lost"
-                session.termination_source = "backend_lost"
-                self._move_to_finished(session)
-                return
+            except Exception as exc:
+                probe_failures += 1
+                if probe_failures >= _REMOTE_PROBE_FAILURE_LIMIT:
+                    self._publish_termination_failure(
+                        session, "backend_probe", str(exc)
+                    )
+                    return
 
     def _pty_reader_loop(self, session: ProcessSession):
         """Background thread: read output from a PTY process."""
@@ -1532,11 +1665,23 @@ class ProcessRegistry:
         except Exception:
             pass
 
-        # Process exited
+        # Process exited only after the PTY confirms it is no longer alive.
+        wait_error = None
         try:
             pty.wait()
         except Exception as e:
             logger.debug("PTY wait timed out or failed: %s", e)
+            wait_error = e
+        try:
+            still_alive = bool(pty.isalive())
+        except Exception as exc:
+            still_alive = True
+            wait_error = wait_error or exc
+        if still_alive:
+            self._publish_termination_failure(
+                session, "pty_reader", str(wait_error or "PTY remains alive")
+            )
+            return
         with session._lock:
             session.exited = True
             session.exit_code = pty.exitstatus if hasattr(pty, 'exitstatus') else -1
@@ -1551,6 +1696,9 @@ class ProcessRegistry:
         with the reader thread), the second call is a no-op — no duplicate
         completion notification is enqueued.
         """
+        with session._lock:
+            if session._termination_in_progress:
+                return
         if session.process is not None:
             ready, rc = self._local_completion_state(session)
             if not ready:
@@ -1794,8 +1942,13 @@ class ProcessRegistry:
             rc = proc.poll()
         except Exception:
             return
-        if rc is None or not self._local_descendants_settled(session):
-            return  # Launcher or owned descendants are still running.
+        if rc is None:
+            return
+        settled = self._local_descendants_settled(session)
+        if not settled:
+            if settled is None:
+                self._ensure_local_completion_supervisor(session)
+            return  # Owned descendants are still running or status is unknown.
 
         # Direct child exited. Try to drain any bytes the reader hasn't
         # consumed yet. This is best-effort: if the pipe is held open by a
@@ -1861,7 +2014,7 @@ class ProcessRegistry:
 
         with session._lock:
             output_preview = strip_ansi(session.output_buffer[-1000:]) if session.output_buffer else ""
-            exited = session.exited
+            exited = session.exited and not session._termination_in_progress
             output_size = session.output_size
             result = {
                 "session_id": session.id,
@@ -2074,11 +2227,16 @@ class ProcessRegistry:
             and not session._pty
             and session.process is None
             and session.env_ref is None
-            and not self._host_pid_is_ours(session.pid, session.host_start_time)
+            and self._host_pid_identity(session.pid, session.host_start_time)
+            == self._PID_GONE_OR_MISMATCH
         )
 
         with session._lock:
             output = strip_ansi(session.output_buffer[-2000:])
+            previous_reason = session.completion_reason
+            previous_source = session.termination_source
+            was_consumed = session_id in self._completion_consumed
+            was_poll_observed = session_id in self._poll_observed
             if session.exited:
                 result = {
                     "status": "already_exited",
@@ -2107,6 +2265,7 @@ class ProcessRegistry:
             else:
                 # Completion readers may observe the numeric return code while
                 # tree termination is still waiting, so kill intent comes first.
+                session._termination_in_progress = True
                 session.completion_reason = "killed"
                 session.termination_source = source
                 result = None
@@ -2118,56 +2277,187 @@ class ProcessRegistry:
         if result is not None:
             if detached_already_exited and result["status"] == "already_exited":
                 self._move_to_finished(session)
+            elif result["status"] == "error":
+                self._publish_termination_failure(session, source, result["error"])
             return result
 
         # Kill via PTY, Popen (local), or env execute (non-local)
         try:
+            confirmed = False
+            failure_detail = None
             if session._pty:
                 # PTYs can launch descendants too; terminate the full host tree.
                 if session.pid:
-                    self._terminate_host_pid(
+                    confirmed = self._terminate_host_pid(
                         session.pid,
                         session.host_start_time,
-                    )
-                else:
+                    ) is not False
+                if not confirmed:
                     session._pty.terminate(force=True)
+                    confirmed = not bool(session._pty.isalive())
+                if confirmed:
+                    try:
+                        session._pty.wait()
+                    except Exception:
+                        pass
             elif session.process:
                 # Local process -- kill the process tree. On Windows this
                 # must be taskkill /T /F; Popen.terminate() only kills the
                 # shell wrapper and leaves Git Bash descendants behind.
-                self._terminate_host_pid(session.process.pid, session.host_start_time)
-            elif session.env_ref and session.pid:
-                # Non-local -- the wrapper starts a dedicated process group.
-                grace = self._daemon_term_grace_seconds()
-                remote_kill = (
-                    f"kill -TERM -- -{session.pid} 2>/dev/null || "
-                    f"kill {session.pid} 2>/dev/null; "
-                    f"sleep {grace}; "
-                    f"kill -KILL -- -{session.pid} 2>/dev/null || true"
+                self._remember_local_descendants(session, include_subreaper=True)
+                primitive_confirmed = self._terminate_host_pid(
+                    session.process.pid, session.host_start_time
+                ) is not False
+                if (
+                    not primitive_confirmed
+                    and session.host_start_time is None
+                    and session.process.poll() is None
+                ):
+                    session.process.terminate()
+                    for child_pid, child_start in list(session._tracked_descendants.items()):
+                        self._terminate_host_pid(child_pid, child_start)
+                    primitive_confirmed = True
+                try:
+                    session.process.wait(timeout=1)
+                except Exception:
+                    pass
+                ready, returncode = self._local_completion_state(session)
+                descendants_gone = self._local_descendants_settled(session)
+                identity_gone = not self._host_process_is_live(
+                    session.process.pid, session.host_start_time
                 )
-                session.env_ref.execute(
+                confirmed = descendants_gone and identity_gone and (
+                    primitive_confirmed or ready
+                )
+                if ready:
+                    with session._lock:
+                        session.exit_code = returncode
+                        session.exited = True
+            elif session.env_ref and session.pid:
+                if session.host_start_time is None:
+                    raise RuntimeError("Remote process identity is unavailable; status unknown")
+                grace = self._daemon_term_grace_seconds()
+                stat_path = f"/proc/{session.pid}/stat"
+                start_probe = (
+                    f"sed 's/^.*) //' {stat_path} 2>/dev/null | cut -d ' ' -f 20"
+                )
+                gone_marker = f"printf '{_REMOTE_KILL_CONFIRMED}\\n'; exit 0"
+                remote_kill = (
+                    f"if [ ! -e {stat_path} ]; then {gone_marker}; fi; "
+                    f"current=$({start_probe}); "
+                    f'if [ -z "$current" ]; then exit 2; fi; '
+                    f'if [ "$current" != "{session.host_start_time}" ]; then {gone_marker}; fi; '
+                    f"kill -TERM -- -{session.pid} 2>/dev/null || "
+                    f"kill -TERM {session.pid} 2>/dev/null || exit 1; "
+                    f"sleep {grace}; "
+                    f"if [ -e {stat_path} ]; then current=$({start_probe}); "
+                    f'if [ "$current" = "{session.host_start_time}" ]; then '
+                    f"kill -KILL -- -{session.pid} 2>/dev/null || "
+                    f"kill -KILL {session.pid} 2>/dev/null || exit 1; fi; fi; "
+                    f'i=0; while [ "$i" -lt 20 ]; do '
+                    f"if [ ! -e {stat_path} ]; then {gone_marker}; fi; "
+                    f"current=$({start_probe}); "
+                    f'if [ -z "$current" ]; then exit 2; fi; '
+                    f'if [ "$current" != "{session.host_start_time}" ]; then {gone_marker}; fi; '
+                    f"i=$((i + 1)); sleep 0.05; done; exit 1"
+                )
+                remote_result = session.env_ref.execute(
                     remote_kill,
                     timeout=max(5, int(grace) + 3),
                 )
+                if not isinstance(remote_result, dict):
+                    raise RuntimeError("Remote kill returned an invalid result; status unknown")
+                remote_output = strip_ansi(str(remote_result.get("output", "")))
+                confirmed = (
+                    remote_result.get("returncode") == 0
+                    and _REMOTE_KILL_CONFIRMED
+                    in {line.strip() for line in remote_output.splitlines()}
+                )
+                if not confirmed:
+                    failure_detail = (
+                        "Remote kill was not confirmed "
+                        f"(returncode={remote_result.get('returncode')!r}, "
+                        f"output={remote_output[-500:]!r})"
+                    )
             elif session.detached and session.pid_scope == "host" and session.pid:
-                self._terminate_host_pid(session.pid, session.host_start_time)
+                confirmed = self._terminate_host_pid(
+                    session.pid, session.host_start_time
+                ) is not False
+
+            with session._lock:
+                if not confirmed and not session.exited:
+                    raise RuntimeError(
+                        failure_detail
+                        or "Process termination was not confirmed; status unknown"
+                    )
+                if session.exited and not confirmed:
+                    session.completion_reason = previous_reason
+                    session.termination_source = previous_source
+                    terminal_status = "already_exited"
+                else:
+                    session.exited = True
+                    session.completion_reason = "killed"
+                    session.termination_source = source
+                    terminal_status = "killed"
+                session._termination_in_progress = False
+                if session.process is None and session.exit_code is None:
+                    session.exit_code = -15
+                output = strip_ansi(session.output_buffer[-2000:])
+
             # Capture output after termination; kill intent and consumption were
             # published before signaling so completion cannot race ahead of them.
-            with session._lock:
-                output = strip_ansi(session.output_buffer[-2000:])
-                session.exited = True
-                if session.process is None:
-                    session.exit_code = -15  # SIGTERM
             self._move_to_finished(session)
+            if not session.exited:
+                raise RuntimeError(
+                    "Process termination was not confirmed for all owned descendants"
+                )
             self._write_checkpoint()
+            if terminal_status == "already_exited":
+                return {
+                    "status": terminal_status,
+                    "command": session.command,
+                    "exit_code": session.exit_code,
+                    "completion_reason": session.completion_reason,
+                    "termination_source": session.termination_source,
+                    "output": output,
+                }
             return {
-                "status": "killed",
+                "status": terminal_status,
                 "session_id": session.id,
                 "completion_reason": session.completion_reason,
                 "termination_source": session.termination_source,
                 "output": output,
             }
-        except Exception as e:
+        except BaseException as e:
+            with session._lock:
+                completed_during_kill = session.exited
+                session.completion_reason = previous_reason
+                session.termination_source = previous_source
+                session._termination_in_progress = False
+                if not was_consumed:
+                    self._completion_consumed.discard(session_id)
+                if not was_poll_observed:
+                    self._poll_observed.discard(session_id)
+                if completed_during_kill and consume_output:
+                    self._completion_consumed.add(session_id)
+            if completed_during_kill:
+                self._move_to_finished(session)
+                if not isinstance(e, Exception):
+                    raise
+                if not session.exited:
+                    self._publish_termination_failure(session, source, str(e))
+                    return {"status": "error", "error": str(e)}
+                return {
+                    "status": "already_exited",
+                    "command": session.command,
+                    "exit_code": session.exit_code,
+                    "completion_reason": session.completion_reason,
+                    "termination_source": session.termination_source,
+                    "output": strip_ansi(session.output_buffer[-2000:]),
+                }
+            if not isinstance(e, Exception):
+                raise
+            self._publish_termination_failure(session, source, str(e))
             return {"status": "error", "error": str(e)}
 
     def write_stdin(self, session_id: str, data: str) -> dict:
@@ -2529,8 +2819,10 @@ class ProcessRegistry:
             # Atomic write to avoid corruption on crash
             from utils import atomic_json_write
             atomic_json_write(CHECKPOINT_PATH, entries)
+            return True
         except Exception as e:
             logger.debug("Failed to write checkpoint file: %s", e, exc_info=True)
+            return False
 
     def recover_from_checkpoint(self) -> int:
         """
@@ -2802,6 +3094,9 @@ def format_process_notification(evt: dict) -> "str | None":
         return None
 
     if evt_type == "watch_disabled":
+        return f"[IMPORTANT: {evt.get('message', '')}]"
+
+    if evt_type == "termination_failed":
         return f"[IMPORTANT: {evt.get('message', '')}]"
 
     if evt_type == "watch_match":

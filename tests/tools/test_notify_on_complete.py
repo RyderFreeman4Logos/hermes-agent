@@ -147,8 +147,8 @@ class TestCheckpointNotify:
             assert data[0]["notify_on_complete"] is True
 
 
-    def test_recover_defaults_false(self, registry, tmp_path):
-        """Old checkpoint entries without the field default to False."""
+    def test_recover_without_process_identity_is_refused(self, registry, tmp_path):
+        """Old checkpoint entries cannot safely prove PID ownership."""
         checkpoint = tmp_path / "procs.json"
         checkpoint.write_text(json.dumps([{
             "session_id": "proc_live",
@@ -158,9 +158,8 @@ class TestCheckpointNotify:
         }]))
         with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
             recovered = registry.recover_from_checkpoint()
-            assert recovered == 1
-            s = registry.get("proc_live")
-            assert s.notify_on_complete is False
+            assert recovered == 0
+            assert registry.get("proc_live") is None
 
 
 # =========================================================================

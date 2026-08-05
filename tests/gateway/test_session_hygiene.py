@@ -215,6 +215,146 @@ class TestTokenEstimation:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("history", "expect_hygiene"),
+    [
+        pytest.param(
+            [
+                {"role": "user", "content": "Earlier request"},
+                {
+                    "role": "assistant",
+                    "content": "Visible answer",
+                    "reasoning_content": "r" * 40_000,
+                    "codex_reasoning_items": [
+                        {
+                            "type": "reasoning",
+                            "encrypted_content": "e" * 1_000_000,
+                        }
+                    ],
+                },
+                {"role": "user", "content": "Follow-up"},
+                {"role": "assistant", "content": "Visible reply"},
+            ],
+            False,
+            id="private-replay-state-fits-wire",
+        ),
+        pytest.param(
+            [
+                {"role": "user", "content": "x" * 1_000_000},
+                {"role": "assistant", "content": "Earlier answer"},
+                {"role": "user", "content": "Follow-up"},
+                {"role": "assistant", "content": "Visible reply"},
+            ],
+            True,
+            id="visible-wire-content-is-oversize",
+        ),
+    ],
+)
+async def test_responses_session_hygiene_uses_projected_wire_history(
+    monkeypatch, tmp_path, history, expect_hygiene
+):
+    """Responses hygiene must ignore private replay weight, not visible input."""
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    class FakeCompressAgent:
+        instances = 0
+
+        def __init__(self, **kwargs):
+            type(self).instances += 1
+            self.session_id = kwargs.get("session_id", "fake-session")
+            self._last_compaction_in_place = False
+            self.context_compressor = SimpleNamespace()
+            self.shutdown_memory_provider = MagicMock()
+            self.close = MagicMock()
+
+        def _compress_context(self, messages, *_args, **_kwargs):
+            self.session_id = f"{self.session_id}_compressed"
+            return ([{"role": "assistant", "content": "compressed"}], None)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = FakeCompressAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    gateway_run = importlib.import_module("gateway.run")
+    runner = object.__new__(gateway_run.GatewayRunner)
+    adapter = HygieneCaptureAdapter()
+    runner.config = GatewayConfig(
+        platforms={
+            Platform.TELEGRAM: PlatformConfig(enabled=True, token="fake-token")
+        }
+    )
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._voice_mode = {}
+    runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
+    runner.session_store = MagicMock()
+    runner.session_store.get_or_create_session.return_value = SessionEntry(
+        session_key="agent:main:telegram:private:12345",
+        session_id="sess-responses-hygiene",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="private",
+        last_prompt_tokens=0,
+    )
+    runner.session_store.load_transcript.return_value = history
+    runner.session_store.has_any_sessions.return_value = True
+    runner.session_store.rewrite_transcript = MagicMock()
+    runner.session_store.append_to_transcript = MagicMock()
+    runner._running_agents = {}
+    runner._pending_messages = {}
+    runner._pending_approvals = {}
+    runner._session_db = None
+    runner._is_user_authorized = lambda _source: True
+    runner._set_session_env = lambda _context: None
+    runner._resolve_session_agent_runtime = lambda **_kwargs: (
+        "gpt-5-codex",
+        {
+            "api_key": "fake",
+            "api_mode": "codex_responses",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "provider": "openai-codex",
+        },
+    )
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "ok",
+            "messages": [],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+        }
+    )
+
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+
+    async def _context_length(*_args, **_kwargs):
+        return 282_353  # int(282_353 * 0.85) == 240_000
+
+    monkeypatch.setattr(
+        "agent.model_metadata.get_model_context_length_async",
+        _context_length,
+    )
+
+    event = MessageEvent(
+        text="Continue",
+        source=SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="12345",
+            chat_type="private",
+            user_id="12345",
+        ),
+        message_id="1",
+    )
+
+    result = await runner._handle_message(event)
+
+    assert result == "ok"
+    assert FakeCompressAgent.instances == int(expect_hygiene)
+
+
+@pytest.mark.asyncio
 async def test_session_hygiene_preserves_transcript_when_no_rotation(monkeypatch, tmp_path):
     """Regression for #21301: the hygiene agent is built without a session_db,
     so _compress_context cannot rotate. When it neither rotates NOR compacts

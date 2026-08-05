@@ -231,10 +231,110 @@ class TestMaybeAutoTitle:
                 "hello",
                 "hi there",
                 failure_callback=None,
-                main_runtime=None,
+                main_runtime={"cache_scope": "sess-1"},
                 title_callback=None,
                 runtime_validator=None,
             )
+
+    def test_bare_threads_bind_logical_cache_scope_without_leaking(self, tmp_path):
+        import threading
+
+        from agent.auxiliary_client import _runtime_main_value, scoped_runtime_main
+
+        db = SessionDB(tmp_path / "state.db")
+        for session_id in (
+            "session-a",
+            "session-b",
+            "root",
+            "cron_nightly_20260804_151339",
+        ):
+            db.create_session(session_id=session_id, source="cli")
+        db.end_session("root", "compression")
+        db.create_session(
+            session_id="continuation",
+            source="cli",
+            parent_session_id="root",
+        )
+        db.end_session("cron_nightly_20260804_151339", "compression")
+        db.create_session(
+            session_id="cron-continuation",
+            source="cron",
+            parent_session_id="cron_nightly_20260804_151339",
+        )
+
+        observed = {}
+        worker_scope_after_return = {}
+        threads = []
+        real_thread = threading.Thread
+        real_auto_title_session = auto_title_session
+
+        def capture_thread(*args, **kwargs):
+            thread = real_thread(*args, **kwargs)
+            threads.append(thread)
+            return thread
+
+        def capture_scope(user_message, *_args, **_kwargs):
+            observed[user_message] = _runtime_main_value("cache_scope")
+            return None
+
+        def run_worker(*args, **kwargs):
+            real_auto_title_session(*args, **kwargs)
+            worker_scope_after_return[args[2]] = _runtime_main_value("cache_scope")
+
+        history = [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+        ]
+        runtime = {
+            "provider": "openai-codex",
+            "model": "gpt-5.4",
+            "api_mode": "codex_responses",
+        }
+        with (
+            patch("agent.title_generator._auto_title_enabled", return_value=True),
+            patch("agent.title_generator.threading.Thread", side_effect=capture_thread),
+            patch("agent.title_generator.auto_title_session", side_effect=run_worker),
+            patch("agent.title_generator.generate_title", side_effect=capture_scope),
+            scoped_runtime_main({"cache_scope": "caller"}),
+        ):
+            for session_id in (
+                "session-a",
+                "session-b",
+                "root",
+                "continuation",
+                "cron_nightly_20260804_151339",
+                "cron-continuation",
+            ):
+                maybe_auto_title(
+                    db,
+                    session_id,
+                    session_id,
+                    "response",
+                    history,
+                    main_runtime=runtime,
+                )
+            for thread in threads:
+                thread.join(timeout=10)
+                assert not thread.is_alive()
+            assert _runtime_main_value("cache_scope") == "caller"
+
+        assert observed == {
+            "session-a": "session-a",
+            "session-b": "session-b",
+            "root": "root",
+            "continuation": "root",
+            "cron_nightly_20260804_151339": "cron:nightly",
+            "cron-continuation": "cron:nightly",
+        }
+        assert worker_scope_after_return == {
+            "session-a": "",
+            "session-b": "",
+            "root": "",
+            "continuation": "",
+            "cron_nightly_20260804_151339": "",
+            "cron-continuation": "",
+        }
+        assert _runtime_main_value("cache_scope") == ""
 
 
 

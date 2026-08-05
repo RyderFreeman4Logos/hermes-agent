@@ -15958,8 +15958,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
 
                     from agent.auxiliary_client import scoped_runtime_main
+                    from hermes_state import resolve_prompt_cache_scope
 
-                    with scoped_runtime_main(vision_runtime):
+                    try:
+                        peek_session_id = getattr(
+                            self.session_store, "peek_session_id", None
+                        )
+                        if callable(peek_session_id):
+                            scope_session_id = peek_session_id(session_key)
+                        else:
+                            entry = self.session_store._entries.get(session_key)
+                            scope_session_id = getattr(entry, "session_id", None)
+                    except Exception:
+                        scope_session_id = None
+                    scoped_vision_runtime = dict(vision_runtime or {})
+                    scoped_vision_runtime["cache_scope"] = resolve_prompt_cache_scope(
+                        scope_session_id or session_key or "",
+                        getattr(
+                            getattr(self, "_session_db", None),
+                            "_db",
+                            getattr(self, "_session_db", None),
+                        ),
+                    )
+
+                    with scoped_runtime_main(scoped_vision_runtime):
                         message_text = await self._enrich_message_with_vision(
                             message_text,
                             image_paths,

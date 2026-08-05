@@ -74,6 +74,61 @@ class TestCodexBuildKwargs:
         )
         assert kw1["prompt_cache_key"] == kw2["prompt_cache_key"]
 
+    def test_cache_key_isolated_by_logical_scope(self, transport):
+        from agent.auxiliary_client import scoped_runtime_main
+
+        messages = [{"role": "user", "content": "Hi"}]
+        with scoped_runtime_main({"cache_scope": "conversation-a"}):
+            first = transport.build_kwargs(
+                model="gpt-5.4", messages=messages, tools=[], session_id="segment-a",
+            )
+            continuation = transport.build_kwargs(
+                model="gpt-5.4", messages=messages, tools=[], session_id="segment-a2",
+            )
+        with scoped_runtime_main({"cache_scope": "conversation-b"}):
+            other = transport.build_kwargs(
+                model="gpt-5.4", messages=messages, tools=[], session_id="segment-b",
+            )
+
+        assert first["prompt_cache_key"] == continuation["prompt_cache_key"]
+        assert first["prompt_cache_key"] != other["prompt_cache_key"]
+
+    def test_same_scope_still_hashes_child_prompt_and_tools(self, transport):
+        from agent.auxiliary_client import scoped_runtime_main
+
+        messages_a = [
+            {"role": "system", "content": "child goal A"},
+            {"role": "user", "content": "work"},
+        ]
+        messages_b = [
+            {"role": "system", "content": "child goal B"},
+            {"role": "user", "content": "work"},
+        ]
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "terminal",
+                "description": "Run a command",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+        with scoped_runtime_main({"cache_scope": "parent"}):
+            goal_a = transport.build_kwargs(
+                model="gpt-5.4", messages=messages_a, tools=[], session_id="child-a"
+            )
+            goal_b = transport.build_kwargs(
+                model="gpt-5.4", messages=messages_b, tools=[], session_id="child-b"
+            )
+            with_tool = transport.build_kwargs(
+                model="gpt-5.4",
+                messages=messages_a,
+                tools=[tool],
+                session_id="child-c",
+            )
+
+        assert goal_a["prompt_cache_key"] != goal_b["prompt_cache_key"]
+        assert goal_a["prompt_cache_key"] != with_tool["prompt_cache_key"]
+
 
     def test_github_responses_drops_message_item_id_end_to_end(self, transport):
         # #32716: Copilot binds codex_message_items ids to a backend

@@ -225,20 +225,74 @@ class TestCompletionConsumed:
         assert registry.is_completion_consumed("proc_wait")
 
 
-    def test_poll_observed_does_not_suppress_gateway_watcher(self, registry):
-        """The gateway/tui watcher gate (is_completion_consumed) must stay False
-        after a read-only poll, so the autonomous delivery turn still fires
-        even though the CLI drain was deduped (#10156)."""
-        s = _make_session(sid="proc_gw", notify_on_complete=True, output="done")
+    @pytest.mark.parametrize("action", ["poll", "log", "wait"])
+    def test_owner_observed_success_survives_prune_and_skips_delivery(
+        self, registry, action, monkeypatch
+    ):
+        from tools.process_registry import FINISHED_TTL_SECONDS
+
+        monkeypatch.setattr(
+            "tools.approval.get_current_session_key",
+            lambda default="": "owner-a",
+        )
+
+        s = _make_session(
+            sid=f"proc_{action}", notify_on_complete=True, output="done"
+        )
+        s.session_key = "owner-a"
+        s.started_at = time.time() - FINISHED_TTL_SECONDS - 100
         s.exited = True
         s.exit_code = 0
-        registry._finished[s.id] = s
+        registry._running[s.id] = s
+        with patch.object(registry, "_write_checkpoint"):
+            registry._move_to_finished(s)
 
-        registry.poll("proc_gw")
-        # CLI-side dedup signal present...
-        assert "proc_gw" in registry._poll_observed
-        # ...but the gateway watcher gate is untouched, so it still delivers.
-        assert not registry.is_completion_consumed("proc_gw")
+        if action == "poll":
+            registry.poll(s.id)
+        elif action == "log":
+            registry.read_log(s.id)
+        else:
+            registry.wait(s.id, timeout=1)
+        with registry._lock:
+            registry._prune_if_needed()
+
+        assert s.id not in registry._finished
+        assert registry.drain_notifications(
+            session_key="owner-a", skip_poll_observed=False
+        ) == []
+
+    @pytest.mark.parametrize("action", ["poll", "log", "wait"])
+    def test_foreign_observation_does_not_suppress_owner_first_delivery(
+        self, registry, action, monkeypatch
+    ):
+        s = _make_session(
+            sid=f"proc_foreign_{action}", notify_on_complete=True, output="done"
+        )
+        s.session_key = "owner-a"
+        s.exited = True
+        s.exit_code = 0
+        registry._running[s.id] = s
+        with patch.object(registry, "_write_checkpoint"):
+            registry._move_to_finished(s)
+
+        monkeypatch.setattr(
+            "tools.approval.get_current_session_key",
+            lambda default="": "owner-b",
+        )
+        if action == "poll":
+            result = registry.poll(s.id)
+        elif action == "log":
+            result = registry.read_log(s.id)
+        else:
+            result = registry.wait(s.id, timeout=1)
+
+        assert result["status"] == "exited"
+        assert "done" in result.get("output", result.get("output_preview", ""))
+        assert s.id not in registry._poll_observed
+        assert not registry.is_completion_consumed(s.id)
+        event = registry.completion_queue.get_nowait()
+        assert registry.completion_event_should_deliver(event)
+        assert registry.claim_completion_delivery(event)
 
     def test_running_poll_does_not_mark_poll_observed(self, registry):
         """poll() on a still-running process must not record _poll_observed."""
@@ -248,9 +302,72 @@ class TestCompletionConsumed:
         registry.poll("proc_run2")
         assert "proc_run2" not in registry._poll_observed
 
+    @pytest.mark.parametrize(
+        ("exit_code", "reason", "extra"),
+        [
+            (1, "exited", {}),
+            (-15, "killed", {}),
+            (None, "timeout", {"timed_out": True}),
+            (0, "exited", {"cancelled": True}),
+            (0, "exited", {"warning": "check output"}),
+            (0, "exited", {"safety_alert": "review required"}),
+        ],
+    )
+    def test_observed_non_noop_completion_fails_open(
+        self, registry, exit_code, reason, extra, monkeypatch
+    ):
+        s = _make_session(sid="proc_fail_open", notify_on_complete=True)
+        s.session_key = "owner-a"
+        monkeypatch.setattr(
+            "tools.approval.get_current_session_key",
+            lambda default="": "owner-a",
+        )
+        registry._record_completion_observed(s)
+        event = {
+            "type": "completion",
+            "session_id": s.id,
+            "session_key": s.session_key,
+            "started_at": s.started_at,
+            "command": s.command,
+            "exit_code": exit_code,
+            "completion_reason": reason,
+            "termination_source": "",
+            "output": "result",
+            **extra,
+        }
+
+        assert registry.claim_completion_delivery(event)
+        registry.complete_completion_delivery(event)
+        assert not registry.completion_event_should_deliver(event)
+
+    def test_completion_claim_is_once_per_known_lifecycle_and_unknown_fails_open(
+        self, registry
+    ):
+        event = {
+            "type": "completion",
+            "session_id": "proc_reused",
+            "session_key": "owner-a",
+            "started_at": 1.0,
+            "command": "echo done",
+            "exit_code": 0,
+            "completion_reason": "exited",
+            "output": "done",
+        }
+
+        assert registry.claim_completion_delivery(event)
+        assert not registry.claim_completion_delivery(event)
+        registry.release_completion_delivery(event)
+        assert registry.claim_completion_delivery(event)
+        registry.complete_completion_delivery(event)
+        assert not registry.claim_completion_delivery(event)
+        assert registry.claim_completion_delivery({**event, "started_at": 2.0})
+        assert registry.claim_completion_delivery({**event, "session_key": "owner-b"})
+        unknown = {key: value for key, value in event.items() if key != "started_at"}
+        assert registry.claim_completion_delivery(unknown)
+        assert registry.claim_completion_delivery(unknown)
+
     def test_wait_and_log_still_skip_cli_drain(self, registry):
-        """wait()/read_log() consume the output, so the CLI drain skips their
-        completions via _completion_consumed (the original #8228 contract)."""
+        """wait()/read_log() record stable owner dispositions for CLI drain."""
         for sid, action in (("proc_w", "wait"), ("proc_l", "log")):
             s = _make_session(sid=sid, notify_on_complete=True, output="done")
             s.exited = True

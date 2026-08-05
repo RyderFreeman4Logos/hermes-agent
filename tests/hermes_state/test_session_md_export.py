@@ -40,10 +40,13 @@ def test_get_compression_lineage_returns_only_compression_chain(tmp_path):
         db.end_session("child", "compression")
         db.create_session("tip", source="cli", parent_session_id="child")
         db.create_session("branch", source="cli", parent_session_id="root", model_config={"_branched_from": "root"})
+        db.create_session("delegate", source="delegate", parent_session_id="child", model_config={"_delegate_from": "child"})
+        db.create_session("tool", source="tool", parent_session_id="child")
 
         assert db.get_compression_lineage("tip") == ["root", "child", "tip"]
         assert db.get_compression_lineage("branch") == ["branch"]
+        assert db.get_compression_lineage("delegate") == ["delegate"]
+        assert db.get_compression_lineage("tool") == ["tool"]
     finally:
         db.close()
-
 

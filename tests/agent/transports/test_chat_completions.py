@@ -731,3 +731,19 @@ class TestPromptCacheKeyCapability:
         assert first == second
         assert first != key("cron_job_2026-07-15T10:05:00Z", instructions="You are different.")
         assert first != key("cron_job_2026-07-15T10:05:00Z", tool_name="search")
+
+    def test_cache_key_isolated_by_logical_scope(self, transport):
+        from agent.auxiliary_client import scoped_runtime_main
+
+        def key(scope):
+            with scoped_runtime_main({"cache_scope": scope}):
+                return transport.build_kwargs(
+                    model="cache-model",
+                    messages=self._messages(),
+                    tools=self._tools(),
+                    session_id=f"segment-{scope}",
+                    supports_prompt_cache_key=True,
+                )["prompt_cache_key"]
+
+        assert key("conversation-a") == key("conversation-a")
+        assert key("conversation-a") != key("conversation-b")

@@ -8,7 +8,7 @@ import logging
 import threading
 from typing import Callable, Optional
 
-from agent.auxiliary_client import call_llm
+from agent.auxiliary_client import call_llm, scoped_runtime_main
 
 logger = logging.getLogger(__name__)
 
@@ -329,13 +329,14 @@ def _auto_title_session(
     # recorded against this session (task='title_generation', #23270).
     set_accounting_context(session_db, session_id)
 
-    title = generate_title(
-        user_message,
-        assistant_response,
-        failure_callback=failure_callback,
-        main_runtime=main_runtime,
-        runtime_validator=runtime_validator,
-    )
+    with scoped_runtime_main(main_runtime):
+        title = generate_title(
+            user_message,
+            assistant_response,
+            failure_callback=failure_callback,
+            main_runtime=main_runtime,
+            runtime_validator=runtime_validator,
+        )
     if not title:
         return
 
@@ -387,12 +388,18 @@ def maybe_auto_title(
         logger.debug("Auto-title skipped: auxiliary.title_generation.enabled=false")
         return
 
+    from hermes_state import resolve_prompt_cache_scope
+
+    cache_scope = resolve_prompt_cache_scope(session_id, session_db)
+    title_runtime = dict(main_runtime) if isinstance(main_runtime, dict) else {}
+    title_runtime["cache_scope"] = cache_scope
+
     thread = threading.Thread(
         target=auto_title_session,
         args=(session_db, session_id, user_message, assistant_response),
         kwargs={
             "failure_callback": failure_callback,
-            "main_runtime": main_runtime,
+            "main_runtime": title_runtime,
             "title_callback": title_callback,
             "runtime_validator": runtime_validator,
         },

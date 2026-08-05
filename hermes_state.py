@@ -76,6 +76,64 @@ from hermes_state_portability import SessionPortabilityMixin
 from hermes_state_schema import SessionSchemaMixin
 from hermes_state_search import SessionSearchMixin
 
+
+_CRON_CACHE_SCOPE_RE = re.compile(r"cron_(.+)_\d{8}_\d{6}")
+
+
+def resolve_prompt_cache_scope(
+    session_id: str,
+    session_db=None,
+    *,
+    parent_session_id: str = None,
+) -> str:
+    """Return the stable prompt-cache namespace for a logical agent tree."""
+    session_id = str(session_id or "")
+    if not session_id:
+        return ""
+
+    current = session_id
+    if session_db is not None:
+        try:
+            if session_db.get_session(current) is None and parent_session_id:
+                current = str(parent_session_id)
+            seen = set()
+            for _ in range(100):
+                if not current or current in seen:
+                    break
+                seen.add(current)
+                lineage = session_db.get_compression_lineage(current)
+                if not isinstance(lineage, (list, tuple)):
+                    raise TypeError("compression lineage must be a sequence")
+                scope = lineage[0] if lineage else current
+                row = session_db.get_session(scope)
+                if row is None:
+                    current = scope
+                    break
+                if not isinstance(row, dict):
+                    raise TypeError("session row must be a mapping")
+                raw = row.get("model_config")
+                try:
+                    config = json.loads(raw) if isinstance(raw, str) else raw
+                except (TypeError, json.JSONDecodeError):
+                    config = None
+                delegate_from = (
+                    config.get("_delegate_from")
+                    if isinstance(config, dict)
+                    else None
+                )
+                if delegate_from is None:
+                    current = scope
+                    break
+                current = str(row.get("parent_session_id") or delegate_from)
+        except Exception:
+            current = str(parent_session_id or session_id)
+    elif parent_session_id:
+        current = str(parent_session_id)
+
+    match = _CRON_CACHE_SCOPE_RE.fullmatch(current)
+    return f"cron:{match.group(1)}" if match else current
+
+
 try:  # Hard dependency, but tolerate scaffold-phase imports before pip install.
     import psutil
 except ImportError:  # pragma: no cover - stripped/scaffold installs only
@@ -8013,7 +8071,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     # Export and cleanup
     # =========================================================================
 
-    def _is_branch_child_row(self, session: Dict[str, Any]) -> bool:
+    def _is_explicit_fork_child_row(self, session: Dict[str, Any]) -> bool:
+        if session.get("source") == "tool":
+            return True
         raw = session.get("model_config")
         if not raw:
             return False
@@ -8021,11 +8081,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             cfg = json.loads(raw) if isinstance(raw, str) else raw
         except (TypeError, json.JSONDecodeError):
             return False
-        return isinstance(cfg, dict) and cfg.get("_branched_from") is not None
+        return isinstance(cfg, dict) and (
+            cfg.get("_branched_from") is not None
+            or cfg.get("_delegate_from") is not None
+        )
 
     def _is_compression_child_row(self, child: Dict[str, Any]) -> bool:
         parent_id = child.get("parent_session_id")
-        if not parent_id or self._is_branch_child_row(child):
+        if not parent_id or self._is_explicit_fork_child_row(child):
             return False
         parent = self.get_session(parent_id)
         return bool(parent and parent.get("end_reason") == "compression")
@@ -8033,7 +8096,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     def get_compression_lineage(self, session_id: str) -> List[str]:
         """Return compression ancestors through tip in chronological order."""
         session = self.get_session(session_id)
-        if not session or self._is_branch_child_row(session):
+        if not session or self._is_explicit_fork_child_row(session):
             return [session_id] if session else []
 
         root = session
@@ -8061,7 +8124,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             next_child = None
             for row in rows:
                 candidate = dict(row)
-                if not self._is_branch_child_row(candidate):
+                if self._is_compression_child_row(candidate):
                     next_child = candidate
                     break
             if not next_child or next_child["id"] in seen:

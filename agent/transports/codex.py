@@ -72,19 +72,20 @@ def _default_prompt_cache_retention_for_request(
 
 
 def _content_cache_key(instructions: str, tools: Optional[List[Dict[str, Any]]]) -> Optional[str]:
-    """Content-address the prompt cache key from the static request prefix.
+    """Content-address the prompt cache key within the logical session scope.
 
-    Returns ``pck_<sha256[:24]>`` of (instructions + sorted tool schemas), or
-    None when there is nothing static to key on. The cache key is a routing
-    hint only — never a correctness boundary — so two requests sharing a system
-    prompt and tool set intentionally resolve to the same warm prefix bucket.
+    Returns ``pck_<sha256[:24]>`` of (logical scope + instructions + sorted
+    tool schemas), or None when there is nothing static to key on. The cache
+    key is a routing hint only — never a correctness boundary. Calls outside
+    an agent runtime retain the legacy content-only key.
 
     The fix this exists for: recurring cron jobs build session_id as
     ``cron_<id>_<timestamp>``, so using session_id as the cache key made every
-    fire cache-cold. The static prefix (identity + tools) is identical across
-    fires, so hashing it gives a stable key that stays warm within the
-    provider's cache TTL. Sorting tools by name keeps the hash insertion-order
-    independent.
+    fire cache-cold. Agent runtime maps those ids to one stable per-job scope,
+    while ordinary conversations and branches remain isolated. A delegation
+    tree shares its parent's logical scope; the full instructions/tools hash
+    still separates child prompts whose static content differs. Sorting tools
+    by name keeps the hash insertion-order independent.
     """
     if not instructions and not tools:
         return None
@@ -99,7 +100,15 @@ def _content_cache_key(instructions: str, tools: Optional[List[Dict[str, Any]]])
         )
     # \x00 separator so instructions ending in the tool JSON can't collide with
     # a request whose instructions contain that JSON and whose tools are empty.
+    try:
+        from agent.auxiliary_client import _runtime_main_value
+
+        cache_scope = str(_runtime_main_value("cache_scope") or "")
+    except Exception:
+        cache_scope = ""
     content = f"{instructions or ''}\x00{tools_part}"
+    if cache_scope:
+        content = f"{cache_scope}\x00{content}"
     digest = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()[:24]
     return f"pck_{digest}"
 

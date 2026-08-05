@@ -35,6 +35,7 @@ from agent.context_engine import ContextEngine, sanitize_memory_context
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
+    estimate_request_tokens_rough,
     get_model_context_length,
     estimate_messages_tokens_rough,
     estimate_tokens_rough,
@@ -1363,6 +1364,7 @@ class ContextCompressor(ContextEngine):
         self._active_compression_telemetry = None
         self._compression_telemetry_seed = None
         self._proactive_prune_rearm_tokens = 0
+        self._proactive_prune_runway_authoritative = True
 
         # Micro-compaction state reset
         self._micro_compact_cursor = 0
@@ -1634,6 +1636,7 @@ class ContextCompressor(ContextEngine):
         self._active_compression_telemetry = None
         self._compression_telemetry_seed = None
         self._proactive_prune_rearm_tokens = 0
+        self._proactive_prune_runway_authoritative = True
 
     def bind_session_state(self, session_db: Any = None, session_id: str = "") -> None:
         """Bind the current session row so durable cooldowns can round-trip."""
@@ -1648,6 +1651,7 @@ class ContextCompressor(ContextEngine):
         self._prellm_skip_count = 0
         self._anti_thrash_recovery_deadline = 0.0
         self._proactive_prune_rearm_tokens = 0
+        self._proactive_prune_runway_authoritative = not bool(session_db and session_id)
         self.get_active_compression_failure_cooldown()
         self._load_fallback_compression_streak()
         self._load_ineffective_compression_count()
@@ -1734,19 +1738,24 @@ class ContextCompressor(ContextEngine):
         if not session_id or not callable(getter):
             return
         try:
-            session = getter(session_id) or {}
+            session = getter(session_id)
+            if not isinstance(session, dict):
+                raise TypeError("session row is unavailable")
             raw = session.get("model_config")
             if isinstance(raw, str):
                 raw = json.loads(raw) if raw.strip() else {}
-            value = (
-                raw.get(PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY, 0)
-                if isinstance(raw, dict)
-                else 0
-            )
+            elif raw is None:
+                raw = {}
+            if not isinstance(raw, dict):
+                raise TypeError("session model_config is not an object")
+            value = raw.get(PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY, 0)
+            if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+                raise TypeError("proactive prune runway is not numeric")
             self._proactive_prune_rearm_tokens = max(
                 0,
-                int(value) if isinstance(value, (int, float, str)) else 0,
+                int(value),
             )
+            self._proactive_prune_runway_authoritative = True
         except (TypeError, ValueError, json.JSONDecodeError, sqlite3.Error) as exc:
             logger.debug("proactive prune runway lookup failed: %s", exc)
         except Exception as exc:
@@ -2313,6 +2322,7 @@ class ContextCompressor(ContextEngine):
         # A committed prune is a prompt-cache boundary. Do not permit the next
         # one until the prompt has regrown the tokens just reclaimed.
         self._proactive_prune_rearm_tokens: int = 0
+        self._proactive_prune_runway_authoritative = True
         self.min_tail_user_messages = min_tail_user_messages
         self.summary_target_ratio = max(0.10, min(summary_target_ratio, 0.80))
         self.quiet_mode = quiet_mode
@@ -3095,65 +3105,100 @@ class ContextCompressor(ContextEngine):
             return messages, 0
         if current_tokens is not None and current_tokens < self.proactive_prune_tokens:
             return messages, 0
+        if not self._proactive_prune_runway_authoritative:
+            return messages, 0
         # Nothing to reclaim until there are messages outside the protected tail.
         if len(messages) <= self.protect_last_n + self._protect_head_size(messages) + 1:
             return messages, 0
-        before = sum(_estimate_msg_budget_tokens(m) for m in messages)
+        # Match the active request route: private Responses replay fields are not
+        # cache-facing growth and therefore cannot rearm another boundary.
+        before = estimate_request_tokens_rough(messages, api_mode=self.api_mode)
         if before < self._proactive_prune_rearm_tokens:
             return messages, 0
-        pruned_msgs, pruned_count = self._prune_old_tool_results(
-            messages,
-            protect_tail_count=self.protect_last_n,
-            protect_tail_tokens=None,
-            min_prune_chars=self.proactive_prune_min_result_chars,
-        )
-        if not pruned_count:
-            # Standard no-op contract: hand back the INPUT object so callers
-            # can gate bookkeeping on `result is not input`.
-            return messages, 0
-        # Measured-savings gate (prompt-cache hysteresis): only commit when
-        # the prune reclaims a meaningful batch of tokens. Estimated on the
-        # real before/after messages so dedup + arg truncation count too.
-        after = sum(_estimate_msg_budget_tokens(m) for m in pruned_msgs)
-        reclaimed = max(0, before - after)
-        if reclaimed < self.proactive_prune_min_reclaim_tokens:
-            return messages, 0
-        # ``after`` includes the tool batch appended since the provider's last
-        # usage reading, so both the low-water mark and future gate use the
-        # same message-token estimate. Require a full trigger-sized growth
-        # interval before another cache-breaking rewrite.
-        runway = max(
-            reclaimed,
-            self.proactive_prune_tokens,
-            self.proactive_prune_min_reclaim_tokens,
-        )
-        next_rearm_tokens = after + runway
+
         session_db = getattr(self, "_session_db", None)
         session_id = getattr(self, "_session_id", "")
-        if session_db and session_id:
-            archive_and_compact = getattr(session_db, "archive_and_compact", None)
-            if not callable(archive_and_compact):
-                return messages, 0
-            try:
-                archive_and_compact(
-                    session_id,
-                    pruned_msgs,
-                    model_config_patch={
-                        PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: next_rearm_tokens,
-                    },
+        archive_and_compact = None
+        lock_holder = None
+        release_lock = None
+        try:
+            if session_db and session_id:
+                archive_and_compact = getattr(session_db, "archive_and_compact", None)
+                acquire_lock = getattr(
+                    session_db, "try_acquire_compression_lock", None,
                 )
-            except Exception as exc:
-                logger.warning(
-                    "Proactive tool-result prune DB commit failed; keeping the "
-                    "original transcript: %s",
-                    exc,
-                )
+                release_lock = getattr(session_db, "release_compression_lock", None)
+                if (
+                    not callable(archive_and_compact)
+                    or not callable(acquire_lock)
+                    or not callable(release_lock)
+                ):
+                    return messages, 0
+                from agent.conversation_compression import _compression_lock_holder
+
+                lock_holder = _compression_lock_holder(self)
+                try:
+                    if not acquire_lock(session_id, lock_holder):
+                        return messages, 0
+                except Exception as exc:
+                    logger.warning(
+                        "Proactive tool-result prune lease acquisition failed; "
+                        "keeping the original transcript: %s",
+                        exc,
+                    )
+                    return messages, 0
+
+            pruned_msgs, pruned_count = self._prune_old_tool_results(
+                messages,
+                protect_tail_count=self.protect_last_n,
+                protect_tail_tokens=None,
+                min_prune_chars=self.proactive_prune_min_result_chars,
+            )
+            if not pruned_count:
+                # Standard no-op contract: hand back the INPUT object so callers
+                # can gate bookkeeping on `result is not input`.
                 return messages, 0
-            for msg in pruned_msgs:
-                if isinstance(msg, dict):
-                    msg[_DB_PERSISTED_MARKER] = True
-        self._proactive_prune_rearm_tokens = next_rearm_tokens
-        return pruned_msgs, pruned_count
+            after = estimate_request_tokens_rough(
+                pruned_msgs, api_mode=self.api_mode,
+            )
+            reclaimed = max(0, before - after)
+            if reclaimed < self.proactive_prune_min_reclaim_tokens:
+                return messages, 0
+            runway = max(
+                reclaimed,
+                self.proactive_prune_tokens,
+                self.proactive_prune_min_reclaim_tokens,
+            )
+            next_rearm_tokens = after + runway
+            if session_db and session_id:
+                try:
+                    archive_and_compact(
+                        session_id,
+                        pruned_msgs,
+                        model_config_patch={
+                            PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: next_rearm_tokens,
+                        },
+                        compression_lock_holder=lock_holder,
+                        require_compression_lease=True,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Proactive tool-result prune DB commit failed; keeping the "
+                        "original transcript: %s",
+                        exc,
+                    )
+                    return messages, 0
+                for msg in pruned_msgs:
+                    if isinstance(msg, dict):
+                        msg[_DB_PERSISTED_MARKER] = True
+            self._proactive_prune_rearm_tokens = next_rearm_tokens
+            return pruned_msgs, pruned_count
+        finally:
+            if lock_holder and callable(release_lock):
+                try:
+                    release_lock(session_id, lock_holder)
+                except Exception as exc:
+                    logger.debug("proactive prune lease release failed: %s", exc)
 
     # ------------------------------------------------------------------
     # Summarization
@@ -6834,6 +6879,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         self._micro_compact_consecutive_failures = 0
         self._micro_compact_last_failure_cursor = -1
         self._proactive_prune_rearm_tokens = 0
+        self._proactive_prune_runway_authoritative = True
 
         return compressed
 

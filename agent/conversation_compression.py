@@ -281,6 +281,7 @@ _COMPRESSOR_ATTEMPT_STATE_FIELDS = (
     "_active_compression_telemetry",
     "_compression_telemetry_seed",
     "_proactive_prune_rearm_tokens",
+    "_proactive_prune_runway_authoritative",
 )
 
 _COMPRESSOR_COOLDOWN_STATE_FIELDS = (
@@ -3276,6 +3277,8 @@ def compress_context(
                         model_config_patch={
                             PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None,
                         },
+                        compression_lock_holder=_lock_holder,
+                        require_compression_lease=_lock_holder is not None,
                     )
                     split_status = "in_place_committed"
                     # Reset the flush identity set so the next turn's appends are
@@ -3416,6 +3419,12 @@ def compress_context(
                     agent.context_compressor._proactive_prune_rearm_tokens = (
                         _compressor_attempt_snapshot[
                             "_proactive_prune_rearm_tokens"
+                        ]
+                    )
+                if "_proactive_prune_runway_authoritative" in _compressor_attempt_snapshot:
+                    agent.context_compressor._proactive_prune_runway_authoritative = (
+                        _compressor_attempt_snapshot[
+                            "_proactive_prune_runway_authoritative"
                         ]
                     )
                 split_status = (

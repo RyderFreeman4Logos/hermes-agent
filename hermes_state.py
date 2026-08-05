@@ -7089,6 +7089,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         billing_provider: Optional[str] = None,
         billing_base_url: Optional[str] = None,
         billing_mode: Optional[str] = None,
+        compression_lock_holder: Optional[str] = None,
+        require_compression_lease: bool = False,
     ) -> int:
         """Non-destructive in-place compaction for a single durable session id.
 
@@ -7120,27 +7122,46 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             self.flush_token_counts()
 
         def _do(conn):
+            session = conn.execute(
+                "SELECT ended_at, end_reason, model_config FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if session is None:
+                raise ValueError(f"Session not found: {session_id}")
+            if (
+                session["ended_at"] is not None
+                and session["end_reason"] == "compression"
+            ):
+                raise CompressionSessionClosedError(session_id)
+            if require_compression_lease:
+                lock_row = conn.execute(
+                    "SELECT holder, expires_at FROM compression_locks WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                if (
+                    lock_row is None
+                    or not compression_lock_holder
+                    or lock_row["holder"] != compression_lock_holder
+                    or float(lock_row["expires_at"]) <= time.time()
+                ):
+                    raise CompressionSessionBusyError(
+                        f"Compression lease lost before compaction: {session_id}"
+                    )
             patched_model_config_json = model_config_json
             if model_config_patch is not None:
                 raw = model_config_json
                 if raw is None:
-                    row = conn.execute(
-                        "SELECT model_config FROM sessions WHERE id = ?",
-                        (session_id,),
-                    ).fetchone()
-                    if row is None:
-                        raise ValueError(f"Session not found: {session_id}")
-                    raw = row["model_config"] if isinstance(row, sqlite3.Row) else row[0]
+                    raw = session["model_config"]
                 config: Dict[str, Any] = {}
                 if isinstance(raw, str) and raw.strip():
-                    try:
-                        parsed = json.loads(raw)
-                        if isinstance(parsed, dict):
-                            config = parsed
-                    except (json.JSONDecodeError, TypeError):
-                        config = {}
+                    parsed = json.loads(raw)
+                    if not isinstance(parsed, dict):
+                        raise ValueError("Session model_config is not a JSON object")
+                    config = parsed
                 elif isinstance(raw, dict):
                     config = dict(raw)
+                elif raw is not None:
+                    raise ValueError("Session model_config is not a JSON object")
                 for key, value in model_config_patch.items():
                     if value is None:
                         config.pop(key, None)

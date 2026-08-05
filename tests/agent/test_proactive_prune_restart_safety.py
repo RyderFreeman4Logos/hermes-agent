@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
 from agent.context_compressor import _estimate_msg_budget_tokens
-from hermes_state import SessionDB
+from hermes_state import CompressionSessionClosedError, SessionDB
 
 
 _REARM_KEY = "_proactive_prune_rearm_tokens"
@@ -85,11 +86,18 @@ def test_gateway_eviction_reload_keeps_prune_and_durable_runway(tmp_path: Path) 
     first_agent = _build_agent(db, session_id)
     _configure_pruning(first_agent)
     before = db.get_messages_as_conversation(session_id)
-    pruned, count = first_agent.context_compressor.prune_tool_results_only(
-        before, current_tokens=120_000,
-    )
+    with patch.object(
+        db, "archive_and_compact", wraps=db.archive_and_compact,
+    ) as archive:
+        pruned, count = first_agent.context_compressor.prune_tool_results_only(
+            before, current_tokens=120_000,
+        )
 
     assert count >= 1
+    archive.assert_called_once()
+    assert archive.call_args.kwargs["require_compression_lease"] is True
+    assert archive.call_args.kwargs["compression_lock_holder"]
+    assert db.get_compression_lock_holder(session_id) is None
     durable = db.get_messages_as_conversation(session_id)
     assert [message["content"] for message in durable] == [
         message["content"] for message in pruned
@@ -113,6 +121,71 @@ def test_gateway_eviction_reload_keeps_prune_and_durable_runway(tmp_path: Path) 
     assert result is reloaded
     assert second_count == 0
     assert len(db.get_messages(session_id, include_inactive=True)) == archived_before
+
+    db.archive_and_compact(
+        session_id,
+        reloaded,
+        model_config_patch={_REARM_KEY: None},
+    )
+    cleared = _build_agent(db, session_id)
+    _configure_pruning(cleared)
+    assert cleared.context_compressor._proactive_prune_rearm_tokens == 0
+    assert cleared.context_compressor._proactive_prune_runway_authoritative is True
+
+
+def test_published_child_fences_stale_proactive_prune(tmp_path: Path) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    parent_id = "PRUNE_STALE_PARENT"
+    child_id = "PRUNE_LIVE_CHILD"
+    db.create_session(
+        parent_id, source="telegram", model_config={"keep": "parent"},
+    )
+    db.append_messages_batch(parent_id, _history())
+    stale = _build_agent(db, parent_id)
+    _configure_pruning(stale)
+    stale_messages = db.get_messages_as_conversation(parent_id)
+
+    winner = "pid=1:tid=1:agent=winner:nonce=winner"
+    assert db.try_acquire_compression_lock(parent_id, winner, ttl_seconds=60)
+    db.publish_compression_child(
+        parent_session_id=parent_id,
+        child_session_id=child_id,
+        source="telegram",
+        messages=[{"role": "user", "content": "compressed handoff"}],
+        model_config={"keep": "child"},
+        compression_lock_holder=winner,
+    )
+    db.release_compression_lock(parent_id, winner)
+    parent_contents = [
+        message["content"] for message in db.get_messages_as_conversation(parent_id)
+    ]
+    parent_config = db.get_session(parent_id)["model_config"]
+    rejected: list[Exception] = []
+    real_archive = db.archive_and_compact
+
+    def _record_rejection(*args, **kwargs):
+        try:
+            return real_archive(*args, **kwargs)
+        except Exception as exc:
+            rejected.append(exc)
+            raise
+
+    with patch.object(db, "archive_and_compact", side_effect=_record_rejection):
+        result, count = stale.context_compressor.prune_tool_results_only(
+            stale_messages, current_tokens=120_000,
+        )
+
+    assert result is stale_messages
+    assert count == 0
+    assert len(rejected) == 1
+    assert isinstance(rejected[0], CompressionSessionClosedError)
+    assert db.get_session(parent_id)["model_config"] == parent_config
+    assert [
+        message["content"] for message in db.get_messages_as_conversation(parent_id)
+    ] == parent_contents
+    assert [
+        message["content"] for message in db.get_messages_as_conversation(child_id)
+    ] == ["compressed handoff"]
 
 
 def test_fresh_agent_rearms_after_durable_history_regrowth_once(tmp_path: Path) -> None:
@@ -184,6 +257,66 @@ def test_prune_persistence_failure_is_a_noop(tmp_path: Path) -> None:
     assert [message["content"] for message in messages] == original_contents
     assert [message["content"] for message in db.get_messages_as_conversation(session_id)] == original_contents
     assert _REARM_KEY not in _model_config(db, session_id)
+
+
+@pytest.mark.parametrize("failure", ["malformed", "read_error"])
+def test_unknown_durable_runway_blocks_until_authoritative_reload(
+    tmp_path: Path, failure: str,
+) -> None:
+    db = SessionDB(db_path=tmp_path / f"{failure}.db")
+    session_id = f"PRUNE_UNKNOWN_{failure.upper()}"
+    db.create_session(
+        session_id, source="telegram", model_config={"keep": "value"},
+    )
+    db.append_messages_batch(session_id, _history())
+    agent = _build_agent(db, session_id)
+    _configure_pruning(agent)
+
+    if failure == "malformed":
+        db._conn.execute(
+            "UPDATE sessions SET model_config = ? WHERE id = ?",
+            ("{malformed", session_id),
+        )
+        db._conn.commit()
+        agent.context_compressor.bind_session_state(db, session_id)
+    else:
+        with patch.object(
+            db, "get_session", side_effect=sqlite3.OperationalError("read failed"),
+        ):
+            agent.context_compressor.bind_session_state(db, session_id)
+
+    assert agent.context_compressor._proactive_prune_runway_authoritative is False
+    messages = db.get_messages_as_conversation(session_id)
+    original_contents = [message["content"] for message in messages]
+    original_config = db.get_session(session_id)["model_config"]
+    with patch.object(
+        db, "archive_and_compact", wraps=db.archive_and_compact,
+    ) as archive:
+        result, count = agent.context_compressor.prune_tool_results_only(
+            messages, current_tokens=120_000,
+        )
+
+    assert result is messages
+    assert count == 0
+    archive.assert_not_called()
+    assert db.get_session(session_id)["model_config"] == original_config
+    assert [
+        message["content"] for message in db.get_messages_as_conversation(session_id)
+    ] == original_contents
+
+    db._conn.execute(
+        "UPDATE sessions SET model_config = ? WHERE id = ?",
+        (json.dumps({"keep": "value"}), session_id),
+    )
+    db._conn.commit()
+    agent.context_compressor.bind_session_state(db, session_id)
+    assert agent.context_compressor._proactive_prune_runway_authoritative is True
+    recovered, recovered_count = agent.context_compressor.prune_tool_results_only(
+        messages, current_tokens=120_000,
+    )
+    assert recovered_count >= 1
+    assert recovered is not messages
+    assert _model_config(db, session_id)[_REARM_KEY] > 0
 
 
 def test_archive_model_config_patch_rolls_back_with_transcript(tmp_path: Path) -> None:

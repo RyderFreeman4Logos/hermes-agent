@@ -7089,6 +7089,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         billing_provider: Optional[str] = None,
         billing_base_url: Optional[str] = None,
         billing_mode: Optional[str] = None,
+        compression_lock_holder: Optional[str] = None,
+        require_compression_lease: bool = False,
+        expected_active_messages: Optional[List[Dict[str, Any]]] = None,
     ) -> int:
         """Non-destructive in-place compaction for a single durable session id.
 
@@ -7120,27 +7123,115 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             self.flush_token_counts()
 
         def _do(conn):
+            session = conn.execute(
+                "SELECT ended_at, end_reason, model_config FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if session is None:
+                raise ValueError(f"Session not found: {session_id}")
+            if (
+                session["ended_at"] is not None
+                and session["end_reason"] == "compression"
+            ):
+                raise CompressionSessionClosedError(session_id)
+            if require_compression_lease:
+                lock_row = conn.execute(
+                    "SELECT holder, expires_at FROM compression_locks WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                if (
+                    lock_row is None
+                    or not compression_lock_holder
+                    or lock_row["holder"] != compression_lock_holder
+                    or float(lock_row["expires_at"]) <= time.time()
+                ):
+                    raise CompressionSessionBusyError(
+                        f"Compression lease lost before compaction: {session_id}"
+                    )
+            if expected_active_messages is not None:
+                rows = conn.execute(
+                    f"SELECT {self._CONVERSATION_ROW_COLUMNS} "
+                    "FROM messages WHERE session_id = ? AND active = 1 ORDER BY id",
+                    (session_id,),
+                ).fetchall()
+                active_messages = self._rows_to_conversation(
+                    rows,
+                    session_id=session_id,
+                    include_ancestors=False,
+                    repair_alternation=False,
+                )
+
+                def _canonical(messages):
+                    canonical = []
+                    truthy_replay_fields = (
+                        "api_content",
+                        "display_kind",
+                        "display_metadata",
+                        "tool_call_id",
+                        "tool_name",
+                        "effect_disposition",
+                        "tool_calls",
+                    )
+                    assistant_truthy_fields = (
+                        "finish_reason",
+                        "reasoning",
+                        "reasoning_details",
+                        "codex_reasoning_items",
+                        "codex_message_items",
+                    )
+                    for message in messages:
+                        if not isinstance(message, dict):
+                            canonical.append(message)
+                            continue
+                        role = message.get("role")
+                        content = message.get("content")
+                        if role in {"user", "assistant"} and isinstance(content, str):
+                            content = sanitize_context(content).strip()
+                        projected = {"role": role, "content": content}
+                        for field in truthy_replay_fields:
+                            value = message.get(field)
+                            if value:
+                                projected[field] = value
+                        if message.get("observed"):
+                            projected["observed"] = True
+                        if role == "assistant":
+                            for field in assistant_truthy_fields:
+                                value = message.get(field)
+                                if value:
+                                    projected[field] = value
+                            # Unlike the other reasoning columns, an empty
+                            # reasoning_content string is durably replayed.
+                            reasoning_content = message.get("reasoning_content")
+                            if reasoning_content is not None:
+                                projected["reasoning_content"] = reasoning_content
+                        platform_message_id = (
+                            message.get("message_id")
+                            or message.get("platform_message_id")
+                        )
+                        if platform_message_id:
+                            projected["message_id"] = platform_message_id
+                        canonical.append(projected)
+                    return canonical
+
+                if _canonical(active_messages) != _canonical(expected_active_messages):
+                    raise CompressionSessionBusyError(
+                        f"Session transcript changed before compaction: {session_id}"
+                    )
             patched_model_config_json = model_config_json
             if model_config_patch is not None:
                 raw = model_config_json
                 if raw is None:
-                    row = conn.execute(
-                        "SELECT model_config FROM sessions WHERE id = ?",
-                        (session_id,),
-                    ).fetchone()
-                    if row is None:
-                        raise ValueError(f"Session not found: {session_id}")
-                    raw = row["model_config"] if isinstance(row, sqlite3.Row) else row[0]
+                    raw = session["model_config"]
                 config: Dict[str, Any] = {}
                 if isinstance(raw, str) and raw.strip():
-                    try:
-                        parsed = json.loads(raw)
-                        if isinstance(parsed, dict):
-                            config = parsed
-                    except (json.JSONDecodeError, TypeError):
-                        config = {}
+                    parsed = json.loads(raw)
+                    if not isinstance(parsed, dict):
+                        raise ValueError("Session model_config is not a JSON object")
+                    config = parsed
                 elif isinstance(raw, dict):
                     config = dict(raw)
+                elif raw is not None:
+                    raise ValueError("Session model_config is not a JSON object")
                 for key, value in model_config_patch.items():
                     if value is None:
                         config.pop(key, None)

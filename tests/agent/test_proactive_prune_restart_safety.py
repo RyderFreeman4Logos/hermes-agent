@@ -2,18 +2,63 @@
 
 from __future__ import annotations
 
+import ast
+import copy
 import json
 import os
+import sqlite3
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
 from agent.context_compressor import _estimate_msg_budget_tokens
-from hermes_state import SessionDB
+from hermes_state import (
+    CompressionSessionBusyError,
+    CompressionSessionClosedError,
+    SessionDB,
+)
 
 
 _REARM_KEY = "_proactive_prune_rearm_tokens"
+
+
+def test_all_runtime_archive_and_compact_calls_are_fenced() -> None:
+    """Every production whole-session rewrite carries lease and snapshot guards."""
+    repo_root = Path(__file__).resolve().parents[2]
+    excluded_dirs = {
+        ".git", ".venv", "venv", "build", "dist", "node_modules", "tests",
+    }
+    archive_calls: list[tuple[Path, ast.Call]] = []
+    for path in repo_root.rglob("*.py"):
+        if any(part in excluded_dirs for part in path.relative_to(repo_root).parts):
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            is_archive_call = (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "archive_and_compact"
+            ) or (
+                isinstance(node.func, ast.Name)
+                and node.func.id == "archive_and_compact"
+            )
+            if is_archive_call:
+                archive_calls.append((path.relative_to(repo_root), node))
+
+    assert archive_calls, "production archive_and_compact caller audit found no calls"
+    required = {
+        "compression_lock_holder",
+        "require_compression_lease",
+        "expected_active_messages",
+    }
+    for path, call in archive_calls:
+        keywords = {keyword.arg for keyword in call.keywords}
+        assert required <= keywords, (
+            f"unfenced archive_and_compact call at {path}:{call.lineno}; "
+            f"missing {sorted(required - keywords)}"
+        )
 
 
 def _assistant_call(call_id: str) -> dict:
@@ -85,11 +130,19 @@ def test_gateway_eviction_reload_keeps_prune_and_durable_runway(tmp_path: Path) 
     first_agent = _build_agent(db, session_id)
     _configure_pruning(first_agent)
     before = db.get_messages_as_conversation(session_id)
-    pruned, count = first_agent.context_compressor.prune_tool_results_only(
-        before, current_tokens=120_000,
-    )
+    with patch.object(
+        db, "archive_and_compact", wraps=db.archive_and_compact,
+    ) as archive:
+        pruned, count = first_agent.context_compressor.prune_tool_results_only(
+            before, current_tokens=120_000,
+        )
 
     assert count >= 1
+    archive.assert_called_once()
+    assert archive.call_args.kwargs["require_compression_lease"] is True
+    assert archive.call_args.kwargs["compression_lock_holder"]
+    assert archive.call_args.kwargs["expected_active_messages"] == before
+    assert db.get_compression_lock_holder(session_id) is None
     durable = db.get_messages_as_conversation(session_id)
     assert [message["content"] for message in durable] == [
         message["content"] for message in pruned
@@ -113,6 +166,221 @@ def test_gateway_eviction_reload_keeps_prune_and_durable_runway(tmp_path: Path) 
     assert result is reloaded
     assert second_count == 0
     assert len(db.get_messages(session_id, include_inactive=True)) == archived_before
+
+    db.archive_and_compact(
+        session_id,
+        reloaded,
+        model_config_patch={_REARM_KEY: None},
+    )
+    cleared = _build_agent(db, session_id)
+    _configure_pruning(cleared)
+    assert cleared.context_compressor._proactive_prune_rearm_tokens == 0
+    assert cleared.context_compressor._proactive_prune_runway_authoritative is True
+
+
+def test_published_child_fences_stale_proactive_prune(tmp_path: Path) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    parent_id = "PRUNE_STALE_PARENT"
+    child_id = "PRUNE_LIVE_CHILD"
+    db.create_session(
+        parent_id, source="telegram", model_config={"keep": "parent"},
+    )
+    db.append_messages_batch(parent_id, _history())
+    stale = _build_agent(db, parent_id)
+    _configure_pruning(stale)
+    stale_messages = db.get_messages_as_conversation(parent_id)
+
+    winner = "pid=1:tid=1:agent=winner:nonce=winner"
+    assert db.try_acquire_compression_lock(parent_id, winner, ttl_seconds=60)
+    db.publish_compression_child(
+        parent_session_id=parent_id,
+        child_session_id=child_id,
+        source="telegram",
+        messages=[{"role": "user", "content": "compressed handoff"}],
+        model_config={"keep": "child"},
+        compression_lock_holder=winner,
+    )
+    db.release_compression_lock(parent_id, winner)
+    parent_contents = [
+        message["content"] for message in db.get_messages_as_conversation(parent_id)
+    ]
+    parent_config = db.get_session(parent_id)["model_config"]
+    rejected: list[Exception] = []
+    real_archive = db.archive_and_compact
+
+    def _record_rejection(*args, **kwargs):
+        try:
+            return real_archive(*args, **kwargs)
+        except Exception as exc:
+            rejected.append(exc)
+            raise
+
+    with patch.object(db, "archive_and_compact", side_effect=_record_rejection):
+        result, count = stale.context_compressor.prune_tool_results_only(
+            stale_messages, current_tokens=120_000,
+        )
+
+    assert result is stale_messages
+    assert count == 0
+    assert len(rejected) == 1
+    assert isinstance(rejected[0], CompressionSessionClosedError)
+    assert db.get_session(parent_id)["model_config"] == parent_config
+    assert [
+        message["content"] for message in db.get_messages_as_conversation(parent_id)
+    ] == parent_contents
+    assert [
+        message["content"] for message in db.get_messages_as_conversation(child_id)
+    ] == ["compressed handoff"]
+
+
+def test_in_place_winner_fences_stale_proactive_prune(tmp_path: Path) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "PRUNE_STALE_IN_PLACE"
+    db.create_session(
+        session_id, source="telegram", model_config={"keep": "original"},
+    )
+    db.append_messages_batch(session_id, _history())
+    stale = _build_agent(db, session_id)
+    _configure_pruning(stale)
+    stale_messages = db.get_messages_as_conversation(session_id)
+
+    winner_messages = [
+        {"role": "user", "content": "winner summary"},
+        {"role": "assistant", "content": "winner reply"},
+    ]
+    winner = "pid=1:tid=1:agent=winner:nonce=winner"
+    assert db.try_acquire_compression_lock(session_id, winner, ttl_seconds=60)
+    db.archive_and_compact(
+        session_id,
+        winner_messages,
+        model_config_patch={_REARM_KEY: None},
+        compression_lock_holder=winner,
+        require_compression_lease=True,
+        expected_active_messages=stale_messages,
+    )
+    db.release_compression_lock(session_id, winner)
+    durable_before = db.get_messages_as_conversation(session_id)
+    config_before = db.get_session(session_id)["model_config"]
+    rows_before = len(db.get_messages(session_id, include_inactive=True))
+
+    result, count = stale.context_compressor.prune_tool_results_only(
+        stale_messages, current_tokens=120_000,
+    )
+
+    assert result is stale_messages
+    assert count == 0
+    assert db.get_messages_as_conversation(session_id) == durable_before
+    assert db.get_session(session_id)["model_config"] == config_before
+    assert len(db.get_messages(session_id, include_inactive=True)) == rows_before
+    assert db.get_compression_lock_holder(session_id) is None
+
+
+def test_stale_snapshot_rejection_rolls_back_archive_and_config(tmp_path: Path) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "PRUNE_STALE_ROLLBACK"
+    db.create_session(
+        session_id, source="telegram", model_config={"keep": "original"},
+    )
+    db.append_messages_batch(session_id, _history())
+    stale_messages = db.get_messages_as_conversation(session_id)
+    db.archive_and_compact(
+        session_id,
+        [{"role": "user", "content": "winner summary"}],
+        model_config_patch={"winner": True},
+        expected_active_messages=stale_messages,
+    )
+    durable_before = db.get_messages_as_conversation(session_id)
+    config_before = db.get_session(session_id)["model_config"]
+    rows_before = db.get_messages(session_id, include_inactive=True)
+
+    stale_holder = "pid=1:tid=1:agent=stale:nonce=stale"
+    assert db.try_acquire_compression_lock(session_id, stale_holder, ttl_seconds=60)
+    try:
+        with pytest.raises(
+            CompressionSessionBusyError,
+            match="transcript changed before compaction",
+        ):
+            db.archive_and_compact(
+                session_id,
+                stale_messages,
+                model_config_patch={"winner": False, "stale": True},
+                compression_lock_holder=stale_holder,
+                require_compression_lease=True,
+                expected_active_messages=stale_messages,
+            )
+    finally:
+        db.release_compression_lock(session_id, stale_holder)
+
+    assert db.get_messages_as_conversation(session_id) == durable_before
+    assert db.get_session(session_id)["model_config"] == config_before
+    assert db.get_messages(session_id, include_inactive=True) == rows_before
+
+
+@pytest.mark.parametrize(
+    ("field", "changed_value"),
+    [
+        ("api_content", "changed wire content"),
+        ("display_kind", "changed-kind"),
+        ("display_metadata", {"changed": True}),
+        ("tool_call_id", "changed-call"),
+        ("tool_name", "changed-tool"),
+        ("effect_disposition", "changed-effect"),
+        ("tool_calls", [{"id": "changed", "type": "function"}]),
+        ("finish_reason", "length"),
+        ("reasoning", "changed reasoning"),
+        ("reasoning_content", "changed reasoning content"),
+        ("reasoning_details", [{"changed": True}]),
+        ("codex_reasoning_items", [{"changed": True}]),
+        ("codex_message_items", [{"changed": True}]),
+        ("observed", False),
+        ("message_id", "changed-message-id"),
+    ],
+)
+def test_snapshot_fence_compares_every_durable_replay_field(
+    tmp_path: Path, field: str, changed_value,
+) -> None:
+    db = SessionDB(db_path=tmp_path / f"{field}.db")
+    session_id = f"REPLAY_FIELD_{field}"
+    db.create_session(session_id, source="telegram")
+    db.append_messages_batch(session_id, [{
+        "role": "assistant",
+        "content": "durable content",
+        "api_content": "wire content",
+        "display_kind": "status",
+        "display_metadata": {"phase": "done"},
+        "tool_call_id": "call-1",
+        "tool_name": "terminal",
+        "effect_disposition": "committed",
+        "tool_calls": [{
+            "id": "call-1",
+            "type": "function",
+            "function": {"name": "terminal", "arguments": "{}"},
+        }],
+        "finish_reason": "tool_calls",
+        "reasoning": "reasoning",
+        "reasoning_content": "reasoning content",
+        "reasoning_details": [{"type": "summary_text", "text": "detail"}],
+        "codex_reasoning_items": [{"type": "reasoning", "id": "r1"}],
+        "codex_message_items": [{"type": "message", "id": "m1"}],
+        "observed": True,
+        "message_id": "platform-message-id",
+    }])
+    durable = db.get_messages_as_conversation(session_id)
+    stale = copy.deepcopy(durable)
+    stale[0][field] = changed_value
+    rows_before = db.get_messages(session_id, include_inactive=True)
+
+    with pytest.raises(
+        CompressionSessionBusyError,
+        match="transcript changed before compaction",
+    ):
+        db.archive_and_compact(
+            session_id,
+            [{"role": "assistant", "content": "replacement"}],
+            expected_active_messages=stale,
+        )
+
+    assert db.get_messages(session_id, include_inactive=True) == rows_before
 
 
 def test_fresh_agent_rearms_after_durable_history_regrowth_once(tmp_path: Path) -> None:
@@ -184,6 +452,66 @@ def test_prune_persistence_failure_is_a_noop(tmp_path: Path) -> None:
     assert [message["content"] for message in messages] == original_contents
     assert [message["content"] for message in db.get_messages_as_conversation(session_id)] == original_contents
     assert _REARM_KEY not in _model_config(db, session_id)
+
+
+@pytest.mark.parametrize("failure", ["malformed", "read_error"])
+def test_unknown_durable_runway_blocks_until_authoritative_reload(
+    tmp_path: Path, failure: str,
+) -> None:
+    db = SessionDB(db_path=tmp_path / f"{failure}.db")
+    session_id = f"PRUNE_UNKNOWN_{failure.upper()}"
+    db.create_session(
+        session_id, source="telegram", model_config={"keep": "value"},
+    )
+    db.append_messages_batch(session_id, _history())
+    agent = _build_agent(db, session_id)
+    _configure_pruning(agent)
+
+    if failure == "malformed":
+        db._conn.execute(
+            "UPDATE sessions SET model_config = ? WHERE id = ?",
+            ("{malformed", session_id),
+        )
+        db._conn.commit()
+        agent.context_compressor.bind_session_state(db, session_id)
+    else:
+        with patch.object(
+            db, "get_session", side_effect=sqlite3.OperationalError("read failed"),
+        ):
+            agent.context_compressor.bind_session_state(db, session_id)
+
+    assert agent.context_compressor._proactive_prune_runway_authoritative is False
+    messages = db.get_messages_as_conversation(session_id)
+    original_contents = [message["content"] for message in messages]
+    original_config = db.get_session(session_id)["model_config"]
+    with patch.object(
+        db, "archive_and_compact", wraps=db.archive_and_compact,
+    ) as archive:
+        result, count = agent.context_compressor.prune_tool_results_only(
+            messages, current_tokens=120_000,
+        )
+
+    assert result is messages
+    assert count == 0
+    archive.assert_not_called()
+    assert db.get_session(session_id)["model_config"] == original_config
+    assert [
+        message["content"] for message in db.get_messages_as_conversation(session_id)
+    ] == original_contents
+
+    db._conn.execute(
+        "UPDATE sessions SET model_config = ? WHERE id = ?",
+        (json.dumps({"keep": "value"}), session_id),
+    )
+    db._conn.commit()
+    agent.context_compressor.bind_session_state(db, session_id)
+    assert agent.context_compressor._proactive_prune_runway_authoritative is True
+    recovered, recovered_count = agent.context_compressor.prune_tool_results_only(
+        messages, current_tokens=120_000,
+    )
+    assert recovered_count >= 1
+    assert recovered is not messages
+    assert _model_config(db, session_id)[_REARM_KEY] > 0
 
 
 def test_archive_model_config_patch_rolls_back_with_transcript(tmp_path: Path) -> None:

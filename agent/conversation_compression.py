@@ -281,6 +281,7 @@ _COMPRESSOR_ATTEMPT_STATE_FIELDS = (
     "_active_compression_telemetry",
     "_compression_telemetry_seed",
     "_proactive_prune_rearm_tokens",
+    "_proactive_prune_runway_authoritative",
 )
 
 _COMPRESSOR_COOLDOWN_STATE_FIELDS = (
@@ -3264,8 +3265,47 @@ def compress_context(
                     # WITHOUT destroying history, unlike a hard replace_messages).
                     # See #38763.
                     from agent.context_compressor import (
+                        _DB_PERSISTED_MARKER,
                         PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY,
                     )
+
+                    expected_active_messages = [
+                        message
+                        for message in messages_before_compression
+                        if isinstance(message, dict)
+                        and message.get(_DB_PERSISTED_MARKER)
+                    ]
+                    if not expected_active_messages:
+                        # First-turn preflight can create the session row before
+                        # any transcript row has been flushed.  An authoritative
+                        # durable count of zero is enough to expect an empty
+                        # active set: archive_and_compact re-checks [] inside the
+                        # same write transaction, so a concurrent winner that
+                        # lands after this read is still rejected.
+                        durable_message_count = None
+                        get_session = getattr(agent._session_db, "get_session", None)
+                        if callable(get_session):
+                            try:
+                                session_row = get_session(agent.session_id)
+                                if session_row is not None:
+                                    durable_message_count = session_row["message_count"]
+                            except Exception:
+                                durable_message_count = None
+                        if durable_message_count == 0:
+                            expected_active_messages = []
+                        else:
+                            current_idx = getattr(
+                                agent, "_persist_user_message_idx", None,
+                            )
+                            if (
+                                isinstance(current_idx, int)
+                                and 0 <= current_idx <= len(messages_before_compression)
+                            ):
+                                expected_active_messages = (
+                                    messages_before_compression[:current_idx]
+                                )
+                            else:
+                                expected_active_messages = messages_before_compression
 
                     agent._session_db.archive_and_compact(
                         agent.session_id,
@@ -3276,6 +3316,9 @@ def compress_context(
                         model_config_patch={
                             PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None,
                         },
+                        compression_lock_holder=_lock_holder,
+                        require_compression_lease=_lock_holder is not None,
+                        expected_active_messages=expected_active_messages,
                     )
                     split_status = "in_place_committed"
                     # Reset the flush identity set so the next turn's appends are
@@ -3416,6 +3459,12 @@ def compress_context(
                     agent.context_compressor._proactive_prune_rearm_tokens = (
                         _compressor_attempt_snapshot[
                             "_proactive_prune_rearm_tokens"
+                        ]
+                    )
+                if "_proactive_prune_runway_authoritative" in _compressor_attempt_snapshot:
+                    agent.context_compressor._proactive_prune_runway_authoritative = (
+                        _compressor_attempt_snapshot[
+                            "_proactive_prune_runway_authoritative"
                         ]
                     )
                 split_status = (

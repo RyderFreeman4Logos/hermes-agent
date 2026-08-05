@@ -229,6 +229,24 @@ class TestCamofoxClose:
         result = json.loads(camofox_close(task_id="nonexistent"))
         assert result["success"] is True
 
+    @patch("tools.browser_camofox.requests.delete")
+    @patch("tools.browser_camofox.requests.post")
+    def test_close_failure_retains_session_for_retry(
+        self, mock_post, mock_delete, monkeypatch
+    ):
+        import tools.browser_camofox as camofox
+
+        monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
+        mock_post.return_value = _mock_response(json_data={"tabId": "tab-fail"})
+        camofox_navigate("https://x.com", task_id="close-failure")
+        mock_delete.return_value.raise_for_status.side_effect = RuntimeError("offline")
+
+        result = json.loads(camofox_close(task_id="close-failure"))
+
+        assert result["success"] is False
+        assert camofox._sessions["close-failure"]["tab_id"] == "tab-fail"
+        camofox._sessions.pop("close-failure", None)
+
 
 # ---------------------------------------------------------------------------
 # Console (limited support)
@@ -360,5 +378,4 @@ class TestBrowserToolRouting:
         monkeypatch.setenv("CAMOFOX_URL", "http://localhost:9377")
         from tools.browser_tool import check_browser_requirements
         assert check_browser_requirements() is True
-
 

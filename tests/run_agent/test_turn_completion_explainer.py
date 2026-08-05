@@ -765,11 +765,13 @@ def test_post_compression_cache_attribution_survives_retry_then_clears():
 
     assert result["final_response"] == "Done."
     assert executions == 3
-    assert len(cache_usage) == 2
+    assert len(cache_usage) == 3
     assert "cache_attribution" not in cache_usage[0]
     assert cache_usage[1]["cache_attribution"] == "post_compression"
     assert cache_usage[1]["cache_read_tokens"] == 1_880
-    assert agent._first_turn_usage == cache_usage[1]
+    assert "cache_attribution" not in cache_usage[2]
+    assert cache_usage[2]["cache_read_tokens"] == 1_900
+    assert agent._first_turn_usage == cache_usage[2]
     assert getattr(agent, "_awaiting_cache_usage_after_compression") is False
     assert not hasattr(engine, "awaiting_real_usage_after_compression")
     assert agent.client.chat.completions.create.call_count == 5
@@ -777,11 +779,12 @@ def test_post_compression_cache_attribution_survives_retry_then_clears():
         call.args[0] for call in vprint.call_args_list if "💾 Cache:" in call.args[0]
     ]
     assert len(cache_lines) == 3
-    assert ["post-compression cold prefix (expected)" in line for line in cache_lines] == [
+    assert ["post-compression warmup (expected)" in line for line in cache_lines] == [
         False,
         True,
         False,
     ]
+    assert "\033[31m94%\033[0m" not in cache_lines[1]
 
 
 def test_run_conversation_partial_stream_recovery_surfaces_explanation():

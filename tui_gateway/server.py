@@ -26,6 +26,7 @@ from agent.secret_scope import (
 from agent.usage_pricing import (
     CACHE_HIT_ERROR_THRESHOLD,
     POST_COMPRESSION_CACHE_NOTE,
+    POST_COMPRESSION_CACHE_WARM_NOTE,
     cache_hit_percent,
 )
 from hermes_constants import (
@@ -5121,7 +5122,10 @@ def _cache_info_from_usage(usage: Any) -> dict[str, int | str] | None:
         "cache_creation_tokens",
         "cache_creation_input_tokens",
     )
-    if not any(key in usage for key in (*read_keys, *write_keys)):
+    telemetry_present = usage.get("cache_telemetry_present")
+    if telemetry_present is not False and not any(
+        key in usage for key in (*read_keys, *write_keys)
+    ):
         return None
 
     def tokens(*keys: str) -> int:
@@ -5137,6 +5141,21 @@ def _cache_info_from_usage(usage: Any) -> dict[str, int | str] | None:
     read_tokens = tokens(*read_keys)
     write_tokens = tokens(*write_keys)
     prompt_tokens = tokens("prompt_tokens")
+    if telemetry_present is False:
+        cache_info: dict[str, int | str] = {
+            "read_tokens": 0,
+            "prompt_tokens": prompt_tokens,
+            "pct": 0,
+            "state": "unavailable",
+            "level": "info",
+        }
+        if usage.get("cache_attribution") == "post_compression":
+            cache_info.update(
+                attribution="post_compression",
+                note="post-compression cache unavailable",
+            )
+        return cache_info
+
     pct = cache_hit_percent(read_tokens, prompt_tokens)
     state = (
         "hit"
@@ -5156,6 +5175,12 @@ def _cache_info_from_usage(usage: Any) -> dict[str, int | str] | None:
     }
     if usage.get("cache_attribution") == "post_compression":
         cache_info["attribution"] = "post_compression"
+        cache_info["level"] = "info"
+        cache_info["note"] = (
+            POST_COMPRESSION_CACHE_WARM_NOTE
+            if state == "hit" and pct >= CACHE_HIT_ERROR_THRESHOLD
+            else POST_COMPRESSION_CACHE_NOTE
+        )
     return cache_info
 
 
@@ -5971,9 +5996,15 @@ def _attach_tui_cache_callback(agent, sid: str):
         }
         state = str(cache_info["state"])
         pct = int(cache_info["pct"])
-        text = f"cache {pct}%" if state == "hit" else f"cache {state.upper()}"
-        if cache_info.get("attribution") == "post_compression":
-            text += f" · {POST_COMPRESSION_CACHE_NOTE}"
+        text = (
+            f"cache {pct}%"
+            if state == "hit"
+            else "cache unavailable"
+            if state == "unavailable"
+            else f"cache {state.upper()}"
+        )
+        if cache_info.get("note"):
+            text += f" · {cache_info['note']}"
         kind = "error" if cache_info["level"] == "error" else "cache_hit"
         _emit("status.update", sid, {"kind": kind, "text": text})
 

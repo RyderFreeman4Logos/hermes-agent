@@ -17912,6 +17912,7 @@ def test_tui_cache_callback_labels_post_compression_usage():
     class _Agent:
         _first_turn_usage = {
             "cache_attribution": "post_compression",
+            "cache_telemetry_present": True,
             "cache_read_tokens": 1_880,
             "cache_write_tokens": 0,
             "prompt_tokens": 2_000,
@@ -17932,9 +17933,37 @@ def test_tui_cache_callback_labels_post_compression_usage():
             "status.update",
             "cache-sid",
             {
-                "kind": "error",
-                "text": "cache 94% · post-compression cold prefix (expected)",
+                "kind": "cache_hit",
+                "text": "cache 94% · post-compression warmup (expected)",
             },
+        )
+    ]
+
+
+def test_tui_cache_callback_reports_unavailable_neutrally():
+    class _Agent:
+        _first_turn_usage = {
+            "cache_telemetry_present": False,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "prompt_tokens": 2_000,
+        }
+
+    agent = _Agent()
+    emitted: list[tuple[str, str, dict]] = []
+    with patch.object(
+        server,
+        "_emit",
+        lambda event_type, sid, payload: emitted.append((event_type, sid, payload)),
+    ):
+        server._attach_tui_cache_callback(agent, "cache-sid")
+        getattr(agent, "_tui_cache_callback")("unavailable", 0, 0, 2_000)
+
+    assert emitted == [
+        (
+            "status.update",
+            "cache-sid",
+            {"kind": "cache_hit", "text": "cache unavailable"},
         )
     ]
 
@@ -17955,6 +17984,53 @@ def test_cache_info_classifies_first_call_usage():
     }
 
 
+def test_cache_info_distinguishes_unavailable_from_reported_zero():
+    base = {
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "prompt_tokens": 2_000,
+    }
+
+    assert server._cache_info_from_usage(
+        {**base, "cache_telemetry_present": False}
+    ) == {
+        "read_tokens": 0,
+        "prompt_tokens": 2_000,
+        "pct": 0,
+        "state": "unavailable",
+        "level": "info",
+    }
+    assert server._cache_info_from_usage(
+        {**base, "cache_telemetry_present": True}
+    ) == {
+        "read_tokens": 0,
+        "prompt_tokens": 2_000,
+        "pct": 0,
+        "state": "miss",
+        "level": "error",
+    }
+
+
+def test_cache_info_keeps_post_compression_low_hit_neutral():
+    assert server._cache_info_from_usage(
+        {
+            "cache_attribution": "post_compression",
+            "cache_telemetry_present": True,
+            "cache_read_tokens": 1_880,
+            "cache_write_tokens": 0,
+            "prompt_tokens": 2_000,
+        }
+    ) == {
+        "attribution": "post_compression",
+        "read_tokens": 1_880,
+        "prompt_tokens": 2_000,
+        "pct": 94,
+        "state": "hit",
+        "level": "info",
+        "note": "post-compression warmup (expected)",
+    }
+
+
 def test_cache_info_attributes_post_compression_usage():
     assert server._cache_info_from_usage(
         {
@@ -17970,6 +18046,7 @@ def test_cache_info_attributes_post_compression_usage():
         "pct": 95,
         "state": "hit",
         "level": "info",
+        "note": "post-compression cache warm",
     }
 
 

@@ -2068,7 +2068,7 @@ describe('createGatewayEventHandler', () => {
     ])
   })
 
-  it('keeps an exact-95 cache hit non-error and labels post-compression usage', () => {
+  it('keeps an exact-95 post-compression cache hit warm and non-error', () => {
     const appended: Msg[] = []
     const onEvent = createGatewayEventHandler(buildCtx(appended))
 
@@ -2077,6 +2077,7 @@ describe('createGatewayEventHandler', () => {
         cache_info: {
           attribution: 'post_compression',
           level: 'info',
+          note: 'post-compression cache warm',
           pct: 95,
           prompt_tokens: 2_000,
           read_tokens: 1_900,
@@ -2089,7 +2090,51 @@ describe('createGatewayEventHandler', () => {
 
     expect(appended).toEqual([
       { role: 'assistant', text: 'final answer' },
-      { kind: 'event', role: 'system', text: 'cache 95% · post-compression cold prefix (expected)' }
+      { kind: 'event', role: 'system', text: 'cache 95% · post-compression cache warm' }
+    ])
+  })
+
+  it('renders post-compression low cache as expected warmup, not an error', () => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+    onEvent({
+      payload: {
+        cache_info: {
+          attribution: 'post_compression',
+          level: 'info',
+          note: 'post-compression warmup (expected)',
+          pct: 94,
+          prompt_tokens: 2_000,
+          read_tokens: 1_880,
+          state: 'hit'
+        },
+        text: 'final answer'
+      },
+      type: 'message.complete'
+    } as any)
+
+    expect(appended).toEqual([
+      { role: 'assistant', text: 'final answer' },
+      { kind: 'event', role: 'system', text: 'cache 94% · post-compression warmup (expected)' }
+    ])
+  })
+
+  it('renders omitted cache telemetry as neutral unavailable', () => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+    onEvent({
+      payload: {
+        cache_info: { level: 'info', pct: 0, prompt_tokens: 2_000, read_tokens: 0, state: 'unavailable' },
+        text: 'final answer'
+      },
+      type: 'message.complete'
+    } as any)
+
+    expect(appended).toEqual([
+      { role: 'assistant', text: 'final answer' },
+      { kind: 'event', role: 'system', text: 'cache unavailable' }
     ])
   })
 })

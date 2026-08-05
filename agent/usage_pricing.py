@@ -11,7 +11,8 @@ from utils import base_url_host_matches
 
 DEFAULT_PRICING = {"input": 0.0, "output": 0.0}
 CACHE_HIT_ERROR_THRESHOLD = 95
-POST_COMPRESSION_CACHE_NOTE = "post-compression cold prefix (expected)"
+POST_COMPRESSION_CACHE_NOTE = "post-compression warmup (expected)"
+POST_COMPRESSION_CACHE_WARM_NOTE = "post-compression cache warm"
 
 _ZERO = Decimal("0")
 _ONE_MILLION = Decimal("1000000")
@@ -42,6 +43,7 @@ class CanonicalUsage:
     reasoning_tokens: int = 0
     request_count: int = 1
     raw_usage: Optional[dict[str, Any]] = None
+    cache_telemetry_present: bool = False
 
     @property
     def prompt_tokens(self) -> int:
@@ -65,6 +67,9 @@ class CanonicalUsage:
             output_tokens=self.output_tokens + other.output_tokens,
             cache_read_tokens=self.cache_read_tokens + other.cache_read_tokens,
             cache_write_tokens=self.cache_write_tokens + other.cache_write_tokens,
+            cache_telemetry_present=(
+                self.cache_telemetry_present or other.cache_telemetry_present
+            ),
             reasoning_tokens=self.reasoning_tokens + other.reasoning_tokens,
             request_count=self.request_count + other.request_count,
             raw_usage=None,
@@ -1231,11 +1236,21 @@ def normalize_usage(
     provider_name = (provider or "").strip().lower()
     mode = (api_mode or "").strip().lower()
 
+    def reports_cache_fields(value: Any, *names: str) -> bool:
+        return value is not None and any(
+            getattr(value, name, None) is not None for name in names
+        )
+
     if mode == "anthropic_messages" or provider_name == "anthropic":
         input_tokens = _to_int(getattr(response_usage, "input_tokens", 0))
         output_tokens = _to_int(getattr(response_usage, "output_tokens", 0))
         cache_read_tokens = _to_int(getattr(response_usage, "cache_read_input_tokens", 0))
         cache_write_tokens = _to_int(getattr(response_usage, "cache_creation_input_tokens", 0))
+        cache_telemetry_present = reports_cache_fields(
+            response_usage,
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+        )
     elif mode == "codex_responses":
         input_total = _to_int(getattr(response_usage, "input_tokens", 0))
         output_tokens = _to_int(getattr(response_usage, "output_tokens", 0))
@@ -1243,6 +1258,9 @@ def normalize_usage(
         cache_read_tokens = _to_int(getattr(details, "cached_tokens", 0) if details else 0)
         cache_write_tokens = _to_int(
             getattr(details, "cache_creation_tokens", 0) if details else 0
+        )
+        cache_telemetry_present = reports_cache_fields(
+            details, "cached_tokens", "cache_creation_tokens"
         )
         input_tokens = max(0, input_total - cache_read_tokens - cache_write_tokens)
     else:
@@ -1274,6 +1292,15 @@ def normalize_usage(
             cache_write_tokens = _to_int(
                 getattr(response_usage, "cache_creation_input_tokens", 0)
             )
+        cache_telemetry_present = reports_cache_fields(
+            details, "cached_tokens", "cache_write_tokens"
+        ) or reports_cache_fields(
+            response_usage,
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+            "prompt_cache_hit_tokens",
+            "prompt_cache_miss_tokens",
+        )
         input_tokens = max(0, prompt_total - cache_read_tokens - cache_write_tokens)
 
     reasoning_tokens = 0
@@ -1299,6 +1326,7 @@ def normalize_usage(
         output_tokens=output_tokens,
         cache_read_tokens=cache_read_tokens,
         cache_write_tokens=cache_write_tokens,
+        cache_telemetry_present=cache_telemetry_present,
         reasoning_tokens=reasoning_tokens,
     )
 

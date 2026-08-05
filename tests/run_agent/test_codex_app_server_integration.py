@@ -121,6 +121,7 @@ class TestRunConversationCodexPath:
         assert result["cache_write_tokens"] == 0
         assert result["reasoning_tokens"] == 5
         assert result["last_prompt_tokens"] == 100
+        assert agent._first_turn_usage["cache_telemetry_present"] is True
 
         assert agent.session_api_calls == 1
         assert agent.session_prompt_tokens == 100
@@ -189,7 +190,7 @@ class TestRunConversationCodexPath:
                 "codex-cache-sid",
                 {
                     "kind": "cache_hit",
-                    "text": "cache 95% · post-compression cold prefix (expected)",
+                    "text": "cache 95% · post-compression cache warm",
                 },
             )
         ]
@@ -202,6 +203,7 @@ class TestRunConversationCodexPath:
             "pct": 95,
             "state": "hit",
             "level": "info",
+            "note": "post-compression cache warm",
         }
         assert getattr(agent, "_awaiting_cache_usage_after_compression") is False
         assert events == [

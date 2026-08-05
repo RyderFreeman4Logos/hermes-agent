@@ -109,6 +109,10 @@ def _record_codex_app_server_usage(
         output_tokens=output_tokens,
         cache_read_tokens=cache_read_tokens,
         cache_write_tokens=0,
+        cache_telemetry_present=(
+            "cachedInputTokens" in usage
+            and usage.get("cachedInputTokens") is not None
+        ),
         reasoning_tokens=reasoning_tokens,
         raw_usage=usage,
     )
@@ -123,6 +127,7 @@ def _record_codex_app_server_usage(
         "output_tokens": canonical_usage.output_tokens,
         "cache_read_tokens": canonical_usage.cache_read_tokens,
         "cache_write_tokens": canonical_usage.cache_write_tokens,
+        "cache_telemetry_present": canonical_usage.cache_telemetry_present,
         "reasoning_tokens": canonical_usage.reasoning_tokens,
     }
 

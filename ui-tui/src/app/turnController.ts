@@ -32,10 +32,11 @@ const TRAIL_LIMIT = 8
 type CacheInfo = {
   attribution?: 'post_compression'
   level: 'error' | 'info'
+  note?: string
   pct: number
   prompt_tokens: number
   read_tokens: number
-  state: 'cold_write' | 'hit' | 'miss' | 'unknown'
+  state: 'cold_write' | 'hit' | 'miss' | 'unavailable' | 'unknown'
 }
 
 const cacheFootnote = (cacheInfo?: CacheInfo): Msg | null => {
@@ -50,7 +51,15 @@ const cacheFootnote = (cacheInfo?: CacheInfo): Msg | null => {
         ? 'cache cold-write'
         : `cache ${cacheInfo.state}`
 
-  const attribution = cacheInfo.attribution === 'post_compression' ? ' · post-compression cold prefix (expected)' : ''
+  const attribution =
+    cacheInfo.attribution === 'post_compression'
+      ? ` · ${
+          cacheInfo.note ??
+          (cacheInfo.state === 'hit' && cacheInfo.pct >= 95
+            ? 'post-compression cache warm'
+            : 'post-compression warmup (expected)')
+        }`
+      : ''
 
   return {
     kind: 'event',

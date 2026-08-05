@@ -86,6 +86,7 @@ from agent.trajectory import has_incomplete_scratchpad
 from agent.usage_pricing import (
     CACHE_HIT_ERROR_THRESHOLD,
     POST_COMPRESSION_CACHE_NOTE,
+    POST_COMPRESSION_CACHE_WARM_NOTE,
     cache_hit_percent,
     estimate_usage_cost,
     normalize_usage,
@@ -104,7 +105,12 @@ def _ingest_successful_provider_usage(agent, usage: dict, *, first_call: bool) -
     post_compression = bool(
         getattr(agent, "_awaiting_cache_usage_after_compression", False)
     )
-    if not (first_call or post_compression):
+    prior_cache_usage = getattr(agent, "_first_turn_usage", None)
+    clear_post_compression = (
+        isinstance(prior_cache_usage, dict)
+        and prior_cache_usage.get("cache_attribution") == "post_compression"
+    )
+    if not (first_call or post_compression or clear_post_compression):
         return False
 
     cache_usage = dict(usage)
@@ -118,11 +124,15 @@ def _ingest_successful_provider_usage(agent, usage: dict, *, first_call: bool) -
         cache_read = cache_usage.get("cache_read_tokens", 0) or 0
         cache_write = cache_usage.get("cache_write_tokens", 0) or 0
         prompt_tokens = cache_usage.get("prompt_tokens", 0) or 0
-        if cache_read > 0:
+        if cache_usage.get("cache_telemetry_present") is False:
+            cache_state, cache_pct = "unavailable", 0
+        elif cache_read > 0:
             cache_state = "hit"
             cache_pct = cache_hit_percent(cache_read, prompt_tokens)
         elif cache_write > 0:
             cache_state, cache_pct = "cold_write", 0
+        elif cache_usage.get("cache_telemetry_present") is True:
+            cache_state, cache_pct = "miss", 0
         else:
             cache_state, cache_pct = "unknown", 0
         try:
@@ -3590,6 +3600,7 @@ def run_conversation(
                         "output_tokens": canonical_usage.output_tokens,
                         "cache_read_tokens": canonical_usage.cache_read_tokens,
                         "cache_write_tokens": canonical_usage.cache_write_tokens,
+                        "cache_telemetry_present": canonical_usage.cache_telemetry_present,
                         "reasoning_tokens": canonical_usage.reasoning_tokens,
                     }
                     post_compression_cache = _ingest_successful_provider_usage(
@@ -3756,10 +3767,18 @@ def run_conversation(
                     if (cached or written) and not agent.quiet_mode:
                         hit_pct = cache_hit_percent(cached, prompt)
                         hit_text = f"{hit_pct}%"
-                        if hit_pct < CACHE_HIT_ERROR_THRESHOLD:
+                        if (
+                            hit_pct < CACHE_HIT_ERROR_THRESHOLD
+                            and not post_compression_cache
+                        ):
                             hit_text = f"{_RED}{hit_text}{_RESET}"
                         cache_note = (
-                            f" · {POST_COMPRESSION_CACHE_NOTE}"
+                            " · "
+                            + (
+                                POST_COMPRESSION_CACHE_WARM_NOTE
+                                if hit_pct >= CACHE_HIT_ERROR_THRESHOLD
+                                else POST_COMPRESSION_CACHE_NOTE
+                            )
                             if post_compression_cache
                             else ""
                         )

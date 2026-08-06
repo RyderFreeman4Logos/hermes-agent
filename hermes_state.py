@@ -8169,11 +8169,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         f"Durable transcript changed before compaction: {session_id}"
                     )
             if model_config_json is not None:
+                system_prompt_hash = self._store_system_prompt(conn, system_prompt)
                 conn.execute(
                     """UPDATE sessions SET
                        model_config = ?,
                        model = COALESCE(?, model),
-                       system_prompt = ?,
+                       system_prompt = NULL,
+                       system_prompt_hash = ?,
                        billing_provider = COALESCE(?, billing_provider),
                        billing_base_url = COALESCE(?, billing_base_url),
                        billing_mode = COALESCE(?, billing_mode)
@@ -8181,13 +8183,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     (
                         model_config_json,
                         model,
-                        system_prompt,
+                        system_prompt_hash,
                         billing_provider,
                         billing_base_url,
                         billing_mode,
                         session_id,
                     ),
                 )
+                self._delete_unreferenced_system_prompts(conn)
             patched_model_config = None
             if model_config_patch is not None:
                 patched_model_config = self._merge_model_config_json(

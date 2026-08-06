@@ -450,6 +450,11 @@ def _(rid, params: dict) -> dict:
             lease = None  # claimed lazily on the first turn (_ensure_active_session_slot)
             try:
                 db.reopen_session(target)
+                recover_completion_intent = getattr(
+                    db, "recover_dangling_completion_tool_intent", None
+                )
+                if callable(recover_completion_intent):
+                    recover_completion_intent(target)
                 # The child's OWN conversation only — include_ancestors would prepend
                 # the parent's transcript onto the subagent's branch.
                 # repair_alternation: this resume feeds LIVE REPLAY (the loaded
@@ -531,6 +536,11 @@ def _(rid, params: dict) -> dict:
             _enable_gateway_prompts()
             try:
                 db.reopen_session(target)
+                recover_completion_intent = getattr(
+                    db, "recover_dangling_completion_tool_intent", None
+                )
+                if callable(recover_completion_intent):
+                    recover_completion_intent(target)
                 # One lineage SELECT feeds both projections (#67142-adjacent perf,
                 # from the desktop audit): the model-fed copy is alternation-repaired
                 # (raw_history → sanitize_replay_history → the resumed session's
@@ -619,6 +629,11 @@ def _(rid, params: dict) -> dict:
         )
         try:
             db.reopen_session(target)
+            recover_completion_intent = getattr(
+                db, "recover_dangling_completion_tool_intent", None
+            )
+            if callable(recover_completion_intent):
+                recover_completion_intent(target)
             # One lineage SELECT feeds both projections (see the interactive resume
             # above): the model-fed copy is alternation-repaired for LIVE REPLAY, the
             # display copy stays verbatim.
@@ -2825,28 +2840,7 @@ def _(rid, params: dict) -> dict:
             # were the write-amplification pattern removed in #23254.
             db.append_messages_batch(
                 new_key,
-                [
-                    {
-                        "role": msg.get("role", "user"),
-                        "content": msg.get("content"),
-                        "reasoning": msg.get("reasoning"),
-                        "reasoning_content": msg.get("reasoning_content"),
-                        "reasoning_details": msg.get("reasoning_details"),
-                        "codex_reasoning_items": msg.get("codex_reasoning_items"),
-                        "codex_message_items": msg.get("codex_message_items"),
-                        # Timeline markers (model_switch, personality_switch,
-                        # auto_continue, …) ride as role=user; dropping the tag
-                        # here re-planted them as bare user turns after a
-                        # restart, corrupting the truncate ordinal address
-                        # space the same way #82756 did.
-                        "display_kind": msg.get("display_kind"),
-                        "display_metadata": msg.get("display_metadata"),
-                        # Preserve the parent's original message timestamps —
-                        # branch copies are history, not new activity (9d73006ad).
-                        "timestamp": msg.get("timestamp"),
-                    }
-                    for msg in history
-                ],
+                copy.deepcopy(history),
                 chunk_rows=500,
             )
             db.set_session_title(new_key, title)

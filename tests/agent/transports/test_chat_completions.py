@@ -84,6 +84,26 @@ class TestChatCompletionsBasic:
         msgs = [{"role": "user", "content": "hi"}]
         assert transport.convert_messages(msgs) is msgs
 
+    def test_convert_messages_restores_tool_name_to_openai_name(self, transport):
+        """Any history backend carrying only durable tool_name replays exactly."""
+        msgs = [{
+            "role": "tool",
+            "content": "result",
+            "tool_call_id": "call_1",
+            "tool_name": "web_search",
+        }]
+
+        result = transport.convert_messages(msgs)
+
+        assert result == [{
+            "role": "tool",
+            "content": "result",
+            "tool_call_id": "call_1",
+            "name": "web_search",
+        }]
+        assert "name" not in msgs[0]
+        assert msgs[0]["tool_name"] == "web_search"
+
     def test_convert_messages_strips_internal_scaffolding_markers(self, transport):
         """Hermes-internal ``_``-prefixed markers must never reach the wire.
 

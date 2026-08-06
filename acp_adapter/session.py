@@ -541,6 +541,7 @@ class SessionManager:
         # otherwise re-fire the pre-request defensive repair on every request
         # for the rest of the session (see hermes_state.get_messages_as_conversation).
         try:
+            db.recover_dangling_completion_tool_intent(session_id)
             history = db.get_messages_as_conversation(
                 session_id, repair_alternation=True
             )

@@ -3571,9 +3571,12 @@ class ContextCompressor(ContextEngine):
             next_rearm_tokens = after + runway
             if session_db and session_id:
                 try:
+                    durable_pruned_msgs = (
+                        durable_messages_before_pending_completion(pruned_msgs)
+                    )
                     archive_and_compact(
                         session_id,
-                        pruned_msgs,
+                        durable_pruned_msgs,
                         model_config_patch={
                             PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: next_rearm_tokens,
                         },
@@ -3596,7 +3599,7 @@ class ContextCompressor(ContextEngine):
                         return latest, 0
                     except Exception:
                         return work_messages, 0
-                for msg in pruned_msgs:
+                for msg in durable_pruned_msgs:
                     if isinstance(msg, dict):
                         msg[_DB_PERSISTED_MARKER] = True
             self._proactive_prune_rearm_tokens = next_rearm_tokens
@@ -6547,14 +6550,17 @@ This compaction should PRIORITISE preserving all information related to the focu
                 acquired = bool(acquire_lock(session_id, lock_holder))
                 if not acquired:
                     return False
+            durable_compacted_messages = (
+                durable_messages_before_pending_completion(compacted_messages)
+            )
             archive_and_compact(
                 session_id,
-                compacted_messages,
+                durable_compacted_messages,
                 compression_lock_holder=lock_holder,
                 require_compression_lease=True,
                 expected_active_fingerprint=expected_active_fingerprint,
             )
-            for msg in compacted_messages:
+            for msg in durable_compacted_messages:
                 if isinstance(msg, dict):
                     msg[_DB_PERSISTED_MARKER] = True
             return True

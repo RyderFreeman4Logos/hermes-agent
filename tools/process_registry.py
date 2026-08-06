@@ -3717,12 +3717,9 @@ def completion_delivery_prompt(evt: dict, payload: str) -> "str | None":
         return payload
     if not _completion_visibility_should_deliver(evt):
         return None
-    return (
-        f"{payload}\n\nInspect the completion payload above. Surface or act on "
-        "important information. If no user-visible action is needed, your final "
-        "assistant message must be literally empty (zero characters): no parentheses, "
-        "no Chinese or English filler, and no meta narration."
-    )
+    from agent.message_sanitization import build_completion_delivery_prompt
+
+    return build_completion_delivery_prompt(payload)
 
 
 def _completion_visibility_should_deliver(evt: dict) -> bool:

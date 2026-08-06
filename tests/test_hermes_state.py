@@ -3153,6 +3153,132 @@ class TestFTSExternalContentMigration:
 
 
 
+def test_tool_result_round_trip_restores_wire_name(tmp_path):
+    """SQLite's tool_name index field must reconstruct the live wire shape."""
+    db = SessionDB(db_path=tmp_path / "tool-name.db")
+    try:
+        db.create_session(session_id="s1", source="cli")
+        db.append_messages_batch("s1", [{
+            "role": "tool",
+            "content": "result",
+            "tool_call_id": "call_1",
+            "name": "web_search",
+        }])
+
+        restored = db.get_messages_as_conversation("s1")
+
+        assert restored[0]["tool_name"] == "web_search"
+        assert restored[0]["name"] == "web_search"
+    finally:
+        db.close()
+
+
+def test_read_only_conversation_getters_do_not_recover_completion_intent(tmp_path):
+    """Inspection getters never turn a read into a transcript mutation."""
+    db_path = tmp_path / "read-only-completion.db"
+    db = SessionDB(db_path=db_path)
+    try:
+        db.create_session(session_id="s1", source="cli")
+        db.append_messages_batch("s1", [
+            {
+                "role": "user",
+                "content": "completion event",
+                "api_content": "completion event plus model-only instruction",
+                "display_kind": "hidden",
+                "display_metadata": {
+                    "completion_delivery_status": "effect_started"
+                },
+            },
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call-read-only",
+                    "type": "function",
+                    "function": {"name": "web_search", "arguments": "{}"},
+                }],
+            },
+        ])
+        before = db.get_messages("s1", include_inactive=True)
+    finally:
+        db.close()
+
+    read_only = SessionDB(db_path=db_path, read_only=True)
+    try:
+        read_only.get_messages_as_conversation(
+            "s1", repair_alternation=True
+        )
+        read_only.get_resume_conversations("s1")
+    finally:
+        read_only.close()
+
+    verify = SessionDB(db_path=db_path)
+    try:
+        after = verify.get_messages("s1", include_inactive=True)
+        assert after == before
+        assert after[-2]["active"] == 1
+        assert after[-2]["display_metadata"] == {
+            "completion_delivery_status": "effect_started"
+        }
+        assert after[-1]["active"] == 1
+    finally:
+        verify.close()
+
+
+def test_completion_intent_recovery_cas_failure_rolls_back_whole_group(tmp_path):
+    """A failed second row fence cannot leave the event half-archived."""
+    db = SessionDB(db_path=tmp_path / "completion-cas.db")
+    try:
+        db.create_session(session_id="s1", source="cli")
+        db.append_messages_batch("s1", [
+            {
+                "role": "user",
+                "content": "completion event",
+                "api_content": "completion event plus model-only instruction",
+                "display_kind": "hidden",
+                "display_metadata": {
+                    "completion_delivery_status": "effect_started"
+                },
+            },
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call-cas",
+                    "type": "function",
+                    "function": {"name": "web_search", "arguments": "{}"},
+                }],
+            },
+        ])
+        db._conn.execute(
+            """CREATE TRIGGER ignore_completion_intent_archive
+               BEFORE UPDATE OF active ON messages
+               WHEN OLD.role = 'assistant'
+               BEGIN
+                   SELECT RAISE(IGNORE);
+               END"""
+        )
+        db._conn.commit()
+
+        with pytest.raises(
+            RuntimeError,
+            match="completion intent recovery compare-and-set failed",
+        ):
+            db.recover_dangling_completion_tool_intent("s1")
+
+        rows = db.get_messages("s1", include_inactive=True)
+        assert len(rows) == 2
+        assert [row["active"] for row in rows] == [1, 1]
+        assert rows[0]["display_metadata"] == {
+            "completion_delivery_status": "effect_started"
+        }
+        session = db.get_session("s1")
+        assert session["message_count"] == 2
+        assert session["tool_call_count"] == 1
+    finally:
+        db.close()
+
+
 # ---------------------------------------------------------------------------
 # apply_wal_with_fallback — read-only probe tests
 # ---------------------------------------------------------------------------

@@ -674,6 +674,14 @@ def build_turn_context(
         if persist_user_display_metadata:
             user_msg["display_metadata"] = persist_user_display_metadata
 
+    if user_msg.get("_completion_delivery_synthetic"):
+        from agent.message_sanitization import (
+            close_completion_delivery_predecessor,
+        )
+
+        user_msg["display_kind"] = "hidden"
+        close_completion_delivery_predecessor(messages)
+
     messages.append(user_msg)
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx

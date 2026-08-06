@@ -18,6 +18,11 @@ from unittest.mock import patch
 import pytest
 
 
+def _public_shape(messages):
+    fields = ("role", "content", "tool_calls", "tool_call_id", "name")
+    return [{key: row[key] for key in fields if key in row} for row in messages]
+
+
 def _make_agent(session_db, session_id, *, in_place):
     with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
         from run_agent import AIAgent
@@ -104,6 +109,7 @@ class TestInPlaceCompaction:
             # doesn't immediately re-compact (#38763).
             reloaded = db.get_messages_as_conversation(sid)
             assert len(reloaded) == 2
+            assert _public_shape(compressed) == _public_shape(reloaded)
             assert [m.get("content") for m in reloaded] == [
                 "[CONTEXT COMPACTION] summary of prior turns",
                 "recent reply",
@@ -124,10 +130,13 @@ class TestInPlaceCompaction:
                 (sid,),
             ).fetchone()
             assert hit is not None
-            # Flush identity/cursor reset so next-turn appends diff against the
-            # compacted transcript (rebuilds the identity set on next flush).
+            # The cursor resets, while the exact durable compacted rows seed the
+            # one-shot identity boundary for completion-delivery finalization.
             assert agent._last_flushed_db_idx == 0
-            assert agent._flushed_db_message_ids == set()
+            assert all(message.get("_db_persisted") is True for message in compressed)
+            assert agent._flushed_db_message_ids == {
+                id(message) for message in compressed
+            }
             # Rotation-independent in-place signal set for the gateway.
             assert agent._last_compaction_in_place is True
             # Live transcript actually shrank.

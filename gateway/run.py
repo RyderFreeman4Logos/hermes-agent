@@ -23124,7 +23124,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             evt["thread_id"] = parsed["thread_id"]
 
     async def _handle_heartbeat_event(self, evt: dict) -> None:
-        """Warm ALIVE targets silently; surface unhealthy targets directly."""
+        """Surface unhealthy status and warm targets that remain live."""
         from tools.runtime_heartbeat import runtime_heartbeat
 
         if not runtime_heartbeat.is_event_current(evt):
@@ -23185,10 +23185,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "created_at": datetime.now(timezone.utc).isoformat(),
                     }
                 )
-                return
-            await self._deliver_platform_notice(source, text)
-            return
-        if status != "ALIVE":
+                if status == "UNKNOWN":
+                    return
+            else:
+                await self._deliver_platform_notice(source, text)
+                if status == "UNKNOWN":
+                    return
+        if status not in {"ALIVE", "STUCK"}:
             return
         source = self._build_process_event_source(evt)
         if source is None or source.platform == Platform.API_SERVER:

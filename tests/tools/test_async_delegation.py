@@ -2,7 +2,7 @@
 
 Covers the dispatch handle, non-blocking behavior, completion-event delivery
 onto the shared process_registry.completion_queue, the rich re-injection block
-formatting, capacity rejection, and crash handling.
+formatting, capacity queueing, and crash handling.
 """
 
 import json
@@ -202,11 +202,14 @@ def test_rich_reinjection_block_is_self_contained():
         assert needle in text, f"missing {needle!r}"
 
 
-def test_dispatch_rejected_at_capacity():
-    ev = threading.Event()
+def test_dispatch_queues_at_capacity_without_oversubscription():
+    occupied = threading.Barrier(3)
+    release = threading.Event()
+    queued_started = threading.Event()
 
     def blocker():
-        ev.wait(timeout=60)
+        occupied.wait(timeout=5)
+        assert release.wait(timeout=60)
         return {"status": "completed", "summary": "x"}
 
     for i in range(2):
@@ -215,14 +218,21 @@ def test_dispatch_rejected_at_capacity():
             model="m", session_key="", runner=blocker, max_async_children=2,
         )
         assert r["status"] == "dispatched"
+    occupied.wait(timeout=5)
 
     r3 = ad.dispatch_async_delegation(
         goal="task3", context=None, toolsets=None, role="leaf", model="m",
-        session_key="", runner=blocker, max_async_children=2,
+        session_key="", runner=lambda: queued_started.set() or {
+            "status": "completed", "summary": "queued"
+        }, max_async_children=2,
     )
-    assert r3["status"] == "rejected"
-    assert "capacity reached" in r3["error"]
-    ev.set()
+    assert r3["status"] == "dispatched"
+    assert not queued_started.is_set()
+    assert sorted(r["status"] for r in ad.list_async_delegations()) == [
+        "queued", "running", "running"
+    ]
+    release.set()
+    assert queued_started.wait(timeout=5)
 
 
 def test_interrupt_all_signals_running_children():
@@ -763,12 +773,22 @@ def test_delegate_task_background_uses_live_tui_agent_session_id(monkeypatch):
 
 
 def test_concurrent_dispatch_respects_capacity():
-    """Two threads racing dispatch with cap=1 must yield exactly one accept
-    (capacity check and record insert are atomic under the records lock)."""
+    """Concurrent dispatches queue behind the single admitted runner."""
     gate = threading.Event()
+    first_started = threading.Event()
+    active = 0
+    max_active = 0
+    active_lock = threading.Lock()
 
     def blocker():
-        gate.wait(timeout=60)
+        nonlocal active, max_active
+        with active_lock:
+            active += 1
+            max_active = max(max_active, active)
+        first_started.set()
+        assert gate.wait(timeout=60)
+        with active_lock:
+            active -= 1
         return {"status": "completed", "summary": "x"}
 
     results = []
@@ -790,8 +810,15 @@ def test_concurrent_dispatch_respects_capacity():
     for t in threads:
         t.join(timeout=10)
     statuses = sorted(r["status"] for r in results)
-    assert statuses == ["dispatched", "rejected"]
+    assert statuses == ["dispatched", "dispatched"]
+    assert first_started.wait(timeout=5)
+    assert sorted(r["status"] for r in ad.list_async_delegations()) == [
+        "queued", "running"
+    ]
     gate.set()
+    for result in results:
+        assert _drain_for(result["delegation_id"]) is not None
+    assert max_active == 1
 
 
 # ---------------------------------------------------------------------------

@@ -277,9 +277,6 @@ _COMPRESSOR_ATTEMPT_STATE_FIELDS = (
     "_last_aux_model_failure_model",
     "_summary_model_fallen_back",
     "summary_model",
-    "_last_compression_telemetry",
-    "_active_compression_telemetry",
-    "_compression_telemetry_seed",
     "_proactive_prune_rearm_tokens",
     "_proactive_prune_runway_authoritative",
 )
@@ -1169,10 +1166,20 @@ def _emit_compression_attempt_telemetry(
 ) -> None:
     """Emit one content-free JSON log line for a compression attempt."""
     try:
+        seed = getattr(agent, "_compression_attempt_telemetry_seed", None)
+        if not isinstance(seed, dict):
+            seed = {}
         telemetry = getattr(agent.context_compressor, "_last_compression_telemetry", None)
-        if not isinstance(telemetry, dict):
+        if (
+            not isinstance(telemetry, dict)
+            or (
+                seed.get("attempt_id")
+                and telemetry.get("attempt_id") != seed.get("attempt_id")
+            )
+        ):
             telemetry = {}
-        payload = dict(telemetry)
+        payload = dict(seed)
+        payload.update(telemetry)
         payload.setdefault("event", "compression_attempt")
         payload.setdefault("attempt_id", getattr(agent, "_compression_attempt_id", "") or uuid.uuid4().hex)
         payload.setdefault("session_id", getattr(agent, "session_id", "") or "")
@@ -1188,12 +1195,98 @@ def _emit_compression_attempt_telemetry(
             or getattr(agent.context_compressor, "_last_summary_fallback_used", False)
             or getattr(agent.context_compressor, "_last_aux_model_failure_model", None)
         )
+        # Also retain the exact content-free outcome for manual callers.  They
+        # must not infer commit from before/after message counts or overload
+        # summary-provider error fields for failures before summary generation.
+        agent.context_compressor._last_compression_telemetry = payload
+        agent.context_compressor._active_compression_telemetry = payload
         logger.info(
             "context compression attempt telemetry: %s",
             json.dumps(payload, sort_keys=True, separators=(",", ":")),
         )
     except Exception as exc:
         logger.debug("failed to emit compression attempt telemetry: %s", exc)
+
+
+def _begin_compression_attempt(
+    agent: Any,
+    *,
+    trigger_source: str,
+) -> tuple[float, str]:
+    """Publish a fresh outcome before any compression gate can return."""
+    started_at = time.monotonic()
+    attempt_id = uuid.uuid4().hex
+    try:
+        agent._compression_attempt_id = attempt_id
+        seed = {
+            "attempt_id": attempt_id,
+            "session_id": getattr(agent, "session_id", "") or "",
+            "trigger_source": trigger_source,
+        }
+        agent._compression_attempt_telemetry_seed = seed
+        compressor = agent.context_compressor
+        compressor._compression_telemetry_seed = seed
+        telemetry = {
+            "event": "compression_attempt",
+            **seed,
+            "commit_status": "pending",
+            "split_status": "pending",
+            "failure_class": None,
+        }
+        compressor._last_compression_telemetry = telemetry
+        compressor._active_compression_telemetry = telemetry
+    except Exception:
+        logger.debug("failed to begin compression attempt telemetry", exc_info=True)
+    return started_at, attempt_id
+
+
+def _finish_compression_attempt_if_pending(
+    agent: Any,
+    *,
+    started_at: float,
+    attempt_id: str,
+    failure_class: str,
+) -> None:
+    """Give this attempt a terminal outcome without overwriting a richer one."""
+    try:
+        telemetry = getattr(
+            agent.context_compressor, "_last_compression_telemetry", None
+        )
+        if (
+            isinstance(telemetry, dict)
+            and telemetry.get("attempt_id") == attempt_id
+            and telemetry.get("commit_status") in {"committed", "aborted"}
+        ):
+            return
+    except Exception:
+        pass
+    _emit_compression_attempt_telemetry(
+        agent,
+        started_at=started_at,
+        commit_status="aborted",
+        split_status="aborted",
+        failure_class=failure_class,
+    )
+
+
+def record_compression_noop(
+    agent: Any,
+    *,
+    trigger_source: str,
+    failure_class: str,
+) -> None:
+    """Record a host-side compression precheck as a fresh terminal no-op."""
+    started_at, _attempt_id = _begin_compression_attempt(
+        agent,
+        trigger_source=trigger_source,
+    )
+    _emit_compression_attempt_telemetry(
+        agent,
+        started_at=started_at,
+        commit_status="aborted",
+        split_status="aborted",
+        failure_class=failure_class,
+    )
 
 
 def compression_skipped_due_to_lock(agent: Any) -> bool:
@@ -2211,6 +2304,56 @@ def compress_context(
     defer_context_engine_notification: bool = False,
     commit_fence: Optional[CompressionCommitFence] = None,
 ) -> Tuple[list, str]:
+    """Run one compression attempt with a fresh, terminal structured outcome."""
+    _attempt_started_at, _attempt_id = _begin_compression_attempt(
+        agent,
+        trigger_source="manual" if force else "auto",
+    )
+    try:
+        return _compress_context_impl(
+            agent,
+            messages,
+            system_message,
+            approx_tokens=approx_tokens,
+            task_id=task_id,
+            focus_topic=focus_topic,
+            force=force,
+            defer_context_engine_notification=defer_context_engine_notification,
+            commit_fence=commit_fence,
+            _attempt_started_at=_attempt_started_at,
+            _attempt_id=_attempt_id,
+        )
+    except BaseException as exc:
+        _finish_compression_attempt_if_pending(
+            agent,
+            started_at=_attempt_started_at,
+            attempt_id=_attempt_id,
+            failure_class=f"exception:{type(exc).__name__}",
+        )
+        raise
+    finally:
+        _finish_compression_attempt_if_pending(
+            agent,
+            started_at=_attempt_started_at,
+            attempt_id=_attempt_id,
+            failure_class="no_boundary",
+        )
+
+
+def _compress_context_impl(
+    agent: Any,
+    messages: list,
+    system_message: str,
+    *,
+    approx_tokens: Optional[int] = None,
+    task_id: str = "default",
+    focus_topic: Optional[str] = None,
+    force: bool = False,
+    defer_context_engine_notification: bool = False,
+    commit_fence: Optional[CompressionCommitFence] = None,
+    _attempt_started_at: float,
+    _attempt_id: str,
+) -> Tuple[list, str]:
     """Compress conversation context and split the session in SQLite.
 
     Args:
@@ -2274,19 +2417,6 @@ def compress_context(
     # it was added in #69870 and is simply idempotent now.
     agent._compression_skipped_due_to_lock = None
 
-    _attempt_started_at = time.monotonic()
-    _attempt_id = uuid.uuid4().hex
-    _trigger_source = "manual" if force else "auto"
-    try:
-        agent._compression_attempt_id = _attempt_id
-        setattr(agent.context_compressor, "_compression_telemetry_seed", {
-            "attempt_id": _attempt_id,
-            "session_id": agent.session_id or "",
-            "trigger_source": _trigger_source,
-        })
-    except Exception:
-        pass
-
     # Codex app-server sessions: the codex agent owns the real thread context;
     # Hermes' summarizer would only rewrite a local mirror without shrinking
     # the actual thread (#36801). Route compaction to the app server's own
@@ -2305,6 +2435,13 @@ def compress_context(
                 _restore_compressor_attempt_state(
                     agent.context_compressor, _compressor_attempt_snapshot
                 )
+                _emit_compression_attempt_telemetry(
+                    agent,
+                    started_at=_attempt_started_at,
+                    commit_status="aborted",
+                    split_status="aborted",
+                    failure_class="commit_fence_cancelled",
+                )
                 existing_prompt = getattr(agent, "_cached_system_prompt", None)
                 if not existing_prompt:
                     existing_prompt = agent._build_system_prompt(system_message)
@@ -2318,6 +2455,7 @@ def compress_context(
                 task_id=task_id,
                 force=force,
                 defer_context_engine_notification=defer_context_engine_notification,
+                attempt_started_at=_attempt_started_at,
             )
         finally:
             if _codex_fence_entered:
@@ -2334,6 +2472,13 @@ def compress_context(
             None,
         )
         if callable(blocked) and blocked(agent.context_compressor):
+            _emit_compression_attempt_telemetry(
+                agent,
+                started_at=_attempt_started_at,
+                commit_status="aborted",
+                split_status="aborted",
+                failure_class="automatic_guard_blocked",
+            )
             existing_prompt = getattr(agent, "_cached_system_prompt", None)
             if not existing_prompt:
                 existing_prompt = agent._build_system_prompt(system_message)
@@ -2695,6 +2840,13 @@ def compress_context(
                 _session_err,
             )
             _release_lock()
+            _emit_compression_attempt_telemetry(
+                agent,
+                started_at=_attempt_started_at,
+                commit_status="aborted",
+                split_status="aborted",
+                failure_class="session_ownership_unavailable",
+            )
             _existing_sp = getattr(agent, "_cached_system_prompt", None)
             if not _existing_sp:
                 _existing_sp = agent._build_system_prompt(system_message)
@@ -2713,11 +2865,24 @@ def compress_context(
                     _lock_sid,
                     agent.session_id,
                 )
+                _emit_compression_attempt_telemetry(
+                    agent,
+                    started_at=_attempt_started_at,
+                    commit_status="committed",
+                    split_status="rotated_adopted",
+                )
                 return recovered_messages, _existing_sp
             logger.warning(
                 "compression skipped: session=%s was already rotated by "
                 "another compression path, but no unique live child could be adopted",
                 _lock_sid,
+            )
+            _emit_compression_attempt_telemetry(
+                agent,
+                started_at=_attempt_started_at,
+                commit_status="aborted",
+                split_status="aborted",
+                failure_class="rotated_child_ambiguous",
             )
             return messages, _existing_sp
 
@@ -2736,6 +2901,13 @@ def compress_context(
         # before cancellation has enough information to restore it. This is a
         # persistence-safety abort, not automatic breaker gating.
         _release_lock()
+        _emit_compression_attempt_telemetry(
+            agent,
+            started_at=_attempt_started_at,
+            commit_status="aborted",
+            split_status="aborted",
+            failure_class="cooldown_authority_unavailable",
+        )
         existing_prompt = getattr(agent, "_cached_system_prompt", None)
         if not existing_prompt:
             existing_prompt = agent._build_system_prompt(system_message)
@@ -2758,6 +2930,13 @@ def compress_context(
         )
         if callable(blocked) and blocked(compressor):
             _release_lock()
+            _emit_compression_attempt_telemetry(
+                agent,
+                started_at=_attempt_started_at,
+                commit_status="aborted",
+                split_status="aborted",
+                failure_class="automatic_guard_blocked",
+            )
             existing_prompt = getattr(agent, "_cached_system_prompt", None)
             if not existing_prompt:
                 existing_prompt = agent._build_system_prompt(system_message)
@@ -3161,6 +3340,13 @@ def compress_context(
             _existing_sp = getattr(agent, "_cached_system_prompt", None)
             if not _existing_sp:
                 _existing_sp = agent._build_system_prompt(system_message)
+            _emit_compression_attempt_telemetry(
+                agent,
+                started_at=_attempt_started_at,
+                commit_status="aborted",
+                split_status="aborted",
+                failure_class="empty_transcript",
+            )
             _release_lock()
             return messages, _existing_sp
 
@@ -3849,6 +4035,7 @@ def _compress_context_via_codex_app_server(
     task_id: str = "default",
     force: bool = False,
     defer_context_engine_notification: bool = False,
+    attempt_started_at: float,
 ) -> Tuple[list, str]:
     """Route compaction to Codex app-server for Codex-owned threads.
 
@@ -3874,6 +4061,13 @@ def _compress_context_via_codex_app_server(
         existing_prompt = getattr(agent, "_cached_system_prompt", None)
         if not existing_prompt:
             existing_prompt = agent._build_system_prompt(system_message)
+        _emit_compression_attempt_telemetry(
+            agent,
+            started_at=attempt_started_at,
+            commit_status="aborted",
+            split_status="aborted",
+            failure_class="codex_native_mode",
+        )
         return messages, existing_prompt
 
     codex_session = getattr(agent, "_codex_session", None)
@@ -3888,6 +4082,13 @@ def _compress_context_via_codex_app_server(
         existing_prompt = getattr(agent, "_cached_system_prompt", None)
         if not existing_prompt:
             existing_prompt = agent._build_system_prompt(system_message)
+        _emit_compression_attempt_telemetry(
+            agent,
+            started_at=attempt_started_at,
+            commit_status="aborted",
+            split_status="aborted",
+            failure_class="codex_thread_unavailable",
+        )
         return messages, existing_prompt
 
     logger.info(
@@ -3943,6 +4144,13 @@ def _compress_context_via_codex_app_server(
         if not existing_prompt:
             existing_prompt = agent._build_system_prompt(system_message)
         _complete_compaction_lifecycle()
+        _emit_compression_attempt_telemetry(
+            agent,
+            started_at=attempt_started_at,
+            commit_status="aborted",
+            split_status="aborted",
+            failure_class="codex_compaction_failed",
+        )
         return messages, existing_prompt
 
     post_boundary_notifications = []
@@ -4020,6 +4228,12 @@ def _compress_context_via_codex_app_server(
     if not existing_prompt:
         existing_prompt = agent._build_system_prompt(system_message)
     _complete_compaction_lifecycle()
+    _emit_compression_attempt_telemetry(
+        agent,
+        started_at=attempt_started_at,
+        commit_status="committed",
+        split_status="codex_app_server_committed",
+    )
     return messages, existing_prompt
 
 

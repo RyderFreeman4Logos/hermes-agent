@@ -960,6 +960,9 @@ def test_fence_cancelled_compression_leaves_lock_reacquirable(tmp_path: Path) ->
     ]
     assert agent.context_compressor._proactive_prune_rearm_tokens == 120_000
     assert db.get_compression_lock_holder(session_id) is None
+    outcome = agent.context_compressor._last_compression_telemetry
+    assert outcome["commit_status"] == "aborted"
+    assert outcome["failure_class"] == "commit_fence_cancelled"
 
     # The NEXT attempt (no fence — a manual /compress retry) must be able to
     # acquire the lock and commit an in-place compaction normally.
@@ -1037,6 +1040,9 @@ def test_delayed_contender_adopts_unique_rotated_child(tmp_path: Path) -> None:
     assert agent._flushed_db_message_session_id == child_sid
     assert agent._last_flushed_db_idx == len(recovered)
     agent.context_compressor.compress.assert_not_called()
+    outcome = agent.context_compressor._last_compression_telemetry
+    assert outcome["commit_status"] == "committed"
+    assert outcome["split_status"] == "rotated_adopted"
     lifecycle_args, lifecycle_kwargs = agent.context_compressor.on_session_start.call_args
     assert lifecycle_args == (child_sid,)
     assert lifecycle_kwargs["boundary_reason"] == "compression"
@@ -1189,6 +1195,7 @@ def test_full_in_place_compression_atomically_clears_durable_prune_runway(
     agent = _build_agent_with_db(db, session_id)
     agent.compression_in_place = True
     agent.context_compressor._proactive_prune_rearm_tokens = 120_000
+    expected_model_config = copy.deepcopy(agent._session_init_model_config)
 
     compressed, _sp = agent._compress_context(
         messages, "sys", approx_tokens=120_000,
@@ -1198,7 +1205,9 @@ def test_full_in_place_compression_atomically_clears_durable_prune_runway(
     assert [message["content"] for message in db.get_messages_as_conversation(session_id)] == [
         message["content"] for message in compressed
     ]
-    assert json.loads(db.get_session(session_id)["model_config"]) == {"keep": "value"}
+    persisted_model_config = json.loads(db.get_session(session_id)["model_config"])
+    assert persisted_model_config == expected_model_config
+    assert "_proactive_prune_rearm_tokens" not in persisted_model_config
 
 
 def test_rotation_child_starts_without_durable_prune_runway(tmp_path: Path) -> None:
@@ -1663,7 +1672,6 @@ def test_late_hard_interrupt_restores_full_compressor_attempt_state_and_retry(
     messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
     provider_returned = threading.Event()
     allow_compress_return = threading.Event()
-    shared_telemetry = {"shared": [1, 2, 3]}
     state_fields = {
         "_previous_summary": "old-summary",
         "_summary_has_user_turn": False,
@@ -1687,15 +1695,13 @@ def test_late_hard_interrupt_restores_full_compressor_attempt_state_and_retry(
         "_last_aux_model_failure_model": "old-aux-model",
         "_summary_model_fallen_back": True,
         "summary_model": "old-summary-model",
-        "_last_compression_telemetry": shared_telemetry,
-        "_active_compression_telemetry": shared_telemetry,
-        "_compression_telemetry_seed": {"seed": [3]},
     }
     for name, value in state_fields.items():
         setattr(agent.context_compressor, name, copy.deepcopy(value))
-    restored_shared_telemetry = copy.deepcopy(shared_telemetry)
-    agent.context_compressor._last_compression_telemetry = restored_shared_telemetry
-    agent.context_compressor._active_compression_telemetry = restored_shared_telemetry
+    agent.context_compressor._last_compression_telemetry = {
+        "attempt_id": "stale",
+        "commit_status": "committed",
+    }
 
     def _provider_succeeded_then_waits(*_args, **_kwargs):
         for name in state_fields:
@@ -1734,6 +1740,10 @@ def test_late_hard_interrupt_restores_full_compressor_attempt_state_and_retry(
         agent.context_compressor._active_compression_telemetry
         is agent.context_compressor._last_compression_telemetry
     )
+    outcome = agent.context_compressor._last_compression_telemetry
+    assert outcome["attempt_id"] != "stale"
+    assert outcome["commit_status"] == "aborted"
+    assert outcome["failure_class"] == "explicit_interrupt"
     assert db.get_compression_lock_holder(session_id) is None
 
     agent.clear_interrupt()
@@ -1823,7 +1833,11 @@ def test_force_cancel_restores_newer_durable_cooldown_captured_under_lease(
     assert stale._summary_failure_cooldown_until > time.monotonic()
     assert stale._last_summary_error == "newer durable failure"
     assert stale._cooldown_persist_failed is False
-    assert stale._compression_telemetry_seed == stale_seed
+    assert stale._compression_telemetry_seed != stale_seed
+    outcome = stale._last_compression_telemetry
+    assert outcome["attempt_id"] == stale._compression_telemetry_seed["attempt_id"]
+    assert outcome["commit_status"] == "aborted"
+    assert outcome["failure_class"] == "explicit_interrupt"
     assert stale._previous_summary == "pre-attempt-summary"
     assert db.get_compression_lock_holder(session_id) is None
 

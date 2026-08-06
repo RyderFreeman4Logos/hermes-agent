@@ -5764,6 +5764,7 @@ class TelegramAdapter(BasePlatformAdapter):
         session_key: str,
         on_model_selected,
         metadata: Optional[Dict[str, Any]] = None,
+        pending_model_switch: str = "",
     ) -> SendResult:
         """Send an interactive inline-keyboard model picker.
 
@@ -5784,11 +5785,18 @@ class TelegramAdapter(BasePlatformAdapter):
             keyboard, provider_page_info = self._build_provider_keyboard(providers, 0)
 
             provider_label = get_label(current_provider)
+            pending_line = (
+                "Pending after the next successful compression: "
+                f"`{pending_model_switch}`\n"
+                if pending_model_switch
+                else ""
+            )
             text = self.format_message(
                 (
                     f"⚙ *Model Configuration*\n\n"
                     f"Current model: `{current_model or 'unknown'}`\n"
                     f"Provider: {provider_label}\n\n"
+                    f"{pending_line}"
                     f"Select a provider:{provider_page_info}"
                 )
             )

@@ -769,6 +769,13 @@ class AIAgent:
         instead of a bare reset. Default callers pass nothing and keep the
         existing reset-only behavior.
         """
+        # Deferred /model intent is scoped to this conversation. Compression
+        # rotation does not call reset_session_state(), so its live lineage keeps
+        # the pending route while /new, /resume, and /branch clear it here.
+        from hermes_cli.model_switch import clear_model_switch_after_compression
+
+        clear_model_switch_after_compression(self)
+
         # Token usage counters
         self.session_total_tokens = 0
         self.session_input_tokens = 0
@@ -8145,7 +8152,15 @@ class AIAgent:
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.codex_runtime.run_codex_app_server_turn``."""
         from agent.codex_runtime import run_codex_app_server_turn
-        return run_codex_app_server_turn(self, user_message=user_message, original_user_message=original_user_message, messages=messages, effective_task_id=effective_task_id, should_review_memory=should_review_memory)
+
+        return run_codex_app_server_turn(
+            self,
+            user_message=user_message,
+            original_user_message=original_user_message,
+            messages=messages,
+            effective_task_id=effective_task_id,
+            should_review_memory=should_review_memory,
+        )
 
 def main(
     query: str = None,

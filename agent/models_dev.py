@@ -579,7 +579,9 @@ class ModelCapabilities:
     model_family: str = ""
 
 
-def _get_provider_models(provider: str) -> Optional[Dict[str, Any]]:
+def _get_provider_models(
+    provider: str, *, allow_network: bool = True
+) -> Optional[Dict[str, Any]]:
     """Resolve a Hermes provider ID to its models dict from models.dev.
 
     Returns the models dict or None if the provider is unknown or has no data.
@@ -588,7 +590,11 @@ def _get_provider_models(provider: str) -> Optional[Dict[str, Any]]:
     if not mdev_provider_id:
         return None
 
-    data = fetch_models_dev()
+    data = (
+        fetch_models_dev()
+        if allow_network
+        else fetch_models_dev(allow_network=False)
+    )
     provider_data = data.get(mdev_provider_id)
     if not isinstance(provider_data, dict):
         return None
@@ -616,7 +622,9 @@ def _find_model_entry(models: Dict[str, Any], model: str) -> Optional[Dict[str, 
     return None
 
 
-def get_model_capabilities(provider: str, model: str) -> Optional[ModelCapabilities]:
+def get_model_capabilities(
+    provider: str, model: str, *, allow_network: bool = True
+) -> Optional[ModelCapabilities]:
     """Look up full capability metadata from models.dev cache.
 
     Uses the existing fetch_models_dev() and PROVIDER_TO_MODELS_DEV mapping.
@@ -630,7 +638,7 @@ def get_model_capabilities(provider: str, model: str) -> Optional[ModelCapabilit
       - limit.output  (int) → max_output_tokens
       - family     (str)   → model_family
     """
-    models = _get_provider_models(provider)
+    models = _get_provider_models(provider, allow_network=allow_network)
     if models is None:
         return None
 
@@ -677,7 +685,7 @@ def get_model_capabilities(provider: str, model: str) -> Optional[ModelCapabilit
     )
 
 
-def list_provider_models(provider: str) -> List[str]:
+def list_provider_models(provider: str, *, allow_network: bool = True) -> List[str]:
     """Return all model IDs for a provider from models.dev.
 
     Returns an empty list if the provider is unknown or has no data.
@@ -685,7 +693,7 @@ def list_provider_models(provider: str) -> List[str]:
     from hermes_cli.models import normalize_provider
     provider = normalize_provider(provider) or provider
     
-    models = _get_provider_models(provider)
+    models = _get_provider_models(provider, allow_network=allow_network)
     if models is None:
         return []
     return [
@@ -741,14 +749,14 @@ def _should_hide_from_provider_catalog(provider: str, model_id: str) -> bool:
     return False
 
 
-def list_agentic_models(provider: str) -> List[str]:
+def list_agentic_models(provider: str, *, allow_network: bool = True) -> List[str]:
     """Return model IDs suitable for agentic use from models.dev.
 
     Filters for tool_call=True and excludes noise (TTS, embedding,
     dated preview snapshots, live/streaming, image-only models).
     Returns an empty list on any failure.
     """
-    models = _get_provider_models(provider)
+    models = _get_provider_models(provider, allow_network=allow_network)
     if models is None:
         return []
 
@@ -871,7 +879,7 @@ def get_provider_info(
 # ---------------------------------------------------------------------------
 
 def get_model_info(
-    provider_id: str, model_id: str
+    provider_id: str, model_id: str, *, allow_network: bool = True
 ) -> Optional[ModelInfo]:
     """Get full model metadata from models.dev.
 
@@ -880,7 +888,11 @@ def get_model_info(
     """
     mdev_id = PROVIDER_TO_MODELS_DEV.get(provider_id, provider_id)
 
-    data = fetch_models_dev()
+    data = (
+        fetch_models_dev()
+        if allow_network
+        else fetch_models_dev(allow_network=False)
+    )
     pdata = data.get(mdev_id)
     if not isinstance(pdata, dict):
         return None

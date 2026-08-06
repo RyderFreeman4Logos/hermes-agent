@@ -57,6 +57,15 @@ HANDLED_HOOKS = frozenset({
     "subagent_stop",
 })
 
+CLEANUP_HOOKS = frozenset({
+    "on_session_end",
+    "on_session_finalize",
+    "on_session_reset",
+    "post_api_request",
+    "post_tool_call",
+    "subagent_stop",
+})
+
 _RUNTIME_FAILED = object()
 _RUNTIMES: dict[str, _Runtime | object] = {}
 _RUNTIME_LOCK = threading.RLock()
@@ -144,6 +153,7 @@ class _Runtime:
         self.host.retain_managed_execution(self._subscriber_name)
         self._registered = True
         atexit.register(self.shutdown)
+        self._shutdown_registered = True
 
     def ensure_session(self, event: dict[str, Any]) -> _MetricsSession | None:
         session_id = str(event.get("session_id") or "")
@@ -464,7 +474,8 @@ class _Runtime:
                 if observed_identity in task.completed_tool_call_ids:
                     return
                 identity = observed_identity
-                tool_call = session.tool_calls.pop((task_id, *identity), None)
+                key = (task_id, *identity)
+                tool_call = session.tool_calls.get(key)
                 if tool_call is None:
                     if any(
                         self._tool_call_identities_are_compatible(
@@ -490,18 +501,32 @@ class _Runtime:
                     if matching_keys:
                         key = matching_keys[0]
                         identity = key[1:]
-                        tool_call = session.tool_calls.pop(key)
+                        tool_call = session.tool_calls[key]
+                task.tool_call_ids.add(identity)
+                if tool_call is None:
+                    tool_call = self._open_tool_call(task, event)
+                    session.tool_calls[key] = tool_call
+                if not self._finish_tool_call(task, tool_call, event):
+                    return
+                if session.tool_calls.get(key) is tool_call:
+                    session.tool_calls.pop(key, None)
                 task.completed_tool_call_ids.update({
                     identity,
                     observed_identity,
                 })
-                task.tool_call_ids.add(identity)
             else:
                 task.unidentified_tool_calls += 1
-                tool_call = None
-            if tool_call is None:
+                key = (
+                    task_id,
+                    str(event.get("api_request_id") or ""),
+                    str(event.get("turn_id") or ""),
+                    f"__unidentified_{task.unidentified_tool_calls}",
+                )
                 tool_call = self._open_tool_call(task, event)
-            self._finish_tool_call(task, tool_call, event)
+                session.tool_calls[key] = tool_call
+                if self._finish_tool_call(task, tool_call, event):
+                    if session.tool_calls.get(key) is tool_call:
+                        session.tool_calls.pop(key, None)
 
     def record_skill_lifecycle(self, event: dict[str, Any]) -> None:
         """Emit one allowlisted skill fact without its local identity."""
@@ -598,7 +623,7 @@ class _Runtime:
             if session.closing:
                 return
             finished = self._finish_task(session, task_id, event)
-        if finished:
+        if finished and self.active:
             try:
                 self.relay.subscribers.flush()
             except Exception:
@@ -608,8 +633,13 @@ class _Runtime:
                 )
             else:
                 self._export()
+        if finished and not self.active:
+            self._discard_idle_session(session)
 
     def close_session(self, event: dict[str, Any]) -> None:
+        self._close_session(event, export=self.active)
+
+    def _close_session(self, event: dict[str, Any], *, export: bool) -> None:
         session = self._session(event)
         if session is None:
             return
@@ -618,8 +648,8 @@ class _Runtime:
             if session.closing:
                 return
             session.closing = True
-            for task_id in list(session.tasks):
-                self._finish_task(
+            for task_id in reversed(list(session.tasks)):
+                if self._finish_task(
                     session,
                     task_id,
                     {
@@ -630,14 +660,28 @@ class _Runtime:
                         "interrupted": False,
                         "turn_exit_reason": "system_aborted",
                     },
-                )
-            self._end_pending_model_calls(session, event)
-        try:
-            self.relay.subscribers.flush()
-        except Exception as exc:
-            failures.append(f"subscriber flush failed: {exc}")
-        else:
-            self._export()
+                ):
+                    continue
+                failures.append(f"task {task_id} close failed")
+                break
+            if not failures and not self._end_pending_model_calls(session, event):
+                failures.append("model call close failed")
+            if failures:
+                session.closing = False
+        if failures:
+            logger.warning(
+                "Hermes shared-metrics session %s closed with errors: %s",
+                session.session_id,
+                "; ".join(failures),
+            )
+            return
+        if export:
+            try:
+                self.relay.subscribers.flush()
+            except Exception as exc:
+                failures.append(f"subscriber flush failed: {exc}")
+            else:
+                self._export()
         with self._sessions_lock:
             if self._sessions.get(session.session_id) is session:
                 self._sessions.pop(session.session_id, None)
@@ -650,11 +694,17 @@ class _Runtime:
 
     def shutdown(self) -> None:
         with self._sessions_lock:
+            export = self._active and self._registered
             self._active = False
             session_ids = list(self._sessions)
         for session_id in session_ids:
-            self._safe(self.close_session, {"session_id": session_id})
+            self._safe(
+                self._close_session,
+                {"session_id": session_id},
+                export=False,
+            )
         if not self._registered:
+            self._unregister_shutdown()
             return
         try:
             self.relay.subscribers.flush()
@@ -664,52 +714,109 @@ class _Runtime:
                 exc_info=True,
             )
         else:
-            self._export()
+            if export:
+                self._export()
         self._safe(self.relay.subscribers.deregister, self._subscriber_name)
         self.host.release_managed_execution(self._subscriber_name)
         self._registered = False
-        try:
-            atexit.unregister(self.shutdown)
-        except Exception:
-            pass
+        self._unregister_shutdown()
 
-    def deactivate(self) -> None:
-        """Stop collection without exporting locally aggregated metrics."""
+    @property
+    def active(self) -> bool:
         with self._sessions_lock:
-            self._active = False
-        self.subscriber.deactivate()
-        if self._registered:
-            self._safe(self.relay.subscribers.deregister, self._subscriber_name)
-            self.host.release_managed_execution(self._subscriber_name)
-            self._registered = False
+            return self._active
+
+    def has_pending_work(self) -> bool:
         with self._sessions_lock:
             sessions = list(self._sessions.values())
         for session in sessions:
             with session.lock:
-                if session.closing:
-                    continue
-                session.closing = True
-                for task_id in list(session.tasks):
-                    self._finish_task(
-                        session,
-                        task_id,
-                        {
-                            "session_id": session.session_id,
-                            "task_id": task_id,
-                            "failed": True,
-                            "turn_exit_reason": "system_aborted",
-                        },
-                    )
-                self._end_pending_model_calls(session, {})
-        with self._sessions_lock:
-            self._sessions.clear()
-        with self._task_sessions_lock:
-            self._task_sessions.clear()
-            self._turn_sessions.clear()
+                if session.tasks or session.model_calls or session.tool_calls:
+                    return True
+        return False
+
+    def retire(self) -> None:
+        """Forget an inactive runtime after all owned scopes have drained."""
+        self._discard_idle_sessions()
+        self._unregister_shutdown()
+
+    def _unregister_shutdown(self) -> None:
+        if not self._shutdown_registered:
+            return
         try:
             atexit.unregister(self.shutdown)
         except Exception:
             pass
+        self._shutdown_registered = False
+
+    def activate(self) -> bool:
+        """Resume collection without replacing ownership of pending scopes."""
+        with self._task_creation_lock:
+            with self._sessions_lock:
+                if self._active:
+                    return True
+                registered = False
+                try:
+                    self.subscriber.activate()
+                    if not self._registered:
+                        self.relay.subscribers.register(
+                            self._subscriber_name,
+                            self.subscriber,
+                        )
+                        registered = True
+                        self.host.retain_managed_execution(self._subscriber_name)
+                        self._registered = True
+                    if not self._shutdown_registered:
+                        atexit.register(self.shutdown)
+                        self._shutdown_registered = True
+                    self._active = True
+                except Exception:
+                    self.subscriber.deactivate()
+                    if registered:
+                        self._safe(
+                            self.relay.subscribers.deregister,
+                            self._subscriber_name,
+                        )
+                        self.host.release_managed_execution(self._subscriber_name)
+                    self._registered = False
+                    logger.warning(
+                        "Hermes shared-metrics reactivation failed",
+                        exc_info=True,
+                    )
+                    return False
+        return True
+
+    def deactivate(self) -> None:
+        """Stop collection while leaving open scopes available for cleanup."""
+        with self._task_creation_lock:
+            with self._sessions_lock:
+                self._active = False
+                self.subscriber.deactivate()
+                if self._registered:
+                    self._safe(
+                        self.relay.subscribers.deregister,
+                        self._subscriber_name,
+                    )
+                    self.host.release_managed_execution(self._subscriber_name)
+                    self._registered = False
+        self._discard_idle_sessions()
+
+    def _discard_idle_session(self, session: _MetricsSession) -> None:
+        with session.lock:
+            idle = not (
+                session.tasks or session.model_calls or session.tool_calls
+            )
+        if not idle:
+            return
+        with self._sessions_lock:
+            if self._sessions.get(session.session_id) is session:
+                self._sessions.pop(session.session_id, None)
+
+    def _discard_idle_sessions(self) -> None:
+        with self._sessions_lock:
+            sessions = list(self._sessions.values())
+        for session in sessions:
+            self._discard_idle_session(session)
 
     def _session(self, event: dict[str, Any]) -> _MetricsSession | None:
         session_id = str(event.get("session_id") or "")
@@ -891,7 +998,7 @@ class _Runtime:
         task: _TaskRun,
         tool_call: _ToolCall,
         event: dict[str, Any],
-    ) -> None:
+    ) -> bool:
         fields = tool_terminal_fields(
             event,
             category=tool_call.category,
@@ -914,32 +1021,45 @@ class _Runtime:
                 "Hermes shared-metrics tool call close failed",
                 exc_info=True,
             )
+            return False
+        return True
 
     def _end_pending_tool_calls(
         self,
         session: _MetricsSession,
         task: _TaskRun,
         event: dict[str, Any],
-    ) -> None:
-        pending_keys = [key for key in session.tool_calls if key[0] == task.task_id]
+    ) -> bool:
+        pending_keys = [
+            key for key in session.tool_calls if key[0] == task.task_id
+        ]
         task_outcome, _, _ = task_terminal_state(event)
         status = {
             "cancelled": "cancelled",
             "timed_out": "timeout",
         }.get(task_outcome, "error")
-        for key in pending_keys:
-            tool_call = session.tool_calls.pop(key, None)
-            if tool_call is not None:
-                self._finish_tool_call(task, tool_call, {**event, "status": status})
+        for key in reversed(pending_keys):
+            tool_call = session.tool_calls.get(key)
+            if tool_call is None:
+                continue
+            if not self._finish_tool_call(
+                task,
+                tool_call,
+                {**event, "status": status},
+            ):
+                return False
+            if session.tool_calls.get(key) is tool_call:
+                session.tool_calls.pop(key, None)
+        return True
 
     def _finish_model_call(
         self,
         session: _MetricsSession,
         model_call_key: tuple[str, str],
-    ) -> None:
-        model_call = session.model_calls.pop(model_call_key, None)
+    ) -> bool:
+        model_call = session.model_calls.get(model_call_key)
         if model_call is None:
-            return
+            return True
         try:
             task = session.tasks.get(model_call.task_id)
             if task is not None:
@@ -962,23 +1082,29 @@ class _Runtime:
             logger.warning(
                 "Hermes shared-metrics model call close failed", exc_info=True
             )
+            return False
+        if session.model_calls.get(model_call_key) is model_call:
+            session.model_calls.pop(model_call_key, None)
+        return True
 
     def _end_pending_model_calls(
         self,
         session: _MetricsSession,
         event: dict[str, Any],
-    ) -> None:
+    ) -> bool:
         task_id = str(event.get("task_id") or "")
         model_call_keys = [
             model_call_key
             for model_call_key, model_call in session.model_calls.items()
             if not task_id or model_call.task_id == task_id
         ]
-        for model_call_key in model_call_keys:
-            self._finish_model_call(
+        for model_call_key in reversed(model_call_keys):
+            if not self._finish_model_call(
                 session,
                 model_call_key,
-            )
+            ):
+                return False
+        return True
 
     @staticmethod
     def _new_model_call_key(event: dict[str, Any]) -> tuple[str, str] | None:
@@ -1014,8 +1140,13 @@ class _Runtime:
         task = session.tasks.get(task_id)
         if task is None:
             return False
-        self._end_pending_tool_calls(session, task, event)
-        self._end_pending_model_calls(session, {**event, "task_id": task_id})
+        if not self._end_pending_tool_calls(session, task, event):
+            return False
+        if not self._end_pending_model_calls(
+            session,
+            {**event, "task_id": task_id},
+        ):
+            return False
         fields = task_terminal_fields(
             {**task.start_fields, **event},
             duration_ms=max(0, (monotonic_ns() - task.started_ns) // 1_000_000),
@@ -1033,17 +1164,17 @@ class _Runtime:
             )
         except Exception:
             logger.warning("Hermes shared-metrics task close failed", exc_info=True)
-        finally:
-            session.tasks.pop(task_id, None)
-            session.retired_turn_ids.extend(task.turn_ids)
-            with self._task_sessions_lock:
-                task_key = (session.session_id, task_id)
-                if self._task_sessions.get(task_key) is session:
-                    self._task_sessions.pop(task_key, None)
-                for turn_id in task.turn_ids:
-                    turn_key = (session.session_id, turn_id)
-                    if self._turn_sessions.get(turn_key) is session:
-                        self._turn_sessions.pop(turn_key, None)
+            return False
+        session.tasks.pop(task_id, None)
+        session.retired_turn_ids.extend(task.turn_ids)
+        with self._task_sessions_lock:
+            task_key = (session.session_id, task_id)
+            if self._task_sessions.get(task_key) is session:
+                self._task_sessions.pop(task_key, None)
+            for turn_id in task.turn_ids:
+                turn_key = (session.session_id, turn_id)
+                if self._turn_sessions.get(turn_key) is session:
+                    self._turn_sessions.pop(turn_key, None)
         return True
 
     def _export(self) -> None:
@@ -1088,25 +1219,41 @@ def enabled() -> bool:
             isinstance(shared_metrics, dict) and shared_metrics.get("enabled") is True
         )
     if value:
+        with _RUNTIME_LOCK:
+            runtime = _RUNTIMES.get(profile_key)
+            if isinstance(runtime, _Runtime) and not runtime.active:
+                runtime.activate()
         return True
     with _RUNTIME_LOCK:
-        runtime = _RUNTIMES.pop(profile_key, None)
+        runtime = _RUNTIMES.get(profile_key)
         if isinstance(runtime, _Runtime):
             runtime.deactivate()
+            if not runtime.has_pending_work():
+                if _RUNTIMES.get(profile_key) is runtime:
+                    _RUNTIMES.pop(profile_key, None)
+                runtime.retire()
     return False
 
 
 def handles_hook(hook_name: str) -> bool:
-    return hook_name in HANDLED_HOOKS and enabled()
+    if hook_name not in HANDLED_HOOKS:
+        return False
+    if enabled():
+        return True
+    return hook_name in CLEANUP_HOOKS and _existing_runtime() is not None
 
 
 def observe_lifecycle(hook_name: str, **kwargs: Any) -> None:
     """Project one Hermes lifecycle event into the core Relay integration."""
-    if not handles_hook(hook_name):
+    if hook_name not in HANDLED_HOOKS:
         return
-    if not relay_runtime.relay_instrumentation_enabled():
+    collection_enabled = enabled()
+    cleanup = hook_name in CLEANUP_HOOKS
+    if not collection_enabled and not cleanup:
         return
-    runtime = _get_runtime()
+    if not relay_runtime.relay_instrumentation_enabled() and not cleanup:
+        return
+    runtime = _get_runtime() if collection_enabled else _existing_runtime()
     if runtime is None:
         return
     try:
@@ -1140,6 +1287,8 @@ def observe_lifecycle(hook_name: str, **kwargs: Any) -> None:
         logger.warning(
             "Hermes shared metrics hook failed: %s", hook_name, exc_info=True
         )
+    finally:
+        _retire_inactive_runtime_if_drained(runtime)
 
 
 def _with_runtime_toolset(event: dict[str, Any]) -> dict[str, Any]:
@@ -1208,9 +1357,8 @@ def finish_task_run(
     error: BaseException | None = None,
 ) -> None:
     """Finish task metrics for every return or exception path."""
-    if not enabled():
-        return
-    runtime = _get_runtime()
+    collection_enabled = enabled()
+    runtime = _get_runtime() if collection_enabled else _existing_runtime()
     if runtime is None:
         return
 
@@ -1249,6 +1397,29 @@ def finish_task_run(
             "turn_exit_reason": reason,
         },
     )
+    _retire_inactive_runtime_if_drained(runtime)
+
+
+def _existing_runtime() -> _Runtime | None:
+    profile_key = relay_runtime.current_profile_key()
+    with _RUNTIME_LOCK:
+        runtime = _RUNTIMES.get(profile_key)
+    return runtime if isinstance(runtime, _Runtime) else None
+
+
+def _retire_inactive_runtime_if_drained(runtime: _Runtime) -> None:
+    if runtime.active or runtime.has_pending_work():
+        return
+    profile_key = runtime.host.profile_key
+    with _RUNTIME_LOCK:
+        if (
+            _RUNTIMES.get(profile_key) is not runtime
+            or runtime.active
+            or runtime.has_pending_work()
+        ):
+            return
+        _RUNTIMES.pop(profile_key, None)
+    runtime.retire()
 
 
 def _get_runtime(
@@ -1263,7 +1434,10 @@ def _get_runtime(
             if host is None or runtime.host is host:
                 return runtime
             runtime.deactivate()
+            if runtime.has_pending_work():
+                return None
             _RUNTIMES.pop(profile_key, None)
+            runtime.retire()
         if runtime is _RUNTIME_FAILED and not retry_failed:
             return None
         if runtime is _RUNTIME_FAILED:

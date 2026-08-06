@@ -1242,6 +1242,13 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     from agent import relay_llm
 
     active_client = client or agent._ensure_primary_openai_client(reason="codex_stream_direct")
+    raw_client = getattr(active_client, "_real_client", active_client)
+    response_create = getattr(getattr(raw_client, "responses", None), "create", None)
+    if not callable(response_create):
+        raise TypeError(
+            "Codex Responses API client must expose responses.create "
+            f"(got {type(raw_client).__name__})"
+        )
     max_stream_retries = 1
     # Accumulate streamed text so callers / compat shims can read it.
     agent._codex_streamed_text_parts: list = []
@@ -1271,7 +1278,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         def _open_codex_stream(next_api_kwargs: dict[str, Any]):
             stream_kwargs = dict(next_api_kwargs)
             stream_kwargs["stream"] = True
-            return active_client.responses.create(**stream_kwargs)
+            return response_create(**stream_kwargs)
 
         def _codex_stream_created(_raw_stream: Any) -> None:
             # Claim the delta sink for THIS physical attempt. A newer attempt

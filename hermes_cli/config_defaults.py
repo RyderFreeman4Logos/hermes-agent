@@ -28,6 +28,12 @@ DEFAULT_CONFIG = {
     # sessions (no live client) so accumulated agents don't pile up under memory
     # pressure. Reopening one re-resumes it from disk. 0/null disables.
     "max_live_sessions": 16,
+    # Warm-KV heartbeats are opt-in and exist only for explicitly managed
+    # background targets. Provider intervals have no fallback semantics.
+    "runtime": {
+        "warm_kv_timeout": {"providers": {}},
+        "heartbeat": {"enabled": False, "mode": "per_target"},
+    },
     "agent": {
         "max_turns": 500,
         # Inactivity timeout for gateway agent execution (seconds).
@@ -295,6 +301,11 @@ DEFAULT_CONFIG = {
         # it here without patching the built desktop app.
         "font_family": "",
         "timeout": 180,
+        "process_poll_strike_limit": 3,
+        "process_poll_strike_window_s": 120,
+        # Foreground calls whose real execution budget exceeds this are
+        # promoted to managed background execution so the turn stays steerable.
+        "auto_background_timeout_threshold": 200,
         # Bounded grace period (seconds) between SIGTERM and an escalated
         # SIGKILL when terminating a host process tree (browser daemons, etc.).
         # A daemon that stalls in its SIGTERM handler is force-killed after this
@@ -950,6 +961,16 @@ DEFAULT_CONFIG = {
             "timeout": 30,
             "extra_body": {},
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
+        },
+        # Optional fail-open gate for routine successful background-process
+        # completions. Disabled until the configured route is smoke-proven.
+        "completion_visibility": {
+            "enabled": False,
+            "provider": "pm",
+            "model": "gpt-5.6-luna",
+            "timeout": 20,  # total single-request budget; no retry or fallback
+            "extra_body": {},
+            "reasoning_effort": "max",
         },
         "mcp": {
             "provider": "auto",
@@ -1761,9 +1782,14 @@ DEFAULT_CONFIG = {
                                  # "medium", "low", "minimal", "none" (empty = inherit)
         "max_concurrent_children": 3,  # unified concurrency cap: max parallel children per batch
                                        # AND max concurrent background (background=true)
-                                       # delegation units. New async dispatches beyond the cap
-                                       # fall back to synchronous execution. Floor of 1, no ceiling.
+                                       # delegation units. Forced async dispatches beyond the cap
+                                       # are rejected; explicit non-forced Python callers fall back
+                                       # synchronously. Floor of 1, no ceiling.
                                        # (Replaces the deprecated max_async_children.)
+        # Default only for direct/internal Python callers that omit
+        # force_background. Model-facing top-level and nested delegation is
+        # always asynchronous and rejects before start when unavailable.
+        "force_background": False,
         # Orchestrator role controls (see tools/delegate_tool.py:_get_max_spawn_depth
         # and _get_orchestrator_enabled).  Floored at 1, no upper ceiling —
         # raise deliberately, each level multiplies API cost.

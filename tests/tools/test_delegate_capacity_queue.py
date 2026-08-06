@@ -456,10 +456,19 @@ def test_queued_cancellation_waits_for_durable_registration_and_completes_once(
     original_persist_dispatch = ad._persist_dispatch
 
     def blocked_persist_dispatch(record):
-        records_lock_was_free = ad._records_lock.acquire(blocking=False)
-        if records_lock_was_free:
-            ad._records_lock.release()
-        persisted_under_records_lock.append(not records_lock_was_free)
+        records_lock_was_free = []
+
+        def probe_records_lock():
+            acquired = ad._records_lock.acquire(blocking=False)
+            records_lock_was_free.append(acquired)
+            if acquired:
+                ad._records_lock.release()
+
+        probe = threading.Thread(target=probe_records_lock)
+        probe.start()
+        probe.join(timeout=5)
+        assert not probe.is_alive()
+        persisted_under_records_lock.append(not records_lock_was_free[0])
         persist_entered.set()
         assert release_persist.wait(timeout=60)
         original_persist_dispatch(record)
@@ -770,7 +779,10 @@ def test_public_handler_cleans_resources_after_schedule_rejection(monkeypatch):
         )
     )
 
-    assert result == {"error": "submit failed"}
+    assert result["status"] == "rejected"
+    assert result["mode"] == "background"
+    assert "submit failed" in result["error"]
+    assert "not started" in result["note"]
     assert parent._active_children == []
     assert len(children) == 2
     for child in children:

@@ -100,3 +100,65 @@ class TestBackgroundCommandTuiRefresh:
         # Clean up
         cli_obj._background_tasks.pop(task_id, None)
         assert task_id not in cli_obj._background_tasks
+
+    def test_background_agent_preserves_requested_provider(self, monkeypatch):
+        captured = {}
+
+        class ImmediateThread:
+            def __init__(self, target=None, **_kwargs):
+                self.target = target
+
+            def start(self):
+                self.target()
+
+        class Agent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+            def run_conversation(self, **_kwargs):
+                return {"final_response": ""}
+
+        cli_obj = _make_cli()
+        cli_obj.max_turns = 1
+        cli_obj.enabled_toolsets = ["terminal"]
+        cli_obj._session_db = None
+        cli_obj.reasoning_config = None
+        cli_obj.service_tier = None
+        cli_obj._providers_only = None
+        cli_obj._providers_ignore = None
+        cli_obj._providers_order = None
+        cli_obj._provider_sort = None
+        cli_obj._provider_require_params = False
+        cli_obj._provider_data_collection = None
+        cli_obj._openrouter_min_coding_score = None
+        cli_obj._fallback_model = None
+        cli_obj._sudo_password_callback = None
+        cli_obj._approval_callback = None
+        cli_obj._secret_capture_callback = None
+        cli_obj._agent_running = False
+        cli_obj._spinner_text = ""
+        cli_obj.bell_on_complete = False
+        cli_obj._ensure_runtime_credentials = lambda: True
+        cli_obj._resolve_turn_agent_config = lambda _prompt: {
+            "model": "gpt-5.4-mini",
+            "runtime": {
+                "provider": "custom",
+                "requested_provider": "custom:pm",
+                "base_url": "https://pm.invalid/v1",
+                "api_key": "key",
+                "api_mode": "chat_completions",
+            },
+        }
+        monkeypatch.setattr("cli.AIAgent", Agent)
+        monkeypatch.setattr(
+            "hermes_cli.cli_commands_mixin.threading.Thread", ImmediateThread
+        )
+        monkeypatch.setattr("cli._cprint", lambda *_args, **_kwargs: None)
+        monkeypatch.setattr(
+            "cli.ChatConsole", lambda: MagicMock(print=lambda *_args, **_kwargs: None)
+        )
+
+        cli_obj._handle_background_command("/background check")
+
+        assert captured["provider"] == "custom"
+        assert captured["requested_provider"] == "custom:pm"

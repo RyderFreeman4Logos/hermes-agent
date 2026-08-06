@@ -3,7 +3,9 @@
 Verifies that users get an immediate status response instead of total silence
 when the agent is working on a task. See PR fix for the @Lonely__MH report.
 """
+import asyncio
 import time
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -25,12 +27,15 @@ sys.modules.setdefault("telegram.constants", _tg.constants)
 sys.modules.setdefault("telegram.ext", types.ModuleType("telegram.ext"))
 
 from gateway.platforms.base import (
+    BasePlatformAdapter,
     MessageEvent,
     MessageType,
     Platform,
+    SendResult,
     SessionSource,
     build_session_key,
 )
+from gateway.config import GatewayConfig, PlatformConfig
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +94,25 @@ def _make_adapter(platform_val="telegram"):
     adapter._text_debounce = {}
     adapter._busy_text_debounce_seconds = 0.6
     return adapter
+
+
+class _HeartbeatAdapter(BasePlatformAdapter):
+    def __init__(self):
+        super().__init__(PlatformConfig(enabled=True), Platform.TELEGRAM)
+        self.sent = []
+
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        return True
+
+    async def disconnect(self) -> None:
+        return None
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None):
+        self.sent.append((chat_id, content, reply_to, metadata))
+        return SendResult(success=True)
+
+    async def get_chat_info(self, chat_id):
+        return {"name": "heartbeat", "type": "private"}
 
 
 # ---------------------------------------------------------------------------
@@ -469,5 +493,130 @@ class TestLongRunningNotificationOwnership:
         assert runner._should_emit_long_running_notification(
             "sess", original_agent, executor_task=None
         ) is False
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_queue_owner_blocks_redrain_and_reports_stop_busy():
+    from gateway.run import GatewayRunner
+
+    adapter = _HeartbeatAdapter()
+    runner = GatewayRunner(GatewayConfig())
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._is_user_authorized = lambda _source: True
+    runner._persist_active_agents = lambda: None
+    runner._recover_telegram_topic_thread_id = lambda _source: None
+
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="heartbeat-chat",
+        chat_type="private",
+        user_id="heartbeat-user",
+    )
+    session_key = build_session_key(source)
+    runner.session_store.get_or_create_session(source)
+    cached_agent = MagicMock()
+    runner._agent_cache[session_key] = (cached_agent, "sig", 0, "heartbeat-session")
+
+    heartbeat_started = asyncio.Event()
+    release_heartbeat = asyncio.Event()
+
+    async def blocked_heartbeat(*_args):
+        heartbeat_started.set()
+        await release_heartbeat.wait()
+
+    runner._run_isolated_heartbeat = blocked_heartbeat
+    runner._handle_message_with_agent = AsyncMock(return_value="ordinary reply")
+    heartbeat_event = {
+        "type": "heartbeat",
+        "target_id": "heartbeat-target",
+        "target_ids": ["heartbeat-target"],
+        "generation": 1,
+        "generations": [1],
+        "target_kind": "process",
+        "session_key": session_key,
+        "provider": "openrouter",
+        "cache_context": "heartbeat-cache",
+        "status": "ALIVE",
+        "evidence": "alive",
+    }
+    ordinary = MessageEvent(
+        text="ordinary prompt", source=source, message_id="ordinary-1"
+    )
+
+    handler_calls = 0
+
+    async def counted_handler(inbound):
+        nonlocal handler_calls
+        handler_calls += 1
+        result = await runner._handle_message(inbound)
+        if handler_calls > 1 and not release_heartbeat.is_set():
+            adapter._pending_messages.pop(session_key, None)
+        return result
+
+    adapter.set_message_handler(counted_handler)
+    adapter.set_busy_session_handler(runner._handle_active_session_busy_message)
+
+    with (
+        patch(
+            "tools.runtime_heartbeat.runtime_heartbeat.is_event_current",
+            return_value=True,
+        ),
+        patch("hermes_cli.plugins.invoke_hook", return_value=[]) as hook,
+    ):
+        heartbeat_task = asyncio.create_task(
+            runner._handle_heartbeat_event(heartbeat_event)
+        )
+        await heartbeat_started.wait()
+        owner = runner._session_state(session_key).turn.heartbeat_owner
+
+        stop_result = await runner._handle_message(
+            MessageEvent(text="/stop", source=source, message_id="stop-1")
+        )
+        owner_after_stop = runner._session_state(session_key).turn.heartbeat_owner
+        cached_after_stop = runner._agent_cache.get(session_key)
+
+        hook_baseline = hook.call_count
+        await adapter.handle_message(ordinary)
+        first_task = adapter._session_tasks[session_key]
+        await first_task
+        spawned = adapter._session_tasks.get(session_key)
+        if spawned is not None:
+            await spawned
+        calls_before_release = handler_calls
+        hooks_before_release = hook.call_count - hook_baseline
+        queued_before_release = adapter._pending_messages.get(session_key) is ordinary
+        no_redrain_task = session_key not in adapter._session_tasks
+
+        release_heartbeat.set()
+        await heartbeat_task
+        drain_task = adapter._session_tasks.get(session_key)
+        if drain_task is not None:
+            await drain_task
+        calls_after_release = handler_calls
+        hooks_after_release = hook.call_count - hook_baseline
+
+        positive = MessageEvent(
+            text="ordinary positive control",
+            source=source,
+            message_id="ordinary-2",
+        )
+        await adapter.handle_message(positive)
+        await adapter._session_tasks[session_key]
+
+    stop_text = str(stop_result).lower()
+    assert "heartbeat" in stop_text and "busy" in stop_text
+    assert "stopped" not in stop_text and "unlocked" not in stop_text
+    assert owner is not None and owner_after_stop is owner
+    assert cached_after_stop is not None and cached_after_stop[0] is cached_agent
+    assert calls_before_release == 1
+    assert hooks_before_release == 1
+    assert queued_before_release is True
+    assert no_redrain_task is True
+    assert calls_after_release == 2
+    assert hooks_after_release == 2
+    assert session_key not in adapter._pending_messages
+    assert runner._session_state(session_key).turn.heartbeat_owner is None
+    assert runner._session_state(session_key).turn.agent is None
+    assert handler_calls == 3
 
 

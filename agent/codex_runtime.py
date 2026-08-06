@@ -844,7 +844,10 @@ def run_codex_app_server_turn(
 
     # External memory provider sync (mirrors line ~15439). Skipped on
     # interrupt/error to avoid feeding partial transcripts to memory.
-    if not turn.interrupted and turn.error is None:
+    if (
+        not turn.interrupted
+        and turn.error is None
+    ):
         try:
             agent._sync_external_memory_for_turn(
                 original_user_message=original_user_message,

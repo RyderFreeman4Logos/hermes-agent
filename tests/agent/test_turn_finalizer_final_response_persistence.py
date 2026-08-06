@@ -1,7 +1,33 @@
+import subprocess
+import sys
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 from agent.turn_finalizer import finalize_turn
+
+
+def test_scaffolding_filter_does_not_import_run_agent():
+    code = """
+import sys
+from agent.message_sanitization import _EPHEMERAL_SCAFFOLDING_FLAGS
+from agent.turn_finalizer import _drop_ephemeral_scaffolding
+
+assert "run_agent" not in sys.modules
+real_messages = [
+    {"role": "user", "content": "real"},
+    {"role": "assistant", "content": "done"},
+]
+messages = real_messages + [
+    {"role": "user", "content": flag, flag: True}
+    for flag in _EPHEMERAL_SCAFFOLDING_FLAGS
+]
+_drop_ephemeral_scaffolding(messages)
+assert messages == real_messages
+assert "run_agent" not in sys.modules
+"""
+    subprocess.run([sys.executable, "-c", code], check=True)
 
 
 class FakeAgent:
@@ -178,9 +204,47 @@ def test_final_response_fills_pure_tool_call_tail(monkeypatch):
     assert sum(1 for m in persisted if m.get("role") == "assistant") == 1
 
 
+@pytest.mark.parametrize("assistant_text", ["Build finished successfully", ""])
+def test_completion_nudge_is_removed_from_finalized_live_history(
+    monkeypatch, assistant_text
+):
+    """Finalization drops only the nudge for meaningful and empty responses."""
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = FakeAgent()
+    nudge = {
+        "role": "user",
+        "content": "completion payload and model-only instruction",
+        "_completion_delivery_synthetic": True,
+    }
+    messages = [
+        {"role": "user", "content": "start the build"},
+        {"role": "assistant", "content": "working"},
+        nudge,
+    ]
+    if assistant_text:
+        messages.append({"role": "assistant", "content": assistant_text})
 
+    result = finalize_turn(
+        agent,
+        final_response=assistant_text,
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message=nudge["content"],
+        original_user_message=nudge["content"],
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(final)" if assistant_text else "empty_response",
+    )
 
-
+    assert nudge not in result["messages"]
+    assert nudge not in agent.persisted_messages
+    assert (assistant_text in [m["content"] for m in result["messages"]]) is bool(
+        assistant_text
+    )
 
 def test_final_response_fill_invalidates_flush_scan_cursor():
     """The fill's marker pop must invalidate the bounded flush-scan cursor.

@@ -4868,7 +4868,7 @@ def test_ws_orphan_reap_releases_resume_lock_before_slow_teardown(monkeypatch):
     assert not thread.is_alive()
 
 
-def test_ws_orphan_reap_waits_for_active_delegation_then_reaps(monkeypatch):
+def test_ws_orphan_reap_waits_for_queued_delegation_then_reaps(monkeypatch):
     from tools import async_delegation
 
     callbacks = []
@@ -4898,7 +4898,7 @@ def test_ws_orphan_reap_waits_for_active_delegation_then_reaps(monkeypatch):
     )
     with async_delegation._records_lock:
         async_delegation._records[delegation_id] = {
-            "status": "running",
+            "status": "queued",
             "origin_ui_session_id": "delegating-sid",
         }
 

@@ -112,6 +112,15 @@ def _emit_compaction_done(agent: Any) -> None:
         logger.debug("status_callback error in compaction completion", exc_info=True)
 
 
+def _refresh_delegate_model_pool_schema_after_compression(agent: Any) -> None:
+    try:
+        from tools.delegate_tool import refresh_model_pool_schema_after_compression
+
+        refresh_model_pool_schema_after_compression(agent)
+    except Exception:
+        logger.debug("delegate model-pool schema refresh failed", exc_info=True)
+
+
 # ── Routine compression status templates ────────────────────────────────────
 # Every ROUTINE (non-failure, non-manual-/compress) compression status line the
 # agent emits lives here so the gateway noise filter and its tests can couple
@@ -3551,6 +3560,10 @@ def compress_context(
                 else None
             ),
         )
+        if split_status in {
+            "not_applicable", "in_place_committed", "rotated_committed",
+        }:
+            _refresh_delegate_model_pool_schema_after_compression(agent)
         return compressed, new_system_prompt
     finally:
         # Release the lock on the OLD session_id only AFTER rotation completed
@@ -3689,6 +3702,8 @@ def _compress_context_via_codex_app_server(
             _record_codex_app_server_usage(agent, result)
     except Exception:
         logger.debug("codex compaction bookkeeping failed", exc_info=True)
+
+    _refresh_delegate_model_pool_schema_after_compression(agent)
 
     try:
         from tools.file_tools import reset_file_dedup

@@ -20,6 +20,10 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List
 
+from agent.message_sanitization import (
+    COMPLETION_DELIVERY_INTERRUPTED_CLOSURE,
+    close_interrupted_tool_sequence,
+)
 from agent.tool_dispatch_helpers import make_tool_result_message
 from agent.tool_result_classification import tool_may_have_side_effect
 from agent.turn_context import drop_stale_api_content
@@ -153,6 +157,24 @@ def strip_dangling_tool_call_tail(
         return agent_history
 
     tool_calls = last.get("tool_calls") or []
+    completion_event_idx = len(agent_history) - 2
+    completion_event = (
+        agent_history[completion_event_idx]
+        if completion_event_idx >= 0
+        else None
+    )
+    completion_metadata = (
+        completion_event.get("display_metadata")
+        if isinstance(completion_event, dict)
+        else None
+    )
+    is_completion_intent = (
+        isinstance(completion_event, dict)
+        and completion_event.get("role") == "user"
+        and completion_event.get("display_kind") == "hidden"
+        and isinstance(completion_metadata, dict)
+        and completion_metadata.get("completion_delivery_status") == "effect_started"
+    )
     if any(
         tool_may_have_side_effect(
             str((call.get("function") or {}).get("name") or "")
@@ -160,6 +182,12 @@ def strip_dangling_tool_call_tail(
         for call in tool_calls
     ):
         recovered = list(agent_history)
+        if is_completion_intent:
+            recovered_event = dict(completion_event)
+            recovered_metadata = dict(completion_metadata)
+            recovered_metadata["completion_delivery_status"] = "interrupted"
+            recovered_event["display_metadata"] = recovered_metadata
+            recovered[completion_event_idx] = recovered_event
         for call in tool_calls:
             function = call.get("function") or {}
             name = str(function.get("name") or "unknown")
@@ -174,6 +202,10 @@ def strip_dangling_tool_call_tail(
             recovered.append(make_tool_result_message(
                 name, content, call_id, effect_disposition=disposition,
             ))
+        if is_completion_intent and close_interrupted_tool_sequence(
+            recovered, COMPLETION_DELIVERY_INTERRUPTED_CLOSURE
+        ):
+            recovered[-1]["display_kind"] = "hidden"
         logger.warning(
             "Recovered dangling side-effecting tool call(s) as UNKNOWN instead of erasing them"
         )
@@ -183,7 +215,7 @@ def strip_dangling_tool_call_tail(
         "Stripping dangling unanswered read-only assistant(tool_calls) tail (%d call(s))",
         len(tool_calls),
     )
-    return agent_history[:-1]
+    return agent_history[:-2] if is_completion_intent else agent_history[:-1]
 
 
 def sanitize_replay_history(

@@ -4844,6 +4844,7 @@ def test_ws_orphan_reap_releases_resume_lock_before_slow_teardown(monkeypatch):
     monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0.01)
     monkeypatch.setattr(server.threading, "Timer", _Timer)
     monkeypatch.setattr(server, "_teardown_session", _slow_teardown)
+    monkeypatch.setattr(server, "_session_has_active_delegations", lambda *_a: False)
     server._sessions["slow-orphan"] = _session(
         transport=server._detached_ws_transport,
         running=False,
@@ -13113,9 +13114,43 @@ def test_session_branch_writes_to_parent_profile_db(monkeypatch, tmp_path):
             self.model = "test-model"
             self.session_id = None
 
+    structured_history = [
+        {
+            "role": "user",
+            "content": "clean event",
+            "api_content": "wire event with model-only instruction",
+            "display_kind": "hidden",
+            "display_metadata": {"completion_delivery_status": "complete"},
+            "timestamp": 123.0,
+        },
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "branch-call",
+                "type": "function",
+                "function": {"name": "terminal", "arguments": "{}"},
+            }],
+            "reasoning": "checked",
+            "timestamp": 124.0,
+        },
+        {
+            "role": "tool",
+            "content": "done",
+            "name": "terminal",
+            "tool_call_id": "branch-call",
+            "timestamp": 125.0,
+        },
+        {
+            "role": "assistant",
+            "content": "Operation completed.",
+            "display_kind": "hidden",
+            "timestamp": 126.0,
+        },
+    ]
     parent = {
         "session_key": "parent-key",
-        "history": [{"role": "user", "content": "hi"}],
+        "history": copy.deepcopy(structured_history),
         "history_lock": __import__("threading").Lock(),
         "running": False,
         "cols": 80,
@@ -13157,7 +13192,15 @@ def test_session_branch_writes_to_parent_profile_db(monkeypatch, tmp_path):
         # profile, not left NULL for aggregators to mis-tag as "default".
         assert seen.get("profile_name") == "mlperf"
         assert seen.get("title") == (seen["created"], "forked")
-        assert len(seen["msgs"]) == 1
+        assert len(seen["msgs"]) == len(structured_history)
+        copied = [
+            {key: value for key, value in row.items() if key != "session_id"}
+            for row in seen["msgs"]
+        ]
+        assert copied == structured_history
+        assert seen["msgs"][1]["tool_calls"][0]["function"]["name"] == "terminal"
+        assert seen["msgs"][2]["tool_call_id"] == "branch-call"
+        assert seen["msgs"][0]["api_content"] == "wire event with model-only instruction"
         assert seen.get("launch") is None
         assert seen.get("launch_create") is None
         child_sid = resp["result"]["session_id"]
@@ -13169,6 +13212,73 @@ def test_session_branch_writes_to_parent_profile_db(monkeypatch, tmp_path):
     finally:
         for k in list(server._sessions):
             server._sessions.pop(k, None)
+
+
+def test_first_turn_branch_seed_preserves_full_message_structure(monkeypatch):
+    """The delayed branch writer must use the same full-row serializer."""
+    import contextlib
+
+    structured_history = [
+        {
+            "role": "user",
+            "content": "clean event",
+            "api_content": "wire event with model-only instruction",
+            "display_kind": "hidden",
+            "display_metadata": {"completion_delivery_status": "failed"},
+            "timestamp": 123.0,
+        },
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "seed-call",
+                "type": "function",
+                "function": {"name": "terminal", "arguments": "{}"},
+            }],
+            "reasoning_details": [{"type": "summary", "text": "checked"}],
+            "timestamp": 124.0,
+        },
+        {
+            "role": "tool",
+            "content": "done",
+            "name": "terminal",
+            "tool_call_id": "seed-call",
+            "timestamp": 125.0,
+        },
+    ]
+    captured = {}
+
+    class DB:
+        def append_messages_batch(self, session_id, messages, **kwargs):
+            captured["session_id"] = session_id
+            captured["messages"] = messages
+            captured["kwargs"] = kwargs
+            return len(messages)
+
+    @contextlib.contextmanager
+    def fake_session_db(_session):
+        yield DB()
+
+    monkeypatch.setattr(server, "_session_db", fake_session_db)
+    session = {
+        "session_key": "branch-key",
+        "parent_session_id": "parent-key",
+        "history": copy.deepcopy(structured_history),
+        "history_lock": threading.Lock(),
+    }
+
+    server._persist_branch_seed(session)
+
+    assert session["_branch_seed_persisted"] is True
+    assert captured == {
+        "session_id": "branch-key",
+        "messages": structured_history,
+        "kwargs": {"chunk_rows": 500},
+    }
+    # Prove that the writer received an isolated deep copy, not the live
+    # branch history or its nested tool-call objects.
+    captured["messages"][1]["tool_calls"][0]["function"]["name"] = "mutated"
+    assert session["history"][1]["tool_calls"][0]["function"]["name"] == "terminal"
 
 
 def test_session_branch_installs_parent_profile_secret_scope(monkeypatch, tmp_path):

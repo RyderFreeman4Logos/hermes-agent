@@ -7061,6 +7061,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         compression_lock_holder: Optional[str] = None,
         chunk_rows: Optional[int] = None,
         compression_patience_s: Optional[float] = None,
+        display_metadata_cas: Optional[Dict[str, Any]] = None,
     ) -> int:
         """Append multiple messages atomically in ONE write transaction.
 
@@ -7088,11 +7089,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         recovery semantics as the old per-row loops (a mid-copy failure
         leaves a partial seed), just with bounded lock holds. A turn flush
         never needs it. Returns the inserted row count.
+
+        ``display_metadata_cas`` atomically transitions one already-persisted
+        active row's presentation metadata in the same transaction as the
+        append.  The match includes the row's complete provider/transcript
+        identity and expected metadata, so a stale finalizer cannot update a
+        different occurrence of the same user text.
         """
-        if not messages:
+        if not messages and not display_metadata_cas:
             return 0
 
         if chunk_rows is not None and len(messages) > chunk_rows:
+            if display_metadata_cas:
+                raise ValueError(
+                    "display_metadata_cas cannot be combined with chunked append"
+                )
             inserted_total = 0
             for start in range(0, len(messages), chunk_rows):
                 inserted_total += self.append_messages_batch(
@@ -7107,6 +7118,51 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             self._check_transcript_write_guards(
                 conn, session_id, compression_lock_holder
             )
+            if display_metadata_cas:
+                expected_metadata = self._encode_display_metadata(
+                    display_metadata_cas.get("expected_display_metadata")
+                )
+                replacement_metadata = self._encode_display_metadata(
+                    display_metadata_cas.get("display_metadata")
+                )
+                role = display_metadata_cas.get("role")
+                content = self._encode_content(display_metadata_cas.get("content"))
+                api_content = display_metadata_cas.get("api_content")
+                if isinstance(api_content, str):
+                    api_content = _scrub_surrogates(api_content)
+                else:
+                    api_content = None
+                display_kind = display_metadata_cas.get("display_kind")
+                if isinstance(display_kind, str):
+                    display_kind = _scrub_surrogates(display_kind)
+                else:
+                    display_kind = None
+                cursor = conn.execute(
+                    """UPDATE messages SET display_metadata = ?
+                       WHERE id = (
+                           SELECT id FROM messages
+                           WHERE session_id = ? AND active = 1
+                             AND role IS ? AND content IS ?
+                             AND api_content IS ? AND display_kind IS ?
+                             AND display_metadata IS ?
+                           ORDER BY id DESC LIMIT 1
+                       )
+                       AND display_metadata IS ?""",
+                    (
+                        replacement_metadata,
+                        session_id,
+                        role,
+                        content,
+                        api_content,
+                        display_kind,
+                        expected_metadata,
+                        expected_metadata,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError(
+                        "display metadata compare-and-set matched no active message"
+                    )
             inserted, tool_calls_total = self._insert_message_rows(
                 conn, session_id, messages
             )
@@ -7129,6 +7185,222 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             _do,
             patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S,
             compression_patience_s=compression_patience_s,
+        )
+
+    def recover_dangling_completion_tool_intent(self, session_id: str) -> str:
+        """Durably recover a completion event that crashed before tool results.
+
+        ``finalize_completion_delivery_suffix(..., commit_tool_intent=True)``
+        atomically stores a hidden ``effect_started`` user event followed by
+        its assistant tool-call intent before any tool runs.  A hard process
+        death can leave exactly those two active rows at the transcript tail.
+
+        Read-only calls are safe to withdraw as one inactive audit group.
+        Potentially side-effecting calls cannot be retried or erased: preserve
+        their intent, mark the event interrupted, append UNKNOWN tool results,
+        and close the provider protocol with a hidden assistant row.
+
+        Selection, exact-row fences, metadata transition/archive, recovery
+        rows, and session counters share one ``BEGIN IMMEDIATE`` transaction.
+        A stale or partial match therefore changes nothing.  Returns
+        ``"none"``, ``"read_only_archived"``, or ``"side_effect_closed"``.
+        """
+        if not session_id or self.read_only:
+            return "none"
+
+        # ``SessionStore.load_transcript`` is also the ordinary gateway turn
+        # loader, so avoid taking a SQLite write lock for healthy sessions.
+        # The write transaction repeats this predicate and owns the only
+        # authoritative decision; this is only a cheap fast-negative probe.
+        with self._read_ctx() as conn:
+            preflight_tail = conn.execute(
+                "SELECT role, tool_calls, display_kind, display_metadata "
+                "FROM messages WHERE session_id = ? AND active = 1 "
+                "ORDER BY id DESC LIMIT 2",
+                (session_id,),
+            ).fetchall()
+        if len(preflight_tail) != 2:
+            return "none"
+        preflight_intent, preflight_event = preflight_tail
+        preflight_metadata = self._decode_display_metadata(
+            preflight_event["display_metadata"]
+        )
+        if not (
+            preflight_event["role"] == "user"
+            and preflight_event["display_kind"] == "hidden"
+            and isinstance(preflight_metadata, dict)
+            and preflight_metadata.get("completion_delivery_status")
+            == "effect_started"
+            and preflight_intent["role"] == "assistant"
+            and preflight_intent["tool_calls"]
+        ):
+            return "none"
+
+        def _do(conn):
+            self._check_transcript_write_guards(conn, session_id, None)
+            tail = conn.execute(
+                "SELECT * FROM messages "
+                "WHERE session_id = ? AND active = 1 "
+                "ORDER BY id DESC LIMIT 2",
+                (session_id,),
+            ).fetchall()
+            if len(tail) != 2:
+                return "none"
+
+            intent, event = tail
+            metadata = self._decode_display_metadata(event["display_metadata"])
+            if not (
+                event["role"] == "user"
+                and event["display_kind"] == "hidden"
+                and isinstance(metadata, dict)
+                and metadata.get("completion_delivery_status") == "effect_started"
+                and intent["role"] == "assistant"
+                and intent["tool_calls"]
+            ):
+                return "none"
+            try:
+                tool_calls = json.loads(intent["tool_calls"])
+            except (json.JSONDecodeError, TypeError):
+                return "none"
+            if not isinstance(tool_calls, list) or not tool_calls:
+                return "none"
+
+            from agent.tool_result_classification import tool_may_have_side_effect
+
+            effect_capable = any(
+                not isinstance(call, dict)
+                or tool_may_have_side_effect(
+                    str((call.get("function") or {}).get("name") or "")
+                )
+                for call in tool_calls
+            )
+            event_fence = (
+                event["id"],
+                session_id,
+                event["role"],
+                event["content"],
+                event["api_content"],
+                event["display_kind"],
+                event["display_metadata"],
+            )
+            intent_fence = (
+                intent["id"],
+                session_id,
+                intent["role"],
+                intent["content"],
+                intent["tool_calls"],
+                intent["api_content"],
+                intent["display_kind"],
+                intent["display_metadata"],
+            )
+            replacement_metadata = dict(metadata)
+            replacement_metadata["completion_delivery_status"] = "interrupted"
+            replacement_metadata_json = self._encode_display_metadata(
+                replacement_metadata
+            )
+
+            if not effect_capable:
+                event_cursor = conn.execute(
+                    """UPDATE messages
+                       SET active = 0, display_metadata = ?
+                       WHERE id = ? AND session_id = ? AND active = 1
+                         AND role IS ? AND content IS ? AND api_content IS ?
+                         AND display_kind IS ? AND display_metadata IS ?""",
+                    (replacement_metadata_json, *event_fence),
+                )
+                intent_cursor = conn.execute(
+                    """UPDATE messages SET active = 0
+                       WHERE id = ? AND session_id = ? AND active = 1
+                         AND role IS ? AND content IS ? AND tool_calls IS ?
+                         AND api_content IS ? AND display_kind IS ?
+                         AND display_metadata IS ?""",
+                    intent_fence,
+                )
+                if event_cursor.rowcount != 1 or intent_cursor.rowcount != 1:
+                    raise RuntimeError(
+                        "completion intent recovery compare-and-set failed"
+                    )
+                conn.execute(
+                    """UPDATE sessions
+                       SET message_count = MAX(message_count - 2, 0),
+                           tool_call_count = MAX(tool_call_count - ?, 0)
+                       WHERE id = ?""",
+                    (len(tool_calls), session_id),
+                )
+                return "read_only_archived"
+
+            metadata_cursor = conn.execute(
+                """UPDATE messages SET display_metadata = ?
+                   WHERE id = ? AND session_id = ? AND active = 1
+                     AND role IS ? AND content IS ? AND api_content IS ?
+                     AND display_kind IS ? AND display_metadata IS ?
+                     AND EXISTS (
+                         SELECT 1 FROM messages AS intent_row
+                         WHERE intent_row.id = ?
+                           AND intent_row.session_id = ?
+                           AND intent_row.active = 1
+                           AND intent_row.role IS ?
+                           AND intent_row.content IS ?
+                           AND intent_row.tool_calls IS ?
+                           AND intent_row.api_content IS ?
+                           AND intent_row.display_kind IS ?
+                           AND intent_row.display_metadata IS ?
+                )""",
+                (
+                    replacement_metadata_json,
+                    *event_fence,
+                    *intent_fence,
+                ),
+            )
+            if metadata_cursor.rowcount != 1:
+                raise RuntimeError(
+                    "completion intent recovery compare-and-set failed"
+                )
+
+            recovery_rows: List[Dict[str, Any]] = []
+            for call in tool_calls:
+                if not isinstance(call, dict):
+                    raise RuntimeError("completion intent contains an invalid tool call")
+                function = call.get("function") or {}
+                name = str(function.get("name") or "unknown")
+                call_id = str(call.get("id") or call.get("call_id") or "")
+                disposition = (
+                    "unknown" if tool_may_have_side_effect(name) else "none"
+                )
+                content = (
+                    "[Orphan recovery: this tool may have executed before Hermes "
+                    "stopped; its effect is UNKNOWN. Inspect current state before "
+                    "retrying.]"
+                    if disposition == "unknown"
+                    else "[Orphan recovery: this read-only tool did not complete "
+                    "and had no effect.]"
+                )
+                recovery_rows.append({
+                    "role": "tool",
+                    "content": content,
+                    "tool_call_id": call_id,
+                    "name": name,
+                    "effect_disposition": disposition,
+                })
+            recovery_rows.append({
+                "role": "assistant",
+                "content": "Operation interrupted.",
+                "display_kind": "hidden",
+            })
+            inserted, new_tool_calls = self._insert_message_rows(
+                conn, session_id, recovery_rows
+            )
+            if inserted != len(recovery_rows) or new_tool_calls:
+                raise RuntimeError("completion intent recovery append was incomplete")
+            conn.execute(
+                "UPDATE sessions SET message_count = message_count + ? WHERE id = ?",
+                (inserted, session_id),
+            )
+            return "side_effect_closed"
+
+        return self._execute_write(
+            _do,
+            patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S,
         )
 
     def set_latest_matching_message_display_kind(
@@ -7382,6 +7654,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         ``(inserted_count, tool_call_count)``. Does NOT touch sessions.* counters
         — the caller owns that, since the two flows reconcile counts differently.
         """
+        # This serializer backs every multi-row transcript writer
+        # (append/replace/full compression/import). Keep the completion-event
+        # atomicity barrier here as defense in depth so a new rewrite caller
+        # cannot persist assistant/tool rows after a still-pending completion
+        # marker. The helper returns a view and never truncates live history.
+        from agent.message_sanitization import (
+            durable_messages_before_pending_completion,
+        )
+
+        messages = durable_messages_before_pending_completion(messages)
         now_ts = time.time()
         inserted = 0
         tool_calls_total = 0
@@ -7444,7 +7726,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     self._encode_content(msg.get("content")),
                     msg.get("tool_call_id"),
                     tool_calls_json,
-                    _scrub_surrogates(msg.get("tool_name")),
+                    _scrub_surrogates(
+                        msg.get("tool_name")
+                        or (msg.get("name") if role == "tool" else None)
+                    ),
                     msg.get("effect_disposition"),
                     message_timestamp,
                     msg.get("token_count"),
@@ -8095,6 +8380,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 msg["tool_call_id"] = row["tool_call_id"]
             if row["tool_name"]:
                 msg["tool_name"] = row["tool_name"]
+                if row["role"] == "tool":
+                    # ``tool_name`` is Hermes' durable/indexing field; ``name``
+                    # is the OpenAI wire field emitted by
+                    # make_tool_result_message().  Restore both so a cold
+                    # resume serializes the exact tool-result message that the
+                    # provider saw before persistence.
+                    msg["name"] = row["tool_name"]
             if row["effect_disposition"]:
                 msg["effect_disposition"] = row["effect_disposition"]
             if row["tool_calls"]:

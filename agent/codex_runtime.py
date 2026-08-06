@@ -756,6 +756,7 @@ def run_codex_app_server_turn(
             "api_calls": 0,
             "completed": False,
             "partial": True,
+            "failed": True,
             "interrupted": _user_interrupted,
             **(
                 {"interrupt_message": _interrupt_message}
@@ -799,6 +800,20 @@ def run_codex_app_server_turn(
     if turn.projected_messages:
         messages.extend(turn.projected_messages)
 
+    from agent.turn_finalizer import finalize_completion_delivery_suffix
+
+    _completion_delivery_status = finalize_completion_delivery_suffix(
+        agent,
+        messages,
+        final_response=turn.final_text,
+        failed=turn.error is not None,
+        interrupted=turn.interrupted,
+    )
+    _completion_delivery_commit_failed = (
+        _completion_delivery_status == "pending"
+    )
+
+    if turn.projected_messages:
         # Persist the newly-projected assistant/tool messages ourselves.
         # This path is an early return that bypasses conversation_loop, whose
         # normal per-step _persist_session() calls would otherwise flush them.
@@ -835,6 +850,30 @@ def run_codex_app_server_turn(
                     getattr(agent, "session_id", None),
                 )
 
+        # The Codex path bypasses the normal finalizer, including its JSON
+        # snapshot write.  Save only after the DB-authoritative completion
+        # commit above; the snapshot helper's durable view automatically stops
+        # before a still-pending marker on commit failure.
+        try:
+            agent._save_session_log(messages)
+        except Exception:
+            logger.warning(
+                "codex app-server session snapshot update failed",
+                exc_info=True,
+            )
+
+    if (
+        not turn.projected_messages
+        and _completion_delivery_status == "committed"
+    ):
+        try:
+            agent._save_session_log(messages)
+        except Exception:
+            logger.warning(
+                "codex completion session snapshot update failed",
+                exc_info=True,
+            )
+
 
     # Counter ticks for the agent-improvement loop.
     # _turns_since_memory and _user_turn_count are ALREADY incremented
@@ -866,6 +905,7 @@ def run_codex_app_server_turn(
     if (
         not turn.interrupted
         and turn.error is None
+        and not _completion_delivery_commit_failed
     ):
         try:
             agent._sync_external_memory_for_turn(
@@ -883,6 +923,7 @@ def run_codex_app_server_turn(
     if (
         turn.final_text
         and not turn.interrupted
+        and not _completion_delivery_commit_failed
         and (should_review_memory or should_review_skills)
     ):
         try:
@@ -894,19 +935,44 @@ def run_codex_app_server_turn(
         except Exception:
             logger.debug("background review spawn raised", exc_info=True)
 
+    _result_messages = messages
+    if _completion_delivery_commit_failed:
+        from agent.message_sanitization import (
+            durable_messages_before_pending_completion,
+        )
+
+        _result_messages = list(durable_messages_before_pending_completion(messages))
+
     return {
         "final_response": turn.final_text,
-        "messages": messages,
+        "messages": _result_messages,
         "api_calls": api_calls,
-        "completed": not turn.interrupted and turn.error is None,
-        "partial": turn.interrupted or turn.error is not None,
+        "completed": (
+            not turn.interrupted
+            and turn.error is None
+            and not _completion_delivery_commit_failed
+        ),
+        "failed": turn.error is not None or _completion_delivery_commit_failed,
+        "partial": (
+            turn.interrupted
+            or turn.error is not None
+            or _completion_delivery_commit_failed
+        ),
         "interrupted": _user_interrupted,
         **(
             {"interrupt_message": _interrupt_message}
             if _interrupt_message
             else {}
         ),
-        "error": turn.error,
+        "error": (
+            turn.error
+            or (
+                "completion delivery could not be committed to SessionDB"
+                if _completion_delivery_commit_failed
+                else None
+            )
+        ),
+        "completion_delivery_status": _completion_delivery_status,
         # The codex app-server runtime IS an early-return path that bypasses
         # conversation_loop, but we flush the projected assistant/tool messages
         # ourselves above (see the _flush_messages_to_session_db call after

@@ -76,7 +76,7 @@ def test_cli_completion_ownership_accepts_compression_lineage():
     )
 
 
-def test_cli_numeric_completion_queues_model_nudge_and_none_queues_nothing(
+def test_cli_numeric_completion_queues_model_nudge_and_nonterminal_fails_open(
     monkeypatch,
 ):
     from tools.process_registry import ProcessRegistry
@@ -121,7 +121,12 @@ def test_cli_numeric_completion_queues_model_nudge_and_none_queues_nothing(
     prompt = cli._pending_input.get_nowait()
     assert isinstance(prompt, _CompletionDeliveryMessage)
     assert "Background process proc-done completed normally" in prompt
-    assert "If no user-visible action is needed, emit no response." in prompt
+    assert "must be literally empty (zero characters)" in prompt
+    nonterminal = cli._pending_input.get_nowait()
+    assert isinstance(nonterminal, _CompletionDeliveryMessage)
+    assert "Background process proc-running exited (exit code None)" in nonterminal
+    assert "Command: sleep 1" in nonterminal
+    assert "Output:\nstill running" in nonterminal
     assert cli._pending_input.empty()
 
 

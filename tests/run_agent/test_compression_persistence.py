@@ -325,12 +325,20 @@ class TestFlushAfterCompression:
             db.close()
 
     @pytest.mark.parametrize("in_place", [True, False])
-    def test_completion_nudge_is_removed_before_compression_publish_and_reload(
+    def test_pending_completion_suffix_is_deferred_before_compression_publish(
         self, in_place
     ):
-        """Both compression publishers keep the real result, never its nudge."""
-        from agent.conversation_compression import compress_context
+        """Both publishers defer, then atomically append, the pending event."""
+        from agent.conversation_compression import (
+            compress_context,
+            conversation_history_after_compression,
+        )
+        from agent.turn_finalizer import finalize_completion_delivery_suffix
         from hermes_state import SessionDB
+        from tools.process_registry import (
+            completion_delivery_prompt,
+            format_process_notification,
+        )
 
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "test.db"
@@ -339,18 +347,40 @@ class TestFlushAfterCompression:
             agent.compression_in_place = in_place
             agent._ensure_db_session()
 
+            event = {
+                "type": "completion",
+                "session_id": "compression-process",
+                "command": "pytest -q",
+                "exit_code": 0,
+                "output": "2 passed",
+            }
+            canonical = format_process_notification(event)
+            wire = completion_delivery_prompt(event, canonical)
             nudge = {
                 "role": "user",
-                "content": "completion payload and model-only instruction",
+                "content": wire,
                 "_completion_delivery_synthetic": True,
             }
             compressor = MagicMock()
             compressor.compress.return_value = [
                 {"role": "user", "content": "[summary] earlier work"},
                 {"role": "assistant", "content": "summary acknowledged"},
-                {"role": "user", "content": "start the build"},
                 nudge,
-                {"role": "assistant", "content": "Build finished successfully"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "completion-call",
+                        "type": "function",
+                        "function": {"name": "terminal", "arguments": "{}"},
+                    }],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "completion-call",
+                    "name": "terminal",
+                    "content": "Build finished successfully",
+                },
             ]
             compressor.compression_count = 1
             compressor.last_prompt_tokens = 0
@@ -367,7 +397,8 @@ class TestFlushAfterCompression:
                     {"role": "user", "content": "old request"},
                     {"role": "assistant", "content": "old response"},
                     nudge,
-                    {"role": "assistant", "content": "Build finished successfully"},
+                    compressor.compress.return_value[-2],
+                    compressor.compress.return_value[-1],
                 ],
                 "system",
                 approx_tokens=100_000,
@@ -378,11 +409,44 @@ class TestFlushAfterCompression:
             assert nudge in returned
             assert returned[-1]["content"] == "Build finished successfully"
 
+            history = conversation_history_after_compression(agent, returned, [])
+            if in_place:
+                assert [row["content"] for row in history] == [
+                    "[summary] earlier work",
+                    "summary acknowledged",
+                ]
+            else:
+                assert history is None
+
+            status = finalize_completion_delivery_suffix(
+                agent,
+                returned,
+                final_response="",
+                failed=False,
+                interrupted=False,
+            )
+            assert status == "committed"
+            # The ordinary post-turn flush must be idempotent against the same
+            # compression baseline and the just-committed suffix.
+            agent._flush_messages_to_session_db(returned, history)
+
             db.close()
             resumed_db = SessionDB(db_path=db_path)
             resumed = resumed_db.get_messages_as_conversation(session_id)
-            assert nudge["content"] not in [message["content"] for message in resumed]
-            assert resumed[-1]["content"] == "Build finished successfully"
+            assert [message["content"] for message in resumed] == [
+                "[summary] earlier work",
+                "summary acknowledged",
+                canonical,
+                "",
+                "Build finished successfully",
+                "Operation completed.",
+            ]
+            event_row = resumed[2]
+            assert event_row["api_content"] == wire
+            assert event_row["display_kind"] == "hidden"
+            assert resumed[3]["tool_calls"][0]["id"] == "completion-call"
+            assert resumed[4]["tool_call_id"] == "completion-call"
+            assert resumed[-1]["display_kind"] == "hidden"
             resumed_db.close()
 
 

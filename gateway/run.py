@@ -5616,6 +5616,9 @@ class TurnRunner:
                 "interrupted": result.get("interrupted", False),
                 "interrupt_message": result.get("interrupt_message"),
                 "error": result.get("error"),
+                "completion_delivery_status": result.get(
+                    "completion_delivery_status"
+                ),
                 "compression_exhausted": result.get("compression_exhausted", False),
                 "compression_deferred": result.get("compression_deferred", False),
                 "tools": ctx.tools_holder[0] or [],
@@ -5749,6 +5752,10 @@ class TurnRunner:
             "interrupted": ctx.result_holder[0].get("interrupted", False) if ctx.result_holder[0] else False,
             "partial": ctx.result_holder[0].get("partial", False) if ctx.result_holder[0] else False,
             "error": ctx.result_holder[0].get("error") if ctx.result_holder[0] else None,
+            "completion_delivery_status": (
+                ctx.result_holder[0].get("completion_delivery_status")
+                if ctx.result_holder[0] else None
+            ),
             "interrupt_message": ctx.result_holder[0].get("interrupt_message") if ctx.result_holder[0] else None,
             # Soft lock-contention defer (#69870 consumer): distinct from
             # compression_exhausted so the gateway never auto-resets a
@@ -18239,6 +18246,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # entries that were stripped before the agent saw them.
             if is_context_overflow_failure:
                 pass  # handled above — skip all transcript writes
+            elif agent_result.get("completion_delivery_status") == "pending":
+                # SessionDB rejected the atomic event suffix. Publish none of
+                # it to the gateway transcript: an assistant/tool row without
+                # its synthetic owner would poison the next provider prefix.
+                pass
             elif (
                 agent_failed_early or hidden_reasoning_incomplete
             ) and not _completion_delivery_synthetic:
@@ -18327,8 +18339,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     for msg in new_messages:
                         # Skip system messages (they're rebuilt each run)
                         if msg.get("role") == "system":
-                            continue
-                        if _completion_delivery_synthetic and msg.get("role") == "user":
                             continue
                         from agent.message_sanitization import _is_ephemeral_scaffolding
 

@@ -28,6 +28,12 @@ from hermes_cli.model_switch import (
 )
 from hermes_state_common import AuthorityWriteIndeterminateError
 
+
+def _public_shape(messages):
+    fields = ("role", "content", "tool_calls", "tool_call_id", "name")
+    return [{key: row[key] for key in fields if key in row} for row in messages]
+
+
 class TestCompressionBoundaryHook:
     def _make_agent(self, session_db):
         with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
@@ -292,6 +298,7 @@ class TestCompressionBoundaryHook:
                 {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
                 {"role": "user", "content": "tail question"},
             ]
+            expected_public = _public_shape(compressed)
             compressor.compress.return_value = compressed
             compressor.compression_count = 1
             compressor.last_prompt_tokens = 0
@@ -339,7 +346,11 @@ class TestCompressionBoundaryHook:
                 approx_tokens=10_000,
             )
 
-            assert returned == compressed
+            assert _public_shape(returned) == expected_public
+            assert all(message.get("_db_persisted") is True for message in returned)
+            assert agent._flushed_db_message_ids == {
+                id(message) for message in returned
+            }
             assert "Model: test/model" in returned_prompt
             assert (agent.session_id == original_sid) is in_place
             assert agent.model == "test/model"
@@ -347,10 +358,7 @@ class TestCompressionBoundaryHook:
             published = db.get_session(agent.session_id)
             assert published["model"] == "test/model"
             stored = db.get_messages_as_conversation(agent.session_id)
-            assert [
-                {"role": message["role"], "content": message["content"]}
-                for message in stored
-            ] == compressed
+            assert _public_shape(stored) == expected_public
             if in_place:
                 assert db.get_session(original_sid)["end_reason"] is None
             else:
@@ -424,7 +432,13 @@ class TestCompressionBoundaryHook:
                 approx_tokens=100,
             )
 
-            assert returned == [{"role": "user", "content": "summary"}]
+            assert _public_shape(returned) == [
+                {"role": "user", "content": "summary"}
+            ]
+            assert all(message.get("_db_persisted") is True for message in returned)
+            assert agent._flushed_db_message_ids == {
+                id(message) for message in returned
+            }
             assert "Model: test/model" in returned_prompt
             assert "broken-model" not in returned_prompt
             assert agent.session_id != original_sid
@@ -686,4 +700,3 @@ class TestSessionCompressEvent:
                 [{"role": "user", "content": "m"}], "sys", approx_tokens=100
             )
             assert compressed
-

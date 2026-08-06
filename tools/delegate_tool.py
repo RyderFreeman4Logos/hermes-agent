@@ -1548,6 +1548,24 @@ def _build_child_agent(
     child_optional_kwargs: Dict[str, Any] = {}
     if isinstance(child_max_tokens, int):
         child_optional_kwargs["max_tokens"] = child_max_tokens
+    same_model = str(effective_model or "").strip().lower() == str(
+        getattr(parent_agent, "model", "") or ""
+    ).strip().lower()
+    if not override_provider and same_model:
+        derived_request_overrides = dict(
+            getattr(parent_agent, "request_overrides", {}) or {}
+        )
+    else:
+        derived_request_overrides = dict(override_request_overrides or {})
+        service_tier = getattr(parent_agent, "service_tier", None)
+        if isinstance(service_tier, str) and service_tier:
+            from hermes_cli.models import resolve_fast_mode_overrides
+
+            derived_request_overrides.update(
+                resolve_fast_mode_overrides(effective_model) or {}
+            )
+    if derived_request_overrides:
+        child_optional_kwargs["fast_mode_overrides"] = derived_request_overrides
 
     from agent.delegation_context import delegated_child_context
 
@@ -1583,10 +1601,8 @@ def _build_child_agent(
             provider_sort=child_provider_sort,
             provider_require_parameters=child_provider_require_parameters,
             provider_data_collection=child_provider_data_collection,
-            request_overrides=(
-                dict(override_request_overrides or {})
-                if override_provider
-                else dict(getattr(parent_agent, "request_overrides", {}) or {})
+            request_overrides=dict(
+                getattr(parent_agent, "_caller_request_overrides", {}) or {}
             ),
             openrouter_min_coding_score=child_openrouter_min_coding_score,
             tool_progress_callback=child_progress_cb,

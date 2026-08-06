@@ -2349,10 +2349,10 @@ def compress_context(
     # Probe whether the lock subsystem is actually available on this
     # SessionDB instance. A process running mismatched module versions can have
     # this call site while its long-lived SessionDB instance predates the lock
-    # API. Only that structural absence is safe to fail open for: compression
-    # must make progress rather than spin forever after an update. Once the
-    # method has been resolved, every exception from its implementation fails
-    # closed because proceeding without a lock can fork the session lineage.
+    # API. Rotation may fail open only for that exact structural version skew
+    # so the legacy outer loop can still make progress. In-place compaction and
+    # every present-but-broken API fail closed because an unlocked transcript
+    # rewrite can lose a concurrent durable turn.
     _try_acquire_lock = None
     _lock_lookup_error: Optional[Exception] = None
     _legacy_session_db_without_lock_api = False
@@ -2369,12 +2369,27 @@ def compress_context(
             )
         except Exception as exc:
             _lock_lookup_error = exc
-        if _lock_lookup_error is None and not _legacy_session_db_without_lock_api:
+        if _lock_lookup_error is None and _legacy_session_db_without_lock_api:
+            if in_place:
+                _lock_lookup_error = TypeError(
+                    "in-place compression lock API is unavailable"
+                )
+        elif _lock_lookup_error is None:
             try:
                 _try_acquire_lock = _lock_db.try_acquire_compression_lock
                 if not callable(_try_acquire_lock):
                     _lock_lookup_error = TypeError(
                         "compression lock API is present but not callable"
+                    )
+                release_lock = getattr(_lock_db, "release_compression_lock", None)
+                archive = getattr(_lock_db, "archive_and_compact", None)
+                if not callable(release_lock):
+                    _lock_lookup_error = TypeError(
+                        "compression lock release API is unavailable"
+                    )
+                elif in_place and not callable(archive):
+                    _lock_lookup_error = TypeError(
+                        "in-place archive API is unavailable"
                     )
             except Exception as exc:
                 _lock_lookup_error = exc
@@ -2410,9 +2425,9 @@ def compress_context(
             )
             _lock_acquired = False
         elif _try_acquire_lock is None:
-            # The lock API itself is absent on this in-memory instance. Log once
-            # and proceed unlocked so an update-version skew cannot leave the
-            # outer auto-compression loop making no progress forever.
+            # Rotation-only compatibility for a live SessionDB class imported
+            # before the lock API existed. In-place rewrites never enter this
+            # branch: they fail closed above.
             _lock_holder = None
             if getattr(agent, "_last_compression_lock_error_sid", None) != _lock_sid:
                 agent._last_compression_lock_error_sid = _lock_sid
@@ -2423,7 +2438,7 @@ def compress_context(
                     "(or `hermes update`) to resync.",
                     _lock_sid,
                 )
-            _lock_acquired = True  # acquired-but-unlocked compatibility path
+            _lock_acquired = True
         else:
             if commit_fence is not None:
                 _lock_setup_entered = commit_fence.begin_lock_setup()
@@ -2683,6 +2698,9 @@ def compress_context(
 
     _activity_heartbeat: Optional[_CompressionActivityHeartbeat] = None
     messages_before_compression = None
+    _durable_compaction_baseline = None
+    _durable_compaction_row_ids = None
+    _durable_compaction_row_fingerprint = None
     try:
         if _lock_holder is not None:
             _candidate_refresher = _CompressionLockLeaseRefresher(
@@ -2701,6 +2719,44 @@ def compress_context(
                     _lock_refresher = _candidate_refresher
                     _lock_refresher.start()
 
+        if in_place and _lock_db is not None and _lock_sid:
+            from agent.context_compressor import _capture_durable_compaction_baseline
+            from hermes_state import CompressionSessionBusyError
+
+            try:
+                (
+                    _durable_compaction_baseline,
+                    _durable_compaction_row_ids,
+                    _durable_compaction_row_fingerprint,
+                ) = _capture_durable_compaction_baseline(
+                    _lock_db,
+                    _lock_sid,
+                    messages,
+                    persisted_boundary=getattr(
+                        agent, "_persist_user_message_idx", None,
+                    ),
+                )
+            except CompressionSessionBusyError as exc:
+                logger.warning(
+                    "Compression baseline rejected; keeping the original "
+                    "transcript: %s",
+                    exc,
+                )
+                agent._last_compression_attempt_in_place = False
+                agent._last_compaction_in_place = False
+                _release_lock()
+                _emit_compression_attempt_telemetry(
+                    agent,
+                    started_at=_attempt_started_at,
+                    commit_status="aborted",
+                    split_status="aborted",
+                    failure_class="illegal_durable_replay",
+                )
+                existing_prompt = getattr(agent, "_cached_system_prompt", None)
+                if not existing_prompt:
+                    existing_prompt = agent._build_system_prompt(system_message)
+                return messages, existing_prompt
+
         # The caller's history snapshot predates lease acquisition. Reload the
         # durable parent after the lease is live; MORE durable rows than the
         # snapshot carries means a frontend/background writer committed a turn
@@ -2710,10 +2766,10 @@ def compress_context(
         # history replacement, think-tag stripping), and a content-equality
         # abort would permanently wedge compression on such sessions — the
         # #14694 failure shape.
-        # Rotation-only: in-place compaction (archive_and_compact) is
-        # non-destructive — pre-compaction rows are soft-archived (active=0,
-        # compacted=1), stay searchable and recoverable, so snapshot/durable
-        # drift cannot lose data there and must not abort compaction.
+        # Rotation-only reload/adopt below: in-place compaction may carry an
+        # unpersisted tail, but archive_and_compact compares its proven durable
+        # prefix inside the write transaction. Any drift in that durable prefix
+        # must abort and fail closed rather than publish a stale rewrite.
         #
         # When durable DID grow, ADOPT it and continue rather than aborting.
         # Aborting returned the stale snapshot unchanged, so busy sessions
@@ -3197,12 +3253,29 @@ def compress_context(
                         PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY,
                     )
 
+                    expected_active_messages = _durable_compaction_baseline
+                    expected_active_row_ids = _durable_compaction_row_ids
+                    expected_active_row_fingerprint = (
+                        _durable_compaction_row_fingerprint
+                    )
+                    if expected_active_messages is None:
+                        raise RuntimeError(
+                            "durable transcript baseline is unavailable"
+                        )
                     agent._session_db.archive_and_compact(
                         agent.session_id,
                         compressed,
                         model_config_patch={
                             PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None,
                         },
+                        system_prompt=new_system_prompt,
+                        compression_lock_holder=_lock_holder,
+                        require_compression_lease=True,
+                        expected_active_messages=expected_active_messages,
+                        expected_active_row_ids=expected_active_row_ids,
+                        expected_active_row_fingerprint=(
+                            expected_active_row_fingerprint
+                        ),
                     )
                     split_status = "in_place_committed"
                     # Reset the flush identity set so the next turn's appends are
@@ -3312,12 +3385,9 @@ def compress_context(
                         except (ValueError, Exception) as e:
                             logger.debug("Could not propagate title on compression: %s", e)
 
-                # In-place mode still updates/replaces the current row here.
-                # Rotation already published prompt + compacted handoff atomically.
+                # Rotation and in-place mode both published the prompt with the
+                # compacted transcript in the transaction above.
                 if in_place:
-                    agent._session_db.update_system_prompt(
-                        agent.session_id, new_system_prompt
-                    )
                     agent._last_flushed_db_idx = 0
                 else:
                     agent._last_flushed_db_idx = len(compressed)
@@ -3337,27 +3407,19 @@ def compress_context(
                     # Atomic publication failed (including lease loss): keep the
                     # parent live and discard the stale compacted snapshot.
                     old_session_id = None
-                    messages[:] = copy.deepcopy(messages_before_compression)
-                    compressed = messages
-                    _compression_made_progress = False
-                    # Restore ONLY the prune runway, not the full attempt
-                    # snapshot: _restore_compressor_attempt_state is reserved
-                    # for pre-commit cancels (fence deny / explicit cancel),
-                    # while this branch is post-attempt — the other snapshot
-                    # fields (telemetry, aborted flags) must keep the failed
-                    # attempt's values. The runway is a property of transcript
-                    # state, and the transcript was just rolled back to its
-                    # pre-compression copy, so the runway rolls back with it.
-                    # (compress() zeroed it in-memory on summary success; the
-                    # durable copy was never cleared — that clear only rides
-                    # the atomic archive_and_compact / child-row publication
-                    # that just failed.)
-                    if "_proactive_prune_rearm_tokens" in _compressor_attempt_snapshot:
-                        agent.context_compressor._proactive_prune_rearm_tokens = (
-                            _compressor_attempt_snapshot[
-                                "_proactive_prune_rearm_tokens"
-                            ]
-                        )
+                messages[:] = copy.deepcopy(messages_before_compression)
+                compressed = messages
+                _compression_made_progress = False
+                compacted_in_place = False
+                # Restore ONLY the prune runway, not the full attempt snapshot:
+                # the transcript-level state rolls back with the rejected
+                # publication, while telemetry keeps the failed attempt.
+                if "_proactive_prune_rearm_tokens" in _compressor_attempt_snapshot:
+                    agent.context_compressor._proactive_prune_rearm_tokens = (
+                        _compressor_attempt_snapshot[
+                            "_proactive_prune_rearm_tokens"
+                        ]
+                    )
                 split_status = (
                     "aborted"
                     if locals().get("old_session_id") is None and not in_place

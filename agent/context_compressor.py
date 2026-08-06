@@ -16,6 +16,7 @@ Improvements over v2:
   - Richer tool call/result detail in summarizer input
 """
 
+import copy
 import hashlib
 import json
 import logging
@@ -149,6 +150,151 @@ COMPRESSED_SUMMARY_HAS_USER_TURN_KEY = "_compressed_summary_has_user_turn"
 # rolling summary, so dropping or rewriting one destroys history.
 MICRO_COMPACT_MARKER_KEY = "_micro_compact_marker"
 _DB_PERSISTED_MARKER = "_db_persisted"
+
+
+def _compaction_replay_projection(
+    messages: List[Dict[str, Any]],
+    *,
+    substitute_api_content: bool = False,
+) -> List[Dict[str, Any]]:
+    """Project live/restored messages to the bytes relevant to compaction."""
+    from agent.tool_dispatch_helpers import (
+        _is_multimodal_tool_result,
+        _multimodal_text_summary,
+    )
+
+    projected: List[Dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            projected.append(message)
+            continue
+        content = message.get("content")
+        api_content = message.get("api_content")
+        if (
+            substitute_api_content
+            and message.get("role") in {"user", "assistant"}
+            and isinstance(api_content, str)
+            and api_content
+        ):
+            content = api_content
+        if _is_multimodal_tool_result(content):
+            content = _multimodal_text_summary(content)
+        elif isinstance(content, list):
+            text_parts = []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    text_parts.append(str(part.get("text", "")))
+                elif isinstance(part, dict) and part.get("type") in {
+                    "image", "image_url", "input_image",
+                }:
+                    text_parts.append("[screenshot]")
+            content = "\n".join(text_parts) if text_parts else None
+        item = {"role": message.get("role"), "content": content}
+        for field in (
+            "tool_call_id", "tool_name", "effect_disposition", "tool_calls",
+            "finish_reason", "reasoning", "reasoning_content",
+            "reasoning_details", "codex_reasoning_items", "codex_message_items",
+        ):
+            value = message.get(field)
+            if value is not None and value != "" and value != []:
+                item[field] = value
+        projected.append(item)
+    return projected
+
+
+def _capture_durable_compaction_baseline(
+    session_db: Any,
+    session_id: str,
+    live_messages: List[Dict[str, Any]],
+    *,
+    persisted_boundary: Optional[int] = None,
+) -> tuple[
+    Optional[List[Dict[str, Any]]],
+    Optional[List[int]],
+    Optional[List[tuple]],
+]:
+    """Fence against raw durable rows after proving their legal replay shape."""
+    loader = getattr(session_db, "get_compaction_baseline", None)
+    if not callable(loader):
+        return None, None, None
+    loaded = loader(session_id)
+    if (
+        not isinstance(loaded, tuple)
+        or len(loaded) != 2
+        or not isinstance(loaded[0], list)
+        or not isinstance(loaded[1], list)
+    ):
+        return None, None, None
+    raw, row_fingerprint = loaded
+    if not raw:
+        return [], [], row_fingerprint
+
+    repaired = copy.deepcopy(raw)
+    from agent.agent_runtime_helpers import repair_message_sequence
+    repair_message_sequence(None, repaired)
+
+    durable_live = [
+        message for message in live_messages
+        if isinstance(message, dict) and message.get(_DB_PERSISTED_MARKER)
+    ]
+    has_persisted_markers = bool(durable_live)
+    if not durable_live:
+        if (
+            isinstance(persisted_boundary, int)
+            and 0 <= persisted_boundary <= len(live_messages)
+        ):
+            durable_live = live_messages[:persisted_boundary]
+        elif raw:
+            durable_live = live_messages
+
+    live_projection = _compaction_replay_projection(durable_live)
+    legal_durable_projections = []
+    for durable_view in (raw, repaired):
+        legal_durable_projections.append(
+            _compaction_replay_projection(durable_view)
+        )
+        legal_durable_projections.append(
+            _compaction_replay_projection(
+                durable_view, substitute_api_content=True,
+            )
+        )
+    if (
+        live_projection not in legal_durable_projections
+        and not has_persisted_markers
+        and persisted_boundary is None
+    ):
+        # Some older/preflight callers have a durable restore followed by an
+        # unpersisted current-turn tail, but no boundary marker yet.  Accept
+        # only a prefix whose replay projection exactly matches one of the
+        # legal raw/repaired durable views; never guess from content alone.
+        for prefix_len in sorted(
+            {len(view) for view in legal_durable_projections}, reverse=True,
+        ):
+            if prefix_len <= 0:
+                continue
+            candidate = _compaction_replay_projection(
+                live_messages[:prefix_len]
+            )
+            if candidate in legal_durable_projections:
+                live_projection = candidate
+                break
+    if live_projection not in legal_durable_projections:
+        from hermes_state import CompressionSessionBusyError
+        raise CompressionSessionBusyError(
+            f"Live transcript is not a legal restore of durable session: {session_id}"
+        )
+
+    row_ids: List[int] = []
+    baseline: List[Dict[str, Any]] = []
+    for message in raw:
+        row_id = message.get("_row_id")
+        if not isinstance(row_id, int):
+            return None, None, None
+        row_ids.append(row_id)
+        item = dict(message)
+        item.pop("_row_id", None)
+        baseline.append(item)
+    return baseline, row_ids, row_fingerprint
 PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY = "_proactive_prune_rearm_tokens"
 
 _NO_USER_TASK_SENTINEL = "None. This session contains no user-authored turns."
@@ -3115,67 +3261,99 @@ class ContextCompressor(ContextEngine):
         before = sum(_estimate_msg_budget_tokens(m) for m in messages)
         if before < self._proactive_prune_rearm_tokens:
             return messages, 0
-        # Capability gate BEFORE the expensive 3-pass scan: a bound store that
-        # can't persist the prune atomically (duck-typed/plugin session store
-        # without archive_and_compact) makes every prune a permanent no-op, so
-        # don't pay the scan for it on every eligible iteration.
         session_db = getattr(self, "_session_db", None)
         session_id = getattr(self, "_session_id", "")
-        if (
-            session_db
-            and session_id
-            and not callable(getattr(session_db, "archive_and_compact", None))
-        ):
-            return messages, 0
-        pruned_msgs, pruned_count = self._prune_old_tool_results(
-            messages,
-            protect_tail_count=self.protect_last_n,
-            protect_tail_tokens=None,
-            min_prune_chars=self.proactive_prune_min_result_chars,
-        )
-        if not pruned_count:
-            # Standard no-op contract: hand back the INPUT object so callers
-            # can gate bookkeeping on `result is not input`.
-            return messages, 0
-        # Measured-savings gate (prompt-cache hysteresis): only commit when
-        # the prune reclaims a meaningful batch of tokens. Estimated on the
-        # real before/after messages so dedup + arg truncation count too.
-        after = sum(_estimate_msg_budget_tokens(m) for m in pruned_msgs)
-        reclaimed = max(0, before - after)
-        if reclaimed < self.proactive_prune_min_reclaim_tokens:
-            return messages, 0
-        # ``after`` includes the tool batch appended since the provider's last
-        # usage reading, so both the low-water mark and future gate use the
-        # same message-token estimate. Require a full trigger-sized growth
-        # interval before another cache-breaking rewrite.
-        runway = max(
-            reclaimed,
-            self.proactive_prune_tokens,
-            self.proactive_prune_min_reclaim_tokens,
-        )
-        next_rearm_tokens = after + runway
-        if session_db and session_id:
-            # The capability gate above guarantees archive_and_compact exists.
-            try:
-                session_db.archive_and_compact(
+        archive_and_compact = acquire = release = None
+        holder = None
+        acquired = False
+        durable_baseline = None
+        durable_row_ids = None
+        durable_row_fingerprint = None
+        try:
+            if session_db and session_id:
+                archive_and_compact = getattr(
+                    session_db, "archive_and_compact", None
+                )
+                acquire = getattr(session_db, "try_acquire_compression_lock", None)
+                release = getattr(session_db, "release_compression_lock", None)
+                if not all(
+                    callable(fn) for fn in (archive_and_compact, acquire, release)
+                ):
+                    return messages, 0
+                from agent.conversation_compression import _compression_lock_holder
+
+                holder = _compression_lock_holder(self)
+                acquired = bool(acquire(session_id, holder))
+                if not acquired:
+                    return messages, 0
+                try:
+                    (
+                        durable_baseline,
+                        durable_row_ids,
+                        durable_row_fingerprint,
+                    ) = _capture_durable_compaction_baseline(
+                        session_db, session_id, messages,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Proactive tool-result prune baseline rejected; "
+                        "keeping the original transcript: %s",
+                        exc,
+                    )
+                    return messages, 0
+                if durable_baseline is None:
+                    return messages, 0
+
+            pruned_msgs, pruned_count = self._prune_old_tool_results(
+                messages,
+                protect_tail_count=self.protect_last_n,
+                protect_tail_tokens=None,
+                min_prune_chars=self.proactive_prune_min_result_chars,
+            )
+            if not pruned_count:
+                return messages, 0
+            after = sum(_estimate_msg_budget_tokens(m) for m in pruned_msgs)
+            reclaimed = max(0, before - after)
+            if reclaimed < self.proactive_prune_min_reclaim_tokens:
+                return messages, 0
+            runway = max(
+                reclaimed,
+                self.proactive_prune_tokens,
+                self.proactive_prune_min_reclaim_tokens,
+            )
+            next_rearm_tokens = after + runway
+            if session_db and session_id:
+                archive_and_compact(
                     session_id,
                     pruned_msgs,
                     model_config_patch={
                         PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: next_rearm_tokens,
                     },
+                    compression_lock_holder=holder,
+                    require_compression_lease=True,
+                    expected_active_messages=durable_baseline,
+                    expected_active_row_ids=durable_row_ids,
+                    expected_active_row_fingerprint=durable_row_fingerprint,
                 )
-            except Exception as exc:
+                for msg in pruned_msgs:
+                    if isinstance(msg, dict):
+                        msg[_DB_PERSISTED_MARKER] = True
+            self._proactive_prune_rearm_tokens = next_rearm_tokens
+            return pruned_msgs, pruned_count
+        except Exception as exc:
+            if session_db and session_id:
                 logger.warning(
                     "Proactive tool-result prune DB commit failed; keeping the "
                     "original transcript: %s",
                     exc,
                 )
-                return messages, 0
-            for msg in pruned_msgs:
-                if isinstance(msg, dict):
-                    msg[_DB_PERSISTED_MARKER] = True
-        self._proactive_prune_rearm_tokens = next_rearm_tokens
-        return pruned_msgs, pruned_count
+            return messages, 0
+        finally:
+            if acquired:
+                try:
+                    release(session_id, holder)
+                except Exception as exc:
+                    logger.debug("proactive prune lease release failed: %s", exc)
 
     # ------------------------------------------------------------------
     # Summarization
@@ -5605,6 +5783,26 @@ This compaction should PRIORITISE preserving all information related to the focu
         if not self._micro_compact_enabled:
             return messages
 
+        session_db = getattr(self, "_session_db", None)
+        session_id = getattr(self, "_session_id", "")
+        expected_active_messages: List[Dict[str, Any]] = []
+        expected_active_row_ids: Optional[List[int]] = None
+        expected_active_row_fingerprint: Optional[List[tuple]] = None
+
+        rollback_state = {
+            name: copy.deepcopy(getattr(self, name))
+            for name in (
+                "_micro_compact_cursor",
+                "_micro_compact_rolling_summary",
+                "_micro_compact_consecutive_failures",
+                "_micro_compact_last_failure_cursor",
+                "_micro_compact_passes",
+                "_micro_compact_tokens_saved_total",
+                "_micro_compact_turns_since_pass",
+                "_flush_scan_cursor_invalidated",
+            )
+        }
+
         # Cadence gate. A pass rewrites already-sent history, so it costs one
         # prompt-cache break; `every_n_turns` is how an operator trades reclaim
         # frequency against that cost. Counted per invocation rather than per
@@ -5638,6 +5836,50 @@ This compaction should PRIORITISE preserving all information related to the focu
             return messages
 
         exchange_start, exchange_end = exchange
+        rollback_items = list(messages)
+        rollback_dicts = [
+            (message, copy.deepcopy(message))
+            for message in messages
+            if isinstance(message, dict)
+        ]
+
+        def _rollback_failed_commit() -> List[Dict[str, Any]]:
+            for message, snapshot in rollback_dicts:
+                message.clear()
+                message.update(snapshot)
+            messages[:] = rollback_items
+            for name, value in rollback_state.items():
+                setattr(self, name, value)
+            return messages
+
+        # Only pay for a full durable-row decode/fingerprint once a real
+        # exchange is eligible to be rewritten. Cadence, shape, and boundary
+        # no-ops run after every turn and must stay DB-free.
+        if session_db and session_id:
+            required = (
+                getattr(session_db, "try_acquire_compression_lock", None),
+                getattr(session_db, "release_compression_lock", None),
+                getattr(session_db, "archive_and_compact", None),
+            )
+            if not all(callable(fn) for fn in required):
+                return _rollback_failed_commit()
+            try:
+                (
+                    expected_active_messages,
+                    expected_active_row_ids,
+                    expected_active_row_fingerprint,
+                ) = _capture_durable_compaction_baseline(
+                    session_db, session_id, messages,
+                )
+            except Exception as exc:
+                logger.info(
+                    "Micro-compaction baseline rejected; retaining the original "
+                    "transcript: %s",
+                    exc,
+                )
+                return _rollback_failed_commit()
+            if expected_active_messages is None:
+                return _rollback_failed_commit()
 
         # Baseline for telemetry. Taken only once an exchange is in hand, so
         # turns that no-op early don't pay for the scan.
@@ -5656,7 +5898,15 @@ This compaction should PRIORITISE preserving all information related to the focu
         if self._needs_defrag():
             defragged = self._defrag_rolling_summary(messages)
             if defragged:
-                self._sync_micro_compact_to_db(messages)
+                if not self._sync_micro_compact_to_db(
+                    messages,
+                    expected_active_messages=expected_active_messages,
+                    expected_active_row_ids=expected_active_row_ids,
+                    expected_active_row_fingerprint=(
+                        expected_active_row_fingerprint
+                    ),
+                ):
+                    return _rollback_failed_commit()
                 self._micro_compact_consecutive_failures = 0
                 self._micro_compact_last_failure_cursor = -1
             self._emit_micro_compaction_telemetry(
@@ -5722,7 +5972,13 @@ This compaction should PRIORITISE preserving all information related to the focu
             messages, exchange_start, exchange_end, supersede=_cumulative,
         )
         self._micro_compact_cursor = self._cursor_after_splice(result, exchange_start + 1)
-        self._sync_micro_compact_to_db(result)
+        if not self._sync_micro_compact_to_db(
+            result,
+            expected_active_messages=expected_active_messages,
+            expected_active_row_ids=expected_active_row_ids,
+            expected_active_row_fingerprint=expected_active_row_fingerprint,
+        ):
+            return _rollback_failed_commit()
         self._emit_micro_compaction_telemetry(
             outcome="absorbed",
             messages_before=_messages_before,
@@ -5851,7 +6107,11 @@ This compaction should PRIORITISE preserving all information related to the focu
     def _sync_micro_compact_to_db(
         self,
         compacted_messages: List[Dict[str, Any]],
-    ) -> None:
+        *,
+        expected_active_messages: List[Dict[str, Any]],
+        expected_active_row_ids: Optional[List[int]] = None,
+        expected_active_row_fingerprint: Optional[List[tuple]] = None,
+    ) -> bool:
         """Persist the micro-compacted message set to the session DB.
 
         Soft-archives every currently-active message row (``active = 0``)
@@ -5868,17 +6128,47 @@ This compaction should PRIORITISE preserving all information related to the focu
         session_db = getattr(self, "_session_db", None)
         session_id = getattr(self, "_session_id", "")
         if not session_db or not session_id:
-            return
+            return True
+        acquire = getattr(session_db, "try_acquire_compression_lock", None)
+        release = getattr(session_db, "release_compression_lock", None)
+        archive_and_compact = getattr(session_db, "archive_and_compact", None)
+        if not all(callable(fn) for fn in (acquire, release, archive_and_compact)):
+            return False
+
+        from agent.conversation_compression import _compression_lock_holder
+
+        holder = _compression_lock_holder(self)
+        acquired = False
         try:
-            session_db.archive_and_compact(session_id, compacted_messages)
+            acquired = bool(acquire(session_id, holder))
+            if not acquired:
+                return False
+            archive_and_compact(
+                session_id,
+                compacted_messages,
+                compression_lock_holder=holder,
+                require_compression_lease=True,
+                expected_active_messages=expected_active_messages,
+                expected_active_row_ids=expected_active_row_ids,
+                expected_active_row_fingerprint=expected_active_row_fingerprint,
+            )
             for msg in compacted_messages:
                 if isinstance(msg, dict):
                     msg[_DB_PERSISTED_MARKER] = True
-        except Exception:
+            return True
+        except Exception as exc:
             logger.info(
-                "Micro-compaction DB sync failed — resume will double-load "
-                "compacted messages until the next batch compression"
+                "Micro-compaction DB sync failed; retaining the original "
+                "transcript: %s",
+                exc,
             )
+            return False
+        finally:
+            if acquired:
+                try:
+                    release(session_id, holder)
+                except Exception as exc:
+                    logger.debug("micro-compaction lease release failed: %s", exc)
 
     def _splice_micro_compact_result(
         self,

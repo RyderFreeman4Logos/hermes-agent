@@ -1140,6 +1140,59 @@ class _NonCallableLockAPI:
         return getattr(self._real, name)
 
 
+def test_legacy_session_db_rotation_still_makes_progress(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hot-reload lock API skew keeps the non-destructive legacy escape hatch."""
+    import hermes_state
+
+    real_db = SessionDB(db_path=tmp_path / "state.db")
+    parent_sid = "LEGACY_LOCK_ROTATION"
+    real_db.create_session(parent_sid, source="cli")
+    agent = _build_agent_with_db(real_db, parent_sid)
+    legacy_cls = _make_legacy_session_db_class()
+    agent._session_db = legacy_cls(real_db)
+    monkeypatch.setattr(hermes_state, "SessionDB", legacy_cls)
+    messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+
+    compressed, _prompt = agent._compress_context(
+        messages, "sys", approx_tokens=120_000,
+    )
+
+    assert compressed is not messages
+    assert agent.session_id != parent_sid
+    assert _count_children(real_db, parent_sid) == 1
+    agent.context_compressor.compress.assert_called_once()
+
+
+def test_legacy_session_db_in_place_fails_closed_before_summary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The rotation compatibility path must never unlock an in-place rewrite."""
+    import hermes_state
+
+    real_db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "LEGACY_LOCK_IN_PLACE"
+    real_db.create_session(session_id, source="cli")
+    agent = _build_agent_with_db(real_db, session_id)
+    agent.compression_in_place = True
+    legacy_cls = _make_legacy_session_db_class()
+    agent._session_db = legacy_cls(real_db)
+    monkeypatch.setattr(hermes_state, "SessionDB", legacy_cls)
+    archive = MagicMock(wraps=real_db.archive_and_compact)
+    real_db.archive_and_compact = archive
+    messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+
+    compressed, _prompt = agent._compress_context(
+        messages, "sys", approx_tokens=120_000,
+    )
+
+    assert compressed is messages
+    assert agent.session_id == session_id
+    agent.context_compressor.compress.assert_not_called()
+    archive.assert_not_called()
+
+
 
 
 

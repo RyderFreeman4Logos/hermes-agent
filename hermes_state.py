@@ -6249,7 +6249,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return None
 
     def _check_transcript_write_guards(
-        self, conn, session_id: str, compression_lock_holder: Optional[str]
+        self,
+        conn,
+        session_id: str,
+        compression_lock_holder: Optional[str],
+        *,
+        require_compression_lease: bool = False,
+        require_session: bool = False,
     ) -> None:
         """Transcript-append admission checks, run INSIDE the write txn.
 
@@ -6263,8 +6269,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             "WHERE session_id = ? AND expires_at > ?",
             (session_id, time.time()),
         ).fetchone()
+        if require_compression_lease and (
+            active_lock is None
+            or not compression_lock_holder
+            or active_lock["holder"] != compression_lock_holder
+        ):
+            raise CompressionSessionBusyError(
+                f"Compression lease lost before transcript rewrite: {session_id}"
+            )
         if (
-            active_lock is not None
+            not require_compression_lease
+            and active_lock is not None
             and active_lock["holder"] != compression_lock_holder
         ):
             raise SessionCompressionInProgressError(
@@ -6274,6 +6289,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             "SELECT ended_at, end_reason FROM sessions WHERE id = ?",
             (session_id,),
         ).fetchone()
+        if session is None and require_session:
+            raise ValueError(f"Session not found: {session_id}")
         if (
             session is not None
             and session["ended_at"] is not None
@@ -6940,6 +6957,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         session_id: str,
         compacted_messages: List[Dict[str, Any]],
         model_config_patch: Optional[Dict[str, Any]] = None,
+        *,
+        system_prompt: Optional[str] = None,
+        compression_lock_holder: Optional[str] = None,
+        require_compression_lease: bool = False,
+        expected_active_messages: Optional[List[Dict[str, Any]]] = None,
+        expected_active_row_ids: Optional[List[int]] = None,
+        expected_active_row_fingerprint: Optional[List[tuple]] = None,
     ) -> int:
         """Non-destructive in-place compaction for a single durable session id.
 
@@ -6962,12 +6986,54 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         This is the durability-preserving alternative to :meth:`replace_messages`
         for compaction. ``message_count`` is set to the ACTIVE (compacted) count,
-        matching what the live load returns. ``model_config_patch`` is merged
-        into the session's JSON config in the same transaction; a ``None``
-        value removes that key. Returns the new active count.
+        matching what the live load returns. ``model_config_patch`` and a
+        non-``None`` ``system_prompt`` are persisted in the same transaction;
+        a ``None`` patch value removes that key. Returns the new active count.
         """
 
         def _do(conn):
+            self._check_transcript_write_guards(
+                conn,
+                session_id,
+                compression_lock_holder,
+                require_compression_lease=require_compression_lease,
+                require_session=True,
+            )
+            if expected_active_row_fingerprint is not None:
+                rows = conn.execute(
+                    "SELECT * FROM messages "
+                    "WHERE session_id = ? AND active = 1 ORDER BY id",
+                    (session_id,),
+                ).fetchall()
+                if (
+                    [tuple(row) for row in rows] != expected_active_row_fingerprint
+                    or (
+                        expected_active_row_ids is not None
+                        and [row["id"] for row in rows] != expected_active_row_ids
+                    )
+                ):
+                    raise CompressionSessionBusyError(
+                        f"Session transcript changed before compaction: {session_id}"
+                    )
+            elif expected_active_messages is not None:
+                rows = conn.execute(
+                    f"SELECT {self._CONVERSATION_ROW_COLUMNS} "
+                    "FROM messages WHERE session_id = ? AND active = 1 ORDER BY id",
+                    (session_id,),
+                ).fetchall()
+                active_messages = self._rows_to_conversation(
+                    rows,
+                    session_id=session_id,
+                    include_ancestors=False,
+                    repair_alternation=False,
+                )
+                if self._canonical_durable_transcript(
+                    active_messages
+                ) != self._canonical_durable_transcript(expected_active_messages):
+                    raise CompressionSessionBusyError(
+                        f"Session transcript changed before compaction: {session_id}"
+                    )
+
             patched_model_config = None
             if model_config_patch is not None:
                 # on_missing="raise": a prune/compaction must not commit
@@ -6994,20 +7060,43 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             # message_count / tool_call_count reflect the LIVE (active) set —
             # the archived rows are still on disk but not part of the live count.
-            if model_config_patch is None:
-                conn.execute(
-                    "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
-                    (inserted, tool_calls_total, session_id),
-                )
-            else:
-                conn.execute(
-                    "UPDATE sessions SET message_count = ?, tool_call_count = ?, "
-                    "model_config = ? WHERE id = ?",
-                    (inserted, tool_calls_total, patched_model_config, session_id),
-                )
+            updates = ["message_count = ?", "tool_call_count = ?"]
+            params: List[Any] = [inserted, tool_calls_total]
+            if model_config_patch is not None:
+                updates.append("model_config = ?")
+                params.append(patched_model_config)
+            if system_prompt is not None:
+                updates.extend(("system_prompt_hash = ?", "system_prompt = NULL"))
+                params.append(self._store_system_prompt(conn, system_prompt))
+            params.append(session_id)
+            conn.execute(
+                f"UPDATE sessions SET {', '.join(updates)} WHERE id = ?",
+                params,
+            )
+            if system_prompt is not None:
+                self._delete_unreferenced_system_prompts(conn)
             return inserted
 
         return self._execute_write(_do)
+
+    def get_compaction_baseline(
+        self, session_id: str,
+    ) -> tuple[List[Dict[str, Any]], List[tuple]]:
+        """Load replay rows and their exact durable fingerprint atomically."""
+        with self._read_ctx() as conn:
+            rows = conn.execute(
+                "SELECT * FROM messages "
+                "WHERE session_id = ? AND active = 1 ORDER BY id",
+                (session_id,),
+            ).fetchall()
+        messages = self._rows_to_conversation(
+            rows,
+            session_id=session_id,
+            include_ancestors=False,
+            repair_alternation=False,
+            include_row_ids=True,
+        )
+        return messages, [tuple(row) for row in rows]
 
     def set_latest_user_api_content(
         self, session_id: str, content: Any, api_content: str
@@ -7327,6 +7416,57 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         "codex_reasoning_items, codex_message_items, platform_message_id, observed, timestamp, "
         "api_content, display_kind, display_metadata"
     )
+
+    @staticmethod
+    def _canonical_durable_transcript(messages) -> List[Any]:
+        """Project messages onto fields that survive durable replay."""
+        canonical = []
+        truthy_fields = (
+            "api_content",
+            "display_kind",
+            "display_metadata",
+            "tool_call_id",
+            "tool_name",
+            "effect_disposition",
+            "tool_calls",
+        )
+        assistant_fields = (
+            "finish_reason",
+            "reasoning",
+            "reasoning_details",
+            "codex_reasoning_items",
+            "codex_message_items",
+        )
+        for message in messages:
+            if not isinstance(message, dict):
+                canonical.append(message)
+                continue
+            role = message.get("role")
+            content = message.get("content")
+            if role in {"user", "assistant"} and isinstance(content, str):
+                content = sanitize_context(content).strip()
+            projected = {"role": role, "content": content}
+            for field in truthy_fields:
+                value = message.get(field)
+                if value:
+                    projected[field] = value
+            if message.get("observed"):
+                projected["observed"] = True
+            if role == "assistant":
+                for field in assistant_fields:
+                    value = message.get(field)
+                    if value:
+                        projected[field] = value
+                reasoning_content = message.get("reasoning_content")
+                if reasoning_content is not None:
+                    projected["reasoning_content"] = reasoning_content
+            message_id = message.get("message_id") or message.get(
+                "platform_message_id"
+            )
+            if message_id:
+                projected["message_id"] = message_id
+            canonical.append(projected)
+        return canonical
 
     def _rows_to_conversation(
         self,

@@ -71,9 +71,17 @@ class TestInPlaceCompaction:
             agent = _make_agent(db, sid, in_place=True)
             agent._last_flushed_db_idx = 5
 
-            messages = [{"role": "user", "content": f"m{i}"} for i in range(8)]
-            compressed, _sp = compress_context(
-                agent, messages, approx_tokens=100_000, system_message="sys"
+            messages = db.get_messages_as_conversation(sid)
+            expected_active_messages = [message.copy() for message in messages]
+            with patch.object(
+                db, "archive_and_compact", wraps=db.archive_and_compact,
+            ) as archive:
+                compressed, _sp = compress_context(
+                    agent, messages, approx_tokens=100_000, system_message="sys"
+                )
+
+            assert archive.call_args.kwargs["expected_active_messages"] == (
+                expected_active_messages
             )
 
             # Identity never moved.
@@ -124,6 +132,144 @@ class TestInPlaceCompaction:
             # Live transcript actually shrank.
             assert len(compressed) == 2
 
+    def test_resume_prefix_with_unpersisted_tail_uses_exact_durable_baseline(self):
+        from agent.conversation_compression import compress_context
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "20260619_resume_tail"
+            _seed(db, sid, "resume-tail")
+            agent = _make_agent(db, sid, in_place=True)
+            durable = db.get_messages_as_conversation(sid)
+            messages = [
+                *durable,
+                {"role": "user", "content": "new unpersisted user"},
+                {"role": "assistant", "content": "new unpersisted reply"},
+            ]
+
+            with patch.object(
+                db, "archive_and_compact", wraps=db.archive_and_compact,
+            ) as archive:
+                compressed, _ = compress_context(
+                    agent,
+                    messages,
+                    approx_tokens=100_000,
+                    system_message="sys",
+                )
+
+            assert archive.call_args.kwargs["expected_active_messages"] == durable
+            assert db._canonical_durable_transcript(
+                db.get_messages_as_conversation(sid)
+            ) == db._canonical_durable_transcript(compressed)
+
+    def test_prompt_publish_cannot_leave_follow_on_flush_to_append_stale_rows(self):
+        from agent.conversation_compression import (
+            compress_context,
+            conversation_history_after_compression,
+        )
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "20260619_atomic_prompt"
+            _seed(db, sid, "atomic-prompt")
+            db.update_system_prompt(sid, "old prompt")
+            agent = _make_agent(db, sid, in_place=True)
+            messages = db.get_messages_as_conversation(sid)
+
+            # Before the prompt joined archive_and_compact's transaction, this
+            # injected failure happened after the 2-row archive committed. The
+            # broad failure handler restored the stale 8-row memory snapshot,
+            # and the normal follow-on flush appended all eight active rows.
+            with patch.object(
+                db,
+                "update_system_prompt",
+                side_effect=RuntimeError("post-archive prompt write failed"),
+            ) as legacy_prompt_write:
+                compressed, new_system_prompt = compress_context(
+                    agent,
+                    messages,
+                    approx_tokens=100_000,
+                    system_message="sys",
+                )
+
+            legacy_prompt_write.assert_not_called()
+            assert len(compressed) == 2
+            assert len(db.get_messages_as_conversation(sid)) == 2
+            assert db.get_session(sid)["system_prompt"] == new_system_prompt
+            all_rows_before_flush = db.get_messages(sid, include_inactive=True)
+            assert len(all_rows_before_flush) == 10
+
+            history = conversation_history_after_compression(
+                agent,
+                compressed,
+                previous_history=[],
+            )
+            agent._flush_messages_to_session_db(
+                compressed,
+                conversation_history=history,
+            )
+
+            assert len(db.get_messages_as_conversation(sid)) == 2
+            assert db.get_messages(sid, include_inactive=True) == all_rows_before_flush
+
+    def test_in_place_archive_failure_rolls_back_candidate_and_prune_state(self):
+        """A stale full-compaction snapshot must not survive a fenced DB reject."""
+        from agent.context_compressor import _DB_PERSISTED_MARKER
+        from agent.conversation_compression import compress_context
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "20260619_stale_full"
+            _seed(db, sid, "stale-full")
+            agent = _make_agent(db, sid, in_place=True)
+            messages = db.get_messages_as_conversation(sid)
+            for message in messages:
+                message[_DB_PERSISTED_MARKER] = True
+            before = [message.copy() for message in messages]
+            winner = "pid=1:tid=1:agent=winner:nonce=winner"
+            assert db.try_acquire_compression_lock(sid, winner, ttl_seconds=60)
+            db.archive_and_compact(
+                sid,
+                [
+                    {"role": "user", "content": "winner summary"},
+                    {"role": "assistant", "content": "winner reply"},
+                ],
+                compression_lock_holder=winner,
+                require_compression_lease=True,
+                expected_active_messages=before,
+            )
+            db.release_compression_lock(sid, winner)
+            durable_before = db.get_messages_as_conversation(sid)
+            all_rows_before = db.get_messages(sid, include_inactive=True)
+            agent.context_compressor._proactive_prune_rearm_tokens = 120_000
+
+            def _stale_compress(*_args, **_kwargs):
+                agent.context_compressor._proactive_prune_rearm_tokens = 0
+                return [
+                    {"role": "user", "content": "stale summary"},
+                    {"role": "assistant", "content": "stale reply"},
+                ]
+
+            agent.context_compressor.compress = _stale_compress
+            returned, _ = compress_context(
+                agent,
+                messages,
+                approx_tokens=100_000,
+                system_message="sys",
+            )
+
+            assert returned is messages
+            assert messages == before
+            agent._flush_messages_to_session_db(returned, conversation_history=[])
+            assert db.get_messages_as_conversation(sid) == durable_before
+            assert db.get_messages(sid, include_inactive=True) == all_rows_before
+            assert db.get_compression_lock_holder(sid) is None
+            assert agent.context_compressor._proactive_prune_rearm_tokens == 120_000
+            assert agent._last_compaction_in_place is False
+
     def test_in_place_alternation_preserved(self):
         """The compacted list must not introduce consecutive same-role messages."""
         from hermes_state import SessionDB
@@ -134,7 +280,7 @@ class TestInPlaceCompaction:
             sid = "20260619_120500_cccccc"
             _seed(db, sid, "alt")
             agent = _make_agent(db, sid, in_place=True)
-            messages = [{"role": "user", "content": f"m{i}"} for i in range(8)]
+            messages = db.get_messages_as_conversation(sid)
             compressed, _ = compress_context(
                 agent, messages, approx_tokens=100_000, system_message="sys"
             )
@@ -218,7 +364,7 @@ class TestInPlaceSignalForGateway:
             _seed(db, "s_ip", "ip")
             a_ip = _make_agent(db, "s_ip", in_place=True)
             compress_context(
-                a_ip, [{"role": "user", "content": "x"}] * 8,
+                a_ip, db.get_messages_as_conversation("s_ip"),
                 approx_tokens=100_000, system_message="sys",
             )
             assert a_ip._last_compaction_in_place is True

@@ -329,6 +329,19 @@ def _record_codex_app_server_compaction(
     except Exception:
         logger.debug("event_callback error on codex session:compress", exc_info=True)
 
+    if not force:
+        try:
+            from agent.conversation_compression import (
+                _refresh_delegate_model_pool_schema_after_compression,
+            )
+
+            _refresh_delegate_model_pool_schema_after_compression(agent)
+        except Exception:
+            logger.debug(
+                "delegate model-pool schema refresh failed after Codex compaction",
+                exc_info=True,
+            )
+
     return True
 
 

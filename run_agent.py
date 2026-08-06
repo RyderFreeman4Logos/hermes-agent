@@ -191,6 +191,8 @@ from agent.process_bootstrap import _get_proxy_from_env  # noqa: F401
 from agent.message_sanitization import (  # noqa: F401
     _EPHEMERAL_SCAFFOLDING_FLAGS,
     _is_ephemeral_scaffolding,
+    drop_uncommitted_completion_delivery_suffix,
+    durable_messages_before_pending_completion,
     _SURROGATE_RE,
     _sanitize_surrogates,
     _sanitize_structure_surrogates,
@@ -2015,19 +2017,31 @@ class AIAgent:
         self,
         messages: List[Dict],
         conversation_history: Optional[List[Dict]] = None,
+        *,
+        display_metadata_cas: Optional[Dict[str, Any]] = None,
     ):
         """Serialize direct and turn-boundary session flushes per agent."""
         persist_lock = getattr(self, "_session_persist_lock", None)
         if persist_lock is None:
-            return self._flush_messages_to_session_db_unlocked(messages, conversation_history)
+            return self._flush_messages_to_session_db_unlocked(
+                messages,
+                conversation_history,
+                display_metadata_cas=display_metadata_cas,
+            )
         with persist_lock:
-            return self._flush_messages_to_session_db_unlocked(messages, conversation_history)
+            return self._flush_messages_to_session_db_unlocked(
+                messages,
+                conversation_history,
+                display_metadata_cas=display_metadata_cas,
+            )
 
     def _flush_messages_to_session_db_unlocked(
         self,
         messages: List[Dict],
         conversation_history: Optional[List[Dict]] = None,
+        *,
         _adoption_budget: int = 1,
+        display_metadata_cas: Optional[Dict[str, Any]] = None,
     ):
         """Persist any un-flushed messages to the SQLite session store.
 
@@ -2056,6 +2070,76 @@ class AIAgent:
             return None
         if not self._session_db:
             return None
+        from agent.conversation_compression import _adopt_live_compression_child
+        from hermes_state import (
+            CompressionSessionBusyError,
+            CompressionSessionClosedError,
+        )
+
+        compression_wait_logged = False
+
+        def _append_messages_batch(rows):
+            nonlocal compression_wait_logged
+            try:
+                wait_seconds = float(
+                    getattr(self._session_db, "_TRANSCRIPT_WRITE_PATIENCE_S", 60.0)
+                )
+            except (TypeError, ValueError):
+                wait_seconds = 60.0
+            deadline = time.monotonic() + max(0.0, wait_seconds)
+            waiting = False
+            while True:
+                if waiting and getattr(self, "_interrupt_requested", False):
+                    return None
+                try:
+                    self._session_db.append_messages_batch(
+                        session_id=self.session_id,
+                        messages=rows,
+                        compression_lock_holder=getattr(
+                            self, "_active_compression_lock_holder", None
+                        ),
+                        # Let this outer loop adopt a published child and honor
+                        # turn interruption instead of blocking inside SessionDB.
+                        compression_patience_s=0.0,
+                        turn_lease_holder=getattr(
+                            self, "_active_session_turn_lease_holder", None
+                        ),
+                        turn_lease_ttl_seconds=getattr(
+                            self, "_active_session_turn_lease_ttl_seconds", 300.0
+                        )
+                        or 300.0,
+                        display_metadata_cas=display_metadata_cas,
+                    )
+                    return True
+                except CompressionSessionBusyError:
+                    waiting = True
+                    if getattr(self, "_interrupt_requested", False):
+                        return None
+                    parent_session_id = str(self.session_id or "")
+                    if _adopt_live_compression_child(
+                        self, self._session_db, parent_session_id
+                    ) is not None:
+                        continue
+                    if not compression_wait_logged:
+                        logger.info(
+                            "Session persistence waiting for compression: %s",
+                            parent_session_id,
+                        )
+                        compression_wait_logged = True
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        logger.warning(
+                            "Session persistence timed out waiting for compression: %s",
+                            parent_session_id,
+                        )
+                        return False
+                    time.sleep(min(0.05, remaining))
+                except CompressionSessionClosedError as exc:
+                    parent_session_id = exc.session_id
+                    if _adopt_live_compression_child(
+                        self, self._session_db, parent_session_id
+                    ) is None:
+                        raise
         # Persist user-message override (#48677 chokepoint): historically this
         # mutated the live `messages` list in place, which — on the early
         # crash-resilience persist that runs BEFORE the API call is built —
@@ -2132,7 +2216,9 @@ class AIAgent:
             # at the end of the scan (see append_messages_batch).
             _batch_rows: List[Dict[str, Any]] = []
             _batch_msgs: List[Dict] = []
-            for _msg_idx in range(_scan_start, len(messages)):
+            _durable_messages = durable_messages_before_pending_completion(messages)
+            _durable_end = len(_durable_messages)
+            for _msg_idx in range(_scan_start, _durable_end):
                 msg = messages[_msg_idx]
                 if not isinstance(msg, dict):
                     continue
@@ -2253,7 +2339,10 @@ class AIAgent:
                 _batch_rows.append({
                     "role": role,
                     "content": content,
-                    "tool_name": msg.get("tool_name"),
+                    "tool_name": (
+                        msg.get("tool_name")
+                        or (msg.get("name") if role == "tool" else None)
+                    ),
                     "tool_calls": tool_calls_data,
                     "tool_call_id": msg.get("tool_call_id"),
                     "finish_reason": msg.get("finish_reason"),
@@ -2298,31 +2387,22 @@ class AIAgent:
             # NO markers were stamped, so the next flush re-scans and
             # re-writes the whole tail (same recovery contract as before,
             # minus the partial-prefix case that could double-pay counters).
-            if _batch_rows:
-                self._session_db.append_messages_batch(
-                    session_id=self.session_id,
-                    messages=_batch_rows,
-                    compression_lock_holder=getattr(
-                        self, "_active_compression_lock_holder", None
-                    ),
-                    turn_lease_holder=getattr(
-                        self, "_active_session_turn_lease_holder", None
-                    ),
-                    turn_lease_ttl_seconds=getattr(
-                        self, "_active_session_turn_lease_ttl_seconds", 300.0
-                    )
-                    or 300.0,
-                )
+            if _batch_rows or display_metadata_cas:
+                append_result = _append_messages_batch(_batch_rows)
+                if append_result is not True:
+                    self._db_flush_scan_prefix = None
+                    return append_result
                 for _written in _batch_msgs:
                     _written[_DB_PERSISTED_MARKER] = True
             # The intrinsic markers are now the sole source of truth. Reset the
             # one-shot seed so no id() outlives this flush to alias a message
             # allocated next turn at a recycled address.
             self._flushed_db_message_ids = set()
-            self._last_flushed_db_idx = len(messages)
+            _settled_end = _durable_end
+            self._last_flushed_db_idx = _settled_end
             # Snapshot for the bounded scan above — only on full success, so
             # a partially-processed list can never be treated as settled.
-            self._db_flush_scan_prefix = messages[:]
+            self._db_flush_scan_prefix = messages[:_settled_end]
             return True
         except Exception as e:
             # Force a full re-scan on the next flush: an exception mid-loop
@@ -2382,6 +2462,7 @@ class AIAgent:
                                 messages,
                                 conversation_history,
                                 _adoption_budget=0,
+                                display_metadata_cas=display_metadata_cas,
                             )
                 # No live tip (or budget exhausted): fail closed — never guess
                 # a target session. The per-turn diagnostic flag lets the
@@ -3108,7 +3189,7 @@ class AIAgent:
 
         try:
             cleaned = []
-            for msg in messages:
+            for msg in durable_messages_before_pending_completion(messages):
                 # Mirror the SQLite flush: ephemeral recovery scaffolding is
                 # internal retry state, never durable transcript content.
                 if _is_ephemeral_scaffolding(msg):
@@ -8382,6 +8463,36 @@ class AIAgent:
                 moa_config=moa_config,
                 heartbeat_event=heartbeat_event,
             )
+        if getattr(self, "_completion_delivery_commit_failed", False):
+            from agent.message_sanitization import (
+                durable_messages_before_pending_completion,
+            )
+            from agent.turn_finalizer import retry_pending_completion_delivery_commit
+
+            _pending_messages = getattr(self, "_session_messages", None) or []
+            _pending_status = retry_pending_completion_delivery_commit(
+                self, _pending_messages
+            )
+            if _pending_status == "committed":
+                conversation_history = list(_pending_messages)
+            else:
+                return {
+                    "final_response": "",
+                    "messages": list(durable_messages_before_pending_completion(
+                        _pending_messages
+                    )),
+                    "api_calls": 0,
+                    "completed": False,
+                    "failed": True,
+                    "partial": True,
+                    "interrupted": False,
+                    "error": (
+                        "A prior completion delivery could not be committed to "
+                        "SessionDB; retry after storage recovers"
+                    ),
+                    "completion_delivery_status": "pending",
+                    "agent_persisted": True,
+                }
         from agent.aux_accounting import (
             reset_accounting_context,
             set_accounting_context,
@@ -8756,6 +8867,77 @@ class AIAgent:
                     # outer finally: a refresher firing between stop and join
                     # would otherwise set an interrupt that survives the clear.
             terminal = result if isinstance(result, dict) else {}
+            terminal_messages = terminal.get("messages")
+            # Several terminal provider-error paths return directly from the
+            # conversation loop before ``finalize_turn``.  If a completion
+            # delivery already executed a tool, that suffix is an audit record,
+            # not retry scaffolding: publish it through the same DB-authority
+            # finalizer before the generic early-return cleanup below.  A
+            # zero-work failed delivery is dropped by the helper instead.
+            from agent.message_sanitization import completion_delivery_suffix_start
+            if (
+                completion_delivery_suffix_start(terminal_messages) is not None
+                and not terminal.get("completion_delivery_status")
+            ):
+                from agent.turn_finalizer import finalize_completion_delivery_suffix
+
+                _early_completion_status = finalize_completion_delivery_suffix(
+                    self,
+                    terminal_messages,
+                    final_response=terminal.get("final_response"),
+                    failed=terminal.get("failed") is True,
+                    interrupted=terminal.get("interrupted") is True,
+                )
+                terminal["completion_delivery_status"] = _early_completion_status
+                if _early_completion_status == "committed":
+                    # The DB commit is authoritative; only then publish the
+                    # canonicalized live state to the optional JSON snapshot.
+                    try:
+                        self._save_session_log(terminal_messages)
+                    except Exception:
+                        logger.warning(
+                            "completion-delivery JSON snapshot update failed",
+                            exc_info=True,
+                        )
+                elif _early_completion_status == "pending":
+                    from agent.message_sanitization import (
+                        durable_messages_before_pending_completion,
+                    )
+
+                    terminal["messages"] = list(
+                        durable_messages_before_pending_completion(
+                            terminal_messages
+                        )
+                    )
+                    terminal["completed"] = False
+                    terminal["failed"] = True
+                    terminal["partial"] = True
+                    terminal["error"] = (
+                        terminal.get("error")
+                        or "completion delivery could not be committed to SessionDB"
+                    )
+            # Successful/no-op completion turns are dispositioned by the
+            # finalizer, which removes the marker.  Any surviving marker means
+            # an early return bypassed finalization; discard that whole atomic
+            # suffix from both the returned continuation and the cached live
+            # history.  Durable writers enforce the same barrier separately.
+            _dropped_completion_suffix = (
+                drop_uncommitted_completion_delivery_suffix(
+                    terminal.get("messages"),
+                    preserve_meaningful_work=True,
+                )
+            )
+            _dropped_completion_suffix = (
+                drop_uncommitted_completion_delivery_suffix(
+                    getattr(self, "_session_messages", None),
+                    preserve_meaningful_work=True,
+                )
+                or _dropped_completion_suffix
+            )
+            if _dropped_completion_suffix:
+                self._persist_user_message_idx = None
+                self._persist_user_message_override = None
+                self._db_flush_scan_prefix = None
             if terminal.get("interrupted") is True:
                 relay_outcome = "cancelled"
             elif terminal.get("failed") is True:
@@ -8793,6 +8975,31 @@ class AIAgent:
                 finish_task_run(**task_context, error=exc)
             raise
         finally:
+            _dropped_pending_completion = False
+            for _completion_owner in (
+                conversation_history,
+                getattr(self, "_session_messages", None),
+            ):
+                _dropped_pending_completion = (
+                    drop_uncommitted_completion_delivery_suffix(
+                        _completion_owner,
+                        preserve_meaningful_work=True,
+                    )
+                    or _dropped_pending_completion
+                )
+            _pending_cli_completion = getattr(
+                self, "_pending_cli_user_message", None
+            )
+            if (
+                isinstance(_pending_cli_completion, dict)
+                and _pending_cli_completion.get("_completion_delivery_synthetic")
+            ):
+                self._pending_cli_user_message = None
+                _dropped_pending_completion = True
+            if _dropped_pending_completion:
+                self._persist_user_message_idx = None
+                self._persist_user_message_override = None
+                self._db_flush_scan_prefix = None
             try:
                 if relay_turn is not None:
                     relay_runtime.SESSION_COORDINATOR.end_turn(

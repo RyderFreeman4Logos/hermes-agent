@@ -344,6 +344,17 @@ class ChatCompletionsTransport(ProviderTransport):
                 or "api_content" in msg  # persist-what-you-send sidecar
             ):
                 out_msg = mutable_msg()
+                if (
+                    msg.get("role") == "tool"
+                    and not msg.get("name")
+                    and isinstance(msg.get("tool_name"), str)
+                    and msg.get("tool_name")
+                ):
+                    # Durable/imported histories may carry only Hermes'
+                    # indexing field. Reconstruct the OpenAI wire field before
+                    # stripping internal metadata so every restore backend
+                    # serializes the same tool-result bytes as a live turn.
+                    out_msg["name"] = msg["tool_name"]
                 out_msg.pop("codex_reasoning_items", None)
                 out_msg.pop("codex_message_items", None)
                 out_msg.pop("tool_name", None)

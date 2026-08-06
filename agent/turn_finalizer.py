@@ -22,12 +22,22 @@ keep the exact logger name (``"agent.conversation_loop"``).
 
 from __future__ import annotations
 
+import copy
 import os
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.message_content import flatten_message_text
 from agent.message_metadata import append_message, stamp_message_timestamp
-from agent.message_sanitization import _is_ephemeral_scaffolding, _sanitize_surrogates
+from agent.message_sanitization import (
+    COMPLETION_DELIVERY_INTERRUPTED_CLOSURE,
+    COMPLETION_DELIVERY_TOOL_CLOSURE,
+    _is_ephemeral_scaffolding,
+    _sanitize_surrogates,
+    close_interrupted_tool_sequence,
+    completion_delivery_suffix_has_meaningful_work,
+    completion_delivery_suffix_start,
+    completion_delivery_transcript_content,
+)
 
 
 def _is_pure_tool_call_tail(msg: dict) -> bool:
@@ -47,6 +57,210 @@ def _is_pure_tool_call_tail(msg: dict) -> bool:
 def _drop_ephemeral_scaffolding(messages) -> None:
     """Remove model-only scaffolding while preserving every real message."""
     messages[:] = [m for m in messages if not _is_ephemeral_scaffolding(m)]
+
+
+def finalize_completion_delivery_suffix(
+    agent,
+    messages,
+    *,
+    final_response,
+    failed: bool,
+    interrupted: bool,
+    commit_tool_intent: bool = False,
+) -> str:
+    """Publish one completion suffix, using SessionDB as commit authority.
+
+    The marked user row and everything after it were withheld from append-only
+    persistence.  A meaningful turn is staged as a hidden durable event plus
+    its assistant/tool sequence.  The staged suffix is atomically appended to
+    SessionDB before the live list is changed, so JSON/live state can never
+    report a commit that cold resume cannot replay. ``api_content`` retains the
+    exact prompt the provider saw; ``content`` contains only the canonical event
+    text.
+
+    Zero-work no-ops and failures are discarded.  Once a tool/effect or visible
+    assistant action exists, failure/interruption commits that audit trail with
+    a provider-safe closure instead of making restart retry the side effect.
+
+    Returns ``"none"``, ``"dropped"``, ``"committed"``, or ``"pending"``.
+    ``pending`` means the atomic DB publish failed after a retry; the marked
+    suffix remains live for a later durability retry and must not be discarded.
+    """
+    start = completion_delivery_suffix_start(messages)
+    if start is None:
+        return "none"
+
+    response_text = flatten_message_text(final_response).strip()
+    suffix_has_work = completion_delivery_suffix_has_meaningful_work(messages, start)
+    meaningful = suffix_has_work or bool(
+        not failed
+        and not interrupted
+        and response_text
+        and response_text != "(empty)"
+    )
+    if commit_tool_intent:
+        meaningful = meaningful or any(
+            isinstance(row, dict)
+            and row.get("role") == "assistant"
+            and row.get("tool_calls")
+            for row in messages[start + 1:]
+        )
+
+    if not meaningful:
+        del messages[start:]
+        agent._pending_completion_delivery_suffix = None
+        agent._pending_completion_delivery_display_metadata_cas = None
+        agent._completion_delivery_commit_failed = False
+        agent._persist_user_message_idx = None
+        agent._persist_user_message_override = None
+        agent._db_flush_scan_prefix = None
+        return "dropped"
+
+    # Keep the durable prefix objects by identity and isolate only the pending
+    # suffix.  The flush protocol uses those prefix identities/markers to tell
+    # already-published compression rows from a turn-start boundary whose DB
+    # append failed and still needs to land with the event.
+    staged = list(messages[:start]) + copy.deepcopy(messages[start:])
+    user = staged[start]
+    wire_content = user.get("content")
+    provider_content = user.get("api_content")
+    if not isinstance(provider_content, str) or not provider_content:
+        provider_content = wire_content
+    clean_content = completion_delivery_transcript_content(wire_content)
+    user["content"] = clean_content
+    if isinstance(provider_content, str) and provider_content != clean_content:
+        user["api_content"] = provider_content
+    user["display_kind"] = "hidden"
+    metadata = user.get("display_metadata")
+    metadata = dict(metadata) if isinstance(metadata, dict) else {}
+    metadata_cas = None
+    if not commit_tool_intent and user.get("_completion_delivery_active"):
+        expected_metadata = dict(metadata)
+        expected_metadata["completion_delivery_status"] = "effect_started"
+    metadata["completion_delivery_status"] = (
+        "effect_started"
+        if commit_tool_intent
+        else "interrupted" if interrupted else "failed" if failed else "complete"
+    )
+    user["display_metadata"] = metadata
+    if not commit_tool_intent and user.get("_completion_delivery_active"):
+        metadata_cas = {
+            "role": "user",
+            "content": clean_content,
+            "api_content": (
+                provider_content
+                if isinstance(provider_content, str)
+                and provider_content != clean_content
+                else None
+            ),
+            "display_kind": "hidden",
+            "expected_display_metadata": expected_metadata,
+            "display_metadata": metadata,
+        }
+    user.pop("_completion_delivery_synthetic", None)
+    # Active is a live finalization marker and therefore a persistence barrier.
+    # Keep it off the staged DB copy until the tool intent has actually landed.
+    user.pop("_completion_delivery_active", None)
+
+    staged_tail = staged[-1] if staged and isinstance(staged[-1], dict) else None
+    if response_text and not failed and not interrupted and (
+        staged_tail is None or staged_tail.get("role") != "assistant"
+    ):
+        staged.append({"role": "assistant", "content": final_response})
+    elif (
+        response_text
+        and not failed
+        and not interrupted
+        and isinstance(staged_tail, dict)
+        and staged_tail.get("content") != final_response
+        and _is_pure_tool_call_tail(staged_tail)
+    ):
+        staged_tail["content"] = final_response
+
+    if staged and isinstance(staged[-1], dict) and staged[-1].get("role") == "tool":
+        closure = (
+            COMPLETION_DELIVERY_INTERRUPTED_CLOSURE
+            if failed or interrupted
+            else COMPLETION_DELIVERY_TOOL_CLOSURE
+        )
+        if close_interrupted_tool_sequence(staged, closure):
+            staged[-1]["display_kind"] = "hidden"
+
+    # The normal incremental writer is already atomic for a new suffix.  Use
+    # its marker protocol on the staged copy; only publish those exact dicts to
+    # the live list after SessionDB accepts them.  One immediate retry covers a
+    # transient append failure without risking duplication: failed transactions
+    # stamp no message markers, while a successful one stamps the staged rows.
+    db_bound = (
+        getattr(agent, "_session_db", None) is not None
+        and not getattr(agent, "_persist_disabled", False)
+    )
+    committed = not db_bound
+    if db_bound:
+        for _attempt in range(2):
+            try:
+                committed = agent._flush_messages_to_session_db(
+                    staged,
+                    display_metadata_cas=metadata_cas,
+                ) is True
+            except Exception:
+                committed = False
+            if committed:
+                break
+    if not committed:
+        agent._pending_completion_delivery_suffix = copy.deepcopy(staged[start:])
+        agent._pending_completion_delivery_display_metadata_cas = copy.deepcopy(
+            metadata_cas
+        )
+        agent._completion_delivery_commit_failed = True
+        agent._db_flush_scan_prefix = None
+        return "pending"
+
+    if commit_tool_intent:
+        staged[start]["_completion_delivery_active"] = True
+    messages[:] = staged
+    agent._pending_completion_delivery_suffix = None
+    agent._pending_completion_delivery_display_metadata_cas = None
+    agent._completion_delivery_commit_failed = False
+    # The normal finalizer applies this override after response repair.  Point
+    # it at the canonical event so it cannot restore the API-only instruction.
+    agent._persist_user_message_idx = start
+    agent._persist_user_message_override = clean_content
+    # Earlier incremental flushes intentionally stopped at this same dict.
+    # Force the marker scanner to revisit it now that its disposition changed.
+    if not db_bound:
+        agent._db_flush_scan_prefix = None
+    return "committed"
+
+
+def retry_pending_completion_delivery_commit(agent, messages) -> str:
+    """Retry the exact canonical suffix retained after a failed DB append."""
+    pending = getattr(agent, "_pending_completion_delivery_suffix", None)
+    start = completion_delivery_suffix_start(messages)
+    if not isinstance(pending, list) or not pending or start is None:
+        return "none"
+    staged = list(messages[:start]) + copy.deepcopy(pending)
+    metadata_cas = copy.deepcopy(getattr(
+        agent, "_pending_completion_delivery_display_metadata_cas", None
+    ))
+    try:
+        committed = agent._flush_messages_to_session_db(
+            staged,
+            display_metadata_cas=metadata_cas,
+        ) is True
+    except Exception:
+        committed = False
+    if not committed:
+        return "pending"
+    messages[:] = staged
+    agent._pending_completion_delivery_suffix = None
+    agent._pending_completion_delivery_display_metadata_cas = None
+    agent._completion_delivery_commit_failed = False
+    try:
+        agent._save_session_log(messages)
+    except Exception:
+        pass
+    return "committed"
 
 
 def finalize_turn(
@@ -188,6 +402,13 @@ def finalize_turn(
             logical_count < agent.max_iterations
             or normal_text_response
         )
+    ) or (
+        str(_turn_exit_reason) in {
+            "completion_delivery_noop",
+            "completion_delivery_effect_complete",
+        }
+        and not failed
+        and not interrupted
     )
 
     # Preflight can seed the display count before the provider receives the
@@ -232,6 +453,7 @@ def finalize_turn(
     # are surfaced on the result dict via ``cleanup_errors`` rather than
     # killing the turn.
     _cleanup_errors = []
+    _completion_delivery_status = "none"
 
     # Save trajectory if enabled.  ``user_message`` may be a multimodal
     # list of parts; the trajectory format wants a plain string.
@@ -255,10 +477,43 @@ def finalize_turn(
     try:
         agent._drop_trailing_empty_response_scaffolding(messages)
 
-        # Drop all model-only nudges from returned/live history. The shared
-        # persistence predicate owns the complete flag list; real assistant
-        # responses are deliberately unflagged and remain durable.
-        _drop_ephemeral_scaffolding(messages)
+        _completion_delivery_status = finalize_completion_delivery_suffix(
+            agent,
+            messages,
+            final_response=final_response,
+            failed=failed,
+            interrupted=interrupted,
+        )
+        _completion_delivery_committed = (
+            _completion_delivery_status == "committed"
+        )
+        if _completion_delivery_status == "pending":
+            completed = False
+            failed = True
+            _cleanup_errors.append("completion_delivery_commit: SessionDB append failed")
+
+        # Drop model-only nudges only after the completion suffix has a final
+        # disposition.  On a DB failure the completion marker is the atomic
+        # write barrier for the still-pending assistant/tool rows; deleting it
+        # here would let the generic persist below append an orphan response.
+        # Keep the whole suffix intact so a later durability retry still has
+        # the event plus every effect it owns.
+        if _completion_delivery_status != "pending":
+            _drop_ephemeral_scaffolding(messages)
+
+        # A completion event may do real tool work and then honor the prompt's
+        # literal-empty final-answer contract.  That is meaningful (so the
+        # whole event/tool suffix is durable), but it would otherwise leave a
+        # raw tool-result tail.  Reuse the established provider-safe closure
+        # helper and keep the synthetic closure out of transcript surfaces.
+        if (
+            _completion_delivery_committed
+            and not flatten_message_text(final_response).strip()
+            and close_interrupted_tool_sequence(
+                messages, COMPLETION_DELIVERY_TOOL_CLOSURE
+            )
+        ):
+            messages[-1]["display_kind"] = "hidden"
 
         # When the turn was interrupted and the last message is a tool
         # result, append a synthetic assistant message to close the
@@ -275,7 +530,6 @@ def finalize_turn(
         # empty, so fall back to an explicit placeholder rather than
         # persisting an empty-content assistant turn.
         if interrupted:
-            from agent.message_sanitization import close_interrupted_tool_sequence
             close_interrupted_tool_sequence(messages, final_response)
 
         # Some recovery/fallback paths return a real final_response without
@@ -499,7 +753,10 @@ def finalize_turn(
     #     an empty response, the "(empty)" terminal sentinel, or a
     #     suspiciously short partial fragment with no terminating
     #     punctuation (e.g. "The").  A real short answer keeps its text.
-    if not interrupted:
+    if not interrupted and str(_turn_exit_reason) not in {
+        "completion_delivery_noop",
+        "completion_delivery_effect_complete",
+    }:
         try:
             if agent._turn_completion_explainer_enabled():
                 _stripped = (final_response or "").strip()
@@ -645,17 +902,26 @@ def finalize_turn(
     if isinstance(final_response, str):
         final_response = _sanitize_surrogates(final_response)
 
+    result_messages = messages
+    if _completion_delivery_status == "pending":
+        from agent.message_sanitization import (
+            durable_messages_before_pending_completion,
+        )
+
+        result_messages = list(durable_messages_before_pending_completion(messages))
+
     # Build result with interrupt info if applicable
     result = {
         "final_response": final_response,
         "last_reasoning": last_reasoning,
-        "messages": messages,
+        "messages": result_messages,
         "api_calls": api_call_count,
         "completed": completed,
         "turn_exit_reason": _turn_exit_reason,
         "failed": failed,
-        "partial": False,  # True only when stopped due to invalid tool calls
+        "partial": _completion_delivery_status == "pending",
         "interrupted": interrupted,
+        "completion_delivery_status": _completion_delivery_status,
         "response_transformed": _response_transformed,
         "pre_transform_response": _pre_transform_response,
         "response_previewed": getattr(agent, "_response_was_previewed", False),
@@ -704,6 +970,8 @@ def finalize_turn(
             result["failure_reason"] = (
                 "session_persistence_failed:" + (_cause or "unknown")
             )
+    elif _completion_delivery_status == "pending":
+        result["error"] = "completion delivery could not be committed to SessionDB"
     # Surface any post-loop cleanup failures so the caller can distinguish a
     # clean turn from one whose trajectory/session/resource teardown raised
     # (the response is still returned either way — #8049).

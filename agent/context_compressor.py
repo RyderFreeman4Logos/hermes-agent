@@ -41,6 +41,7 @@ from agent.model_metadata import (
     _reasoning_alias_for_estimation,
 )
 from agent.redact import redact_sensitive_text
+from agent.message_sanitization import durable_messages_before_pending_completion
 from agent.turn_context import api_content_for_wire, drop_stale_api_content
 from tools.todo_tool import TODO_INJECTION_HEADER
 
@@ -3575,9 +3576,12 @@ class ContextCompressor(ContextEngine):
         if session_db and session_id:
             # The capability gate above guarantees archive_and_compact exists.
             try:
+                durable_pruned_msgs = durable_messages_before_pending_completion(
+                    pruned_msgs
+                )
                 session_db.archive_and_compact(
                     session_id,
-                    pruned_msgs,
+                    durable_pruned_msgs,
                     model_config_patch={
                         PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: next_rearm_tokens,
                     },
@@ -3589,7 +3593,7 @@ class ContextCompressor(ContextEngine):
                     exc,
                 )
                 return messages, 0
-            for msg in pruned_msgs:
+            for msg in durable_pruned_msgs:
                 if isinstance(msg, dict):
                     msg[_DB_PERSISTED_MARKER] = True
         self._proactive_prune_rearm_tokens = next_rearm_tokens
@@ -6363,8 +6367,11 @@ This compaction should PRIORITISE preserving all information related to the focu
         if not session_db or not session_id:
             return
         try:
-            session_db.archive_and_compact(session_id, compacted_messages)
-            for msg in compacted_messages:
+            durable_compacted_messages = (
+                durable_messages_before_pending_completion(compacted_messages)
+            )
+            session_db.archive_and_compact(session_id, durable_compacted_messages)
+            for msg in durable_compacted_messages:
                 if isinstance(msg, dict):
                     msg[_DB_PERSISTED_MARKER] = True
         except Exception:

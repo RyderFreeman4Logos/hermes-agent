@@ -66,36 +66,28 @@ def _drain_for(delegation_id, timeout=5.0):
     return None
 
 
-def test_active_for_session_counts_every_live_delegation_state():
+@pytest.mark.parametrize(
+    "status",
+    sorted(ad._ACTIVE_STATUSES | {"completed", "error", "interrupted", "stalled"}),
+)
+def test_session_live_predicates_follow_authoritative_statuses(status):
     with ad._records_lock:
-        ad._records.update(
-            {
-                "running": {
-                    "status": "running",
-                    "origin_ui_session_id": "desktop-sid",
-                },
-                "stalling": {
-                    "status": "stalling",
-                    "origin_ui_session_id": "desktop-sid",
-                },
-                "finalizing": {
-                    "status": "finalizing",
-                    "origin_ui_session_id": "desktop-sid",
-                },
-                "completed": {
-                    "status": "completed",
-                    "origin_ui_session_id": "desktop-sid",
-                },
-                "other-session": {
-                    "status": "running",
-                    "origin_ui_session_id": "other-sid",
-                },
-            }
-        )
+        ad._records[status] = {
+            "status": status,
+            "session_key": "session-key",
+            "origin_ui_session_id": "desktop-sid",
+            "parent_session_id": "parent-session",
+        }
 
-    assert ad.active_for_session("desktop-sid") == 3
-    assert ad.active_for_session("other-sid") == 1
+    expected = status in ad._ACTIVE_STATUSES
+    assert ad.active_for_session("desktop-sid") == int(expected)
+    assert ad.active_for_session("other-sid") == 0
     assert ad.active_for_session("") == 0
+    assert ad.has_live_for_session(session_key="session-key") is expected
+    assert ad.has_live_for_session(origin_ui_session_id="desktop-sid") is expected
+    assert ad.has_live_for_session(parent_session_id="parent-session") is expected
+    assert not ad.has_live_for_session(origin_ui_session_id="other-sid")
+    assert not ad.has_live_for_session()
 
 
 def test_heartbeat_config_is_validated_before_delegation_submit(monkeypatch):

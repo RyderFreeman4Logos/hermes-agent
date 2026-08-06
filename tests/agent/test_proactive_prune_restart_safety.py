@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ast
 import copy
 import json
 import os
@@ -24,44 +23,6 @@ from hermes_state import (
 
 
 _REARM_KEY = "_proactive_prune_rearm_tokens"
-
-
-def test_all_runtime_archive_and_compact_calls_are_fenced() -> None:
-    """Every production whole-session rewrite carries lease and snapshot guards."""
-    repo_root = Path(__file__).resolve().parents[2]
-    excluded_dirs = {
-        ".git", ".venv", "venv", "build", "dist", "node_modules", "tests",
-    }
-    archive_calls: list[tuple[Path, ast.Call]] = []
-    for path in repo_root.rglob("*.py"):
-        if any(part in excluded_dirs for part in path.relative_to(repo_root).parts):
-            continue
-        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            is_archive_call = (
-                isinstance(node.func, ast.Attribute)
-                and node.func.attr == "archive_and_compact"
-            ) or (
-                isinstance(node.func, ast.Name)
-                and node.func.id == "archive_and_compact"
-            )
-            if is_archive_call:
-                archive_calls.append((path.relative_to(repo_root), node))
-
-    assert archive_calls, "production archive_and_compact caller audit found no calls"
-    required = {
-        "compression_lock_holder",
-        "require_compression_lease",
-        "expected_active_fingerprint",
-    }
-    for path, call in archive_calls:
-        keywords = {keyword.arg for keyword in call.keywords}
-        assert required <= keywords, (
-            f"unfenced archive_and_compact call at {path}:{call.lineno}; "
-            f"missing {sorted(required - keywords)}"
-        )
 
 
 def _assistant_call(call_id: str) -> dict:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from unittest.mock import patch
 
 import pytest
 
@@ -93,6 +94,85 @@ def test_prompt_replacement_and_route_changes_collect_only_orphans(db):
     assert db.get_session("s2")["system_prompt"] == "replacement"
     db.update_system_prompt("s2", None)
     assert _prompt_count(db) == 0
+
+
+def test_archive_prompt_publication_rolls_back_with_compaction(db):
+    db.create_session(
+        "atomic-compaction",
+        "cli",
+        model="old-model",
+        model_config={"provider": "old-provider"},
+        system_prompt="old prompt",
+    )
+    db.update_session_billing_route(
+        "atomic-compaction",
+        provider="old-provider",
+        base_url="https://old.example/v1",
+        billing_mode="chat_completions",
+    )
+    db.append_message("atomic-compaction", "user", "original message")
+
+    before_session = dict(
+        db._conn.execute(
+            "SELECT model, model_config, system_prompt, system_prompt_hash, "
+            "billing_provider, billing_base_url, billing_mode, message_count, "
+            "tool_call_count FROM sessions WHERE id = 'atomic-compaction'"
+        ).fetchone()
+    )
+    before_prompts = [
+        tuple(row)
+        for row in db._conn.execute(
+            "SELECT hash, prompt FROM system_prompts ORDER BY hash"
+        )
+    ]
+    before_messages = [
+        tuple(row)
+        for row in db._conn.execute(
+            "SELECT role, content, active, compacted FROM messages "
+            "WHERE session_id = 'atomic-compaction' ORDER BY id"
+        )
+    ]
+
+    with patch.object(
+        db,
+        "_insert_message_rows",
+        side_effect=RuntimeError("injected compaction failure"),
+    ):
+        with pytest.raises(RuntimeError, match="injected compaction failure"):
+            db.archive_and_compact(
+                "atomic-compaction",
+                [{"role": "user", "content": "compacted message"}],
+                model_config_json=json.dumps({"provider": "new-provider"}),
+                model="new-model",
+                system_prompt="new prompt",
+                billing_provider="new-provider",
+                billing_base_url="https://new.example/v1",
+                billing_mode="responses",
+            )
+
+    after_session = dict(
+        db._conn.execute(
+            "SELECT model, model_config, system_prompt, system_prompt_hash, "
+            "billing_provider, billing_base_url, billing_mode, message_count, "
+            "tool_call_count FROM sessions WHERE id = 'atomic-compaction'"
+        ).fetchone()
+    )
+    after_prompts = [
+        tuple(row)
+        for row in db._conn.execute(
+            "SELECT hash, prompt FROM system_prompts ORDER BY hash"
+        )
+    ]
+    after_messages = [
+        tuple(row)
+        for row in db._conn.execute(
+            "SELECT role, content, active, compacted FROM messages "
+            "WHERE session_id = 'atomic-compaction' ORDER BY id"
+        )
+    ]
+    assert after_session == before_session
+    assert after_prompts == before_prompts
+    assert after_messages == before_messages
 
 
 def test_existing_session_enrichment_does_not_leak_unused_prompt(db):

@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -95,6 +96,149 @@ def test_active_for_session_counts_every_live_delegation_state():
     assert ad.active_for_session("desktop-sid") == 3
     assert ad.active_for_session("other-sid") == 1
     assert ad.active_for_session("") == 0
+
+
+def test_heartbeat_config_is_validated_before_delegation_submit(monkeypatch):
+    from tools.runtime_heartbeat import HeartbeatConfigError
+
+    monkeypatch.setattr(
+        "tools.runtime_heartbeat.preflight_current_heartbeat",
+        lambda: (_ for _ in ()).throw(
+            HeartbeatConfigError("missing exact mapping for custom:pm")
+        ),
+    )
+    get_executor = MagicMock()
+    monkeypatch.setattr(ad, "_get_executor", get_executor)
+
+    with pytest.raises(HeartbeatConfigError, match="custom:pm"):
+        ad.dispatch_async_delegation(
+            goal="g",
+            context=None,
+            toolsets=None,
+            role="leaf",
+            model="m",
+            session_key="owner",
+            runner=lambda: {"status": "completed"},
+        )
+
+    get_executor.assert_not_called()
+    assert ad.active_count() == 0
+
+
+def test_delegation_arms_after_submit_and_cancels_on_completion(monkeypatch):
+    from tools.runtime_heartbeat import runtime_heartbeat
+
+    gate = threading.Event()
+    monkeypatch.setattr(
+        "tools.runtime_heartbeat.preflight_current_heartbeat", lambda: 1700
+    )
+    arm = MagicMock(return_value=True)
+    cancel = MagicMock(return_value=True)
+    monkeypatch.setattr(runtime_heartbeat, "arm", arm)
+    monkeypatch.setattr(runtime_heartbeat, "cancel", cancel)
+
+    result = ad.dispatch_async_delegation(
+        goal="g",
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="owner",
+        runner=lambda: (gate.wait(timeout=5), {"status": "completed"})[1],
+    )
+    assert result["status"] == "dispatched"
+    arm.assert_called_once()
+    assert arm.call_args.kwargs["interval"] == 1700
+    assert arm.call_args.kwargs["caller_id"] == "owner"
+
+    gate.set()
+    assert _drain_for(result["delegation_id"]) is not None
+    cancel.assert_called_once_with(result["delegation_id"])
+
+
+@pytest.mark.parametrize("batch", [False, True])
+def test_fast_completion_cannot_cancel_before_heartbeat_arm(monkeypatch, batch):
+    from tools.runtime_heartbeat import runtime_heartbeat
+
+    arm_entered = threading.Event()
+    release_arm = threading.Event()
+    admission_entered = threading.Event()
+    worker_finished = threading.Event()
+    timers = []
+    original_arm = runtime_heartbeat.arm
+    original_admit_worker = ad._admit_worker
+
+    class FakeTimer:
+        def __init__(self, _interval, _callback):
+            self.daemon = False
+            self.cancelled = False
+            timers.append(self)
+
+        def start(self):
+            pass
+
+        def cancel(self):
+            self.cancelled = True
+
+    def blocked_arm(*args, **kwargs):
+        arm_entered.set()
+        assert release_arm.wait(timeout=5)
+        return original_arm(*args, **kwargs)
+
+    def tracked_admit_worker(delegation_id):
+        admission_entered.set()
+        return original_admit_worker(delegation_id)
+
+    def runner():
+        worker_finished.set()
+        if batch:
+            return {"results": [{"status": "completed"}]}
+        return {"status": "completed"}
+
+    monkeypatch.setattr(
+        "tools.runtime_heartbeat.preflight_current_heartbeat", lambda: 1700
+    )
+    monkeypatch.setattr(runtime_heartbeat, "_timer_factory", FakeTimer)
+    monkeypatch.setattr(runtime_heartbeat, "arm", blocked_arm)
+    monkeypatch.setattr(ad, "_admit_worker", tracked_admit_worker)
+
+    result_holder = []
+
+    def dispatch():
+        kwargs = {
+            "session_key": "owner",
+            "runner": runner,
+            "max_async_children": 3,
+        }
+        if batch:
+            result_holder.append(ad.dispatch_async_delegation_batch(
+                goals=["g"], context=None, toolsets=None, role="leaf", model="m",
+                **kwargs,
+            ))
+        else:
+            result_holder.append(ad.dispatch_async_delegation(
+                goal="g", context=None, toolsets=None, role="leaf", model="m",
+                **kwargs,
+            ))
+
+    dispatch_thread = threading.Thread(target=dispatch)
+    dispatch_thread.start()
+    try:
+        assert arm_entered.wait(timeout=5)
+        assert admission_entered.wait(timeout=5)
+        assert not worker_finished.is_set()
+    finally:
+        release_arm.set()
+        dispatch_thread.join(timeout=5)
+
+    assert not dispatch_thread.is_alive()
+    result = result_holder[0]
+    assert result["status"] == "dispatched"
+    assert worker_finished.wait(timeout=5)
+    assert _drain_for(result["delegation_id"]) is not None
+    assert result["delegation_id"] not in runtime_heartbeat._targets
+    assert len(timers) == 1
+    assert timers[0].cancelled is True
 
 
 def test_dispatch_returns_immediately_without_blocking():

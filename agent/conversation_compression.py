@@ -3213,6 +3213,18 @@ def compress_context(
             new_system_prompt = agent._build_system_prompt(system_message)
             agent._cached_system_prompt = new_system_prompt
 
+        # Compression publishes rebuilt transcripts directly, bypassing the
+        # normal SQLite/JSON flush filters. Build this view after todo/anchor
+        # preservation has finalized ``compressed``, but keep the live list
+        # intact so a current completion nudge still reaches the model.
+        from agent.message_sanitization import _is_ephemeral_scaffolding
+
+        persisted_compressed = [
+            message
+            for message in compressed
+            if not _is_ephemeral_scaffolding(message)
+        ]
+
         _session_commit_succeeded = False
         split_status = "not_applicable"
         _system_prompt_before_route = new_system_prompt

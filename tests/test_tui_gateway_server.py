@@ -1,3 +1,4 @@
+import copy
 import json
 import os
 import subprocess
@@ -3895,6 +3896,24 @@ def test_background_agent_kwargs_preserves_full_fallback_chain(monkeypatch):
     assert kwargs["fallback_model"] == chain
 
 
+def test_background_and_preview_agents_preserve_requested_provider(monkeypatch):
+    agent = types.SimpleNamespace(
+        model="gpt-5.4-mini",
+        provider="custom",
+        requested_provider="custom:pm",
+    )
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"max_turns": 25})
+    monkeypatch.setattr(server, "_load_enabled_toolsets", lambda: ["file"])
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+
+    assert server._background_agent_kwargs(agent, "background")[
+        "requested_provider"
+    ] == "custom:pm"
+    assert server._ephemeral_preview_agent_kwargs(agent, "preview")[
+        "requested_provider"
+    ] == "custom:pm"
+
+
 def test_background_agent_kwargs_preserves_empty_fallback_chain(monkeypatch):
     agent = types.SimpleNamespace(
         model="gpt-5.5",
@@ -3971,6 +3990,410 @@ def _session(agent=None, **extra):
         "tool_progress_mode": "all",
         **extra,
     }
+
+
+def _runtime_heartbeat_event(**overrides):
+    event = {
+        "type": "heartbeat",
+        "target_id": "proc-heartbeat",
+        "target_ids": ["proc-heartbeat"],
+        "generations": [5],
+        "generation": 5,
+        "target_kind": "process",
+        "session_id": "proc-heartbeat",
+        "session_key": "heartbeat-owner",
+        "provider": "openai",
+        "cache_context": "openai-cache",
+        "status": "ALIVE",
+        "evidence": "output grew 0->128 bytes",
+    }
+    event.update(overrides)
+    return event
+
+
+@pytest.fixture
+def current_heartbeat(monkeypatch):
+    monkeypatch.setattr(
+        "tools.runtime_heartbeat.runtime_heartbeat.is_event_current",
+        lambda _event: True,
+    )
+
+
+def test_tui_heartbeat_routes_to_idle_owner_as_silent_turn(
+    monkeypatch, current_heartbeat
+):
+    session = _session(session_key="heartbeat-owner")
+    event = _runtime_heartbeat_event()
+    submitted = []
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *args, **kwargs: submitted.append((args, kwargs)),
+    )
+
+    server._handle_heartbeat_event("heartbeat-sid", session, event)
+
+    assert len(submitted) == 1
+    args, kwargs = submitted[0]
+    assert args[1] == "heartbeat-sid"
+    assert "proc-heartbeat" in args[3]
+    assert kwargs == {
+        "turn_origin": "heartbeat_warm",
+        "heartbeat_event": event,
+    }
+
+
+@pytest.mark.parametrize("status", ["STUCK", "UNKNOWN"])
+def test_tui_unhealthy_heartbeat_is_directly_visible_without_model_turn(
+    monkeypatch, current_heartbeat, status
+):
+    session = _session(session_key="heartbeat-owner")
+    event = _runtime_heartbeat_event(status=status, evidence="no progress")
+    emitted = []
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *_args, **_kwargs: pytest.fail("unhealthy heartbeat created a model turn"),
+    )
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event_type, sid, payload: emitted.append((event_type, sid, payload)),
+    )
+
+    server._handle_heartbeat_event("heartbeat-sid", session, event)
+
+    assert len(emitted) == 1
+    event_type, emitted_sid, payload = emitted[0]
+    assert event_type == "status.update"
+    assert emitted_sid == "heartbeat-sid"
+    assert payload["kind"] == "process"
+    assert status in payload["text"]
+    assert "no progress" in payload["text"]
+    assert session["running"] is False
+
+
+def test_tui_unhealthy_heartbeat_revalidates_at_notice_boundary(monkeypatch):
+    session = _session(session_key="heartbeat-owner")
+    event = _runtime_heartbeat_event(status="STUCK", evidence="no progress")
+    emitted = []
+    checks = iter((True, False))
+    monkeypatch.setattr(
+        "tools.runtime_heartbeat.runtime_heartbeat.is_event_current",
+        lambda _event: next(checks),
+    )
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda *args, **kwargs: emitted.append((args, kwargs)),
+    )
+
+    server._handle_heartbeat_event("heartbeat-sid", session, event)
+
+    assert emitted == []
+
+
+def test_tui_alive_heartbeat_does_not_duplicate_busy_turn(
+    monkeypatch, current_heartbeat
+):
+    session = _session(session_key="heartbeat-owner", running=True)
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *_args, **_kwargs: pytest.fail("busy heartbeat created a turn"),
+    )
+
+    server._handle_heartbeat_event(
+        "heartbeat-sid", session, _runtime_heartbeat_event()
+    )
+
+
+@pytest.mark.parametrize("mode", ["interrupt", "steer"])
+def test_tui_submit_during_heartbeat_is_queued_and_drained_once(
+    monkeypatch, current_heartbeat, mode
+):
+    prompts = []
+    busy_responses = []
+
+    class _Agent:
+        model = "test-model"
+        provider = "test-provider"
+        base_url = "https://example.test"
+        interim_assistant_callback = None
+
+        def clear_interrupt(self):
+            pass
+
+        def redirect(self, _text):
+            pytest.fail("user prompt redirected into heartbeat")
+
+        def steer(self, _text):
+            pytest.fail("user prompt steered into heartbeat")
+
+        def run_conversation(self, prompt, *, turn_origin=None, **kwargs):
+            prompts.append(prompt)
+            if turn_origin == "heartbeat_warm":
+                busy_responses.append(
+                    server._handle_busy_submit(
+                        "rid-user",
+                        "heartbeat-sid",
+                        session,
+                        "accepted user prompt",
+                        "user-transport",
+                    )
+                )
+                return {
+                    "final_response": "",
+                    "messages": [],
+                    "api_calls": 1,
+                    "completed": True,
+                    "silent_noop": True,
+                }
+            return {
+                "final_response": "user reply",
+                "messages": [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": "user reply"},
+                ],
+                "api_calls": 1,
+                "completed": True,
+            }
+
+    session = _session(agent=_Agent(), session_key="heartbeat-owner")
+    emitted = []
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: mode)
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: emitted.append(args))
+    monkeypatch.setattr(server, "make_stream_renderer", lambda _cols: None)
+    monkeypatch.setattr(server, "render_message", lambda _raw, _cols: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+
+    server._handle_heartbeat_event(
+        "heartbeat-sid", session, _runtime_heartbeat_event()
+    )
+
+    assert busy_responses, (prompts, emitted)
+    assert busy_responses[0]["result"]["status"] == "queued"
+    assert len(prompts) == 2
+    assert "proc-heartbeat" in prompts[0]
+    assert prompts[1] == "accepted user prompt"
+    assert session.get("queued_prompt") is None
+    assert session.get("_heartbeat_running") is None
+    assert session["running"] is False
+    completed = [event for event in emitted if event[0] == "message.complete"]
+    assert len(completed) == 1
+    assert completed[0][2]["text"] == "user reply"
+
+
+def test_tui_foreign_heartbeat_never_crosses_owner(
+    monkeypatch, current_heartbeat
+):
+    session = _session(session_key="heartbeat-owner")
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *_args, **_kwargs: pytest.fail("foreign heartbeat created a turn"),
+    )
+
+    server._handle_heartbeat_event(
+        "heartbeat-sid",
+        session,
+        _runtime_heartbeat_event(session_key="foreign-owner"),
+    )
+
+
+@pytest.mark.parametrize("existing_snapshot", [None, {
+    "user": "real prompt",
+    "assistant": "partial answer",
+    "status": "error",
+    "error": "real turn failed",
+    "recoverable": True,
+}])
+def test_tui_heartbeat_returned_error_preserves_recovery_state(
+    monkeypatch, existing_snapshot
+):
+    class _Agent:
+        def run_conversation(self, *_args, **_kwargs):
+            return {
+                "final_response": None,
+                "messages": [],
+                "api_calls": 1,
+                "completed": False,
+                "failed": True,
+                "error": "heartbeat provider failed",
+            }
+
+    snapshot = copy.deepcopy(existing_snapshot)
+    session = _session(agent=_Agent(), inflight_turn=copy.deepcopy(snapshot))
+    emitted = []
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: emitted.append(args))
+    monkeypatch.setattr(server, "make_stream_renderer", lambda _cols: None)
+    monkeypatch.setattr(server, "render_message", lambda _raw, _cols: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+
+    server._run_prompt_submit(
+        "rid",
+        "heartbeat-sid",
+        session,
+        "[HEARTBEAT] inspect target",
+        turn_origin="heartbeat_warm",
+    )
+
+    assert session.get("inflight_turn") == snapshot
+    completed = [event for event in emitted if event[0] == "message.complete"]
+    assert completed
+    assert completed[-1][2]["status"] == "error"
+    assert completed[-1][2]["recoverable"] is True
+    assert "heartbeat provider failed" in completed[-1][2]["error"]
+
+
+@pytest.mark.parametrize("existing_snapshot", [None, {
+    "user": "real prompt",
+    "assistant": "partial answer",
+    "status": "error",
+    "error": "real turn failed",
+    "recoverable": True,
+}])
+def test_tui_heartbeat_exception_preserves_recovery_state(
+    monkeypatch, tmp_path, existing_snapshot
+):
+    class _Agent:
+        def run_conversation(self, *_args, **_kwargs):
+            raise RuntimeError("heartbeat exploded")
+
+    snapshot = copy.deepcopy(existing_snapshot)
+    session = _session(agent=_Agent(), inflight_turn=copy.deepcopy(snapshot))
+    emitted = []
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: emitted.append(args))
+    monkeypatch.setattr(server, "make_stream_renderer", lambda _cols: None)
+    monkeypatch.setattr(server, "render_message", lambda _raw, _cols: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_CRASH_LOG", str(tmp_path / "heartbeat-crash.log"))
+
+    server._run_prompt_submit(
+        "rid",
+        "heartbeat-sid",
+        session,
+        "[HEARTBEAT] inspect target",
+        turn_origin="heartbeat_warm",
+    )
+
+    assert session.get("inflight_turn") == snapshot
+    completed = [event for event in emitted if event[0] == "message.complete"]
+    assert completed
+    assert completed[-1][2]["status"] == "error"
+    assert completed[-1][2]["recoverable"] is True
+    assert "heartbeat exploded" in completed[-1][2]["error"]
+
+
+def test_tui_heartbeat_preserves_pending_user_only_state(monkeypatch):
+    prompts = []
+
+    class _Agent:
+        model = "test-model"
+        provider = "test-provider"
+        base_url = "https://example.test"
+        interim_assistant_callback = None
+
+        def clear_interrupt(self):
+            pass
+
+        def run_conversation(self, prompt, **kwargs):
+            prompts.append(prompt)
+            if kwargs.get("turn_origin") == "heartbeat_warm":
+                return {
+                    "final_response": "",
+                    "messages": [],
+                    "api_calls": 1,
+                    "completed": True,
+                    "silent_noop": True,
+                }
+            return {
+                "final_response": "real reply",
+                "messages": [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": "real reply"},
+                ],
+                "api_calls": 1,
+                "completed": True,
+            }
+
+    moa_restore = {
+        "override": None,
+        "model": "prior-model",
+        "provider": "prior-provider",
+    }
+    one_turn_restore = {"model": "protected-once-model"}
+    session = _session(
+        agent=_Agent(),
+        moa_one_shot_restore=copy.deepcopy(moa_restore),
+        one_turn_model_restore=copy.deepcopy(one_turn_restore),
+        pending_model_switch={"model": "queued-model", "provider": "custom:pm"},
+        pending_title="queued title",
+    )
+    reaction_notes = Mock(return_value="[The user reacted 👍 to your message]")
+    restored = []
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "make_stream_renderer", lambda _cols: None)
+    monkeypatch.setattr(server, "render_message", lambda _raw, _cols: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_pending_reaction_notes", reaction_notes)
+    pending_switches = []
+    monkeypatch.setattr(
+        server,
+        "_apply_pending_model_switch",
+        lambda *_args: pending_switches.append("applied"),
+    )
+    monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda *_args: None)
+    audio_calls = []
+    monkeypatch.setattr(
+        server, "_tts_stream_begin", lambda: audio_calls.append("tts") or None
+    )
+    monkeypatch.setattr(
+        server, "_arm_full_duplex_listener", lambda: audio_calls.append("duplex")
+    )
+    monkeypatch.setattr(server, "_voice_mode_enabled", lambda: True)
+    monkeypatch.setattr(server, "_voice_cfg_dict", lambda: {"barge_in": True})
+    monkeypatch.setattr(server, "_voice_tts_enabled", lambda: False)
+    monkeypatch.setattr(
+        server,
+        "_apply_model_switch",
+        lambda _sid, _session, raw, **_kwargs: restored.append(raw),
+    )
+    from tools import tts_streaming
+
+    tts_streaming.mark_speech_interrupted()
+    server._run_prompt_submit(
+        "rid-heartbeat",
+        "sid",
+        session,
+        "[HEARTBEAT] inspect target",
+        turn_origin="heartbeat_warm",
+    )
+
+    assert session["moa_one_shot_restore"] == moa_restore
+    assert session["one_turn_model_restore"] == one_turn_restore
+    assert session["pending_model_switch"] == {
+        "model": "queued-model",
+        "provider": "custom:pm",
+    }
+    assert session["pending_title"] == "queued title"
+    assert reaction_notes.call_count == 0
+    assert pending_switches == []
+    assert audio_calls == []
+
+    server._run_prompt_submit("rid-user", "sid", session, "real user prompt")
+
+    assert "moa_one_shot_restore" not in session
+    assert "one_turn_model_restore" not in session
+    assert reaction_notes.call_count == 1
+    assert restored == ["prior-model --provider prior-provider"]
+    assert tts_streaming.SPEECH_INTERRUPTED_NOTE in prompts[-1]
+    assert "reacted" in prompts[-1].lower()
+    assert tts_streaming.take_speech_interrupted() is False
 
 
 def test_session_close_commits_memory_and_fires_finalize_hook(monkeypatch):
@@ -4846,8 +5269,9 @@ def test_notification_poller_live_loop_requeues_foreign_completion_for_owner(
     monkeypatch.setattr(server, "_get_db", lambda: None)
     monkeypatch.setattr(server, "_emit", lambda *args, **_kwargs: emitted.append(args))
 
-    def _deliver(_rid, sid, session, text):
+    def _deliver(_rid, sid, session, text, **kwargs):
         delivered["a" if sid == "sid-a-live-handoff" else "b"].append(text)
+        delivered.setdefault("kwargs", []).append(kwargs)
         session["running"] = False
 
     monkeypatch.setattr(server, "_run_prompt_submit", _deliver)
@@ -4875,6 +5299,8 @@ def test_notification_poller_live_loop_requeues_foreign_completion_for_owner(
 
         assert len(delivered["a"]) == 1
         assert "proc-live-handoff completed normally" in delivered["a"][0]
+        assert "final assistant message must be literally empty (zero characters)" in delivered["a"][0]
+        assert delivered["kwargs"] == [{"completion_delivery": True}]
         assert delivered["b"] == []
         assert isolated_queue.empty()
     finally:
@@ -4955,7 +5381,7 @@ def test_notification_poller_live_loop_drops_addressed_orphan(
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda _rid, _sid, _session, text: delivered.append(text),
+        lambda _rid, _sid, _session, text, **_kwargs: delivered.append(text),
     )
     server._sessions["sid-live-orphan"] = session
     process_registry._completion_consumed.discard(event["session_id"])
@@ -4996,7 +5422,7 @@ def test_notification_poller_drops_orphaned_events(monkeypatch, routing):
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda _rid, _sid, _session, text: delivered.append(text),
+        lambda _rid, _sid, _session, text, **_kwargs: delivered.append(text),
     )
     monkeypatch.setattr(server, "_get_db", lambda: None)
 
@@ -5062,7 +5488,7 @@ def test_notification_poller_delivers_owned_events(
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda _rid, _sid, _session, text: delivered.append(text),
+        lambda _rid, _sid, _session, text, **_kwargs: delivered.append(text),
     )
     monkeypatch.setattr(server, "_get_db", lambda: _CompressionDB())
 
@@ -14468,6 +14894,11 @@ def test_notification_poller_delivers_completion(monkeypatch):
     class _Agent:
         def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
             turns.append(prompt)
+            assert self._pending_cli_user_message == {
+                "role": "user",
+                "content": prompt,
+                "_completion_delivery_synthetic": True,
+            }
             return {
                 "final_response": "ok",
                 "messages": [{"role": "assistant", "content": "ok"}],
@@ -14522,65 +14953,101 @@ def test_notification_poller_delivers_completion(monkeypatch):
         # Should have triggered an agent turn
         assert len(turns) == 1
         assert "[IMPORTANT: Background process proc_poller_test completed normally" in turns[0]
+        assert "final assistant message must be literally empty (zero characters)" in turns[0]
     finally:
         server._sessions.pop("sid_poll", None)
         while not process_registry.completion_queue.empty():
             process_registry.completion_queue.get_nowait()
 
 
-def test_notification_poller_skips_consumed(monkeypatch):
-    """Already-consumed completions are not dispatched by the poller."""
+@pytest.mark.parametrize(
+    ("exit_code", "session_id"),
+    [(None, "proc_unknown_exit"), ("unknown", "proc_noninteger_exit")],
+)
+def test_notification_poller_delivers_unknown_exit_code(
+    monkeypatch, exit_code, session_id
+):
+    """Unknown completion shapes fail open to the positively matched owner."""
     import queue as _queue_mod
 
     from tools.process_registry import process_registry
 
-    turns = []
-
-    class _Agent:
-        def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
-            turns.append(prompt)
-            return {"final_response": "ok", "messages": []}
-
-    class _ImmediateThread:
-        def __init__(self, target=None, daemon=None):
-            self._target = target
-        def start(self):
-            self._target()
-
-    sess = _session(agent=_Agent())
-    server._sessions["sid_skip"] = sess
-    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
-    monkeypatch.setattr(server, "_emit", lambda *a, **kw: None)
-    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
-    monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
-
-    # Isolate the completion queue so a concurrent/leaked poller in the same
-    # xdist worker can't dequeue this session_key-less event before our poller
-    # does. monkeypatch restores the shared singleton on teardown. (Same
-    # pattern as test_notification_poller_requeues_when_busy.)
+    delivered = []
+    emitted = []
+    sess = _session()
     isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
-    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
-
-    process_registry._completion_consumed.add("proc_already_done")
     isolated_queue.put({
         "type": "completion",
-        "session_id": "proc_already_done",
-        "command": "echo x",
-        "exit_code": 0,
-        "output": "x",
+        "session_id": session_id,
+        "session_key": sess["session_key"],
+        "started_at": 1.0,
+        "command": "sleep 1",
+        "exit_code": exit_code,
+        "completion_reason": "exited",
+        "termination_source": "",
+        "output": "still running",
     })
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda _rid, _sid, _session, text, **kwargs: delivered.append((text, kwargs)),
+    )
 
     stop = threading.Event()
     stop.set()
-
+    server._sessions["sid_unknown_completion"] = sess
     try:
-        server._notification_poller_loop(stop, "sid_skip", sess)
-        assert len(turns) == 0
+        server._notification_poller_loop(stop, "sid_unknown_completion", sess)
+        assert len(delivered) == 1
+        assert "still running" in delivered[0][0]
+        assert "literally empty" not in delivered[0][0]
+        assert delivered[0][1] == {"completion_delivery": True}
+        assert any(event[0] == "status.update" for event in emitted)
     finally:
-        server._sessions.pop("sid_skip", None)
-        process_registry._completion_consumed.discard("proc_already_done")
+        server._sessions.pop("sid_unknown_completion", None)
         while not process_registry.completion_queue.empty():
             process_registry.completion_queue.get_nowait()
+
+
+def test_notification_poller_skips_completed_lifecycle(monkeypatch):
+    """An accepted known lifecycle is not dispatched again by the poller."""
+    import queue as _queue_mod
+
+    from tools.process_registry import process_registry
+
+    event = {
+        "type": "completion",
+        "session_id": "proc_completed_lifecycle",
+        "session_key": "session-key",
+        "started_at": 1.0,
+        "command": "echo x",
+        "exit_code": 0,
+        "completion_reason": "exited",
+        "termination_source": "",
+        "output": "x",
+    }
+    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    isolated_queue.put(event)
+    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
+    process_registry.complete_completion_delivery(event)
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("completed lifecycle must not be dispatched")
+        ),
+    )
+    stop = threading.Event()
+    stop.set()
+    sess = _session()
+    server._sessions["sid_skip"] = sess
+    try:
+        server._notification_poller_loop(stop, "sid_skip", sess)
+        assert isolated_queue.empty()
+    finally:
+        server._sessions.pop("sid_skip", None)
 
 
 def test_notification_poller_requeues_when_busy(monkeypatch):
@@ -16301,6 +16768,73 @@ class TestResolveRuntimeWithFallback:
         assert captured["provider"] == "deepseek"
         assert captured["base_url"] == "https://fallback.invalid/v1"
         assert captured["api_key"] == "fb-tok"
+
+    def test_make_agent_binds_fallback_requested_provider_and_exact_ttl(
+        self, monkeypatch
+    ):
+        from hermes_cli.auth import AuthError
+        from tools.runtime_heartbeat import (
+            bind_agent_provider,
+            get_current_provider,
+            preflight_current_heartbeat,
+            reset_current_provider,
+        )
+
+        captured = {}
+
+        def fake_resolve(**kwargs):
+            requested = kwargs.get("requested")
+            if requested == "custom:bad":
+                raise AuthError("bad primary")
+            assert requested == "custom:pm"
+            return {
+                "provider": "custom",
+                "requested_provider": "custom:pm",
+                "api_key": "fallback-key",
+                "base_url": "https://pm.invalid/v1",
+                "api_mode": "chat_completions",
+            }
+
+        def fake_agent(**kwargs):
+            captured.update(kwargs)
+            return types.SimpleNamespace(**kwargs)
+
+        monkeypatch.setattr(
+            server,
+            "_load_cfg",
+            lambda: {
+                "model": {"default": "bad-model", "provider": "custom:bad"},
+                "fallback_providers": [
+                    {"provider": "custom:pm", "model": "gpt-5.4-mini"}
+                ],
+            },
+        )
+        monkeypatch.setattr(
+            server, "_resolve_startup_runtime", lambda: ("bad-model", "custom:bad")
+        )
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider", fake_resolve
+        )
+        monkeypatch.setattr("run_agent.AIAgent", fake_agent)
+        monkeypatch.setattr(server, "_load_enabled_toolsets", lambda: ["file"])
+        monkeypatch.setattr(server, "_get_db", lambda: None)
+        monkeypatch.setattr(
+            "tools.runtime_heartbeat._runtime_config",
+            lambda: {
+                "heartbeat": {"enabled": True, "mode": "per_target"},
+                "warm_kv_timeout": {"providers": {"custom:pm": 1700}},
+            },
+        )
+
+        agent = server._make_agent("sid", "session-key")
+        token = bind_agent_provider(agent)
+        try:
+            assert captured["provider"] == "custom"
+            assert captured["requested_provider"] == "custom:pm"
+            assert get_current_provider() == "custom:pm"
+            assert preflight_current_heartbeat() == 1700
+        finally:
+            reset_current_provider(token)
 
 
 def test_get_usage_does_not_substitute_cumulative_total_for_context_used():

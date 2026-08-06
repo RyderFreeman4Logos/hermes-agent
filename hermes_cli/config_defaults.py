@@ -1778,6 +1778,8 @@ DEFAULT_CONFIG = {
         # Flip to true only if you trust delegated work to run dangerous cmds
         # without human review (cron pipelines, batch automation, etc.).
         "subagent_auto_approve": False,
+        "default_profile": "",
+        "model_pool": {},
     },
 
     # Ephemeral prefill messages file — JSON list of {role, content} dicts

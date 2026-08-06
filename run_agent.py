@@ -765,6 +765,7 @@ class AIAgent:
         self.session_estimated_cost_usd = 0.0
         self.session_cost_status = "unknown"
         self.session_cost_source = "none"
+        self._awaiting_cache_usage_after_compression = False
         
         # Turn counter (added after reset_session_state was first written — #2635)
         self._user_turn_count = 0

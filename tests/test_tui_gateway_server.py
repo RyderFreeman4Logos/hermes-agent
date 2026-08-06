@@ -4469,17 +4469,18 @@ def test_tui_heartbeat_routes_to_idle_owner_as_silent_turn(
     }
 
 
-@pytest.mark.parametrize("status", ["STUCK", "UNKNOWN"])
-def test_tui_unhealthy_heartbeat_is_directly_visible_without_model_turn(
-    monkeypatch, current_heartbeat, status
+@pytest.mark.parametrize(("status", "warm_turns"), [("STUCK", 1), ("UNKNOWN", 0)])
+def test_tui_unhealthy_heartbeat_is_visible_and_warms_only_when_live(
+    monkeypatch, current_heartbeat, status, warm_turns
 ):
     session = _session(session_key="heartbeat-owner")
     event = _runtime_heartbeat_event(status=status, evidence="no progress")
     emitted = []
+    submitted = []
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda *_args, **_kwargs: pytest.fail("unhealthy heartbeat created a model turn"),
+        lambda *args, **kwargs: submitted.append((args, kwargs)),
     )
     monkeypatch.setattr(
         server,
@@ -4489,6 +4490,12 @@ def test_tui_unhealthy_heartbeat_is_directly_visible_without_model_turn(
 
     server._handle_heartbeat_event("heartbeat-sid", session, event)
 
+    assert len(submitted) == warm_turns
+    if submitted:
+        assert submitted[0][1] == {
+            "turn_origin": "heartbeat_warm",
+            "heartbeat_event": event,
+        }
     assert len(emitted) == 1
     event_type, emitted_sid, payload = emitted[0]
     assert event_type == "status.update"
@@ -4496,7 +4503,7 @@ def test_tui_unhealthy_heartbeat_is_directly_visible_without_model_turn(
     assert payload["kind"] == "process"
     assert status in payload["text"]
     assert "no progress" in payload["text"]
-    assert session["running"] is False
+    assert session["running"] is bool(warm_turns)
 
 
 def test_tui_unhealthy_heartbeat_revalidates_at_notice_boundary(monkeypatch):

@@ -222,18 +222,20 @@ async def test_gateway_heartbeat_releases_its_reservation_on_early_exit(
     assert not runner._is_session_running(event["session_key"])
 
 
-@pytest.mark.parametrize("status", ["STUCK", "UNKNOWN"])
-def test_gateway_unhealthy_heartbeat_is_directly_visible_without_model_turn(
-    monkeypatch, current_heartbeat, status
+@pytest.mark.parametrize(("status", "warm_turns"), [("STUCK", 1), ("UNKNOWN", 0)])
+def test_gateway_unhealthy_heartbeat_is_visible_and_warms_only_when_live(
+    monkeypatch, current_heartbeat, status, warm_turns
 ):
     event = _runtime_heartbeat_event(status=status, evidence="no progress")
     adapter = SimpleNamespace(handle_message=AsyncMock())
     runner = _runner(adapter, origins={event["session_key"]: object()})
-    runner._running_agents = {event["session_key"]: object()}
+    runner._running_agents = {}
     inject = AsyncMock()
     deliver = AsyncMock(return_value=True)
+    isolated = AsyncMock()
     monkeypatch.setattr(runner, "_inject_watch_notification", inject)
     monkeypatch.setattr(runner, "_deliver_platform_notice", deliver)
+    monkeypatch.setattr(runner, "_run_isolated_heartbeat", isolated)
 
     asyncio.run(runner._handle_heartbeat_event(event))
 
@@ -241,6 +243,7 @@ def test_gateway_unhealthy_heartbeat_is_directly_visible_without_model_turn(
     deliver.assert_awaited_once()
     assert status in deliver.await_args.args[1]
     assert "no progress" in deliver.await_args.args[1]
+    assert isolated.await_count == warm_turns
 
 
 def test_gateway_unhealthy_heartbeat_revalidates_at_notice_boundary(monkeypatch):

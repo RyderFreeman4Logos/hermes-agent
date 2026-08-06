@@ -356,9 +356,11 @@ def test_heartbeat_silent_noop_leaves_no_durable_or_live_history(heartbeat_event
     external_memory.assert_not_called()
 
 
-def test_heartbeat_uses_one_provider_response_with_tools_disabled_on_wire(
-    heartbeat_event,
+@pytest.mark.parametrize("status", ["ALIVE", "STUCK"])
+def test_live_heartbeat_uses_one_provider_response_with_tools_disabled_on_wire(
+    heartbeat_event, status,
 ):
+    heartbeat_event["status"] = status
     agent = _make_agent(max_iterations=10)
     agent.tools = [
         {
@@ -1205,12 +1207,9 @@ def test_heartbeat_never_enters_request_middleware(heartbeat_event):
     agent.client.chat.completions.create.assert_called_once()
 
 
-@pytest.mark.parametrize("status", ["STUCK", "UNKNOWN"])
-def test_unhealthy_heartbeat_is_structured_visible_without_model_call(
-    heartbeat_event, status
-):
+def test_unknown_heartbeat_is_structured_visible_without_model_call(heartbeat_event):
     agent = _make_agent(max_iterations=10)
-    heartbeat_event["status"] = status
+    heartbeat_event["status"] = "UNKNOWN"
     heartbeat_event["evidence"] = "no output or CPU progress"
 
     result = agent.run_conversation(
@@ -1220,7 +1219,7 @@ def test_unhealthy_heartbeat_is_structured_visible_without_model_call(
     )
 
     assert result["silent_noop"] is False
-    assert status in result["final_response"]
+    assert "UNKNOWN" in result["final_response"]
     assert "no output or CPU progress" in result["final_response"]
     agent.client.chat.completions.create.assert_not_called()
 

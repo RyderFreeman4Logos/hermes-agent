@@ -4263,75 +4263,88 @@ class GatewaySlashCommandsMixin:
                     )
                     return describe_compression_lock_skip(_lock_skipped)
 
-                if partial and tail:
-                    compressed = rejoin_compressed_head_and_tail(compressed, tail)
+                from agent.manual_compression_feedback import (
+                    compression_attempt_committed,
+                )
+                _committed = compression_attempt_committed(compressor)
+                if _committed:
+                    if partial and tail:
+                        compressed = rejoin_compressed_head_and_tail(compressed, tail)
 
-                # _compress_context has already published the authoritative
-                # child transcript. Advance the gateway route with the store's
-                # lineage-checked CAS instead of rewriting that child from an
-                # outer snapshot (which could fail after the inner commit).
-                new_session_id = tmp_agent.session_id
-                old_session_id = session_entry.session_id
-                rotated = new_session_id != old_session_id
-                _in_place = bool(getattr(tmp_agent, "_last_compaction_in_place", False))
+                    # _compress_context has already published the authoritative
+                    # child transcript. Advance the gateway route with the store's
+                    # lineage-checked CAS instead of rewriting that child from an
+                    # outer snapshot (which could fail after the inner commit).
+                    new_session_id = tmp_agent.session_id
+                    old_session_id = session_entry.session_id
+                    rotated = new_session_id != old_session_id
+                    _in_place = bool(getattr(tmp_agent, "_last_compaction_in_place", False))
 
-                if rotated:
-                    try:
-                        advanced = await self.async_session_store.advance_compression_session(
-                            session_entry.session_key,
-                            old_session_id,
-                            new_session_id,
-                        )
-                        if advanced is not None:
-                            session_entry = advanced
-                    except Exception as exc:
-                        # advance_compression_session mutates the shared entry
-                        # before persisting mirrors. Keep the coherent child
-                        # route and let its existing startup healing retry disk.
-                        if session_entry.session_id == old_session_id:
-                            session_entry.session_id = new_session_id
-                        logger.warning(
-                            "Manual /compress committed child %s but route mirror "
-                            "persistence needs healing: %s",
-                            new_session_id,
-                            exc,
-                        )
-                    for message in tail:
-                        await self.async_session_store.append_to_transcript(
-                            new_session_id,
-                            message,
-                        )
-                    if session_entry.session_id == new_session_id:
+                    if rotated:
                         try:
-                            await asyncio.to_thread(
-                                self._sync_telegram_topic_binding,
-                                source,
-                                session_entry,
-                                reason="compress-command",
-                            )
-                        except Exception:
-                            logger.exception(
-                                "Manual /compress committed child %s but topic binding refresh failed",
+                            advanced = await self.async_session_store.advance_compression_session(
+                                session_entry.session_key,
+                                old_session_id,
                                 new_session_id,
                             )
-                elif not _in_place:
-                    logger.warning(
-                        "Manual /compress: session rotation did not occur "
-                        "(session_id unchanged) and in-place mode is off — "
-                        "preserving original transcript instead of overwriting "
-                        "it (#44794)."
+                            if advanced is not None:
+                                session_entry = advanced
+                        except Exception as exc:
+                            # advance_compression_session mutates the shared entry
+                            # before persisting mirrors. Keep the coherent child
+                            # route and let its existing startup healing retry disk.
+                            if session_entry.session_id == old_session_id:
+                                session_entry.session_id = new_session_id
+                            logger.warning(
+                                "Manual /compress committed child %s but route mirror "
+                                "persistence needs healing: %s",
+                                new_session_id,
+                                exc,
+                            )
+                        for message in tail:
+                            await self.async_session_store.append_to_transcript(
+                                new_session_id,
+                                message,
+                            )
+                        if session_entry.session_id == new_session_id:
+                            try:
+                                await asyncio.to_thread(
+                                    self._sync_telegram_topic_binding,
+                                    source,
+                                    session_entry,
+                                    reason="compress-command",
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "Manual /compress committed child %s but topic binding refresh failed",
+                                    new_session_id,
+                                )
+                    elif not _in_place:
+                        logger.warning(
+                            "Manual /compress: session rotation did not occur "
+                            "(session_id unchanged) and in-place mode is off — "
+                            "preserving original transcript instead of overwriting "
+                            "it (#44794)."
+                        )
+                    # The child/in-place publication is authoritative from here.
+                    # Finalize before non-critical mirrors/summary rendering so a
+                    # later outer failure can never claim to roll it back.
+                    finalize_context_engine_compression_notification(
+                        tmp_agent,
+                        committed=True,
                     )
-                # The child/in-place publication is authoritative from here.
-                # Finalize before non-critical mirrors/summary rendering so a
-                # later outer failure can never claim to roll it back.
-                finalize_context_engine_compression_notification(
-                    tmp_agent,
-                    committed=True,
-                )
-                # Reset stored token count — transcript changed, old value is stale
-                await self.async_session_store.update_session(
-                    session_entry.session_key, last_prompt_tokens=0
-                )
+                    # Reset stored token count — transcript changed, old value is stale
+                    await self.async_session_store.update_session(
+                        session_entry.session_key, last_prompt_tokens=0
+                    )
+                else:
+                    # A pre-summary durability rejection or other no-commit
+                    # outcome must leave the gateway route and transcript intact.
+                    compressed = msgs
+                    finalize_context_engine_compression_notification(
+                        tmp_agent,
+                        committed=False,
+                    )
                 new_tokens = estimate_request_tokens_rough(
                     compressed,
                     system_prompt=_sys_prompt,

@@ -9364,6 +9364,8 @@ def _call_llm_impl(
                 task,
                 provider=request_provider, base_url=_base_info)
         except Exception as transient_err:
+            if task == "completion_visibility":
+                raise
             original_primary_err = transient_err
             configured_primary_should_evict |= bool(configured_chain) and (
                 _is_connection_error(transient_err)
@@ -9475,6 +9477,8 @@ def _call_llm_impl(
             # Retries exhausted — fall through to first_err fallback handling.
             raise _last_transient
     except Exception as first_err:
+        if task == "completion_visibility":
+            raise
         if configured_chain:
             original_primary_err = original_primary_err or first_err
             if configured_primary_should_evict or configured_recovery_attempted:
@@ -10181,6 +10185,8 @@ async def _async_call_llm_impl(
                 task,
                 provider=request_provider, base_url=_client_base)
         except Exception as transient_err:
+            if task == "completion_visibility":
+                raise
             original_primary_err = transient_err
             configured_primary_should_evict |= bool(configured_chain) and (
                 _is_connection_error(transient_err)
@@ -10271,6 +10277,8 @@ async def _async_call_llm_impl(
                     last_err = retry_err
             raise last_err
     except Exception as first_err:
+        if task == "completion_visibility":
+            raise
         if configured_chain:
             original_primary_err = original_primary_err or first_err
             if configured_primary_should_evict or configured_recovery_attempted:

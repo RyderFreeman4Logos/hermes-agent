@@ -484,6 +484,8 @@ class TestValidateConfigKey:
     @pytest.mark.parametrize("key", [
         "model",
         "terminal.backend",
+        "terminal.process_poll_strike_limit",
+        "terminal.process_poll_strike_window_s",
         "agent.max_turns",
         "discord.gateway_restart_notification",
         "telegram.bot_token",
@@ -498,6 +500,14 @@ class TestValidateConfigKey:
         from hermes_cli.config import _validate_config_key
         is_known, _ = _validate_config_key(key)
         assert is_known, f"Expected {key!r} to validate as known"
+
+    def test_process_poll_strike_defaults_are_registered(self):
+        from hermes_cli.config import DEFAULT_CONFIG, _validate_config_key
+
+        assert DEFAULT_CONFIG["terminal"]["process_poll_strike_limit"] == 3
+        assert DEFAULT_CONFIG["terminal"]["process_poll_strike_window_s"] == 120
+        assert _validate_config_key("terminal.process_poll_strike_limit")[0]
+        assert _validate_config_key("terminal.process_poll_strike_window_s")[0]
 
     @pytest.mark.parametrize("key,expected_in_suggestion", [
         ("gateway.discord.gateway_restart_notification", None),  # no close suggestion

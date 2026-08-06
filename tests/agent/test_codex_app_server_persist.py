@@ -158,6 +158,7 @@ def test_codex_turn_persists_each_message_exactly_once():
     finally:
         import shutil
 
+        db.close()
         shutil.rmtree(tmp)
 
 

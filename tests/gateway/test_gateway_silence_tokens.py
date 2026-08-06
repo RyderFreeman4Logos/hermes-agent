@@ -40,7 +40,7 @@ def _runner(monkeypatch, tmp_path):
     runner._pending_messages = {}
     runner._pending_approvals = {}
     runner._is_user_authorized = lambda _source: True
-    runner._set_session_env = lambda _context: None
+    runner._set_session_env = MagicMock()
     runner._handle_active_session_busy_message = AsyncMock(return_value=False)
     runner._session_db = MagicMock()
     runner._recover_telegram_topic_thread_id = lambda _source: None
@@ -195,3 +195,81 @@ async def test_agent_end_hook_includes_model_and_provider(monkeypatch, tmp_path)
     )
     assert end_context["model"] == "gpt-5.6-terra"
     assert end_context["provider"] == "openai-codex"
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["STUCK", "UNKNOWN"])
+async def test_unhealthy_heartbeat_is_directly_visible_without_model_turn(
+    monkeypatch, tmp_path, status
+):
+    runner = _runner(monkeypatch, tmp_path)
+    caller_id = "agent:main:telegram:group:-1001:12345"
+    runner.session_store._entries = {caller_id: object()}
+    runner._inject_watch_notification = AsyncMock(return_value=True)
+    runner._deliver_platform_notice = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        "tools.runtime_heartbeat.runtime_heartbeat.is_event_current",
+        lambda *_args, **_kwargs: True,
+    )
+
+    await runner._handle_heartbeat_event(
+        {
+            "type": "heartbeat",
+            "target_id": "proc-heartbeat",
+            "session_key": caller_id,
+            "status": status,
+            "evidence": "not healthy",
+        }
+    )
+
+    runner._inject_watch_notification.assert_not_awaited()
+    runner._deliver_platform_notice.assert_awaited_once()
+    assert status in runner._deliver_platform_notice.await_args_list[0].args[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["STUCK", "UNKNOWN"])
+async def test_raw_api_heartbeat_is_directly_visible_without_model_turn(
+    monkeypatch, tmp_path, status
+):
+    runner = _runner(monkeypatch, tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    caller_id = "raw-api-session"
+    runner.session_store._entries = {caller_id: object()}
+    runner._inject_watch_notification = AsyncMock(return_value=True)
+    runner._deliver_platform_notice = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        "tools.runtime_heartbeat.runtime_heartbeat.is_event_current",
+        lambda *_args, **_kwargs: True,
+    )
+
+    await runner._handle_heartbeat_event(
+        {
+            "type": "heartbeat",
+            "target_id": "proc-heartbeat",
+            "session_key": caller_id,
+            "status": status,
+            "evidence": "not healthy",
+            "generation": 17,
+            "target_kind": "process",
+            "provider": "custom:pm",
+            "cache_context": "custom:pm|https://pm.invalid/v1|model-a|chat_completions",
+            "heartbeat_group_token": 23,
+        }
+    )
+
+    runner._inject_watch_notification.assert_not_awaited()
+    runner._deliver_platform_notice.assert_not_awaited()
+    from gateway.status import read_runtime_status
+
+    notices = read_runtime_status()["runtime_notices"]
+    assert notices[-1]["type"] == "runtime_heartbeat"
+    assert notices[-1]["status"] == status
+    assert notices[-1]["session_key"] == caller_id
+    assert notices[-1]["target_id"] == "proc-heartbeat"
+    assert notices[-1]["generation"] == 17
+    assert notices[-1]["target_kind"] == "process"
+    assert notices[-1]["provider"] == "custom:pm"
+    assert notices[-1]["cache_context"] == (
+        "custom:pm|https://pm.invalid/v1|model-a|chat_completions"
+    )
+    assert notices[-1]["heartbeat_group_token"] == 23

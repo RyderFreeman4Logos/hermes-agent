@@ -2,6 +2,7 @@
 
 import json
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -61,6 +62,98 @@ def _make_session(
         output_buffer=output,
     )
     return s
+
+
+def test_terminal_claim_cancels_heartbeat_before_completion_publication(
+    registry, monkeypatch
+):
+    from tools.runtime_heartbeat import runtime_heartbeat
+
+    order = []
+    session = _make_session(sid="proc-heartbeat", exited=True, exit_code=0)
+    session.notify_on_complete = True
+    session.session_key = "owner"
+    registry._running[session.id] = session
+    monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+    monkeypatch.setattr(
+        runtime_heartbeat,
+        "cancel",
+        lambda target_id: order.append(("cancel", target_id)) or True,
+    )
+
+    class RecordingQueue:
+        def put(self, event):
+            order.append(("publish", event["session_id"]))
+
+    registry.completion_queue = RecordingQueue()
+    registry._move_to_finished(session)
+
+    assert order == [
+        ("cancel", "proc-heartbeat"),
+        ("publish", "proc-heartbeat"),
+    ]
+
+
+def test_remote_threshold_refreshes_status_before_promotion(registry, monkeypatch):
+    class FinishedEnv:
+        def execute(self, command, **_kwargs):
+            if "kill -0" in command:
+                return {"output": "1\n", "returncode": 0}
+            if command.endswith(".log 2>/dev/null"):
+                return {"output": "finished\n", "returncode": 0}
+            return {"output": "0\n", "returncode": 0}
+
+    session = _make_session(sid="proc_remote_short")
+    session.env_ref = FinishedEnv()
+    session.pid_scope = "sandbox"
+    session._started_monotonic = time.monotonic() - 1.1
+    monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+    monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False)
+
+    assert registry.wait_for_promotion(session, 1) == "exited"
+    assert session.output_buffer == "finished\n"
+    assert session.exit_code == 0
+    assert registry.promote(session) is False
+    assert session.id not in registry._running
+
+
+def test_remote_threshold_nonzero_probe_promotes_and_retains_owner(
+    registry, monkeypatch
+):
+    class FailedProbeEnv:
+        def execute(self, command, **_kwargs):
+            if "kill -0" in command:
+                return {"output": "1\n", "returncode": 7}
+            if command.endswith(".log 2>/dev/null"):
+                return {"output": "unknown\n", "returncode": 7}
+            return {"output": "0\n", "returncode": 7}
+
+    session = _make_session(sid="proc_remote_unknown")
+    session.env_ref = FailedProbeEnv()
+    session.pid_scope = "sandbox"
+    session._started_monotonic = time.monotonic() - 1.1
+    monkeypatch.setattr(registry, "_write_checkpoint", lambda: True)
+    monkeypatch.setattr("tools.interrupt.is_interrupted", lambda: False)
+
+    assert registry.wait_for_promotion(session, 1) == "running"
+    assert session.exited is False
+    assert registry.promote(session) is True
+    assert registry._running[session.id] is session
+
+
+def test_promotion_checkpoint_failure_contains_deferred_session(registry, monkeypatch):
+    session = _make_session(sid="proc_promotion_checkpoint")
+    kill = MagicMock(return_value={"status": "killed"})
+    monkeypatch.setattr(registry, "kill_process", kill)
+    monkeypatch.setattr(registry, "_write_checkpoint", lambda: False)
+
+    with pytest.raises(RuntimeError, match="checkpoint failed during background promotion"):
+        registry.promote(session)
+
+    kill.assert_called_once_with(
+        session.id, source="background_promotion_failed", consume_output=True
+    )
+    assert session.id not in registry._running
 
 
 def _spawn_python_sleep(seconds: float) -> subprocess.Popen:
@@ -208,6 +301,151 @@ class TestGetAndPoll:
         assert result["exit_code"] == 0
 
 
+class TestProcessPollStrike:
+    def _install(self, monkeypatch, session):
+        from tools import process_registry as process_module
+
+        registry = ProcessRegistry()
+        registry._running[session.id] = session
+        monkeypatch.setattr(process_module, "process_registry", registry)
+        monkeypatch.setattr(
+            process_module, "_get_process_poll_strike_config", lambda: (3, 120)
+        )
+        return process_module
+
+    def test_poll_strike_trips_after_three_no_progress_repolls(self, monkeypatch):
+        process_module = self._install(monkeypatch, _make_session())
+        args = {"action": "poll", "session_id": "proc_test123"}
+
+        replies = [json.loads(process_module._handle_process(args)) for _ in range(4)]
+
+        assert all("error" not in reply for reply in replies[:3])
+        assert "error" in replies[3]
+        assert "notify_on_complete" in replies[3]["error"]
+
+    def test_poll_strike_resets_when_output_arrives(self, monkeypatch):
+        session = _make_session()
+        process_module = self._install(monkeypatch, session)
+        args = {"action": "poll", "session_id": session.id}
+
+        for _ in range(3):
+            assert "error" not in json.loads(process_module._handle_process(args))
+        with session._lock:
+            session.output_buffer += "progress\n"
+            session.output_size += len("progress\n")
+        assert "error" not in json.loads(process_module._handle_process(args))
+        for _ in range(2):
+            assert "error" not in json.loads(process_module._handle_process(args))
+        assert "error" in json.loads(process_module._handle_process(args))
+
+    def test_second_poll_of_exited_process_is_a_short_final_note(self, monkeypatch):
+        session = _make_session(exited=True, exit_code=0, output="done")
+        process_module = self._install(monkeypatch, session)
+        process_module.process_registry._running.clear()
+        process_module.process_registry._finished[session.id] = session
+        args = {"action": "poll", "session_id": session.id}
+
+        first = json.loads(process_module._handle_process(args))
+        second = json.loads(process_module._handle_process(args))
+
+        assert first["status"] == "exited"
+        assert first["output_preview"] == "done"
+        assert second["status"] == "exited"
+        assert "output_preview" not in second
+        assert "already exited" in second["note"].lower()
+
+    def test_running_snapshot_cannot_consume_a_later_terminal_result(self, monkeypatch):
+        session = _make_session(output="partial")
+        session.output_size = len(session.output_buffer)
+        process_module = self._install(monkeypatch, session)
+        registry = process_module.process_registry
+        real_snapshot = registry._poll_snapshot
+
+        def running_snapshot_then_exit(session_id):
+            snapshot = real_snapshot(session_id)
+            with session._lock:
+                session.output_buffer = "final"
+                session.output_size = len(session.output_buffer)
+                session.exited = True
+                session.exit_code = 0
+                session.completion_reason = "exited"
+            return snapshot
+
+        monkeypatch.setattr(registry, "_poll_snapshot", running_snapshot_then_exit)
+        args = {"action": "poll", "session_id": session.id}
+
+        first = json.loads(process_module._handle_process(args))
+
+        assert first["status"] == "running"
+        assert first["output_preview"] == "partial"
+        assert not session._poll_terminal_reported
+
+        monkeypatch.setattr(registry, "_poll_snapshot", real_snapshot)
+        second = json.loads(process_module._handle_process(args))
+        third = json.loads(process_module._handle_process(args))
+
+        assert second["status"] == "exited"
+        assert second["output_preview"] == "final"
+        assert session._poll_terminal_reported
+        assert "output_preview" not in third
+
+    def test_poll_strike_only_resets_for_output_in_the_returned_snapshot(self, monkeypatch):
+        session = _make_session(output="partial")
+        session.output_size = len(session.output_buffer)
+        process_module = self._install(monkeypatch, session)
+        registry = process_module.process_registry
+        real_snapshot = registry._poll_snapshot
+        with session._lock:
+            session._poll_last_status = "running"
+            session._poll_last_output_size = session.output_size
+            session._poll_last_at = time.monotonic()
+            session._poll_consecutive_strikes = 1
+
+        def old_snapshot_then_new_output(session_id):
+            snapshot = real_snapshot(session_id)
+            with session._lock:
+                session.output_buffer += "\nnew output"
+                session.output_size = len(session.output_buffer)
+            return snapshot
+
+        monkeypatch.setattr(registry, "_poll_snapshot", old_snapshot_then_new_output)
+        args = {"action": "poll", "session_id": session.id}
+
+        first = json.loads(process_module._handle_process(args))
+
+        assert first["output_preview"] == "partial"
+        assert session._poll_consecutive_strikes == 2
+
+        monkeypatch.setattr(registry, "_poll_snapshot", real_snapshot)
+        second = json.loads(process_module._handle_process(args))
+
+        assert second["output_preview"].endswith("new output")
+        assert session._poll_consecutive_strikes == 0
+
+
+def test_process_poll_strike_config_is_hot_read(monkeypatch):
+    import hermes_cli.config as config_module
+    from tools.process_registry import _get_process_poll_strike_config
+
+    configs = iter([
+        {"terminal": {"process_poll_strike_limit": 2, "process_poll_strike_window_s": 4}},
+        {"terminal": {"process_poll_strike_limit": 5, "process_poll_strike_window_s": 8}},
+    ])
+    monkeypatch.setattr(config_module, "load_config_readonly", lambda: next(configs))
+
+    assert _get_process_poll_strike_config() == (2, 4)
+    assert _get_process_poll_strike_config() == (5, 8)
+
+
+def test_completion_delivery_requires_a_literally_empty_final_response():
+    from tools.process_registry import completion_delivery_prompt
+
+    prompt = completion_delivery_prompt({"type": "completion", "exit_code": 0}, "done")
+
+    assert "literally empty" in prompt
+    assert "no parentheses" in prompt
+
+
 def test_request_close_terminal_invokes_sink_without_killing(registry):
     """With a sink wired, close routes (session, process_id) to the UI and leaves
     the process running — close is a view drop, not a kill."""
@@ -267,9 +505,37 @@ def test_reader_loop_streams_incremental_chunks_from_read1(registry, monkeypatch
 
     assert emitted == ["tick 1\n", "tick 2\n", "tick 3\n"]
     assert session.output_buffer == "tick 1\ntick 2\ntick 3\n"
+    assert session.output_size == len("tick 1\ntick 2\ntick 3\n")
     assert session.exited is True
     assert session.exit_code == 0
     assert moved == ["proc_reader_live"]
+
+
+def test_reader_activity_counter_advances_after_rolling_buffer_saturates(
+    registry, monkeypatch
+):
+    class _Buffer:
+        def __init__(self):
+            self.chunks = [b"abcde", b"fghij", b""]
+
+        def read1(self, _size):
+            return self.chunks.pop(0)
+
+    process = MagicMock()
+    process.stdout.buffer = _Buffer()
+    process.wait.return_value = 0
+    process.returncode = 0
+    session = _make_session(sid="proc-saturated")
+    session.process = process
+    session.max_output_chars = 5
+    monkeypatch.setattr(registry, "_check_watch_patterns", lambda *_args: None)
+    monkeypatch.setattr(registry, "_emit_output", lambda *_args: None)
+    monkeypatch.setattr(registry, "_move_to_finished", lambda *_args: None)
+
+    registry._reader_loop(session)
+
+    assert session.output_buffer == "fghij"
+    assert session.output_size == 10
 
 
 # =========================================================================
@@ -379,92 +645,63 @@ def test_pty_reader_loop_reassembles_multibyte_char_split_across_chunks(registry
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only: uses setsid/fcntl")
 class TestOrphanedPipeReconciliation:
-    """Regression tests for issue #17327.
+    """A launcher exit is non-terminal while its owned process group is live."""
 
-    `hermes update` in Feishu spawned a background subprocess that restarted
-    the gateway; the direct child exited quickly but a descendant daemon
-    held the stdout pipe open. `_reader_loop.finally` never ran, so
-    `session.exited` stayed False and the agent polled 74 times over 7
-    minutes, all returning `status: running`.
-
-    The fix is `_reconcile_local_exit()`: poll() and wait() now check the
-    direct `Popen.poll()` before trusting `session.exited`.
-    """
-
-    def test_reconcile_flips_exited_when_direct_child_done(self, registry):
-        """Direct child exited but reader thread is blocked on orphaned pipe."""
-        # Simulate the orphaned-pipe scenario: direct child exited, but a
-        # descendant holds stdout open so the reader never sees EOF.
-        # Approach: spawn `sh -c 'sleep 10 &'` with setsid — sh forks the
-        # sleep into a new session group, exits immediately, but sleep
-        # inherits the stdout pipe and keeps it open.
+    def test_reconcile_waits_for_detached_child(self, registry):
         proc = subprocess.Popen(
-            ["sh", "-c", "exec 1>&2; ( sleep 30 ) & disown; exit 0"],
+            [
+                sys.executable,
+                "-c",
+                "import os,time; pid=os.fork(); "
+                "time.sleep(.8) if pid == 0 else os._exit(7)",
+            ],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            preexec_fn=os.setsid,
+            start_new_session=True,
         )
 
         s = _make_session(sid="proc_orphan_test")
         s.process = proc
         s.pid = proc.pid
+        s.process_group_id = proc.pid
         registry._running[s.id] = s
 
-        # Wait for the direct child to exit. We don't start a reader thread,
-        # so session.exited stays False (mimicking the stuck-reader state).
         assert _wait_until(lambda: proc.poll() is not None, timeout=5.0), (
-            "Direct child should exit quickly (sh exits, sleep descendant "
-            "holds the pipe open)"
+            "launcher should exit before its detached child"
         )
+        assert s.exit_code is None
+        assert registry.poll(s.id)["status"] == "running"
+        assert _wait_until(lambda: registry.poll(s.id)["status"] == "exited")
+        assert registry.poll(s.id)["exit_code"] == 7
 
-        # Before the fix: poll would return "running" forever.
-        # After the fix: poll reconciles against proc.poll() and flips.
-        assert s.exited is False  # Precondition: reader hasn't updated it.
-        result = registry.poll(s.id)
-        assert result["status"] == "exited", (
-            f"Expected reconciled 'exited' status; got {result!r}. "
-            "This is issue #17327 — reader is blocked on orphaned pipe."
-        )
-        assert result["exit_code"] == 0
-        assert s.exited is True
-        assert s.id in registry._finished
-        assert s.id not in registry._running
-
-        # Clean up the orphaned descendant.
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
-
-    def test_wait_returns_when_reader_blocked(self, registry):
-        """wait() must also reconcile — not just poll()."""
+    def test_wait_blocks_until_descendant_settles(self, registry):
         proc = subprocess.Popen(
-            ["sh", "-c", "( sleep 30 ) & disown; exit 0"],
+            [
+                sys.executable,
+                "-c",
+                "import os,time; pid=os.fork(); "
+                "time.sleep(.6) if pid == 0 else os._exit(0)",
+            ],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            preexec_fn=os.setsid,
+            start_new_session=True,
         )
 
         s = _make_session(sid="proc_wait_orphan")
         s.process = proc
         s.pid = proc.pid
+        s.process_group_id = proc.pid
         registry._running[s.id] = s
 
         assert _wait_until(lambda: proc.poll() is not None, timeout=5.0)
 
         start = time.monotonic()
-        result = registry.wait(s.id, timeout=10)
+        result = registry.wait(s.id, timeout=5)
         elapsed = time.monotonic() - start
 
         assert result["status"] == "exited", result
-        assert elapsed < 5.0, (
-            f"wait() should return ~immediately via reconcile; took {elapsed:.1f}s"
-        )
-
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            pass
+        assert result["exit_code"] == 0
+        assert elapsed >= 0.2
 
     def test_wait_wakes_when_session_moves_to_finished(self, registry):
         """wait() should not sleep for the old 1s polling tick after exit."""
@@ -732,6 +969,40 @@ class TestSpawnEnvSanitization:
         # A failed launch must not be exposed as a running/tracked session.
         assert session.id not in registry._running
 
+    def test_spawn_via_env_carries_deadline_and_notification_metadata(self, registry):
+        commands = []
+
+        class FakeEnv:
+            def execute(self, command, **kwargs):
+                commands.append(command)
+                return {"output": "4321", "returncode": 0}
+        fake_thread = MagicMock()
+        fake_timer = MagicMock()
+
+        def assert_registered():
+            assert len(registry._running) == 1
+
+        fake_thread.start.side_effect = assert_registered
+        fake_timer.start.side_effect = assert_registered
+        with patch(
+            "tools.process_registry.threading.Thread", return_value=fake_thread
+        ), patch(
+            "tools.process_registry.threading.Timer", return_value=fake_timer
+        ), patch.object(registry, "_write_checkpoint"):
+            session = registry.spawn_via_env(
+                FakeEnv(),
+                "echo hello",
+                execution_timeout=12,
+                notification_metadata={"notify_on_complete": True},
+            )
+
+        assert session.execution_deadline == pytest.approx(session.started_at + 12)
+        assert session.notify_on_complete is True
+        assert session.id in registry._running
+        assert "nohup setsid bash -lc" in commands[0]
+        fake_timer.start.assert_called_once()
+        fake_thread.start.assert_called_once()
+
     def test_env_poller_quotes_temp_paths_with_spaces(self, registry):
         session = _make_session(sid="proc_space")
         session.exited = False
@@ -792,23 +1063,63 @@ class TestPopenLeakOnSetupFailure:
         def boom(*args, **kwargs):
             raise RuntimeError("Thread creation failed")
 
-        # proc.pid is a MagicMock-backed fake; os.getpgid(fake_pid) would query
-        # the real OS for an arbitrary PID. On a busy host that PID may exist,
-        # in which case spawn_local's primary cleanup path
-        # (os.killpg(os.getpgid(pid), SIGKILL)) succeeds against an UNRELATED
-        # real process group and proc.kill() is never reached — flaky failure,
-        # and a real risk of SIGKILLing an innocent process group. Force the
-        # ProcessLookupError fallback so the test deterministically exercises
-        # proc.kill() and never issues a real killpg.
+        def confirmed_tree_kill(*_args):
+            proc.kill()
+            proc.poll.return_value = -9
+            return True
+
         with patch("tools.process_registry._find_shell", return_value="/bin/bash"), \
              patch("subprocess.Popen", return_value=proc), \
              patch("threading.Thread", side_effect=boom), \
-             patch("os.getpgid", side_effect=ProcessLookupError), \
+             patch.object(registry, "_terminate_host_pid", side_effect=confirmed_tree_kill), \
              patch.object(registry, "_write_checkpoint"):
             with pytest.raises(RuntimeError, match="Thread creation failed"):
                 registry.spawn_local("echo hello", cwd="/tmp")
 
         assert killed, "proc.kill() must be called when post-Popen setup raises"
+
+    def test_unconfirmed_cleanup_retains_spawned_process(self, registry):
+        proc = MagicMock(pid=9999, stdout=iter([]), stdin=MagicMock())
+        proc.poll.return_value = None
+
+        with patch("tools.process_registry._find_shell", return_value="/bin/bash"), \
+             patch("subprocess.Popen", return_value=proc), \
+             patch("threading.Thread", side_effect=RuntimeError("thread failed")), \
+             patch.object(registry, "_safe_host_start_time", return_value=77), \
+             patch.object(registry, "_terminate_host_pid", return_value=False), \
+             patch.object(registry, "_host_process_is_live", return_value=True), \
+             patch.object(registry, "_write_checkpoint"):
+            with pytest.raises(RuntimeError, match="thread failed"):
+                registry.spawn_local("echo hello", cwd="/tmp")
+
+        assert len(registry._running) == 1
+        retained = next(iter(registry._running.values()))
+        assert retained.process is proc
+        event = registry.completion_queue.get_nowait()
+        assert event["type"] == "termination_failed"
+        assert event["session_id"] == retained.id
+
+    def test_unconfirmed_pty_cleanup_retains_spawned_process(self, registry):
+        pty_proc = MagicMock(pid=9999)
+        pty_proc.terminate.side_effect = RuntimeError("terminate failed")
+        pty_module = MagicMock()
+        pty_module.PtyProcess.spawn.return_value = pty_proc
+
+        with patch("tools.process_registry._IS_WINDOWS", False), \
+             patch.dict("sys.modules", {"ptyprocess": pty_module}), \
+             patch("threading.Thread", side_effect=RuntimeError("thread failed")), \
+             patch.object(registry, "_safe_host_start_time", return_value=77), \
+             patch.object(registry, "_terminate_host_pid", return_value=False), \
+             patch.object(registry, "_write_checkpoint"):
+            with pytest.raises(RuntimeError, match="termination was not confirmed"):
+                registry.spawn_local("echo hello", cwd="/tmp", use_pty=True)
+
+        assert len(registry._running) == 1
+        retained = next(iter(registry._running.values()))
+        assert retained._pty is pty_proc
+        event = registry.completion_queue.get_nowait()
+        assert event["type"] == "termination_failed"
+        assert event["session_id"] == retained.id
 
 # =========================================================================
 # Spawn rewrite regression (issue #68915)
@@ -847,7 +1158,7 @@ class TestSpawnRewriteCompoundBackground:
         assert len(captured_cmd) == 1
         shell_cmd = captured_cmd[0]
         # The command passed to Popen should be the REWRITTEN version
-        assert "&& { node server.js &>/tmp/srv.log & }" in shell_cmd[2]
+        assert "&& { node server.js &>/tmp/srv.log & }" in shell_cmd[-1]
 
     def test_simple_background_preserved(self, registry):
         """Simple cmd & (no &&) must NOT be rewritten — no subshell bug."""
@@ -870,7 +1181,7 @@ class TestSpawnRewriteCompoundBackground:
             registry.spawn_local("sleep 5 &", cwd="/tmp")
 
         assert len(captured_cmd) == 1
-        shell_cmd = captured_cmd[0][2]
+        shell_cmd = captured_cmd[0][-1]
         # Simple background must remain as-is
         assert "sleep 5 &" in shell_cmd
 
@@ -1019,10 +1330,195 @@ class TestKillProcess:
         result = registry.kill_process(s.id)
         assert result["status"] == "already_exited"
 
+    def test_kill_pty_uses_process_tree_termination(self, registry, monkeypatch):
+        s = _make_session(sid="proc_pty_tree")
+        s.pid = 424242
+        s.host_start_time = 99
+        s._pty = MagicMock()
+        registry._running[s.id] = s
+        terminate = MagicMock()
+        monkeypatch.setattr(registry, "_terminate_host_pid", terminate)
+
+        result = registry.kill_process(s.id)
+
+        assert result["status"] == "killed"
+        terminate.assert_called_once_with(424242, 99)
+        s._pty.terminate.assert_not_called()
+
+    def test_kill_remote_uses_process_group(self, registry, monkeypatch):
+        env = MagicMock()
+        env.execute.return_value = {
+            "returncode": 0,
+            "output": "__HERMES_TERMINATED__\n",
+        }
+        s = _make_session(sid="proc_remote_tree")
+        s.pid = 4321
+        s.host_start_time = 99
+        s.pid_scope = "sandbox"
+        s.env_ref = env
+        registry._running[s.id] = s
+        monkeypatch.setattr(registry, "_daemon_term_grace_seconds", lambda: 0.0)
+
+        result = registry.kill_process(s.id)
+
+        assert result["status"] == "killed"
+        command = env.execute.call_args.args[0]
+        assert "kill -TERM -- -4321" in command
+        assert "kill -KILL -- -4321" in command
+
+    def test_unconfirmed_remote_kill_retains_running_owner(self, registry, monkeypatch):
+        env = MagicMock()
+        env.execute.return_value = {"returncode": 0, "output": ""}
+        s = _make_session(sid="proc_remote_unknown")
+        s.pid = 4321
+        s.host_start_time = 99
+        s.pid_scope = "sandbox"
+        s.env_ref = env
+        registry._running[s.id] = s
+        monkeypatch.setattr(registry, "_daemon_term_grace_seconds", lambda: 0.0)
+
+        result = registry.kill_process(s.id)
+
+        assert result["status"] == "error"
+        assert s.exited is False
+        assert registry._running[s.id] is s
+
+    def test_remote_without_proc_identity_fails_open_and_notifies(self, registry):
+        env = MagicMock()
+        s = _make_session(sid="proc_remote_no_proc")
+        s.pid = 4321
+        s.pid_scope = "sandbox"
+        s.env_ref = env
+        registry._running[s.id] = s
+
+        result = registry.kill_process(
+            s.id, source="execution_timeout", consume_output=False
+        )
+
+        assert result["status"] == "error"
+        assert s.exited is False
+        assert registry._running[s.id] is s
+        event = registry.completion_queue.get_nowait()
+        assert event["type"] == "termination_failed"
+        assert event["termination_source"] == "execution_timeout"
+        env.execute.assert_not_called()
+
+    def test_remote_nonzero_kill_retains_owner_and_reports_evidence(self, registry):
+        env = MagicMock()
+        env.execute.return_value = {"returncode": 7, "output": "kill denied"}
+        s = _make_session(sid="proc_remote_nonzero")
+        s.pid = 4321
+        s.host_start_time = 99
+        s.pid_scope = "sandbox"
+        s.env_ref = env
+        registry._running[s.id] = s
+
+        result = registry.kill_process(s.id, consume_output=False)
+
+        assert result["status"] == "error"
+        assert "returncode=7" in result["error"]
+        assert "kill denied" in result["error"]
+        assert registry._running[s.id] is s
+        assert registry.completion_queue.get_nowait()["type"] == "termination_failed"
+
+    def test_deadline_kill_failure_is_not_discarded(self, registry, monkeypatch):
+        s = _make_session(sid="proc_deadline_failure")
+        s.pid = 4321
+        s.host_start_time = 99
+        s.detached = True
+        s.session_key = "owner"
+        registry._running[s.id] = s
+        monkeypatch.setattr(registry, "_host_pid_identity", lambda *_args: registry._PID_MATCH)
+        monkeypatch.setattr(registry, "_terminate_host_pid", lambda *_args: False)
+
+        registry._kill_for_deadline(s.id)
+
+        assert registry._running[s.id] is s
+        event = registry.completion_queue.get_nowait()
+        assert event["type"] == "termination_failed"
+        assert event["session_key"] == "owner"
+        assert event["termination_source"] == "execution_timeout"
+        assert "Ownership was retained" in format_process_notification(event)
+
+    def test_deadline_remote_kill_timeout_notifies_and_retains(self, registry):
+        env = MagicMock()
+        env.execute.side_effect = TimeoutError("kill timed out")
+        s = _make_session(sid="proc_deadline_timeout")
+        s.pid = 4321
+        s.host_start_time = 99
+        s.pid_scope = "sandbox"
+        s.env_ref = env
+        registry._running[s.id] = s
+
+        registry._kill_for_deadline(s.id)
+
+        assert registry._running[s.id] is s
+        assert s.exited is False
+        event = registry.completion_queue.get_nowait()
+        assert event["type"] == "termination_failed"
+        assert event["termination_source"] == "execution_timeout"
+        assert "kill timed out" in event["message"]
+
+    def test_kill_failure_rolls_back_completion_disposition_atomically(
+        self, registry, monkeypatch
+    ):
+        s = _make_session(sid="proc_kill_rollback")
+        s.pid = 4321
+        s.host_start_time = 99
+        s.detached = True
+        registry._running[s.id] = s
+        monkeypatch.setattr(registry, "_host_pid_identity", lambda *_args: registry._PID_MATCH)
+
+        def fail_after_transient_completion(*_args):
+            with s._lock:
+                s.exited = True
+            assert registry.poll(s.id)["status"] == "running"
+            registry._poll_observed.add(s.id)
+            registry._completion_consumed.add(s.id)
+            with s._lock:
+                s.exited = False
+            return False
+
+        monkeypatch.setattr(registry, "_terminate_host_pid", fail_after_transient_completion)
+
+        assert registry.kill_process(s.id)["status"] == "error"
+        assert s.id not in registry._poll_observed
+        assert s.id not in registry._completion_consumed
+        assert s.completion_reason == "exited"
+        assert s.termination_source == ""
+        assert registry._running[s.id] is s
+
+    def test_unsettled_post_kill_recheck_rolls_back_disposition(
+        self, registry, monkeypatch
+    ):
+        s = _make_session(sid="proc_kill_recheck")
+        s.process = MagicMock(pid=4321)
+        s.host_start_time = 99
+        registry._running[s.id] = s
+        monkeypatch.setattr(registry, "_terminate_host_pid", lambda *_args: True)
+        monkeypatch.setattr(registry, "_local_completion_state", lambda _s: (True, -15))
+        monkeypatch.setattr(registry, "_local_descendants_settled", lambda _s: True)
+        monkeypatch.setattr(registry, "_host_process_is_live", lambda *_args: False)
+
+        def refuse_completion(session):
+            session.exited = False
+
+        monkeypatch.setattr(registry, "_move_to_finished", refuse_completion)
+
+        result = registry.kill_process(s.id)
+
+        assert result["status"] == "error"
+        assert s.exited is False
+        assert s.completion_reason == "exited"
+        assert s.termination_source == ""
+        assert s.id not in registry._completion_consumed
+        assert s.id not in registry._poll_observed
+        assert registry._running[s.id] is s
 
     def test_kill_detached_session_uses_host_pid(self, registry):
         s = _make_session(sid="proc_detached", command="sleep 999")
         s.pid = 424242
+        s.host_start_time = 99
         s.detached = True
         registry._running[s.id] = s
 
@@ -1031,10 +1527,16 @@ class TestKillProcess:
         class FakeProcess:
             def __init__(self, pid):
                 self.pid = pid
+                self.alive = True
             def children(self, recursive=False):
                 return []
             def terminate(self):
                 terminate_calls.append(("terminate", self.pid))
+                self.alive = False
+            def is_running(self):
+                return self.alive
+            def status(self):
+                return "running"
 
         import psutil as _psutil
 
@@ -1047,6 +1549,7 @@ class TestKillProcess:
             # SIGKILL-escalation step (grace=0) so it doesn't call
             # ``psutil.wait_procs`` on the FakeProcess.
             with patch("gateway.status._pid_exists", return_value=True), \
+                 patch.object(ProcessRegistry, "_safe_host_start_time", return_value=99), \
                  patch.object(ProcessRegistry, "_daemon_term_grace_seconds",
                               staticmethod(lambda: 0.0)), \
                  patch.object(_psutil, "Process", side_effect=lambda pid: FakeProcess(pid)):
@@ -1056,6 +1559,62 @@ class TestKillProcess:
             assert ("terminate", 424242) in terminate_calls
         finally:
             registry._running.pop(s.id, None)
+
+    def test_kill_intent_wins_completion_race(self, registry, monkeypatch):
+        class FakeProcess:
+            pid = 424242
+            returncode = None
+            stdout = None
+            stdin = None
+
+            def poll(self):
+                return self.returncode
+
+        proc = FakeProcess()
+        s = _make_session(sid="proc_kill_race")
+        s.process = proc
+        s.pid = proc.pid
+        s.notify_on_complete = True
+        s._subreaper_managed = True
+        registry._running[s.id] = s
+        registry._move_to_finished(s)
+
+        terminate_entered = threading.Event()
+        release_terminate = threading.Event()
+        result = {}
+
+        def terminate(*_args):
+            terminate_entered.set()
+            assert release_terminate.wait(5)
+
+        monkeypatch.setattr(registry, "_terminate_host_pid", terminate)
+        thread = threading.Thread(
+            target=lambda: result.update(registry.kill_process(s.id))
+        )
+        thread.start()
+        try:
+            assert terminate_entered.wait(2)
+            proc.returncode = -15
+            assert registry.completion_queue.empty()
+            release_terminate.set()
+            thread.join(5)
+            assert _wait_until(lambda: not registry.completion_queue.empty())
+
+            event = registry.completion_queue.get_nowait()
+            assert event["completion_reason"] == "killed"
+            assert event["exit_code"] == -15
+            assert registry.completion_queue.empty()
+        finally:
+            release_terminate.set()
+            thread.join(5)
+
+        assert not thread.is_alive()
+        assert result["status"] == "killed"
+        assert s.completion_reason == "killed"
+        assert s.exit_code == -15
+        assert registry.is_completion_consumed(s.id)
+        registry._move_to_finished(s)
+        assert registry.completion_queue.empty()
 
 
 # =========================================================================
@@ -1073,7 +1632,121 @@ class TestProcessToolHandler:
 # format_process_notification + drain_notifications (shared helpers)
 # =========================================================================
 
-from tools.process_registry import format_process_notification
+from tools.process_registry import completion_delivery_prompt, format_process_notification
+
+
+def _completion_event(**overrides):
+    event = {
+        "type": "completion",
+        "session_id": "proc_visibility",
+        "session_key": "session-a",
+        "command": "safe-test-command",
+        "exit_code": 0,
+        "output": "done",
+    }
+    event.update(overrides)
+    return event
+
+
+def _visibility_config():
+    return {"auxiliary": {"completion_visibility": {"enabled": True}}}
+
+
+def test_completion_visibility_explicit_false_skips_delivery(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly", _visibility_config
+    )
+    monkeypatch.setattr(
+        "agent.auxiliary_client.call_llm",
+        lambda **_kwargs: SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content='{"deliver": false, "reason": "routine success"}'))]
+        ),
+    )
+
+    assert completion_delivery_prompt(_completion_event(), "payload") is None
+
+
+@pytest.mark.parametrize(
+    ("output", "canary"),
+    [
+        ("SYNTHETIC_API_KEY=SYNTHETIC_ENV_SECRET_7f3a", "SYNTHETIC_ENV_SECRET_7f3a"),
+        ("https://example.invalid/result?token=SYNTHETIC_QUERY_SECRET_9c2d", "SYNTHETIC_QUERY_SECRET_9c2d"),
+        ("https://user:SYNTHETIC_USERINFO_SECRET_4b8e@example.invalid/result", "SYNTHETIC_USERINFO_SECRET_4b8e"),
+        ('{"api_key": "SYNTHETIC_JSON_SECRET_1a6f"}', "SYNTHETIC_JSON_SECRET_1a6f"),
+        ("api_key: SYNTHETIC_YAML_SECRET_5e0c", "SYNTHETIC_YAML_SECRET_5e0c"),
+    ],
+)
+def test_completion_visibility_judge_prompt_redacts_secrets(monkeypatch, output, canary):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly", _visibility_config
+    )
+    captured = {}
+
+    def judge(**kwargs):
+        captured["prompt"] = kwargs["messages"][1]["content"]
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content='{"deliver": false, "reason": "routine"}'))]
+        )
+
+    monkeypatch.setattr("agent.auxiliary_client.call_llm", judge)
+
+    assert completion_delivery_prompt(_completion_event(output=output), "payload") is None
+    assert canary not in captured["prompt"]
+
+
+def test_completion_visibility_fails_open_on_judge_error(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly", _visibility_config
+    )
+    monkeypatch.setattr(
+        "agent.auxiliary_client.call_llm", lambda **_kwargs: (_ for _ in ()).throw(TimeoutError())
+    )
+
+    assert completion_delivery_prompt(_completion_event(), "payload") is not None
+
+
+def test_completion_visibility_fails_open_on_invalid_json(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly", _visibility_config
+    )
+    monkeypatch.setattr(
+        "agent.auxiliary_client.call_llm",
+        lambda **_kwargs: SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="not json"))]
+        ),
+    )
+
+    assert completion_delivery_prompt(_completion_event(), "payload") is not None
+
+
+def test_completion_visibility_nonzero_exit_forces_delivery(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly", _visibility_config
+    )
+    monkeypatch.setattr(
+        "agent.auxiliary_client.call_llm",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("must not judge failure")),
+    )
+
+    assert completion_delivery_prompt(_completion_event(exit_code=1), "payload") is not None
+
+
+def test_completion_visibility_missing_fields_fails_open(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly", _visibility_config
+    )
+    monkeypatch.setattr(
+        "agent.auxiliary_client.call_llm",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("must not judge incomplete event")),
+    )
+
+    assert completion_delivery_prompt(_completion_event(output=None), "payload") is not None
 
 
 def test_drain_notifications_completion_callback_exception_fails_closed(registry):
@@ -1233,8 +1906,10 @@ class TestTerminateHostPidWindows:
             return MagicMock(returncode=0, stderr="", stdout="")
 
         monkeypatch.setattr(pr.subprocess, "run", fake_run)
+        monkeypatch.setattr(pr.ProcessRegistry, "_is_host_pid_alive", lambda pid: True)
+        monkeypatch.setattr(pr.ProcessRegistry, "_safe_host_start_time", lambda pid: 99)
 
-        pr.ProcessRegistry._terminate_host_pid(12345)
+        pr.ProcessRegistry._terminate_host_pid(12345, 99)
 
         assert captured["args"][0] == "taskkill"
         assert "/PID" in captured["args"]
@@ -1270,13 +1945,15 @@ class TestTerminateHostPidPosix:
                 terminate_order.append(self.pid)
 
         monkeypatch.setattr(psutil, "Process", _FakeParent)
+        monkeypatch.setattr(pr.ProcessRegistry, "_is_host_pid_alive", lambda pid: True)
+        monkeypatch.setattr(pr.ProcessRegistry, "_safe_host_start_time", lambda pid: 99)
         # This test covers only the SIGTERM tree-walk ordering; disable the
         # SIGKILL-escalation step (which would call psutil.wait_procs on the
         # fakes) by setting the grace to 0.
         monkeypatch.setattr(pr.ProcessRegistry, "_daemon_term_grace_seconds",
                             staticmethod(lambda: 0.0))
 
-        pr.ProcessRegistry._terminate_host_pid(12345)
+        pr.ProcessRegistry._terminate_host_pid(12345, 99)
 
         assert terminate_order == [101, 102, 103, 12345], (
             "Children must be terminated before the parent"
@@ -1296,10 +1973,23 @@ class TestTerminateHostPidPosix:
 
         monkeypatch.setattr(psutil, "Process", boom)
         monkeypatch.setattr(pr.os, "kill", fake_kill)
+        monkeypatch.setattr(pr.ProcessRegistry, "_is_host_pid_alive", lambda pid: True)
+        monkeypatch.setattr(pr.ProcessRegistry, "_safe_host_start_time", lambda pid: 99)
 
-        pr.ProcessRegistry._terminate_host_pid(12345)
+        confirmed = pr.ProcessRegistry._terminate_host_pid(12345, 99)
 
         assert kill_calls == [(12345, signal.SIGTERM)]
+        assert confirmed is False
+
+    def test_psutil_probe_error_is_unknown_not_gone(self):
+        import psutil
+
+        proc = MagicMock()
+        proc.is_running.side_effect = psutil.AccessDenied(pid=12345)
+
+        assert ProcessRegistry._proc_live_state(proc) is None
+        assert ProcessRegistry._proc_alive(proc) is False
+        assert ProcessRegistry._proc_confirmed_gone(proc) is False
 
 
 # =========================================================================
@@ -1313,6 +2003,33 @@ class TestTerminateHostPidPosix:
 # =========================================================================
 
 class TestPidReuseGuard:
+    def test_unknown_identity_refuses_signal_and_retains_owner(self, monkeypatch):
+        from tools import process_registry as pr
+
+        monkeypatch.setattr(ProcessRegistry, "_is_host_pid_alive", lambda pid: True)
+        monkeypatch.setattr(ProcessRegistry, "_safe_host_start_time", lambda pid: None)
+        signals = []
+        monkeypatch.setattr(pr, "_IS_WINDOWS", True)
+        monkeypatch.setattr(
+            pr.subprocess,
+            "run",
+            lambda *args, **kwargs: signals.append((args, kwargs)),
+        )
+
+        assert ProcessRegistry._host_pid_identity(12345, 99) == ProcessRegistry._PID_UNKNOWN
+        assert ProcessRegistry._terminate_host_pid(12345, 99) is False
+        assert signals == []
+
+        s = _make_session(sid="proc_unknown")
+        s.pid = 12345
+        s.detached = True
+        s.host_start_time = 99
+        self.registry = ProcessRegistry()
+        self.registry._running[s.id] = s
+        assert self.registry.kill_process(s.id)["status"] == "error"
+        assert self.registry._running[s.id] is s
+        assert s.exited is False
+
     def test_terminate_refuses_when_start_time_mismatches(self, registry):
         """A live PID whose start time changed (recycled) is NOT killed."""
         proc = _spawn_python_sleep(30)
@@ -1329,18 +2046,86 @@ class TestPidReuseGuard:
             proc.wait()
 
 
-    def test_refresh_detached_marks_recycled_pid_exited(self, registry):
-        """A detached session whose PID got recycled is moved to finished."""
-        wrong_start = (ProcessRegistry._safe_host_start_time(os.getpid()) or 0) + 999
-        s = _make_session(sid="proc_detached")
-        s.pid = os.getpid()          # alive, but...
-        s.pid_scope = "host"
-        s.detached = True
-        s.host_start_time = wrong_start  # ...identity no longer matches
-        registry._running[s.id] = s
-        refreshed = registry._refresh_detached_session(s)
-        assert refreshed.exited is True
-        assert s.id in registry._finished
+@pytest.mark.skipif(sys.platform == "win32", reason="uses a real POSIX child")
+def test_post_popen_identity_interrupt_contains_child(registry, monkeypatch, tmp_path):
+    from tools import process_registry as process_registry_module
+
+    created = []
+    real_popen = subprocess.Popen
+
+    def capture_popen(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        created.append(proc)
+        return proc
+
+    monkeypatch.setattr(process_registry_module.subprocess, "Popen", capture_popen)
+    monkeypatch.setattr(
+        registry,
+        "_safe_host_start_time",
+        MagicMock(side_effect=KeyboardInterrupt("identity interrupted")),
+    )
+
+    try:
+        with pytest.raises(KeyboardInterrupt, match="identity interrupted"):
+            registry.spawn_local(
+                f"{shlex.quote(sys.executable)} -c 'import time; time.sleep(30)'",
+                cwd=str(tmp_path),
+            )
+        assert len(created) == 1
+        assert created[0].poll() is not None
+        assert not registry._running
+    finally:
+        for proc in created:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=5)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="uses a real POSIX child")
+def test_checkpoint_failure_contains_spawned_child(registry, monkeypatch, tmp_path):
+    from tools import process_registry as process_registry_module
+    import utils
+
+    created = []
+    real_popen = subprocess.Popen
+
+    def capture_popen(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        created.append(proc)
+        return proc
+
+    monkeypatch.setattr(process_registry_module, "CHECKPOINT_PATH", tmp_path / "processes.json")
+    monkeypatch.setattr(process_registry_module.subprocess, "Popen", capture_popen)
+    monkeypatch.setattr(utils, "atomic_json_write", MagicMock(side_effect=OSError("disk full")))
+
+    try:
+        with pytest.raises(RuntimeError, match="checkpoint"):
+            registry.spawn_local(
+                f"{shlex.quote(sys.executable)} -c 'import time; time.sleep(30)'",
+                cwd=str(tmp_path),
+            )
+        assert len(created) == 1
+        assert created[0].poll() is not None
+        assert not registry._running
+    finally:
+        for proc in created:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(timeout=5)
+
+
+def test_refresh_detached_marks_recycled_pid_exited(registry):
+    """A detached session whose PID got recycled is moved to finished."""
+    wrong_start = (ProcessRegistry._safe_host_start_time(os.getpid()) or 0) + 999
+    s = _make_session(sid="proc_detached")
+    s.pid = os.getpid()
+    s.pid_scope = "host"
+    s.detached = True
+    s.host_start_time = wrong_start
+    registry._running[s.id] = s
+    refreshed = registry._refresh_detached_session(s)
+    assert refreshed.exited is True
+    assert s.id in registry._finished
 
 
 @pytest.mark.skipif(sys.platform == "win32",
@@ -1379,7 +2164,9 @@ class TestSigkillEscalation:
                             staticmethod(lambda: 0.3))
         proc = self._spawn_trap()
         try:
-            ProcessRegistry._terminate_host_pid(proc.pid)
+            ProcessRegistry._terminate_host_pid(
+                proc.pid, ProcessRegistry._safe_host_start_time(proc.pid)
+            )
             assert _wait_until(lambda: proc.poll() is not None, timeout=4.0), \
                 "SIGTERM-ignoring daemon should be SIGKILLed after grace"
         finally:
@@ -1446,7 +2233,9 @@ class TestSigkillEscalation:
         child_pids = [int(x) for x in parent.stdout.readline().split()]
         all_pids = [parent.pid] + child_pids
         try:
-            ProcessRegistry._terminate_host_pid(parent.pid)
+            ProcessRegistry._terminate_host_pid(
+                parent.pid, ProcessRegistry._safe_host_start_time(parent.pid)
+            )
 
             def _pid_dead(p: int) -> bool:
                 # A pid is "dead" for our purposes if it no longer exists OR
@@ -1600,101 +2389,204 @@ class TestHandleProcessRedaction:
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only: select() on pipes")
 class TestReaderLoopOrphanedPipe:
-    """Regression tests for issue #68915.
+    """The reader supervises the complete owned process group."""
 
-    When an agent command backgrounds a long-lived process (``node server.js
-    &``), the grandchild inherits the write end of the reader's stdout pipe.
-    The direct bash child exits, but the pipe never EOFs — the old blocking
-    ``read1()`` parked the reader thread forever, ``session.exited`` never
-    flipped on its own, and ``notify_on_complete`` never fired. The reader
-    must instead terminate shortly after the direct child exits, even while
-    a descendant still holds the pipe open.
-    """
+    @pytest.mark.skipif(
+        not sys.platform.startswith("linux"),
+        reason="Linux-only: requires PR_SET_CHILD_SUBREAPER",
+    )
+    def test_spawn_waits_for_setsid_worker_before_one_completion(
+        self, registry, tmp_path
+    ):
+        done = tmp_path / "worker.done"
+        code = (
+            "import os,time; pid=os.fork(); "
+            "(os.setsid(), print('worker-start', flush=True), os.close(1), "
+            f"os.close(2), time.sleep(.8), open({str(done)!r}, 'w').close(), "
+            "os._exit(0)) "
+            "if pid == 0 else os._exit(23)"
+        )
+        command = f"{shlex.quote(sys.executable)} -c {shlex.quote(code)}"
+        session = registry.spawn_local(command, cwd=str(tmp_path))
+        session.notify_on_complete = True
 
-    def test_reader_exits_when_orphan_holds_pipe(self, registry):
-        """Reader loop must return promptly after the direct child exits,
-        even though a backgrounded descendant keeps the pipe open."""
+        try:
+            assert _wait_until(lambda: "worker-start" in session.output_buffer)
+            assert registry.poll(session.id)["status"] == "running"
+            assert session.id in registry._running
+            assert registry.completion_queue.empty()
+            assert not done.exists()
+
+            assert _wait_until(done.exists)
+            assert _wait_until(
+                lambda: registry.poll(session.id)["status"] == "exited"
+            )
+            assert _wait_until(lambda: not registry.completion_queue.empty())
+            event = registry.completion_queue.get_nowait()
+            assert event["session_id"] == session.id
+            assert event["exit_code"] == 23
+            assert event["output"].endswith("worker-start\n")
+            registry._move_to_finished(session)
+            assert registry.completion_queue.empty()
+        finally:
+            if not session.exited:
+                registry.kill_process(session.id)
+
+    def test_final_notify_waits_for_child_and_is_exactly_once(self, registry):
         proc = subprocess.Popen(
-            ["sh", "-c", "echo started; sleep 30 & exit 0"],
+            [
+                sys.executable,
+                "-c",
+                "import os,time; print('launcher', flush=True); pid=os.fork(); "
+                "(time.sleep(.8), print('child-final', flush=True), os._exit(0)) "
+                "if pid == 0 else os._exit(9)",
+            ],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             encoding="utf-8",
             errors="replace",
-            preexec_fn=os.setsid,
+            start_new_session=True,
         )
-        s = _make_session(sid="proc_orphan_reader")
+        s = _make_session(sid="proc_orphan_notify")
         s.process = proc
         s.pid = proc.pid
+        s.process_group_id = proc.pid
+        s.notify_on_complete = True
         registry._running[s.id] = s
 
         done = threading.Event()
-
-        def _run():
-            registry._reader_loop(s)
-            done.set()
-
-        t = threading.Thread(target=_run, daemon=True)
+        t = threading.Thread(
+            target=lambda: (registry._reader_loop(s), done.set()), daemon=True
+        )
         t.start()
-        try:
-            # The direct child exits immediately; the reader must notice and
-            # return well before the 30s descendant releases the pipe.
-            assert done.wait(timeout=10.0), (
-                "_reader_loop is still blocked on the orphan-held pipe "
-                "(issue #68915) — session.exited would never flip and "
-                "notify_on_complete would never fire"
-            )
-            assert s.exited is True
-            assert s.exit_code == 0
-            assert s.completion_reason == "exited"
-            assert "started" in s.output_buffer
-            assert s.id in registry._finished
-        finally:
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                pass
+        assert _wait_until(lambda: proc.poll() is not None)
+        assert not done.wait(timeout=0.2)
+        assert registry.completion_queue.empty()
+        assert done.wait(timeout=5)
 
-    def test_reader_exit_fires_notify_on_complete(self, registry):
-        """The autonomous completion notification must not depend on a
-        poll()/wait() call when an orphan holds the pipe."""
+        item = registry.completion_queue.get_nowait()
+        assert item["type"] == "completion"
+        assert item["session_id"] == s.id
+        assert item["exit_code"] == 9
+        assert item["output"] == "launcher\nchild-final\n"
+        registry._move_to_finished(s)
+        assert registry.completion_queue.empty()
+
+    def test_final_buffered_tail_is_complete_and_notified_once(self, registry):
+        payload = "".join(f"tail-{i:05d}:abcdefghij\n" for i in range(1200))
+        payload += "TAIL-SUFFIX-IS-PRESENT\n"
         proc = subprocess.Popen(
-            ["sh", "-c", "sleep 30 & echo bg-started"],
+            [sys.executable, "-c", "import sys; sys.stdout.write(sys.argv[1])", payload],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             encoding="utf-8",
             errors="replace",
-            preexec_fn=os.setsid,
+            start_new_session=True,
         )
-        s = _make_session(sid="proc_orphan_notify")
+        assert proc.stdout.buffer.peek(1), "expected a real BufferedReader tail"
+        s = _make_session(sid="proc_buffered_tail")
+        s.process = proc
+        s.pid = proc.pid
+        s.process_group_id = proc.pid
+        s.notify_on_complete = True
+        s.max_output_chars = len(payload) + 1
+        registry._running[s.id] = s
+
+        registry._reader_loop(s)
+
+        assert s.output_buffer == payload
+        event = registry.completion_queue.get_nowait()
+        assert event["exit_code"] == 0
+        assert event["output"].endswith("TAIL-SUFFIX-IS-PRESENT\n")
+        registry._move_to_finished(s)
+        assert registry.completion_queue.empty()
+
+    def test_buffered_and_delayed_tail_finish_with_external_writer_open(self, registry):
+        read_fd, write_fd = os.pipe()
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "print('prefetched-tail', flush=True)"],
+            stdout=write_fd,
+            stderr=write_fd,
+        )
+        stdout = os.fdopen(read_fd, "r", encoding="utf-8")
+        proc.stdout = stdout
+        proc.wait()
+        assert stdout.buffer.peek(1), "expected a real BufferedReader tail"
+        s = _make_session(sid="proc_external_writer")
         s.process = proc
         s.pid = proc.pid
         s.notify_on_complete = True
         registry._running[s.id] = s
 
+        delayed = threading.Thread(
+            target=lambda: (time.sleep(0.3), os.write(write_fd, b"delayed-tail\n")),
+            daemon=True,
+        )
         done = threading.Event()
-
-        def _run():
-            registry._reader_loop(s)
-            done.set()
-
-        t = threading.Thread(target=_run, daemon=True)
-        t.start()
+        reader = threading.Thread(
+            target=lambda: (registry._reader_loop(s), done.set()), daemon=True
+        )
+        delayed.start()
+        reader.start()
         try:
-            assert done.wait(timeout=10.0), (
-                "_reader_loop blocked — completion notification lost (#68915)"
-            )
-            # Exactly one completion event must have been queued.
-            item = registry.completion_queue.get_nowait()
-            assert item["type"] == "completion"
-            assert item["session_id"] == s.id
-            assert item["exit_code"] == 0
+            assert done.wait(timeout=3)
+            assert s.output_buffer == "prefetched-tail\ndelayed-tail\n"
+            event = registry.completion_queue.get_nowait()
+            assert event["exit_code"] == 0
+            registry._move_to_finished(s)
+            assert registry.completion_queue.empty()
         finally:
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
                 pass
+            delayed.join(timeout=1)
+            os.close(write_fd)
+            reader.join(timeout=1)
+            stdout.close()
+
+    def test_known_launcher_exit_is_kept_until_descendant_settles(self, registry):
+        proc = subprocess.Popen(
+            [
+                sys.executable,
+                "-c",
+                "import os,time; pid=os.fork(); "
+                "time.sleep(.7) if pid == 0 else os._exit(4)",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+        s = _make_session(sid="proc_zombie_notify", exited=True)
+        s.process = proc
+        s.pid = proc.pid
+        s.process_group_id = proc.pid
+        s.notify_on_complete = True
+        registry._running[s.id] = s
+
+        import psutil
+
+        assert _wait_until(lambda: psutil.Process(proc.pid).status() == psutil.STATUS_ZOMBIE)
+        assert s.exit_code is None
+        registry._move_to_finished(s)
+        assert s.exited is False
+        assert s.exit_code == 4
+        assert s.id in registry._running
+        assert s.id not in registry._finished
+        assert registry.poll(s.id)["status"] == "running"
+        assert s.exit_code == 4
+        assert registry.completion_queue.empty()
+        assert _wait_until(lambda: not registry.completion_queue.empty(), timeout=5)
+        assert s.exited is True
+        assert s.id not in registry._running
+        assert s.id in registry._finished
+        item = registry.completion_queue.get_nowait()
+        assert item["exit_code"] == 4
+        assert registry.completion_queue.empty()
+
+
 # =========================================================================
 # systemd cgroup isolation for gateway-spawned local executors (#70716)
 # =========================================================================
@@ -1825,8 +2717,8 @@ class TestSystemdCgroupIsolation:
             registry.spawn_local("echo hello", cwd="/tmp")
 
         argv = captured["argv"]
-        # No systemd-run wrapping — direct shell invocation.
-        assert argv == ["/bin/bash", "-lic", "set +m; echo hello"], argv
+        assert argv[-3:] == ["/bin/bash", "-lic", "set +m; echo hello"], argv
+        assert argv[1].endswith("tools/process_subreaper.py"), argv
         assert captured["start_new_session"] is True
 
     def test_falls_back_when_not_under_supervisor(self, registry, monkeypatch):
@@ -1852,7 +2744,8 @@ class TestSystemdCgroupIsolation:
             registry.spawn_local("echo hello", cwd="/tmp")
 
         argv = captured["argv"]
-        assert argv == ["/bin/bash", "-lic", "set +m; echo hello"], argv
+        assert argv[-3:] == ["/bin/bash", "-lic", "set +m; echo hello"], argv
+        assert argv[1].endswith("tools/process_subreaper.py"), argv
         assert captured["start_new_session"] is True
 
     @pytest.mark.parametrize("use_pty", [False, True])
@@ -1894,9 +2787,10 @@ class TestSystemdCgroupIsolation:
                 patch.object(registry, "_write_checkpoint"),
             ):
                 session = registry.spawn_local("echo hello", cwd="/tmp")
-            assert captured["argv"] == [
+            assert captured["argv"][-3:] == [
                 "/bin/bash", "-lic", "set +m; echo hello",
             ]
+            assert captured["argv"][1].endswith("tools/process_subreaper.py")
             assert captured["start_new_session"] is True
 
         assert session.systemd_unit == ""
@@ -1945,9 +2839,10 @@ class TestSystemdCgroupIsolation:
                 patch.object(registry, "_write_checkpoint"),
             ):
                 session = registry.spawn_local("echo hello", cwd="/tmp")
-            assert captured["argv"] == [
+            assert captured["argv"][-3:] == [
                 "/bin/bash", "-lic", "set +m; echo hello",
             ]
+            assert captured["argv"][1].endswith("tools/process_subreaper.py")
             assert captured["start_new_session"] is True
 
         assert session.systemd_unit == ""
@@ -2278,3 +3173,93 @@ class TestSystemdCgroupIsolation:
         )
 
         assert pr._stop_systemd_unit("hermes-worker-gone.scope") is True
+
+# systemd cgroup isolation for gateway-spawned local executors (#70716)
+# =========================================================================
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX-only: systemd scopes")
+def test_remote_poller_probe_failure_is_bounded_and_retains_owner(
+    registry, monkeypatch
+):
+    env = MagicMock()
+    env.execute.side_effect = OSError("backend unavailable")
+    s = _make_session(sid="proc_remote_probe")
+    s.env_ref = env
+    s.pid = 4321
+    s.pid_scope = "sandbox"
+    registry._running[s.id] = s
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr("tools.process_registry._REMOTE_PROBE_FAILURE_LIMIT", 2)
+
+    registry._env_poller_loop(s, env, "/tmp/log", "/tmp/pid", "/tmp/exit")
+
+    assert env.execute.call_count == 2
+    assert s.exited is False
+    assert registry._running[s.id] is s
+    assert registry.completion_queue.get_nowait()["type"] == "termination_failed"
+
+
+def test_remote_poller_nonzero_probe_is_bounded_and_retains_owner(
+    registry, monkeypatch
+):
+    env = MagicMock()
+
+    def execute(command, **_kwargs):
+        if "kill -0" in command:
+            return {"output": "1\n", "returncode": 7}
+        return {"output": "", "returncode": 0}
+
+    env.execute.side_effect = execute
+    s = _make_session(sid="proc_remote_nonzero_probe")
+    s.env_ref = env
+    s.pid = 4321
+    s.pid_scope = "sandbox"
+    registry._running[s.id] = s
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr("tools.process_registry._REMOTE_PROBE_FAILURE_LIMIT", 2)
+
+    registry._env_poller_loop(s, env, "/tmp/log", "/tmp/pid", "/tmp/exit")
+
+    assert env.execute.call_count == 4
+    assert s.exited is False
+    assert registry._running[s.id] is s
+    assert registry.completion_queue.get_nowait()["type"] == "termination_failed"
+
+
+def test_completion_supervisor_stops_on_bounded_unknown_without_releasing_owner(
+    registry, monkeypatch
+):
+    proc = MagicMock()
+    proc.poll.return_value = 0
+    s = _make_session(sid="proc_unknown_descendants")
+    s.process = proc
+    registry._running[s.id] = s
+    monkeypatch.setattr(registry, "_local_completion_state", lambda _s: (False, 0))
+    monkeypatch.setattr(registry, "_local_descendants_settled", lambda _s: None)
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(
+        "tools.process_registry._COMPLETION_SUPERVISOR_UNKNOWN_LIMIT", 2
+    )
+
+    registry._ensure_local_completion_supervisor(s)
+
+    assert _wait_until(lambda: not registry.completion_queue.empty())
+    assert s.exited is False
+    assert registry._running[s.id] is s
+    assert s._completion_supervisor_started is False
+    assert registry.completion_queue.get_nowait()["type"] == "termination_failed"
+
+
+def test_pty_wait_failure_retains_owner(registry):
+    pty = MagicMock()
+    pty.isalive.side_effect = [False, True]
+    pty.wait.side_effect = TimeoutError("still alive")
+    s = _make_session(sid="proc_pty_wait")
+    s._pty = pty
+    s.pid = 4321
+    registry._running[s.id] = s
+
+    registry._pty_reader_loop(s)
+
+    assert s.exited is False
+    assert registry._running[s.id] is s
+    assert registry.completion_queue.get_nowait()["type"] == "termination_failed"

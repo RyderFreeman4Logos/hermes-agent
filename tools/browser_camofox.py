@@ -772,17 +772,19 @@ def camofox_press(key: str, task_id: Optional[str] = None) -> str:
 
 def camofox_close(task_id: Optional[str] = None) -> str:
     """Close the browser session via Camofox."""
-    try:
-        session = _drop_session(task_id)
-        if not session:
-            return json.dumps({"success": True, "closed": True})
-
-        _delete(
-            f"/sessions/{session['user_id']}",
-        )
+    task_id = task_id or "default"
+    with _sessions_lock:
+        session = _sessions.get(task_id)
+    if not session:
         return json.dumps({"success": True, "closed": True})
+    try:
+        _delete(f"/sessions/{session['user_id']}")
     except Exception as e:
-        return json.dumps({"success": True, "closed": True, "warning": str(e)})
+        return tool_error(str(e), success=False)
+    with _sessions_lock:
+        if _sessions.get(task_id) is session:
+            _sessions.pop(task_id, None)
+    return json.dumps({"success": True, "closed": True})
 
 
 def camofox_get_images(task_id: Optional[str] = None) -> str:
@@ -948,6 +950,5 @@ def camofox_console(clear: bool = False, task_id: Optional[str] = None) -> str:
         "note": "Console log capture is not available with the Camofox backend. "
                 "Use browser_snapshot or browser_vision to inspect page state.",
     })
-
 
 

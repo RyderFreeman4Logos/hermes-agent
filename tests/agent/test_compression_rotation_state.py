@@ -28,6 +28,11 @@ from agent.context_compressor import ContextCompressor
 from hermes_state import SessionDB
 
 
+def _public_shape(messages):
+    fields = ("role", "content", "tool_calls", "tool_call_id", "name")
+    return [{key: row[key] for key in fields if key in row} for row in messages]
+
+
 def _build_agent_with_db(db: SessionDB, session_id: str, platform: str = "telegram"):
     with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
         from run_agent import AIAgent
@@ -687,7 +692,11 @@ class TestTodoSnapshotScaffoldingTails:
             _msgs(), "sys", approx_tokens=120_000
         )
 
-        assert compressed == expected
+        assert _public_shape(compressed) == expected
+        assert all(message.get("_db_persisted") is True for message in compressed)
+        assert agent._flushed_db_message_ids == {
+            id(message) for message in compressed
+        }
         assert not any(
             TODO_INJECTION_HEADER in str(message.get("content") or "")
             for message in compressed

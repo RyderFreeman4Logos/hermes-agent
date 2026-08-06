@@ -124,7 +124,7 @@ def test_deliver_wake_retries_429_then_succeeds(monkeypatch):
     assert calls["n"] == 2
 
 
-async def _completion_self_post_is_ephemeral_but_result_is_durable(
+async def _completion_self_post_commits_hidden_event_with_result(
     tmp_path, monkeypatch
 ):
     """The private self-post marker reaches the model but cannot be forged."""
@@ -167,6 +167,16 @@ async def _completion_self_post_is_ephemeral_but_result_is_durable(
         seen_prompts.append(user_message)
         assistant = {"role": "assistant", "content": f"handled: {user_message}"}
         messages = [*conversation_history, user_row, assistant]
+        if pending is not None:
+            from agent.turn_finalizer import finalize_completion_delivery_suffix
+
+            finalize_completion_delivery_suffix(
+                agent,
+                messages,
+                final_response=assistant["content"],
+                failed=False,
+                interrupted=False,
+            )
         agent._persist_session(messages, conversation_history)
         agent._pending_cli_user_message = None
         return {
@@ -207,16 +217,19 @@ async def _completion_self_post_is_ephemeral_but_result_is_durable(
     resumed = db.get_messages_as_conversation(session_id)
     contents = [message["content"] for message in resumed]
     assert seen_prompts == [internal_prompt, external_prompt]
-    assert internal_prompt not in contents
+    internal_row = next(
+        message for message in resumed if message["content"] == internal_prompt
+    )
+    assert internal_row["display_kind"] == "hidden"
     assert f"handled: {internal_prompt}" in contents
     assert external_prompt in contents
     assert f"handled: {external_prompt}" in contents
     db.close()
 
 
-def test_completion_self_post_is_ephemeral_but_result_is_durable(
+def test_completion_self_post_commits_hidden_event_with_result(
     tmp_path, monkeypatch
 ):
     asyncio.run(
-        _completion_self_post_is_ephemeral_but_result_is_durable(tmp_path, monkeypatch)
+        _completion_self_post_commits_hidden_event_with_result(tmp_path, monkeypatch)
     )

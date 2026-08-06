@@ -42,6 +42,7 @@ from agent.model_metadata import (
     estimate_tokens_rough,
 )
 from agent.redact import redact_sensitive_text
+from agent.message_sanitization import durable_messages_before_pending_completion
 from agent.turn_context import drop_stale_api_content
 from tools.todo_tool import TODO_INJECTION_HEADER
 
@@ -227,6 +228,7 @@ def _capture_durable_compaction_baseline(
     Optional[List[tuple]],
 ]:
     """Fence against raw durable rows after proving their legal replay shape."""
+    live_messages = durable_messages_before_pending_completion(live_messages)
     loader = getattr(session_db, "get_compaction_baseline", None)
     if not callable(loader):
         return None, None, None
@@ -3342,16 +3344,23 @@ class ContextCompressor(ContextEngine):
                 if expected_active_messages is None:
                     expected_active_messages = [
                         message
-                        for message in messages
+                        for message in durable_messages_before_pending_completion(
+                            messages
+                        )
                         if isinstance(message, dict)
                         and message.get(_DB_PERSISTED_MARKER)
                     ]
                     if not expected_active_messages:
-                        expected_active_messages = messages
+                        expected_active_messages = (
+                            durable_messages_before_pending_completion(messages)
+                        )
                 try:
+                    durable_pruned_msgs = (
+                        durable_messages_before_pending_completion(pruned_msgs)
+                    )
                     archive_and_compact(
                         session_id,
-                        pruned_msgs,
+                        durable_pruned_msgs,
                         model_config_patch={
                             PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: next_rearm_tokens,
                         },
@@ -3370,7 +3379,7 @@ class ContextCompressor(ContextEngine):
                         exc,
                     )
                     return messages, 0
-                for msg in pruned_msgs:
+                for msg in durable_pruned_msgs:
                     if isinstance(msg, dict):
                         msg[_DB_PERSISTED_MARKER] = True
             self._proactive_prune_rearm_tokens = next_rearm_tokens
@@ -5903,12 +5912,14 @@ This compaction should PRIORITISE preserving all information related to the focu
         if expected_active_messages is None:
             expected_active_messages = [
                 copy.deepcopy(message)
-                for message in messages
+                for message in durable_messages_before_pending_completion(messages)
                 if isinstance(message, dict)
                 and message.get(_DB_PERSISTED_MARKER)
             ]
             if not expected_active_messages:
-                expected_active_messages = copy.deepcopy(messages)
+                expected_active_messages = copy.deepcopy(
+                    durable_messages_before_pending_completion(messages)
+                )
 
         # Baseline for telemetry. Taken only once an exchange is in hand, so
         # turns that no-op early don't pay for the scan.
@@ -6177,16 +6188,19 @@ This compaction should PRIORITISE preserving all information related to the focu
             acquired = bool(acquire_lock(session_id, lock_holder))
             if not acquired:
                 return False
+            durable_compacted_messages = (
+                durable_messages_before_pending_completion(compacted_messages)
+            )
             archive_and_compact(
                 session_id,
-                compacted_messages,
+                durable_compacted_messages,
                 compression_lock_holder=lock_holder,
                 require_compression_lease=True,
                 expected_active_messages=expected_active_messages,
                 expected_active_row_ids=expected_active_row_ids,
                 expected_active_row_fingerprint=expected_active_row_fingerprint,
             )
-            for msg in compacted_messages:
+            for msg in durable_compacted_messages:
                 if isinstance(msg, dict):
                     msg[_DB_PERSISTED_MARKER] = True
             return True

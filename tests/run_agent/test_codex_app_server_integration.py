@@ -86,6 +86,202 @@ class TestRunConversationCodexPath:
         assert result["codex_thread_id"] == "thread-stub-1"
         assert result["codex_turn_id"] == "turn-stub-1"
 
+    def test_completion_delivery_is_finalized_before_codex_early_return(
+        self, fake_session, tmp_path, monkeypatch
+    ):
+        """Codex projection must publish the event atomically before return."""
+        from hermes_state import SessionDB
+        from tests.agent.test_completion_delivery_prefix_stability import (
+            _capture_client,
+            _make_agent,
+            _mock_response,
+        )
+        from tools.process_registry import (
+            completion_delivery_prompt,
+            format_process_notification,
+        )
+
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+        db = SessionDB(db_path=tmp_path / "state.db")
+        session_id = "codex-completion-delivery"
+        db.create_session(session_id, source="tui", model="test-model")
+        db.append_messages_batch(
+            session_id,
+            [
+                {"role": "user", "content": "original request"},
+                {"role": "assistant", "content": "background task started"},
+            ],
+        )
+        event = {
+            "type": "completion",
+            "session_id": "codex-process",
+            "command": "pytest -q",
+            "exit_code": 0,
+            "output": "2 passed",
+        }
+        canonical = format_process_notification(event)
+        wire = completion_delivery_prompt(event, canonical)
+
+        try:
+            before = db.get_messages_as_conversation(session_id)
+            agent = _make_codex_agent(session_db=db, session_id=session_id)
+            agent._cached_system_prompt = "BYTE-STABLE SYSTEM"
+            agent._session_json_enabled = True
+            agent._pending_cli_user_message = {
+                "role": "user",
+                "content": wire,
+                "_completion_delivery_synthetic": True,
+            }
+            with patch.object(agent, "_spawn_background_review", return_value=None):
+                result = agent.run_conversation(wire, conversation_history=before)
+
+            assert result["completed"] is True
+            assert result["completion_delivery_status"] == "committed"
+            resumed = db.get_messages_as_conversation(session_id)
+            event_row = next(row for row in resumed if row.get("content") == canonical)
+            assert event_row["api_content"] == wire
+            assert event_row["display_kind"] == "hidden"
+            assert resumed[-1]["content"] == f"echo: {wire}"
+            snapshot = agent.logs_dir / f"session_{session_id}.json"
+            snapshot_rows = __import__("json").loads(
+                snapshot.read_text(encoding="utf-8")
+            )["messages"]
+            snapshot_event = next(
+                row for row in snapshot_rows if row.get("content") == canonical
+            )
+            assert snapshot_event["api_content"] == wire
+
+            # A cold chat-completions runtime must replay the exact model-only
+            # event bytes from api_content, while keeping the clean transcript.
+            next_agent = _make_agent(tmp_path, db, session_id)
+            requests = _capture_client(
+                next_agent, [_mock_response(content="ok", finish_reason="stop")]
+            )
+            next_agent.run_conversation("review again", conversation_history=resumed)
+            replayed_event = next(
+                row for row in requests[0] if row.get("content") == wire
+            )
+            assert replayed_event == {"role": "user", "content": wire}
+        finally:
+            db.close()
+
+    def test_codex_exception_drops_failed_completion_instead_of_committing_error(
+        self, tmp_path, monkeypatch
+    ):
+        """The outer finalizer must see Codex startup/turn exceptions as failed."""
+        from hermes_state import SessionDB
+        from tools.process_registry import (
+            completion_delivery_prompt,
+            format_process_notification,
+        )
+
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+        monkeypatch.setattr(
+            CodexAppServerSession,
+            "ensure_started",
+            lambda self: "thread-error",
+        )
+        monkeypatch.setattr(
+            CodexAppServerSession,
+            "run_turn",
+            lambda self, user_input, **kwargs: (_ for _ in ()).throw(
+                RuntimeError("codex transport failed")
+            ),
+        )
+        db = SessionDB(db_path=tmp_path / "state.db")
+        session_id = "codex-completion-error"
+        db.create_session(session_id, source="tui", model="test-model")
+        db.append_messages_batch(
+            session_id,
+            [
+                {"role": "user", "content": "original request"},
+                {"role": "assistant", "content": "background task started"},
+            ],
+        )
+        event = {
+            "type": "completion",
+            "session_id": "codex-process",
+            "command": "pytest -q",
+            "exit_code": 0,
+            "output": "2 passed",
+        }
+        canonical = format_process_notification(event)
+        wire = completion_delivery_prompt(event, canonical)
+
+        try:
+            before = db.get_messages_as_conversation(session_id)
+            agent = _make_codex_agent(session_db=db, session_id=session_id)
+            agent._cached_system_prompt = "BYTE-STABLE SYSTEM"
+            agent._pending_cli_user_message = {
+                "role": "user",
+                "content": wire,
+                "_completion_delivery_synthetic": True,
+            }
+            result = agent.run_conversation(wire, conversation_history=before)
+
+            assert result["failed"] is True
+            assert result["completed"] is False
+            assert "codex transport failed" in result["error"]
+            assert result["completion_delivery_status"] == "dropped"
+            resumed = db.get_messages_as_conversation(session_id)
+            assert [
+                {key: value for key, value in row.items() if not key.startswith("_db_")}
+                for row in resumed
+            ] == [
+                {key: value for key, value in row.items() if not key.startswith("_db_")}
+                for row in before
+            ]
+            assert all(row.get("content") not in {canonical, wire} for row in resumed)
+        finally:
+            db.close()
+
+    def test_codex_pending_commit_returns_only_db_authoritative_prefix(
+        self, fake_session, tmp_path, monkeypatch
+    ):
+        from hermes_state import SessionDB
+        from tools.process_registry import completion_delivery_prompt, format_process_notification
+
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+        db = SessionDB(db_path=tmp_path / "state.db")
+        session_id = "codex-completion-pending"
+        db.create_session(session_id, source="tui", model="test-model")
+        db.append_messages_batch(session_id, [
+            {"role": "user", "content": "original request"},
+            {"role": "assistant", "content": "background task started"},
+        ])
+        event = {"type": "completion", "session_id": "codex-process",
+                 "command": "pytest -q", "exit_code": 0, "output": "2 passed"}
+        canonical = format_process_notification(event)
+        wire = completion_delivery_prompt(event, canonical)
+        before = db.get_messages_as_conversation(session_id)
+        agent = _make_codex_agent(session_db=db, session_id=session_id)
+        agent._cached_system_prompt = "BYTE-STABLE SYSTEM"
+        agent._pending_cli_user_message = {
+            "role": "user", "content": wire,
+            "_completion_delivery_synthetic": True,
+        }
+        sync = MagicMock()
+        monkeypatch.setattr(agent, "_sync_external_memory_for_turn", sync)
+        monkeypatch.setattr(
+            db, "append_messages_batch", lambda *_a, **_kw: (_ for _ in ()).throw(
+                RuntimeError("sqlite unavailable")
+            )
+        )
+        try:
+            result = agent.run_conversation(wire, conversation_history=before)
+            assert result["completion_delivery_status"] == "pending"
+            assert result["failed"] is True
+            assert result["messages"] == before
+            assert any(row.get("_completion_delivery_synthetic")
+                       for row in agent._session_messages)
+            assert db.get_messages_as_conversation(session_id) == [
+                {key: value for key, value in row.items() if not key.startswith("_db_")}
+                for row in before
+            ]
+            sync.assert_not_called()
+        finally:
+            db.close()
+
     def test_codex_app_server_token_usage_updates_session_accounting(self, monkeypatch):
         def fake_run_turn(self, user_input: str, **kwargs):
             return TurnResult(

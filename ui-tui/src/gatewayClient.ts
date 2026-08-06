@@ -353,7 +353,7 @@ export class GatewayClient extends EventEmitter {
     // guard can force it ahead of any same-named package in the launch cwd.
     env.HERMES_PYTHON_SRC_ROOT = root
     this.startReadyTimer(python, cwd)
-    this.proc = spawn(python, ['-m', 'tui_gateway.entry'], { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] })
+    this.proc = spawn(python, ['-P', '-m', 'tui_gateway.entry'], { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] })
     this.lifecycle(`[lifecycle] spawned gateway child ${describeChild(this.proc)} python=${python} cwd=${cwd}`)
 
     this.stdoutRl = createInterface({ input: this.proc.stdout! })

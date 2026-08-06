@@ -1277,13 +1277,19 @@ def _write_claude_code_credentials(
         logger.debug("Failed to write refreshed credentials: %s", e)
 
 
-def _resolve_claude_code_token_from_credentials(creds: Optional[Dict[str, Any]] = None) -> Optional[str]:
+def _resolve_claude_code_token_from_credentials(
+    creds: Optional[Dict[str, Any]] = None,
+    *,
+    allow_network: bool = True,
+) -> Optional[str]:
     """Resolve a token from Claude Code credential files, refreshing if needed."""
     creds = creds or read_claude_code_credentials()
     if creds and is_claude_code_token_valid(creds):
         logger.debug("Using Claude Code credentials (auto-detected)")
         return creds["accessToken"]
     if creds:
+        if not allow_network:
+            return None
         logger.debug("Claude Code credentials expired — attempting refresh")
         refreshed = _refresh_oauth_token(creds)
         if refreshed:
@@ -1292,7 +1298,12 @@ def _resolve_claude_code_token_from_credentials(creds: Optional[Dict[str, Any]] 
     return None
 
 
-def _prefer_refreshable_claude_code_token(env_token: str, creds: Optional[Dict[str, Any]]) -> Optional[str]:
+def _prefer_refreshable_claude_code_token(
+    env_token: str,
+    creds: Optional[Dict[str, Any]],
+    *,
+    allow_network: bool = True,
+) -> Optional[str]:
     """Prefer Claude Code creds when a persisted env OAuth token would shadow refresh.
 
     Hermes historically persisted setup tokens into ANTHROPIC_TOKEN. That makes
@@ -1305,7 +1316,10 @@ def _prefer_refreshable_claude_code_token(env_token: str, creds: Optional[Dict[s
     if not creds.get("refreshToken"):
         return None
 
-    resolved = _resolve_claude_code_token_from_credentials(creds)
+    resolved = _resolve_claude_code_token_from_credentials(
+        creds,
+        allow_network=allow_network,
+    )
     if resolved and resolved != env_token:
         logger.debug(
             "Preferring Claude Code credential file over static env OAuth token so refresh can proceed"
@@ -1329,7 +1343,7 @@ def _resolve_anthropic_pool_token() -> Optional[str]:
         return None
 
     try:
-        pool = load_pool("anthropic")
+        pool = load_pool("anthropic", read_only=True)
         # Enumerate read-only (clear_expired=False, refresh=False): never persist
         # to auth.json or trigger a network refresh from a bare resolve. select()
         # is deliberately NOT used — it runs clear_expired=True, refresh=True,
@@ -1354,7 +1368,7 @@ def _resolve_anthropic_pool_token() -> Optional[str]:
     return None
 
 
-def resolve_anthropic_token() -> Optional[str]:
+def resolve_anthropic_token(*, allow_network: bool = True) -> Optional[str]:
     """Resolve an Anthropic token from all available sources.
 
     Priority:
@@ -1380,7 +1394,11 @@ def resolve_anthropic_token() -> Optional[str]:
     # 1. Hermes-managed OAuth/setup token env var
     token = _getenv("ANTHROPIC_TOKEN").strip()
     if token:
-        preferred = _prefer_refreshable_claude_code_token(token, _read_creds())
+        preferred = _prefer_refreshable_claude_code_token(
+            token,
+            _read_creds(),
+            allow_network=allow_network,
+        )
         if preferred:
             return preferred
         return token
@@ -1388,7 +1406,11 @@ def resolve_anthropic_token() -> Optional[str]:
     # 2. CLAUDE_CODE_OAUTH_TOKEN (used by Claude Code for setup-tokens)
     cc_token = _getenv("CLAUDE_CODE_OAUTH_TOKEN").strip()
     if cc_token:
-        preferred = _prefer_refreshable_claude_code_token(cc_token, _read_creds())
+        preferred = _prefer_refreshable_claude_code_token(
+            cc_token,
+            _read_creds(),
+            allow_network=allow_network,
+        )
         if preferred:
             return preferred
         return cc_token
@@ -1400,7 +1422,10 @@ def resolve_anthropic_token() -> Optional[str]:
         return api_key
 
     # 4. Claude Code credential file
-    resolved_claude_token = _resolve_claude_code_token_from_credentials(_read_creds())
+    resolved_claude_token = _resolve_claude_code_token_from_credentials(
+        _read_creds(),
+        allow_network=allow_network,
+    )
     if resolved_claude_token:
         return resolved_claude_token
 

@@ -2512,6 +2512,8 @@ def detect_static_provider_for_model(
 def detect_provider_for_model(
     model_name: str,
     current_provider: str,
+    *,
+    allow_network: bool = True,
 ) -> Optional[tuple[str, str]]:
     """Auto-detect the best provider for a model name.
 
@@ -2536,7 +2538,7 @@ def detect_provider_for_model(
 
     # --- Step 2: check OpenRouter catalog ---
     # First try exact match (handles provider/model format)
-    or_slug = _find_openrouter_slug(name)
+    or_slug = _find_openrouter_slug(name, allow_network=allow_network)
     if or_slug:
         if current_provider != "openrouter":
             return ("openrouter", or_slug)
@@ -2548,7 +2550,11 @@ def detect_provider_for_model(
     return None
 
 
-def _find_openrouter_slug(model_name: str) -> Optional[str]:
+def _find_openrouter_slug(
+    model_name: str,
+    *,
+    allow_network: bool = True,
+) -> Optional[str]:
     """Find the full OpenRouter model slug for a bare or partial model name.
 
     Handles:
@@ -2560,13 +2566,15 @@ def _find_openrouter_slug(model_name: str) -> Optional[str]:
     if not name_lower:
         return None
 
+    catalog = model_ids() if allow_network else _provider_catalog_names("openrouter")
+
     # Exact match (already has provider/ prefix)
-    for mid in model_ids():
+    for mid in catalog:
         if name_lower == mid.lower():
             return mid
 
     # Try matching just the model part (after the /)
-    for mid in model_ids():
+    for mid in catalog:
         if "/" in mid:
             _, model_part = mid.split("/", 1)
             if name_lower == model_part.lower():
@@ -3528,11 +3536,17 @@ _GITHUB_MODEL_CATALOG_CACHE_TTL = 300  # 5 minutes
 
 
 def fetch_github_model_catalog(
-    api_key: Optional[str] = None, timeout: float = 5.0
+    api_key: Optional[str] = None,
+    timeout: float = 5.0,
+    *,
+    allow_network: bool = True,
 ) -> Optional[list[dict[str, Any]]]:
     """Fetch the live GitHub Copilot model catalog for this account."""
     global _github_model_catalog_cache, _github_model_catalog_cache_key
     global _github_model_catalog_cache_time
+
+    if not allow_network:
+        return None
 
     if (
         _github_model_catalog_cache is not None
@@ -4021,8 +4035,10 @@ _COPILOT_MODEL_ALIASES = {
 def _copilot_catalog_ids(
     catalog: Optional[list[dict[str, Any]]] = None,
     api_key: Optional[str] = None,
+    *,
+    allow_network: bool = True,
 ) -> set[str]:
-    if catalog is None and api_key:
+    if catalog is None and api_key and allow_network:
         catalog = fetch_github_model_catalog(api_key=api_key)
     if not catalog:
         return set()
@@ -4038,12 +4054,15 @@ def normalize_copilot_model_id(
     *,
     catalog: Optional[list[dict[str, Any]]] = None,
     api_key: Optional[str] = None,
+    allow_network: bool = True,
 ) -> str:
     raw = str(model_id or "").strip()
     if not raw:
         return ""
 
-    catalog_ids = _copilot_catalog_ids(catalog=catalog, api_key=api_key)
+    catalog_ids = _copilot_catalog_ids(
+        catalog=catalog, api_key=api_key, allow_network=allow_network
+    )
     alias = _COPILOT_MODEL_ALIASES.get(raw)
     if alias:
         return alias
@@ -4106,6 +4125,7 @@ def copilot_model_api_mode(
     *,
     catalog: Optional[list[dict[str, Any]]] = None,
     api_key: Optional[str] = None,
+    allow_network: bool = True,
 ) -> str:
     """Determine the API mode for a Copilot model.
 
@@ -4115,10 +4135,15 @@ def copilot_model_api_mode(
     """
     # Fetch the catalog once so normalize + endpoint check share it
     # (avoids two redundant network calls for non-GPT-5 models).
-    if catalog is None and api_key:
+    if catalog is None and api_key and allow_network:
         catalog = fetch_github_model_catalog(api_key=api_key)
 
-    normalized = normalize_copilot_model_id(model_id, catalog=catalog, api_key=api_key)
+    normalized = normalize_copilot_model_id(
+        model_id,
+        catalog=catalog,
+        api_key=api_key,
+        allow_network=allow_network,
+    )
     if not normalized:
         return "chat_completions"
 
@@ -4967,12 +4992,14 @@ def validate_requested_model(
     api_key: Optional[str] = None,
     base_url: Optional[str] = None,
     api_mode: Optional[str] = None,
+    allow_network: bool = True,
 ) -> dict[str, Any]:
     """
     Validate a ``/model`` value for the active provider.
 
-    Performs format checks first, then probes the live API to confirm
-    the model actually exists.
+    Performs format checks first, then optionally probes the live API to
+    confirm the model actually exists. ``allow_network=False`` still runs all
+    deterministic and curated-catalog checks.
 
     Returns a dict with:
       - accepted: whether the CLI should switch to the requested model now
@@ -4989,6 +5016,7 @@ def validate_requested_model(
         requested_for_lookup = normalize_copilot_model_id(
             requested,
             api_key=api_key,
+            allow_network=allow_network,
         ) or requested
 
     if not requested:
@@ -5025,7 +5053,7 @@ def validate_requested_model(
             "message": "Model names cannot contain spaces.",
         }
 
-    if normalized == "lmstudio":
+    if allow_network and normalized == "lmstudio":
         from hermes_cli.auth import AuthError
         # Use probe_lmstudio_models so we can distinguish None (unreachable
         # / malformed response) from [] (reachable, but no chat-capable models
@@ -5059,7 +5087,9 @@ def validate_requested_model(
             "message": f"Model `{requested}` was not found in LM Studio's model listing.",
         }
 
-    if normalized == "custom" or normalized.startswith("custom:"):
+    if allow_network and (
+        normalized == "custom" or normalized.startswith("custom:")
+    ):
         # Try probing with correct auth for the api_mode.
         if api_mode == "anthropic_messages":
             probe = probe_api_models(api_key, base_url, api_mode=api_mode)
@@ -5131,7 +5161,11 @@ def validate_requested_model(
     # Providers with non-standard catalog validation — /v1/models probing is not the right path.
     if normalized in {"openai-codex", "xai-oauth"}:
         try:
-            catalog_models = provider_model_ids(normalized)
+            catalog_models = (
+                provider_model_ids(normalized)
+                if allow_network
+                else list(_PROVIDER_MODELS.get(normalized, []))
+            )
         except Exception:
             catalog_models = []
         if catalog_models:
@@ -5203,7 +5237,11 @@ def validate_requested_model(
     # the static catalog instead, similar to openai-codex.
     if normalized in {"minimax", "minimax-cn"}:
         try:
-            catalog_models = provider_model_ids(normalized)
+            catalog_models = (
+                provider_model_ids(normalized)
+                if allow_network
+                else list(_PROVIDER_MODELS.get(normalized, []))
+            )
         except Exception:
             catalog_models = []
         if catalog_models:
@@ -5250,7 +5288,7 @@ def validate_requested_model(
     # the native fetcher which handles both API keys and Claude-Code OAuth
     # tokens.  (The api_mode=="anthropic_messages" branch below handles the
     # Messages-API transport case separately.)
-    if normalized == "anthropic":
+    if allow_network and normalized == "anthropic":
         anthropic_models = _fetch_anthropic_models(
             base_url=base_url or None,
             api_key=api_key or None,
@@ -5294,7 +5332,7 @@ def validate_requested_model(
 
     # Anthropic Messages API: many proxies don't implement /v1/models.
     # Try probing with correct auth; if it fails, accept with a warning.
-    if api_mode == "anthropic_messages":
+    if allow_network and api_mode == "anthropic_messages":
         api_models = fetch_api_models(api_key, base_url, api_mode=api_mode)
         if api_models is not None:
             if requested_for_lookup in set(api_models):
@@ -5328,7 +5366,7 @@ def validate_requested_model(
         }
 
     # Probe the live API to check if the model actually exists
-    api_models = fetch_api_models(api_key, base_url)
+    api_models = fetch_api_models(api_key, base_url) if allow_network else None
 
     if api_models is not None:
         # Gemini's OpenAI-compat /v1beta/openai/models endpoint returns IDs
@@ -5418,7 +5456,7 @@ def validate_requested_model(
     # Bedrock: use our own discovery instead of HTTP /models endpoint.
     # Bedrock's bedrock-runtime URL doesn't support /models — it uses the
     # AWS SDK control plane (ListFoundationModels + ListInferenceProfiles).
-    if normalized == "bedrock":
+    if allow_network and normalized == "bedrock":
         try:
             from agent.bedrock_adapter import discover_bedrock_models, resolve_bedrock_region
             region = resolve_bedrock_region()
@@ -5460,7 +5498,11 @@ def validate_requested_model(
     # the gateway would never write to _session_model_overrides.
     provider_label = _PROVIDER_LABELS.get(normalized, normalized)
     try:
-        catalog_models = provider_model_ids(normalized)
+        catalog_models = (
+            provider_model_ids(normalized)
+            if allow_network
+            else list(_PROVIDER_MODELS.get(normalized, []))
+        )
     except Exception:
         catalog_models = []
 
@@ -5494,13 +5536,14 @@ def validate_requested_model(
             suggestion_text = "\n  Similar models: " + ", ".join(
                 f"`{catalog_lower[s]}`" for s in suggestions
             )
+        probe_note = " and the /models endpoint was unreachable" if allow_network else ""
         return {
             "accepted": True,
             "persist": True,
             "recognized": False,
             "message": (
-                f"Note: `{requested}` was not found in the {provider_label} curated catalog "
-                f"and the /models endpoint was unreachable.{suggestion_text}"
+                f"Note: `{requested}` was not found in the {provider_label} curated catalog"
+                f"{probe_note}.{suggestion_text}"
                 f"\n  The model may still work if it exists on the provider."
             ),
         }
@@ -5514,5 +5557,7 @@ def validate_requested_model(
         "message": (
             f"Note: could not reach the {provider_label} API to validate `{requested}`. "
             f"If the service isn't down, this model may not be valid."
+            if allow_network
+            else None
         ),
     }

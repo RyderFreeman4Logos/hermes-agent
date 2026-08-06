@@ -21,6 +21,12 @@ import pytest
 from agent.conversation_compression import (
     finalize_context_engine_compression_notification,
 )
+from hermes_cli.model_switch import (
+    ModelSwitchResult,
+    get_model_switch_after_compression,
+    schedule_model_switch_after_compression,
+)
+from hermes_state_common import AuthorityWriteIndeterminateError
 
 class TestCompressionBoundaryHook:
     def _make_agent(self, session_db):
@@ -138,6 +144,356 @@ class TestCompressionBoundaryHook:
 
             assert events == ["persist", "compression"]
 
+    def test_deferred_switch_applies_between_publication_and_boundary_hook(self):
+        from hermes_state import SessionDB
+
+        events = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+            agent = self._make_agent(db)
+            compressor = MagicMock()
+            compressor.compress.return_value = [{"role": "user", "content": "summary"}]
+            compressor.compression_count = 1
+            compressor.last_prompt_tokens = 0
+            compressor.last_completion_tokens = 0
+            compressor._last_summary_error = None
+            compressor._last_compress_aborted = False
+            compressor.on_session_start.side_effect = (
+                lambda *_args, **kwargs: events.append(kwargs.get("boundary_reason"))
+            )
+            agent.context_compressor = compressor
+            original_publish = db.publish_compression_child
+
+            def _record_publish(*args, **kwargs):
+                value = original_publish(*args, **kwargs)
+                events.append("persist")
+                return value
+
+            def _switch(model, provider, *_args):
+                events.append("switch")
+                agent.model = model
+                agent.provider = provider
+
+            agent.switch_model = _switch
+            schedule_model_switch_after_compression(
+                agent,
+                ModelSwitchResult(
+                    success=True,
+                    new_model="new-model",
+                    target_provider="new-provider",
+                    context_length=128_000,
+                ),
+                on_applied=lambda *_args: events.append("frontend-sync"),
+            )
+
+            with patch.object(
+                db, "publish_compression_child", side_effect=_record_publish
+            ):
+                _, returned_prompt = agent._compress_context(
+                    [{"role": "user", "content": "request"}],
+                    "sys",
+                    approx_tokens=100,
+                )
+
+            assert events == ["persist", "switch", "frontend-sync", "compression"]
+            assert agent.model == "new-model"
+            assert "Model: new-model" in returned_prompt
+            assert get_model_switch_after_compression(agent) is None
+            child = db.get_session(agent.session_id)
+            assert child["model"] == "new-model"
+            assert "pending_model_switch_after_compression" not in (
+                child["model_config"] or ""
+            )
+
+    def test_deferred_notification_still_publishes_target_route_atomically(self):
+        import json
+
+        from agent.conversation_compression import (
+            finalize_context_engine_compression_notification,
+        )
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+            agent = self._make_agent(db)
+            compressor = MagicMock()
+            compressor.compress.return_value = [
+                {"role": "user", "content": "summary"}
+            ]
+            compressor.compression_count = 1
+            compressor.last_prompt_tokens = 0
+            compressor.last_completion_tokens = 0
+            compressor._last_summary_error = None
+            compressor._last_compress_aborted = False
+            agent.context_compressor = compressor
+            agent._ensure_db_session()
+            pending = ModelSwitchResult(
+                success=True,
+                new_model="new-model",
+                target_provider="new-provider",
+                api_key="new-key",
+                base_url="https://new.example/v1",
+                api_mode="responses",
+                          context_length=128_000,
+            )
+            schedule_model_switch_after_compression(agent, pending)
+
+            def switch_model(model, provider, api_key, base_url, api_mode):
+                agent.model = model
+                agent.provider = provider
+                agent.api_key = api_key
+                agent.base_url = base_url
+                agent.api_mode = api_mode
+
+            agent.switch_model = MagicMock(side_effect=switch_model)
+            old_sid = agent.session_id
+
+            agent._compress_context(
+                [{"role": "user", "content": "request"}],
+                "sys",
+                approx_tokens=100,
+                defer_context_engine_notification=True,
+            )
+
+            child = db.get_session(agent.session_id)
+            assert child["model"] == "test/model"
+            assert get_model_switch_after_compression(agent) is pending
+            compressor.on_session_start.assert_not_called()
+
+            assert finalize_context_engine_compression_notification(
+                agent, committed=True
+            )
+            child = db.get_session(agent.session_id)
+            config = json.loads(child["model_config"])
+            assert child["model"] == "new-model"
+            assert config["provider"] == "new-provider"
+            assert "Model: new-model" in child["system_prompt"]
+            assert child["billing_provider"] == "new-provider"
+            assert child["billing_mode"] == "responses"
+            assert get_model_switch_after_compression(agent) is None
+            compressor.on_session_start.assert_called_once_with(
+                agent.session_id,
+                boundary_reason="compression",
+                old_session_id=old_sid,
+                platform="cli",
+                conversation_id=None,
+            )
+
+    @pytest.mark.parametrize("in_place", [False, True])
+    def test_callback_failure_is_post_commit_reconciliation(self, in_place):
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+            agent = self._make_agent(db)
+            agent.compression_in_place = in_place
+            compressor = MagicMock()
+            compressed = [
+                {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
+                {"role": "user", "content": "tail question"},
+            ]
+            compressor.compress.return_value = compressed
+            compressor.compression_count = 1
+            compressor.last_prompt_tokens = 0
+            compressor.last_completion_tokens = 0
+            compressor._last_summary_error = None
+            compressor._last_compress_aborted = False
+            compressor.has_content_to_compress.return_value = True
+            agent.context_compressor = compressor
+            agent._ensure_db_session()
+            original_sid = agent.session_id
+            pending = ModelSwitchResult(
+                success=True,
+                new_model="new-model",
+                target_provider="new-provider",
+                api_key="new-key",
+                base_url="https://new.example/v1",
+                api_mode="responses",
+                          context_length=128_000,
+            )
+
+            def fail_callback(*_args):
+                raise OSError("injected frontend publication failure")
+
+            schedule_model_switch_after_compression(
+                agent,
+                pending,
+                on_applied=fail_callback,
+            )
+
+            def switch_model(model, provider, api_key, base_url, api_mode):
+                agent.model = model
+                agent.provider = provider
+                agent.api_key = api_key
+                agent.base_url = base_url
+                agent.api_mode = api_mode
+
+            agent.switch_model = MagicMock(side_effect=switch_model)
+            messages = [
+                {"role": "user", "content": f"m{i}"} for i in range(10)
+            ]
+
+            returned, returned_prompt = agent._compress_context(
+                messages,
+                "sys",
+                approx_tokens=10_000,
+            )
+
+            assert returned == compressed
+            assert "Model: test/model" in returned_prompt
+            assert (agent.session_id == original_sid) is in_place
+            assert agent.model == "test/model"
+            assert get_model_switch_after_compression(agent) is pending
+            published = db.get_session(agent.session_id)
+            assert published["model"] == "test/model"
+            stored = db.get_messages_as_conversation(agent.session_id)
+            assert [
+                {"role": message["role"], "content": message["content"]}
+                for message in stored
+            ] == compressed
+            if in_place:
+                assert db.get_session(original_sid)["end_reason"] is None
+            else:
+                assert db.get_session(original_sid)["end_reason"] == "compression"
+
+    def test_auto_compression_aborts_on_authority_indeterminate_finalizer(self):
+        """The automatic path must not continue to a post-compression request."""
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+            agent = self._make_agent(db)
+            compressor = MagicMock()
+            compressor.compress.return_value = [{"role": "user", "content": "summary"}]
+            compressor.compression_count = 1
+            compressor.last_prompt_tokens = 0
+            compressor.last_completion_tokens = 0
+            compressor._last_summary_error = None
+            compressor._last_compress_aborted = False
+            agent.context_compressor = compressor
+            pending = ModelSwitchResult(
+                success=True,
+                new_model="target-model",
+                target_provider="target-provider",
+                          context_length=128_000,
+            )
+            schedule_model_switch_after_compression(agent, pending)
+
+            with patch(
+                "hermes_cli.model_switch.apply_model_switch_after_compression",
+                side_effect=AuthorityWriteIndeterminateError("authority indeterminate"),
+            ), pytest.raises(AuthorityWriteIndeterminateError, match="indeterminate"):
+                agent._compress_context(
+                    [{"role": "user", "content": "request"}],
+                    "sys",
+                    approx_tokens=100,
+                )
+
+            assert get_model_switch_after_compression(agent) is pending
+            compressor.on_session_start.assert_not_called()
+
+    def test_apply_failure_after_rotation_keeps_pending_and_old_route(self):
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+            agent = self._make_agent(db)
+            compressor = MagicMock()
+            compressor.compress.return_value = [{"role": "user", "content": "summary"}]
+            compressor.compression_count = 1
+            compressor.last_prompt_tokens = 0
+            compressor.last_completion_tokens = 0
+            compressor._last_summary_error = None
+            compressor._last_compress_aborted = False
+            agent.context_compressor = compressor
+            agent._ensure_db_session()
+            original_sid = agent.session_id
+            pending = ModelSwitchResult(
+                success=True,
+                new_model="broken-model",
+                target_provider="broken-provider",
+                          context_length=128_000,
+            )
+            schedule_model_switch_after_compression(agent, pending)
+            agent.switch_model = MagicMock(side_effect=RuntimeError("switch failed"))
+
+            messages = [{"role": "user", "content": "request"}]
+            returned, returned_prompt = agent._compress_context(
+                messages,
+                "sys",
+                approx_tokens=100,
+            )
+
+            assert returned == [{"role": "user", "content": "summary"}]
+            assert "Model: test/model" in returned_prompt
+            assert "broken-model" not in returned_prompt
+            assert agent.session_id != original_sid
+            assert agent.model == "test/model"
+            assert get_model_switch_after_compression(agent) is pending
+            assert db.get_session(agent.session_id)["model"] == "test/model"
+            compressor.on_session_start.assert_called_once()
+
+    def test_publication_failure_rolls_back_switch_and_keeps_pending(self):
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+            agent = self._make_agent(db)
+            compressor = MagicMock()
+            compressor.compress.return_value = [{"role": "user", "content": "summary"}]
+            compressor.compression_count = 1
+            compressor.last_prompt_tokens = 0
+            compressor.last_completion_tokens = 0
+            compressor._last_summary_error = None
+            compressor._last_compress_aborted = False
+            agent.context_compressor = compressor
+            agent._ensure_db_session()
+            original_sid = agent.session_id
+            original_route = (agent.model, agent.provider, agent.api_key, agent.base_url)
+            pending = ModelSwitchResult(
+                success=True,
+                new_model="new-model",
+                target_provider="new-provider",
+                api_key="new-key",
+                base_url="https://new.example/v1",
+                          context_length=128_000,
+            )
+            on_applied = MagicMock()
+            schedule_model_switch_after_compression(
+                agent,
+                pending,
+                on_applied=on_applied,
+            )
+            scheduled_config = db.get_session(original_sid)["model_config"]
+
+            def _switch(model, provider, api_key, base_url, _api_mode):
+                agent.model = model
+                agent.provider = provider
+                agent.api_key = api_key
+                agent.base_url = base_url
+
+            agent.switch_model = MagicMock(side_effect=_switch)
+            messages = [{"role": "user", "content": "request"}]
+            with patch.object(
+                db,
+                "publish_compression_child",
+                side_effect=RuntimeError("publication failed"),
+            ):
+                returned, _ = agent._compress_context(
+                    messages,
+                    "sys",
+                    approx_tokens=100,
+                )
+
+            assert returned == messages
+            assert agent.session_id == original_sid
+            assert (agent.model, agent.provider, agent.api_key, agent.base_url) == original_route
+            agent.switch_model.assert_not_called()
+            assert get_model_switch_after_compression(agent) is pending
+            assert db.get_session(original_sid)["model_config"] == scheduled_config
+            on_applied.assert_not_called()
+            compressor.on_session_start.assert_not_called()
+
     def test_failure_before_persistence_does_not_notify(self):
         from hermes_state import SessionDB
 
@@ -147,6 +503,13 @@ class TestCompressionBoundaryHook:
             compressor = MagicMock()
             compressor.compress.side_effect = RuntimeError("synthetic compression failure")
             agent.context_compressor = compressor
+            pending = ModelSwitchResult(
+                success=True,
+                new_model="later-model",
+                target_provider="later-provider",
+                          context_length=128_000,
+            )
+            schedule_model_switch_after_compression(agent, pending)
 
             with pytest.raises(RuntimeError, match="synthetic compression failure"):
                 agent._compress_context(
@@ -156,6 +519,7 @@ class TestCompressionBoundaryHook:
                 )
 
             compressor.on_session_start.assert_not_called()
+            assert get_model_switch_after_compression(agent) is pending
 
 
     def test_no_progress_does_not_notify(self):

@@ -2946,6 +2946,21 @@ class TestCodexAdapterPromptCacheKey:
         ])
         assert "prompt_cache_retention" not in captured
 
+    def test_prompt_cache_key_isolated_by_logical_scope(self):
+        from agent.auxiliary_client import scoped_runtime_main
+
+        def key(scope):
+            adapter, captured = self._build_adapter()
+            with scoped_runtime_main({"cache_scope": scope}):
+                adapter.create(messages=[
+                    {"role": "system", "content": "SYS"},
+                    {"role": "user", "content": "hi"},
+                ])
+            return captured["prompt_cache_key"]
+
+        assert key("conversation-a") == key("conversation-a")
+        assert key("conversation-a") != key("conversation-b")
+
     @pytest.mark.parametrize("base_url", [
         "https://api.openai.com/v1",
         "https://example.services.ai.azure.com/openai/v1",

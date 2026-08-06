@@ -631,8 +631,15 @@ def _write_through_provider_state_to_global_root(
 
 
 class CredentialPool:
-    def __init__(self, provider: str, entries: List[PooledCredential]):
+    def __init__(
+        self,
+        provider: str,
+        entries: List[PooledCredential],
+        *,
+        read_only: bool = False,
+    ):
         self.provider = provider
+        self._read_only = read_only
         self._entries = sorted(entries, key=lambda entry: entry.priority)
         self._current_id: Optional[str] = None
         self._strategy = get_pool_strategy(provider)
@@ -758,6 +765,8 @@ class CredentialPool:
                     return
 
     def _persist(self, *, removed_ids: Optional[List[str]] = None) -> None:
+        if self._read_only:
+            return
         # Self-locking (RLock): snapshotting self._entries must not race a
         # concurrent rotation when called from the deferred refresh path.
         with self._lock:
@@ -1817,6 +1826,29 @@ class CredentialPool:
         acquisition + OAuth network I/O.
         """
         now = time.time()
+        if self._read_only:
+            available = []
+            for entry in self._entries:
+                if entry.auth_type == AUTH_TYPE_API_KEY and not entry.runtime_api_key:
+                    continue
+                if self._entry_needs_refresh(entry):
+                    continue
+                if (
+                    self.provider != "nous"
+                    and entry.auth_type == AUTH_TYPE_OAUTH
+                    and entry.expires_at_ms is not None
+                    and int(entry.expires_at_ms) <= int(now * 1000)
+                ):
+                    continue
+                if entry.last_status == STATUS_DEAD:
+                    continue
+                if entry.last_status == STATUS_EXHAUSTED:
+                    exhausted_until = _exhausted_until(entry)
+                    if exhausted_until is not None and now < exhausted_until:
+                        continue
+                available.append(entry)
+            return available, []
+
         cleared_any = False
         entries_to_prune: List[str] = []
         available: List[PooledCredential] = []
@@ -3081,9 +3113,9 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
     return changed, active_sources
 
 
-def load_pool(provider: str) -> CredentialPool:
+def load_pool(provider: str, *, read_only: bool = False) -> CredentialPool:
     provider = (provider or "").strip().lower()
-    raw_entries = read_credential_pool(provider)
+    raw_entries = read_credential_pool(provider, read_only=read_only)
     disk_ids = {
         entry.get("id")
         for entry in raw_entries
@@ -3095,6 +3127,8 @@ def load_pool(provider: str) -> CredentialPool:
         for payload in raw_entries
     )
     entries = [PooledCredential.from_dict(provider, payload) for payload in raw_entries]
+    if read_only:
+        return CredentialPool(provider, entries, read_only=True)
     raw_needs_auth_normalization = any(
         isinstance(payload, dict)
         and _normalize_pool_auth_type(

@@ -83,7 +83,7 @@ def test_missing_global_auth_file_is_safe(profile_env):
     assert read_credential_pool("anthropic") == []
 
 
-def test_malformed_global_auth_file_does_not_break_profile_read(profile_env):
+def test_read_only_profile_fallback_never_repairs_malformed_global_auth(profile_env):
     (profile_env["global"] / "auth.json").write_text("{not valid json")
     _write(profile_env["profile"] / "auth.json", _make_auth_store(pool={
         "openrouter": [{
@@ -96,12 +96,73 @@ def test_malformed_global_auth_file_does_not_break_profile_read(profile_env):
         }],
     }))
 
+    from hermes_cli import auth
+
+    assert auth.read_credential_pool("openrouter", read_only=True)[0]["id"] == "prof-1"
+    assert auth.read_credential_pool("anthropic", read_only=True) == []
+    assert auth.get_provider_auth_state("nous", read_only=True) is None
+    assert not list(profile_env["global"].glob("auth.json.corrupt*"))
+
+
+@pytest.mark.parametrize("provider", ["nous", "codex", "xai-oauth"])
+def test_public_local_only_provider_resolution_never_repairs_global_auth(
+    profile_env, monkeypatch, provider
+):
+    from hermes_cli import auth
+    from hermes_cli import runtime_provider as runtime
+
+    global_auth = profile_env["global"] / "auth.json"
+    global_auth.write_text("{not valid json")
+    _write(profile_env["profile"] / "auth.json", _make_auth_store(pool={}))
+    for name in (
+        "NOUS_API_KEY",
+        "CODEX_API_KEY",
+        "OPENAI_API_KEY",
+        "XAI_API_KEY",
+        "XAI_OAUTH_TOKEN",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(runtime, "_get_model_config", lambda: {})
+
+    network_calls = []
+
+    def no_network(*args, **kwargs):
+        network_calls.append((args, kwargs))
+        raise AssertionError("provider resolution must not touch the network")
+
+    monkeypatch.setattr(auth.httpx, "Client", no_network)
+    monkeypatch.setattr(auth.httpx, "get", no_network)
+    def auth_files():
+        return {
+            path.relative_to(profile_env["global"]): path.read_bytes()
+            for path in profile_env["global"].rglob("auth.json*")
+            if path.is_file()
+        }
+
+    before = auth_files()
+
+    with pytest.raises(auth.AuthError):
+        runtime.resolve_runtime_provider(requested=provider, allow_network=False)
+
+    after = auth_files()
+    assert after == before
+    assert network_calls == []
+
+    with pytest.raises(auth.AuthError):
+        runtime.resolve_runtime_provider(requested=provider, allow_network=True)
+
+    assert len(list(profile_env["global"].glob("auth.json.corrupt*"))) == 1
+    assert network_calls == []
+
+
+def test_normal_profile_fallback_still_backs_up_malformed_global_auth(profile_env):
+    (profile_env["global"] / "auth.json").write_text("{not valid json")
+    _write(profile_env["profile"] / "auth.json", _make_auth_store(pool={}))
+
     from hermes_cli.auth import read_credential_pool
 
-    # Profile reads still work; malformed global is silently ignored.
-    assert read_credential_pool("openrouter")[0]["id"] == "prof-1"
-    # And no fallback for anthropic since global is unreadable.
-    assert read_credential_pool("anthropic") == []
+    assert read_credential_pool("anthropic", read_only=False) == []
+    assert list(profile_env["global"].glob("auth.json.corrupt*"))
 
 
 # ---------------------------------------------------------------------------

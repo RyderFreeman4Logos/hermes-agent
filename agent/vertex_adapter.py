@@ -108,7 +108,11 @@ def _refresh_credentials(creds) -> None:
     creds.refresh(auth_req)
 
 
-def get_vertex_credentials(credentials_path: Optional[str] = None) -> Tuple[Optional[str], Optional[str]]:
+def get_vertex_credentials(
+    credentials_path: Optional[str] = None,
+    *,
+    allow_network: bool = True,
+) -> Tuple[Optional[str], Optional[str]]:
     """Return a (fresh access_token, project_id) pair or (None, None) on failure.
 
     Caches the underlying Credentials object and refreshes it when within
@@ -131,6 +135,8 @@ def get_vertex_credentials(credentials_path: Optional[str] = None) -> Tuple[Opti
                 )
                 project_id = creds.project_id
             else:
+                if not allow_network:
+                    return None, None
                 # google.auth.default() reads GOOGLE_APPLICATION_CREDENTIALS
                 # straight from os.environ internally — it has no notion of
                 # the profile secret scope. _resolve_credentials_path already
@@ -165,6 +171,8 @@ def get_vertex_credentials(credentials_path: Optional[str] = None) -> Tuple[Opti
             )
         )
         if needs_refresh:
+            if not allow_network:
+                return None, None
             _refresh_credentials(creds)
 
         override_project = _resolve_project_override()
@@ -182,7 +190,10 @@ def get_vertex_credentials(credentials_path: Optional[str] = None) -> Tuple[Opti
             sa_path = _resolve_credentials_path(credentials_path)
             if sa_path:
                 logger.info("ADC failed, retrying with service account: %s", sa_path)
-                return get_vertex_credentials(sa_path)
+                return get_vertex_credentials(
+                    sa_path,
+                    allow_network=allow_network,
+                )
 
         return None, None
 
@@ -202,9 +213,14 @@ def build_vertex_base_url(project_id: str, region: str = DEFAULT_REGION) -> str:
 def get_vertex_config(
     credentials_path: Optional[str] = None,
     region: Optional[str] = None,
+    *,
+    allow_network: bool = True,
 ) -> Tuple[Optional[str], Optional[str]]:
     """Resolve (access_token, base_url) for Vertex AI, or (None, None) on failure."""
-    token, project_id = get_vertex_credentials(credentials_path)
+    token, project_id = get_vertex_credentials(
+        credentials_path,
+        allow_network=allow_network,
+    )
     if not token or not project_id:
         return None, None
 

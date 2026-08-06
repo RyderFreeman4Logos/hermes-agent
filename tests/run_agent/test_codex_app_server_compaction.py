@@ -4,8 +4,18 @@ from types import SimpleNamespace
 import pytest
 
 from agent.codex_runtime import _record_codex_app_server_compaction
-from agent.conversation_compression import COMPACTION_DONE_STATUS, COMPACTION_STATUS, compress_context
+from agent.conversation_compression import (
+    COMPACTION_DONE_STATUS,
+    COMPACTION_STATUS,
+    compress_context,
+    finalize_context_engine_compression_notification,
+)
 from agent.transports.codex_app_server_session import TurnResult
+from hermes_cli.model_switch import (
+    ModelSwitchResult,
+    get_model_switch_after_compression,
+    schedule_model_switch_after_compression,
+)
 
 
 class FakeCodexSession:
@@ -67,6 +77,7 @@ class DummyAgent:
         self.status_callback = lambda kind, text: self.status_events.append((kind, text))
         self.warnings = []
         self.events = []
+        self.order = []
         self.built_prompts = []
         self.touch_calls = []
         self.touch_provenances = []
@@ -89,6 +100,7 @@ class DummyAgent:
         return "built prompt"
 
     def event_callback(self, name, payload):
+        self.order.append(name)
         self.events.append((name, payload))
 
 
@@ -144,6 +156,135 @@ def test_codex_app_server_compaction_heartbeat_refreshes_activity_while_waiting(
     assert all(
         p is ActivityProvenance.AGENT_COMPRESSION for p in agent.touch_provenances
     )
+
+
+def _schedule_codex_switch(agent):
+    agent.model = "old-codex"
+    agent.provider = "openai-codex"
+    agent.codex_app_server_auto_compaction = "hermes"
+    agent.switch_calls = []
+
+    def _switch(model, provider, *_args):
+        agent.order.append("switch")
+        agent.switch_calls.append((model, provider))
+        agent.model = model
+        agent.provider = provider
+
+    agent.switch_model = _switch
+    result = ModelSwitchResult(
+        success=True,
+        new_model="next-model",
+        target_provider="next-provider",
+                 context_length=128_000,
+    )
+    schedule_model_switch_after_compression(agent, result)
+    return result
+
+
+def test_codex_successful_compaction_applies_deferred_switch_before_return():
+    agent = DummyAgent(TurnResult(thread_id="thread-1", turn_id="compact-turn-1"))
+    _schedule_codex_switch(agent)
+
+    compress_context(
+        agent,
+        [{"role": "user", "content": "hi"}],
+        "system",
+        approx_tokens=100000,
+        task_id="test",
+        force=True,
+    )
+
+    assert agent.switch_calls == [("next-model", "next-provider")]
+    assert agent.order.index("switch") < agent.order.index("session:compress")
+    assert get_model_switch_after_compression(agent) is None
+
+
+def test_codex_failed_compaction_keeps_deferred_switch():
+    agent = DummyAgent(
+        TurnResult(
+            thread_id="thread-1",
+            turn_id="compact-turn-1",
+            error="compact failed",
+        )
+    )
+    pending = _schedule_codex_switch(agent)
+
+    compress_context(
+        agent,
+        [{"role": "user", "content": "hi"}],
+        "system",
+        approx_tokens=100000,
+        task_id="test",
+        force=True,
+    )
+
+    assert agent.switch_calls == []
+    assert get_model_switch_after_compression(agent) is pending
+
+
+def test_codex_outer_publication_controls_deferred_switch():
+    agent = DummyAgent(TurnResult(thread_id="thread-1", turn_id="compact-turn-1"))
+    pending = _schedule_codex_switch(agent)
+
+    compress_context(
+        agent,
+        [{"role": "user", "content": "hi"}],
+        "system",
+        approx_tokens=100000,
+        task_id="test",
+        force=True,
+        defer_context_engine_notification=True,
+    )
+
+    assert agent.switch_calls == []
+    assert get_model_switch_after_compression(agent) is pending
+    assert finalize_context_engine_compression_notification(agent, committed=True)
+    assert agent.switch_calls == [("next-model", "next-provider")]
+
+
+def test_native_inline_codex_compaction_rejects_deferred_switch():
+    agent = SimpleNamespace(
+        model="old-model",
+        provider="openai-codex",
+        base_url="https://chatgpt.com/backend-api/codex",
+        api_key="old-key",
+        api_mode="codex_app_server",
+        codex_app_server_auto_compaction="native",
+    )
+
+    with pytest.raises(ValueError, match="inline auto-compaction"):
+        schedule_model_switch_after_compression(
+            agent,
+            ModelSwitchResult(
+                success=True,
+                new_model="next-model",
+                target_provider="openai-codex",
+                context_length=128_000,
+            ),
+        )
+
+    assert get_model_switch_after_compression(agent) is None
+    assert agent.model == "old-model"
+
+
+def test_codex_responses_deferred_switch_remains_supported():
+    agent = SimpleNamespace(
+        model="old-model",
+        provider="openai-codex",
+        base_url="https://chatgpt.com/backend-api/codex/responses",
+        api_key="old-key",
+        api_mode="codex_responses",
+    )
+    pending = ModelSwitchResult(
+        success=True,
+        new_model="next-model",
+        target_provider="openai-codex",
+                  context_length=128_000,
+    )
+
+    assert schedule_model_switch_after_compression(agent, pending) is None
+    assert get_model_switch_after_compression(agent) is pending
+    assert agent.model == "old-model"
 
 
 

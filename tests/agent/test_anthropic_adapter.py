@@ -271,7 +271,7 @@ class TestResolveAnthropicToken:
         pool = SimpleNamespace(
             _available_entries=lambda **_kwargs: ([pool_entry], []),
         )
-        monkeypatch.setattr("agent.credential_pool.load_pool", lambda provider: pool)
+        monkeypatch.setattr("agent.credential_pool.load_pool", lambda provider, **_kwargs: pool)
 
         assert resolve_anthropic_token() == "pool-oauth-token"
 
@@ -306,7 +306,7 @@ class TestResolveAnthropicToken:
         pool = SimpleNamespace(
             _available_entries=lambda **_kwargs: ([broken_entry], []),
         )
-        monkeypatch.setattr("agent.credential_pool.load_pool", lambda provider: pool)
+        monkeypatch.setattr("agent.credential_pool.load_pool", lambda provider, **_kwargs: pool)
 
         # Must fall through to source #3 (ANTHROPIC_API_KEY), not raise.
         assert resolve_anthropic_token() == "sk-ant...ykey"
@@ -326,7 +326,7 @@ class TestResolveAnthropicToken:
         pool = SimpleNamespace(
             _available_entries=lambda **_kwargs: ([api_key_entry], []),
         )
-        monkeypatch.setattr("agent.credential_pool.load_pool", lambda provider: pool)
+        monkeypatch.setattr("agent.credential_pool.load_pool", lambda provider, **_kwargs: pool)
 
         # No OAuth entry and no other source → None (the api_key entry is ignored here).
         assert resolve_anthropic_token() is None
@@ -350,7 +350,7 @@ class TestResolveAnthropicToken:
             return ([pool_entry], [])
 
         pool = SimpleNamespace(_available_entries=_available_entries)
-        monkeypatch.setattr("agent.credential_pool.load_pool", lambda provider: pool)
+        monkeypatch.setattr("agent.credential_pool.load_pool", lambda provider, **_kwargs: pool)
 
         assert resolve_anthropic_token() == "pool-oauth-token"
         assert captured == {"clear_expired": False, "refresh": False}

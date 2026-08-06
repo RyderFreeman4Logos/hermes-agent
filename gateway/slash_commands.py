@@ -1675,12 +1675,17 @@ class GatewaySlashCommandsMixin:
           /model                              — interactive picker (Telegram/Discord) or text list
           /model <name>                       — switch model (this session only)
           /model <name> --once                — switch for the next turn only
+          /model <name> --after-compression   — switch after successful compression
           /model <name> --session             — switch for this session only (explicit)
           /model <name> --global              — switch and persist to config.yaml
           /model <name> --provider <provider> — switch provider + model
           /model --provider <provider>        — switch to provider, auto-detect model
         """
-        from gateway.run import _hermes_home, _load_gateway_config
+        from gateway.run import (
+            _AGENT_PENDING_SENTINEL,
+            _hermes_home,
+            _load_gateway_config,
+        )
         from hermes_cli.model_switch import (
             switch_model as _switch_model, parse_model_switch_args,
             resolve_persist_behavior,
@@ -1706,10 +1711,11 @@ class GatewaySlashCommandsMixin:
         force_refresh = request.force_refresh
         is_session = request.is_session
         one_turn = request.is_once
+        after_compression = request.is_after_compression
         if request.errors:
             # Gateway decoration: "❌ " prefix over the canonical error copy.
             return f"❌ {request.error_messages()[0]}"
-        persist_global = resolve_persist_behavior(
+        persist_global = False if after_compression else resolve_persist_behavior(
             is_global_flag,
             is_session,
             is_once=one_turn,
@@ -1769,6 +1775,18 @@ class GatewaySlashCommandsMixin:
             current_provider = override.get("provider", current_provider)
             current_base_url = override.get("base_url", current_base_url)
             current_api_key = override.get("api_key", current_api_key)
+
+        pending_switch = self._after_compression_model_switches.get(session_key)
+        pending_model_switch = ""
+        if pending_switch is not None:
+            pending_provider = (
+                pending_switch.provider_label
+                or get_label(pending_switch.target_provider)
+                or pending_switch.target_provider
+            )
+            pending_model_switch = (
+                f"{pending_switch.new_model} ({pending_provider})"
+            )
 
         # No args: show interactive picker (Telegram/Discord) or text list
         if not model_input and not explicit_provider:
@@ -1929,6 +1947,10 @@ class GatewaySlashCommandsMixin:
                             "base_url": result.base_url,
                             "api_mode": result.api_mode,
                         }
+                        _self._after_compression_model_switches.pop(
+                            _session_key,
+                            None,
+                        )
 
                         # Write-through the non-secret parts to the session
                         # store so the picked model survives a gateway restart
@@ -2081,13 +2103,20 @@ class GatewaySlashCommandsMixin:
                         session_key=session_key,
                         on_model_selected=_on_model_selected,
                         metadata=metadata,
+                        pending_model_switch=pending_model_switch,
                     )
                     if result.success:
                         return None  # Picker sent — adapter handles the response
 
             # Fallback: text list (for platforms without picker or if picker failed)
             provider_label = get_label(current_provider)
-            lines = [t("gateway.model.current_label", model=current_model or "unknown", provider=provider_label), ""]
+            lines = [t("gateway.model.current_label", model=current_model or "unknown", provider=provider_label)]
+            if pending_model_switch:
+                lines.append(
+                    "Pending after the next successful compression: "
+                    f"`{pending_model_switch}`"
+                )
+            lines.append("")
 
             try:
                 # Offload blocking provider-listing off the event loop so the
@@ -2139,30 +2168,31 @@ class GatewaySlashCommandsMixin:
             explicit_provider=explicit_provider,
             user_providers=user_provs,
             custom_providers=custom_provs,
+            validate_live=not after_compression,
         )
 
         if not result.success:
             return t("gateway.model.error_prefix", error=result.error_message)
 
-        try:
-            from hermes_cli.context_switch_guard import (
-                enrich_model_switch_warnings_for_gateway,
-            )
+        if not after_compression:
+            try:
+                from hermes_cli.context_switch_guard import (
+                    enrich_model_switch_warnings_for_gateway,
+                )
 
-            # Offload: merge_preflight_compression_warning() calls the sync
-            # resolve_display_context_length() provider probe ladder — must
-            # not run on the loop.
-            await asyncio.to_thread(
-                enrich_model_switch_warnings_for_gateway,
-                result,
-                self,
-                session_key=session_key,
-                source=source,
-                custom_providers=custom_provs,
-                load_gateway_config=_load_gateway_config,
-            )
-        except Exception as exc:
-            logger.debug("preflight-compression switch warning failed: %s", exc)
+                # The provider probe ladder is synchronous; keep it off the
+                # gateway event loop.
+                await asyncio.to_thread(
+                    enrich_model_switch_warnings_for_gateway,
+                    result,
+                    self,
+                    session_key=session_key,
+                    source=source,
+                    custom_providers=custom_provs,
+                    load_gateway_config=_load_gateway_config,
+                )
+            except Exception as exc:
+                logger.debug("preflight-compression switch warning failed: %s", exc)
 
         async def _finish_switch() -> str:
             """Apply the resolved switch (agent, session, config) and build the reply."""
@@ -2173,23 +2203,61 @@ class GatewaySlashCommandsMixin:
             if _cache_lock and _cache is not None:
                 with _cache_lock:
                     cached_entry = _cache.get(session_key)
+            running_agent = self._running_agents.get(session_key)
+            if running_agent is _AGENT_PENDING_SENTINEL:
+                running_agent = None
+            cached_agent = (
+                cached_entry[0]
+                if cached_entry and cached_entry[0] is not None
+                else None
+            )
+            live_agent = running_agent or cached_agent
 
-            if cached_entry and cached_entry[0] is not None:
-                try:
-                    cached_entry[0].switch_model(
-                        new_model=result.new_model,
-                        new_provider=result.target_provider,
-                        api_key=result.api_key,
-                        base_url=result.base_url,
-                        api_mode=result.api_mode,
+            if after_compression:
+                state = self._session_state(session_key)
+                replaced = state.conversation.after_compression_model_switch
+                state.conversation.after_compression_model_switch = result
+                if live_agent is not None:
+                    self._attach_model_switch_after_compression(
+                        session_key,
+                        live_agent,
                     )
+                lines = [
+                    "Model switch scheduled after the next successful compression: "
+                    f"`{result.new_model}`",
+                    f"Provider: {result.provider_label or result.target_provider}",
+                ]
+                if replaced is not None:
+                    lines.append(
+                        "_(replaced the previously scheduled model switch)_"
+                    )
+                return "\n".join(lines)
+
+            from hermes_cli.model_switch import (
+                clear_model_switch_after_compression,
+                model_switch_transaction_lock,
+            )
+
+            state = self._session_state(session_key)
+            if live_agent is not None:
+                try:
+                    with model_switch_transaction_lock(live_agent):
+                        # Never mutate an active turn's route. Its next request
+                        # is rebuilt from the override below, but the superseded
+                        # deferred intent must be cancelled on the live object.
+                        if running_agent is None:
+                            live_agent.switch_model(
+                                new_model=result.new_model,
+                                new_provider=result.target_provider,
+                                api_key=result.api_key,
+                                base_url=result.base_url,
+                                api_mode=result.api_mode,
+                            )
+                        clear_model_switch_after_compression(live_agent)
+                        state.conversation.after_compression_model_switch = None
                 except Exception as exc:
-                    # In-place swap rolled the agent back to the OLD working
-                    # model/client and re-raised.  Abort the commit: skip DB
-                    # persist, session override, cache eviction, and config
-                    # write so a failed switch is a no-op rather than a dead
-                    # conversation (#50163).  Without this early return the
-                    # next message rebuilds a broken agent from the override.
+                    # In-place swap rolled the idle cached agent back to the OLD
+                    # working model/client and re-raised. Abort the commit.
                     logger.warning("In-place model switch failed for cached agent: %s", exc)
                     return t(
                         "gateway.model.error_prefix",
@@ -2198,6 +2266,8 @@ class GatewaySlashCommandsMixin:
                             f"staying on {current_model}."
                         ),
                     )
+            else:
+                state.conversation.after_compression_model_switch = None
 
             # Persist the new model to the session DB so the dashboard
             # shows the updated model (#34850).
@@ -2240,6 +2310,7 @@ class GatewaySlashCommandsMixin:
                 "base_url": result.base_url,
                 "api_mode": result.api_mode,
             }
+            # Deferred intent was atomically cleared with the live agent above.
             if one_turn:
                 if not hasattr(self, "_pending_one_turn_model_restores"):
                     self._pending_one_turn_model_restores = {}
@@ -2396,6 +2467,9 @@ class GatewaySlashCommandsMixin:
                 lines.append(t("gateway.model.session_only_hint"))
 
             return "\n".join(lines)
+
+        if after_compression:
+            return await _finish_switch()
 
         # Expensive-model confirmation gate (typed /model <name> path).
         # The pickers (Telegram/Discord inline keyboards, TUI, dashboard)
@@ -4127,6 +4201,7 @@ class GatewaySlashCommandsMixin:
                 session_db=getattr(self._session_db, "_db", self._session_db),
             )
             _seed_hygiene_system_prompt(tmp_agent, session_row)
+            self._attach_model_switch_after_compression(session_key, tmp_agent)
             # Keep the real source platform during construction so external
             # context engines bind correctly. If compression has to rebuild the
             # prompt, stamp that provider-less fallback as stale for the next
@@ -4188,75 +4263,71 @@ class GatewaySlashCommandsMixin:
                 if partial and tail:
                     compressed = rejoin_compressed_head_and_tail(compressed, tail)
 
-                # _compress_context either rotated (legacy: ended the old
-                # session, created a continuation id — write compressed messages
-                # into the NEW session so the original stays searchable) or
-                # compacted in place (compression.in_place / #38763: same id,
-                # transcript replaced with the compacted set).
+                # _compress_context has already published the authoritative
+                # child transcript. Advance the gateway route with the store's
+                # lineage-checked CAS instead of rewriting that child from an
+                # outer snapshot (which could fail after the inner commit).
                 new_session_id = tmp_agent.session_id
-                rotated = new_session_id != session_entry.session_id
+                old_session_id = session_entry.session_id
+                rotated = new_session_id != old_session_id
                 _in_place = bool(getattr(tmp_agent, "_last_compaction_in_place", False))
 
-                # Persist the compressed transcript BEFORE repointing the live
-                # session onto the new session_id. Order matters: if we
-                # repointed first and the canonical DB write then failed (lock
-                # contention under concurrent writes, ENOSPC, a disk/IO error),
-                # the session entry would already reference a brand-new, empty
-                # session_id while the handler still reported success — the
-                # user's active conversation would silently vanish from view.
-                # Writing first, and treating a write failure as fatal, keeps
-                # the old history reachable (on rotation the entry still points
-                # at it; in place the original transcript is untouched) and lets
-                # the outer handler surface a "compress failed" banner instead.
-                #
-                # Only rewrite the transcript when rotation produced a NEW
-                # session id.  In-place compaction does NOT need a rewrite:
-                # archive_and_compact() has already soft-archived the previous
-                # active rows and inserted the compacted messages as the new
-                # active set inside _compress_context().  Calling
-                # rewrite_transcript() after in-place compaction would invoke
-                # replace_messages(active_only=False) which DELETEs ALL rows —
-                # including the archived turns that archive_and_compact()
-                # deliberately preserved (silent data loss, #61145).
-                #
-                # The third case: _compress_context could NOT rotate AND was
-                # not in-place (e.g. legacy mode but _session_db unavailable /
-                # the DB split raised) — there session_id is unchanged for a
-                # FAILURE reason, and rewrite_transcript() would DELETE the
-                # original messages and replace them with only the compressed
-                # summary (permanent data loss #44794, #39704).
                 if rotated:
-                    if not await self.async_session_store.rewrite_transcript(
-                        new_session_id, compressed
-                    ):
-                        raise RuntimeError(
-                            f"failed to persist compressed transcript for "
-                            f"session {new_session_id}"
+                    try:
+                        advanced = await self.async_session_store.advance_compression_session(
+                            session_entry.session_key,
+                            old_session_id,
+                            new_session_id,
                         )
-                    session_entry.session_id = new_session_id
-                    await self.async_session_store._save()
-                    await asyncio.to_thread(
-                        self._sync_telegram_topic_binding,
-                        source, session_entry, reason="compress-command",
-                    )
-                elif _in_place:
-                    # archive_and_compact() already persisted the compacted
-                    # transcript inside _compress_context — nothing to do.
-                    pass
-                else:
+                        if advanced is not None:
+                            session_entry = advanced
+                    except Exception as exc:
+                        # advance_compression_session mutates the shared entry
+                        # before persisting mirrors. Keep the coherent child
+                        # route and let its existing startup healing retry disk.
+                        if session_entry.session_id == old_session_id:
+                            session_entry.session_id = new_session_id
+                        logger.warning(
+                            "Manual /compress committed child %s but route mirror "
+                            "persistence needs healing: %s",
+                            new_session_id,
+                            exc,
+                        )
+                    for message in tail:
+                        await self.async_session_store.append_to_transcript(
+                            new_session_id,
+                            message,
+                        )
+                    if session_entry.session_id == new_session_id:
+                        try:
+                            await asyncio.to_thread(
+                                self._sync_telegram_topic_binding,
+                                source,
+                                session_entry,
+                                reason="compress-command",
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Manual /compress committed child %s but topic binding refresh failed",
+                                new_session_id,
+                            )
+                elif not _in_place:
                     logger.warning(
                         "Manual /compress: session rotation did not occur "
                         "(session_id unchanged) and in-place mode is off — "
                         "preserving original transcript instead of overwriting "
                         "it (#44794)."
                     )
-                # Reset stored token count — transcript changed, old value is stale
-                await self.async_session_store.update_session(
-                    session_entry.session_key, last_prompt_tokens=0
-                )
+                # The child/in-place publication is authoritative from here.
+                # Finalize before non-critical mirrors/summary rendering so a
+                # later outer failure can never claim to roll it back.
                 finalize_context_engine_compression_notification(
                     tmp_agent,
                     committed=True,
+                )
+                # Reset stored token count — transcript changed, old value is stale
+                await self.async_session_store.update_session(
+                    session_entry.session_key, last_prompt_tokens=0
                 )
                 new_tokens = estimate_request_tokens_rough(
                     compressed, system_prompt=_sys_prompt, tools=_tools

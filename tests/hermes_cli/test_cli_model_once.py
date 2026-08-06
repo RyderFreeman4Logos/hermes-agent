@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from hermes_cli.model_switch import ModelSwitchResult
+from hermes_cli.model_switch import (
+    ModelSwitchResult,
+    apply_model_switch_after_compression,
+    get_model_switch_after_compression,
+    schedule_model_switch_after_compression,
+)
 
 
 class _FakeAgent:
@@ -62,6 +67,7 @@ def test_cli_model_once_records_restore_and_does_not_persist(monkeypatch):
             base_url="https://api.anthropic.com",
             api_mode="anthropic_messages",
             provider_label="Anthropic",
+                        context_length=128_000,
         ),
     )
     monkeypatch.setattr("hermes_cli.model_switch.resolve_display_context_length", lambda *a, **k: None)
@@ -76,6 +82,138 @@ def test_cli_model_once_records_restore_and_does_not_persist(monkeypatch):
     assert stub.agent.calls[-1]["new_model"] == "claude-sonnet-4.6"
     assert stub._pending_one_turn_model_restore["model"] == "old/model"
     assert "next turn only" in printed[-1]
+
+
+def test_cli_model_after_compression_resolves_now_without_mutating_route(monkeypatch):
+    import cli as cli_mod
+
+    class DeferredAgent(_FakeAgent):
+        def switch_model(
+            self,
+            new_model,
+            new_provider,
+            api_key="",
+            base_url="",
+            api_mode="",
+        ):
+            self.calls.append(
+                {
+                    "new_model": new_model,
+                    "new_provider": new_provider,
+                    "api_key": api_key,
+                    "base_url": base_url,
+                    "api_mode": api_mode,
+                }
+            )
+            self.model = new_model
+            self.provider = new_provider
+
+    stub = _StubCLI()
+    stub.agent = DeferredAgent()
+    monkeypatch.setattr(
+        stub,
+        "_confirm_expensive_model_switch",
+        lambda result: (_ for _ in ()).throw(
+            AssertionError("deferred schedule must not run cost discovery")
+        ),
+    )
+    printed = []
+    monkeypatch.setattr(cli_mod, "_cprint", lambda s, *a, **k: printed.append(str(s)))
+    monkeypatch.setattr(
+        cli_mod,
+        "save_config_value",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not persist")),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.inventory.load_picker_context",
+        lambda: SimpleNamespace(
+            user_providers=None,
+            custom_providers=None,
+            with_overrides=lambda **_: SimpleNamespace(
+                user_providers=None,
+                custom_providers=None,
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.switch_model",
+        lambda **_: ModelSwitchResult(
+            success=True,
+            new_model="gpt-5.6-sol",
+            target_provider="pm",
+            api_key="sk-next",
+            base_url="https://pm.invalid/v1",
+            api_mode="codex_responses",
+            provider_label="pm",
+                        context_length=128_000,
+        ),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.resolve_display_context_length",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("deferred schedule must use local scheduling metadata")
+        ),
+    )
+
+    cli_mod.HermesCLI._handle_model_switch(
+        stub,
+        "/model gpt-5.6-sol --provider pm --after-compression",
+    )
+
+    agent = stub.agent
+    assert agent is not None
+    pending = get_model_switch_after_compression(agent)
+    assert pending is not None
+    assert stub.model == "old/model"
+    assert stub.provider == "openrouter"
+    assert agent.calls == []
+    assert pending.new_model == "gpt-5.6-sol"
+    assert any("after the next successful compression" in line for line in printed)
+
+    assert apply_model_switch_after_compression(agent) == "applied"
+    assert stub.model == "gpt-5.6-sol"
+    assert stub.provider == "pm"
+    assert agent.calls[-1]["new_model"] == "gpt-5.6-sol"
+
+
+def test_cli_model_picker_reports_pending_deferred_route(monkeypatch):
+    import cli as cli_mod
+
+    stub = _StubCLI()
+    stub.agent = _FakeAgent()
+    opened = []
+    stub._open_model_picker = lambda *args, **kwargs: opened.append((args, kwargs))
+    schedule_model_switch_after_compression(
+        stub.agent,
+        ModelSwitchResult(
+            success=True,
+            new_model="next/model",
+            target_provider="anthropic",
+            context_length=128_000,
+        ),
+    )
+    printed = []
+    monkeypatch.setattr(cli_mod, "_cprint", lambda s, *a, **k: printed.append(str(s)))
+    monkeypatch.setattr(
+        "hermes_cli.inventory.load_picker_context",
+        lambda: SimpleNamespace(
+            user_providers=None,
+            custom_providers=None,
+            with_overrides=lambda **_: SimpleNamespace(
+                user_providers=None,
+                custom_providers=None,
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.inventory.build_models_payload",
+        lambda *_args, **_kwargs: {"providers": [{"slug": "anthropic"}]},
+    )
+
+    cli_mod.HermesCLI._handle_model_switch(stub, "/model")
+
+    assert opened
+    assert any("next/model" in line and "pending" in line.lower() for line in printed)
 
 
 def test_cli_restore_model_runtime_snapshot_restores_agent():

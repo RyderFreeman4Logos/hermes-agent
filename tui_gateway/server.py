@@ -2201,6 +2201,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
             # Session DB row deferred to first run_conversation() call.
             # pending_title applied post-first-message (see cli.exec handler).
             current["agent"] = agent
+            _attach_model_switch_after_compression(sid, current, agent)
             # Baseline for the per-turn config sync; the profile home
             # override is still active here.
             current["config_model_seen"] = _config_model_target()
@@ -3851,7 +3852,13 @@ def _is_model_switch_marker(entry: Any) -> bool:
     return isinstance(content, str) and content.startswith(_MODEL_SWITCH_MARKER_PREFIX)
 
 
-def _append_model_switch_marker(session: dict | None, *, model: str, provider: str) -> None:
+def _append_model_switch_marker(
+    session: dict | None,
+    *,
+    model: str,
+    provider: str,
+    require_durable: bool = False,
+) -> None:
     """Record a real system-history pivot after a live model switch.
 
     Only the most recent marker is kept: each new switch first strips any
@@ -3859,7 +3866,8 @@ def _append_model_switch_marker(session: dict | None, *, model: str, provider: s
     marker (naming the active model), not N stale ones accumulating tokens on
     every subsequent API call (#65891). The in-memory history is the payload
     re-sent each turn; the dedup is self-healing across resumes because the
-    next switch collapses whatever markers a reload brought back.
+    next switch collapses whatever markers a reload brought back. Deferred
+    activation can require the durable write before it commits frontend state.
     """
     if not session:
         return
@@ -3907,15 +3915,20 @@ def _append_model_switch_marker(session: dict | None, *, model: str, provider: s
 
         _ensure_session_db_row(session)
         with _session_db(session) as scoped_db:
-            if scoped_db is not None:
-                scoped_db.append_message(
-                    session_id=session_key,
-                    role="user",
-                    content=marker,
-                    display_kind="model_switch",
-                )
+            if scoped_db is None:
+                if require_durable:
+                    raise RuntimeError("session database unavailable for model switch marker")
+                return
+            scoped_db.append_message(
+                session_id=session_key,
+                role="user",
+                content=marker,
+                display_kind="model_switch",
+            )
     except Exception:
         logger.debug("failed to persist model switch marker", exc_info=True)
+        if require_durable:
+            raise
 
 
 def _write_config_key(key_path: str, value):
@@ -4365,6 +4378,112 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
         )
 
 
+def _attach_model_switch_after_compression(
+    sid: str,
+    session: dict,
+    agent,
+    pending=None,
+):
+    """Publish this TUI session's deferred route under the live-agent lock."""
+    from hermes_cli.model_switch import (
+        model_switch_transaction_lock,
+        schedule_model_switch_after_compression,
+    )
+
+    with model_switch_transaction_lock(agent):
+        previous = session.get("after_compression_model_switch")
+        pending = pending if pending is not None else previous
+        if pending is None:
+            return previous
+        session["after_compression_model_switch"] = pending
+
+        def _on_applied(result, old_model, _old_provider):
+            if session.get("after_compression_model_switch") is not result:
+                return
+            missing = object()
+            old_values = {
+                key: session.get(key, missing)
+                for key in (
+                    "after_compression_model_switch",
+                    "one_turn_model_restore",
+                    "model_override",
+                    "history",
+                    "history_version",
+                )
+            }
+            old_history = old_values["history"]
+            old_history_items = list(old_history) if isinstance(old_history, list) else None
+            try:
+                session.pop("after_compression_model_switch", None)
+                session.pop("one_turn_model_restore", None)
+                session["model_override"] = {
+                    "model": result.new_model,
+                    "provider": result.target_provider,
+                    "base_url": result.base_url,
+                    "api_key": result.api_key,
+                    "api_mode": result.api_mode,
+                }
+                _append_model_switch_marker(
+                    session,
+                    model=result.new_model,
+                    provider=result.target_provider,
+                    require_durable=True,
+                )
+            except BaseException:
+                for key, value in old_values.items():
+                    if value is missing:
+                        session.pop(key, None)
+                    else:
+                        session[key] = value
+                if old_history_items is not None:
+                    old_history[:] = old_history_items
+                raise
+
+            # Transport publication is an observer, not route authority. A closed
+            # frontend must not roll back a committed runtime + durable marker.
+            notifications = []
+            try:
+                notifications.append(("session.info", _session_info(agent, session)))
+            except Exception:
+                logger.debug(
+                    "deferred model switch session info failed",
+                    exc_info=True,
+                )
+            notifications.append(
+                (
+                    "status",
+                    {
+                        "message": (
+                            f"Model switched after compression: {old_model} → "
+                            f"{result.new_model}"
+                        )
+                    },
+                )
+            )
+            for method, params in notifications:
+                try:
+                    _emit(method, sid, params)
+                except Exception:
+                    logger.debug(
+                        "deferred model switch notification failed",
+                        exc_info=True,
+                    )
+
+        try:
+            schedule_model_switch_after_compression(
+                agent,
+                pending,
+                on_applied=_on_applied,
+            )
+        except BaseException:
+            if previous is None:
+                session.pop("after_compression_model_switch", None)
+            else:
+                session["after_compression_model_switch"] = previous
+            raise
+        return previous
+
+
 def _apply_model_switch(
     sid: str,
     session: dict,
@@ -4379,6 +4498,7 @@ def _apply_model_switch(
         parse_model_switch_args,
         resolve_persist_behavior,
         switch_model,
+        get_model_switch_after_compression,
         MODEL_SWITCH_ERR_ONCE_WITH_GLOBAL,
         MODEL_SWITCH_ERROR_TEXT,
     )
@@ -4392,16 +4512,26 @@ def _apply_model_switch(
         is_global_flag = parsed_flags.is_global
         is_session = parsed_flags.is_session
         one_turn = parsed_flags.is_once
+        after_compression = bool(
+            getattr(parsed_flags, "is_after_compression", False)
+        )
+        errors = tuple(getattr(parsed_flags, "errors", ()))
     else:
         model_input, explicit_provider, is_global_flag, _force_refresh, is_session = parsed_flags
         one_turn = False
+        after_compression = False
+        errors = ()
     # Conflict validation delegates to the shared single-owner parser; the
     # TUI surfaces it as a raised ValueError (its historical behavior)
     # using the canonical error copy.
+    if errors:
+        raise ValueError(MODEL_SWITCH_ERROR_TEXT[errors[0]])
     if is_global_flag and one_turn:
         raise ValueError(MODEL_SWITCH_ERROR_TEXT[MODEL_SWITCH_ERR_ONCE_WITH_GLOBAL])
     persist_global = (
-        persist_override
+        False
+        if after_compression
+        else persist_override
         if persist_override is not None
         else resolve_persist_behavior(
             is_global_flag,
@@ -4410,7 +4540,15 @@ def _apply_model_switch(
             explicit_provider=explicit_provider,
         )
     )
-    if not model_input:
+    if not model_input and not explicit_provider:
+        pending = session.get("after_compression_model_switch")
+        if pending is None:
+            pending = get_model_switch_after_compression(session.get("agent"))
+        if pending is not None:
+            raise ValueError(
+                "model value required; pending after compression: "
+                f"{pending.new_model} via {pending.target_provider}"
+            )
         raise ValueError("model value required")
 
     agent = session.get("agent")
@@ -4465,13 +4603,14 @@ def _apply_model_switch(
         explicit_provider=explicit_provider,
         user_providers=user_provs,
         custom_providers=custom_provs,
+        validate_live=not after_compression,
     )
     if not result.success:
         raise ValueError(result.error_message or "model switch failed")
 
     restore_snapshot = _snapshot_agent_model_runtime(agent) if (one_turn and agent) else None
 
-    if agent:
+    if agent and not after_compression:
         try:
             from hermes_cli.context_switch_guard import merge_preflight_compression_warning
 
@@ -4490,7 +4629,7 @@ def _apply_model_switch(
         except Exception as exc:
             logger.debug("preflight-compression switch warning failed: %s", exc)
 
-    if not confirm_expensive_model:
+    if not confirm_expensive_model and not after_compression:
         try:
             from hermes_cli.model_cost_guard import expensive_model_warning
 
@@ -4513,6 +4652,24 @@ def _apply_model_switch(
                 "confirm_required": True,
                 "confirm_message": confirm_msg,
             }
+
+    if after_compression:
+        if agent is None:
+            raise ValueError("/model --after-compression requires a live session")
+        replaced = _attach_model_switch_after_compression(
+            sid,
+            session,
+            agent,
+            pending=result,
+        )
+        return {
+            "value": result.new_model,
+            "warning": result.warning_message or "",
+            "confirm_required": False,
+            "scope": "after_compression",
+            "pending": True,
+            "replaced": replaced is not None,
+        }
 
     if agent:
         try:
@@ -4569,6 +4726,7 @@ def _apply_model_switch(
             "api_key": result.api_key,
             "api_mode": result.api_mode,
         }
+    session.pop("after_compression_model_switch", None)
     if persist_global:
         _persist_model_switch(result)
     return {
@@ -4784,18 +4942,48 @@ def _compress_session_history(
 
     if partial and tail:
         compressed = rejoin_compressed_head_and_tail(compressed, tail)
+    newer_messages = []
     with session["history_lock"]:
-        if int(session.get("history_version", 0)) != history_version:
-            # External mutation during compaction — drop the compressed
-            # result so we don't clobber concurrent edits.
-            finalize_context_engine_compression_notification(
-                agent,
-                committed=False,
-            )
-            usage = _get_usage(agent)
-            return 0, usage
-        session["history"] = compressed
-        session["history_version"] = history_version + 1
+        current_history = list(session.get("history", []))
+        current_version = int(session.get("history_version", 0))
+        pending_notification = getattr(agent, "__dict__", {}).get(
+            "_pending_context_engine_compression_notification"
+        )
+        if current_version != history_version:
+            if (
+                current_history[: len(history)] == history
+                and callable(pending_notification)
+            ):
+                # A real boundary committed under the deferred host fence;
+                # retain append-only input that arrived while it ran.
+                newer_messages = current_history[len(history) :]
+            else:
+                # No durable boundary (or a non-append mutation): keep the
+                # live transcript and discard the queued boundary effects.
+                finalize_context_engine_compression_notification(
+                    agent,
+                    committed=False,
+                )
+                agent._awaiting_cache_usage_after_compression = (
+                    cache_attribution_pending_before
+                )
+                if compressor is not None and hasattr(
+                    compressor, "awaiting_real_usage_after_compression"
+                ):
+                    compressor.awaiting_real_usage_after_compression = real_usage_pending_before
+                usage = _get_usage(agent)
+                return 0, usage
+        session["history"] = [*compressed, *newer_messages]
+        session["history_version"] = current_version + 1
+    if newer_messages:
+        flush_messages = getattr(agent, "_flush_messages_to_session_db", None)
+        if callable(flush_messages):
+            try:
+                for message in newer_messages:
+                    message.pop("_db_persisted", None)
+                flush_messages(newer_messages, None)
+            except Exception:
+                logger.exception("Failed to persist messages that arrived during compression")
     usage = _get_usage(agent)
     return len(history) - len(compressed), usage
 
@@ -4830,11 +5018,20 @@ def _sync_session_key_after_compress(
     if not new_session_id or new_session_id == old_key:
         return
 
-    lease_reanchored = _transfer_active_session_slot(
-        sid,
-        session,
-        new_session_id=new_session_id,
-    )
+    try:
+        lease_reanchored = _transfer_active_session_slot(
+            sid,
+            session,
+            new_session_id=new_session_id,
+        )
+    except Exception:
+        lease_reanchored = False
+        logger.exception(
+            "Compression session lease re-anchor failed: sid=%s old_session_id=%s new_session_id=%s",
+            sid,
+            old_key,
+            new_session_id,
+        )
     if not lease_reanchored:
         logger.warning(
             "Compression session lease did not re-anchor: sid=%s old_session_id=%s new_session_id=%s",
@@ -6187,6 +6384,7 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
         session.pop("create_reasoning_override", None)
         session.pop("create_service_tier_override", None)
         session.pop("one_turn_model_restore", None)
+        session.pop("after_compression_model_switch", None)
         new_agent = _make_agent(
             sid,
             session["session_key"],
@@ -9743,7 +9941,13 @@ def _run_prompt_submit(
             if display_kind and "persist_user_display_kind" in _run_params:
                 run_kwargs["persist_user_display_kind"] = display_kind
                 run_kwargs["persist_user_display_metadata"] = display_metadata
-            result = agent.run_conversation(run_message, **run_kwargs)
+            # Auto-compression must activate only after the outer TUI
+            # publication fence reanchors the session.
+            agent._defer_host_compression_publication = True
+            try:
+                result = agent.run_conversation(run_message, **run_kwargs)
+            finally:
+                agent._defer_host_compression_publication = False
             if display_kind and isinstance(text, str):
                 db = getattr(agent, "_session_db", None)
                 current_session_id = getattr(agent, "session_id", None) or session.get("session_key")
@@ -9872,14 +10076,27 @@ def _run_prompt_submit(
                                 )
 
                 # If auto-compression fired inside run_conversation(), agent.session_id
-                # may have rotated. Sync session_key before downstream title/goal/finalize
-                # handling uses it. Preserve pending_title (user intent) so it can be
-                # applied to the continuation. Restart slash worker so subsequent
-                # worker-backed commands (/title etc.) target the live session.
-                # Fix for #20001.
-                _sync_session_key_after_compress(
-                    sid, session, clear_pending_title=False, restart_slash_worker=True,
+                # may have rotated. Match the three manual compression callers:
+                # re-anchor first, finalize deferred activation on the outer
+                # commit, then restart the slash worker against the final route
+                # before any commit-success notification / next provider request.
+                # Preserve pending_title (user intent) so it can be applied to
+                # the continuation. Fix for #20001 / #49 F2.
+                from agent.conversation_compression import (
+                    finalize_context_engine_compression_notification,
                 )
+
+                _sync_session_key_after_compress(
+                    sid, session, clear_pending_title=False, restart_slash_worker=False,
+                )
+                finalize_context_engine_compression_notification(
+                    agent,
+                    committed=True,
+                )
+                try:
+                    _restart_slash_worker(sid, session)
+                except Exception:
+                    pass
 
                 raw = result.get("final_response", "")
                 status = (
@@ -10583,6 +10800,28 @@ def _(rid, params: dict) -> dict:
             if session:
                 from hermes_cli.model_switch import parse_model_switch_args
 
+                parsed_flags = parse_model_switch_args(value)
+                if parsed_flags.errors:
+                    raise ValueError(parsed_flags.error_messages()[0])
+
+                # A deferred switch is safe to resolve and attach while the
+                # current turn runs. Do it before the generic immediate-switch
+                # queue so an in-flight compression can observe the intent.
+                if session.get("running") and parsed_flags.is_after_compression:
+                    if session.get("agent") is None:
+                        raise ValueError(
+                            "/model --after-compression requires a live session"
+                        )
+                    result = _apply_model_switch(
+                        params.get("session_id", ""),
+                        session,
+                        value,
+                        confirm_expensive_model=bool(
+                            params.get("confirm_expensive_model", False)
+                        ),
+                        parsed_flags=parsed_flags,
+                    )
+
                 # A live swap can't run in-place while a turn streams:
                 # agent.switch_model() mutates self.model / self.provider /
                 # self.base_url / self.client, and the worker thread running
@@ -10593,13 +10832,13 @@ def _(rid, params: dict) -> dict:
                 # (_apply_pending_model_switch), where nothing is in flight.
                 # The user gets to pick, keep typing, and send the next turn on
                 # the new model without waiting for the swap or interrupting.
-                if session.get("running"):
-                    parsed = parse_model_switch_args(value)
+                elif session.get("running"):
+                    parsed = parsed_flags
                     try:
                         pending_model = parsed.model_input
                     except Exception:
                         pending_model = str(value)
-                    session["pending_model_switch"] = {
+                    queued_switch = {
                         "raw": value,
                         "confirm_expensive_model": bool(
                             params.get("confirm_expensive_model", False)
@@ -10613,6 +10852,20 @@ def _(rid, params: dict) -> dict:
                             getattr(parsed, "explicit_provider", "") or ""
                         ).strip(),
                     }
+                    from hermes_cli.model_switch import (
+                        clear_model_switch_after_compression,
+                        model_switch_transaction_lock,
+                    )
+
+                    agent = session.get("agent")
+                    if agent is None:
+                        session.pop("after_compression_model_switch", None)
+                        session["pending_model_switch"] = queued_switch
+                    else:
+                        with model_switch_transaction_lock(agent):
+                            clear_model_switch_after_compression(agent)
+                            session.pop("after_compression_model_switch", None)
+                            session["pending_model_switch"] = queued_switch
                     return _ok(
                         rid,
                         {
@@ -10625,25 +10878,25 @@ def _(rid, params: dict) -> dict:
                             "deferred": True,
                         },
                     )
-                parsed_flags = parse_model_switch_args(value)
-                explicit_provider = parsed_flags.explicit_provider
-                if session.get("agent") is None and not explicit_provider.strip():
-                    session_id = params.get("session_id", "")
-                    _start_agent_build(session_id, session)
-                    init_err = _wait_agent(session, rid)
-                    if init_err:
-                        return init_err
-                    if session.get("agent") is None:
-                        return _err(rid, 5032, "agent initialization failed")
-                result = _apply_model_switch(
-                    params.get("session_id", ""),
-                    session,
-                    value,
-                    confirm_expensive_model=bool(
-                        params.get("confirm_expensive_model", False)
-                    ),
-                    parsed_flags=parsed_flags,
-                )
+                else:
+                    explicit_provider = parsed_flags.explicit_provider
+                    if session.get("agent") is None and not explicit_provider.strip():
+                        session_id = params.get("session_id", "")
+                        _start_agent_build(session_id, session)
+                        init_err = _wait_agent(session, rid)
+                        if init_err:
+                            return init_err
+                        if session.get("agent") is None:
+                            return _err(rid, 5032, "agent initialization failed")
+                    result = _apply_model_switch(
+                        params.get("session_id", ""),
+                        session,
+                        value,
+                        confirm_expensive_model=bool(
+                            params.get("confirm_expensive_model", False)
+                        ),
+                        parsed_flags=parsed_flags,
+                    )
             else:
                 result = _apply_model_switch(
                     "",
@@ -10662,6 +10915,8 @@ def _(rid, params: dict) -> dict:
                     "confirm_required": result.get("confirm_required", False),
                     "confirm_message": result.get("confirm_message", ""),
                     "scope": result.get("scope", "session"),
+                    "pending": result.get("pending", False),
+                    "replaced": result.get("replaced", False),
                 },
             )
         except Exception as e:
@@ -12514,10 +12769,25 @@ def _format_live_model_output(session: dict) -> str:
     model = getattr(agent, "model", "") if agent is not None else ""
     provider = getattr(agent, "provider", "") if agent is not None else ""
     if model and provider:
-        return f"Current model: {model} ({provider})"
-    if model:
-        return f"Current model: {model}"
-    return "Current model: (unknown)"
+        output = f"Current model: {model} ({provider})"
+    elif model:
+        output = f"Current model: {model}"
+    else:
+        output = "Current model: (unknown)"
+
+    pending = session.get("after_compression_model_switch")
+    if pending is not None:
+        pending_model = getattr(pending, "new_model", "") or "unknown"
+        pending_provider = (
+            getattr(pending, "provider_label", "")
+            or getattr(pending, "target_provider", "")
+            or "unknown"
+        )
+        output += (
+            "\nPending after the next successful compression: "
+            f"{pending_model} ({pending_provider})"
+        )
+    return output
 
 
 def _live_slash_command_output(sid: str, session: Optional[dict], name: str, arg: str) -> Optional[str]:
@@ -12625,6 +12895,16 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
     try:
         if name == "model" and arg and agent:
             result = _apply_model_switch(sid, session, arg)
+            if result.get("pending"):
+                lines = [
+                    "Model switch scheduled after the next successful compression: "
+                    f"{result['value']}"
+                ]
+                if result.get("replaced"):
+                    lines.append("(replaced the previously scheduled model switch)")
+                if result.get("warning"):
+                    lines.append(result["warning"])
+                return "\n".join(lines)
             return result.get("warning", "")
         elif name == "personality" and arg and agent:
             pname, new_prompt = _validate_personality(arg, _load_cfg())
@@ -12670,7 +12950,16 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
                     describe_compression_lock_skip,
                 )
                 return describe_compression_lock_skip(e.holder)
-            _sync_session_key_after_compress(sid, session)
+            _sync_session_key_after_compress(
+                sid,
+                session,
+                restart_slash_worker=False,
+            )
+            finalize_context_engine_compression_notification(
+                agent,
+                committed=True,
+            )
+            _restart_slash_worker(sid, session)
 
             with session["history_lock"]:
                 _after_messages = list(session.get("history", []))
@@ -12694,10 +12983,6 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
             _lines = [_fb["headline"], _fb["token_line"]]
             if _fb.get("note"):
                 _lines.append(_fb["note"])
-            finalize_context_engine_compression_notification(
-                agent,
-                committed=True,
-            )
             return "\n".join(_lines)
         elif name == "fast" and agent:
             mode = arg.lower()

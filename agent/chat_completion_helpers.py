@@ -2106,6 +2106,9 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             and base_url_host_matches(fb_base_url, "amazonaws.com")
         ):
             fb_api_mode = "bedrock_converse"
+        explicit_api_mode = fb.get("api_mode")
+        if isinstance(explicit_api_mode, str) and explicit_api_mode.strip():
+            fb_api_mode = explicit_api_mode.strip()
 
         old_model = agent.model
         old_provider = agent.provider
@@ -2251,21 +2254,23 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 api_mode=agent.api_mode,
             )
 
-        # Re-resolve reasoning_config for the new fallback model (Closes #21256).
-        # Shared chokepoint: per-model override > global reasoning_effort
-        # (YAML boolean False = disabled). Wrapped in try/except because a
-        # config load failure must not kill the swap.
+        # A profile fallback entry may pin its own reasoning level.
         try:
             from hermes_cli.config import load_config
-            from hermes_constants import resolve_reasoning_config
+            from hermes_constants import parse_reasoning_effort, resolve_reasoning_config
 
-            agent.reasoning_config = resolve_reasoning_config(
-                load_config() or {}, agent.model
-            )
-            logger.info(
-                "Fallback %s: reasoning_config resolved: %s",
-                agent.model, agent.reasoning_config,
-            )
+            entry_effort = fb.get("reasoning_effort")
+            entry_reasoning = None
+            if entry_effort is False or (
+                isinstance(entry_effort, str) and entry_effort.strip()
+            ):
+                entry_reasoning = parse_reasoning_effort(entry_effort)
+            if entry_reasoning is not None:
+                agent.reasoning_config = entry_reasoning
+            else:
+                agent.reasoning_config = resolve_reasoning_config(
+                    load_config() or {}, agent.model
+                )
         except Exception as _reasoning_err:
             logger.debug(
                 "Failed to resolve reasoning_config for fallback %s; keeping current: %s",

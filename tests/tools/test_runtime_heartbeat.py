@@ -268,10 +268,43 @@ def test_stuck_live_target_emits_once_and_rearms_exactly_once():
 
     FakeTimer.created[0].callback()
 
-    assert events.get_nowait()["status"] == "STUCK"
+    event = events.get_nowait()
+    assert event["status"] == "STUCK"
+    assert manager.is_event_current(event) is True
     assert events.empty()
     assert len(FakeTimer.created) == 2
     assert FakeTimer.created[1].interval == 1700
+
+
+@pytest.mark.parametrize("end_state", ["terminal", "cancelled"])
+def test_stuck_live_event_is_suppressed_after_terminal_or_cancel(end_state):
+    from tools.runtime_heartbeat import RuntimeHeartbeat
+
+    FakeTimer.created = []
+    events = queue.Queue()
+    alive = {"value": True}
+    manager = RuntimeHeartbeat(event_queue=events, timer_factory=FakeTimer)
+    manager.arm(
+        "proc",
+        caller_id="owner",
+        kind="process",
+        interval=1700,
+        inspect=lambda: {
+            "alive": alive["value"],
+            "output_size": 0,
+            "cpu_seconds": 0.0,
+        },
+    )
+    FakeTimer.created[0].callback()
+    event = events.get_nowait()
+    assert event["status"] == "STUCK"
+
+    if end_state == "terminal":
+        alive["value"] = False
+    else:
+        assert manager.cancel("proc") is True
+
+    assert manager.is_event_current(event) is False
 
 
 def test_due_targets_for_one_owner_coalesce_to_one_warm_event():

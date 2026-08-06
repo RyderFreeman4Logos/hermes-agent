@@ -151,9 +151,9 @@ def _record_model_calls_in_process(
     count: int,
     start_barrier: Any | None = None,
 ) -> None:
+    store = SharedMetricsStore(Path(database_path), Path(outbox_directory))
     if start_barrier is not None:
         start_barrier.wait()
-    store = SharedMetricsStore(Path(database_path), Path(outbox_directory))
     for _ in range(count):
         store.record_model_call(_dimensions(), _resource())
 
@@ -1423,9 +1423,11 @@ def test_concurrent_model_call_updates_are_transactional(tmp_path):
     database_path = tmp_path / "metrics.sqlite3"
     outbox_directory = tmp_path / "outbox"
     SharedMetricsStore(database_path, outbox_directory)
+    ready = threading.Barrier(2)
 
     def record_calls(count: int) -> None:
         store = SharedMetricsStore(database_path, outbox_directory)
+        ready.wait(timeout=5)
         for _ in range(count):
             store.record_model_call(_dimensions(), _resource())
 
@@ -1511,6 +1513,193 @@ def test_schema_initialization_waits_for_an_existing_writer(tmp_path):
         store = future.result(timeout=2)
 
     assert store.counter_snapshot() == []
+
+
+def test_model_call_update_waits_for_a_transient_writer(tmp_path, monkeypatch):
+    database_path = tmp_path / "metrics.sqlite3"
+    store = SharedMetricsStore(database_path, tmp_path / "outbox")
+    blocker = sqlite3.connect(database_path)
+    blocker.execute("BEGIN IMMEDIATE")
+    retrying = threading.Event()
+    real_sleep = time.sleep
+
+    def observe_retry_sleep(seconds):
+        retrying.set()
+        real_sleep(seconds)
+
+    monkeypatch.setattr(shared_metrics_module.time, "sleep", observe_retry_sleep)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(store.record_model_call, _dimensions(), _resource())
+        try:
+            assert retrying.wait(timeout=2)
+            assert not future.done()
+        finally:
+            blocker.rollback()
+            blocker.close()
+        future.result(timeout=2)
+
+    assert store.counter_snapshot()[0]["value"] == 1
+
+
+def test_model_call_commit_waits_without_replaying_the_increment(tmp_path, monkeypatch):
+    database_path = tmp_path / "metrics.sqlite3"
+    store = SharedMetricsStore(database_path, tmp_path / "outbox")
+    reader = sqlite3.connect(database_path)
+    reader.execute("BEGIN")
+    reader.execute("SELECT * FROM counter_aggregates").fetchall()
+    retrying = threading.Event()
+    real_sleep = time.sleep
+
+    def observe_retry_sleep(seconds):
+        retrying.set()
+        real_sleep(seconds)
+
+    monkeypatch.setattr(shared_metrics_module.time, "sleep", observe_retry_sleep)
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(store.record_model_call, _dimensions(), _resource())
+        try:
+            assert retrying.wait(timeout=2)
+            assert not future.done()
+        finally:
+            reader.rollback()
+            reader.close()
+        future.result(timeout=2)
+
+    assert store.counter_snapshot()[0]["value"] == 1
+
+
+def test_model_call_update_rolls_back_non_lock_failure(tmp_path, monkeypatch):
+    database_path = tmp_path / "metrics.sqlite3"
+    store = SharedMetricsStore(database_path, tmp_path / "outbox")
+    record_counter = SharedMetricsStore._record_counter_in_transaction
+
+    def fail_after_increment(*args, **kwargs):
+        record_counter(*args, **kwargs)
+        raise RuntimeError("stop after increment")
+
+    monkeypatch.setattr(
+        SharedMetricsStore,
+        "_record_counter_in_transaction",
+        staticmethod(fail_after_increment),
+    )
+
+    with pytest.raises(RuntimeError, match="stop after increment"):
+        store.record_model_call(_dimensions(), _resource())
+
+    assert store.counter_snapshot() == []
+
+
+def test_model_call_update_stops_at_the_lock_retry_budget(tmp_path, monkeypatch):
+    database_path = tmp_path / "metrics.sqlite3"
+    store = SharedMetricsStore(database_path, tmp_path / "outbox")
+    blocker = sqlite3.connect(database_path)
+    blocker.execute("BEGIN IMMEDIATE")
+    sleeps = []
+    monkeypatch.setattr(
+        shared_metrics_module,
+        "_WRITE_BUSY_BUDGET_S",
+        0.05,
+    )
+    monkeypatch.setattr(shared_metrics_module, "_BUSY_TIMEOUT_MS", 0)
+    monkeypatch.setattr(shared_metrics_module.random, "uniform", lambda _a, _b: 0.02)
+    monkeypatch.setattr(shared_metrics_module.time, "monotonic", lambda: sum(sleeps))
+    monkeypatch.setattr(shared_metrics_module.time, "sleep", sleeps.append)
+
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            store.record_model_call(_dimensions(), _resource())
+    finally:
+        blocker.rollback()
+        blocker.close()
+
+    assert len(sleeps) >= 2
+    assert sum(sleeps) == pytest.approx(0.05)
+    assert store.counter_snapshot() == []
+
+
+def test_begin_and_commit_share_one_lock_retry_budget(tmp_path, monkeypatch):
+    class PhasedConnection:
+        def __init__(self):
+            self.begin_attempts = 0
+            self.commit_attempts = 0
+            self.rollbacks = 0
+            self.busy_timeouts = []
+
+        def execute(self, statement):
+            if statement.startswith("PRAGMA"):
+                self.busy_timeouts.append(int(statement.rsplit("=", 1)[1]))
+                return None
+            if statement == "BEGIN IMMEDIATE":
+                self.begin_attempts += 1
+                if self.begin_attempts == 1:
+                    raise sqlite3.OperationalError("database is locked")
+                return None
+            if statement == "COMMIT":
+                self.commit_attempts += 1
+                raise sqlite3.OperationalError("database is locked")
+            if statement == "ROLLBACK":
+                self.rollbacks += 1
+                return None
+            raise AssertionError(f"unexpected statement: {statement}")
+
+    store = SharedMetricsStore(tmp_path / "metrics.sqlite3", tmp_path / "outbox")
+    sleeps = []
+    monkeypatch.setattr(shared_metrics_module.random, "uniform", lambda _a, _b: 0.02)
+    monkeypatch.setattr(shared_metrics_module.time, "monotonic", lambda: sum(sleeps))
+    monkeypatch.setattr(shared_metrics_module.time, "sleep", sleeps.append)
+    connection = PhasedConnection()
+
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        with store._write_transaction(connection, retry_budget_s=0.05):
+            pass
+
+    assert sum(sleeps) == pytest.approx(0.05)
+    assert connection.begin_attempts == 2
+    assert connection.commit_attempts >= 2
+    assert connection.rollbacks == 1
+    assert connection.busy_timeouts[-1] == shared_metrics_module._BUSY_TIMEOUT_MS
+    assert max(connection.busy_timeouts[:-1]) <= 50
+
+
+def test_uncontended_model_call_does_not_enter_the_retry_sleep(tmp_path, monkeypatch):
+    def fail_if_called(_seconds):
+        pytest.fail("uncontended write entered the lock retry path")
+
+    monkeypatch.setattr(shared_metrics_module.time, "sleep", fail_if_called)
+    store = SharedMetricsStore(tmp_path / "metrics.sqlite3", tmp_path / "outbox")
+
+    store.record_model_call(_dimensions(), _resource())
+
+    assert store.counter_snapshot()[0]["value"] == 1
+
+
+def test_non_lock_operational_error_is_not_retried(monkeypatch):
+    class BrokenConnection:
+        attempts = 0
+
+        def execute(self, statement):
+            if statement.startswith("PRAGMA"):
+                return None
+            self.attempts += 1
+            raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(
+        shared_metrics_module.time,
+        "sleep",
+        lambda _seconds: pytest.fail("non-lock error entered the retry path"),
+    )
+    connection = BrokenConnection()
+
+    with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+        SharedMetricsStore._run_write_boundary(
+            connection,
+            "BEGIN IMMEDIATE",
+            time.monotonic() + 1.5,
+        )
+
+    assert connection.attempts == 1
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX permission modes are unavailable")

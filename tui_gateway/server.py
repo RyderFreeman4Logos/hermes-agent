@@ -23,6 +23,12 @@ from agent.secret_scope import (
     reset_secret_scope,
     set_secret_scope,
 )
+from agent.usage_pricing import (
+    CACHE_HIT_ERROR_THRESHOLD,
+    POST_COMPRESSION_CACHE_NOTE,
+    POST_COMPRESSION_CACHE_WARM_NOTE,
+    cache_hit_percent,
+)
 from hermes_constants import (
     DEFAULT_INDICATOR_STYLE,
     INDICATOR_STYLES,
@@ -1543,6 +1549,12 @@ def _event_frame(event: str, sid: str, payload: dict | None = None) -> dict:
 
 
 def _emit(event: str, sid: str, payload: dict | None = None):
+    # This is the authoritative moment a terminal turn frame leaves the
+    # gateway. Keep it on the frame (rather than a client-side Date.now()) so
+    # the TUI can distinguish a delayed delivery from an agent that just
+    # stopped. Copy rather than mutate because some callers reuse payloads.
+    if event == "message.complete":
+        payload = {**(payload or {}), "completed_at": time.time()}
     write_json(_event_frame(event, sid, payload))
 
 
@@ -4862,6 +4874,13 @@ def _compress_session_history(
     )
 
     agent = session["agent"]
+    compressor = getattr(agent, "context_compressor", None)
+    cache_attribution_pending_before = bool(
+        getattr(agent, "_awaiting_cache_usage_after_compression", False)
+    )
+    real_usage_pending_before = bool(
+        getattr(compressor, "awaiting_real_usage_after_compression", False)
+    )
     # Snapshot history under the lock so the LLM-bound compression call
     # below does NOT hold history_lock for the duration of the request —
     # otherwise other handlers acquiring the lock (prompt.submit etc.)
@@ -5147,6 +5166,82 @@ def _get_usage(agent) -> dict:
         except Exception:
             pass
     return usage
+
+
+def _cache_level(pct: int) -> str:
+    return "error" if pct < CACHE_HIT_ERROR_THRESHOLD else "info"
+
+
+def _cache_info_from_usage(usage: Any) -> dict[str, int | str] | None:
+    if not isinstance(usage, dict):
+        return None
+
+    read_keys = ("cache_read_tokens",)
+    write_keys = (
+        "cache_write_tokens",
+        "cache_creation_tokens",
+        "cache_creation_input_tokens",
+    )
+    telemetry_present = usage.get("cache_telemetry_present")
+    if telemetry_present is not False and not any(
+        key in usage for key in (*read_keys, *write_keys)
+    ):
+        return None
+
+    def tokens(*keys: str) -> int:
+        for key in keys:
+            value = usage.get(key)
+            if value is not None:
+                try:
+                    return max(0, int(float(value)))
+                except (TypeError, ValueError):
+                    pass
+        return 0
+
+    read_tokens = tokens(*read_keys)
+    write_tokens = tokens(*write_keys)
+    prompt_tokens = tokens("prompt_tokens")
+    if telemetry_present is False:
+        cache_info: dict[str, int | str] = {
+            "read_tokens": 0,
+            "prompt_tokens": prompt_tokens,
+            "pct": 0,
+            "state": "unavailable",
+            "level": "info",
+        }
+        if usage.get("cache_attribution") == "post_compression":
+            cache_info.update(
+                attribution="post_compression",
+                note="post-compression cache unavailable",
+            )
+        return cache_info
+
+    pct = cache_hit_percent(read_tokens, prompt_tokens)
+    state = (
+        "hit"
+        if read_tokens
+        else "cold_write"
+        if write_tokens
+        else "unknown"
+        if prompt_tokens < 1024
+        else "miss"
+    )
+    cache_info: dict[str, int | str] = {
+        "read_tokens": read_tokens,
+        "prompt_tokens": prompt_tokens,
+        "pct": pct,
+        "state": state,
+        "level": _cache_level(pct),
+    }
+    if usage.get("cache_attribution") == "post_compression":
+        cache_info["attribution"] = "post_compression"
+        cache_info["level"] = "info"
+        cache_info["note"] = (
+            POST_COMPRESSION_CACHE_WARM_NOTE
+            if state == "hit" and pct >= CACHE_HIT_ERROR_THRESHOLD
+            else POST_COMPRESSION_CACHE_NOTE
+        )
+    return cache_info
 
 
 def _probe_credentials(agent) -> str:
@@ -5957,6 +6052,36 @@ def _agent_cbs(sid: str) -> dict:
     return callbacks
 
 
+def _attach_tui_cache_callback(agent, sid: str):
+    """Attach the first-provider-call cache signal to a live TUI agent."""
+    def emit_cache_state(state: str, pct: int, read: int, prompt: int) -> None:
+        cache_info = _cache_info_from_usage(
+            getattr(agent, "_first_turn_usage", None)
+        ) or {
+            "read_tokens": read,
+            "prompt_tokens": prompt,
+            "pct": pct,
+            "state": state,
+            "level": _cache_level(pct),
+        }
+        state = str(cache_info["state"])
+        pct = int(cache_info["pct"])
+        text = (
+            f"cache {pct}%"
+            if state == "hit"
+            else "cache unavailable"
+            if state == "unavailable"
+            else f"cache {state.upper()}"
+        )
+        if cache_info.get("note"):
+            text += f" · {cache_info['note']}"
+        kind = "error" if cache_info["level"] == "error" else "cache_hit"
+        _emit("status.update", sid, {"kind": kind, "text": text})
+
+    agent._tui_cache_callback = emit_cache_state
+    return agent
+
+
 def _apply_project_workspace(task_id: str, path: str, _name: str = "") -> None:
     """Intentional workspace move from the project_* tools: re-anchor the live
     session's cwd to the chosen project's folder and push session.info so the
@@ -6572,7 +6697,7 @@ def _make_agent(
 
     synthetic = maybe_build_synthetic_agent(session_id or key, model_override)
     if synthetic is not None:
-        return synthetic
+        return _attach_tui_cache_callback(synthetic, sid)
 
     from run_agent import AIAgent
 
@@ -6692,7 +6817,7 @@ def _make_agent(
                 raise RuntimeError("Auth fallback resolved without a model")
             model = resolution.selected_model
     _pr = _load_provider_routing()
-    return AIAgent(
+    agent = AIAgent(
         model=model,
         max_iterations=_cfg_max_turns(cfg, 500),
         provider=runtime.get("provider"),
@@ -6740,6 +6865,7 @@ def _make_agent(
         fallback_model=_load_fallback_model(),
         **_agent_cbs(sid),
     )
+    return _attach_tui_cache_callback(agent, sid)
 
 
 def _init_session(
@@ -9740,6 +9866,70 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
     return stop
 
 
+# Captured at import time. Several _run_prompt_submit tests monkeypatch
+# threading.Thread with a stub that runs the target synchronously to keep the
+# turn deterministic. This ticker's loop only exits once the caller sets `stop`
+# *after* run_conversation returns, so running it inline would spin forever.
+# It's a non-critical, fire-and-forget background poller, so it always uses a
+# real daemon thread regardless of any such patch.
+_RealThread = threading.Thread
+
+
+def _start_usage_ticker(
+    sid: str, agent, interval: float = 1.0
+) -> tuple[threading.Event, threading.Thread]:
+    """Push live usage snapshots while a turn runs.
+
+    The desktop/TUI status-bar context-window figure is otherwise refreshed
+    only at ``message.complete``, so it stays frozen for the whole (often
+    multi-minute, multi-tool) turn. On the standard chat-completions path the
+    agent's token counters grow after every internal API call, so this daemon
+    emits a lightweight ``session.usage`` event every ``interval`` seconds and
+    the bar tracks context growth live. (The codex app-server runtime folds
+    usage into the counters only at turn end — codex_runtime.
+    _record_codex_app_server_usage — so it gets no mid-turn ticks; its final
+    value still lands via ``message.complete``.)
+
+    The caller must set the returned Event AND join the returned thread
+    before emitting ``message.complete``: a tick that survived past it would
+    roll the client's final usage back to a stale mid-turn snapshot.
+    """
+    stop = threading.Event()
+
+    # Sample the dedup baseline BEFORE the thread starts: the client already
+    # has the turn-start values from the previous message.complete /
+    # session.info. Seeding here (not in the thread) guarantees the baseline
+    # predates the turn's first API call — a late-scheduled thread would
+    # otherwise absorb that first counter growth and never emit it.
+    try:
+        baseline: dict | None = _get_usage(agent)
+    except Exception:
+        baseline = None
+
+    def _loop() -> None:
+        last = baseline
+        while not stop.wait(interval):
+            try:
+                usage = _get_usage(agent)
+                if usage == last:
+                    # Counters frozen (e.g. one long API call in flight) —
+                    # skip the redundant frame so idle ticks don't re-render
+                    # the client status bar every second.
+                    continue
+                last = usage
+                if stop.is_set():
+                    # Turn ended while snapshotting — drop the tick;
+                    # message.complete carries the authoritative usage.
+                    break
+                _emit("session.usage", sid, {"usage": usage})
+            except Exception:
+                pass
+
+    thread = _RealThread(target=_loop, daemon=True)
+    thread.start()
+    return stop, thread
+
+
 def _run_prompt_submit(
     rid,
     sid: str,
@@ -10086,6 +10276,7 @@ def _run_prompt_submit(
             if display_kind and "persist_user_display_kind" in _run_params:
                 run_kwargs["persist_user_display_kind"] = display_kind
                 run_kwargs["persist_user_display_metadata"] = display_metadata
+            _usage_stop, _usage_thread = _start_usage_ticker(sid, agent)
             # Auto-compression must activate only after the outer TUI
             # publication fence reanchors the session.
             agent._defer_host_compression_publication = True
@@ -10093,6 +10284,10 @@ def _run_prompt_submit(
                 result = agent.run_conversation(run_message, **run_kwargs)
             finally:
                 agent._defer_host_compression_publication = False
+                # Stop and join before terminal events so a stale live tick
+                # cannot arrive after message.complete.
+                _usage_stop.set()
+                _usage_thread.join()
             heartbeat_silent_noop = bool(
                 heartbeat_turn
                 and isinstance(result, dict)

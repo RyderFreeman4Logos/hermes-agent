@@ -5,6 +5,7 @@ import { getOverlayState, patchOverlayState, resetOverlayState } from '../app/ov
 import { turnController } from '../app/turnController.js'
 import { getTurnState, resetTurnState } from '../app/turnStore.js'
 import { getUiState, patchUiState, resetUiState } from '../app/uiStore.js'
+import { ZERO } from '../domain/usage.js'
 import { estimateTokensRough } from '../lib/text.js'
 import type { Msg } from '../types.js'
 
@@ -1905,6 +1906,47 @@ describe('createGatewayEventHandler', () => {
     })
   })
 
+  describe('session.usage', () => {
+    it('merges a live usage tick into uiState (payload.usage shape, see tui_gateway _start_usage_ticker)', () => {
+      patchUiState({ sid: 'sess-1' })
+      const onEvent = createGatewayEventHandler(buildCtx([]))
+
+      onEvent({
+        payload: { usage: { calls: 3, context_percent: 42, input: 1200, output: 80, total: 1280 } },
+        session_id: 'sess-1',
+        type: 'session.usage'
+      } as any)
+
+      expect(getUiState().usage).toMatchObject({ context_percent: 42, input: 1200, total: 1280 })
+    })
+
+    it('keeps existing usage fields when the tick only carries a subset', () => {
+      patchUiState({ sid: 'sess-1', usage: { calls: 2, input: 500, output: 40, total: 540 } })
+      const onEvent = createGatewayEventHandler(buildCtx([]))
+
+      onEvent({
+        payload: { usage: { context_percent: 55 } },
+        session_id: 'sess-1',
+        type: 'session.usage'
+      } as any)
+
+      expect(getUiState().usage).toMatchObject({ context_percent: 55, input: 500, total: 540 })
+    })
+
+    it('drops a tick for a non-focused session', () => {
+      patchUiState({ sid: 'focused', usage: ZERO })
+      const onEvent = createGatewayEventHandler(buildCtx([]))
+
+      onEvent({
+        payload: { usage: { input: 9999, total: 9999 } },
+        session_id: 'background',
+        type: 'session.usage'
+      } as any)
+
+      expect(getUiState().usage).toEqual(ZERO)
+    })
+  })
+
   describe('message.interim', () => {
     it('finalizes an interim segment without settling the turn', () => {
       const appended: Msg[] = []
@@ -1980,5 +2022,119 @@ describe('createGatewayEventHandler', () => {
       expect(getUiState().busy).toBe(true)
       expect(appended).toHaveLength(0)
     })
+  })
+
+  it('adds the local completion time after the assistant response', () => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+    const formatTime = vi.spyOn(Date.prototype, 'toLocaleTimeString').mockReturnValue('14:23:05')
+
+    try {
+      onEvent({
+        payload: { completed_at: 1_700_000_000.25, text: 'final answer' },
+        type: 'message.complete'
+      } as any)
+
+      expect(appended).toEqual([
+        { role: 'assistant', text: 'final answer' },
+        { kind: 'event', role: 'system', text: '完成 14:23:05' }
+      ])
+      expect(formatTime).toHaveBeenCalledWith('en-GB', {
+        hour: '2-digit',
+        hour12: false,
+        minute: '2-digit',
+        second: '2-digit'
+      })
+    } finally {
+      formatTime.mockRestore()
+    }
+  })
+
+  it('renders a sub-95 first-call cache hit as an error event', () => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+    onEvent({
+      payload: {
+        cache_info: { level: 'error', pct: 94, prompt_tokens: 2_000, read_tokens: 1_880, state: 'hit' },
+        text: 'final answer'
+      },
+      type: 'message.complete'
+    } as any)
+
+    expect(appended).toEqual([
+      { role: 'assistant', text: 'final answer' },
+      { kind: 'event', role: 'system', text: 'cache 94%', tone: 'error' }
+    ])
+  })
+
+  it('keeps an exact-95 post-compression cache hit warm and non-error', () => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+    onEvent({
+      payload: {
+        cache_info: {
+          attribution: 'post_compression',
+          level: 'info',
+          note: 'post-compression cache warm',
+          pct: 95,
+          prompt_tokens: 2_000,
+          read_tokens: 1_900,
+          state: 'hit'
+        },
+        text: 'final answer'
+      },
+      type: 'message.complete'
+    } as any)
+
+    expect(appended).toEqual([
+      { role: 'assistant', text: 'final answer' },
+      { kind: 'event', role: 'system', text: 'cache 95% · post-compression cache warm' }
+    ])
+  })
+
+  it('renders post-compression low cache as expected warmup, not an error', () => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+    onEvent({
+      payload: {
+        cache_info: {
+          attribution: 'post_compression',
+          level: 'info',
+          note: 'post-compression warmup (expected)',
+          pct: 94,
+          prompt_tokens: 2_000,
+          read_tokens: 1_880,
+          state: 'hit'
+        },
+        text: 'final answer'
+      },
+      type: 'message.complete'
+    } as any)
+
+    expect(appended).toEqual([
+      { role: 'assistant', text: 'final answer' },
+      { kind: 'event', role: 'system', text: 'cache 94% · post-compression warmup (expected)' }
+    ])
+  })
+
+  it('renders omitted cache telemetry as neutral unavailable', () => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+    onEvent({
+      payload: {
+        cache_info: { level: 'info', pct: 0, prompt_tokens: 2_000, read_tokens: 0, state: 'unavailable' },
+        text: 'final answer'
+      },
+      type: 'message.complete'
+    } as any)
+
+    expect(appended).toEqual([
+      { role: 'assistant', text: 'final answer' },
+      { kind: 'event', role: 'system', text: 'cache unavailable' }
+    ])
   })
 })

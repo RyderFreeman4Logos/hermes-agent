@@ -769,6 +769,28 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     tool_calls = assistant_message.tool_calls
     num_tools = len(tool_calls)
 
+    # Public/internal callers may invoke this entry directly. Re-apply the
+    # planner so identical retries cannot all launch before their results are
+    # available to the no-progress guardrail.
+    if finalize and num_tools > 1:
+        _active_env = get_active_env(effective_task_id)
+        _exec_cwd = (
+            Path(_active_env.cwd)
+            if _active_env is not None and _active_env.cwd
+            else None
+        )
+        segments = _plan_tool_batch_segments(tool_calls, execution_cwd=_exec_cwd)
+        if len(segments) != 1 or segments[0][0] != "parallel":
+            execute_tool_calls_segmented(
+                agent,
+                assistant_message,
+                messages,
+                effective_task_id,
+                api_call_count,
+                segments=segments,
+            )
+            return
+
     # Resolve the context-scaled tool-output budget once per turn (cheap, but
     # avoids rebuilding it per result inside the loop below).
     _tool_budget = _budget_for_agent(agent)
@@ -1366,6 +1388,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # tool genuinely succeeded, just slightly late.
         effect_disposition = None
         if i in timed_out_indices and r is None:
+            agent._tool_guardrails.break_observation_streak()
             suffix = f"{timeout_s:.1f}s" if timeout_s is not None else "the configured timeout"
             function_result = f"Error executing tool '{name}': timed out after {suffix}"
             effect_disposition = "unknown"
@@ -1384,6 +1407,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             )
             tool_duration = float(timeout_s or 0.0)
         elif r is None:
+            agent._tool_guardrails.break_observation_streak()
             # Tool was cancelled (interrupt) or thread didn't return
             if agent._interrupt_requested:
                 function_result = f"[Tool execution cancelled — {name} was skipped due to user interrupt]"
@@ -1442,6 +1466,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     function_result,
                     failed=is_error,
                 )
+            else:
+                agent._tool_guardrails.break_observation_streak()
 
             if is_error:
                 _err_text = _multimodal_text_summary(function_result)
@@ -2243,6 +2269,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             result_preview = function_result if agent.verbose_logging else (
                 function_result[:200] if len(function_result) > 200 else function_result
             )
+        else:
+            agent._tool_guardrails.break_observation_streak()
         if _is_error_result:
             logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
         else:

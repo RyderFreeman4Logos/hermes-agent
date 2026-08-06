@@ -1173,6 +1173,15 @@ auxiliary:
     api_key: ""
     timeout: 30                # seconds
 
+  # Optional fail-open filter for routine successful background-process exits.
+  # Disabled by default: enable only after the selected auxiliary route works.
+  completion_visibility:
+    enabled: false
+    provider: pm
+    model: gpt-5.6-luna
+    reasoning_effort: max
+    timeout: 20               # total single-request budget; no retry or fallback
+
   # Gemini 3.1 TTS hidden audio-tag insertion
   tts_audio_tags:
     provider: "auto"

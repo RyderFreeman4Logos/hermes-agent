@@ -31,11 +31,13 @@ class TestForegroundTimeoutCap:
     """FOREGROUND_MAX_TIMEOUT rejects foreground commands that exceed it."""
 
     def test_foreground_timeout_rejected_above_max(self):
-        """When model requests timeout > FOREGROUND_MAX_TIMEOUT, return error."""
+        """When promotion is disabled by a higher threshold, the hard cap rejects."""
         from tools.terminal_tool import terminal_tool, FOREGROUND_MAX_TIMEOUT
 
-        with patch("tools.terminal_tool._get_env_config", return_value=_make_env_config()), \
-             patch("tools.terminal_tool._start_cleanup_thread"):
+        with patch(
+            "tools.terminal_tool._get_env_config",
+            return_value=_make_env_config(auto_background_timeout_threshold=10000),
+        ), patch("tools.terminal_tool._start_cleanup_thread"):
 
             result = json.loads(terminal_tool(
                 command="echo hello",
@@ -90,39 +92,34 @@ class TestForegroundTimeoutCap:
         assert call_kwargs[0][0] == "pnpm dev --help"
 
 
-    def test_config_default_above_cap_not_rejected(self):
-        """When config default timeout > cap but model passes no timeout, execute normally.
-
-        Only the model's explicit timeout parameter triggers rejection,
-        not the user's configured default.
-        """
+    def test_config_default_above_cap_is_checked(self):
+        """The hard cap inspects the effective configured foreground budget."""
         from tools.terminal_tool import terminal_tool
 
-        # User configured TERMINAL_TIMEOUT=900 in their env
-        with patch("tools.terminal_tool._get_env_config",
-                    return_value=_make_env_config(timeout=900)), \
-             patch("tools.terminal_tool._start_cleanup_thread"):
+        # Keep the promotion threshold above the configured timeout so this
+        # specifically exercises the final foreground cap.
+        with patch(
+            "tools.terminal_tool._get_env_config",
+            return_value=_make_env_config(
+                timeout=900, auto_background_timeout_threshold=1000
+            ),
+        ), patch("tools.terminal_tool._start_cleanup_thread"):
+            result = json.loads(terminal_tool(command="make build"))
 
-            mock_env = MagicMock()
-            mock_env.execute.return_value = {"output": "done", "returncode": 0}
-
-            with patch("tools.terminal_tool._active_environments", {"default": mock_env}), \
-                 patch("tools.terminal_tool._last_activity", {"default": 0}), \
-                 patch("tools.terminal_tool._check_all_guards", return_value={"approved": True}):
-                result = json.loads(terminal_tool(command="make build"))
-
-        # Should execute with the config default, NOT be rejected
-        call_kwargs = mock_env.execute.call_args
-        assert call_kwargs[1]["timeout"] == 900
-        assert "error" not in result or result["error"] is None
+        assert "900" in result["error"]
+        assert "background=true" in result["error"]
 
 
     def test_exactly_at_max_not_rejected(self):
         """Timeout exactly at FOREGROUND_MAX_TIMEOUT should execute normally."""
         from tools.terminal_tool import terminal_tool, FOREGROUND_MAX_TIMEOUT
 
-        with patch("tools.terminal_tool._get_env_config", return_value=_make_env_config()), \
-             patch("tools.terminal_tool._start_cleanup_thread"):
+        with patch(
+            "tools.terminal_tool._get_env_config",
+            return_value=_make_env_config(
+                auto_background_timeout_threshold=FOREGROUND_MAX_TIMEOUT
+            ),
+        ), patch("tools.terminal_tool._start_cleanup_thread"):
 
             mock_env = MagicMock()
             mock_env.execute.return_value = {"output": "done", "returncode": 0}

@@ -31,6 +31,8 @@ import time
 import types
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 
 def _make_cli():
     """Build a HermesCLI with prompt_toolkit stubbed (same pattern as
@@ -154,6 +156,260 @@ def test_unacknowledged_interrupt_message_is_requeued_not_dropped():
     assert agent.clear_calls >= 1
 
 
+@pytest.mark.parametrize("api_mode", ["chat_completions", "codex_app_server"])
+def test_acknowledged_heartbeat_interrupt_is_cleared_before_requeue(api_mode):
+    cli = _make_cli()
+
+    class HeartbeatAgent(_StubAgent):
+        def run_conversation(self, **kwargs):
+            assert kwargs["turn_origin"] == "heartbeat_warm"
+            time.sleep(self.turn_seconds)
+            return {
+                "final_response": "",
+                "messages": [],
+                "api_calls": 1,
+                "completed": False,
+                "partial": True,
+                "interrupted": True,
+                "interrupt_message": self._interrupt_message,
+                "response_previewed": True,
+            }
+
+    class CheckingQueue(queue.Queue):
+        def put(self, item, *args, **kwargs):
+            assert agent._interrupt_requested is False
+            super().put(item, *args, **kwargs)
+
+    agent = HeartbeatAgent(cli.session_id)
+    agent.api_mode = api_mode
+    cli.agent = agent
+    cli._interrupt_queue = queue.Queue()
+    cli._pending_input = CheckingQueue()
+    cli._interrupt_queue.put("real user prompt")
+
+    with patch.object(cli, "_ensure_runtime_credentials", return_value=True), patch.object(
+        cli,
+        "_resolve_turn_agent_config",
+        return_value={
+            "signature": cli._active_agent_route_signature,
+            "model": None,
+            "runtime": None,
+            "request_overrides": None,
+        },
+    ), patch.object(cli, "_init_agent", return_value=True):
+        cli.chat("[HEARTBEAT] inspect target", heartbeat_warm=True)
+
+    assert cli._pending_input.get_nowait() == "real user prompt"
+    assert agent.clear_calls == 1
+    assert agent._interrupt_requested is False
+    assert cli.conversation_history == []
+
+
+def test_unhealthy_heartbeat_skips_user_voice_and_title_state():
+    cli = _make_cli()
+
+    class HeartbeatAgent(_StubAgent):
+        def run_conversation(self, **kwargs):
+            assert kwargs["turn_origin"] == "heartbeat_warm"
+            return {
+                "final_response": "",
+                "messages": [],
+                "api_calls": 1,
+                "completed": False,
+                "failed": True,
+                "error": "target is stuck",
+                "response_previewed": True,
+            }
+
+    cli.agent = HeartbeatAgent(cli.session_id, turn_seconds=0)
+    cli._interrupt_queue = queue.Queue()
+    cli._pending_input = queue.Queue()
+    cli._voice_mode = True
+    cli._voice_continuous = True
+    cli._voice_tts = True
+    cli._voice_full_duplex_listener = MagicMock()
+    cli._voice_speak_response_async = MagicMock()
+
+    with patch.object(cli, "_ensure_runtime_credentials", return_value=True), patch.object(
+        cli,
+        "_resolve_turn_agent_config",
+        return_value={
+            "signature": cli._active_agent_route_signature,
+            "model": None,
+            "runtime": None,
+            "request_overrides": None,
+        },
+    ), patch.object(cli, "_init_agent", return_value=True), patch(
+        "tools.tts_tool.check_tts_requirements"
+    ) as tts_requirements, patch(
+        "tools.voice_mode.start_thinking_sound"
+    ) as thinking_sound, patch(
+        "agent.title_generator.maybe_auto_title"
+    ) as auto_title:
+        response = cli.chat("[HEARTBEAT] inspect target", heartbeat_warm=True)
+
+    assert response == "Error: target is stuck"
+    assert cli._voice_continuous is True
+    cli._voice_full_duplex_listener.assert_not_called()
+    cli._voice_speak_response_async.assert_not_called()
+    tts_requirements.assert_not_called()
+    thinking_sound.assert_not_called()
+    auto_title.assert_not_called()
+
+
+@pytest.mark.parametrize("heartbeat_warm", [True, False], ids=["heartbeat", "user-control"])
+def test_process_loop_heartbeat_skips_user_turn_automation(
+    heartbeat_warm, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setenv("HERMES_DEFER_AGENT_STARTUP", "1")
+    cli = _make_cli()
+    cli_globals = type(cli).run.__globals__
+    forbidden: list[str] = []
+    chat_seen = threading.Event()
+    post_turn = threading.Event()
+
+    app = MagicMock()
+    app.is_running = True
+
+    def run_app():
+        cli._voice_mode = True
+        cli._voice_continuous = True
+        cli._voice_recording = False
+        cli._voice_tts = False
+        cli._pending_input.put(
+            cli_globals["_HeartbeatWarmMessage"](
+                "[HEARTBEAT] target remains STUCK"
+            )
+            if heartbeat_warm
+            else "normal user turn"
+        )
+        assert post_turn.wait(5), "classic process loop did not finish heartbeat turn"
+
+    app.run.side_effect = run_app
+
+    def chat(*_args, **kwargs):
+        assert kwargs["heartbeat_warm"] is heartbeat_warm
+        chat_seen.set()
+
+    def drain_notifications(stage):
+        if stage == "cli-post-turn":
+            cli._should_exit = True
+            post_turn.set()
+
+    def record_microphone_start():
+        forbidden.append("microphone")
+
+    real_thread = threading.Thread
+
+    def make_thread(*args, **kwargs):
+        target = kwargs.get("target")
+        if getattr(target, "__name__", "") == "_restart_recording":
+            immediate = MagicMock()
+            immediate.start.side_effect = target
+            return immediate
+        return real_thread(*args, **kwargs)
+
+    threading_proxy = MagicMock(wraps=threading)
+    threading_proxy.Thread.side_effect = make_thread
+    monkeypatch.setitem(cli_globals, "threading", threading_proxy)
+
+    for name in (
+        "prewarm_picker_cache_async",
+        "maybe_run_curator",
+        "maybe_pull_skills",
+        "maybe_pull_org_skills",
+        "_apply_bracketed_paste_timeout_patch",
+        "_disable_prompt_toolkit_cpr_warning",
+        "_mark_tui_input_modes_active",
+        "_run_cleanup",
+    ):
+        monkeypatch.setitem(cli_globals, name, lambda *_args, **_kwargs: None)
+    monkeypatch.setitem(cli_globals, "detect_openclaw_residue", lambda: False)
+    monkeypatch.setitem(
+        cli_globals, "get_plugin_manager", MagicMock(return_value=MagicMock())
+    )
+    monkeypatch.setitem(
+        cli_globals, "_select_classic_cli_pt_output", lambda _stdout: None
+    )
+    monkeypatch.setitem(cli_globals, "Application", MagicMock(return_value=app))
+
+    for name in (
+        "show_banner",
+        "_show_security_advisories",
+        "_preload_resumed_session",
+        "_display_resumed_history",
+        "_console_print",
+        "_install_tool_callbacks",
+        "_ensure_tirith_security",
+        "_check_config_mcp_changes",
+        "_print_user_message_preview",
+        "_turn_summary_begin",
+        "_turn_summary_emit",
+        "_recover_terminal_after_interrupt",
+        "_drain_interrupt_queue_to_pending_input",
+        "_maybe_start_wake_word",
+        "_pet_start_anim",
+        "_pet_stop_anim",
+        "_persist_active_session_before_close",
+        "_print_exit_summary",
+        "_release_active_session",
+    ):
+        monkeypatch.setattr(cli, name, lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cli, "_claim_active_session", lambda _surface: True)
+    monkeypatch.setattr(cli, "_typed_voice_stop", lambda _text: False)
+    monkeypatch.setattr(cli, "chat", chat)
+    monkeypatch.setattr(cli, "_drain_process_notifications", drain_notifications)
+    monkeypatch.setattr(cli, "_pet_react_turn_end", lambda: forbidden.append("pet"))
+    monkeypatch.setattr(
+        cli,
+        "_maybe_continue_goal_after_turn",
+        lambda: forbidden.append("goal"),
+    )
+    monkeypatch.setattr(cli, "_voice_start_recording", record_microphone_start)
+
+    cli.run()
+
+    assert chat_seen.is_set()
+    assert forbidden == ([] if heartbeat_warm else ["pet", "goal", "microphone"])
+
+
+def test_completion_delivery_chat_stages_ephemeral_user_message():
+    cli = _make_cli()
+
+    class CompletionAgent(_StubAgent):
+        def run_conversation(self, **kwargs):
+            assert self._pending_cli_user_message == {
+                "role": "user",
+                "content": "completion prompt",
+                "_completion_delivery_synthetic": True,
+            }
+            return {
+                "final_response": "Build finished successfully",
+                "messages": [
+                    {"role": "assistant", "content": "Build finished successfully"}
+                ],
+                "api_calls": 1,
+                "completed": True,
+                "partial": True,
+                "response_previewed": True,
+            }
+
+    cli.agent = CompletionAgent(cli.session_id, turn_seconds=0)
+    cli._interrupt_queue = queue.Queue()
+    cli._pending_input = queue.Queue()
+
+    with patch.object(cli, "_ensure_runtime_credentials", return_value=True), patch.object(
+        cli,
+        "_resolve_turn_agent_config",
+        return_value={
+            "signature": cli._active_agent_route_signature,
+            "model": None,
+            "runtime": None,
+            "request_overrides": None,
+        },
+    ), patch.object(cli, "_init_agent", return_value=True):
+        cli.chat("completion prompt", completion_delivery=True)
 
 
 def test_chat_persists_clean_input_when_a_queued_note_changes_api_message():

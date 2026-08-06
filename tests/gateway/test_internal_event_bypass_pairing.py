@@ -39,6 +39,15 @@ class _FakeRegistry:
     def is_completion_consumed(self, session_id):
         return session_id in self._completion_consumed
 
+    def claim_completion_delivery(self, _event):
+        return True
+
+    def complete_completion_delivery(self, _event):
+        pass
+
+    def release_completion_delivery(self, _event):
+        pass
+
 
 def _build_runner(monkeypatch, tmp_path) -> GatewayRunner:
     """Create a GatewayRunner with notifications set to 'all'."""
@@ -211,5 +220,4 @@ async def test_none_user_id_does_not_generate_pairing_code(monkeypatch, tmp_path
     assert not generate_called, (
         "Pairing code should NOT be generated for messages with user_id=None"
     )
-
 

@@ -23,9 +23,11 @@ import random
 import re
 import ssl
 import time
+from copy import deepcopy
 from typing import Any, Dict, List, Optional
 
 from agent import relay_llm
+from agent.chat_completion_helpers import estimate_request_context_tokens
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.conversation_compression import (
     COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
@@ -967,6 +969,15 @@ def _rewrite_system_content_blocks(system_message: dict, effective: str) -> bool
     return False
 
 
+def _effective_system_prompt(agent, active_system_prompt):
+    """Return the byte-exact system prefix used for a physical request."""
+    effective = active_system_prompt or ""
+    ephemeral = getattr(agent, "ephemeral_system_prompt", None)
+    if ephemeral:
+        effective = (effective + "\n\n" + ephemeral).strip()
+    return effective
+
+
 def _sync_failover_system_message(agent, api_messages, active_system_prompt):
     """Refresh the in-flight system message after a provider failover.
 
@@ -986,9 +997,7 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
     if not isinstance(sp, str) or not sp:
         return active_system_prompt
     if api_messages and api_messages[0].get("role") == "system":
-        effective = sp
-        if agent.ephemeral_system_prompt:
-            effective = (effective + "\n\n" + agent.ephemeral_system_prompt).strip()
+        effective = _effective_system_prompt(agent, sp)
         if not _rewrite_system_content_blocks(api_messages[0], effective):
             api_messages[0]["content"] = effective
     return sp
@@ -1229,6 +1238,232 @@ def _notify_context_engine_turn_complete(
             getattr(agent, "session_id", None) or "-",
             exc_info=True,
         )
+
+
+def _record_runtime_provider_activity(
+    agent,
+    activity_at: float,
+    *,
+    caller_id: str | None = None,
+    provider: str | None = None,
+    cache_context: str | None = None,
+) -> None:
+    """Rearm only the cache group reached by a successful provider call."""
+    if caller_id is None and getattr(agent, "_delegate_depth", 0):
+        return
+    try:
+        from tools.approval import get_current_session_key
+        from tools.runtime_heartbeat import (
+            canonical_runtime_cache_context_identity,
+            canonical_runtime_provider_identity,
+            runtime_heartbeat,
+        )
+
+        owner = caller_id or (get_current_session_key(default="") or "")
+        if not owner:
+            return
+        runtime_heartbeat.reset_for_caller(
+            owner,
+            provider=(
+                provider
+                if provider is not None
+                else canonical_runtime_provider_identity(agent)
+            ),
+            cache_context=(
+                cache_context
+                if cache_context is not None
+                else canonical_runtime_cache_context_identity(agent)
+            ),
+            activity_at=activity_at,
+        )
+    except Exception:
+        logger.debug("Could not reset exact heartbeat cache lease", exc_info=True)
+
+
+def run_heartbeat_warm(
+    agent,
+    user_message: Any,
+    system_message: str = None,
+    conversation_history: List[Dict[str, Any]] = None,
+    *,
+    moa_config: Optional[dict[str, Any]] = None,
+    heartbeat_event: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Run one isolated cache-warm attempt without entering the turn lifecycle."""
+    retained_history = list(conversation_history or [])
+    request_history = list(
+        conversation_history
+        if conversation_history is not None
+        else (getattr(agent, "_session_messages", None) or [])
+    )
+    api_calls = 0
+
+    def finish(*, silent: bool, status: str = "", evidence: str = ""):
+        final = "" if silent else (
+            f"[HEARTBEAT ALERT] {status}: "
+            f"{evidence or 'target liveness is uncertain'}"
+        )
+        return {
+            "final_response": final,
+            "messages": retained_history,
+            "api_calls": api_calls,
+            "completed": True,
+            "failed": False,
+            "error": None,
+            "silent_noop": silent,
+            "turn_exit_reason": (
+                "heartbeat_silent_noop" if silent else "heartbeat_alert"
+            ),
+            "response_previewed": False,
+        }
+
+    from tools.runtime_heartbeat import runtime_heartbeat
+
+    if not isinstance(heartbeat_event, dict) or not runtime_heartbeat.is_event_current(
+        heartbeat_event, agent
+    ):
+        return finish(silent=True)
+    status = str(heartbeat_event.get("status") or "").upper()
+    if status in {"STUCK", "UNKNOWN"}:
+        return finish(
+            silent=False,
+            status=status,
+            evidence=str(heartbeat_event.get("evidence") or ""),
+        )
+    api_mode = str(getattr(agent, "api_mode", "") or "").lower()
+    provider = str(getattr(agent, "provider", "") or "").lower()
+    base_url = str(getattr(agent, "base_url", "") or "").lower()
+    dispatch_client = agent.client
+    from agent.copilot_acp_client import CopilotACPClient
+    from agent.gemini_native_adapter import GeminiNativeClient
+
+    if (
+        status != "ALIVE"
+        or moa_config is not None
+        or provider in {
+            "anthropic",
+            "copilot-acp",
+            "gemini",
+            "moa",
+            "openai-codex",
+        }
+        or base_url.startswith(("acp://copilot", "acp+tcp://"))
+        or isinstance(dispatch_client, (CopilotACPClient, GeminiNativeClient))
+        or api_mode != "chat_completions"
+    ):
+        return finish(silent=True)
+
+    api_messages = []
+    for message in request_history:
+        if not isinstance(message, dict):
+            continue
+        api_message = deepcopy(message)
+        api_content = api_message.pop("api_content", None)
+        if (
+            isinstance(api_content, str)
+            and api_content
+            and message.get("role") in {"user", "assistant"}
+        ):
+            api_message["content"] = api_content
+        for field in (
+            "display_kind",
+            "display_metadata",
+            "_row_id",
+            "reasoning",
+            "finish_reason",
+            "_thinking_prefill",
+        ):
+            api_message.pop(field, None)
+        agent._copy_reasoning_content_for_api(message, api_message)
+        if agent._should_sanitize_tool_calls():
+            agent._sanitize_tool_calls_for_strict_api(api_message, model=agent.model)
+        api_messages.append(api_message)
+    api_messages.append({"role": "user", "content": deepcopy(user_message)})
+
+    active_system_prompt = (
+        system_message
+        if system_message is not None
+        else getattr(agent, "_cached_system_prompt", None)
+    )
+    effective_system = _effective_system_prompt(agent, active_system_prompt)
+    if effective_system:
+        api_messages.insert(0, {"role": "system", "content": effective_system})
+    if agent.prefill_messages:
+        system_offset = int(
+            bool(api_messages and api_messages[0].get("role") == "system")
+        )
+        for index, prefill in enumerate(agent.prefill_messages):
+            api_messages.insert(system_offset + index, deepcopy(prefill))
+    api_messages = agent._sanitize_api_messages(api_messages)
+    api_messages = agent._drop_thinking_only_and_merge_users(
+        api_messages,
+        drop_codex_reasoning_items=True,
+    )
+    for message in api_messages:
+        if isinstance(message.get("content"), str):
+            message["content"] = message["content"].strip()
+        for tool_call in message.get("tool_calls") or ():
+            try:
+                arguments = json.loads(tool_call["function"]["arguments"])
+                tool_call["function"]["arguments"] = json.dumps(
+                    arguments, separators=(",", ":"), sort_keys=True
+                )
+            except Exception:
+                try:
+                    tool_call["function"]["arguments"] = _repair_tool_call_arguments(
+                        tool_call["function"].get("arguments"),
+                        tool_call["function"].get("name", "?"),
+                    )
+                except Exception:
+                    pass
+    if agent._use_prompt_caching:
+        static_system_prefix = getattr(agent, "_cached_system_prompt_static", None)
+        api_messages = apply_anthropic_cache_control(
+            api_messages,
+            cache_ttl=agent._cache_ttl,
+            native_anthropic=agent._use_native_cache_layout,
+            static_system_prefix=(
+                static_system_prefix
+                if isinstance(static_system_prefix, str)
+                else None
+            ),
+        )
+
+    api_kwargs = agent._build_api_kwargs(api_messages)
+    if api_kwargs.get("tools"):
+        api_kwargs["tool_choice"] = "none"
+    api_kwargs["stream"] = False
+    configured_limit = int(
+        getattr(getattr(agent, "context_compressor", None), "threshold_tokens", 0)
+        or 0
+    )
+    pressure_limit = min(
+        limit for limit in (configured_limit, 272_000) if limit > 0
+    )
+    if estimate_request_context_tokens(api_kwargs) >= pressure_limit:
+        return finish(silent=True)
+    if not runtime_heartbeat.is_event_current(
+        heartbeat_event, agent, consume=True
+    ):
+        return finish(silent=True)
+
+    api_calls = 1
+    dispatch_started_at = time.monotonic()
+    try:
+        response = dispatch_client.chat.completions.create(**api_kwargs)
+        if not agent._get_transport().validate_response(response):
+            return finish(silent=True)
+    except Exception:
+        logger.debug("Isolated heartbeat warm attempt failed", exc_info=True)
+    else:
+        _record_runtime_provider_activity(
+            agent,
+            dispatch_started_at,
+            caller_id=str(heartbeat_event.get("session_key") or ""),
+            provider=str(heartbeat_event.get("provider") or ""),
+            cache_context=str(heartbeat_event.get("cache_context") or ""),
+        )
+    return finish(silent=True)
 
 
 def run_conversation(
@@ -1639,6 +1874,7 @@ def run_conversation(
                     )
                     if _composed is not None:
                         api_msg["content"] = _composed
+
             elif (
                 isinstance(_api_content, str)
                 and _api_content
@@ -1714,9 +1950,7 @@ def run_conversation(
         # every turn. ``apply_anthropic_cache_control`` may split its stable
         # prefix into content blocks on the wire, but the stored string and
         # its byte-stability remain unchanged.
-        effective_system = active_system_prompt or ""
-        if agent.ephemeral_system_prompt:
-            effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
+        effective_system = _effective_system_prompt(agent, active_system_prompt)
         if effective_system:
             api_messages = [{"role": "system", "content": effective_system}] + api_messages
 
@@ -2393,7 +2627,36 @@ def run_conversation(
                     if isinstance(getattr(agent, "client", None), Mock):
                         _use_streaming = False
 
+                provider_dispatch_started_at = None
+                provider_dispatch_context = None
+
+                def _mark_provider_dispatch(dispatch_started_at):
+                    nonlocal provider_dispatch_started_at, provider_dispatch_context
+                    provider_dispatch_started_at = dispatch_started_at
+                    provider_dispatch_context = None
+                    if dispatch_started_at is None:
+                        return
+                    from tools.runtime_heartbeat import (
+                        canonical_runtime_cache_context_identity,
+                        canonical_runtime_provider_identity,
+                    )
+
+                    provider_dispatch_context = (
+                        canonical_runtime_provider_identity(agent),
+                        canonical_runtime_cache_context_identity(agent),
+                    )
+
+                def _perform_physical_api_call(physical_api_kwargs):
+                    dispatch_started_at = time.monotonic()
+                    _mark_provider_dispatch(dispatch_started_at)
+                    try:
+                        return agent._interruptible_api_call(physical_api_kwargs)
+                    except BaseException:
+                        _mark_provider_dispatch(None)
+                        raise
+
                 def _perform_api_call(next_api_kwargs):
+                    _mark_provider_dispatch(None)
                     if terminal_text_only:
                         next_api_kwargs = dict(next_api_kwargs)
                         relay_llm.disable_tools(next_api_kwargs)
@@ -2407,11 +2670,13 @@ def run_conversation(
                     with relay_llm.text_only_requests(terminal_text_only):
                         if _use_streaming:
                             return agent._interruptible_streaming_api_call(
-                                next_api_kwargs, on_first_delta=_stop_spinner
+                                next_api_kwargs,
+                                on_first_delta=_stop_spinner,
+                                on_provider_dispatch=_mark_provider_dispatch,
                             )
                         return relay_llm.execute(
                             next_api_kwargs,
-                            agent._interruptible_api_call,
+                            _perform_physical_api_call,
                             session_id=str(agent.session_id or ""),
                             name=str(agent.provider or "provider"),
                             model_name=str(agent.model or ""),
@@ -2463,13 +2728,13 @@ def run_conversation(
                         with _redirect_lock:
                             if _model_request_active is not None:
                                 _model_request_active.clear()
-                            _redirect_crossed_response = bool(
-                                agent._pending_redirect
-                            )
+                            _redirect_crossed_response = bool(agent._pending_redirect)
                     else:
                         if _model_request_active is not None:
                             _model_request_active.clear()
-                        _redirect_crossed_response = agent._has_pending_redirect()
+                        _redirect_crossed_response = bool(
+                            agent._has_pending_redirect()
+                        )
                 if _redirect_crossed_response:
                     # The response and redirect can cross on different threads:
                     # redirect() observed the request as active just before this
@@ -2758,6 +3023,16 @@ def run_conversation(
                         break  # rebuild this iteration from the correction
                     continue  # Retry the API call
 
+                if (
+                    provider_dispatch_started_at is not None
+                    and provider_dispatch_context is not None
+                ):
+                    _record_runtime_provider_activity(
+                        agent,
+                        provider_dispatch_started_at,
+                        provider=provider_dispatch_context[0],
+                        cache_context=provider_dispatch_context[1],
+                    )
                 agent._turn_received_provider_response = True
 
                 # Check finish_reason before proceeding
@@ -5708,6 +5983,7 @@ def run_conversation(
             agent._ephemeral_max_output_tokens = min(_boost, _boost_cap)
             continue
 
+
         # Guard: if all retries exhausted without a successful response
         # (e.g. repeated context-length errors that exhausted retry_count),
         # the `response` variable is still None. Break out cleanly.
@@ -5746,6 +6022,7 @@ def run_conversation(
                     assistant_message.content = "\n".join(parts)
                 else:
                     assistant_message.content = str(raw)
+
 
             try:
                 from hermes_cli.lifecycle import (

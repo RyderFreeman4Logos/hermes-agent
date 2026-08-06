@@ -9,6 +9,8 @@ state (when available) is acknowledged through its authoritative SQLite API.
 import asyncio
 import json
 import queue
+import threading
+import time
 from collections import OrderedDict
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -84,6 +86,194 @@ def _completion_event(*, started_at, session_id="proc_reused"):
     }
 
 
+def _runtime_heartbeat_event(**overrides):
+    event = {
+        "type": "heartbeat",
+        "target_id": "proc-heartbeat",
+        "target_ids": ["proc-heartbeat"],
+        "generations": [11],
+        "generation": 11,
+        "target_kind": "process",
+        "session_id": "proc-heartbeat",
+        "session_key": "agent:main:telegram:dm:12345:678",
+        "provider": "openai",
+        "cache_context": "openai-cache",
+        "status": "ALIVE",
+        "evidence": "output grew",
+    }
+    event.update(overrides)
+    return event
+
+
+@pytest.fixture
+def current_heartbeat(monkeypatch):
+    monkeypatch.setattr(
+        "tools.runtime_heartbeat.runtime_heartbeat.is_event_current",
+        lambda _event: True,
+    )
+
+
+def test_gateway_heartbeat_routes_to_exact_idle_owner(monkeypatch, current_heartbeat):
+    event = _runtime_heartbeat_event()
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter, origins={event["session_key"]: object()})
+    runner._running_agents = {}
+    isolated = AsyncMock()
+    monkeypatch.setattr(runner, "_run_isolated_heartbeat", isolated)
+
+    asyncio.run(runner._handle_heartbeat_event(event))
+
+    isolated.assert_awaited_once()
+    assert isolated.await_args.args[1:] == (event["session_key"], event)
+    assert not runner._is_session_running(event["session_key"])
+
+
+def test_gateway_raw_api_heartbeat_never_runs_or_self_posts(
+    monkeypatch, current_heartbeat
+):
+    adapter = SimpleNamespace(handle_message=AsyncMock(), supports_push=False)
+    event = _runtime_heartbeat_event(session_key="opaque-api-session")
+    runner = _runner(adapter, origins={event["session_key"]: object()})
+    runner.adapters = {Platform.API_SERVER: adapter}
+    runner._running_agents = {}
+    isolated = AsyncMock()
+    monkeypatch.setattr(runner, "_run_isolated_heartbeat", isolated)
+
+    asyncio.run(runner._handle_heartbeat_event(event))
+
+    isolated.assert_not_awaited()
+    adapter.handle_message.assert_not_awaited()
+
+
+def test_gateway_alive_heartbeat_does_not_duplicate_busy_turn(
+    monkeypatch, current_heartbeat
+):
+    event = _runtime_heartbeat_event()
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter, origins={event["session_key"]: object()})
+    runner._running_agents = {event["session_key"]: object()}
+    isolated = AsyncMock()
+    monkeypatch.setattr(runner, "_run_isolated_heartbeat", isolated)
+
+    asyncio.run(runner._handle_heartbeat_event(event))
+
+    isolated.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_gateway_heartbeat_reserves_busy_slot_and_releases_only_its_owner(
+    monkeypatch, current_heartbeat
+):
+    event = _runtime_heartbeat_event()
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter, origins={event["session_key"]: object()})
+    runner._running_agents = {}
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocked(*_args):
+        started.set()
+        await release.wait()
+
+    monkeypatch.setattr(runner, "_run_isolated_heartbeat", blocked)
+    task = asyncio.create_task(runner._handle_heartbeat_event(event))
+    await started.wait()
+
+    assert runner._is_session_running(event["session_key"])
+    ordinary_owner = object()
+    state = runner._session_state(event["session_key"])
+    state.turn.agent = ordinary_owner
+    state.turn.heartbeat_owner = None
+    release.set()
+    await task
+
+    assert state.turn.agent is ordinary_owner
+    assert state.turn.heartbeat_owner is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exit_kind", ["stale", "exception"])
+async def test_gateway_heartbeat_releases_its_reservation_on_early_exit(
+    monkeypatch, exit_kind
+):
+    event = _runtime_heartbeat_event()
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter, origins={event["session_key"]: object()})
+    runner._running_agents = {}
+    checks = iter((True, exit_kind != "stale"))
+    monkeypatch.setattr(
+        "tools.runtime_heartbeat.runtime_heartbeat.is_event_current",
+        lambda _event: next(checks),
+    )
+
+    async def fail(*_args):
+        raise RuntimeError("heartbeat failed")
+
+    isolated = AsyncMock(side_effect=fail if exit_kind == "exception" else None)
+    monkeypatch.setattr(runner, "_run_isolated_heartbeat", isolated)
+
+    if exit_kind == "exception":
+        with pytest.raises(RuntimeError, match="heartbeat failed"):
+            await runner._handle_heartbeat_event(event)
+    else:
+        await runner._handle_heartbeat_event(event)
+        isolated.assert_not_awaited()
+
+    assert not runner._is_session_running(event["session_key"])
+
+
+@pytest.mark.parametrize("status", ["STUCK", "UNKNOWN"])
+def test_gateway_unhealthy_heartbeat_is_directly_visible_without_model_turn(
+    monkeypatch, current_heartbeat, status
+):
+    event = _runtime_heartbeat_event(status=status, evidence="no progress")
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter, origins={event["session_key"]: object()})
+    runner._running_agents = {event["session_key"]: object()}
+    inject = AsyncMock()
+    deliver = AsyncMock(return_value=True)
+    monkeypatch.setattr(runner, "_inject_watch_notification", inject)
+    monkeypatch.setattr(runner, "_deliver_platform_notice", deliver)
+
+    asyncio.run(runner._handle_heartbeat_event(event))
+
+    inject.assert_not_awaited()
+    deliver.assert_awaited_once()
+    assert status in deliver.await_args.args[1]
+    assert "no progress" in deliver.await_args.args[1]
+
+
+def test_gateway_unhealthy_heartbeat_revalidates_at_notice_boundary(monkeypatch):
+    event = _runtime_heartbeat_event(status="STUCK", evidence="no progress")
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter, origins={event["session_key"]: object()})
+    deliver = AsyncMock()
+    checks = iter((True, False))
+    monkeypatch.setattr(
+        "tools.runtime_heartbeat.runtime_heartbeat.is_event_current",
+        lambda _event: next(checks),
+    )
+    monkeypatch.setattr(runner, "_deliver_platform_notice", deliver)
+
+    asyncio.run(runner._handle_heartbeat_event(event))
+
+    deliver.assert_not_awaited()
+
+
+def test_gateway_foreign_heartbeat_never_crosses_owner(
+    monkeypatch, current_heartbeat
+):
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter, origins={})
+    runner._running_agents = {}
+    inject = AsyncMock(return_value=True)
+    monkeypatch.setattr(runner, "_inject_watch_notification", inject)
+
+    asyncio.run(runner._handle_heartbeat_event(_runtime_heartbeat_event()))
+
+    inject.assert_not_awaited()
+
+
 def _stop_after_sleeps(monkeypatch, runner, count):
     sleep_calls = 0
 
@@ -157,6 +347,115 @@ def test_concurrent_claims_share_the_same_narrow_delivery_seam():
     adapter.handle_message.assert_awaited_once()
 
 
+def test_numeric_completion_gets_nudge_and_unknown_fails_open(monkeypatch):
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    injected = AsyncMock(return_value=True)
+    monkeypatch.setattr(runner, "_inject_watch_notification", injected)
+
+    event = _completion_event(started_at=1.0)
+    assert asyncio.run(runner._deliver_completion_notification("payload", event)) is True
+    prompt = injected.await_args.args[0]
+    assert prompt.startswith("payload")
+    assert "final assistant message must be literally empty (zero characters)" in prompt
+
+    none_event = _completion_event(started_at=2.0)
+    none_event["exit_code"] = None
+    assert asyncio.run(
+        runner._deliver_completion_notification("not complete", none_event)
+    ) is True
+    assert injected.await_count == 2
+    assert injected.await_args.args[0] == "not complete"
+
+
+def test_owner_observed_success_skips_gateway_turn(monkeypatch, isolated_registry):
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    injected = AsyncMock(return_value=True)
+    monkeypatch.setattr(runner, "_inject_watch_notification", injected)
+    monkeypatch.setattr(
+        "tools.approval.get_current_session_key",
+        lambda default="": "agent:main:telegram:dm:123",
+    )
+    event = _completion_event(started_at=3.0)
+    isolated_registry._record_completion_observed(ProcessSession(
+        id=event["session_id"], command=event["command"],
+        session_key=event["session_key"], started_at=event["started_at"],
+        notify_on_complete=True,
+    ))
+
+    assert asyncio.run(
+        runner._deliver_completion_notification("payload", event)
+    ) is None
+    injected.assert_not_awaited()
+
+
+def test_failed_process_injection_releases_lifecycle_claim(monkeypatch):
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    injected = AsyncMock(side_effect=[False, True])
+    monkeypatch.setattr(runner, "_inject_watch_notification", injected)
+    event = _completion_event(started_at=4.0)
+
+    assert asyncio.run(
+        runner._deliver_completion_notification("payload", event)
+    ) is False
+    assert asyncio.run(
+        runner._deliver_completion_notification("payload", event)
+    ) is True
+    assert injected.await_count == 2
+
+
+def test_failed_completion_prompt_releases_lifecycle_claim_for_retry(monkeypatch):
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    injected = AsyncMock(return_value=True)
+    monkeypatch.setattr(runner, "_inject_watch_notification", injected)
+    monkeypatch.setattr(
+        "tools.process_registry.completion_delivery_prompt",
+        MagicMock(side_effect=[RuntimeError("judge failed"), "payload"]),
+    )
+    event = _completion_event(started_at=5.0)
+
+    with pytest.raises(RuntimeError, match="judge failed"):
+        asyncio.run(runner._deliver_completion_notification("payload", event))
+    assert asyncio.run(
+        runner._deliver_completion_notification("payload", event)
+    ) is True
+    injected.assert_awaited_once_with("payload", event)
+
+
+def test_completion_judge_runs_off_loop_and_delivers_after_timeout(monkeypatch):
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    injected = AsyncMock(return_value=True)
+    monkeypatch.setattr(runner, "_inject_watch_notification", injected)
+    entered = threading.Event()
+
+    def timed_out_judge(_event, payload):
+        entered.set()
+        time.sleep(0.05)
+        return payload
+
+    monkeypatch.setattr(
+        "tools.process_registry.completion_delivery_prompt", timed_out_judge
+    )
+    async def exercise():
+        delivery = asyncio.create_task(
+            runner._deliver_completion_notification(
+                "payload", _completion_event(started_at=3.0)
+            )
+        )
+        await asyncio.wait_for(asyncio.to_thread(entered.wait), timeout=1)
+        tick = asyncio.Event()
+        asyncio.get_running_loop().call_later(0.01, tick.set)
+        await asyncio.wait_for(tick.wait(), timeout=0.1)
+        assert not delivery.done()
+        return await delivery
+
+    assert asyncio.run(exercise()) is True
+
+
 def test_failed_async_injection_is_retried_and_only_success_is_acked(
     monkeypatch, isolated_registry,
 ):
@@ -202,7 +501,7 @@ def _persist_pending_completion(event):
     })
 
 
-def test_explicit_kill_returns_output_before_consuming_notification(monkeypatch):
+def test_explicit_kill_returns_output_and_completion_still_fails_open(monkeypatch):
     import tools.process_registry as pr_module
 
     registry = ProcessRegistry()
@@ -216,6 +515,7 @@ def test_explicit_kill_returns_output_before_consuming_notification(monkeypatch)
     )
     session.process = MagicMock()
     session.process.pid = 4242
+    session.process.poll.return_value = -15
     registry._running[session.id] = session
     monkeypatch.setattr(registry, "_terminate_host_pid", lambda *_a, **_kw: None)
     monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
@@ -243,7 +543,7 @@ def test_explicit_kill_returns_output_before_consuming_notification(monkeypatch)
         "notify_on_complete": True,
     }))
 
-    adapter.handle_message.assert_not_awaited()
+    adapter.handle_message.assert_awaited_once()
 
 
 def test_process_tool_redacts_explicit_kill_output(monkeypatch):

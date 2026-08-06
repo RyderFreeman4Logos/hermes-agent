@@ -125,3 +125,38 @@ def test_json_log_drops_only_nudge_keeps_candidate(tmp_path, monkeypatch):
     # Only the nudge is dropped.
     assert "[System: run tests]" not in contents
     assert all(not m.get("_pre_verify_synthetic") for m in data["messages"])
+
+
+@pytest.mark.parametrize("assistant_text", ["Build finished successfully", None])
+def test_completion_delivery_scaffolding_is_not_durable(
+    tmp_path, monkeypatch, assistant_text
+):
+    """Only a meaningful completion response survives SQLite and JSON flushes."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    ra = _fresh_run_agent(tmp_path)
+    agent = _make_agent(ra, f"completion_{bool(assistant_text)}", tmp_path)
+    nudge = {
+        "role": "user",
+        "content": "completion payload and model-only instruction",
+        "_completion_delivery_synthetic": True,
+    }
+    messages = [{"role": "user", "content": "start the build"}, nudge]
+    if assistant_text:
+        messages.append({"role": "assistant", "content": assistant_text})
+
+    agent._flush_messages_to_session_db(messages, conversation_history=[])
+    agent._save_session_log(messages)
+
+    db_contents = [
+        message.get("content")
+        for _args, kwargs in agent._session_db.append_messages_batch.call_args_list
+        for message in kwargs["messages"]
+    ]
+    snapshot = json.loads(
+        (agent.logs_dir / f"session_{agent.session_id}.json").read_text(encoding="utf-8")
+    )
+    json_contents = [message.get("content") for message in snapshot["messages"]]
+    assert nudge["content"] not in db_contents
+    assert nudge["content"] not in json_contents
+    assert (assistant_text in db_contents) is bool(assistant_text)
+    assert (assistant_text in json_contents) is bool(assistant_text)

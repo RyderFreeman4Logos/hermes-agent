@@ -205,10 +205,10 @@ def test_final_response_fills_pure_tool_call_tail(monkeypatch):
 
 
 @pytest.mark.parametrize("assistant_text", ["Build finished successfully", ""])
-def test_completion_nudge_is_removed_from_finalized_live_history(
+def test_completion_delivery_suffix_is_committed_only_for_meaningful_response(
     monkeypatch, assistant_text
 ):
-    """Finalization drops only the nudge for meaningful and empty responses."""
+    """A meaningful pair is durable; a literal-empty suffix is discarded."""
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
     agent = FakeAgent()
     nudge = {
@@ -240,11 +240,19 @@ def test_completion_nudge_is_removed_from_finalized_live_history(
         _turn_exit_reason="text_response(final)" if assistant_text else "empty_response",
     )
 
-    assert nudge not in result["messages"]
-    assert nudge not in agent.persisted_messages
-    assert (assistant_text in [m["content"] for m in result["messages"]]) is bool(
-        assistant_text
-    )
+    if assistant_text:
+        expected_event = {
+            "role": "user",
+            "content": nudge["content"],
+            "display_kind": "hidden",
+            "display_metadata": {"completion_delivery_status": "complete"},
+        }
+        assert result["messages"][2] == expected_event
+        assert agent.persisted_messages[2] == expected_event
+        assert assistant_text in [m["content"] for m in result["messages"]]
+    else:
+        assert nudge not in result["messages"]
+        assert nudge not in agent.persisted_messages
 
 def test_final_response_fill_invalidates_flush_scan_cursor():
     """The fill's marker pop must invalidate the bounded flush-scan cursor.

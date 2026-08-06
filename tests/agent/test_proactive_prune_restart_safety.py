@@ -191,6 +191,52 @@ def test_gateway_eviction_reload_keeps_prune_and_durable_runway(tmp_path: Path) 
     assert cleared.context_compressor._proactive_prune_runway_authoritative is True
 
 
+def test_proactive_prune_does_not_publish_pending_completion_suffix(
+    tmp_path: Path,
+) -> None:
+    """A whole-session prune keeps pending tool work live-only until finalization."""
+    db_path = tmp_path / "state.db"
+    db = SessionDB(db_path=db_path)
+    session_id = "PRUNE_PENDING_COMPLETION"
+    db.create_session(session_id, source="telegram")
+    db.append_messages_batch(session_id, _history())
+    agent = _build_agent(db, session_id)
+    _configure_pruning(agent)
+    settled = db.get_messages_as_conversation(session_id)
+    pending = [
+        *settled,
+        {
+            "role": "user",
+            "content": "completion payload",
+            "_completion_delivery_synthetic": True,
+        },
+        _assistant_call("pending_completion"),
+        _tool_result("pending_completion", "pending completion tool result"),
+    ]
+
+    pruned, count = agent.context_compressor.prune_tool_results_only(
+        pending, current_tokens=120_000,
+    )
+
+    assert count >= 1
+    assert pruned[-1]["content"] == "pending completion tool result"
+    assert not pruned[-1].get("_db_persisted")
+    db.close()
+
+    resumed_db = SessionDB(db_path=db_path)
+    try:
+        resumed = resumed_db.get_messages_as_conversation(session_id)
+        assert "completion payload" not in [row.get("content") for row in resumed]
+        assert "pending completion tool result" not in [
+            row.get("content") for row in resumed
+        ]
+        assert [row.get("content") for row in resumed] == [
+            row.get("content") for row in pruned[: len(settled)]
+        ]
+    finally:
+        resumed_db.close()
+
+
 def test_published_child_fences_stale_proactive_prune(tmp_path: Path) -> None:
     db = SessionDB(db_path=tmp_path / "state.db")
     parent_id = "PRUNE_STALE_PARENT"

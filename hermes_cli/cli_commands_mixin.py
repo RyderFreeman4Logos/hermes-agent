@@ -1063,6 +1063,7 @@ class CLICommandsMixin:
         # lineage verbatim, used by _display_resumed_history() so timeline
         # events and ancestor rows render correctly (matching the startup
         # --resume path in _preload_resumed_session).
+        self._session_db.recover_dangling_completion_tool_intent(target_id)
         model_history, display_history = self._session_db.get_resume_conversations(
             target_id
         )

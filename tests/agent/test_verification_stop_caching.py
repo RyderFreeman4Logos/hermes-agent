@@ -19,9 +19,53 @@ from unittest.mock import MagicMock
 import pytest
 
 
+def _is_reload_target(module_name: str) -> bool:
+    return (
+        module_name == "run_agent"
+        or module_name.startswith("agent.")
+        or module_name.startswith("tools.")
+        or module_name.startswith("hermes_")
+    )
+
+
+@pytest.fixture(autouse=True)
+def _restore_reloaded_modules():
+    """Keep the fresh-import tests from leaking mixed module generations."""
+    previous = {
+        name: module
+        for name, module in sys.modules.items()
+        if _is_reload_target(name)
+    }
+    yield
+
+    current = {
+        name: module
+        for name, module in sys.modules.items()
+        if _is_reload_target(name)
+    }
+    for name in current:
+        sys.modules.pop(name, None)
+    sys.modules.update(previous)
+
+    for name, module in current.items():
+        if name in previous or "." not in name:
+            continue
+        parent_name, child_name = name.rsplit(".", 1)
+        parent = sys.modules.get(parent_name)
+        if parent is not None and getattr(parent, child_name, None) is module:
+            delattr(parent, child_name)
+    for name, module in sorted(previous.items(), key=lambda item: item[0].count(".")):
+        if "." not in name:
+            continue
+        parent_name, child_name = name.rsplit(".", 1)
+        parent = sys.modules.get(parent_name)
+        if parent is not None:
+            setattr(parent, child_name, module)
+
+
 def _fresh_run_agent(hermes_home):
     for mod in list(sys.modules):
-        if mod == "run_agent" or mod.startswith("agent.") or mod.startswith("tools.") or mod.startswith("hermes_"):
+        if _is_reload_target(mod):
             del sys.modules[mod]
     import run_agent  # noqa: F401
     return sys.modules["run_agent"]
@@ -128,10 +172,10 @@ def test_json_log_drops_only_nudge_keeps_candidate(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("assistant_text", ["Build finished successfully", None])
-def test_completion_delivery_scaffolding_is_not_durable(
+def test_completion_delivery_suffix_is_deferred_before_finalization(
     tmp_path, monkeypatch, assistant_text
 ):
-    """Only a meaningful completion response survives SQLite and JSON flushes."""
+    """Crash-time SQLite and JSON writes defer the whole completion suffix."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     ra = _fresh_run_agent(tmp_path)
     agent = _make_agent(ra, f"completion_{bool(assistant_text)}", tmp_path)
@@ -158,5 +202,5 @@ def test_completion_delivery_scaffolding_is_not_durable(
     json_contents = [message.get("content") for message in snapshot["messages"]]
     assert nudge["content"] not in db_contents
     assert nudge["content"] not in json_contents
-    assert (assistant_text in db_contents) is bool(assistant_text)
-    assert (assistant_text in json_contents) is bool(assistant_text)
+    assert assistant_text not in db_contents
+    assert assistant_text not in json_contents

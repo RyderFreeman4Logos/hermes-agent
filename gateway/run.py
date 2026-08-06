@@ -65,6 +65,11 @@ from agent.turn_context import (
 )
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
+from hermes_state_common import (
+    AUTHORITY_WRITE_INDETERMINATE_ATTR,
+    AUTHORITY_WRITE_OUTCOME_ATTR,
+    AuthorityWriteIndeterminateError,
+)
 
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
@@ -2434,6 +2439,7 @@ _AGENT_PENDING_SENTINEL = object()
 #   _clear_conversation_scope calls.
 _CONVERSATION_SCOPED_STATE: tuple = (
     "_session_model_overrides",
+    "_after_compression_model_switches",
     "_pending_one_turn_model_restores",
     "_session_reasoning_overrides",
     "_session_service_tier_overrides",
@@ -4787,6 +4793,8 @@ class TurnRunner:
                     self._runner._enforce_agent_cache_cap()
             logger.debug("Created new agent for session %s (sig=%s)", ctx.session_key, _sig)
 
+        self._runner._attach_model_switch_after_compression(ctx.session_key, agent)
+
         # Per-message state — callbacks and reasoning config change every
         # turn and must not be baked into the cached agent constructor.
         # Gate on needs_progress_queue (tool_progress OR thinking_progress)
@@ -5745,6 +5753,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _turn_lease_tokens = legacy_lease_token_property()
     _session_run_generation = legacy_dict_property("_session_run_generation")
     _session_model_overrides = legacy_dict_property("_session_model_overrides")
+    _after_compression_model_switches = legacy_dict_property(
+        "_after_compression_model_switches"
+    )
     _pending_one_turn_model_restores = legacy_dict_property(
         "_pending_one_turn_model_restores"
     )
@@ -5789,6 +5800,139 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not sessions:
             return None
         return sessions.get(session_key)
+
+    def _attach_model_switch_after_compression(
+        self,
+        session_key: Optional[str],
+        agent: Any,
+    ) -> None:
+        """Bind conversation-scoped deferred route state to a live agent."""
+        if not session_key:
+            return
+        state = self._peek_session_state(session_key)
+        pending = (
+            state.conversation.after_compression_model_switch
+            if state is not None
+            else None
+        )
+        if pending is None:
+            return
+
+        from hermes_cli.model_switch import schedule_model_switch_after_compression
+
+        def _on_applied(result, old_model, old_provider):
+            current = self._peek_session_state(session_key)
+            if (
+                current is None
+                or current.conversation.after_compression_model_switch is not result
+            ):
+                return
+            persisted_override = {
+                "model": result.new_model,
+                "provider": result.target_provider,
+                "base_url": result.base_url,
+            }
+            store = getattr(self, "session_store", None)
+            missing = object()
+            old_persisted = missing
+            old_pending = current.conversation.after_compression_model_switch
+            old_override = current.conversation.model_override
+            pending_notes = getattr(self, "_pending_model_notes", None)
+            old_note = (
+                pending_notes.get(session_key, missing)
+                if pending_notes is not None
+                else missing
+            )
+            store_touched = False
+            callback_interrupt = None
+            try:
+                if store is not None:
+                    old_persisted = {
+                        "model": old_model,
+                        "provider": old_provider,
+                    }
+                    getter = getattr(store, "get_model_override", None)
+                    if callable(getter):
+                        try:
+                            old_persisted = getter(session_key)
+                        except Exception:
+                            logger.exception(
+                                "failed to snapshot gateway model override"
+                            )
+                    store_touched = True
+                    try:
+                        store.set_model_override(session_key, persisted_override)
+                    except BaseException as exc:
+                        if (
+                            getattr(exc, AUTHORITY_WRITE_OUTCOME_ATTR, None)
+                            == "commit-confirmed"
+                        ):
+                            callback_interrupt = exc
+                        else:
+                            raise
+                current.conversation.after_compression_model_switch = None
+                current.conversation.model_override = {
+                    "model": result.new_model,
+                    "provider": result.target_provider,
+                    "api_key": result.api_key,
+                    "base_url": result.base_url,
+                    "api_mode": result.api_mode,
+                }
+                if pending_notes is not None:
+                    pending_notes[session_key] = (
+                        f"[Note: model was just switched from {old_model} to "
+                        f"{result.new_model} via "
+                        f"{result.provider_label or result.target_provider}. "
+                        "Adjust your self-identification accordingly.]"
+                    )
+                if callback_interrupt is not None:
+                    raise callback_interrupt
+            except BaseException as exc:
+                if (
+                    getattr(exc, AUTHORITY_WRITE_OUTCOME_ATTR, None)
+                    == "commit-confirmed"
+                ):
+                    raise
+                indeterminate = (
+                    exc
+                    if isinstance(exc, AuthorityWriteIndeterminateError)
+                    else getattr(exc, AUTHORITY_WRITE_INDETERMINATE_ATTR, None)
+                )
+                current.conversation.after_compression_model_switch = old_pending
+                current.conversation.model_override = old_override
+                secondary_error = None
+                if pending_notes is not None:
+                    try:
+                        if old_note is missing:
+                            pending_notes.pop(session_key, None)
+                        else:
+                            pending_notes[session_key] = old_note
+                    except BaseException as secondary:
+                        secondary_error = secondary
+                if (
+                    not isinstance(indeterminate, AuthorityWriteIndeterminateError)
+                    and store_touched
+                    and old_persisted is not missing
+                    and store is not None
+                ):
+                    try:
+                        store.set_model_override(session_key, old_persisted)
+                    except BaseException as secondary:
+                        secondary_error = secondary
+                if secondary_error is not None:
+                    if (
+                        getattr(secondary_error, AUTHORITY_WRITE_OUTCOME_ATTR, None)
+                        == "commit-confirmed"
+                    ):
+                        delattr(secondary_error, AUTHORITY_WRITE_OUTCOME_ATTR)
+                    raise secondary_error from exc
+                raise
+
+        schedule_model_switch_after_compression(
+            agent,
+            pending,
+            on_applied=_on_applied,
+        )
 
     def _is_session_running(self, session_key: str) -> bool:
         """True when the session holds a running-turn slot (agent or sentinel)."""
@@ -16843,11 +16987,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     _hyg_agent,
                                     _hyg_session_row,
                                 )
+                                self._attach_model_switch_after_compression(
+                                    session_key,
+                                    _hyg_agent,
+                                )
                                 # If compression must rebuild instead of retaining
                                 # the cached prompt, make the persisted result
                                 # deliberately stale for every real gateway surface.
                                 _hyg_agent.platform = _GATEWAY_HYGIENE_PLATFORM
                                 _hyg_cleanup_deferred = False
+                                _hyg_boundary_committed = False
                                 try:
                                     # Gateway hygiene runs before the user turn
                                     # starts and already owns the session binding.
@@ -16882,6 +17031,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             _hyg_msgs, "",
                                             approx_tokens=_approx_tokens,
                                             commit_fence=_hyg_commit_fence,
+                                            defer_context_engine_notification=True,
                                         ),
                                     )
                                     try:
@@ -17146,6 +17296,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             session_entry.session_id,
                                         )
 
+                                    _hyg_boundary_committed = bool(
+                                        _hyg_rotated or _hyg_in_place
+                                    )
+
                                     logger.info(
                                         "Session hygiene: compressed %s → %s msgs, "
                                         "~%s → ~%s tokens",
@@ -17263,16 +17417,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                 _werr,
                                             )
                                 finally:
-                                    # Evict the cached agent so the next turn
-                                    # rebuilds its system prompt from current
-                                    # SOUL.md, memory, and skills.
-                                    self._evict_cached_agent(session_key)
-                                    if not _hyg_cleanup_deferred:
-                                        await self._cleanup_agent_resources_off_loop(
-                                            _hyg_agent, context="session hygiene"
-                                        )
+                                    from agent.conversation_compression import (
+                                        finalize_context_engine_compression_notification,
+                                    )
 
-                    except Exception as e:
+                                    try:
+                                        finalize_context_engine_compression_notification(
+                                            _hyg_agent,
+                                            committed=_hyg_boundary_committed,
+                                        )
+                                    finally:
+                                        # Evict the cached agent so the next turn
+                                        # rebuilds its system prompt from current
+                                        # SOUL.md, memory, and skills.
+                                        try:
+                                            self._evict_cached_agent(session_key)
+                                        finally:
+                                            if not _hyg_cleanup_deferred:
+                                                await self._cleanup_agent_resources_off_loop(
+                                                    _hyg_agent, context="session hygiene"
+                                                )
+
+                    except BaseException as e:
+                        indeterminate = (
+                            e
+                            if isinstance(e, AuthorityWriteIndeterminateError)
+                            else getattr(e, AUTHORITY_WRITE_INDETERMINATE_ATTR, None)
+                        )
+                        if isinstance(indeterminate, AuthorityWriteIndeterminateError):
+                            raise
+                        if not isinstance(e, Exception):
+                            raise
                         logger.warning(
                             "Session hygiene auto-compress failed: %s", e
                         )

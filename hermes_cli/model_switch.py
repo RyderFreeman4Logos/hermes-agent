@@ -20,11 +20,21 @@ OpenRouter variant suffixes (``:free``, ``:extended``, ``:fast``).
 
 from __future__ import annotations
 
+import copy
+import json
 import logging
 import re
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, List, NamedTuple, Optional
+from typing import Any, Callable, Iterator, List, NamedTuple, Optional
 
+from hermes_state_common import (
+    AUTHORITY_WRITE_INDETERMINATE_ATTR,
+    AUTHORITY_WRITE_OUTCOME_ATTR,
+    AuthorityWriteIndeterminateError,
+    reconcile_authoritative_write,
+)
 from hermes_cli.providers import (
     ProviderDef,
     custom_provider_aliases,
@@ -475,6 +485,517 @@ class ModelSwitchResult:
     capabilities: Optional[ModelCapabilities] = None
     model_info: Optional[ModelInfo] = None
     is_global: bool = False
+    context_length: Optional[int] = None
+    reasoning_config: Optional[dict] = None
+
+
+_AFTER_COMPRESSION_ATTR = "_model_switch_after_compression"
+_AFTER_COMPRESSION_CALLBACK_ATTR = "_model_switch_after_compression_callback"
+_AFTER_COMPRESSION_CONFIG_KEY = "pending_model_switch_after_compression"
+_RUNTIME_ROUTE_CONFIG_KEY = "runtime_route"
+_AFTER_COMPRESSION_CONTEXT_ATTR = "_deferred_model_switch_context_length"
+_AFTER_COMPRESSION_REASONING_ATTR = "_deferred_model_switch_reasoning_config"
+_RUNTIME_MISSING = object()
+_MODEL_SWITCH_LOCK_ATTR = "_model_switch_transaction_lock"
+_MODEL_SWITCH_LOCK_CREATION = threading.Lock()
+
+
+def model_switch_transaction_lock(agent: Any) -> threading.RLock:
+    """Return the per-agent lock shared by scheduling, apply, and live swaps."""
+    lock = getattr(agent, _MODEL_SWITCH_LOCK_ATTR, None)
+    if lock is None:
+        with _MODEL_SWITCH_LOCK_CREATION:
+            lock = getattr(agent, _MODEL_SWITCH_LOCK_ATTR, None)
+            if lock is None:
+                lock = threading.RLock()
+                setattr(agent, _MODEL_SWITCH_LOCK_ATTR, lock)
+    return lock
+
+
+def get_model_switch_after_compression(agent: Any) -> Optional[ModelSwitchResult]:
+    """Return the pending resolved switch, if this live session has one."""
+    pending = getattr(agent, _AFTER_COMPRESSION_ATTR, None)
+    return pending if isinstance(pending, ModelSwitchResult) else None
+
+
+def _read_session_route_snapshot(session_db: Any, session_id: str) -> Optional[dict]:
+    reader = getattr(session_db, "read_session_route_snapshot", None)
+    if callable(reader):
+        return reader(session_id)
+    getter = getattr(session_db, "get_session", None)
+    return getter(session_id) if callable(getter) else None
+
+
+def _session_model_config(agent: Any) -> dict[str, Any]:
+    """Return the current durable model config, falling back to init state."""
+    config = getattr(agent, "_session_init_model_config", None)
+    config = copy.deepcopy(config) if isinstance(config, dict) else {}
+    session_db = getattr(agent, "_session_db", None)
+    session_id = getattr(agent, "session_id", None)
+    if session_db is None or not session_id:
+        return config
+    row = _read_session_route_snapshot(session_db, session_id)
+    if not row:
+        return config
+    raw = row.get("model_config")
+    try:
+        stored = json.loads(raw) if isinstance(raw, str) and raw else raw
+    except (TypeError, ValueError):
+        stored = None
+    return copy.deepcopy(stored) if isinstance(stored, dict) else config
+
+
+_SESSION_ROUTE_FIELDS = (
+    "model_config",
+    "model",
+    "system_prompt",
+    "billing_provider",
+    "billing_base_url",
+    "billing_mode",
+)
+
+
+def _session_route_state(row: Optional[dict]) -> Optional[tuple]:
+    return None if row is None else tuple(row.get(key) for key in _SESSION_ROUTE_FIELDS)
+
+
+def _persist_session_model_config(
+    agent: Any,
+    config: dict[str, Any],
+    *,
+    model: Optional[str] = None,
+    system_prompt: Optional[str] = None,
+    result: Optional[ModelSwitchResult] = None,
+) -> Optional[BaseException]:
+    """Publish secret-free route metadata before updating the live mirror."""
+    authority_interrupt = None
+    session_db = getattr(agent, "_session_db", None)
+    session_id = getattr(agent, "session_id", None)
+    if session_db is not None and session_id:
+        publish = getattr(session_db, "publish_session_route", None)
+        if callable(publish) and result is not None:
+            config_json = json.dumps(config, sort_keys=True)
+            intended = (
+                config_json,
+                model,
+                system_prompt,
+                result.target_provider,
+                result.base_url,
+                result.api_mode,
+            )
+            reader = getattr(session_db, "read_session_route_snapshot", None)
+            getter = getattr(session_db, "get_session", None)
+            if callable(reader) or callable(getter):
+                preimage = _session_route_state(
+                    _read_session_route_snapshot(session_db, session_id)
+                )
+                readback = lambda: _session_route_state(
+                    _read_session_route_snapshot(session_db, session_id)
+                )
+            else:
+                preimage = object()
+
+                def readback():
+                    raise RuntimeError("session route authority readback unavailable")
+
+            outcome = reconcile_authoritative_write(
+                write=lambda: publish(
+                    session_id,
+                    model_config_json=config_json,
+                    model=model,
+                    system_prompt=system_prompt,
+                    billing_provider=result.target_provider,
+                    billing_base_url=result.base_url,
+                    billing_mode=result.api_mode,
+                ),
+                readback=readback,
+                intended=intended,
+                preimage=preimage,
+                label="session route authority",
+            )
+            if isinstance(outcome, BaseException):
+                authority_interrupt = outcome
+        else:
+            session_db.update_session_meta(
+                session_id,
+                json.dumps(config, sort_keys=True),
+                model=model,
+            )
+            if system_prompt is not None:
+                session_db.update_system_prompt(session_id, system_prompt)
+            if result is not None and hasattr(
+                session_db, "update_session_billing_route"
+            ):
+                session_db.update_session_billing_route(
+                    session_id,
+                    provider=result.target_provider,
+                    base_url=result.base_url,
+                    billing_mode=result.api_mode or None,
+                )
+    setattr(agent, "_session_init_model_config", copy.deepcopy(config))
+    return authority_interrupt
+
+
+def _applied_model_config(
+    agent: Any,
+    result: ModelSwitchResult,
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    applied = copy.deepcopy(config)
+    applied.pop(_AFTER_COMPRESSION_CONFIG_KEY, None)
+    route = {
+        "model": result.new_model,
+        "provider": result.target_provider,
+        "base_url": result.base_url or None,
+        "api_mode": result.api_mode or None,
+    }
+    applied.update(route)
+    applied["gateway_runtime"] = {
+        key: value
+        for key, value in {
+            "provider": result.target_provider,
+            "base_url": result.base_url,
+            "api_mode": result.api_mode,
+            "fallback_active": False,
+        }.items()
+        if value not in (None, "")
+    }
+    return applied
+
+
+def _snapshot_durable_session_route(agent: Any) -> tuple[Any, Optional[str], Any]:
+    session_db = getattr(agent, "_session_db", None)
+    session_id = getattr(agent, "session_id", None)
+    if session_db is None or not session_id:
+        return session_db, session_id, None
+    row = _read_session_route_snapshot(session_db, session_id)
+    return session_db, session_id, copy.deepcopy(row) if row else None
+
+
+def _restore_durable_session_route(snapshot: tuple[Any, Optional[str], Any]) -> None:
+    session_db, session_id, row = snapshot
+    if session_db is None or not session_id or not row:
+        return
+    publish = getattr(session_db, "publish_session_route", None)
+    if callable(publish):
+        publish(
+            session_id,
+            model_config_json=row.get("model_config") or "{}",
+            model=row.get("model") or "",
+            system_prompt=row.get("system_prompt"),
+            billing_provider=row.get("billing_provider") or "",
+            billing_base_url=row.get("billing_base_url") or "",
+            billing_mode=row.get("billing_mode") or "",
+        )
+        return
+    session_db.update_session_meta(
+        session_id,
+        row.get("model_config"),
+        model=row.get("model"),
+    )
+    if hasattr(session_db, "update_session_billing_route"):
+        session_db.update_session_billing_route(
+            session_id,
+            provider=row.get("billing_provider") or "",
+            base_url=row.get("billing_base_url") or "",
+            billing_mode=row.get("billing_mode"),
+        )
+    if row.get("system_prompt") is not None and hasattr(
+        session_db, "update_system_prompt"
+    ):
+        session_db.update_system_prompt(session_id, row["system_prompt"])
+
+
+def schedule_model_switch_after_compression(
+    agent: Any,
+    result: ModelSwitchResult,
+    *,
+    on_applied: Optional[Callable[[ModelSwitchResult, str, str], None]] = None,
+) -> Optional[ModelSwitchResult]:
+    """Schedule a validated route without mutating the active runtime."""
+    if not result.success or not result.new_model or not result.target_provider:
+        raise ValueError("deferred model switch requires a resolved model and provider")
+    if (
+        getattr(agent, "api_mode", "") == "codex_app_server"
+        and str(
+            getattr(agent, "codex_app_server_auto_compaction", "native") or "native"
+        ).lower()
+        == "native"
+    ):
+        raise ValueError(
+            "deferred model switching is unavailable with Codex inline "
+            "auto-compaction; set compression.codex_app_server_auto to hermes"
+        )
+    model_context = result.context_length
+    if not isinstance(model_context, int) or model_context <= 0:
+        model_context = getattr(result.model_info, "context_window", 0)
+        if not isinstance(model_context, int) or model_context <= 0:
+            try:
+                from hermes_cli.config import get_custom_provider_context_length
+
+                model_context = get_custom_provider_context_length(
+                    model=result.new_model,
+                    base_url=result.base_url,
+                )
+            except Exception:  # noqa: BLE001
+                model_context = None
+        if isinstance(model_context, int) and model_context > 0:
+            result.context_length = model_context
+    if not isinstance(result.context_length, int) or result.context_length <= 0:
+        raise ValueError(
+            "deferred model switch requires a positive destination context length"
+        )
+    if result.reasoning_config is None:
+        try:
+            from hermes_constants import resolve_reasoning_config
+            from hermes_cli.config import load_config
+
+            result.reasoning_config = resolve_reasoning_config(
+                load_config(), result.new_model
+            )
+        except Exception:  # noqa: BLE001
+            result.reasoning_config = None
+    with model_switch_transaction_lock(agent):
+        previous = get_model_switch_after_compression(agent)
+        setattr(agent, _AFTER_COMPRESSION_ATTR, result)
+        setattr(agent, _AFTER_COMPRESSION_CALLBACK_ATTR, on_applied)
+        agent._model_switch_after_compression_state = {
+            "state": "pending",
+            "model": result.new_model,
+            "provider": result.target_provider,
+            "context_length": result.context_length,
+        }
+        return previous
+
+
+def clear_model_switch_after_compression(
+    agent: Any,
+) -> Optional[ModelSwitchResult]:
+    """Clear pending session intent without touching the current route."""
+    with model_switch_transaction_lock(agent):
+        pending = get_model_switch_after_compression(agent)
+        config = _session_model_config(agent)
+        if _AFTER_COMPRESSION_CONFIG_KEY in config:
+            config.pop(_AFTER_COMPRESSION_CONFIG_KEY, None)
+            try:
+                _persist_session_model_config(agent, config)
+            except Exception:
+                logger.warning(
+                    "failed to clear durable deferred model-switch descriptor",
+                    exc_info=True,
+                )
+                setattr(agent, "_session_init_model_config", config)
+        setattr(agent, _AFTER_COMPRESSION_ATTR, None)
+        setattr(agent, _AFTER_COMPRESSION_CALLBACK_ATTR, None)
+        if pending is not None:
+            agent._model_switch_after_compression_state = {
+                "state": "cancelled",
+                "model": pending.new_model,
+                "provider": pending.target_provider,
+            }
+        return pending
+
+
+def _emit_deferred_model_switch_status(agent: Any, message: str) -> None:
+    callback = getattr(agent, "_emit_status", None)
+    if callable(callback):
+        try:
+            callback(message)
+        except Exception:
+            logger.debug("deferred model-switch status callback failed", exc_info=True)
+
+
+@dataclass
+class DeferredModelSwitchTransaction:
+    """Staged live route consumed only when its publication block succeeds."""
+
+    status: str = "none"
+    result: Optional[ModelSwitchResult] = None
+    model_config: Optional[dict[str, Any]] = None
+
+    @property
+    def active(self) -> bool:
+        return self.status == "staged" and self.result is not None
+
+
+@contextmanager
+def model_switch_after_compression_transaction(
+    agent: Any,
+) -> Iterator[DeferredModelSwitchTransaction]:
+    """Stage, publish, then consume a deferred route under one agent fence."""
+    with model_switch_transaction_lock(agent):
+        result = get_model_switch_after_compression(agent)
+        if result is None:
+            yield DeferredModelSwitchTransaction()
+            return
+
+        callback = getattr(agent, _AFTER_COMPRESSION_CALLBACK_ATTR, None)
+        old_model = str(getattr(agent, "model", "") or "")
+        old_provider = str(getattr(agent, "provider", "") or "")
+        old_config = _session_model_config(agent)
+        durable_snapshot = _snapshot_durable_session_route(agent)
+        from agent.agent_runtime_helpers import (
+            capture_model_runtime_for_rollback,
+            restore_model_runtime_for_rollback,
+        )
+
+        runtime_snapshot = capture_model_runtime_for_rollback(agent)
+        old_context = getattr(agent, _AFTER_COMPRESSION_CONTEXT_ATTR, _RUNTIME_MISSING)
+        old_reasoning = getattr(
+            agent, _AFTER_COMPRESSION_REASONING_ATTR, _RUNTIME_MISSING
+        )
+        setattr(agent, _AFTER_COMPRESSION_CONTEXT_ATTR, result.context_length)
+        setattr(agent, _AFTER_COMPRESSION_REASONING_ATTR, result.reasoning_config)
+        agent._applying_model_switch_after_compression = True
+        try:
+            agent.switch_model(
+                result.new_model,
+                result.target_provider,
+                result.api_key,
+                result.base_url,
+                result.api_mode,
+            )
+        except BaseException as exc:
+            restore_model_runtime_for_rollback(agent, runtime_snapshot)
+            agent._model_switch_after_compression_state = {
+                "state": "failed",
+                "model": result.new_model,
+                "provider": result.target_provider,
+            }
+            _emit_deferred_model_switch_status(
+                agent,
+                "Deferred model switch failed after committed compression; "
+                f"still using {old_model}: {exc}",
+            )
+            raise
+        finally:
+            agent._applying_model_switch_after_compression = False
+            for name, value in (
+                (_AFTER_COMPRESSION_CONTEXT_ATTR, old_context),
+                (_AFTER_COMPRESSION_REASONING_ATTR, old_reasoning),
+            ):
+                if value is _RUNTIME_MISSING:
+                    try:
+                        delattr(agent, name)
+                    except AttributeError:
+                        pass
+                else:
+                    setattr(agent, name, value)
+
+        transaction = DeferredModelSwitchTransaction(
+            status="staged",
+            result=result,
+            model_config=_applied_model_config(agent, result, old_config),
+        )
+        setattr(
+            agent,
+            "_session_init_model_config",
+            copy.deepcopy(transaction.model_config),
+        )
+        activation_interrupt = None
+        try:
+            yield transaction
+            if callable(callback):
+                callback(result, old_model, old_provider)
+        except BaseException as exc:
+            if getattr(exc, AUTHORITY_WRITE_OUTCOME_ATTR, None) == "commit-confirmed":
+                activation_interrupt = exc
+            else:
+                restore_model_runtime_for_rollback(agent, runtime_snapshot)
+                setattr(agent, "_session_init_model_config", old_config)
+                indeterminate = (
+                    exc
+                    if isinstance(exc, AuthorityWriteIndeterminateError)
+                    else getattr(exc, AUTHORITY_WRITE_INDETERMINATE_ATTR, None)
+                )
+                restore_error = None
+                if isinstance(indeterminate, AuthorityWriteIndeterminateError):
+                    transaction.status = "blocked"
+                    description = "blocked by indeterminate durable publication"
+                else:
+                    if (
+                        getattr(exc, AUTHORITY_WRITE_OUTCOME_ATTR, None)
+                        != "preimage-confirmed"
+                    ):
+                        try:
+                            _restore_durable_session_route(durable_snapshot)
+                        except BaseException as secondary:
+                            restore_error = secondary
+                    transaction.status = "blocked" if restore_error else "failed"
+                    description = (
+                        "blocked because durable rollback failed"
+                        if restore_error
+                        else "failed; restored previous route"
+                    )
+                agent._model_switch_after_compression_state = {
+                    "state": transaction.status,
+                    "model": result.new_model,
+                    "provider": result.target_provider,
+                }
+                _emit_deferred_model_switch_status(
+                    agent, f"Deferred model switch {description}: {exc}"
+                )
+                if restore_error is not None:
+                    raise restore_error from exc
+                raise
+
+        # Consume only after runtime and durable route publication both succeed.
+        setattr(agent, _AFTER_COMPRESSION_ATTR, None)
+        setattr(agent, _AFTER_COMPRESSION_CALLBACK_ATTR, None)
+        transaction.status = "applied"
+        agent._model_switch_after_compression_state = {
+            "state": "applied",
+            "model": result.new_model,
+            "provider": result.target_provider,
+        }
+        _emit_deferred_model_switch_status(
+            agent,
+            "Deferred model switch applied after compression: "
+            f"{result.new_model} via {result.provider_label or result.target_provider}",
+        )
+        if activation_interrupt is not None:
+            raise activation_interrupt
+
+
+def apply_model_switch_after_compression(
+    agent: Any,
+    *,
+    system_message: Optional[str] = None,
+) -> str:
+    """Apply and durably publish a pending route at a committed boundary."""
+    transaction = DeferredModelSwitchTransaction()
+    publication_interrupt = None
+    try:
+        with model_switch_after_compression_transaction(agent) as transaction:
+            if transaction.active:
+                result = transaction.result
+                assert result is not None
+                prompt = None
+                invalidate_prompt = getattr(agent, "_invalidate_system_prompt", None)
+                build_prompt = getattr(agent, "_build_system_prompt", None)
+                if callable(invalidate_prompt):
+                    invalidate_prompt()
+                if callable(build_prompt):
+                    prompt = build_prompt(system_message)
+                    agent._cached_system_prompt = prompt
+                publication_interrupt = _persist_session_model_config(
+                    agent,
+                    transaction.model_config or {},
+                    model=result.new_model,
+                    system_prompt=prompt,
+                    result=result,
+                )
+        if publication_interrupt is not None:
+            raise publication_interrupt
+    except BaseException as exc:
+        if publication_interrupt is not None and exc is not publication_interrupt:
+            raise publication_interrupt from exc
+        if isinstance(exc, AuthorityWriteIndeterminateError):
+            raise
+        if not isinstance(exc, Exception):
+            raise
+        return transaction.status if transaction.status != "none" else "failed"
+    return transaction.status
 
 
 @dataclass(frozen=True)
@@ -487,6 +1008,7 @@ class ModelFlagParseResult:
     force_refresh: bool = False
     is_session: bool = False
     is_once: bool = False
+    is_after_compression: bool = False
 # ---------------------------------------------------------------------------
 # Flag parsing
 # ---------------------------------------------------------------------------
@@ -519,11 +1041,16 @@ def parse_model_flags_detailed(raw_args: str) -> ModelFlagParseResult:
     force_refresh = False
     is_session = False
     is_once = False
+    is_after_compression = False
 
     # Normalize Unicode dashes (Telegram/iOS auto-converts -- to em/en dash)
     # A single Unicode dash before a flag keyword becomes "--"
     import re as _re
-    raw_args = _re.sub(r'[\u2012\u2013\u2014\u2015](provider|global|session|refresh|once)', r'--\1', raw_args)
+    raw_args = _re.sub(
+        r'[\u2012\u2013\u2014\u2015](provider|global|session|refresh|once|after-compression)',
+        r'--\1',
+        raw_args,
+    )
 
     # Keep this hand-rolled because model IDs may contain colons/slashes and
     # the historical parser did not require shell quoting.
@@ -543,6 +1070,9 @@ def parse_model_flags_detailed(raw_args: str) -> ModelFlagParseResult:
         elif parts[i] == "--once":
             is_once = True
             i += 1
+        elif parts[i] == "--after-compression":
+            is_after_compression = True
+            i += 1
         elif parts[i] == "--provider" and i + 1 < len(parts):
             explicit_provider = parts[i + 1]
             i += 2
@@ -558,6 +1088,7 @@ def parse_model_flags_detailed(raw_args: str) -> ModelFlagParseResult:
         force_refresh=force_refresh,
         is_session=is_session,
         is_once=is_once,
+        is_after_compression=is_after_compression,
     )
 
 
@@ -639,6 +1170,9 @@ def resolve_persist_behavior(
 # Error codes emitted by parse_model_switch_args().
 MODEL_SWITCH_ERR_ONCE_WITH_GLOBAL = "once_with_global"
 MODEL_SWITCH_ERR_ONCE_REQUIRES_TARGET = "once_requires_target"
+MODEL_SWITCH_ERR_AFTER_COMPRESSION_WITH_ONCE = "after_compression_with_once"
+MODEL_SWITCH_ERR_AFTER_COMPRESSION_WITH_GLOBAL = "after_compression_with_global"
+MODEL_SWITCH_ERR_AFTER_COMPRESSION_REQUIRES_TARGET = "after_compression_requires_target"
 
 # Canonical (surface-neutral) error copy.  Surfaces prepend their own
 # decoration ("  ✗ " in the CLI, "❌ " in the gateway) but MUST NOT change
@@ -646,6 +1180,9 @@ MODEL_SWITCH_ERR_ONCE_REQUIRES_TARGET = "once_requires_target"
 MODEL_SWITCH_ERROR_TEXT = {
     MODEL_SWITCH_ERR_ONCE_WITH_GLOBAL: "/model --once cannot be combined with --global",
     MODEL_SWITCH_ERR_ONCE_REQUIRES_TARGET: "/model --once requires a model or provider.",
+    MODEL_SWITCH_ERR_AFTER_COMPRESSION_WITH_ONCE: "/model --after-compression cannot be combined with --once",
+    MODEL_SWITCH_ERR_AFTER_COMPRESSION_WITH_GLOBAL: "/model --after-compression cannot be combined with --global",
+    MODEL_SWITCH_ERR_AFTER_COMPRESSION_REQUIRES_TARGET: "/model --after-compression requires a model or provider.",
 }
 
 
@@ -668,6 +1205,7 @@ class ModelSwitchRequest:
     is_global: bool = False
     is_session: bool = False
     is_once: bool = False
+    is_after_compression: bool = False
     force_refresh: bool = False
     scope: str = "default"
     errors: tuple = ()
@@ -687,6 +1225,7 @@ class ModelSwitchRequest:
             force_refresh=self.force_refresh,
             is_session=self.is_session,
             is_once=self.is_once,
+            is_after_compression=self.is_after_compression,
         )
 
     def error_messages(self) -> list:
@@ -720,8 +1259,20 @@ def parse_model_switch_args(raw: str) -> ModelSwitchRequest:
         errors.append(MODEL_SWITCH_ERR_ONCE_WITH_GLOBAL)
     if parsed.is_once and not parsed.model_input and not parsed.explicit_provider:
         errors.append(MODEL_SWITCH_ERR_ONCE_REQUIRES_TARGET)
+    if parsed.is_after_compression and parsed.is_once:
+        errors.append(MODEL_SWITCH_ERR_AFTER_COMPRESSION_WITH_ONCE)
+    if parsed.is_after_compression and parsed.is_global:
+        errors.append(MODEL_SWITCH_ERR_AFTER_COMPRESSION_WITH_GLOBAL)
+    if (
+        parsed.is_after_compression
+        and not parsed.model_input
+        and not parsed.explicit_provider
+    ):
+        errors.append(MODEL_SWITCH_ERR_AFTER_COMPRESSION_REQUIRES_TARGET)
 
-    if parsed.is_once:
+    if parsed.is_after_compression:
+        scope = "after_compression"
+    elif parsed.is_once:
         scope = "once"
     elif parsed.is_session:
         scope = "session"
@@ -737,6 +1288,7 @@ def parse_model_switch_args(raw: str) -> ModelSwitchRequest:
         is_global=parsed.is_global,
         is_session=parsed.is_session,
         is_once=parsed.is_once,
+        is_after_compression=parsed.is_after_compression,
         force_refresh=parsed.force_refresh,
         scope=scope,
         errors=tuple(errors),
@@ -903,6 +1455,8 @@ def _model_sort_key(model_id: str, prefix: str) -> tuple:
 def resolve_alias(
     raw_input: str,
     current_provider: str,
+    *,
+    allow_network: bool = True,
 ) -> Optional[tuple[str, str, str]]:
     """Resolve a short alias against the current provider's catalog.
 
@@ -940,7 +1494,9 @@ def resolve_alias(
     # Build catalog from models.dev, then merge in static _PROVIDER_MODELS
     # entries that models.dev may be missing (e.g. newly added models not
     # yet synced to the registry).
-    catalog = list_provider_models(current_provider)
+    catalog = list_provider_models(
+        current_provider, **({} if allow_network else {"allow_network": False})
+    )
     try:
         from hermes_cli.models import _PROVIDER_MODELS
         static = _PROVIDER_MODELS.get(current_provider, [])
@@ -953,7 +1509,7 @@ def resolve_alias(
         pass
 
     # For aggregators, models are vendor/model-name format
-    aggregator = is_aggregator(current_provider)
+    aggregator = is_aggregator(current_provider, allow_network=allow_network)
 
     if aggregator:
         prefix = f"{vendor}/{family}".lower()
@@ -981,6 +1537,8 @@ def get_authenticated_provider_slugs(
     current_provider: str = "",
     user_providers: dict = None,
     custom_providers: list | None = None,
+    *,
+    allow_network: bool = True,
 ) -> list[str]:
     """Return slugs of providers that have credentials.
 
@@ -993,6 +1551,7 @@ def get_authenticated_provider_slugs(
             user_providers=user_providers,
             custom_providers=custom_providers,
             max_models=0,
+            allow_network=allow_network,
         )
         return [p["slug"] for p in providers]
     except Exception:
@@ -1002,6 +1561,8 @@ def get_authenticated_provider_slugs(
 def _resolve_alias_fallback(
     raw_input: str,
     authenticated_providers: list[str] = (),
+    *,
+    allow_network: bool = True,
 ) -> Optional[tuple[str, str, str]]:
     """Try to resolve an alias on the user's authenticated providers.
 
@@ -1010,7 +1571,11 @@ def _resolve_alias_fallback(
     """
     providers = authenticated_providers or ("openrouter", "nous")
     for provider in providers:
-        result = resolve_alias(raw_input, provider)
+        result = resolve_alias(
+            raw_input,
+            provider,
+            **({} if allow_network else {"allow_network": False}),
+        )
         if result is not None:
             return result
     return None
@@ -1193,6 +1758,48 @@ def _configured_provider_matches(
     return matches
 
 
+def _configured_model_for_provider(
+    model_name: str,
+    provider: str,
+    user_providers: Optional[dict],
+    custom_providers: Optional[list],
+) -> str:
+    """Return the configured spelling when this provider declares the model."""
+    target = str(provider or "").strip().lower()
+    if target.startswith("custom:"):
+        target = custom_provider_slug(target.removeprefix("custom:"))
+    for slug, configured_model in _configured_provider_matches(
+        model_name, user_providers, custom_providers
+    ).items():
+        candidate = str(slug).strip().lower()
+        if candidate.startswith("custom:"):
+            candidate = custom_provider_slug(candidate.removeprefix("custom:"))
+        if candidate == target:
+            return configured_model
+    return ""
+
+
+def _configured_default_model_for_provider(
+    provider: str,
+    user_providers: Optional[dict],
+    custom_providers: Optional[list],
+) -> str:
+    """Return an explicitly configured provider default without discovery."""
+    target = str(provider or "").strip().lower()
+    if isinstance(user_providers, dict):
+        for slug, config in user_providers.items():
+            if str(slug).strip().lower() == target and isinstance(config, dict):
+                return str(config.get("default_model") or config.get("model") or "").strip()
+    if target.startswith("custom:"):
+        for config in custom_providers or []:
+            if not isinstance(config, dict):
+                continue
+            name = str(config.get("name") or config.get("provider_key") or "")
+            if custom_provider_slug(name) == target:
+                return str(config.get("default_model") or config.get("model") or "").strip()
+    return ""
+
+
 def _resolve_named_custom_model_id(
     model_name: str,
     target_provider: str,
@@ -1238,6 +1845,7 @@ def switch_model(
     explicit_provider: str = "",
     user_providers: dict = None,
     custom_providers: list | None = None,
+    validate_live: bool = True,
 ) -> ModelSwitchResult:
     """Core model-switching pipeline shared between CLI and gateway.
 
@@ -1288,17 +1896,34 @@ def switch_model(
     new_model = raw_input.strip()
     target_provider = current_provider
     resolved_moa_preset = False
+    local_model_authority = False
+    network_kwargs = {} if validate_live else {"allow_network": False}
+
+    def resolve_switch_provider(name: str):
+        return resolve_provider_full(
+            name, user_providers, custom_providers, **network_kwargs
+        )
+
+    def resolve_switch_alias(model: str, provider: str):
+        return resolve_alias(model, provider, **network_kwargs)
+
+    # Reject malformed targets before provider, credential, or metadata resolution.
+    if new_model and " " in new_model:
+        return ModelSwitchResult(
+            success=False,
+            is_global=is_global,
+            error_message=(
+                f"'{new_model}' contains spaces. Model names must be a single identifier "
+                f"(for example: claude-sonnet-4-5 or openai/gpt-5.5)."
+            ),
+        )
 
     # =================================================================
     # PATH A: Explicit --provider given
     # =================================================================
     if explicit_provider:
         # Resolve the provider
-        pdef = resolve_provider_full(
-            explicit_provider,
-            user_providers,
-            custom_providers,
-        )
+        pdef = resolve_switch_provider(explicit_provider)
         if pdef is None and explicit_provider.strip().lower() == "custom":
             pdef = _bare_custom_provider_def(current_base_url)
         if pdef is None:
@@ -1353,6 +1978,7 @@ def switch_model(
                 current_provider=current_provider,
                 user_providers=user_providers,
                 custom_providers=custom_providers,
+                allow_network=validate_live,
             )
             if target_provider not in _authed:
                 _suggestions = [
@@ -1370,12 +1996,31 @@ def switch_model(
                     is_global=is_global,
                     error_message=(
                         f"Provider '{_explicit_norm}' is an alias that routes "
-                        f"through {get_label(target_provider)}, which "
+                        f"through {get_label(target_provider, allow_network=validate_live)}, which "
                         f"has no credentials configured.{_hint}"
                     ),
                 )
 
-        # If no model specified, try auto-detect from endpoint
+        # Deferred scheduling may only use an explicit local default; endpoint
+        # auto-detection remains an immediate-switch behavior.
+        if not new_model and not validate_live:
+            new_model = _configured_default_model_for_provider(
+                target_provider, user_providers, custom_providers
+            )
+            if not new_model:
+                return ModelSwitchResult(
+                    success=False,
+                    target_provider=target_provider,
+                    provider_label=pdef.name,
+                    is_global=is_global,
+                    error_message=(
+                        f"Provider '{pdef.name}' has no locally configured default model. "
+                        f"Specify the model explicitly: /model <model-name> "
+                        f"--provider {explicit_provider} --after-compression"
+                    ),
+                )
+
+        # Immediate provider-only switches retain endpoint auto-detection.
         if not new_model:
             if pdef.base_url:
                 from hermes_cli.runtime_provider import _auto_detect_local_model
@@ -1405,10 +2050,22 @@ def switch_model(
                     ),
                 )
 
-        # Resolve alias on the TARGET provider
-        alias_result = resolve_alias(new_model, target_provider)
-        if alias_result is not None:
-            _, new_model, resolved_alias = alias_result
+        # Deferred config declarations are authoritative and avoid catalog lookup.
+        configured_model = (
+            _configured_model_for_provider(
+                new_model, target_provider, user_providers, custom_providers
+            )
+            if not validate_live
+            else ""
+        )
+        if configured_model:
+            new_model = configured_model
+            local_model_authority = True
+        else:
+            alias_result = resolve_switch_alias(new_model, target_provider)
+            if alias_result is not None:
+                _, new_model, resolved_alias = alias_result
+                local_model_authority = not validate_live
 
     # =================================================================
     # PATH B: No explicit provider — resolve from model input
@@ -1427,9 +2084,9 @@ def switch_model(
                 resolved_moa_preset = True
                 alias_result = None
             else:
-                alias_result = resolve_alias(raw_input, current_provider)
+                alias_result = resolve_switch_alias(raw_input, current_provider)
         except Exception:
-            alias_result = resolve_alias(raw_input, current_provider)
+            alias_result = resolve_switch_alias(raw_input, current_provider)
 
         # --- Step a: Try alias resolution on current provider ---
 
@@ -1437,6 +2094,7 @@ def switch_model(
             pass
         elif alias_result is not None:
             target_provider, new_model, resolved_alias = alias_result
+            local_model_authority = not validate_live
             logger.debug(
                 "Alias '%s' resolved to %s on %s",
                 resolved_alias, new_model, target_provider,
@@ -1449,10 +2107,14 @@ def switch_model(
                     current_provider=current_provider,
                     user_providers=user_providers,
                     custom_providers=custom_providers,
+                    allow_network=validate_live,
                 )
-                fallback_result = _resolve_alias_fallback(raw_input, authed)
+                fallback_result = _resolve_alias_fallback(
+                    raw_input, authed, **network_kwargs
+                )
                 if fallback_result is not None:
                     target_provider, new_model, resolved_alias = fallback_result
+                    local_model_authority = not validate_live
                     logger.debug(
                         "Alias '%s' resolved via fallback to %s on %s",
                         resolved_alias, new_model, target_provider,
@@ -1474,7 +2136,11 @@ def switch_model(
                 # is already in vendor/model format and the colon is a variant
                 # tag (:free, :extended, :fast) that must be preserved.
                 colon_pos = raw_input.find(":")
-                if colon_pos > 0 and "/" not in raw_input and is_aggregator(current_provider):
+                if (
+                    colon_pos > 0
+                    and "/" not in raw_input
+                    and is_aggregator(current_provider, **network_kwargs)
+                ):
                     left = raw_input[:colon_pos].strip().lower()
                     right = raw_input[colon_pos + 1:].strip()
                     if left and right:
@@ -1492,8 +2158,8 @@ def switch_model(
         # whose live /v1/models returns bare IDs (e.g. "deepseek-v4-flash") that
         # coincidentally match entries in native providers' static catalogs.
         resolved_in_current_catalog = False
-        if is_aggregator(target_provider) and not resolved_alias:
-            catalog = list_provider_models(target_provider)
+        if is_aggregator(target_provider, **network_kwargs) and not resolved_alias:
+            catalog = list_provider_models(target_provider, **network_kwargs)
             if catalog:
                 new_model_lower = new_model.lower()
                 for mid in catalog:
@@ -1562,6 +2228,9 @@ def switch_model(
                     if isinstance(user_providers, dict) and target_provider in user_providers:
                         explicit_provider = target_provider
 
+        if config_routed:
+            local_model_authority = True
+
         # --- Step e: detect_provider_for_model() as last resort ---
         _base = current_base_url or ""
         is_custom = (
@@ -1577,7 +2246,9 @@ def switch_model(
             and not resolved_in_current_catalog
             and not config_routed
         ):
-            detected = detect_provider_for_model(new_model, current_provider)
+            detected = detect_provider_for_model(
+                new_model, current_provider, **network_kwargs
+            )
             if detected:
                 target_provider, new_model = detected
 
@@ -1586,15 +2257,11 @@ def switch_model(
     # =================================================================
 
     provider_changed = target_provider != current_provider
-    provider_label = get_label(target_provider)
+    provider_label = get_label(target_provider, **network_kwargs)
     if target_provider == "custom" and current_base_url:
         provider_label = "Custom endpoint"
     if target_provider.startswith("custom:"):
-        custom_pdef = resolve_provider_full(
-            target_provider,
-            user_providers,
-            custom_providers,
-        )
+        custom_pdef = resolve_switch_provider(target_provider)
         if custom_pdef is not None:
             provider_label = custom_pdef.name
 
@@ -1632,6 +2299,7 @@ def switch_model(
                     explicit_api_key=_ukey or None,
                     explicit_base_url=_user_pdef.base_url,
                     target_model=new_model,
+                    allow_network=validate_live,
                 )
                 api_key = runtime.get("api_key", "") or _ukey
                 base_url = runtime.get("base_url", "") or _user_pdef.base_url
@@ -1643,12 +2311,15 @@ def switch_model(
         elif target_provider == "custom" and current_base_url:
             api_key = current_api_key
             base_url = current_base_url
-            api_mode = determine_api_mode(target_provider, base_url)
+            api_mode = determine_api_mode(
+                target_provider, base_url, allow_network=validate_live
+            )
         else:
             try:
                 runtime = resolve_runtime_provider(
                     requested=target_provider,
                     target_model=new_model,
+                    allow_network=validate_live,
                 )
                 api_key = runtime.get("api_key", "")
                 base_url = runtime.get("base_url", "")
@@ -1669,6 +2340,7 @@ def switch_model(
             runtime = resolve_runtime_provider(
                 requested=current_provider,
                 target_model=new_model,
+                allow_network=validate_live,
             )
             # If resolution fell through to "custom" (e.g. named custom provider like
             # "ollama-launch" that resolve_runtime_provider doesn't know), keep existing
@@ -1702,7 +2374,7 @@ def switch_model(
     _mandated_mode = host_mandated_api_mode(base_url)
     if _mandated_mode is not None:
         api_mode = _mandated_mode
-    elif not api_mode:
+    elif not api_mode and validate_live:
         api_mode = determine_api_mode(target_provider, base_url)
 
     # --- Normalize model name for target provider ---
@@ -1710,6 +2382,15 @@ def switch_model(
         new_model, target_provider, custom_providers
     )
     new_model = normalize_model_for_provider(new_model, target_provider)
+    if not validate_live and _configured_model_for_provider(
+        new_model, target_provider, user_providers, custom_providers
+    ):
+        local_model_authority = True
+    if (
+        target_provider == current_provider
+        and new_model.lower() == str(current_model or "").strip().lower()
+    ):
+        local_model_authority = True
 
     # --- Validate ---
     try:
@@ -1719,6 +2400,7 @@ def switch_model(
             api_key=api_key,
             base_url=base_url,
             api_mode=api_mode or None,
+            allow_network=validate_live,
         )
     except Exception as e:
         validation = {
@@ -1731,7 +2413,7 @@ def switch_model(
     # Override rejection if model is in the user's saved provider config.
     # API /v1/models may not list cloud/aliased models even though the server supports them.
     if not validation.get("accepted"):
-        override = False
+        override = not validate_live and local_model_authority
         if user_providers:
             from hermes_cli.config import is_provider_enabled
             # user_providers is a dict: {provider_slug: config_dict}
@@ -1778,13 +2460,32 @@ def switch_model(
                 error_message=msg,
             )
 
+    if (
+        not validate_live
+        and not local_model_authority
+        and not validation.get("recognized")
+    ):
+        return ModelSwitchResult(
+            success=False,
+            new_model=new_model,
+            target_provider=target_provider,
+            provider_label=provider_label,
+            is_global=is_global,
+            error_message=(
+                f"Cannot schedule '{new_model}' for '{target_provider}': no local "
+                "configured model or catalog entry is available."
+            ),
+        )
+
     # Apply auto-correction if validation found a closer match
     if validation.get("corrected_model"):
         new_model = validation["corrected_model"]
 
     # --- Copilot api_mode override ---
     if target_provider in {"copilot", "github-copilot"}:
-        api_mode = copilot_model_api_mode(new_model, api_key=api_key)
+        api_mode = copilot_model_api_mode(
+            new_model, api_key=api_key, allow_network=validate_live
+        )
 
     # --- OpenCode api_mode override ---
     if target_provider in {"opencode-zen", "opencode-go", "opencode"}:
@@ -1802,6 +2503,17 @@ def switch_model(
 
     # --- Determine api_mode if not already set ---
     if not api_mode:
+        if not validate_live:
+            return ModelSwitchResult(
+                success=False,
+                target_provider=target_provider,
+                provider_label=provider_label,
+                is_global=is_global,
+                error_message=(
+                    f"Cannot determine an API mode for '{target_provider}' from local configuration. "
+                    "Configure api_mode before scheduling this switch."
+                ),
+            )
         api_mode = determine_api_mode(
             target_provider, base_url, model=new_model
         )
@@ -1821,11 +2533,27 @@ def switch_model(
         from hermes_cli.models import normalize_opencode_base_url
         base_url = normalize_opencode_base_url(target_provider, api_mode, base_url)
 
-    # --- Get capabilities (legacy) ---
-    capabilities = get_model_capabilities(target_provider, new_model)
+    context_length = None
+    if validate_live:
+        capabilities = get_model_capabilities(target_provider, new_model)
+        model_info = get_model_info(target_provider, new_model)
+    else:
+        # Prefer the existing configured-route authority. Only built-ins without
+        # a configured context need the local static catalog lookup.
+        capabilities = None
+        from hermes_cli.config import get_custom_provider_context_length
 
-    # --- Get full model info from models.dev ---
-    model_info = get_model_info(target_provider, new_model)
+        context_length = get_custom_provider_context_length(
+            model=new_model, base_url=base_url
+        )
+        model_info = (
+            None
+            if (
+                (isinstance(context_length, int) and context_length > 0)
+                or (isinstance(user_providers, dict) and target_provider in user_providers)
+            )
+            else get_model_info(target_provider, new_model, allow_network=False)
+        )
 
     # --- Collect warnings ---
     warnings: list[str] = []
@@ -1849,6 +2577,7 @@ def switch_model(
         resolved_via_alias=resolved_alias,
         capabilities=capabilities,
         model_info=model_info,
+        context_length=context_length,
         is_global=is_global,
     )
 
@@ -1865,7 +2594,12 @@ import threading as _threading  # noqa: E402
 _picker_prewarm_done = _threading.Event()
 
 
-def _credential_pool_is_usable(provider: str, *, raw_pool_present: bool = False) -> bool:
+def _credential_pool_is_usable(
+    provider: str,
+    *,
+    raw_pool_present: bool = False,
+    read_only: bool = False,
+) -> bool:
     """Return whether *provider* has a credential that can be selected now.
 
     ``auth.json`` historically allowed opaque token-style pool values that do
@@ -1876,7 +2610,10 @@ def _credential_pool_is_usable(provider: str, *, raw_pool_present: bool = False)
     try:
         from agent.credential_pool import load_pool
 
-        pool = load_pool(provider)
+        pool = load_pool(
+            provider,
+            **({"read_only": True} if read_only else {}),
+        )
         if pool.has_credentials():
             return pool.has_available()
     except Exception:
@@ -1954,6 +2691,7 @@ def list_authenticated_providers(
     probe_current_custom_provider: bool = False,
     for_picker: bool = False,
     excluded_providers: list | None = None,
+    allow_network: bool = True,
 ) -> List[dict]:
     """Detect which providers have credentials and list their curated models.
 
@@ -2003,6 +2741,58 @@ def list_authenticated_providers(
         _MODELS_DEV_PREFERRED, _merge_with_models_dev, cached_provider_model_ids,
         clear_provider_models_cache, get_curated_nous_model_ids,
     )
+
+    if not allow_network:
+        from hermes_cli.auth import _load_auth_store
+
+        store = _load_auth_store()
+        raw_states = store.get("providers")
+        states = raw_states if isinstance(raw_states, dict) else {}
+        raw_pool_map = store.get("credential_pool")
+        raw_pools = (
+            raw_pool_map
+            if isinstance(raw_pool_map, dict)
+            else {}
+        )
+        slugs = {
+            str(current_provider or "").strip().lower(),
+            *(
+                slug
+                for slug, config in PROVIDER_REGISTRY.items()
+                if any(os.environ.get(name, "").strip() for name in config.api_key_env_vars)
+                or isinstance(states.get(slug), dict)
+                or _credential_pool_is_usable(
+                    slug,
+                    raw_pool_present=bool(raw_pools.get(slug)),
+                    read_only=True,
+                )
+            ),
+        }
+        slugs.discard("")
+        for slug, entry in (user_providers or {}).items():
+            if isinstance(entry, dict) and entry.get("enabled", True) is not False:
+                slugs.add(str(slug).strip().lower())
+        custom_names = {
+            custom_provider_slug(str(entry.get("name") or ""))
+            for entry in (custom_providers or [])
+            if isinstance(entry, dict)
+            and str(entry.get("name") or "").strip()
+            and str(entry.get("base_url") or entry.get("url") or entry.get("api") or "").strip()
+        }
+        slugs.update(custom_names)
+        excluded = {str(item).strip().lower() for item in (excluded_providers or [])}
+        return [
+            {
+                "slug": slug,
+                "name": get_label(slug, allow_network=False),
+                "is_current": slug == str(current_provider or "").strip().lower(),
+                "is_user_defined": slug in (user_providers or {}) or slug in custom_names,
+                "models": [],
+                "total_models": 0,
+                "source": "user-config" if slug in (user_providers or {}) or slug in custom_names else "built-in",
+            }
+            for slug in sorted(slugs - excluded)
+        ]
 
     # Explicit refresh: drop every provider's cached model-id list so the
     # cached_provider_model_ids() calls below all re-fetch live. Without this

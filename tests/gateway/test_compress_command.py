@@ -80,6 +80,7 @@ async def test_compress_command_works_when_auto_compaction_disabled():
     agent_instance.close = MagicMock()
     agent_instance._cached_system_prompt = ""
     agent_instance.tools = None
+    agent_instance.api_mode = "codex_responses"
     agent_instance.compression_enabled = False
     agent_instance.context_compressor.has_content_to_compress.return_value = True
     agent_instance.session_id = "sess-1"
@@ -87,7 +88,10 @@ async def test_compress_command_works_when_auto_compaction_disabled():
     # Explicit non-lock-skip: MagicMock getattr would return a truthy mock.
     agent_instance._compression_skipped_due_to_lock = False
 
-    def _estimate(messages, **_kwargs):
+    estimate_modes = []
+
+    def _estimate(messages, **kwargs):
+        estimate_modes.append(kwargs.get("api_mode"))
         return 100 if messages == history else 60
 
     with (
@@ -102,6 +106,7 @@ async def test_compress_command_works_when_auto_compaction_disabled():
     assert "Compressed:" in result
     agent_instance._compress_context.assert_called_once()
     assert agent_instance._compress_context.call_args.kwargs.get("force") is True
+    assert estimate_modes == ["codex_responses", "codex_responses"]
 
 
 @pytest.mark.asyncio

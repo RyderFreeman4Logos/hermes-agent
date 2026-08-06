@@ -3274,8 +3274,9 @@ def estimate_request_tokens_rough(
     *,
     system_prompt: str = "",
     tools: Optional[List[Dict[str, Any]]] = None,
+    api_mode: Optional[str] = None,
 ) -> int:
-    """Rough token estimate for a full chat-completions request.
+    """Rough token estimate for a full provider request.
 
     Includes the major payload buckets Hermes sends to providers:
     system prompt, conversation messages, and tool schemas.  With 50+
@@ -3286,8 +3287,43 @@ def estimate_request_tokens_rough(
     total = 0
     if system_prompt:
         total += estimate_tokens_rough(system_prompt)
+    elif (
+        api_mode == "codex_responses"
+        and messages
+        and isinstance(messages[0], dict)
+        and messages[0].get("role") == "system"
+    ):
+        total += estimate_tokens_rough(str(messages[0].get("content") or "").strip())
     if messages:
-        total += estimate_messages_tokens_rough(messages)
+        estimated_messages = messages
+        if api_mode == "codex_responses" and all(
+            isinstance(message, dict) for message in messages
+        ):
+            try:
+                from agent.codex_responses_adapter import (
+                    _chat_messages_to_responses_input,
+                )
+                from agent.turn_context import substitute_api_content
+
+                api_messages = [message.copy() for message in messages]
+                for message in api_messages:
+                    substitute_api_content(message)
+                estimated_messages = _chat_messages_to_responses_input(api_messages)
+                wire_shadows = []
+                for item in estimated_messages:
+                    shadow = item.copy()
+                    if shadow.get("type") == "reasoning":
+                        shadow.pop("encrypted_content", None)
+                    elif (
+                        shadow.get("type") == "function_call_output"
+                        and isinstance(shadow.get("output"), list)
+                    ):
+                        shadow["content"] = shadow.pop("output")
+                    wire_shadows.append(shadow)
+                estimated_messages = wire_shadows
+            except Exception:
+                estimated_messages = messages
+        total += estimate_messages_tokens_rough(estimated_messages)
     if tools:
         total += _estimate_tools_tokens_rough(tools)
     return total

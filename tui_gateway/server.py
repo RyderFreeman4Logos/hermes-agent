@@ -4839,7 +4839,10 @@ def _compress_session_history(
         _sys_prompt = getattr(agent, "_cached_system_prompt", "") or ""
         _tools = getattr(agent, "tools", None) or None
         approx_tokens = estimate_request_tokens_rough(
-            history, system_prompt=_sys_prompt, tools=_tools
+            history,
+            system_prompt=_sys_prompt,
+            tools=_tools,
+            api_mode=getattr(agent, "api_mode", None),
         )
     # Pass system_message=None so AIAgent._compress_context rebuilds the
     # system prompt cleanly via _build_system_prompt(None). Passing the
@@ -12846,7 +12849,10 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
             _tools = getattr(agent, "tools", None) or None
             _before_tokens = (
                 estimate_request_tokens_rough(
-                    _before_messages, system_prompt=_sys_prompt, tools=_tools
+                    _before_messages,
+                    system_prompt=_sys_prompt,
+                    tools=_tools,
+                    api_mode=getattr(agent, "api_mode", None),
                 )
                 if _before_count
                 else 0
@@ -12880,7 +12886,10 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
             _tools_after = getattr(agent, "tools", None) or _tools
             _after_tokens = (
                 estimate_request_tokens_rough(
-                    _after_messages, system_prompt=_sys_prompt_after, tools=_tools_after
+                    _after_messages,
+                    system_prompt=_sys_prompt_after,
+                    tools=_tools_after,
+                    api_mode=getattr(agent, "api_mode", None),
                 )
                 if _after_messages
                 else 0

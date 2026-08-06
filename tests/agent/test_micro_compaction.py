@@ -18,6 +18,9 @@ The invariants that matter:
   times and then skipped, so a poison exchange can't stall every turn.
 """
 
+import copy
+import os
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -25,8 +28,11 @@ import pytest
 from agent.context_compressor import (
     COMPRESSED_SUMMARY_METADATA_KEY,
     ContextCompressor,
+    _DB_PERSISTED_MARKER,
     _MICRO_COMPACT_MAX_CONSECUTIVE_FAILURES,
+    MICRO_COMPACT_MARKER_KEY,
 )
+from hermes_state import SessionDB
 
 
 def _compressor(summary="ROLLING SUMMARY") -> ContextCompressor:
@@ -55,6 +61,22 @@ def _conversation(exchanges: int = 6) -> list:
 
 def _summary_markers(messages: list) -> list:
     return [m for m in messages if m.get(COMPRESSED_SUMMARY_METADATA_KEY)]
+
+
+def _agent_with_db(db: SessionDB, session_id: str):
+    with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
+        from run_agent import AIAgent
+
+        return AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            session_db=db,
+            session_id=session_id,
+            skip_context_files=True,
+            skip_memory=True,
+        )
 
 
 class TestMicroCompaction:
@@ -752,6 +774,211 @@ class TestMicroCompaction:
         assert not unstamped, (
             "splice must not strip _db_persisted from surviving messages"
         )
+
+    def test_stale_snapshot_cannot_overwrite_newer_in_place_compaction(
+        self, tmp_path: Path,
+    ):
+        """A rejected stale micro pass cannot leak through append-only flush."""
+        db = SessionDB(db_path=tmp_path / "state.db")
+        session_id = "STALE_MICRO_COMPACTION"
+        db.create_session(session_id, source="cli")
+        db.append_messages_batch(session_id, _conversation(exchanges=8))
+        stale = db.get_messages_as_conversation(session_id)
+        for message in stale:
+            message[_DB_PERSISTED_MARKER] = True
+
+        winner_messages = [
+            {"role": "user", "content": "winner summary"},
+            {"role": "assistant", "content": "winner reply"},
+        ]
+        winner = "pid=1:tid=1:agent=winner:nonce=winner"
+        assert db.try_acquire_compression_lock(
+            session_id, winner, ttl_seconds=60,
+        )
+        db.archive_and_compact(
+            session_id,
+            winner_messages,
+            compression_lock_holder=winner,
+            require_compression_lease=True,
+            expected_active_messages=stale,
+        )
+        db.release_compression_lock(session_id, winner)
+        durable_before = db.get_messages_as_conversation(session_id)
+        rows_before = db.get_messages(session_id, include_inactive=True)
+
+        agent = _agent_with_db(db, session_id)
+        compressor = agent.context_compressor
+        compressor._micro_compact_enabled = True
+        compressor._micro_summarize_one = lambda _text: "STALE SUMMARY"
+        original_messages = copy.deepcopy(stale)
+        original_message_ids = [id(message) for message in stale]
+        state_names = (
+            "_micro_compact_cursor",
+            "_micro_compact_rolling_summary",
+            "_micro_compact_consecutive_failures",
+            "_micro_compact_last_failure_cursor",
+            "_micro_compact_passes",
+            "_micro_compact_tokens_saved_total",
+            "_micro_compact_turns_since_pass",
+            "_flush_scan_cursor_invalidated",
+        )
+        state_before = {
+            name: copy.deepcopy(getattr(compressor, name)) for name in state_names
+        }
+        with patch.object(
+            db, "archive_and_compact", wraps=db.archive_and_compact,
+        ) as archive:
+            result = compressor._micro_compact(stale)
+
+        archive.assert_called_once()
+        assert archive.call_args.kwargs["require_compression_lease"] is True
+        assert archive.call_args.kwargs["compression_lock_holder"]
+        assert archive.call_args.kwargs["expected_active_messages"] == original_messages
+        assert result is stale
+        assert result == original_messages
+        assert [id(message) for message in result] == original_message_ids
+        assert {
+            name: copy.deepcopy(getattr(compressor, name)) for name in state_names
+        } == state_before
+
+        # Reproduce turn_finalizer's next step. No stale hidden summary may be
+        # appended after the transaction fence rejected the whole rewrite.
+        agent._flush_messages_to_session_db(result, conversation_history=[])
+        assert db.get_messages_as_conversation(session_id) == durable_before
+        assert db.get_messages(session_id, include_inactive=True) == rows_before
+        assert db.get_compression_lock_holder(session_id) is None
+
+    @pytest.mark.parametrize("binding_kind", ["subclass", "adapter"])
+    @pytest.mark.parametrize(
+        "missing_api",
+        [
+            "try_acquire_compression_lock",
+            "release_compression_lock",
+            "archive_and_compact",
+        ],
+    )
+    def test_bound_db_missing_fence_api_rolls_back_before_follow_on_flush(
+        self, tmp_path: Path, binding_kind: str, missing_api: str,
+    ):
+        class LegacySessionDB(SessionDB):
+            pass
+
+        class SessionDBAdapter:
+            def __init__(self, wrapped):
+                self._wrapped = wrapped
+
+            def __getattr__(self, name):
+                return getattr(self._wrapped, name)
+
+        session_id = f"MISSING_MICRO_FENCE_{binding_kind.upper()}_{missing_api}"
+        if binding_kind == "subclass":
+            durable_db = LegacySessionDB(db_path=tmp_path / "state.db")
+            bound_db = durable_db
+        else:
+            durable_db = SessionDB(db_path=tmp_path / "state.db")
+            bound_db = SessionDBAdapter(durable_db)
+        durable_db.create_session(session_id, source="cli")
+        durable_db.append_messages_batch(session_id, _conversation(exchanges=8))
+        stale = durable_db.get_messages_as_conversation(session_id)
+        for message in stale:
+            message[_DB_PERSISTED_MARKER] = True
+
+        durable_db.archive_and_compact(
+            session_id,
+            [{"role": "assistant", "content": "winner summary"}],
+            expected_active_messages=stale,
+        )
+        durable_before = durable_db.get_messages_as_conversation(session_id)
+        rows_before = durable_db.get_messages(session_id, include_inactive=True)
+        if binding_kind == "subclass":
+            setattr(LegacySessionDB, missing_api, None)
+        else:
+            setattr(bound_db, missing_api, None)
+
+        agent = _agent_with_db(bound_db, session_id)
+        compressor = agent.context_compressor
+        compressor._micro_compact_enabled = True
+        compressor._micro_summarize_one = lambda _text: "UNFENCED SUMMARY"
+        original_messages = copy.deepcopy(stale)
+        original_message_ids = [id(message) for message in stale]
+
+        result = compressor._micro_compact(stale)
+
+        assert result is stale
+        assert result == original_messages
+        assert [id(message) for message in result] == original_message_ids
+        agent._flush_messages_to_session_db(result, conversation_history=[])
+        assert durable_db.get_messages_as_conversation(session_id) == durable_before
+        assert durable_db.get_messages(session_id, include_inactive=True) == rows_before
+
+    def test_stale_defrag_rolls_back_marker_and_micro_state(self, tmp_path: Path):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        session_id = "STALE_MICRO_DEFRAG"
+        db.create_session(session_id, source="cli")
+        seeded = _conversation(exchanges=8)
+        seeded[2] = {
+            "role": "assistant",
+            "content": "old compacted marker",
+            COMPRESSED_SUMMARY_METADATA_KEY: True,
+            MICRO_COMPACT_MARKER_KEY: True,
+        }
+        db.append_messages_batch(session_id, seeded)
+        stale = db.get_messages_as_conversation(session_id)
+        stale[2][COMPRESSED_SUMMARY_METADATA_KEY] = True
+        stale[2][MICRO_COMPACT_MARKER_KEY] = True
+        for message in stale:
+            message[_DB_PERSISTED_MARKER] = True
+
+        winner = "pid=1:tid=1:agent=winner:nonce=winner"
+        assert db.try_acquire_compression_lock(
+            session_id, winner, ttl_seconds=60,
+        )
+        db.archive_and_compact(
+            session_id,
+            [{"role": "assistant", "content": "winner summary"}],
+            compression_lock_holder=winner,
+            require_compression_lease=True,
+            expected_active_messages=stale,
+        )
+        db.release_compression_lock(session_id, winner)
+        durable_before = db.get_messages_as_conversation(session_id)
+        rows_before = db.get_messages(session_id, include_inactive=True)
+
+        agent = _agent_with_db(db, session_id)
+        compressor = agent.context_compressor
+        compressor._micro_compact_enabled = True
+        compressor._micro_compact_rolling_summary = "x" * 40_000
+        compressor._micro_summarize_one = lambda _text: "STALE DEFRAGGED SUMMARY"
+        original_messages = copy.deepcopy(stale)
+        original_message_ids = [id(message) for message in stale]
+        state_before = {
+            "_micro_compact_cursor": compressor._micro_compact_cursor,
+            "_micro_compact_rolling_summary": (
+                compressor._micro_compact_rolling_summary
+            ),
+            "_flush_scan_cursor_invalidated": (
+                compressor._flush_scan_cursor_invalidated
+            ),
+        }
+
+        result = compressor._micro_compact(stale)
+
+        assert result is stale
+        assert result == original_messages
+        assert [id(message) for message in result] == original_message_ids
+        assert {
+            "_micro_compact_cursor": compressor._micro_compact_cursor,
+            "_micro_compact_rolling_summary": (
+                compressor._micro_compact_rolling_summary
+            ),
+            "_flush_scan_cursor_invalidated": (
+                compressor._flush_scan_cursor_invalidated
+            ),
+        } == state_before
+        agent._flush_messages_to_session_db(result, conversation_history=[])
+        assert db.get_messages_as_conversation(session_id) == durable_before
+        assert db.get_messages(session_id, include_inactive=True) == rows_before
+        assert db.get_compression_lock_holder(session_id) is None
 
 
 class TestDefragFlushCursorInvalidation:

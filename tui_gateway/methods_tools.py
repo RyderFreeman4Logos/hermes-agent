@@ -997,7 +997,10 @@ def _(rid, params: dict) -> dict:
             _tools = getattr(_agent, "tools", None) or None
             before_tokens = (
                 estimate_request_tokens_rough(
-                    before_messages, system_prompt=_sys_prompt, tools=_tools
+                    before_messages,
+                    system_prompt=_sys_prompt,
+                    tools=_tools,
+                    api_mode=getattr(_agent, "api_mode", None),
                 )
                 if before_count
                 else 0
@@ -1031,6 +1034,7 @@ def _(rid, params: dict) -> dict:
                     after_messages,
                     system_prompt=_sys_prompt_after,
                     tools=_tools_after,
+                    api_mode=getattr(_agent, "api_mode", None),
                 )
                 if after_count
                 else 0

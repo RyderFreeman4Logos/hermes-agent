@@ -58,12 +58,13 @@ def test_compress_session_history_raises_on_lock_skip():
 
     history = _make_history()
     agent = _make_lock_skip_agent("pid=99999:tid=1:agent=1:nonce=abc")
+    agent.api_mode = "codex_responses"
     session = _make_session(agent, history)
 
     with (
         patch(
             "agent.model_metadata.estimate_request_tokens_rough", return_value=100
-        ),
+        ) as estimate,
         pytest.raises(CompressionLockHeld) as exc_info,
     ):
         _compress_session_history(session)
@@ -72,6 +73,7 @@ def test_compress_session_history_raises_on_lock_skip():
     # The history must be untouched by the lock-skip.
     assert session["history"] == history
     assert session["history_version"] == 1
+    assert estimate.call_args.kwargs["api_mode"] == "codex_responses"
 
 
 # ── Consumer 1: session.compress RPC ───────────────────────────────────
@@ -168,5 +170,4 @@ def test_mirror_slash_side_effects_reports_lock_skip():
     assert "pid=6161" in output
     assert "No changes from compression" not in output
     assert "live session sync failed" not in output
-
 

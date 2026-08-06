@@ -29,7 +29,12 @@ def _threshold_tokens(context_length: int, threshold_percent: float) -> int:
     return max(int(context_length * threshold_percent), MINIMUM_CONTEXT_LENGTH)
 
 
-def _estimate_tokens(agent: Any, messages: Optional[List[dict]]) -> Optional[int]:
+def _estimate_tokens(
+    agent: Any,
+    messages: Optional[List[dict]],
+    *,
+    api_mode: Optional[str] = None,
+) -> Optional[int]:
     cc = getattr(agent, "context_compressor", None)
     if cc is None:
         return None
@@ -50,6 +55,7 @@ def _estimate_tokens(agent: Any, messages: Optional[List[dict]]) -> Optional[int
                     messages,
                     system_prompt=system_prompt,
                     tools=tools or None,
+                    api_mode=api_mode or getattr(agent, "api_mode", None),
                 )
             )
         except Exception:
@@ -118,7 +124,7 @@ def merge_preflight_compression_warning(
     if not new_ctx:
         return
 
-    estimate = _estimate_tokens(agent, messages)
+    estimate = _estimate_tokens(agent, messages, api_mode=result.api_mode)
     if estimate is None:
         return
 

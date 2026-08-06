@@ -1905,7 +1905,10 @@ def run_conversation(
         # messages walk inside estimate_request_tokens_rough. Tools added
         # separately (compression needs them: 50+ tools = 20-30K tokens).
         # total_chars is a rough (~) proxy — verbose log + hook metric only.
-        approx_tokens = estimate_messages_tokens_rough(api_messages)
+        approx_tokens = estimate_request_tokens_rough(
+            api_messages,
+            api_mode=getattr(agent, "api_mode", None),
+        )
         request_pressure_tokens = approx_tokens + (
             _estimate_tools_tokens_rough(agent.tools) if agent.tools else 0
         )
@@ -4409,7 +4412,11 @@ def run_conversation(
                         # the true request (msgs + tools + system), not the tool-blind message count.
                         messages, active_system_prompt = agent._compress_context(
                             messages, system_message,
-                            approx_tokens=estimate_request_tokens_rough(api_messages, tools=agent.tools or None),
+                            approx_tokens=estimate_request_tokens_rough(
+                                api_messages,
+                                tools=agent.tools or None,
+                                api_mode=getattr(agent, "api_mode", None),
+                            ),
                             task_id=effective_task_id,
                         )
                         conversation_history = conversation_history_after_compression(
@@ -4668,7 +4675,11 @@ def run_conversation(
                     # true request (msgs + tools + system), not the tool-blind message count.
                     messages, active_system_prompt = agent._compress_context(
                         messages, system_message,
-                        approx_tokens=estimate_request_tokens_rough(api_messages, tools=agent.tools or None),
+                        approx_tokens=estimate_request_tokens_rough(
+                            api_messages,
+                            tools=agent.tools or None,
+                            api_mode=getattr(agent, "api_mode", None),
+                        ),
                         task_id=effective_task_id,
                     )
                     if messages is _overflow_input and compression_skipped_due_to_lock(agent):
@@ -4765,7 +4776,9 @@ def run_conversation(
                         # messages.  Use the smaller budget and apply a small
                         # safety margin.  Do not alter context_length.
                         request_input_estimate = estimate_request_tokens_rough(
-                            api_messages, tools=agent.tools or None,
+                            api_messages,
+                            tools=agent.tools or None,
+                            api_mode=getattr(agent, "api_mode", None),
                         )
                         local_available_out = old_ctx - request_input_estimate
                         if local_available_out > 0:
@@ -4969,7 +4982,11 @@ def run_conversation(
                     # _should_force_overflow_recovery. (approx_tokens stays for the status display.)
                     messages, active_system_prompt = agent._compress_context(
                         messages, system_message,
-                        approx_tokens=estimate_request_tokens_rough(api_messages, tools=agent.tools or None),
+                        approx_tokens=estimate_request_tokens_rough(
+                            api_messages,
+                            tools=agent.tools or None,
+                            api_mode=getattr(agent, "api_mode", None),
+                        ),
                         task_id=effective_task_id,
                     )
                     if messages is _overflow_input and compression_skipped_due_to_lock(agent):
@@ -6476,7 +6493,9 @@ def run_conversation(
                     # estimate misses, which can skip compression
                     # past the configured threshold (#14695).
                     _real_tokens = estimate_request_tokens_rough(
-                        messages, tools=agent.tools or None
+                        messages,
+                        tools=agent.tools or None,
+                        api_mode=getattr(agent, "api_mode", None),
                     )
 
                 if (

@@ -281,6 +281,7 @@ _COMPRESSOR_ATTEMPT_STATE_FIELDS = (
     "_active_compression_telemetry",
     "_compression_telemetry_seed",
     "_proactive_prune_rearm_tokens",
+    "_proactive_prune_runway_authoritative",
 )
 
 _COMPRESSOR_COOLDOWN_STATE_FIELDS = (
@@ -3252,17 +3253,60 @@ def compress_context(
                     # WITHOUT destroying history, unlike a hard replace_messages).
                     # See #38763.
                     from agent.context_compressor import (
+                        _DB_PERSISTED_MARKER,
                         PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY,
                     )
+
+                    expected_active_messages = [
+                        message
+                        for message in messages_before_compression
+                        if isinstance(message, dict)
+                        and message.get(_DB_PERSISTED_MARKER)
+                    ]
+                    if not expected_active_messages:
+                        # First-turn preflight can create the session row before
+                        # any transcript row has been flushed.  An authoritative
+                        # durable count of zero is enough to expect an empty
+                        # active set: archive_and_compact re-checks [] inside the
+                        # same write transaction, so a concurrent winner that
+                        # lands after this read is still rejected.
+                        durable_message_count = None
+                        get_session = getattr(agent._session_db, "get_session", None)
+                        if callable(get_session):
+                            try:
+                                session_row = get_session(agent.session_id)
+                                if session_row is not None:
+                                    durable_message_count = session_row["message_count"]
+                            except Exception:
+                                durable_message_count = None
+                        if durable_message_count == 0:
+                            expected_active_messages = []
+                        else:
+                            current_idx = getattr(
+                                agent, "_persist_user_message_idx", None,
+                            )
+                            if (
+                                isinstance(current_idx, int)
+                                and 0 <= current_idx <= len(messages_before_compression)
+                            ):
+                                expected_active_messages = (
+                                    messages_before_compression[:current_idx]
+                                )
+                            else:
+                                expected_active_messages = messages_before_compression
+
                     agent._session_db.archive_and_compact(
                         agent.session_id,
                         persisted_compressed,
-                        model_config_patch={
-                            PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None,
-                        },
                         model_config_json=json.dumps(published_config, sort_keys=True),
                         model=agent.model,
                         system_prompt=new_system_prompt,
+                        model_config_patch={
+                            PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None,
+                        },
+                        compression_lock_holder=_lock_holder,
+                        require_compression_lease=_lock_holder is not None,
+                        expected_active_messages=expected_active_messages,
                     )
                     split_status = "in_place_committed"
                     # Reset the flush identity set so the next turn's appends are
@@ -3394,29 +3438,23 @@ def compress_context(
                     # Atomic publication failed (including lease loss): keep the
                     # parent live and discard the stale compacted snapshot.
                     old_session_id = None
-                    messages[:] = copy.deepcopy(messages_before_compression)
-                    compressed = messages
-                    new_system_prompt = _system_prompt_before_route
-                    _compression_made_progress = False
-                    compacted_in_place = False
-                    # Restore ONLY the prune runway, not the full attempt
-                    # snapshot: _restore_compressor_attempt_state is reserved
-                    # for pre-commit cancels (fence deny / explicit cancel),
-                    # while this branch is post-attempt — the other snapshot
-                    # fields (telemetry, aborted flags) must keep the failed
-                    # attempt's values. The runway is a property of transcript
-                    # state, and the transcript was just rolled back to its
-                    # pre-compression copy, so the runway rolls back with it.
-                    # (compress() zeroed it in-memory on summary success; the
-                    # durable copy was never cleared — that clear only rides
-                    # the atomic archive_and_compact / child-row publication
-                    # that just failed.)
-                    if "_proactive_prune_rearm_tokens" in _compressor_attempt_snapshot:
-                        agent.context_compressor._proactive_prune_rearm_tokens = (
-                            _compressor_attempt_snapshot[
-                                "_proactive_prune_rearm_tokens"
-                            ]
-                        )
+                messages[:] = copy.deepcopy(messages_before_compression)
+                compressed = messages
+                new_system_prompt = _system_prompt_before_route
+                _compression_made_progress = False
+                compacted_in_place = False
+                if "_proactive_prune_rearm_tokens" in _compressor_attempt_snapshot:
+                    agent.context_compressor._proactive_prune_rearm_tokens = (
+                        _compressor_attempt_snapshot[
+                            "_proactive_prune_rearm_tokens"
+                        ]
+                    )
+                if "_proactive_prune_runway_authoritative" in _compressor_attempt_snapshot:
+                    agent.context_compressor._proactive_prune_runway_authoritative = (
+                        _compressor_attempt_snapshot[
+                            "_proactive_prune_runway_authoritative"
+                        ]
+                    )
                 split_status = (
                     "aborted"
                     if locals().get("old_session_id") is None and not in_place
@@ -3558,6 +3596,7 @@ def compress_context(
             compressed,
             system_prompt=new_system_prompt or "",
             tools=agent.tools or None,
+            api_mode=getattr(agent, "api_mode", None),
         )
         agent.context_compressor.last_compression_rough_tokens = _compressed_est
         agent.context_compressor.last_prompt_tokens = -1

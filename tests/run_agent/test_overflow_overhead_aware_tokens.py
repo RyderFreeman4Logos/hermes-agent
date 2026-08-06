@@ -155,8 +155,10 @@ class TestHTTP413OverheadAwareTokens:
 
         estimate_calls = []
 
-        def _capture_estimate(messages, tools=None):
-            estimate_calls.append({"messages": messages, "tools": tools})
+        def _capture_estimate(messages, tools=None, api_mode=None):
+            estimate_calls.append(
+                {"messages": messages, "tools": tools, "api_mode": api_mode}
+            )
             return _SENTINEL_TOKENS
 
         with (
@@ -182,6 +184,7 @@ class TestHTTP413OverheadAwareTokens:
             "during 413 recovery. All calls: "
             + str([c["tools"] for c in estimate_calls])
         )
+        assert all(c["api_mode"] == agent.api_mode for c in handler_calls_with_tools)
 
 
 # ---------------------------------------------------------------------------
@@ -249,8 +252,10 @@ class TestContextOverflowOverheadAwareTokens:
 
         estimate_calls = []
 
-        def _capture_estimate(messages, tools=None):
-            estimate_calls.append({"messages": messages, "tools": tools})
+        def _capture_estimate(messages, tools=None, api_mode=None):
+            estimate_calls.append(
+                {"messages": messages, "tools": tools, "api_mode": api_mode}
+            )
             return _SENTINEL_TOKENS
 
         with (
@@ -275,6 +280,7 @@ class TestContextOverflowOverheadAwareTokens:
             "during context-overflow recovery. All calls: "
             + str([c["tools"] for c in estimate_calls])
         )
+        assert all(c["api_mode"] == agent.api_mode for c in handler_calls_with_tools)
 
     def test_prompt_too_long_variant_passes_overhead_aware_tokens(self, agent):
         """Anthropic 'prompt is too long' error also routes to context_overflow handler."""
@@ -376,8 +382,10 @@ class TestLongContextTierOverheadAwareTokens:
 
         estimate_calls = []
 
-        def _capture_estimate(messages, tools=None):
-            estimate_calls.append({"messages": messages, "tools": tools})
+        def _capture_estimate(messages, tools=None, api_mode=None):
+            estimate_calls.append(
+                {"messages": messages, "tools": tools, "api_mode": api_mode}
+            )
             return _SENTINEL_TOKENS
 
         with (
@@ -402,3 +410,4 @@ class TestLongContextTierOverheadAwareTokens:
             "during long-context-tier recovery. All calls: "
             + str([c["tools"] for c in estimate_calls])
         )
+        assert all(c["api_mode"] == agent.api_mode for c in handler_calls_with_tools)

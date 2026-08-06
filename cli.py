@@ -8258,6 +8258,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         },
                     )
                     self.agent._session_db_created = True
+                    self.agent._reload_proactive_prune_runway_after_session_open()
                 except Exception:
                     pass
                 if title and self._session_db:
@@ -11103,6 +11104,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 self.conversation_history,
                 system_prompt=_sys_prompt,
                 tools=_tools,
+                api_mode=getattr(self.agent, "api_mode", None),
             )
             report = summarize_compress_preview(
                 self.conversation_history,
@@ -11147,6 +11149,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     original_history,
                     system_prompt=_sys_prompt,
                     tools=_tools,
+                    api_mode=getattr(self.agent, "api_mode", None),
                 )
                 if partial:
                     print(f"🗜️  Summarizing up to here: compressing {len(head)} of "
@@ -11232,6 +11235,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     self.conversation_history,
                     system_prompt=_sys_prompt,
                     tools=_tools,
+                    api_mode=getattr(self.agent, "api_mode", None),
                 )
                 summary = summarize_manual_compression(
                     original_history,

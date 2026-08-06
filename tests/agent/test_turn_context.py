@@ -15,6 +15,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from agent.context_compressor import ContextCompressor
+from agent.model_metadata import estimate_request_tokens_rough
 from agent.turn_context import TurnContext, build_turn_context
 from hermes_state import SessionDB
 
@@ -208,6 +209,49 @@ def test_returns_turn_context_with_user_message_appended():
     assert ctx.active_system_prompt == "SYSTEM"
 
 
+def test_responses_preflight_uses_wire_estimate_for_compression_decision():
+    agent = _FakeAgent()
+    agent.api_mode = "codex_responses"
+    agent.compression_enabled = True
+    decision_tokens = []
+    threshold = 100
+    agent.context_compressor = types.SimpleNamespace(
+        protect_first_n=0,
+        protect_last_n=0,
+        threshold_tokens=threshold,
+        last_prompt_tokens=0,
+        should_compress=lambda tokens: (
+            decision_tokens.append(tokens) or tokens >= threshold
+        ),
+        should_compress_info=lambda _tokens: (False, None),
+        should_defer_preflight_to_real_usage=lambda _tokens: False,
+        get_active_compression_failure_cooldown=lambda: None,
+    )
+    agent._compress_context = MagicMock()
+    history = [
+        {
+            "role": "assistant",
+            "content": "ok",
+            "reasoning": "r" * 120_000,
+        }
+    ]
+
+    ctx = _build(agent, conversation_history=history)
+
+    wire_tokens = estimate_request_tokens_rough(
+        ctx.messages,
+        system_prompt=ctx.active_system_prompt or "",
+        api_mode="codex_responses",
+    )
+    rough_tokens = estimate_request_tokens_rough(
+        ctx.messages,
+        system_prompt=ctx.active_system_prompt or "",
+    )
+    assert wire_tokens < threshold < rough_tokens
+    assert decision_tokens == [wire_tokens]
+    agent._compress_context.assert_not_called()
+
+
 # ── Trivial-prompt prefetch gate (PR #25350 salvage) ─────────────────────────
 #
 # The prologue is the ONLY place the per-turn synchronous
@@ -363,9 +407,6 @@ def test_between_turns_refresh_adds_late_tool_when_servers_registered():
 
     assert "mcp_x_tool" in agent.valid_tool_names
     assert any(t["function"]["name"] == "mcp_x_tool" for t in agent.tools)
-
-
-
 
 
 

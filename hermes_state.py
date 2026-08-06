@@ -7044,11 +7044,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         def _do(conn):
             if model_config_json is not None:
+                system_prompt_hash = self._store_system_prompt(conn, system_prompt)
                 conn.execute(
                     """UPDATE sessions SET
                        model_config = ?,
                        model = COALESCE(?, model),
-                       system_prompt = ?,
+                       system_prompt = NULL,
+                       system_prompt_hash = ?,
                        billing_provider = COALESCE(?, billing_provider),
                        billing_base_url = COALESCE(?, billing_base_url),
                        billing_mode = COALESCE(?, billing_mode)
@@ -7056,13 +7058,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     (
                         model_config_json,
                         model,
-                        system_prompt,
+                        system_prompt_hash,
                         billing_provider,
                         billing_base_url,
                         billing_mode,
                         session_id,
                     ),
                 )
+                self._delete_unreferenced_system_prompts(conn)
             # Soft-archive the live turns: active=0 hides them from the live
             # context load, compacted=1 marks them as "summarized away" (vs
             # rewind/undo's active=0+compacted=0, which means "user took it

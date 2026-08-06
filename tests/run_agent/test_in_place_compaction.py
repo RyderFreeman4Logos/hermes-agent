@@ -9,6 +9,7 @@ gaps, #42228 null cwd). When the flag is False (default), rotation behaves
 exactly as before.
 """
 
+import hashlib
 import os
 import tempfile
 from pathlib import Path
@@ -196,6 +197,59 @@ class TestInPlaceCompaction:
             assert observed["billing_base_url"] == "https://new.example/v1"
             assert observed["billing_mode"] == "responses"
             assert len(observed["messages"]) == 2
+
+    def test_in_place_replaces_hashed_prompt_without_deferred_switch(self):
+        """Ordinary compaction publishes the rebuilt prompt for resume."""
+        from agent.conversation_compression import compress_context
+        from agent.conversation_loop import _restore_or_build_system_prompt
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "ordinary-prompt-publication"
+            _seed(db, sid, "ordinary")
+            old_prompt = "old prompt"
+            db.update_system_prompt(sid, old_prompt)
+            old_hash = hashlib.sha256(old_prompt.encode("utf-8")).hexdigest()
+            agent = _make_agent(db, sid, in_place=True)
+
+            _, new_prompt = compress_context(
+                agent,
+                [{"role": "user", "content": f"m{i}"} for i in range(8)],
+                approx_tokens=100_000,
+                system_message="sys",
+            )
+
+            assert new_prompt != old_prompt
+            assert db.get_session(sid)["system_prompt"] == new_prompt
+            raw = db._conn.execute(
+                "SELECT system_prompt, system_prompt_hash FROM sessions WHERE id = ?",
+                (sid,),
+            ).fetchone()
+            new_hash = hashlib.sha256(new_prompt.encode("utf-8")).hexdigest()
+            assert raw["system_prompt"] is None
+            assert raw["system_prompt_hash"] == new_hash
+            stored_hashes = {
+                row["hash"]
+                for row in db._conn.execute("SELECT hash FROM system_prompts")
+            }
+            assert stored_hashes == {new_hash}
+            assert old_hash not in stored_hashes
+
+            # A fresh resume must reuse the newly published prompt byte-for-byte,
+            # rather than rebuilding or hydrating the stale pre-compaction hash.
+            agent._cached_system_prompt = None
+            with patch.object(
+                agent,
+                "_build_system_prompt",
+                side_effect=AssertionError("resume rebuilt the persisted prompt"),
+            ):
+                _restore_or_build_system_prompt(
+                    agent,
+                    "sys",
+                    db.get_messages_as_conversation(sid),
+                )
+            assert agent._cached_system_prompt == new_prompt
 
     def test_in_place_alternation_preserved(self):
         """The compacted list must not introduce consecutive same-role messages."""

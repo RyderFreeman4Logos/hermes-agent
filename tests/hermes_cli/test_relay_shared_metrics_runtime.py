@@ -14,6 +14,7 @@ from typing import Any
 
 import pytest
 
+from agent import relay_llm
 from hermes_cli import lifecycle, plugins
 from hermes_cli.observability import relay_runtime, relay_shared_metrics
 from hermes_cli.plugins import PluginManager
@@ -1301,6 +1302,354 @@ def test_direct_runtime_fake_enforces_lifo_scope_contract(direct_runtime):
 
     runtime.run_in_session(session, direct_runtime.scope.pop, second)
     runtime.run_in_session(session, direct_runtime.scope.pop, first)
+
+
+@pytest.mark.parametrize("completion_order", [("a", "b"), ("b", "a")])
+def test_overlapping_logical_llm_calls_close_without_non_lifo_pop(
+    direct_runtime,
+    caplog,
+    completion_order,
+):
+    coordinator = relay_runtime.SESSION_COORDINATOR
+    profile_key = relay_runtime.current_profile_key()
+    lease = coordinator.acquire_conversation(
+        profile_key=profile_key,
+        session_id="shared-session",
+        platform="cli",
+    )
+    turn = coordinator.begin_turn(
+        lease,
+        turn_id="turn",
+        task_id="task",
+    )
+    runtime = turn.lease.host
+    session = turn.lease.session
+    assert isinstance(runtime, relay_runtime.RelayRuntime)
+    assert session is not None
+
+    started = {name: threading.Event() for name in ("a", "b")}
+    release = {name: threading.Event() for name in ("a", "b")}
+    results: dict[str, dict[str, str]] = {}
+    errors: list[BaseException] = []
+
+    def call_provider(name: str) -> None:
+        try:
+            logical = relay_llm._logical_parent(
+                runtime,
+                session,
+                turn.handle,
+                {"api_request_id": f"request-{name}"},
+            )
+            started[name].set()
+            if not release[name].wait(timeout=5):
+                raise TimeoutError(f"provider {name} was not released")
+            results[name] = {"content": name}
+            relay_llm._complete_logical(
+                logical,
+                outcome="success",
+                model_name=f"model-{name}",
+                provider_name=f"provider-{name}",
+                response_model_name=f"response-{name}",
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    first = threading.Thread(
+        target=contextvars.copy_context().run,
+        args=(call_provider, "a"),
+    )
+    second = threading.Thread(
+        target=contextvars.copy_context().run,
+        args=(call_provider, "b"),
+    )
+    try:
+        first.start()
+        assert started["a"].wait(timeout=1)
+        second.start()
+        assert started["b"].wait(timeout=1)
+
+        threads = {"a": first, "b": second}
+        for name in completion_order:
+            release[name].set()
+            threads[name].join(timeout=1)
+            assert threads[name].is_alive() is False
+
+        assert errors == []
+        assert results == {
+            "a": {"content": "a"},
+            "b": {"content": "b"},
+        }
+        assert turn.logical_llm_calls == {}
+        assert not [
+            event
+            for event in direct_runtime.events
+            if event[0] == "scope.pop.rejected"
+        ]
+        logical_closes = [
+            event
+            for event in direct_runtime.events
+            if event[0] == "scope.pop"
+            and event[1][1] == relay_runtime.LOGICAL_LLM_SCOPE
+        ]
+        assert [event[2]["output"] for event in logical_closes] == [
+            {
+                "model": "model-b",
+                "outcome": "success",
+                "provider": "provider-b",
+                "response_model": "response-b",
+            },
+            {
+                "model": "model-a",
+                "outcome": "success",
+                "provider": "provider-a",
+                "response_model": "response-a",
+            },
+        ]
+        assert "Hermes Relay logical LLM finalization failed" not in caplog.messages
+    finally:
+        release["a"].set()
+        release["b"].set()
+        first.join(timeout=1)
+        second.join(timeout=1)
+        coordinator.end_turn(turn, outcome="success")
+        coordinator.release_conversation(lease)
+        coordinator.finalize_conversation(
+            profile_key=profile_key,
+            session_id="shared-session",
+        )
+
+
+def test_three_overlapping_logical_calls_drain_only_terminal_suffix(
+    direct_runtime,
+    caplog,
+):
+    coordinator = relay_runtime.SESSION_COORDINATOR
+    profile_key = relay_runtime.current_profile_key()
+    lease = coordinator.acquire_conversation(
+        profile_key=profile_key,
+        session_id="three-way",
+        platform="cli",
+    )
+    turn = coordinator.begin_turn(lease, turn_id="turn", task_id="task")
+    runtime = turn.lease.host
+    session = turn.lease.session
+    assert isinstance(runtime, relay_runtime.RelayRuntime)
+    assert session is not None
+    logical = {
+        name: relay_llm._logical_parent(
+            runtime,
+            session,
+            turn.handle,
+            {"api_request_id": f"request-{name}"},
+        )
+        for name in ("a", "b", "c")
+    }
+    try:
+        relay_llm._complete_logical(logical["a"], outcome="success")
+        assert list(turn.logical_llm_calls) == ["request-a", "request-b", "request-c"]
+        relay_llm._complete_logical(logical["c"], outcome="success")
+        assert list(turn.logical_llm_calls) == ["request-a", "request-b"]
+        relay_llm._complete_logical(logical["b"], outcome="success")
+
+        assert turn.logical_llm_calls == {}
+        assert [
+            event[1]
+            for event in direct_runtime.events
+            if event[0] == "scope.pop"
+            and event[1][1] == relay_runtime.LOGICAL_LLM_SCOPE
+        ] == [logical[name][1] for name in ("c", "b", "a")]
+        assert not [
+            event for event in direct_runtime.events if event[0] == "scope.pop.rejected"
+        ]
+        assert "Hermes Relay logical LLM finalization failed" not in caplog.messages
+    finally:
+        coordinator.end_turn(turn, outcome="success")
+        coordinator.release_conversation(lease)
+        coordinator.finalize_conversation(
+            profile_key=profile_key,
+            session_id="three-way",
+        )
+
+
+def test_duplicate_logical_completion_preserves_first_terminal_output(direct_runtime):
+    coordinator = relay_runtime.SESSION_COORDINATOR
+    profile_key = relay_runtime.current_profile_key()
+    lease = coordinator.acquire_conversation(
+        profile_key=profile_key,
+        session_id="duplicate",
+        platform="cli",
+    )
+    turn = coordinator.begin_turn(lease, turn_id="turn", task_id="task")
+    runtime = turn.lease.host
+    session = turn.lease.session
+    assert isinstance(runtime, relay_runtime.RelayRuntime)
+    assert session is not None
+    first = relay_llm._logical_parent(
+        runtime,
+        session,
+        turn.handle,
+        {"api_request_id": "request-a"},
+    )
+    blocker = relay_llm._logical_parent(
+        runtime,
+        session,
+        turn.handle,
+        {"api_request_id": "request-b"},
+    )
+    duplicate = relay_llm._logical_parent(
+        runtime,
+        session,
+        turn.handle,
+        {"api_request_id": "request-a"},
+    )
+    assert duplicate == first
+    try:
+        relay_llm._complete_logical(
+            first,
+            outcome="success",
+            model_name="first-model",
+            provider_name="first-provider",
+        )
+        relay_llm._complete_logical(
+            duplicate,
+            outcome="failed",
+            model_name="duplicate-model",
+            provider_name="duplicate-provider",
+        )
+        relay_llm._complete_logical(blocker, outcome="success")
+
+        first_close = [
+            event
+            for event in direct_runtime.events
+            if event[0] == "scope.pop" and event[1] == first[1]
+        ]
+        assert first_close[0][2]["output"] == {
+            "model": "first-model",
+            "outcome": "success",
+            "provider": "first-provider",
+        }
+    finally:
+        coordinator.end_turn(turn, outcome="success")
+        coordinator.release_conversation(lease)
+        coordinator.finalize_conversation(
+            profile_key=profile_key,
+            session_id="duplicate",
+        )
+
+
+def test_turn_teardown_closes_pending_calls_with_turn_outcome(direct_runtime):
+    coordinator = relay_runtime.SESSION_COORDINATOR
+    profile_key = relay_runtime.current_profile_key()
+    lease = coordinator.acquire_conversation(
+        profile_key=profile_key,
+        session_id="teardown",
+        platform="cli",
+    )
+    turn = coordinator.begin_turn(lease, turn_id="turn", task_id="task")
+    runtime = turn.lease.host
+    session = turn.lease.session
+    assert isinstance(runtime, relay_runtime.RelayRuntime)
+    assert session is not None
+    first = relay_llm._logical_parent(
+        runtime,
+        session,
+        turn.handle,
+        {"api_request_id": "request-a"},
+    )
+    relay_llm._logical_parent(
+        runtime,
+        session,
+        turn.handle,
+        {"api_request_id": "request-b"},
+    )
+    relay_llm._complete_logical(
+        first,
+        outcome="success",
+        model_name="model-a",
+        provider_name="provider-a",
+    )
+
+    coordinator.end_turn(turn, outcome="cancelled")
+    coordinator.release_conversation(lease)
+    coordinator.finalize_conversation(
+        profile_key=profile_key,
+        session_id="teardown",
+    )
+
+    closes = [
+        event
+        for event in direct_runtime.events
+        if event[0] == "scope.pop"
+        and event[1][1]
+        in {relay_runtime.LOGICAL_LLM_SCOPE, relay_runtime.TURN_SCOPE}
+    ]
+    assert [event[2]["output"] for event in closes] == [
+        {"outcome": "cancelled"},
+        {"model": "model-a", "outcome": "success", "provider": "provider-a"},
+        {"outcome": "cancelled"},
+    ]
+
+
+def test_failed_logical_teardown_does_not_pop_ancestor_turn(
+    direct_runtime,
+    monkeypatch,
+):
+    coordinator = relay_runtime.SESSION_COORDINATOR
+    profile_key = relay_runtime.current_profile_key()
+    lease = coordinator.acquire_conversation(
+        profile_key=profile_key,
+        session_id="failed-teardown",
+        platform="cli",
+    )
+    turn = coordinator.begin_turn(lease, turn_id="turn", task_id="task")
+    runtime = turn.lease.host
+    session = turn.lease.session
+    assert isinstance(runtime, relay_runtime.RelayRuntime)
+    assert session is not None
+    logical = relay_llm._logical_parent(
+        runtime,
+        session,
+        turn.handle,
+        {"api_request_id": "request-a"},
+    )
+    assert logical is not None
+    original_pop = direct_runtime.scope.pop
+
+    def fail_logical_pop(handle, **kwargs):
+        if handle == logical[1]:
+            raise RuntimeError("simulated logical pop failure")
+        return original_pop(handle, **kwargs)
+
+    monkeypatch.setattr(direct_runtime.scope, "pop", fail_logical_pop)
+    coordinator.end_turn(turn, outcome="failed")
+
+    assert turn.logical_llm_calls == {"request-a": logical[1]}
+    assert turn.logical_llm_outputs == {"request-a": {"outcome": "failed"}}
+    assert not [
+        event
+        for event in direct_runtime.events
+        if event[0] == "scope.pop" and event[1] == turn.handle
+    ]
+    assert not [
+        event
+        for event in direct_runtime.events
+        if event[0] == "scope.pop.rejected" and event[1] == turn.handle
+    ]
+
+    monkeypatch.setattr(direct_runtime.scope, "pop", original_pop)
+    with turn.finalize_lock:
+        coordinator._finish_logical_calls(turn, outcome="failed")
+        runtime.run_in_session(
+            session,
+            original_pop,
+            turn.handle,
+            output={"outcome": "failed"},
+        )
+    coordinator.release_conversation(lease)
+    coordinator.finalize_conversation(
+        profile_key=profile_key,
+        session_id="failed-teardown",
+    )
 
 
 def test_concurrent_turn_skips_relay_before_scope_stack_can_interleave(

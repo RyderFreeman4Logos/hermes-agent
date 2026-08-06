@@ -444,6 +444,97 @@ def test_run_codex_stream_returns_collected_items_when_stream_ends_without_termi
     assert response.output == [output_item]
 
 
+def test_run_codex_stream_unwraps_chat_only_auxiliary_client(monkeypatch):
+    from agent.auxiliary_client import CodexAuxiliaryClient
+
+    agent = _build_agent(monkeypatch)
+    calls = []
+
+    def _fake_create(**kwargs):
+        calls.append(kwargs)
+        return _FakeCreateStream([
+            SimpleNamespace(
+                type="response.completed",
+                response=_codex_message_response("Summary"),
+            )
+        ])
+
+    raw_client = SimpleNamespace(
+        api_key="test-key",
+        base_url="https://api.example/v1",
+        responses=SimpleNamespace(create=_fake_create),
+    )
+    agent.client = CodexAuxiliaryClient(raw_client, "gpt-5-codex")
+
+    assert not hasattr(agent.client, "responses")
+    response = agent._run_codex_stream(_codex_request_kwargs())
+
+    assert response is not None
+    assert response.status == "completed"
+    assert calls == [{**_codex_request_kwargs(), "stream": True}]
+
+
+def test_run_codex_stream_preserves_raw_responses_client(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    calls = []
+
+    def _fake_create(**kwargs):
+        calls.append(kwargs)
+        return _FakeCreateStream([
+            SimpleNamespace(
+                type="response.completed",
+                response=_codex_message_response("Summary"),
+            )
+        ])
+
+    raw_client = SimpleNamespace(responses=SimpleNamespace(create=_fake_create))
+    response = agent._run_codex_stream(_codex_request_kwargs(), client=raw_client)
+
+    assert response is not None
+    assert response.status == "completed"
+    assert calls == [{**_codex_request_kwargs(), "stream": True}]
+
+
+def test_run_codex_stream_rejects_non_responses_client(monkeypatch):
+    agent = _build_agent(monkeypatch)
+
+    with pytest.raises(TypeError, match="Responses API client"):
+        agent._run_codex_stream(_codex_request_kwargs(), client=object())
+
+
+def test_max_iteration_summary_uses_raw_client_behind_auxiliary_facade(monkeypatch):
+    from agent.auxiliary_client import CodexAuxiliaryClient
+
+    agent = _build_agent(monkeypatch)
+    calls = []
+    summary_item = _codex_ack_message_response("Summary after iteration limit.").output[0]
+
+    def _fake_create(**kwargs):
+        calls.append(kwargs)
+        return _FakeCreateStream([
+            SimpleNamespace(type="response.output_item.done", item=summary_item),
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(status="completed"),
+            )
+        ])
+
+    raw_client = SimpleNamespace(
+        api_key="test-key",
+        base_url="https://api.example/v1",
+        responses=SimpleNamespace(create=_fake_create),
+    )
+    agent.client = CodexAuxiliaryClient(raw_client, "gpt-5-codex")
+    monkeypatch.setattr(agent, "_cached_system_prompt", "You are helpful.", raising=False)
+
+    result = agent._handle_max_iterations(
+        [{"role": "user", "content": "Summarize the work."}], 200
+    )
+
+    assert result == "Summary after iteration limit."
+    assert len(calls) == 1
+
+
 def test_consume_codex_stream_routes_commentary_phase_deltas_to_reasoning(monkeypatch):
     from agent.codex_runtime import _consume_codex_event_stream
 

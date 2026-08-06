@@ -23,7 +23,7 @@ import re
 import threading
 from typing import Any, Callable, Optional
 
-from agent.auxiliary_client import call_llm
+from agent.auxiliary_client import call_llm, scoped_runtime_main
 from agent.context_compressor import LEGACY_SUMMARY_PREFIX
 from agent.message_content import flatten_message_text
 
@@ -601,12 +601,13 @@ def _auto_title_session(
     # recorded against this session (task='title_generation', #23270).
     set_accounting_context(session_db, session_id)
 
-    title = generate_title(
-        user_message,
-        failure_callback=failure_callback,
-        main_runtime=main_runtime,
-        runtime_validator=runtime_validator,
-    )
+    with scoped_runtime_main(main_runtime):
+        title = generate_title(
+            user_message,
+            failure_callback=failure_callback,
+            main_runtime=main_runtime,
+            runtime_validator=runtime_validator,
+        )
     source = "llm"
     if not title:
         # No model title, so the derived one has to hold — and it may never have
@@ -724,12 +725,18 @@ def maybe_auto_title(
 
     apply_instant_title(session_db, session_id, user_message, title_callback)
 
+    from hermes_state import resolve_prompt_cache_scope
+
+    cache_scope = resolve_prompt_cache_scope(session_id, session_db)
+    title_runtime = dict(main_runtime) if isinstance(main_runtime, dict) else {}
+    title_runtime["cache_scope"] = cache_scope
+
     thread = threading.Thread(
         target=auto_title_session,
         args=(session_db, session_id, user_message),
         kwargs={
             "failure_callback": failure_callback,
-            "main_runtime": main_runtime,
+            "main_runtime": title_runtime,
             "title_callback": title_callback,
             "runtime_validator": runtime_validator,
         },

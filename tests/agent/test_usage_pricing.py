@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 from agent.usage_pricing import (
     CanonicalUsage,
     estimate_usage_cost,
@@ -13,6 +15,103 @@ from agent.usage_pricing import (
 
 
 
+
+
+@pytest.mark.parametrize(
+    ("provider", "api_mode", "usage", "expected"),
+    [
+        (
+            "anthropic",
+            "anthropic_messages",
+            SimpleNamespace(
+                input_tokens=200,
+                output_tokens=10,
+                cache_read_input_tokens=1_400,
+                cache_creation_input_tokens=400,
+            ),
+            (200, 1_400, 400),
+        ),
+        (
+            "openai",
+            "codex_responses",
+            SimpleNamespace(
+                input_tokens=2_000,
+                output_tokens=10,
+                input_tokens_details=SimpleNamespace(
+                    cached_tokens=1_400, cache_creation_tokens=400
+                ),
+            ),
+            (200, 1_400, 400),
+        ),
+        (
+            "openai",
+            "chat_completions",
+            SimpleNamespace(
+                prompt_tokens=2_000,
+                completion_tokens=10,
+                prompt_tokens_details=SimpleNamespace(
+                    cached_tokens=1_400, cache_write_tokens=400
+                ),
+            ),
+            (200, 1_400, 400),
+        ),
+        (
+            "openrouter",
+            "chat_completions",
+            SimpleNamespace(
+                prompt_tokens=2_000,
+                completion_tokens=10,
+                cache_read_input_tokens=1_400,
+                cache_creation_input_tokens=400,
+            ),
+            (200, 1_400, 400),
+        ),
+        (
+            "deepseek",
+            "chat_completions",
+            SimpleNamespace(
+                prompt_tokens=2_000,
+                completion_tokens=10,
+                prompt_cache_hit_tokens=1_400,
+                prompt_cache_miss_tokens=600,
+            ),
+            (600, 1_400, 0),
+        ),
+    ],
+)
+def test_normalize_usage_preserves_cache_presence_and_prompt_arithmetic(
+    provider, api_mode, usage, expected
+):
+    normalized = normalize_usage(usage, provider=provider, api_mode=api_mode)
+
+    assert (
+        normalized.input_tokens,
+        normalized.cache_read_tokens,
+        normalized.cache_write_tokens,
+    ) == expected
+    assert normalized.prompt_tokens == sum(expected)
+    assert normalized.cache_telemetry_present is True
+
+
+def test_normalize_usage_distinguishes_reported_zero_from_omitted_cache_fields():
+    reported_zero = normalize_usage(
+        SimpleNamespace(
+            prompt_tokens=2_000,
+            completion_tokens=10,
+            prompt_tokens_details=SimpleNamespace(cached_tokens=0),
+        ),
+        provider="openai",
+        api_mode="chat_completions",
+    )
+    omitted = normalize_usage(
+        SimpleNamespace(prompt_tokens=2_000, completion_tokens=10),
+        provider="openai",
+        api_mode="chat_completions",
+    )
+
+    assert reported_zero.cache_read_tokens == omitted.cache_read_tokens == 0
+    assert reported_zero.cache_telemetry_present is True
+    assert omitted.cache_telemetry_present is False
 
 
 def test_normalize_usage_reads_deepseek_native_cache_hit_tokens():

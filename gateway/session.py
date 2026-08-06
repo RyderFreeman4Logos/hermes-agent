@@ -3709,7 +3709,14 @@ class SessionStore:
             session_id=session_id,
             role=message.get("role", "unknown"),
             content=message.get("content"),
-            tool_name=message.get("tool_name"),
+            tool_name=(
+                message.get("tool_name")
+                or (
+                    message.get("name")
+                    if message.get("role") == "tool"
+                    else None
+                )
+            ),
             tool_calls=message.get("tool_calls"),
             tool_call_id=message.get("tool_call_id"),
             reasoning=message.get("reasoning") if message.get("role") == "assistant" else None,
@@ -3879,6 +3886,7 @@ class SessionStore:
         except Exception:
             pass
         try:
+            self._db.recover_dangling_completion_tool_intent(session_id)
             # repair_alternation: this load feeds LIVE REPLAY. A durable
             # user;user wedge (e.g. a turn that persisted no assistant row)
             # would otherwise re-trigger the pre-request repair on every

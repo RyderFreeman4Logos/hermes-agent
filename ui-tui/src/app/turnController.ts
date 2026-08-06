@@ -29,6 +29,63 @@ const INTERRUPT_COOLDOWN_MS = 1500
 const ACTIVITY_LIMIT = 8
 const TRAIL_LIMIT = 8
 
+type CacheInfo = {
+  attribution?: 'post_compression'
+  level: 'error' | 'info'
+  note?: string
+  pct: number
+  prompt_tokens: number
+  read_tokens: number
+  state: 'cold_write' | 'hit' | 'miss' | 'unavailable' | 'unknown'
+}
+
+const cacheFootnote = (cacheInfo?: CacheInfo): Msg | null => {
+  if (!cacheInfo) {
+    return null
+  }
+
+  const cacheText =
+    cacheInfo.state === 'hit'
+      ? `cache ${Math.max(0, Math.round(cacheInfo.pct))}%`
+      : cacheInfo.state === 'cold_write'
+        ? 'cache cold-write'
+        : `cache ${cacheInfo.state}`
+
+  const attribution =
+    cacheInfo.attribution === 'post_compression'
+      ? ` · ${
+          cacheInfo.note ??
+          (cacheInfo.state === 'hit' && cacheInfo.pct >= 95
+            ? 'post-compression cache warm'
+            : 'post-compression warmup (expected)')
+        }`
+      : ''
+
+  return {
+    kind: 'event',
+    role: 'system',
+    text: `${cacheText}${attribution}`,
+    ...(cacheInfo.level === 'error' && { tone: 'error' as const })
+  }
+}
+
+const completionFootnote = (completedAt?: number): Msg | null => {
+  if (!Number.isFinite(completedAt)) {
+    return null
+  }
+
+  // Omit a timeZone so this is rendered in the TUI host's local system time,
+  // not UTC. en-GB gives a compact, reliable 24-hour HH:mm:ss representation.
+  const time = new Date(completedAt! * 1_000).toLocaleTimeString('en-GB', {
+    hour: '2-digit',
+    hour12: false,
+    minute: '2-digit',
+    second: '2-digit'
+  })
+
+  return { kind: 'event', role: 'system', text: `完成 ${time}` }
+}
+
 // Extracts the raw patch from a diff-only segment produced by
 // pushInlineDiffSegment. Used at message.complete to dedupe against final
 // assistant text that narrates the same patch. Returns null for anything
@@ -556,6 +613,8 @@ class TurnController {
   }
 
   recordMessageComplete(payload: {
+    cache_info?: CacheInfo
+    completed_at?: number
     rendered?: string
     reasoning?: string
     response_previewed?: boolean
@@ -633,6 +692,18 @@ class TurnController {
 
     if (finalText) {
       finalMessages.push({ role: 'assistant', text: finalText })
+    }
+
+    const footnote = cacheFootnote(payload.cache_info)
+
+    if (footnote && finalMessages.some(message => message.role === 'assistant')) {
+      finalMessages.push(footnote)
+    }
+
+    const completion = completionFootnote(payload.completed_at)
+
+    if (completion) {
+      finalMessages.push(completion)
     }
 
     const wasInterrupted = this.interrupted

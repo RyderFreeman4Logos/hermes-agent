@@ -59,6 +59,19 @@ class TestPlanToolBatchSegments:
         assert _kinds(segments) == ["parallel"]
         assert _flatten_ids(segments) == [c.id for c in calls]
 
+    def test_identical_calls_are_ordered_for_result_guardrails(self):
+        calls = [
+            _tc("web_search", '{"query":"same"}', call_id=f"r{i}")
+            for i in range(7)
+        ]
+
+        segments = _plan_tool_batch_segments(calls)
+
+        assert _kinds(segments) == ["parallel", "sequential"]
+        assert [tc.id for tc in segments[0][1]] == [f"r{i}" for i in range(4)]
+        assert [tc.id for tc in segments[1][1]] == [f"r{i}" for i in range(4, 7)]
+        assert _flatten_ids(segments) == [f"r{i}" for i in range(7)]
+
     def test_three_safe_reads_plus_trailing_unsafe_keeps_reads_parallel(self):
         """The headline case: 3 safe reads + 1 unsafe tool must NOT go fully sequential."""
         calls = [

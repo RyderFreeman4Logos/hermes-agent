@@ -9177,6 +9177,40 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return self._execute_write(_do)
 
+    def compare_and_set_active_tool_content(
+        self,
+        session_id: str,
+        tool_call_id: str,
+        expected_content: Any,
+        replacement_content: Any,
+    ) -> int:
+        """Replace one durable tool result only while its old bytes match.
+
+        Tool progress is appended before callbacks and before the rest of a
+        batch finishes.  A late ``/steer`` can therefore arrive after that
+        append and extend the hot tool message.  This holder-free CAS keeps
+        the already-published row aligned without inserting a duplicate or
+        overwriting a concurrently compacted/replaced transcript.
+        """
+        expected = self._encode_content(expected_content)
+        replacement = self._encode_content(replacement_content)
+
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE messages SET content = ?, api_content = NULL "
+                "WHERE id = ("
+                "SELECT id FROM messages "
+                "WHERE session_id = ? AND active = 1 AND role = 'tool' "
+                "AND tool_call_id = ? ORDER BY id DESC LIMIT 1"
+                ") AND content IS ?",
+                (replacement, session_id, tool_call_id, expected),
+            )
+            return cursor.rowcount
+
+        return self._execute_write(
+            _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
+        )
+
     def get_messages(
         self,
         session_id: str,

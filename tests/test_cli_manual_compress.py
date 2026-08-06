@@ -18,6 +18,9 @@ class DummyAgent:
         self.boundary_calls = []
         self.context_compressor = type("ContextEngineStub", (), {})()
         self.context_compressor.on_session_start = self._record_boundary
+        self.context_compressor._last_compression_telemetry = {
+            "commit_status": "committed",
+        }
 
     def _record_boundary(self, session_id, **kwargs):
         self.host_events.append("notify")

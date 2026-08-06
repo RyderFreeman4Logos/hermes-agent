@@ -8786,7 +8786,9 @@ def test_compress_session_history_passes_force():
     from unittest.mock import MagicMock
 
     agent = MagicMock()
-    agent.context_compressor = None  # keep _get_usage on the simple path
+    agent.context_compressor = types.SimpleNamespace(
+        _last_compression_telemetry={"commit_status": "committed"}
+    )
     compressed = [{"role": "user", "content": "summary"}]
     agent._compress_context.return_value = (compressed, "")
     # Explicit non-lock-skip: MagicMock getattr would return a truthy mock.
@@ -8808,6 +8810,35 @@ def test_compress_session_history_passes_force():
     assert agent._compress_context.call_args.kwargs.get("force") is True
 
 
+def test_compress_session_history_short_precheck_records_fresh_noop():
+    from unittest.mock import MagicMock
+
+    agent = MagicMock()
+    agent.session_id = "short-session"
+    agent.context_compressor = types.SimpleNamespace(
+        _last_compression_telemetry={
+            "attempt_id": "stale",
+            "commit_status": "committed",
+        }
+    )
+    session = _session(
+        agent=agent,
+        history=[
+            {"role": "user", "content": "one"},
+            {"role": "assistant", "content": "two"},
+        ],
+    )
+
+    removed, _usage = server._compress_session_history(session)
+
+    assert removed == 0
+    agent._compress_context.assert_not_called()
+    outcome = agent.context_compressor._last_compression_telemetry
+    assert outcome["attempt_id"] != "stale"
+    assert outcome["commit_status"] == "aborted"
+    assert outcome["failure_class"] == "insufficient_messages"
+
+
 def test_compress_session_history_restores_cache_attribution_on_outer_rollback():
     original = [
         {"role": "user", "content": "one"},
@@ -8816,7 +8847,10 @@ def test_compress_session_history_restores_cache_attribution_on_outer_rollback()
         {"role": "assistant", "content": "four"},
     ]
     current = [*original, {"role": "user", "content": "typed during compression"}]
-    compressor = types.SimpleNamespace(awaiting_real_usage_after_compression=False)
+    compressor = types.SimpleNamespace(
+        awaiting_real_usage_after_compression=False,
+        _last_compression_telemetry={"commit_status": "committed"},
+    )
     agent = types.SimpleNamespace(
         _awaiting_cache_usage_after_compression=False,
         _compression_skipped_due_to_lock=False,
@@ -8855,7 +8889,9 @@ def test_compress_session_history_works_when_auto_compaction_disabled():
 
     agent = MagicMock()
     agent.compression_enabled = False
-    agent.context_compressor = None  # keep _get_usage on the simple path
+    agent.context_compressor = types.SimpleNamespace(
+        _last_compression_telemetry={"commit_status": "committed"}
+    )
     compressed = [{"role": "user", "content": "summary"}]
     agent._compress_context.return_value = (compressed, "")
     # Explicit non-lock-skip: MagicMock getattr would return a truthy mock.
@@ -9056,6 +9092,10 @@ def test_session_compress_reports_aborted_summary_without_success(monkeypatch):
         _last_summary_error=(
             "Provider 'opencode-zen' is set in config.yaml but no API key was found."
         ),
+        _last_compression_telemetry={
+            "commit_status": "aborted",
+            "failure_class": "summary_failed",
+        },
     )
     agent = types.SimpleNamespace(
         context_compressor=compression_state,
@@ -9084,9 +9124,19 @@ def test_session_compress_reports_aborted_summary_without_success(monkeypatch):
         lambda session, focus_topic=None, **_kw: (0, {"total": 42}),
     )
     monkeypatch.setattr(server, "_session_info", lambda _agent, *a: {"model": "x"})
+    sync = MagicMock()
+    restart = MagicMock()
+    monkeypatch.setattr(server, "_sync_session_key_after_compress", sync)
+    monkeypatch.setattr(server, "_restart_slash_worker", restart)
 
     try:
-        with patch("tui_gateway.server._emit"):
+        with (
+            patch("tui_gateway.server._emit"),
+            patch(
+                "agent.conversation_compression."
+                "finalize_context_engine_compression_notification"
+            ) as finalize,
+        ):
             resp = server.handle_request(
                 {
                     "id": "1",
@@ -9105,6 +9155,9 @@ def test_session_compress_reports_aborted_summary_without_success(monkeypatch):
         assert "no API key was found" in result["summary"]["note"]
         assert "Compressed:" not in result["summary"]["headline"]
         assert get_model_switch_after_compression(agent) is pending
+        sync.assert_not_called()
+        restart.assert_not_called()
+        finalize.assert_called_once_with(agent, committed=False)
     finally:
         server._sessions.pop("sid", None)
 
@@ -9407,7 +9460,8 @@ def test_session_compress_syncs_session_key_after_rotation(monkeypatch):
     agent = types.SimpleNamespace(
         session_id="rotated-id",
         context_compressor=types.SimpleNamespace(
-            on_session_start=lambda *_args, **_kwargs: events.append("notify")
+            on_session_start=lambda *_args, **_kwargs: events.append("notify"),
+            _last_compression_telemetry={"commit_status": "committed"},
         ),
     )
     server._sessions["sid"] = _session(agent=agent)
@@ -9461,7 +9515,9 @@ def test_manual_compress_restarts_worker_from_final_authoritative_route(
         session_id="child",
         _cached_system_prompt="",
         tools=None,
-        context_compressor=None,
+        context_compressor=types.SimpleNamespace(
+            _last_compression_telemetry={"commit_status": "committed"}
+        ),
     )
     session = _session(
         agent=agent,
@@ -9567,7 +9623,8 @@ def test_session_compress_post_commit_failure_keeps_lcm_notification(monkeypatch
     agent = types.SimpleNamespace(
         session_id="rotated-id",
         context_compressor=types.SimpleNamespace(
-            on_session_start=lambda *_args, **_kwargs: events.append("notify")
+            on_session_start=lambda *_args, **_kwargs: events.append("notify"),
+            _last_compression_telemetry={"commit_status": "committed"},
         ),
     )
     server._sessions["sid"] = _session(agent=agent)
@@ -12340,7 +12397,14 @@ def test_mirror_slash_compress_does_not_prelock_history(monkeypatch):
     session["history"] = [
         {"role": "user", "content": f"m{i}"} for i in range(6)
     ]
-    session["agent"] = types.SimpleNamespace(model="x", _cached_system_prompt="", tools=None)
+    session["agent"] = types.SimpleNamespace(
+        model="x",
+        _cached_system_prompt="",
+        tools=None,
+        context_compressor=types.SimpleNamespace(
+            _last_compression_telemetry={"commit_status": "committed"}
+        ),
+    )
 
     warning = server._mirror_slash_side_effects("sid", session, "/compress")
 
@@ -12373,7 +12437,9 @@ def _partial_compress_agent(compress_context_calls):
         _cached_system_prompt=None,
         tools=None,
         session_id="s1",
-        context_compressor=None,  # keep _get_usage on the simple path
+        context_compressor=types.SimpleNamespace(
+            _last_compression_telemetry={"commit_status": "committed"}
+        ),
     )
 
     def _fake_compress_context(history, sys, approx_tokens=0, focus_topic=None, **kw):

@@ -21,7 +21,7 @@ The invariants that matter:
 import copy
 import os
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -809,7 +809,7 @@ class TestMicroCompaction:
         agent = _agent_with_db(db, session_id)
         compressor = agent.context_compressor
         compressor._micro_compact_enabled = True
-        compressor._micro_summarize_one = lambda _text: "STALE SUMMARY"
+        compressor._micro_summarize_one = MagicMock(return_value="STALE SUMMARY")
         original_messages = copy.deepcopy(stale)
         original_message_ids = [id(message) for message in stale]
         state_names = (
@@ -830,10 +830,10 @@ class TestMicroCompaction:
         ) as archive:
             result = compressor._micro_compact(stale)
 
-        archive.assert_called_once()
-        assert archive.call_args.kwargs["require_compression_lease"] is True
-        assert archive.call_args.kwargs["compression_lock_holder"]
-        assert archive.call_args.kwargs["expected_active_messages"] == original_messages
+        # The durable/live replay proof now rejects this stale snapshot before
+        # the summarizer or transactional rewrite runs.
+        archive.assert_not_called()
+        compressor._micro_summarize_one.assert_not_called()
         assert result is stale
         assert result == original_messages
         assert [id(message) for message in result] == original_message_ids
@@ -978,6 +978,69 @@ class TestMicroCompaction:
         agent._flush_messages_to_session_db(result, conversation_history=[])
         assert db.get_messages_as_conversation(session_id) == durable_before
         assert db.get_messages(session_id, include_inactive=True) == rows_before
+        assert db.get_compression_lock_holder(session_id) is None
+
+    def test_defrag_rejects_same_content_replaced_with_new_row_ids(
+        self, tmp_path: Path,
+    ):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        session_id = "MICRO_DEFRAG_ROW_ID_FENCE"
+        db.create_session(session_id, source="cli")
+        seeded = _conversation(exchanges=8)
+        seeded[2] = {
+            "role": "assistant",
+            "content": "old compacted marker",
+            COMPRESSED_SUMMARY_METADATA_KEY: True,
+            MICRO_COMPACT_MARKER_KEY: True,
+        }
+        db.append_messages_batch(session_id, seeded)
+        live = db.get_messages_as_conversation(session_id)
+        live[2][COMPRESSED_SUMMARY_METADATA_KEY] = True
+        live[2][MICRO_COMPACT_MARKER_KEY] = True
+        for message in live:
+            message[_DB_PERSISTED_MARKER] = True
+
+        agent = _agent_with_db(db, session_id)
+        compressor = agent.context_compressor
+        compressor._micro_compact_enabled = True
+        compressor._micro_compact_rolling_summary = "x" * 40_000
+        compressor._micro_summarize_one = lambda _text: "DEFRAGGED SUMMARY"
+        real_defrag = compressor._defrag_rolling_summary
+        replacement_row_ids: list[int] = []
+
+        def _replace_rows_then_defrag(messages):
+            durable = db.get_messages_as_conversation(session_id)
+            db.archive_and_compact(
+                session_id,
+                durable,
+                expected_active_messages=durable,
+            )
+            replacement_row_ids.extend(
+                message["_row_id"]
+                for message in db.get_messages_as_conversation(
+                    session_id, include_row_ids=True,
+                )
+            )
+            return real_defrag(messages)
+
+        original_messages = copy.deepcopy(live)
+        original_message_ids = [id(message) for message in live]
+        with patch.object(
+            compressor,
+            "_defrag_rolling_summary",
+            side_effect=_replace_rows_then_defrag,
+        ):
+            result = compressor._micro_compact(live)
+
+        assert result is live
+        assert result == original_messages
+        assert [id(message) for message in result] == original_message_ids
+        assert [
+            message["_row_id"]
+            for message in db.get_messages_as_conversation(
+                session_id, include_row_ids=True,
+            )
+        ] == replacement_row_ids
         assert db.get_compression_lock_holder(session_id) is None
 
 

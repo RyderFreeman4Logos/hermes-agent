@@ -165,6 +165,127 @@ _LEGACY_COMPRESSION_CONTINUATION_USER_CONTENT = (
 )
 
 
+def _compaction_replay_projection(
+    messages: List[Dict[str, Any]],
+    *,
+    substitute_api_content: bool = False,
+) -> List[Dict[str, Any]]:
+    """Project live/restored messages to the bytes relevant to compaction."""
+    from agent.tool_dispatch_helpers import (
+        _is_multimodal_tool_result,
+        _multimodal_text_summary,
+    )
+
+    projected: List[Dict[str, Any]] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            projected.append(message)
+            continue
+        content = message.get("content")
+        api_content = message.get("api_content")
+        if (
+            substitute_api_content
+            and message.get("role") in {"user", "assistant"}
+            and isinstance(api_content, str)
+            and api_content
+        ):
+            content = api_content
+        if _is_multimodal_tool_result(content):
+            content = _multimodal_text_summary(content)
+        elif isinstance(content, list):
+            text_parts = []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    text_parts.append(str(part.get("text", "")))
+                elif isinstance(part, dict) and part.get("type") in {
+                    "image", "image_url", "input_image",
+                }:
+                    text_parts.append("[screenshot]")
+            content = "\n".join(text_parts) if text_parts else None
+        item = {"role": message.get("role"), "content": content}
+        for field in (
+            "tool_call_id", "tool_name", "effect_disposition", "tool_calls",
+            "finish_reason", "reasoning", "reasoning_content",
+            "reasoning_details", "codex_reasoning_items", "codex_message_items",
+        ):
+            value = message.get(field)
+            if value is not None and value != "" and value != []:
+                item[field] = value
+        projected.append(item)
+    return projected
+
+
+def _capture_durable_compaction_baseline(
+    session_db: Any,
+    session_id: str,
+    live_messages: List[Dict[str, Any]],
+    *,
+    persisted_boundary: Optional[int] = None,
+) -> tuple[
+    Optional[List[Dict[str, Any]]],
+    Optional[List[int]],
+    Optional[List[tuple]],
+]:
+    """Fence against raw durable rows after proving their legal replay shape."""
+    loader = getattr(session_db, "get_compaction_baseline", None)
+    if not callable(loader):
+        return None, None, None
+    loaded = loader(session_id)
+    if (
+        not isinstance(loaded, tuple)
+        or len(loaded) != 2
+        or not isinstance(loaded[0], list)
+        or not isinstance(loaded[1], list)
+    ):
+        return None, None, None
+    raw, row_fingerprint = loaded
+    if not raw:
+        return [], [], row_fingerprint
+
+    repaired = copy.deepcopy(raw)
+    from agent.agent_runtime_helpers import repair_message_sequence
+    repair_message_sequence(None, repaired)
+
+    durable_live = [
+        message for message in live_messages
+        if isinstance(message, dict) and message.get(_DB_PERSISTED_MARKER)
+    ]
+    if not durable_live:
+        if isinstance(persisted_boundary, int) and 0 <= persisted_boundary <= len(live_messages):
+            durable_live = live_messages[:persisted_boundary]
+        elif raw:
+            durable_live = live_messages
+
+    live_projection = _compaction_replay_projection(durable_live)
+    legal_durable_projections = []
+    for durable_view in (raw, repaired):
+        legal_durable_projections.append(
+            _compaction_replay_projection(durable_view)
+        )
+        legal_durable_projections.append(
+            _compaction_replay_projection(
+                durable_view, substitute_api_content=True,
+            )
+        )
+    if live_projection not in legal_durable_projections:
+        from hermes_state import CompressionSessionBusyError
+        raise CompressionSessionBusyError(
+            f"Live transcript is not a legal restore of durable session: {session_id}"
+        )
+
+    row_ids: List[int] = []
+    baseline: List[Dict[str, Any]] = []
+    for message in raw:
+        row_id = message.get("_row_id")
+        if not isinstance(row_id, int):
+            return None, None, None
+        row_ids.append(row_id)
+        item = dict(message)
+        item.pop("_row_id", None)
+        baseline.append(item)
+    return baseline, row_ids, row_fingerprint
+
+
 def _fresh_compaction_message_copy(msg: Dict[str, Any]) -> Dict[str, Any]:
     """Copy a message for compaction assembly without persistence markers.
 
@@ -3122,6 +3243,9 @@ class ContextCompressor(ContextEngine):
         archive_and_compact = None
         lock_holder = None
         release_lock = None
+        durable_baseline = None
+        durable_row_ids = None
+        durable_row_fingerprint = None
         try:
             if session_db and session_id:
                 archive_and_compact = getattr(session_db, "archive_and_compact", None)
@@ -3144,6 +3268,23 @@ class ContextCompressor(ContextEngine):
                 except Exception as exc:
                     logger.warning(
                         "Proactive tool-result prune lease acquisition failed; "
+                        "keeping the original transcript: %s",
+                        exc,
+                    )
+                    return messages, 0
+                try:
+                    (
+                        durable_baseline,
+                        durable_row_ids,
+                        durable_row_fingerprint,
+                    ) = (
+                        _capture_durable_compaction_baseline(
+                            session_db, session_id, messages,
+                        )
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Proactive tool-result prune baseline rejected; "
                         "keeping the original transcript: %s",
                         exc,
                     )
@@ -3172,14 +3313,18 @@ class ContextCompressor(ContextEngine):
             )
             next_rearm_tokens = after + runway
             if session_db and session_id:
-                expected_active_messages = [
-                    message
-                    for message in messages
-                    if isinstance(message, dict)
-                    and message.get(_DB_PERSISTED_MARKER)
-                ]
-                if not expected_active_messages:
-                    expected_active_messages = messages
+                expected_active_messages = durable_baseline
+                expected_active_row_ids = durable_row_ids
+                expected_active_row_fingerprint = durable_row_fingerprint
+                if expected_active_messages is None:
+                    expected_active_messages = [
+                        message
+                        for message in messages
+                        if isinstance(message, dict)
+                        and message.get(_DB_PERSISTED_MARKER)
+                    ]
+                    if not expected_active_messages:
+                        expected_active_messages = messages
                 try:
                     archive_and_compact(
                         session_id,
@@ -3190,6 +3335,10 @@ class ContextCompressor(ContextEngine):
                         compression_lock_holder=lock_holder,
                         require_compression_lease=True,
                         expected_active_messages=expected_active_messages,
+                        expected_active_row_ids=expected_active_row_ids,
+                        expected_active_row_fingerprint=(
+                            expected_active_row_fingerprint
+                        ),
                     )
                 except Exception as exc:
                     logger.warning(
@@ -5707,14 +5856,38 @@ This compaction should PRIORITISE preserving all information related to the focu
         # baseline.  A real DB binding with no markers deliberately compares
         # the whole transcript and fails closed rather than rewriting an
         # unverifiable session snapshot.
-        expected_active_messages = [
-            copy.deepcopy(message)
-            for message in messages
-            if isinstance(message, dict)
-            and message.get(_DB_PERSISTED_MARKER)
-        ]
-        if not expected_active_messages:
-            expected_active_messages = copy.deepcopy(messages)
+        expected_active_messages = None
+        expected_active_row_ids = None
+        expected_active_row_fingerprint = None
+        session_db = getattr(self, "_session_db", None)
+        session_id = getattr(self, "_session_id", "")
+        if session_db and session_id:
+            try:
+                (
+                    expected_active_messages,
+                    expected_active_row_ids,
+                    expected_active_row_fingerprint,
+                ) = (
+                    _capture_durable_compaction_baseline(
+                        session_db, session_id, messages,
+                    )
+                )
+            except Exception as exc:
+                logger.info(
+                    "Micro-compaction baseline rejected; retaining the original "
+                    "transcript: %s",
+                    exc,
+                )
+                return _rollback_failed_commit()
+        if expected_active_messages is None:
+            expected_active_messages = [
+                copy.deepcopy(message)
+                for message in messages
+                if isinstance(message, dict)
+                and message.get(_DB_PERSISTED_MARKER)
+            ]
+            if not expected_active_messages:
+                expected_active_messages = copy.deepcopy(messages)
 
         # Baseline for telemetry. Taken only once an exchange is in hand, so
         # turns that no-op early don't pay for the scan.
@@ -5736,6 +5909,10 @@ This compaction should PRIORITISE preserving all information related to the focu
                 committed = self._sync_micro_compact_to_db(
                     messages,
                     expected_active_messages=expected_active_messages,
+                    expected_active_row_ids=expected_active_row_ids,
+                    expected_active_row_fingerprint=(
+                        expected_active_row_fingerprint
+                    ),
                 )
                 if not committed:
                     return _rollback_failed_commit()
@@ -5807,6 +5984,8 @@ This compaction should PRIORITISE preserving all information related to the focu
         committed = self._sync_micro_compact_to_db(
             result,
             expected_active_messages=expected_active_messages,
+            expected_active_row_ids=expected_active_row_ids,
+            expected_active_row_fingerprint=expected_active_row_fingerprint,
         )
         if not committed:
             return _rollback_failed_commit()
@@ -5940,6 +6119,8 @@ This compaction should PRIORITISE preserving all information related to the focu
         compacted_messages: List[Dict[str, Any]],
         *,
         expected_active_messages: List[Dict[str, Any]],
+        expected_active_row_ids: Optional[List[int]] = None,
+        expected_active_row_fingerprint: Optional[List[tuple]] = None,
     ) -> bool:
         """Persist the micro-compacted message set to the session DB.
 
@@ -5981,6 +6162,8 @@ This compaction should PRIORITISE preserving all information related to the focu
                 compression_lock_holder=lock_holder,
                 require_compression_lease=True,
                 expected_active_messages=expected_active_messages,
+                expected_active_row_ids=expected_active_row_ids,
+                expected_active_row_fingerprint=expected_active_row_fingerprint,
             )
             for msg in compacted_messages:
                 if isinstance(msg, dict):

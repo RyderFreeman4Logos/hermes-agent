@@ -2733,6 +2733,9 @@ def compress_context(
 
     _activity_heartbeat: Optional[_CompressionActivityHeartbeat] = None
     messages_before_compression = None
+    _durable_compaction_baseline = None
+    _durable_compaction_row_ids = None
+    _durable_compaction_row_fingerprint = None
     try:
         if _lock_holder is not None:
             _candidate_refresher = _CompressionLockLeaseRefresher(
@@ -2750,6 +2753,42 @@ def compress_context(
                 if not _lock_released:
                     _lock_refresher = _candidate_refresher
                     _lock_refresher.start()
+
+        if in_place and _lock_db is not None and _lock_sid:
+            from agent.context_compressor import _capture_durable_compaction_baseline
+            from hermes_state import CompressionSessionBusyError
+
+            try:
+                (
+                    _durable_compaction_baseline,
+                    _durable_compaction_row_ids,
+                    _durable_compaction_row_fingerprint,
+                ) = _capture_durable_compaction_baseline(
+                    _lock_db,
+                    _lock_sid,
+                    messages,
+                    persisted_boundary=getattr(
+                        agent, "_persist_user_message_idx", None,
+                    ),
+                )
+            except CompressionSessionBusyError as exc:
+                logger.warning(
+                    "Compression baseline rejected; keeping the original "
+                    "transcript: %s",
+                    exc,
+                )
+                _release_lock()
+                _emit_compression_attempt_telemetry(
+                    agent,
+                    started_at=_attempt_started_at,
+                    commit_status="aborted",
+                    split_status="aborted",
+                    failure_class="illegal_durable_replay",
+                )
+                existing_prompt = getattr(agent, "_cached_system_prompt", None)
+                if not existing_prompt:
+                    existing_prompt = agent._build_system_prompt(system_message)
+                return messages, existing_prompt
 
         # The caller's history snapshot predates lease acquisition. Reload the
         # durable parent after the lease is live; MORE durable rows than the
@@ -3269,13 +3308,22 @@ def compress_context(
                         PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY,
                     )
 
-                    expected_active_messages = [
-                        message
-                        for message in messages_before_compression
-                        if isinstance(message, dict)
-                        and message.get(_DB_PERSISTED_MARKER)
-                    ]
-                    if not expected_active_messages:
+                    expected_active_messages = _durable_compaction_baseline
+                    expected_active_row_ids = _durable_compaction_row_ids
+                    expected_active_row_fingerprint = (
+                        _durable_compaction_row_fingerprint
+                    )
+                    if expected_active_messages is None:
+                        expected_active_messages = [
+                            message
+                            for message in messages_before_compression
+                            if isinstance(message, dict)
+                            and message.get(_DB_PERSISTED_MARKER)
+                        ]
+                    if (
+                        not expected_active_messages
+                        and expected_active_row_ids is None
+                    ):
                         # First-turn preflight can create the session row before
                         # any transcript row has been flushed.  An authoritative
                         # durable count of zero is enough to expect an empty
@@ -3319,6 +3367,10 @@ def compress_context(
                         compression_lock_holder=_lock_holder,
                         require_compression_lease=_lock_holder is not None,
                         expected_active_messages=expected_active_messages,
+                        expected_active_row_ids=expected_active_row_ids,
+                        expected_active_row_fingerprint=(
+                            expected_active_row_fingerprint
+                        ),
                     )
                     split_status = "in_place_committed"
                     # Reset the flush identity set so the next turn's appends are

@@ -12,7 +12,11 @@ from unittest.mock import patch
 
 import pytest
 
-from agent.context_compressor import _estimate_msg_budget_tokens
+from agent.agent_runtime_helpers import repair_message_sequence
+from agent.context_compressor import (
+    _capture_durable_compaction_baseline,
+    _estimate_msg_budget_tokens,
+)
 from hermes_state import (
     CompressionSessionBusyError,
     CompressionSessionClosedError,
@@ -52,6 +56,8 @@ def test_all_runtime_archive_and_compact_calls_are_fenced() -> None:
         "compression_lock_holder",
         "require_compression_lease",
         "expected_active_messages",
+        "expected_active_row_ids",
+        "expected_active_row_fingerprint",
     }
     for path, call in archive_calls:
         keywords = {keyword.arg for keyword in call.keywords}
@@ -314,6 +320,284 @@ def test_stale_snapshot_rejection_rolls_back_archive_and_config(tmp_path: Path) 
     assert db.get_messages_as_conversation(session_id) == durable_before
     assert db.get_session(session_id)["model_config"] == config_before
     assert db.get_messages(session_id, include_inactive=True) == rows_before
+
+
+def _raw_compaction_baseline(
+    db: SessionDB,
+    session_id: str,
+    live_messages: list[dict],
+) -> tuple[list[dict], list[int], list[tuple]]:
+    baseline, row_ids, row_fingerprint = _capture_durable_compaction_baseline(
+        db, session_id, live_messages,
+    )
+    assert baseline is not None
+    assert row_ids is not None
+    assert row_fingerprint is not None
+    return baseline, row_ids, row_fingerprint
+
+
+def test_repaired_restore_uses_raw_rows_for_exact_compaction_fence(
+    tmp_path: Path,
+) -> None:
+    """A legal restore repair must not weaken the raw transactional fence."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "REPAIRED_RESTORE_BASELINE"
+    db.create_session(session_id, source="tui")
+    db.append_messages_batch(session_id, [
+        {"role": "user", "content": "first"},
+        {"role": "user", "content": "second"},
+        {"role": "assistant", "content": "reply"},
+    ])
+
+    live = db.get_messages_as_conversation(session_id)
+    repair_message_sequence(None, live)
+    assert [message["role"] for message in live] == ["user", "assistant"]
+    baseline, row_ids, row_fingerprint = _raw_compaction_baseline(
+        db, session_id, live,
+    )
+    assert len(baseline) == 3
+
+    replacement = [{"role": "user", "content": "summary"}]
+    db.archive_and_compact(
+        session_id,
+        replacement,
+        expected_active_messages=baseline,
+        expected_active_row_ids=row_ids,
+        expected_active_row_fingerprint=row_fingerprint,
+    )
+    assert [
+        (message["role"], message["content"])
+        for message in db.get_messages_as_conversation(session_id)
+    ] == [("user", "summary")]
+
+
+def test_persisted_text_and_live_multimodal_projection_share_raw_fence(
+    tmp_path: Path,
+) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "MULTIMODAL_RESTORE_BASELINE"
+    db.create_session(session_id, source="tui")
+    db.append_messages_batch(session_id, [{
+        "role": "user",
+        "content": "describe\n[screenshot]",
+    }])
+    live = [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "describe"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,x"}},
+        ],
+        "_db_persisted": True,
+    }]
+
+    baseline, row_ids, row_fingerprint = _raw_compaction_baseline(
+        db, session_id, live,
+    )
+    replacement = [{"role": "user", "content": "summary"}]
+    db.archive_and_compact(
+        session_id,
+        replacement,
+        expected_active_messages=baseline,
+        expected_active_row_ids=row_ids,
+        expected_active_row_fingerprint=row_fingerprint,
+    )
+    assert [
+        (message["role"], message["content"])
+        for message in db.get_messages_as_conversation(session_id)
+    ] == [("user", "summary")]
+
+
+def test_compaction_baseline_accepts_only_clean_or_hot_api_content_view(
+    tmp_path: Path,
+) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "API_CONTENT_RESTORE_VIEWS"
+    db.create_session(session_id, source="tui")
+    db.append_messages_batch(session_id, [{
+        "role": "user",
+        "content": "clean",
+        "api_content": "wire",
+    }])
+    cold = db.get_messages_as_conversation(session_id)
+
+    assert _capture_durable_compaction_baseline(db, session_id, cold)[0] is not None
+
+    hot = copy.deepcopy(cold)
+    hot[0]["content"] = hot[0].pop("api_content")
+    assert _capture_durable_compaction_baseline(db, session_id, hot)[0] is not None
+
+    mutated = copy.deepcopy(cold)
+    mutated[0]["content"] = "MUTATED"
+    with pytest.raises(
+        CompressionSessionBusyError,
+        match="not a legal restore",
+    ):
+        _capture_durable_compaction_baseline(db, session_id, mutated)
+
+
+def test_compaction_baseline_rejects_tool_content_whitespace_mutation(
+    tmp_path: Path,
+) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "TOOL_CONTENT_BYTES"
+    db.create_session(session_id, source="tui")
+    db.append_messages_batch(session_id, [{
+        "role": "tool",
+        "content": "result",
+        "tool_call_id": "call-1",
+    }])
+    live = db.get_messages_as_conversation(session_id)
+    live[0]["content"] = " result "
+
+    with pytest.raises(
+        CompressionSessionBusyError,
+        match="not a legal restore",
+    ):
+        _capture_durable_compaction_baseline(db, session_id, live)
+
+
+def test_compaction_baseline_never_substitutes_tool_api_content(
+    tmp_path: Path,
+) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "TOOL_API_CONTENT_MASK"
+    db.create_session(session_id, source="tui")
+    db.append_messages_batch(session_id, [{
+        "role": "tool",
+        "content": "clean",
+        "api_content": "mask",
+        "tool_call_id": "call-1",
+    }])
+    live = db.get_messages_as_conversation(session_id)
+    live[0]["content"] = "mask"
+
+    with pytest.raises(
+        CompressionSessionBusyError,
+        match="not a legal restore",
+    ):
+        _capture_durable_compaction_baseline(db, session_id, live)
+
+
+def test_raw_row_fence_rejects_append_without_mutating_caller(
+    tmp_path: Path,
+) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "APPEND_RACE_REJECTED"
+    db.create_session(session_id, source="tui")
+    db.append_messages_batch(session_id, [{"role": "user", "content": "before"}])
+    live = db.get_messages_as_conversation(session_id)
+    baseline, row_ids, row_fingerprint = _raw_compaction_baseline(
+        db, session_id, live,
+    )
+    db.append_messages_batch(session_id, [{"role": "assistant", "content": "later"}])
+    replacement = [{"role": "user", "content": "summary"}]
+    before = copy.deepcopy(replacement)
+
+    with pytest.raises(
+        CompressionSessionBusyError,
+        match="transcript changed before compaction",
+    ):
+        db.archive_and_compact(
+            session_id,
+            replacement,
+            expected_active_messages=baseline,
+            expected_active_row_ids=row_ids,
+            expected_active_row_fingerprint=row_fingerprint,
+        )
+
+    assert replacement == before
+    assert [message["content"] for message in db.get_messages_as_conversation(session_id)] == [
+        "before", "later",
+    ]
+
+
+def test_raw_row_fence_rejects_same_row_sanitize_equivalent_update(
+    tmp_path: Path,
+) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "RAW_FENCE_WHITESPACE_UPDATE"
+    db.create_session(session_id, source="tui")
+    db.append_messages_batch(
+        session_id, [{"role": "user", "content": "original"}],
+    )
+    live = db.get_messages_as_conversation(session_id)
+    baseline, row_ids, row_fingerprint = _raw_compaction_baseline(
+        db, session_id, live,
+    )
+    db._conn.execute(
+        "UPDATE messages SET content = ? WHERE id = ?",
+        (" original ", row_ids[0]),
+    )
+    db._conn.commit()
+    durable_before = db.get_messages(session_id, include_inactive=True)
+
+    with pytest.raises(
+        CompressionSessionBusyError,
+        match="transcript changed before compaction",
+    ):
+        db.archive_and_compact(
+            session_id,
+            [{"role": "user", "content": "summary"}],
+            expected_active_messages=baseline,
+            expected_active_row_ids=row_ids,
+            expected_active_row_fingerprint=row_fingerprint,
+        )
+
+    assert db.get_messages(session_id, include_inactive=True) == durable_before
+
+
+@pytest.mark.parametrize("mutation", ["rewrite", "delete", "replace"])
+def test_raw_row_fence_rejects_durable_rewrite_delete_or_reorder(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    db = SessionDB(db_path=tmp_path / f"{mutation}.db")
+    session_id = f"RAW_FENCE_{mutation.upper()}"
+    db.create_session(session_id, source="tui")
+    original = [
+        {"role": "user", "content": "one"},
+        {"role": "assistant", "content": "two"},
+    ]
+    db.append_messages_batch(session_id, original)
+    live = db.get_messages_as_conversation(session_id)
+    baseline, row_ids, row_fingerprint = _raw_compaction_baseline(
+        db, session_id, live,
+    )
+
+    if mutation == "rewrite":
+        db._conn.execute(
+            "UPDATE messages SET content = ? WHERE id = ?",
+            ("changed", row_ids[0]),
+        )
+        db._conn.commit()
+    elif mutation == "delete":
+        db._conn.execute(
+            "UPDATE messages SET active = 0 WHERE id = ?",
+            (row_ids[0],),
+        )
+        db._conn.commit()
+    else:
+        db.archive_and_compact(
+            session_id,
+            list(reversed(original)),
+            expected_active_messages=baseline,
+        )
+
+    durable_before = db.get_messages(session_id, include_inactive=True)
+    replacement = [{"role": "user", "content": "summary"}]
+    with pytest.raises(
+        CompressionSessionBusyError,
+        match="transcript changed before compaction",
+    ):
+        db.archive_and_compact(
+            session_id,
+            replacement,
+            expected_active_messages=baseline,
+            expected_active_row_ids=row_ids,
+            expected_active_row_fingerprint=row_fingerprint,
+        )
+
+    assert db.get_messages(session_id, include_inactive=True) == durable_before
 
 
 @pytest.mark.parametrize(

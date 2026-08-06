@@ -7092,6 +7092,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         compression_lock_holder: Optional[str] = None,
         require_compression_lease: bool = False,
         expected_active_messages: Optional[List[Dict[str, Any]]] = None,
+        expected_active_row_ids: Optional[List[int]] = None,
+        expected_active_row_fingerprint: Optional[List[tuple]] = None,
     ) -> int:
         """Non-destructive in-place compaction for a single durable session id.
 
@@ -7148,7 +7150,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     raise CompressionSessionBusyError(
                         f"Compression lease lost before compaction: {session_id}"
                     )
-            if expected_active_messages is not None:
+            if expected_active_row_fingerprint is not None:
+                rows = conn.execute(
+                    "SELECT * FROM messages "
+                    "WHERE session_id = ? AND active = 1 ORDER BY id",
+                    (session_id,),
+                ).fetchall()
+                if [tuple(row) for row in rows] != expected_active_row_fingerprint:
+                    raise CompressionSessionBusyError(
+                        f"Session transcript changed before compaction: {session_id}"
+                    )
+            elif expected_active_messages is not None:
                 rows = conn.execute(
                     f"SELECT {self._CONVERSATION_ROW_COLUMNS} "
                     "FROM messages WHERE session_id = ? AND active = 1 ORDER BY id",
@@ -7159,6 +7171,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     session_id=session_id,
                     include_ancestors=False,
                     repair_alternation=False,
+                    include_row_ids=True,
                 )
 
                 def _canonical(messages):
@@ -7213,7 +7226,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         canonical.append(projected)
                     return canonical
 
-                if _canonical(active_messages) != _canonical(expected_active_messages):
+                if expected_active_row_ids is not None:
+                    active_row_ids = [
+                        message.get("_row_id") for message in active_messages
+                    ]
+                    if (
+                        len(expected_active_messages) != len(expected_active_row_ids)
+                        or active_row_ids != expected_active_row_ids
+                        or _canonical(active_messages)
+                        != _canonical(expected_active_messages)
+                    ):
+                        raise CompressionSessionBusyError(
+                            f"Session transcript changed before compaction: {session_id}"
+                        )
+                elif _canonical(active_messages) != _canonical(expected_active_messages):
                     raise CompressionSessionBusyError(
                         f"Session transcript changed before compaction: {session_id}"
                     )
@@ -7289,6 +7315,25 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return inserted
 
         return self._execute_write(_do)
+
+    def get_compaction_baseline(
+        self, session_id: str,
+    ) -> tuple[List[Dict[str, Any]], List[tuple]]:
+        """Load replay rows and their exact durable fingerprint atomically."""
+        with self._read_ctx() as conn:
+            rows = conn.execute(
+                "SELECT * FROM messages "
+                "WHERE session_id = ? AND active = 1 ORDER BY id",
+                (session_id,),
+            ).fetchall()
+        messages = self._rows_to_conversation(
+            rows,
+            session_id=session_id,
+            include_ancestors=False,
+            repair_alternation=False,
+            include_row_ids=True,
+        )
+        return messages, [tuple(row) for row in rows]
 
     def set_latest_user_api_content(
         self, session_id: str, content: Any, api_content: str

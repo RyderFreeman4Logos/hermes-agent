@@ -79,6 +79,64 @@ from hermes_state_portability import SessionPortabilityMixin
 from hermes_state_schema import SessionSchemaMixin
 from hermes_state_search import SessionSearchMixin
 
+
+_CRON_CACHE_SCOPE_RE = re.compile(r"cron_(.+)_\d{8}_\d{6}")
+
+
+def resolve_prompt_cache_scope(
+    session_id: str,
+    session_db=None,
+    *,
+    parent_session_id: str = None,
+) -> str:
+    """Return the stable prompt-cache namespace for a logical agent tree."""
+    session_id = str(session_id or "")
+    if not session_id:
+        return ""
+
+    current = session_id
+    if session_db is not None:
+        try:
+            if session_db.get_session(current) is None and parent_session_id:
+                current = str(parent_session_id)
+            seen = set()
+            for _ in range(100):
+                if not current or current in seen:
+                    break
+                seen.add(current)
+                lineage = session_db.get_compression_lineage(current)
+                if not isinstance(lineage, (list, tuple)):
+                    raise TypeError("compression lineage must be a sequence")
+                scope = lineage[0] if lineage else current
+                row = session_db.get_session(scope)
+                if row is None:
+                    current = scope
+                    break
+                if not isinstance(row, dict):
+                    raise TypeError("session row must be a mapping")
+                raw = row.get("model_config")
+                try:
+                    config = json.loads(raw) if isinstance(raw, str) else raw
+                except (TypeError, json.JSONDecodeError):
+                    config = None
+                delegate_from = (
+                    config.get("_delegate_from")
+                    if isinstance(config, dict)
+                    else None
+                )
+                if delegate_from is None:
+                    current = scope
+                    break
+                current = str(row.get("parent_session_id") or delegate_from)
+        except Exception:
+            current = str(parent_session_id or session_id)
+    elif parent_session_id:
+        current = str(parent_session_id)
+
+    match = _CRON_CACHE_SCOPE_RE.fullmatch(current)
+    return f"cron:{match.group(1)}" if match else current
+
+
 try:  # Hard dependency, but tolerate scaffold-phase imports before pip install.
     import psutil
 except ImportError:  # pragma: no cover - stripped/scaffold installs only

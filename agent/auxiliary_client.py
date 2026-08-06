@@ -1554,7 +1554,11 @@ class _CodexCompletionsAdapter:
                 # transport (agent/transports/codex.py::build_kwargs) does the
                 # same; this adapter had no session handle before
                 # set_runtime_main() started threading one through.
-                _scope = _cache_scope_from_session_id(_runtime_main_value("session_id"))
+                _scope = str(_runtime_main_value("cache_scope") or "")
+                if not _scope:
+                    _scope = _cache_scope_from_session_id(
+                        _runtime_main_value("session_id")
+                    )
                 _cache_key = _content_cache_key(instructions, resp_kwargs.get("tools"), _scope)
                 if _cache_key:
                     resp_kwargs["prompt_cache_key"] = _cache_key
@@ -3286,6 +3290,7 @@ def set_runtime_main(
     api_mode: str = "",
     auth_mode: str = "",
     session_id: str = "",
+    cache_scope: Optional[str] = None,
 ) -> contextvars.Token:
     """Record the current context's live main runtime for auxiliary routing.
 
@@ -3295,6 +3300,8 @@ def set_runtime_main(
     global _RUNTIME_MAIN_PROVIDER, _RUNTIME_MAIN_MODEL
     global _RUNTIME_MAIN_BASE_URL, _RUNTIME_MAIN_API_KEY, _RUNTIME_MAIN_API_MODE
     global _RUNTIME_MAIN_AUTH_MODE, _RUNTIME_MAIN_COMPAT_SNAPSHOT
+    if cache_scope is None:
+        cache_scope = _runtime_main_value("cache_scope")
     runtime = {
         "provider": (provider or "").strip().lower(),
         "requested_provider": (requested_provider or "").strip().lower(),
@@ -3308,6 +3315,7 @@ def set_runtime_main(
         "api_mode": (api_mode or "").strip(),
         "auth_mode": (auth_mode or "").strip().lower(),
         "session_id": (session_id or "").strip(),
+        "cache_scope": (cache_scope or "").strip(),
     }
     # Publish authoritative context before updating locked compatibility
     # mirrors; concurrent sessions never read those mirrors at runtime.
@@ -3781,7 +3789,9 @@ _AUTO_PROVIDER_LABELS = {
 }
 
 _MAIN_RUNTIME_FIELDS = ("provider", "model", "base_url", "api_key", "api_mode", "auth_mode")
-_MAIN_RUNTIME_CONTEXT_FIELDS = _MAIN_RUNTIME_FIELDS + ("requested_provider",)
+_MAIN_RUNTIME_CONTEXT_FIELDS = _MAIN_RUNTIME_FIELDS + (
+    "requested_provider", "cache_scope",
+)
 
 
 def _normalize_main_runtime(main_runtime: Optional[Dict[str, Any]]) -> Dict[str, Any]:

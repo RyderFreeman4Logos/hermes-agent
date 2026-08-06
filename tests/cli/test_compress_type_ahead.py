@@ -63,6 +63,9 @@ def test_type_ahead_queued_during_compress_becomes_next_prompt():
     ]
     shell.conversation_history = history
     shell.agent = MagicMock()
+    shell.agent.context_compressor._last_compression_telemetry = {
+        "commit_status": "committed",
+    }
     shell.agent.compression_enabled = True
     shell.agent._cached_system_prompt = ""
     shell.agent.tools = None

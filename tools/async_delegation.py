@@ -704,7 +704,7 @@ def active_for_session(origin_ui_session_id: str) -> int:
         return sum(
             1
             for r in _records.values()
-            if r.get("status") in {"running", "stalling", "finalizing"}
+            if r.get("status") in _ACTIVE_STATUSES
             and str(r.get("origin_ui_session_id") or "")
             == origin_ui_session_id
         )
@@ -754,14 +754,13 @@ def has_live_for_session(
 ) -> bool:
     """Whether a session still owns any live async delegation.
 
-    Live = running / stalling / finalizing — the same states the reapers'
-    keepalive treats as active work.
+    Live states are defined by ``_ACTIVE_STATUSES``.
     """
     if not session_key and not origin_ui_session_id and not parent_session_id:
         return False
     with _records_lock:
         return any(
-            r.get("status") in {"running", "stalling", "finalizing"}
+            r.get("status") in _ACTIVE_STATUSES
             and _matches_session_selectors(
                 r,
                 session_key=session_key,

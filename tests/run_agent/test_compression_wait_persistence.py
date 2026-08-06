@@ -252,7 +252,6 @@ def test_real_storage_error_keeps_exact_fatal_safeguard() -> None:
         "session_persistence_failed"
         ) == (
             "⚠️ No reply: the turn was stopped because session storage could not be "
-            "written (the transcript would have been lost on restart). This is often "
-            "a full disk — free some space (or fix state.db permissions), then send "
-            "your message again."
+            "written (the transcript would have been lost on restart). Check the state "
+            "database health (`hermes doctor`), then send your message again."
         )

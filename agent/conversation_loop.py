@@ -51,6 +51,9 @@ from agent.turn_retry_state import TurnRetryState
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.message_sanitization import (
     close_interrupted_tool_sequence,
+    completion_delivery_suffix_has_meaningful_work,
+    completion_delivery_suffix_start,
+    drop_uncommitted_completion_delivery_suffix,
     _repair_tool_call_arguments,
     _sanitize_messages_non_ascii,
     _sanitize_messages_surrogates,
@@ -6705,14 +6708,32 @@ def run_conversation(
                     ]
 
                 _tool_turn_persisted = None
+                _completion_tool_intent = (
+                    completion_delivery_suffix_start(messages) is not None
+                )
                 try:
                     # Persist the assistant tool-call turn before any tool
                     # side effects run. If a destructive tool restarts or
                     # terminates Hermes mid-turn, resume logic still sees the
                     # exact tool-call block that already executed.
-                    _tool_turn_persisted = agent._flush_messages_to_session_db(
-                        messages, conversation_history
-                    )
+                    if _completion_tool_intent:
+                        from agent.turn_finalizer import (
+                            finalize_completion_delivery_suffix,
+                        )
+
+                        _intent_status = finalize_completion_delivery_suffix(
+                            agent,
+                            messages,
+                            final_response="",
+                            failed=False,
+                            interrupted=False,
+                            commit_tool_intent=True,
+                        )
+                        _tool_turn_persisted = _intent_status == "committed"
+                    else:
+                        _tool_turn_persisted = agent._flush_messages_to_session_db(
+                            messages, conversation_history
+                        )
                 except Exception as exc:
                     _tool_turn_persisted = False
                     logger.warning(
@@ -6723,6 +6744,14 @@ def run_conversation(
                     )
 
                 if _tool_turn_persisted is False:
+                    if _completion_tool_intent:
+                        # No side effect ran and the intent never became
+                        # canonical. Roll back the whole event/tool-call suffix;
+                        # visible assistant narration must not resurrect an
+                        # unexecuted, result-less tool call in finalization.
+                        drop_uncommitted_completion_delivery_suffix(messages)
+                        agent._pending_completion_delivery_suffix = None
+                        agent._completion_delivery_commit_failed = False
                     # The canonical append failed. Do not project the row or
                     # run side-effecting tools from state that exists only in
                     # this process. Breaking also avoids retrying the same
@@ -7047,6 +7076,21 @@ def run_conversation(
                         m.get("role") == "tool"
                         for m in messages[-5:]  # check recent messages
                     )
+                    _completion_delivery_tool_empty = (
+                        _prior_was_tool
+                        and 0 <= current_turn_user_idx < len(messages)
+                        and completion_delivery_suffix_start(messages)
+                        == current_turn_user_idx
+                    )
+                    if _completion_delivery_tool_empty:
+                        # The completion event already caused meaningful tool
+                        # work. Its literal-empty terminal response means
+                        # "nothing more to surface", not "retry the model".
+                        # Finalization commits the atomic suffix and adds the
+                        # hidden provider-safe assistant closure.
+                        _turn_exit_reason = "completion_delivery_effect_complete"
+                        final_response = ""
+                        break
                     # Detect Qwen3/Ollama-style in-content thinking blocks.
                     # Ollama puts <think> in the content field (not in
                     # reasoning_content), so _has_structured below would
@@ -7143,6 +7187,32 @@ def run_conversation(
                     _truly_empty = not agent._strip_think_blocks(
                         final_response
                     ).strip()
+                    _completion_delivery_empty = (
+                        _truly_empty
+                        and not _has_structured
+                        and 0 <= current_turn_user_idx < len(messages)
+                        and completion_delivery_suffix_start(messages)
+                        == current_turn_user_idx
+                    )
+                    if _completion_delivery_empty:
+                        # The completion prompt explicitly defines a literal
+                        # empty response as "nothing more to surface or act
+                        # on".  Before any work that is a silent no-op; after
+                        # a tool/text action it is a successful terminal signal
+                        # and finalization commits the suffix with a hidden
+                        # provider-safe assistant closure.
+                        _has_completion_work = (
+                            completion_delivery_suffix_has_meaningful_work(
+                                messages, current_turn_user_idx
+                            )
+                        )
+                        _turn_exit_reason = (
+                            "completion_delivery_effect_complete"
+                            if _has_completion_work
+                            else "completion_delivery_noop"
+                        )
+                        final_response = ""
+                        break
                     _prefill_exhausted = (
                         _has_structured
                         and agent._thinking_prefill_retries >= 2

@@ -404,6 +404,9 @@ class CLIAgentSetupMixin:
                 resolved_meta = self._session_db.get_session(self.session_id)
                 if resolved_meta:
                     session_meta = resolved_meta
+            self._session_db.recover_dangling_completion_tool_intent(
+                self.session_id
+            )
             restored = self._session_db.get_messages_as_conversation(
                 self.session_id, repair_alternation=True
             )
@@ -615,7 +618,10 @@ class CLIAgentSetupMixin:
             if resolved_meta:
                 session_meta = resolved_meta
 
-        model_history, display_history = self._session_db.get_resume_conversations(self.session_id)
+        self._session_db.recover_dangling_completion_tool_intent(self.session_id)
+        model_history, display_history = self._session_db.get_resume_conversations(
+            self.session_id
+        )
         restored = model_history
         if restored:
             restored = [m for m in restored if m.get("role") != "session_meta"]

@@ -425,6 +425,7 @@ class SessionPortabilityMixin:
             "role",
             "tool_call_id",
             "tool_name",
+            "name",
             "effect_disposition",
             "finish_reason",
             "reasoning",

@@ -1880,15 +1880,26 @@ def conversation_history_after_compression(
     drop any later, unflushed turns on restart; clearing the baseline would
     append the already-persisted compacted rows a second time.
     """
+    from agent.message_sanitization import (
+        _is_ephemeral_scaffolding,
+        durable_messages_before_pending_completion,
+    )
+
+    persisted_messages = [
+        message
+        for message in durable_messages_before_pending_completion(messages)
+        if not _is_ephemeral_scaffolding(message)
+    ]
+
     if bool(getattr(agent, "_last_compression_attempt_recorded", False)):
         attempt_in_place = getattr(agent, "_last_compression_attempt_in_place", None)
         if attempt_in_place is True:
-            return list(messages)
+            return list(persisted_messages)
         if attempt_in_place is False:
             return None
         return previous_history
     if bool(getattr(agent, "_last_compaction_in_place", False)):
-        return list(messages)
+        return list(persisted_messages)
     return None
 
 
@@ -3256,11 +3267,14 @@ def compress_context(
         # normal SQLite/JSON flush filters. Build this view after todo/anchor
         # preservation has finalized ``compressed``, but keep the live list
         # intact so a current completion nudge still reaches the model.
-        from agent.message_sanitization import _is_ephemeral_scaffolding
+        from agent.message_sanitization import (
+            _is_ephemeral_scaffolding,
+            durable_messages_before_pending_completion,
+        )
 
         persisted_compressed = [
             message
-            for message in compressed
+            for message in durable_messages_before_pending_completion(compressed)
             if not _is_ephemeral_scaffolding(message)
         ]
 
@@ -3316,7 +3330,9 @@ def compress_context(
                     if expected_active_messages is None:
                         expected_active_messages = [
                             message
-                            for message in messages_before_compression
+                            for message in durable_messages_before_pending_completion(
+                                messages_before_compression
+                            )
                             if isinstance(message, dict)
                             and message.get(_DB_PERSISTED_MARKER)
                         ]
@@ -3350,10 +3366,16 @@ def compress_context(
                                 and 0 <= current_idx <= len(messages_before_compression)
                             ):
                                 expected_active_messages = (
-                                    messages_before_compression[:current_idx]
+                                    durable_messages_before_pending_completion(
+                                        messages_before_compression[:current_idx]
+                                    )
                                 )
                             else:
-                                expected_active_messages = messages_before_compression
+                                expected_active_messages = (
+                                    durable_messages_before_pending_completion(
+                                        messages_before_compression
+                                    )
+                                )
 
                     agent._session_db.archive_and_compact(
                         agent.session_id,
@@ -3373,12 +3395,17 @@ def compress_context(
                         ),
                     )
                     split_status = "in_place_committed"
-                    # Reset the flush identity set so the next turn's appends are
-                    # diffed against the COMPACTED transcript: the compacted dicts
-                    # are passed as conversation_history next turn and skipped by
-                    # identity, so only genuinely new turn messages get appended
-                    # (no dup of the summary, no resurrection of dropped turns).
-                    agent._flushed_db_message_ids = set()
+                    # Seed the exact compacted dict identities as already
+                    # durable.  Normal callers also pass them back as
+                    # conversation_history, but completion-delivery finalization
+                    # publishes its withheld suffix directly and therefore
+                    # needs the same one-shot identity boundary.
+                    agent._flushed_db_message_session_id = agent.session_id
+                    agent._flushed_db_message_ids = {
+                        id(message)
+                        for message in persisted_compressed
+                        if isinstance(message, dict)
+                    }
                     # Rotation-independent signal: the conversation was compacted in
                     # place (id unchanged). The gateway reads this (NOT an id-change
                     # diff) to re-baseline transcript handling.
@@ -3488,14 +3515,17 @@ def compress_context(
 
                 # Rotation and in-place mode both published the prompt with the
                 # compacted transcript in the transaction above.
+                for _persisted_message in persisted_compressed:
+                    if isinstance(_persisted_message, dict):
+                        _persisted_message["_db_persisted"] = True
                 if in_place:
                     agent._last_flushed_db_idx = 0
                 else:
-                    agent._last_flushed_db_idx = len(compressed)
+                    agent._last_flushed_db_idx = len(persisted_compressed)
                     agent._flushed_db_message_session_id = agent.session_id
                     agent._flushed_db_message_ids = {
                         id(message)
-                        for message in compressed
+                        for message in persisted_compressed
                         if isinstance(message, dict)
                     }
                 _session_commit_succeeded = True

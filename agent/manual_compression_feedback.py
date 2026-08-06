@@ -7,6 +7,26 @@ from typing import Any, Sequence
 from agent.redact import redact_sensitive_text
 
 
+_ATTEMPT_FAILURE_NOTES = {
+    "illegal_durable_replay": (
+        "The live transcript did not match the durable session, so Hermes "
+        "preserved both instead of rewriting history."
+    ),
+    "commit_fence_cancelled": "Compression was cancelled before its commit boundary.",
+    "pool_saturated": "The compression worker pool was full; try again shortly.",
+}
+
+
+def compression_attempt_committed(compression_state: Any) -> bool:
+    """Return whether the latest structured attempt crossed its commit edge."""
+    telemetry = (
+        getattr(compression_state, "_last_compression_telemetry", None)
+        if compression_state is not None
+        else None
+    )
+    return isinstance(telemetry, dict) and telemetry.get("commit_status") == "committed"
+
+
 def describe_compression_lock_skip(lock_signal: Any) -> str:
     """User-facing text for a manual /compress skipped by the compression lock.
 
@@ -49,17 +69,30 @@ def summarize_manual_compression(
     before_count = len(before_messages)
     after_count = len(after_messages)
     noop = list(after_messages) == list(before_messages)
-    aborted = (
+    summary_aborted = (
         compression_state is not None
         and getattr(compression_state, "_last_compress_aborted", False) is True
     )
+    telemetry = (
+        getattr(compression_state, "_last_compression_telemetry", None)
+        if compression_state is not None
+        else None
+    )
+    attempt_failure_class = (
+        telemetry.get("failure_class") if isinstance(telemetry, dict) else None
+    )
+    attempt_aborted = bool(
+        isinstance(telemetry, dict)
+        and telemetry.get("commit_status") == "aborted"
+    )
+    aborted = summary_aborted or attempt_aborted
     fallback_used = (
         compression_state is not None
         and getattr(compression_state, "_last_summary_fallback_used", False) is True
     )
     failure_reason = (
         getattr(compression_state, "_last_summary_error", None)
-        if compression_state is not None
+        if compression_state is not None and (summary_aborted or fallback_used)
         else None
     )
     if not isinstance(failure_reason, str) or not failure_reason.strip():
@@ -86,7 +119,13 @@ def summarize_manual_compression(
 
     note = None
     if aborted:
-        note = "Summary generation failed; no messages were removed."
+        if summary_aborted:
+            note = "Summary generation failed; no messages were removed."
+        else:
+            note = _ATTEMPT_FAILURE_NOTES.get(
+                attempt_failure_class,
+                "Compression stopped before committing; no messages were removed.",
+            )
     elif fallback_used:
         dropped_count = getattr(
             compression_state, "_last_summary_dropped_count", None

@@ -108,6 +108,10 @@ def test_codex_app_server_native_auto_mode_leaves_thread_compaction_to_codex():
     agent = DummyAgent(
         TurnResult(thread_id="thread-1", turn_id="compact-turn-1")
     )
+    agent.context_compressor._last_compression_telemetry = {
+        "attempt_id": "stale",
+        "commit_status": "committed",
+    }
     messages = [{"role": "user", "content": "hi"}]
 
     returned, prompt = compress_context(
@@ -123,6 +127,10 @@ def test_codex_app_server_native_auto_mode_leaves_thread_compaction_to_codex():
     assert agent._codex_session.calls == 0
     assert agent.context_compressor.compression_count == 0
     assert agent.events == []
+    outcome = agent.context_compressor._last_compression_telemetry
+    assert outcome["attempt_id"] != "stale"
+    assert outcome["commit_status"] == "aborted"
+    assert outcome["failure_class"] == "codex_native_mode"
 
 
 def test_codex_app_server_compaction_heartbeat_refreshes_activity_while_waiting():
@@ -156,6 +164,12 @@ def test_codex_app_server_compaction_heartbeat_refreshes_activity_while_waiting(
     assert all(
         p is ActivityProvenance.AGENT_COMPRESSION for p in agent.touch_provenances
     )
+    assert agent.context_compressor._last_compression_telemetry[
+        "commit_status"
+    ] == "committed"
+    assert agent.context_compressor._last_compression_telemetry[
+        "split_status"
+    ] == "codex_app_server_committed"
 
 
 def _schedule_codex_switch(agent):
@@ -220,6 +234,12 @@ def test_codex_failed_compaction_keeps_deferred_switch():
 
     assert agent.switch_calls == []
     assert get_model_switch_after_compression(agent) is pending
+    assert agent.context_compressor._last_compression_telemetry[
+        "commit_status"
+    ] == "aborted"
+    assert agent.context_compressor._last_compression_telemetry[
+        "failure_class"
+    ] == "codex_compaction_failed"
 
 
 def test_codex_outer_publication_controls_deferred_switch():

@@ -8,10 +8,13 @@ and prompt-cache integrity.
 from __future__ import annotations
 
 import threading
+from pathlib import Path
 
 import pytest
 
 from agent.prompt_builder import STEER_MARKER_OPEN, format_steer_marker
+from agent.context_compressor import _capture_durable_compaction_baseline
+from hermes_state import SessionDB
 from run_agent import AIAgent
 
 
@@ -378,6 +381,119 @@ class TestSteerInjection:
         assert new_content[0] == {"type": "text", "text": "existing output"}
         assert new_content[1]["type"] == "text"
         assert "extra note" in new_content[1]["text"]
+
+    def test_persisted_tool_result_updates_durable_row_before_hot_copy(
+        self, tmp_path: Path
+    ):
+        """The live 21:57 ordering: progress flush, then late /steer."""
+        db_path = tmp_path / "state.db"
+        db = SessionDB(db_path=db_path)
+        session_id = "POST_FLUSH_STEER"
+        db.create_session(session_id, source="tui")
+        db.append_message(
+            session_id,
+            "tool",
+            "review complete",
+            tool_call_id="call-review",
+        )
+        messages = db.get_messages_as_conversation(session_id)
+        messages[0]["_db_persisted"] = True
+
+        agent = _bare_agent()
+        agent._session_db = db
+        agent.session_id = session_id
+        steer = "不用审计, 这是codex加的修复, 解决了你压缩失败的问题"
+        agent.steer(steer)
+        agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=1)
+
+        cold = SessionDB(db_path=db_path)
+        try:
+            restarted = cold.get_messages_as_conversation(session_id)
+        finally:
+            cold.close()
+        assert len(restarted) == 1
+        assert restarted[0]["content"] == messages[0]["content"]
+        assert steer in restarted[0]["content"]
+        assert _capture_durable_compaction_baseline(
+            db, session_id, messages
+        )[0] is not None
+
+    def test_persisted_multi_tool_batch_updates_only_last_result(
+        self, tmp_path: Path
+    ):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        session_id = "MULTI_TOOL_STEER"
+        db.create_session(session_id, source="tui")
+        db.append_messages_batch(session_id, [
+            {"role": "tool", "content": "first", "tool_call_id": "call-1"},
+            {"role": "tool", "content": "second", "tool_call_id": "call-2"},
+        ])
+        messages = db.get_messages_as_conversation(session_id)
+        for message in messages:
+            message["_db_persisted"] = True
+
+        agent = _bare_agent()
+        agent._session_db = db
+        agent.session_id = session_id
+        agent.steer("inspect the second result")
+        agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=2)
+
+        restarted = db.get_messages_as_conversation(session_id)
+        assert [message["content"] for message in restarted] == [
+            "first",
+            messages[1]["content"],
+        ]
+        assert len(restarted) == 2
+
+    def test_persisted_cas_race_defers_older_steer_before_newer_text(self):
+        agent = _bare_agent()
+        agent.session_id = "sid"
+
+        class RacingDB:
+            def compare_and_set_active_tool_content(self, *_args):
+                agent.steer("newer")
+                return 0
+
+        agent._session_db = RacingDB()
+        messages = [{
+            "role": "tool",
+            "content": "result",
+            "tool_call_id": "call-1",
+            "_db_persisted": True,
+        }]
+        agent.steer("older")
+
+        agent._apply_pending_steer_to_tool_results(messages, num_tool_msgs=1)
+
+        assert messages[0]["content"] == "result"
+        assert agent._pending_steer == "older\nnewer"
+
+    def test_missing_target_race_restores_drained_steer_before_newer_text(self):
+        agent = _bare_agent()
+        agent.steer("older")
+        drained = threading.Event()
+        allow_return = threading.Event()
+        original_drain = agent._drain_pending_steer
+
+        def blocking_drain():
+            text = original_drain()
+            drained.set()
+            assert allow_return.wait(timeout=2)
+            return text
+
+        agent._drain_pending_steer = blocking_drain
+        worker = threading.Thread(
+            target=agent._apply_pending_steer_to_tool_results,
+            args=([{"role": "assistant", "content": "no tool target"}], 1),
+        )
+        worker.start()
+        assert drained.wait(timeout=2)
+        agent.steer("newer")
+        allow_return.set()
+        worker.join(timeout=2)
+
+        assert not worker.is_alive()
+        assert agent._pending_steer == "older\nnewer"
 
 
 

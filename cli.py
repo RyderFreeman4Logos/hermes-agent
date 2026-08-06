@@ -11220,7 +11220,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         with self._busy_command("Compressing context...", blocks_input=False):
             try:
                 from agent.model_metadata import estimate_request_tokens_rough
-                from agent.manual_compression_feedback import summarize_manual_compression
+                from agent.manual_compression_feedback import (
+                    compression_attempt_committed,
+                    summarize_manual_compression,
+                )
                 original_history = list(self.conversation_history)
 
                 # Boundary-aware split: only the head is summarized; the
@@ -11307,29 +11310,43 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     )
                     return
 
-                if partial and tail:
-                    compressed = rejoin_compressed_head_and_tail(compressed, tail)
-                self.conversation_history = compressed
-                # _compress_context ends the old session and creates a new child
-                # session on the agent (run_agent.py::_compress_context). Sync the
-                # CLI's session_id so /status, /resume, exit summary, and title
-                # generation all point at the live continuation session, not the
-                # ended parent. Without this, subsequent end_session() calls target
-                # the already-closed parent and the child is orphaned.
-                if (
-                    getattr(self.agent, "session_id", None)
-                    and self.agent.session_id != self.session_id
-                ):
-                    self.session_id = self.agent.session_id
-                    self._pending_title = None
-                    # Manual /compress replaces conversation_history with a new
-                    # compressed handoff for the child session. Persist it from
-                    # offset 0 so resume can recover the continuation after exit.
-                    self.agent._flush_messages_to_session_db(self.conversation_history, None)
-                finalize_context_engine_compression_notification(
-                    self.agent,
-                    committed=True,
+                compression_state = getattr(
+                    self.agent, "context_compressor", None
                 )
+                _committed = compression_attempt_committed(compression_state)
+                if _committed:
+                    if partial and tail:
+                        compressed = rejoin_compressed_head_and_tail(compressed, tail)
+                    self.conversation_history = compressed
+                    # _compress_context ends the old session and creates a new child
+                    # session on the agent (run_agent.py::_compress_context). Sync the
+                    # CLI's session_id so /status, /resume, exit summary, and title
+                    # generation all point at the live continuation session, not the
+                    # ended parent. Without this, subsequent end_session() calls target
+                    # the already-closed parent and the child is orphaned.
+                    if (
+                        getattr(self.agent, "session_id", None)
+                        and self.agent.session_id != self.session_id
+                    ):
+                        self.session_id = self.agent.session_id
+                        self._pending_title = None
+                        # Manual /compress replaces conversation_history with a new
+                        # compressed handoff for the child session. Persist it from
+                        # offset 0 so resume can recover the continuation after exit.
+                        self.agent._flush_messages_to_session_db(self.conversation_history, None)
+                    finalize_context_engine_compression_notification(
+                        self.agent,
+                        committed=True,
+                    )
+                else:
+                    # Preserve the exact host transcript on an aborted/no-op
+                    # attempt; message-count equality alone cannot prove a
+                    # compression boundary was published.
+                    compressed = original_history
+                    finalize_context_engine_compression_notification(
+                        self.agent,
+                        committed=False,
+                    )
                 new_tokens = estimate_request_tokens_rough(
                     self.conversation_history,
                     system_prompt=_sys_prompt,
@@ -11341,9 +11358,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     self.conversation_history,
                     approx_tokens,
                     new_tokens,
-                    compression_state=getattr(
-                        self.agent, "context_compressor", None
-                    ),
+                    compression_state=compression_state,
                 )
                 if summary.get("aborted") or summary.get("fallback_used"):
                     icon = "⚠️"

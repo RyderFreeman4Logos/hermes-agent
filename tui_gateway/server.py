@@ -4807,6 +4807,7 @@ def _compress_session_history(
     """
     from agent.conversation_compression import (
         finalize_context_engine_compression_notification,
+        record_compression_noop,
     )
     from agent.model_metadata import estimate_request_tokens_rough
     from hermes_cli.partial_compress import (
@@ -4833,6 +4834,11 @@ def _compress_session_history(
             history_version = int(session.get("history_version", 0))
     history = before_messages
     if len(history) < 4:
+        record_compression_noop(
+            agent,
+            trigger_source="manual",
+            failure_class="insufficient_messages",
+        )
         usage = _get_usage(agent)
         return 0, usage
     partial, keep_last, focus_topic = parse_partial_compress_args(focus_topic or "")
@@ -4903,6 +4909,24 @@ def _compress_session_history(
         raise CompressionLockHeld(
             _lock_skipped if isinstance(_lock_skipped, str) else None
         )
+
+    from agent.manual_compression_feedback import compression_attempt_committed
+    if not compression_attempt_committed(compressor):
+        # No compression boundary was published (durable-replay rejection,
+        # summary abort, or a genuine no-op).  Do not rewrite/version-bump the
+        # host history or acknowledge the deferred notification as committed.
+        finalize_context_engine_compression_notification(
+            agent,
+            committed=False,
+        )
+        agent._awaiting_cache_usage_after_compression = (
+            cache_attribution_pending_before
+        )
+        if compressor is not None and hasattr(
+            compressor, "awaiting_real_usage_after_compression"
+        ):
+            compressor.awaiting_real_usage_after_compression = real_usage_pending_before
+        return 0, _get_usage(agent)
 
     if partial and tail:
         compressed = rejoin_compressed_head_and_tail(compressed, tail)
@@ -13153,7 +13177,10 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
             # compressed + emitted session.info and returned "", so the TUI
             # showed no "compressed N → M messages / ~X → ~Y tokens" stats
             # while CLI and gateway both did.
-            from agent.manual_compression_feedback import summarize_manual_compression
+            from agent.manual_compression_feedback import (
+                compression_attempt_committed,
+                summarize_manual_compression,
+            )
             from agent.model_metadata import estimate_request_tokens_rough
             from agent.conversation_compression import (
                 finalize_context_engine_compression_notification,
@@ -13186,16 +13213,25 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
                     describe_compression_lock_skip,
                 )
                 return describe_compression_lock_skip(e.holder)
-            _sync_session_key_after_compress(
-                sid,
-                session,
-                restart_slash_worker=False,
+            _committed = compression_attempt_committed(
+                getattr(agent, "context_compressor", None)
             )
-            finalize_context_engine_compression_notification(
-                agent,
-                committed=True,
-            )
-            _restart_slash_worker(sid, session)
+            if _committed:
+                _sync_session_key_after_compress(
+                    sid,
+                    session,
+                    restart_slash_worker=False,
+                )
+                finalize_context_engine_compression_notification(
+                    agent,
+                    committed=True,
+                )
+                _restart_slash_worker(sid, session)
+            else:
+                finalize_context_engine_compression_notification(
+                    agent,
+                    committed=False,
+                )
 
             with session["history_lock"]:
                 _after_messages = list(session.get("history", []))

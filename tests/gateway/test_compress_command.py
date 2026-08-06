@@ -58,6 +58,12 @@ def _make_runner(history: list[dict[str, str]]):
     return runner
 
 
+def _mark_compression_committed(agent) -> None:
+    agent.context_compressor._last_compression_telemetry = {
+        "commit_status": "committed",
+    }
+
+
 @pytest.mark.asyncio
 async def test_compress_command_works_when_auto_compaction_disabled():
     """compression.enabled: false disables *automatic* compaction only.
@@ -81,6 +87,7 @@ async def test_compress_command_works_when_auto_compaction_disabled():
     agent_instance.api_mode = "codex_responses"
     agent_instance.compression_enabled = False
     agent_instance.context_compressor.has_content_to_compress.return_value = True
+    _mark_compression_committed(agent_instance)
     agent_instance.session_id = "sess-1"
     agent_instance._compress_context.return_value = (compressed, "")
     # Explicit non-lock-skip: MagicMock getattr would return a truthy mock.
@@ -215,6 +222,7 @@ async def test_compress_command_surfaces_aux_model_failure_even_when_recovered()
     agent_instance._cached_system_prompt = ""
     agent_instance.tools = None
     agent_instance.context_compressor.has_content_to_compress.return_value = True
+    _mark_compression_committed(agent_instance)
     # Fallback placeholder was NOT used — recovery succeeded.
     agent_instance.context_compressor._last_compress_aborted = False
     agent_instance.context_compressor._last_summary_fallback_used = False
@@ -287,6 +295,7 @@ async def test_compress_command_in_place_skips_destructive_rewrite():
     agent_instance._cached_system_prompt = ""
     agent_instance.tools = None
     agent_instance.context_compressor.has_content_to_compress.return_value = True
+    _mark_compression_committed(agent_instance)
     # In-place compaction: session_id is UNCHANGED but marked as a success.
     agent_instance._last_compaction_in_place = True
     agent_instance.session_id = "sess-1"
@@ -332,6 +341,7 @@ async def test_compress_command_preserves_platform_and_gateway_session_key():
     agent_instance._cached_system_prompt = ""
     agent_instance.tools = None
     agent_instance.context_compressor.has_content_to_compress.return_value = True
+    _mark_compression_committed(agent_instance)
     agent_instance.session_id = "sess-1"
     agent_instance._compress_context.return_value = (list(history), "")
     agent_instance._compression_skipped_due_to_lock = False
@@ -382,6 +392,7 @@ async def test_compress_command_passes_tool_messages_to_compressor():
     agent_instance._cached_system_prompt = ""
     agent_instance.tools = None
     agent_instance.context_compressor.has_content_to_compress.return_value = True
+    _mark_compression_committed(agent_instance)
     agent_instance.session_id = "sess-1"
     agent_instance._compress_context.return_value = (list(history), "")
 
@@ -444,6 +455,7 @@ async def test_compress_command_multiplexed_runs_under_profile_secret_scope(tmp_
     agent_instance._cached_system_prompt = ""
     agent_instance.tools = None
     agent_instance.context_compressor.has_content_to_compress.return_value = True
+    _mark_compression_committed(agent_instance)
     agent_instance.context_compressor._last_compress_aborted = False
     agent_instance.context_compressor._last_summary_fallback_used = False
     agent_instance.context_compressor._last_summary_dropped_count = 0
@@ -499,6 +511,7 @@ async def test_compress_command_single_profile_skips_profile_resolution():
     agent_instance._cached_system_prompt = ""
     agent_instance.tools = None
     agent_instance.context_compressor.has_content_to_compress.return_value = True
+    _mark_compression_committed(agent_instance)
     agent_instance.session_id = "sess-1"
     agent_instance._compress_context.return_value = (list(history), "")
     agent_instance._compression_skipped_due_to_lock = False

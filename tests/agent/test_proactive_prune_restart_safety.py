@@ -456,6 +456,51 @@ def test_compaction_baseline_rejects_tool_content_whitespace_mutation(
         _capture_durable_compaction_baseline(db, session_id, live)
 
 
+def test_manual_compression_records_pre_summary_durable_replay_abort(
+    tmp_path: Path,
+) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "MANUAL_ILLEGAL_DURABLE_REPLAY"
+    db.create_session(session_id, source="tui")
+    history = _history(large_chars=2_000)
+    db.append_messages_batch(session_id, history)
+    live = db.get_messages_as_conversation(session_id)
+    for message in live:
+        message["_db_persisted"] = True
+    # Reproduce the historical post-flush /steer divergence without using the
+    # fixed steer path: only the hot tool result receives the marker.
+    live[2]["content"] += "\n<USER_STEER>late</USER_STEER>"
+
+    agent = _build_agent(db, session_id, platform="tui")
+    agent.client = type(
+        "NoProviderCall",
+        (),
+        {"chat": type("Chat", (), {"completions": type(
+            "Completions",
+            (),
+            {"create": staticmethod(lambda **_kw: pytest.fail(
+                "durable replay abort must happen before summary provider call"
+            ))},
+        )()})()},
+    )()
+
+    compressed, _ = agent._compress_context(
+        live,
+        None,
+        approx_tokens=120_000,
+        force=True,
+        defer_context_engine_notification=True,
+    )
+
+    assert compressed is live
+    telemetry = agent.context_compressor._last_compression_telemetry
+    assert telemetry["commit_status"] == "aborted"
+    assert telemetry["failure_class"] == "illegal_durable_replay"
+    assert agent.context_compressor._last_summary_error is None
+    assert agent.context_compressor._last_compress_aborted is False
+    assert db.get_compression_lock_holder(session_id) is None
+
+
 def test_compaction_baseline_never_substitutes_tool_api_content(
     tmp_path: Path,
 ) -> None:

@@ -34,7 +34,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from hermes_cli.timeouts import get_provider_request_timeout
 from agent.prompt_builder import format_steer_marker
-from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
+from agent.tool_dispatch_helpers import (
+    _trajectory_normalize_msg,
+    make_tool_result_message,
+    tool_content_for_session_persistence,
+)
 from agent.trajectory import convert_scratchpad_to_think
 from agent.credential_pool import STATUS_EXHAUSTED, credential_pool_matches_provider
 from agent.error_classifier import FailoverReason
@@ -4189,27 +4193,80 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
         if _lock is not None:
             with _lock:
                 if agent._pending_steer:
-                    agent._pending_steer = agent._pending_steer + "\n" + steer_text
+                    agent._pending_steer = steer_text + "\n" + agent._pending_steer
                 else:
                     agent._pending_steer = steer_text
         else:
             existing = getattr(agent, "_pending_steer", None)
-            agent._pending_steer = (existing + "\n" + steer_text) if existing else steer_text
+            agent._pending_steer = (steer_text + "\n" + existing) if existing else steer_text
         return
+    target = messages[target_idx]
     marker = format_steer_marker(steer_text)
-    existing_content = messages[target_idx].get("content", "")
+    existing_content = target.get("content", "")
     if not isinstance(existing_content, str):
         # Anthropic multimodal content blocks — preserve them and append
         # a text block at the end.
         try:
             blocks = list(existing_content) if existing_content else []
             blocks.append({"type": "text", "text": marker.lstrip()})
-            messages[target_idx]["content"] = blocks
+            replacement_content = blocks
         except Exception:
             # Fall back to string replacement if content shape is unexpected.
-            messages[target_idx]["content"] = f"{existing_content}{marker}"
+            replacement_content = f"{existing_content}{marker}"
     else:
-        messages[target_idx]["content"] = existing_content + marker
+        replacement_content = existing_content + marker
+
+    # Tool results are deliberately flushed before UI callbacks and before a
+    # whole batch finishes, so this end-of-batch steer can target a dict that
+    # already carries _db_persisted.  Mutating that dict alone makes the marker
+    # lie: cold resume sees the old content and the compaction baseline rejects
+    # the hot transcript as an illegal durable replay.  Update the exact row by
+    # (session, tool_call_id, old content) CAS before publishing the hot value.
+    if target.get("_db_persisted"):
+        session_db = getattr(agent, "_session_db", None)
+        session_id = str(getattr(agent, "session_id", "") or "")
+        tool_call_id = str(target.get("tool_call_id") or "")
+        updater = getattr(session_db, "compare_and_set_active_tool_content", None)
+        updated = False
+        if session_id and tool_call_id and callable(updater):
+            try:
+                updated = updater(
+                    session_id,
+                    tool_call_id,
+                    tool_content_for_session_persistence(existing_content),
+                    tool_content_for_session_persistence(replacement_content),
+                ) == 1
+            except Exception:
+                logger.warning(
+                    "Could not persist /steer on tool result %s; retaining it "
+                    "for the next safe delivery boundary",
+                    tool_call_id,
+                    exc_info=True,
+                )
+        if not updated:
+            # The durable row moved or could not be updated.  Keep hot and cold
+            # histories identical and restore this older steer ahead of any
+            # newer text that arrived while the CAS was in flight.
+            lock = getattr(agent, "_pending_steer_lock", None)
+            if lock is not None:
+                with lock:
+                    pending = getattr(agent, "_pending_steer", None)
+                    agent._pending_steer = (
+                        steer_text + "\n" + pending if pending else steer_text
+                    )
+            else:
+                pending = getattr(agent, "_pending_steer", None)
+                agent._pending_steer = (
+                    steer_text + "\n" + pending if pending else steer_text
+                )
+            logger.warning(
+                "Deferred /steer because its persisted tool-result row no "
+                "longer matched"
+            )
+            return
+
+    target["content"] = replacement_content
+    drop_stale_api_content(target)
     _ra().logger.info(
         "Delivered /steer to agent after tool batch (%d chars): %s",
         len(steer_text),

@@ -2401,7 +2401,10 @@ def _(rid, params: dict) -> dict:
     sid = params.get("session_id", "")
     focus_topic = str(params.get("focus_topic", "") or "").strip()
     try:
-        from agent.manual_compression_feedback import summarize_manual_compression
+        from agent.manual_compression_feedback import (
+            compression_attempt_committed,
+            summarize_manual_compression,
+        )
         from agent.model_metadata import estimate_request_tokens_rough
 
         with session["history_lock"]:
@@ -2440,16 +2443,25 @@ def _(rid, params: dict) -> dict:
                 history_version=history_version,
             )
             agent = session["agent"]
-            _sync_session_key_after_compress(
-                sid,
-                session,
-                restart_slash_worker=False,
+            _committed = compression_attempt_committed(
+                getattr(agent, "context_compressor", None)
             )
-            finalize_context_engine_compression_notification(
-                agent,
-                committed=True,
-            )
-            _restart_slash_worker(sid, session)
+            if _committed:
+                _sync_session_key_after_compress(
+                    sid,
+                    session,
+                    restart_slash_worker=False,
+                )
+                finalize_context_engine_compression_notification(
+                    agent,
+                    committed=True,
+                )
+                _restart_slash_worker(sid, session)
+            else:
+                finalize_context_engine_compression_notification(
+                    agent,
+                    committed=False,
+                )
             with session["history_lock"]:
                 messages = list(session.get("history", []))
             after_count = len(messages)

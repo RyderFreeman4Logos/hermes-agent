@@ -14,12 +14,19 @@ def _make_history() -> list[dict[str, str]]:
     ]
 
 
+def _mark_compression_committed(agent) -> None:
+    agent.context_compressor._last_compression_telemetry = {
+        "commit_status": "committed",
+    }
+
+
 def test_manual_compress_keeps_tui_composer_editable(capsys):
     """A follow-up can be drafted and queued while /compress runs."""
     shell = _make_cli()
     history = _make_history()
     shell.conversation_history = history
     shell.agent = MagicMock()
+    _mark_compression_committed(shell.agent)
     shell.agent.compression_enabled = True
     shell.agent._cached_system_prompt = ""
     shell.agent.tools = None
@@ -57,6 +64,7 @@ def test_manual_compress_explains_when_token_estimate_rises(capsys):
     ]
     shell.conversation_history = history
     shell.agent = MagicMock()
+    _mark_compression_committed(shell.agent)
     shell.agent.compression_enabled = True
     shell.agent._cached_system_prompt = ""
     shell.agent.tools = None
@@ -104,6 +112,7 @@ def test_manual_compress_syncs_session_id_after_split():
     ]
     shell.conversation_history = history
     shell.agent = MagicMock()
+    _mark_compression_committed(shell.agent)
     shell.agent.compression_enabled = True
     shell.agent._cached_system_prompt = ""
     shell.agent.tools = None
@@ -146,6 +155,7 @@ def test_manual_compress_flushes_compressed_history_to_child_session_db():
     ]
     shell.conversation_history = history
     shell.agent = MagicMock()
+    _mark_compression_committed(shell.agent)
     shell.agent.compression_enabled = True
     shell.agent._cached_system_prompt = ""
     shell.agent.session_id = old_id
@@ -182,6 +192,7 @@ def test_manual_compress_runs_when_auto_compaction_disabled(capsys):
     ]
     shell.conversation_history = history
     shell.agent = MagicMock()
+    _mark_compression_committed(shell.agent)
     shell.agent.compression_enabled = False
     shell.agent._cached_system_prompt = ""
     shell.agent.tools = None
@@ -199,6 +210,41 @@ def test_manual_compress_runs_when_auto_compaction_disabled(capsys):
     # Manual compression bypasses the summary-failure cooldown.
     assert shell.agent._compress_context.call_args.kwargs.get("force") is True
     assert shell.conversation_history == compressed
+
+
+def test_manual_compress_reports_durable_replay_abort_without_publishing(capsys):
+    shell = _make_cli()
+    history = _make_history()
+    shell.conversation_history = history
+    shell.agent = MagicMock()
+    shell.agent._cached_system_prompt = ""
+    shell.agent.tools = None
+    shell.agent.session_id = shell.session_id
+    shell.agent._compression_skipped_due_to_lock = False
+    shell.agent.context_compressor._last_compress_aborted = False
+    shell.agent.context_compressor._last_summary_error = None
+    shell.agent.context_compressor._last_summary_fallback_used = False
+    shell.agent.context_compressor._last_compression_telemetry = {
+        "commit_status": "aborted",
+        "failure_class": "illegal_durable_replay",
+    }
+    shell.agent._compress_context.return_value = (list(history), "")
+
+    with (
+        patch("agent.model_metadata.estimate_request_tokens_rough", return_value=100),
+        patch(
+            "agent.conversation_compression."
+            "finalize_context_engine_compression_notification"
+        ) as finalize,
+    ):
+        shell._manual_compress()
+
+    output = capsys.readouterr().out
+    assert "Compression aborted: 4 messages preserved" in output
+    assert "did not match the durable session" in output
+    assert shell.conversation_history == history
+    finalize.assert_called_once_with(shell.agent, committed=False)
+    shell.agent._flush_messages_to_session_db.assert_not_called()
 
 
 

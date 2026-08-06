@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 
 from agent.manual_compression_feedback import (
+    compression_attempt_committed,
     describe_compression_lock_skip,
     summarize_manual_compression,
 )
@@ -63,6 +64,42 @@ def test_fallback_compression_reports_dropped_message_count():
     assert "removed 8 message(s)" in feedback["note"]
     assert "invalid response" in feedback["note"]
 
+
+def test_pre_summary_durable_replay_abort_uses_structured_attempt_outcome():
+    messages = _messages(12)
+    state = SimpleNamespace(
+        _last_compress_aborted=False,
+        _last_summary_fallback_used=False,
+        _last_summary_error=None,
+        _last_compression_telemetry={
+            "commit_status": "aborted",
+            "failure_class": "illegal_durable_replay",
+        },
+    )
+
+    feedback = summarize_manual_compression(
+        messages,
+        list(messages),
+        120_000,
+        120_000,
+        compression_state=state,
+    )
+
+    assert feedback["aborted"] is True
+    assert feedback["headline"] == "Compression aborted: 12 messages preserved"
+    assert "did not match the durable session" in feedback["note"]
+    assert "Summary generation failed" not in feedback["note"]
+    assert compression_attempt_committed(state) is False
+
+
+def test_commit_status_is_not_inferred_from_message_changes():
+    assert compression_attempt_committed(SimpleNamespace(
+        _last_compression_telemetry={"commit_status": "committed"}
+    )) is True
+    assert compression_attempt_committed(SimpleNamespace(
+        _last_compression_telemetry={"commit_status": "pending"}
+    )) is False
+    assert compression_attempt_committed(SimpleNamespace()) is False
 
 
 

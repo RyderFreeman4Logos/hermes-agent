@@ -2028,6 +2028,69 @@ class AIAgent:
             return None
         if not self._session_db:
             return None
+        from agent.conversation_compression import _adopt_live_compression_child
+        from hermes_state import (
+            CompressionSessionBusyError,
+            CompressionSessionClosedError,
+        )
+
+        compression_wait_logged = False
+
+        def _append_messages_batch(rows):
+            nonlocal compression_wait_logged
+            try:
+                wait_seconds = float(
+                    getattr(self._session_db, "_TRANSCRIPT_WRITE_PATIENCE_S", 60.0)
+                )
+            except (TypeError, ValueError):
+                wait_seconds = 60.0
+            deadline = time.monotonic() + max(0.0, wait_seconds)
+            waiting = False
+            while True:
+                if waiting and getattr(self, "_interrupt_requested", False):
+                    return None
+                try:
+                    self._session_db.append_messages_batch(
+                        session_id=self.session_id,
+                        messages=rows,
+                        compression_lock_holder=getattr(
+                            self, "_active_compression_lock_holder", None
+                        ),
+                        # Let this outer loop adopt a published child and honor
+                        # turn interruption instead of blocking inside SessionDB.
+                        compression_patience_s=0.0,
+                    )
+                    return True
+                except CompressionSessionBusyError:
+                    waiting = True
+                    if getattr(self, "_interrupt_requested", False):
+                        return None
+                    parent_session_id = str(self.session_id or "")
+                    if _adopt_live_compression_child(
+                        self, self._session_db, parent_session_id
+                    ) is not None:
+                        continue
+                    if not compression_wait_logged:
+                        logger.info(
+                            "Session persistence waiting for compression: %s",
+                            parent_session_id,
+                        )
+                        compression_wait_logged = True
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        logger.warning(
+                            "Session persistence timed out waiting for compression: %s",
+                            parent_session_id,
+                        )
+                        return False
+                    time.sleep(min(0.05, remaining))
+                except CompressionSessionClosedError as exc:
+                    parent_session_id = exc.session_id
+                    if _adopt_live_compression_child(
+                        self, self._session_db, parent_session_id
+                    ) is None:
+                        raise
+
         # Persist user-message override (#48677 chokepoint): historically this
         # mutated the live `messages` list in place, which — on the early
         # crash-resilience persist that runs BEFORE the API call is built —
@@ -2255,13 +2318,10 @@ class AIAgent:
             # re-writes the whole tail (same recovery contract as before,
             # minus the partial-prefix case that could double-pay counters).
             if _batch_rows:
-                self._session_db.append_messages_batch(
-                    session_id=self.session_id,
-                    messages=_batch_rows,
-                    compression_lock_holder=getattr(
-                        self, "_active_compression_lock_holder", None
-                    ),
-                )
+                append_result = _append_messages_batch(_batch_rows)
+                if append_result is not True:
+                    self._db_flush_scan_prefix = None
+                    return append_result
                 for _written in _batch_msgs:
                     _written[_DB_PERSISTED_MARKER] = True
             # The intrinsic markers are now the sole source of truth. Reset the

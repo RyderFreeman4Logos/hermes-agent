@@ -13,6 +13,7 @@ diagnostic accessor) — not the wiring into compression.
 from __future__ import annotations
 
 import os
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -176,6 +177,97 @@ def test_unstructured_holder_waits_for_ttl(
     assert db.try_acquire_compression_lock(
         "sess1", "pid=525252:tid=2:agent=def:nonce=other", ttl_seconds=300
     ) is False
+
+
+def _hold_sqlite_writer(db: SessionDB) -> sqlite3.Connection:
+    conn = sqlite3.connect(
+        str(db.db_path), timeout=0, isolation_level=None, check_same_thread=False
+    )
+    conn.execute("BEGIN IMMEDIATE")
+    return conn
+
+
+def test_busy_acquire_retries_with_jitter_then_succeeds(
+    db: SessionDB, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    blocker = _hold_sqlite_writer(db)
+    db._conn.execute("PRAGMA busy_timeout=50")
+    jitters: list[float] = []
+    retry_observed = threading.Event()
+
+    def jitter(_low: float, _high: float) -> float:
+        jitters.append(0.02)
+        retry_observed.set()
+        return 0.02
+
+    def release_writer() -> None:
+        retry_observed.wait()
+        blocker.rollback()
+        blocker.close()
+
+    monkeypatch.setattr(hermes_state.random, "uniform", jitter)
+    releaser = threading.Thread(target=release_writer)
+    releaser.start()
+    try:
+        assert db.try_acquire_compression_lock("busy-session", "winner") is True
+    finally:
+        retry_observed.set()
+        releaser.join(timeout=2)
+
+    assert not releaser.is_alive()
+    assert jitters
+    assert db.get_compression_lock_holder("busy-session") == "winner"
+
+
+def test_busy_acquire_retries_through_exhaustion_budget(
+    db: SessionDB, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    blocker = _hold_sqlite_writer(db)
+    patience_s = 0.12
+    sleeps: list[float] = []
+
+    db._conn.execute("PRAGMA busy_timeout=0")
+    monkeypatch.setattr(db, "_COMPRESSION_LOCK_ACQUIRE_PATIENCE_S", patience_s)
+    monkeypatch.setattr(
+        hermes_state,
+        "time",
+        SimpleNamespace(
+            time=time.time, monotonic=lambda: sum(sleeps), sleep=sleeps.append
+        ),
+    )
+    monkeypatch.setattr(hermes_state.random, "uniform", lambda *_args: 0.02)
+
+    try:
+        assert db.try_acquire_compression_lock("busy-session", "candidate") is False
+    finally:
+        blocker.rollback()
+        blocker.close()
+
+    assert len(sleeps) > 1
+    assert sum(sleeps) == pytest.approx(patience_s)
+
+
+def test_acquire_non_busy_sqlite_error_fails_without_retry(
+    db: SessionDB, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls = 0
+
+    def fail_write(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise sqlite3.DatabaseError("database disk image is malformed")
+
+    monkeypatch.setattr(db, "_execute_write", fail_write)
+    monkeypatch.setattr(
+        hermes_state.random,
+        "uniform",
+        lambda *_args: pytest.fail("non-busy failures must not jitter-retry"),
+    )
+
+    with pytest.raises(sqlite3.DatabaseError, match="disk image is malformed"):
+        db.try_acquire_compression_lock("broken-session", "candidate")
+
+    assert calls == 1
 
 
 

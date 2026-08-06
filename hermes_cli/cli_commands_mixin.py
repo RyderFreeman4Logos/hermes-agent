@@ -2044,7 +2044,7 @@ class CLICommandsMixin:
                     session_db=self._session_db,
                     reasoning_config=self.reasoning_config,
                     service_tier=self.service_tier,
-                    request_overrides=turn_route.get("request_overrides"),
+                    fast_mode_overrides=turn_route.get("request_overrides"),
                     providers_allowed=self._providers_only,
                     providers_ignored=self._providers_ignore,
                     providers_order=self._providers_order,

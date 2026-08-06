@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import sqlite3
+import time
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -12,7 +14,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from hermes_cli.sqlite_util import write_txn
 from hermes_constants import get_hermes_home
 from utils import atomic_json_write
 
@@ -28,7 +29,8 @@ from .shared_metrics_contract import (
 _PACKAGE_SCHEMA_VERSION = "hermes.shared_metrics.v2"
 _STORE_SCHEMA_VERSION = "2"
 _BUSY_TIMEOUT_MS = 250
-_SCHEMA_BUSY_TIMEOUT_MS = 5_000
+_WRITE_BUSY_BUDGET_S = 1.5
+_SCHEMA_BUSY_BUDGET_S = 5.0
 _LOCAL_HISTORY_RETENTION_DAYS = 30
 _ACTIVE_INSTALL_STATE_KEY = "client_active_recorded_at"
 _ACTIVE_INSTALL_INTERVAL = timedelta(hours=24)
@@ -74,7 +76,7 @@ class SharedMetricsStore:
         self._validate_counter(CLIENT_ACTIVE_METRIC, dimensions, resource)
         now = _utc_now()
         with self._connection() as connection:
-            with write_txn(connection):
+            with self._write_transaction(connection):
                 row = connection.execute(
                     "SELECT value FROM telemetry_state WHERE key = ?",
                     (_ACTIVE_INSTALL_STATE_KEY,),
@@ -126,13 +128,14 @@ class SharedMetricsStore:
         """Increment one allowlisted counter for the current UTC day."""
         self._validate_counter(metric_name, dimensions, resource)
         with self._connection() as connection:
-            self._record_counter_in_transaction(
-                connection,
-                metric_name,
-                dimensions,
-                resource,
-                period_start=_utc_now().date().isoformat(),
-            )
+            with self._write_transaction(connection):
+                self._record_counter_in_transaction(
+                    connection,
+                    metric_name,
+                    dimensions,
+                    resource,
+                    period_start=_utc_now().date().isoformat(),
+                )
 
     @staticmethod
     def _validate_counter(
@@ -281,6 +284,79 @@ class SharedMetricsStore:
         finally:
             connection.close()
 
+    @contextmanager
+    def _write_transaction(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        retry_budget_s: float | None = None,
+    ) -> Iterator[sqlite3.Connection]:
+        budget = _WRITE_BUSY_BUDGET_S if retry_budget_s is None else retry_budget_s
+        try:
+            deadline = time.monotonic() + budget
+            self._run_write_boundary(connection, "BEGIN IMMEDIATE", deadline)
+            try:
+                yield connection
+            except Exception:
+                self._rollback(connection)
+                raise
+            try:
+                self._run_write_boundary(connection, "COMMIT", deadline)
+            except Exception:
+                self._rollback(connection)
+                raise
+        finally:
+            try:
+                connection.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS}")
+            except sqlite3.Error:
+                pass
+
+    @staticmethod
+    def _run_write_boundary(
+        connection: sqlite3.Connection,
+        statement: str,
+        deadline: float,
+    ) -> None:
+        while True:
+            remaining_s = max(0.0, deadline - time.monotonic())
+            busy_timeout_ms = min(
+                _BUSY_TIMEOUT_MS,
+                int(remaining_s * 1000),
+            )
+            connection.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+            try:
+                connection.execute(statement)
+                return
+            except sqlite3.OperationalError as exc:
+                if not SharedMetricsStore._is_write_contention(exc):
+                    raise
+                remaining_s = deadline - time.monotonic()
+                if remaining_s <= 0:
+                    raise
+                time.sleep(min(random.uniform(0.02, 0.1), remaining_s))
+
+    @staticmethod
+    def _is_write_contention(exc: sqlite3.OperationalError) -> bool:
+        error_code = getattr(exc, "sqlite_errorcode", None)
+        if isinstance(error_code, int) and error_code & 0xFF in {
+            sqlite3.SQLITE_BUSY,
+            sqlite3.SQLITE_LOCKED,
+        }:
+            return True
+        message = str(exc).lower()
+        return message == "database is locked" or message.startswith((
+            "database table is locked",
+            "database schema is locked",
+            "database is busy",
+        ))
+
+    @staticmethod
+    def _rollback(connection: sqlite3.Connection) -> None:
+        try:
+            connection.execute("ROLLBACK")
+        except sqlite3.OperationalError:
+            pass
+
     @staticmethod
     def _ensure_private_directory(path: Path) -> None:
         path.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -298,9 +374,12 @@ class SharedMetricsStore:
             pass
 
     def _ensure_schema(self) -> None:
-        with self._connection(busy_timeout_ms=_SCHEMA_BUSY_TIMEOUT_MS) as connection:
+        with self._connection() as connection:
             # Serialize first-run creation and upgrades across Hermes processes.
-            with write_txn(connection):
+            with self._write_transaction(
+                connection,
+                retry_budget_s=_SCHEMA_BUSY_BUDGET_S,
+            ):
                 self._ensure_schema_in_transaction(connection)
 
     @staticmethod
@@ -463,7 +542,7 @@ class SharedMetricsStore:
     def _create_pending_packages_if_due(self) -> None:
         now = _utc_now()
         with self._connection() as connection:
-            with write_txn(connection):
+            with self._write_transaction(connection):
                 # Gate on the committed package, not its file write, so a failed
                 # outbox export can be retried without packaging deltas twice.
                 package_created_today = connection.execute(
@@ -483,7 +562,7 @@ class SharedMetricsStore:
     def _create_package(self) -> dict[str, Any] | None:
         now = _utc_now()
         with self._connection() as connection:
-            with write_txn(connection):
+            with self._write_transaction(connection):
                 return self._create_package_in_transaction(connection, now)
 
     def _create_package_in_transaction(
@@ -643,14 +722,15 @@ class SharedMetricsStore:
                 mode=0o600,
             )
             with self._connection() as connection:
-                connection.execute(
-                    """
-                    UPDATE package_outbox
-                    SET exported_at = ?
-                    WHERE package_id = ? AND exported_at IS NULL
-                    """,
-                    (_isoformat(_utc_now()), package_id),
-                )
+                with self._write_transaction(connection):
+                    connection.execute(
+                        """
+                        UPDATE package_outbox
+                        SET exported_at = ?
+                        WHERE package_id = ? AND exported_at IS NULL
+                        """,
+                        (_isoformat(_utc_now()), package_id),
+                    )
             exported.append(path)
         return exported
 
@@ -690,7 +770,7 @@ class SharedMetricsStore:
             removable_package_ids.append(package_id)
 
         with self._connection() as connection:
-            with write_txn(connection):
+            with self._write_transaction(connection):
                 for package_id in removable_package_ids:
                     connection.execute(
                         """

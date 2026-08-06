@@ -69,11 +69,25 @@ _executor_lock = threading.Lock()
 _executor_max_workers: int = 0
 
 _records_lock = threading.Lock()
+_admission_condition = threading.Condition(_records_lock)
+_admission_cap = 0
+# Accepted records that have not yet left the admission backlog. Keep this
+# separate from record status so a cancelled queued future still occupies its
+# bounded slot until the executor drains it.
+_pending_admission_ids: set[str] = set()
 # delegation_id -> record dict. Kept for the lifetime of the run plus a short
 # tail after completion so `list_async_delegations()` can show recent results.
 _records: Dict[str, Dict[str, Any]] = {}
 
+_ACTIVE_STATUSES = frozenset(
+    {"queued", "running", "stalling", "cancelling", "finalizing"}
+)
+
 _DEFAULT_MAX_ASYNC_CHILDREN = 3
+_BACKLOG_FULL_ERROR = (
+    "Async delegation capacity reached: the process-wide background backlog is full. "
+    "Wait for queued work to start before dispatching more."
+)
 # How many completed records to retain for status queries before pruning.
 _MAX_RETAINED_COMPLETED = 50
 _DURABLE_RETENTION_SECONDS = 7 * 24 * 60 * 60
@@ -520,7 +534,7 @@ def _get_executor(max_workers: int) -> ThreadPoolExecutor:
     cap grows between calls we rebuild a larger pool. Existing in-flight
     futures keep running on the old pool until it's garbage collected.
     """
-    global _executor, _executor_max_workers
+    global _admission_cap, _executor, _executor_max_workers
     with _executor_lock:
         if _executor is None or max_workers > _executor_max_workers:
             # Daemon threads: thread_name_prefix aids debugging in stack dumps.
@@ -529,11 +543,65 @@ def _get_executor(max_workers: int) -> ThreadPoolExecutor:
                 thread_name_prefix="async-delegate",
             )
             _executor_max_workers = max_workers
+        with _admission_condition:
+            _admission_cap = max_workers
+            _admission_condition.notify_all()
         return _executor
 
 
+def _admit_worker(delegation_id: str) -> bool:
+    """Wait off-thread until this queued record owns a process-wide slot."""
+    with _admission_condition:
+        while True:
+            record = _records.get(delegation_id)
+            if record is None or record.get("status") != "queued":
+                _pending_admission_ids.discard(delegation_id)
+                return False
+            running = sum(
+                1
+                for current in _records.values()
+                if current.get("status") in ("running", "stalling")
+            )
+            if running < _admission_cap:
+                _pending_admission_ids.discard(delegation_id)
+                record["status"] = "running"
+                record["_progress_ts"] = time.time()
+                # The runner owns cleanup from this point onward.
+                record.pop("_on_not_started", None)
+                return True
+            _admission_condition.wait()
+
+
+def _try_register_queued(record: Dict[str, Any]) -> bool:
+    """Atomically reserve and durably register one backlog slot for ``record``."""
+    delegation_id = record["delegation_id"]
+    with _records_lock:
+        running = sum(
+            1
+            for current in _records.values()
+            if current.get("status") in ("running", "stalling")
+        )
+        available_runner_slots = max(0, _admission_cap - running)
+        if len(_pending_admission_ids) >= _admission_cap + available_runner_slots:
+            return False
+        _persist_dispatch(record)
+        _pending_admission_ids.add(delegation_id)
+        _records[delegation_id] = record
+        return True
+
+
+def _invoke_not_started(callback: Optional[Callable[[str], None]], status: str) -> None:
+    """Finalize caller-owned resources when no runner took ownership."""
+    if not callable(callback):
+        return
+    try:
+        callback(status)
+    except Exception:
+        logger.exception("Async delegation pre-admission finalization failed")
+
+
 def active_count() -> int:
-    """Number of async delegation UNITS currently running.
+    """Number of queued or running async delegation units.
 
     A unit is one dispatch: a single subagent OR a whole fan-out batch. A batch
     counts as ONE here because it occupies one async-pool slot (the capacity
@@ -544,7 +612,7 @@ def active_count() -> int:
     with _records_lock:
         return sum(
             1 for r in _records.values()
-            if r.get("status") in {"running", "stalling", "finalizing"}
+            if r.get("status") in _ACTIVE_STATUSES
         )
 
 
@@ -636,7 +704,7 @@ def _prune_completed_locked() -> None:
     completed = [
         (rid, r)
         for rid, r in _records.items()
-        if r.get("status") != "running"
+        if r.get("status") not in _ACTIVE_STATUSES
     ]
     if len(completed) <= _MAX_RETAINED_COMPLETED:
         return
@@ -687,6 +755,7 @@ def dispatch_async_delegation(
     origin_ui_session_id: str = "",
     origin_session_id: str = "",
     interrupt_fn: Optional[Callable[[], None]] = None,
+    on_not_started: Optional[Callable[[str], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     progress_fn: Optional[Callable[[], tuple]] = None,
 ) -> Dict[str, Any]:
@@ -713,6 +782,10 @@ def dispatch_async_delegation(
     interrupt_fn
         Optional callable to signal the child to stop (used on shutdown /
         explicit cancel).
+    on_not_started
+        Optional callable invoked exactly once with the terminal status when
+        registration, submission, or queued cancellation ends the delegation
+        before its runner owns cleanup.
     progress_fn
         Optional zero-arg callable returning ``(token, in_tool)`` where
         ``token`` is any comparable snapshot of the child's progress (api
@@ -722,15 +795,13 @@ def dispatch_async_delegation(
         stale-detection block at the top of this module). When omitted, the
         delegation is not monitored.
     max_async_children
-        Concurrency cap. When at capacity the dispatch is REJECTED (the caller
-        should fall back to sync or tell the user) rather than queued, so a
-        runaway model can't pile up unbounded background work.
+        Maximum number of runners admitted at once and queued registrations
+        retained process-wide. Excess registrations are rejected immediately.
 
     Returns
     -------
     dict
-        ``{"status": "dispatched", "delegation_id": ...}`` on success, or
-        ``{"status": "rejected", "error": ...}`` when at capacity.
+        ``{"status": "dispatched", "delegation_id": ...}`` on success.
     """
     delegation_id = _new_delegation_id()
     dispatched_at = time.time()
@@ -745,41 +816,30 @@ def dispatch_async_delegation(
         "origin_ui_session_id": origin_ui_session_id,
         "origin_session_id": origin_session_id,
         "parent_session_id": parent_session_id,
-        "status": "running",
+        "status": "queued",
         "dispatched_at": dispatched_at,
         "completed_at": None,
         "interrupt_fn": interrupt_fn,
+        "_on_not_started": on_not_started,
         "progress_fn": progress_fn,
         # Stale-monitor bookkeeping (see _stale_monitor_loop).
         "_progress_token": None,
         "_progress_ts": dispatched_at,
         "_interrupted_at": None,
     }
-    # Capacity check and record insert under ONE lock hold — checking
-    # active_count() separately would let two concurrent dispatches (e.g.
-    # from different gateway sessions) both pass the check and exceed the cap.
-    with _records_lock:
-        running = sum(
-            1 for r in _records.values()
-            if r.get("status") in ("running", "stalling")
-        )
-        if running >= max_async_children:
-            return {
-                "status": "rejected",
-                "error": (
-                    f"Async delegation capacity reached ({max_async_children} "
-                    f"running). Wait for one to finish (its result will re-enter "
-                    f"the chat), or run this task synchronously "
-                    f"(background=false). Raise delegation.max_concurrent_children in "
-                    f"config.yaml to allow more concurrent background subagents."
-                ),
-            }
-        _records[delegation_id] = record
-
-    _persist_dispatch(record)
     executor = _get_executor(max_async_children)
+    if not _try_register_queued(record):
+        _invoke_not_started(on_not_started, "error")
+        return {
+            "status": "rejected",
+            "error": _BACKLOG_FULL_ERROR,
+        }
 
     def _worker() -> None:
+        if not _admit_worker(delegation_id):
+            return
+        if progress_fn is not None:
+            _ensure_stale_monitor()
         result: Dict[str, Any] = {}
         status = "error"
         try:
@@ -805,14 +865,13 @@ def dispatch_async_delegation(
     except Exception as exc:  # pragma: no cover — pool submit failure is rare
         with _records_lock:
             _records.pop(delegation_id, None)
+            _pending_admission_ids.discard(delegation_id)
         _delete_durable_delegation(delegation_id)
+        _invoke_not_started(on_not_started, "error")
         return {
             "status": "rejected",
             "error": f"Failed to schedule async delegation: {exc}",
         }
-    if progress_fn is not None:
-        _ensure_stale_monitor()
-
     logger.info(
         "Dispatched async delegation %s (session_key=%s): %s",
         delegation_id, session_key or "<cli>", (goal or "")[:80],
@@ -825,19 +884,31 @@ def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
     claimed = _begin_finalization(delegation_id)
     if claimed is None:
         return
-    event_record, _interrupt_fn = claimed
+    event_record, _interrupt_fn, on_not_started = claimed
 
+    _invoke_not_started(on_not_started, status)
     _push_completion_event(event_record, result, status)
     _finish_finalization(delegation_id, status)
 
 
 def _begin_finalization(
     delegation_id: str,
-) -> Optional[tuple[Dict[str, Any], Optional[Callable[[], None]]]]:
+) -> Optional[
+    tuple[
+        Dict[str, Any],
+        Optional[Callable[[], None]],
+        Optional[Callable[[str], None]],
+    ]
+]:
     """Atomically claim terminal delivery while keeping the record active."""
     with _records_lock:
         record = _records.get(delegation_id)
-        if record is None or record.get("status") not in ("running", "stalling"):
+        if record is None or record.get("status") not in (
+            "queued",
+            "running",
+            "stalling",
+            "cancelling",
+        ):
             return
         # Stay active until durable persistence and queue publication finish;
         # otherwise process shutdown can kill this daemon worker in the narrow
@@ -847,9 +918,11 @@ def _begin_finalization(
         interrupt_fn = record.get("interrupt_fn")
         record["interrupt_fn"] = None  # drop the closure; child is done
         record["progress_fn"] = None  # stop stale-monitor sampling
+        on_not_started = record.pop("_on_not_started", None)
         event_record = dict(record)
+        _admission_condition.notify_all()
 
-    return event_record, interrupt_fn
+    return event_record, interrupt_fn, on_not_started
 
 
 def _finish_finalization(delegation_id: str, status: str) -> None:
@@ -942,6 +1015,7 @@ def dispatch_async_delegation_batch(
     origin_ui_session_id: str = "",
     origin_session_id: str = "",
     interrupt_fn: Optional[Callable[[], None]] = None,
+    on_not_started: Optional[Callable[[str], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     delegation_id: Optional[str] = None,
     progress_fn: Optional[Callable[[], tuple]] = None,
@@ -962,9 +1036,10 @@ def dispatch_async_delegation_batch(
     as one message once every child is done — the chat is never blocked while
     they run.
 
-    Returns ``{"status": "dispatched", "delegation_id": ...}`` on success or
-    ``{"status": "rejected", "error": ...}`` when the async pool is at
-    capacity.
+    Returns ``{"status": "dispatched", "delegation_id": ...}`` after the
+    batch is registered. Excess process-wide backlog is rejected immediately;
+    runner admission remains off the foreground thread. If no runner takes
+    ownership, ``on_not_started`` receives the terminal status exactly once.
     """
     delegation_id = delegation_id or _new_delegation_id()
     dispatched_at = time.time()
@@ -985,37 +1060,30 @@ def dispatch_async_delegation_batch(
         "origin_ui_session_id": origin_ui_session_id,
         "origin_session_id": origin_session_id,
         "parent_session_id": parent_session_id,
-        "status": "running",
+        "status": "queued",
         "dispatched_at": dispatched_at,
         "completed_at": None,
         "interrupt_fn": interrupt_fn,
+        "_on_not_started": on_not_started,
         "is_batch": True,
         "progress_fn": progress_fn,
         "_progress_token": None,
         "_progress_ts": dispatched_at,
         "_interrupted_at": None,
     }
-    with _records_lock:
-        running = sum(
-            1 for r in _records.values()
-            if r.get("status") in ("running", "stalling")
-        )
-        if running >= max_async_children:
-            return {
-                "status": "rejected",
-                "error": (
-                    f"Async delegation capacity reached ({max_async_children} "
-                    f"running). Wait for one to finish (its result will re-enter "
-                    f"the chat), or raise delegation.max_concurrent_children in "
-                    f"config.yaml to allow more concurrent background units."
-                ),
-            }
-        _records[delegation_id] = record
-
-    _persist_dispatch(record)
     executor = _get_executor(max_async_children)
+    if not _try_register_queued(record):
+        _invoke_not_started(on_not_started, "error")
+        return {
+            "status": "rejected",
+            "error": _BACKLOG_FULL_ERROR,
+        }
 
     def _worker() -> None:
+        if not _admit_worker(delegation_id):
+            return
+        if progress_fn is not None:
+            _ensure_stale_monitor()
         combined: Dict[str, Any] = {}
         status = "error"
         try:
@@ -1046,14 +1114,13 @@ def dispatch_async_delegation_batch(
     except Exception as exc:  # pragma: no cover
         with _records_lock:
             _records.pop(delegation_id, None)
+            _pending_admission_ids.discard(delegation_id)
         _delete_durable_delegation(delegation_id)
+        _invoke_not_started(on_not_started, "error")
         return {
             "status": "rejected",
             "error": f"Failed to schedule async delegation batch: {exc}",
         }
-    if progress_fn is not None:
-        _ensure_stale_monitor()
-
     logger.info(
         "Dispatched async delegation batch %s (%d task(s), session_key=%s)",
         delegation_id, n, session_key or "<cli>",
@@ -1068,8 +1135,9 @@ def _finalize_batch(
     claimed = _begin_finalization(delegation_id)
     if claimed is None:
         return
-    event_record, _interrupt_fn = claimed
+    event_record, _interrupt_fn, on_not_started = claimed
 
+    _invoke_not_started(on_not_started, status)
     _push_batch_completion_event(event_record, combined, status)
     _finish_finalization(delegation_id, status)
 
@@ -1255,7 +1323,8 @@ def _finalize_stalled(delegation_id: str) -> None:
     claimed = _begin_finalization(delegation_id)
     if claimed is None:
         return
-    event_record, _interrupt_fn = claimed
+    event_record, _interrupt_fn, on_not_started = claimed
+    _invoke_not_started(on_not_started, "stalled")
 
     completed_at = event_record.get("completed_at") or time.time()
     duration = round(
@@ -1412,7 +1481,7 @@ def list_async_delegations() -> List[Dict[str, Any]]:
 
 
 def interrupt_all(reason: str = "shutdown") -> int:
-    """Signal every running async delegation to stop. Returns how many.
+    """Cancel every queued or running async delegation. Returns how many.
 
     Used on ``/stop`` and gateway shutdown so a dangling background subagent
     can't keep burning tokens with no one listening. The child still emits a
@@ -1421,23 +1490,70 @@ def interrupt_all(reason: str = "shutdown") -> int:
     count = 0
     with _records_lock:
         targets = [
-            r for r in _records.values()
-            if r.get("status") in ("running", "stalling")
+            r["delegation_id"] for r in _records.values()
+            if r.get("status") in ("queued", "running", "stalling")
         ]
-    for r in targets:
-        fn = r.get("interrupt_fn")
-        if callable(fn):
-            try:
-                fn()
-                count += 1
-            except Exception as exc:
-                logger.debug(
-                    "interrupt_all: %s interrupt failed: %s",
-                    r.get("delegation_id"), exc,
-                )
+        targets.sort(key=lambda delegation_id: _records[delegation_id]["status"] != "queued")
+    for delegation_id in targets:
+        count += int(_interrupt_record(delegation_id, reason))
     if count:
         logger.info("Interrupted %d async delegation(s) (%s)", count, reason)
     return count
+
+
+def _interrupt_record(delegation_id: str, reason: str) -> bool:
+    """Interrupt a running unit or finalize a queued unit without starting it."""
+    with _records_lock:
+        record = _records.get(delegation_id)
+        if record is None or record.get("status") not in (
+            "queued",
+            "running",
+            "stalling",
+        ):
+            return False
+        queued = record.get("status") == "queued"
+        if queued:
+            record["status"] = "cancelling"
+            _admission_condition.notify_all()
+        interrupt_fn = record.get("interrupt_fn")
+        is_batch = bool(record.get("is_batch"))
+
+    if callable(interrupt_fn):
+        try:
+            interrupt_fn()
+        except Exception as exc:
+            logger.debug(
+                "interrupt %s failed for async delegation %s: %s",
+                reason,
+                delegation_id,
+                exc,
+            )
+            if not queued:
+                return False
+    elif not queued:
+        return False
+
+    if queued:
+        error = f"Async delegation cancelled before worker admission ({reason})."
+        if is_batch:
+            _finalize_batch(
+                delegation_id,
+                {"results": [], "error": error, "total_duration_seconds": 0},
+                "interrupted",
+            )
+        else:
+            _finalize(
+                delegation_id,
+                {
+                    "status": "interrupted",
+                    "summary": None,
+                    "error": error,
+                    "api_calls": 0,
+                    "duration_seconds": 0,
+                },
+                "interrupted",
+            )
+    return True
 
 
 def interrupt_for_session(
@@ -1446,7 +1562,7 @@ def interrupt_for_session(
     parent_session_id: str = "",
     reason: str = "session_end",
 ) -> int:
-    """Signal running async delegations owned by ONE session to stop.
+    """Cancel queued or running async delegations owned by ONE session.
 
     A delegation's lifecycle is bound to the session that spawned it: when
     that session ends, its in-flight background subagents must end with it —
@@ -1469,8 +1585,8 @@ def interrupt_for_session(
     count = 0
     with _records_lock:
         targets = [
-            r for r in _records.values()
-            if r.get("status") in ("running", "stalling")
+            r["delegation_id"] for r in _records.values()
+            if r.get("status") in ("queued", "running", "stalling")
             and _matches_session_selectors(
                 r,
                 session_key=session_key,
@@ -1478,17 +1594,9 @@ def interrupt_for_session(
                 parent_session_id=parent_session_id,
             )
         ]
-    for r in targets:
-        fn = r.get("interrupt_fn")
-        if callable(fn):
-            try:
-                fn()
-                count += 1
-            except Exception as exc:
-                logger.debug(
-                    "interrupt_for_session: %s interrupt failed: %s",
-                    r.get("delegation_id"), exc,
-                )
+        targets.sort(key=lambda delegation_id: _records[delegation_id]["status"] != "queued")
+    for delegation_id in targets:
+        count += int(_interrupt_record(delegation_id, reason))
     if count:
         logger.info(
             "Interrupted %d async delegation(s) for ending session (%s)",
@@ -1499,10 +1607,10 @@ def interrupt_for_session(
 
 def _reset_for_tests() -> None:
     """Test-only: clear all state and tear down the executor + monitor."""
-    global _executor, _executor_max_workers, _monitor_thread
+    global _admission_cap, _executor, _executor_max_workers, _monitor_thread
     with _executor_lock:
         if _executor is not None:
-            _executor.shutdown(wait=False)
+            _executor.shutdown(wait=False, cancel_futures=True)
         _executor = None
         _executor_max_workers = 0
     _monitor_stop.set()
@@ -1511,5 +1619,8 @@ def _reset_for_tests() -> None:
         _monitor_thread = None
     if thread is not None and thread.is_alive():
         thread.join(timeout=2)
-    with _records_lock:
+    with _admission_condition:
         _records.clear()
+        _pending_admission_ids.clear()
+        _admission_cap = 0
+        _admission_condition.notify_all()

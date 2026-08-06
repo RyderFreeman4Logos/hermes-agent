@@ -4286,11 +4286,11 @@ class TestSynchronousFallbackCachePlans:
         client.chat.completions.create.return_value = _DummyResponse()
         resolved_calls = []
 
-        def resolve(provider, model=None, **kwargs):
+        def get_cached_client(provider, model=None, **kwargs):
             resolved_calls.append((provider, model, kwargs))
             return client, model
 
-        monkeypatch.setattr("agent.auxiliary_client.resolve_provider_client", resolve)
+        monkeypatch.setattr("agent.auxiliary_client._get_cached_client", get_cached_client)
         monkeypatch.setattr(
             "agent.auxiliary_client._get_auxiliary_task_config",
             lambda task: {"fallback_chain": [entry]},
@@ -4336,8 +4336,8 @@ class TestSynchronousFallbackCachePlans:
             "anthropic",
             "claude-sonnet-4-6",
             {
-                "explicit_base_url": "https://api.anthropic.com",
-                "explicit_api_key": None,
+                "base_url": "https://api.anthropic.com",
+                "api_key": None,
                 "api_mode": "anthropic_messages",
             },
         )]
@@ -4353,7 +4353,7 @@ class TestSynchronousFallbackCachePlans:
             "api_mode": "anthropic_messages",
         })
 
-        assert resolved_calls[0][2]["explicit_base_url"] == "https://api.minimax.io/anthropic"
+        assert resolved_calls[0][2]["base_url"] == "https://api.minimax.io/anthropic"
         assert resolved_calls[0][2]["api_mode"] == "anthropic_messages"
         wire_request = client.chat.completions.create.call_args.kwargs
         assert "cache_control" not in wire_request["tools"][-1]
@@ -4389,7 +4389,7 @@ class TestAsynchronousFallbackCachePlans:
 
         client.chat.completions.create = MagicMock(side_effect=_create)
         monkeypatch.setattr(
-            "agent.auxiliary_client.resolve_provider_client",
+            "agent.auxiliary_client._get_cached_client",
             lambda provider, model=None, **kwargs: (client, model),
         )
         monkeypatch.setattr(

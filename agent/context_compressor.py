@@ -182,6 +182,77 @@ MAX_ITERATIONS_SUMMARY_REQUEST = (
 _BACKGROUND_PROCESS_NOTIFICATION_PREFIX = "[IMPORTANT: Background process "
 
 
+def _pending_completion_suffix(messages: Any) -> List[Dict[str, Any]]:
+    """Return the live-only completion suffix without copying its messages."""
+    start = completion_delivery_suffix_start(messages)
+    if start is None:
+        return []
+    return list(messages[start:])
+
+
+def _same_persisted_completion_row(
+    durable_message: Any,
+    live_message: Any,
+) -> bool:
+    """Compare one persisted completion row without process-local metadata."""
+    if not isinstance(durable_message, dict) or not isinstance(live_message, dict):
+        return False
+    ignored = {
+        "timestamp",
+        _DB_PERSISTED_MARKER,
+        "_completion_delivery_active",
+    }
+    return {
+        key: value
+        for key, value in durable_message.items()
+        if key not in ignored
+    } == {
+        key: value
+        for key, value in live_message.items()
+        if key not in ignored
+    }
+
+
+def _capture_durable_compaction_view(
+    session_db: Any,
+    session_id: str,
+    live_messages: Any,
+) -> tuple[List[tuple], List[Dict[str, Any]]]:
+    """Capture one exact durable generation plus the live-only suffix."""
+    snapshot = getattr(type(session_db), "get_compaction_snapshot", None)
+    if not callable(snapshot):
+        raise RuntimeError("durable compaction snapshot is unavailable")
+    fingerprint, durable = snapshot(session_db, session_id)
+    if not isinstance(fingerprint, list) or not isinstance(durable, list):
+        raise RuntimeError("invalid durable compaction snapshot")
+    pending = _pending_completion_suffix(live_messages)
+    if not pending:
+        return fingerprint, [*durable]
+    if not pending[0].get("_completion_delivery_active"):
+        return fingerprint, [*durable, *pending]
+
+    persisted_prefix_length = 0
+    for message in pending:
+        if not isinstance(message, dict) or not message.get(_DB_PERSISTED_MARKER):
+            break
+        persisted_prefix_length += 1
+    if (
+        persisted_prefix_length == 0
+        or persisted_prefix_length > len(durable)
+        or any(
+            not _same_persisted_completion_row(durable_message, live_message)
+            for durable_message, live_message in zip(
+                durable[-persisted_prefix_length:],
+                pending[:persisted_prefix_length],
+            )
+        )
+    ):
+        raise RuntimeError(
+            "active completion delivery does not match durable transcript tail"
+        )
+    return fingerprint, [*durable[:-persisted_prefix_length], *pending]
+
+
 def _fresh_compaction_message_copy(msg: Dict[str, Any]) -> Dict[str, Any]:
     """Copy a message for compaction assembly without persistence markers.
 

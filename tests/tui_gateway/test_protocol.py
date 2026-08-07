@@ -2,15 +2,18 @@
 
 import io
 import json
+import subprocess
 import sys
 import threading
 import time
 import types
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 _original_stdout = sys.stdout
+_TEST_HERMES_HOME = Path("/tmp/hermes_test")
 
 
 @pytest.fixture(autouse=True)
@@ -28,7 +31,9 @@ def server():
     # (a fixed shared path) forever, leaking active-session registry entries
     # across every later test in the process. Scope the patch to the import.
     with patch.dict("sys.modules", {
-        "hermes_constants": MagicMock(get_hermes_home=MagicMock(return_value="/tmp/hermes_test")),
+        "hermes_constants": MagicMock(
+            get_hermes_home=MagicMock(return_value=_TEST_HERMES_HOME)
+        ),
         "hermes_cli.env_loader": MagicMock(),
         "hermes_cli.banner": MagicMock(),
         "hermes_state": MagicMock(),
@@ -56,6 +61,32 @@ def server():
     mod._pending.clear()
     mod._answers.clear()
     mod._live_transports.clear()
+
+
+def test_server_fixture_home_supports_cold_path_import():
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import importlib
+from unittest.mock import MagicMock, patch
+from tests.tui_gateway.test_protocol import _TEST_HERMES_HOME
+
+with patch.dict("sys.modules", {
+    "hermes_constants": MagicMock(
+        get_hermes_home=MagicMock(return_value=_TEST_HERMES_HOME)
+    ),
+}):
+    importlib.import_module("tools.environments.singularity")
+""",
+        ],
+        cwd=Path(__file__).resolve().parents[2],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_shared_fixture_cleanup_uses_full_session_teardown(server, monkeypatch):
@@ -663,5 +694,3 @@ def test_unregister_live_transport_stops_delivery(capture):
     assert a.frames == []
     # No live transports left → fell back to stdio.
     assert json.loads(buf.getvalue())["params"]["type"] == "skin.changed"
-
-

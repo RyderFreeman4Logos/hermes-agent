@@ -611,8 +611,8 @@ export function StatusRule({
       : ''
 
   const showBar = !!bar && fits(SEP + stringWidth(`[${bar}] ${pct != null ? `${pct}%` : ''}`))
-  const showHeartbeat = !!heartbeatText && fits(SEP + stringWidth(heartbeatText))
   const showDuration = segs.duration && !!sessionStartedAt && fits(SEP + MAX_DURATION_WIDTH)
+  const showHeartbeat = !!heartbeatText && fits(SEP + stringWidth(heartbeatText))
 
   // Idle clock — time since the last final agent response. Hidden while busy
   // (the FaceTicker's elapsed tail covers the live turn) and before the first

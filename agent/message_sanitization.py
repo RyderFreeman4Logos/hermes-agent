@@ -163,18 +163,30 @@ def drop_uncommitted_completion_delivery_suffix(
 
 
 def durable_messages_before_pending_completion(messages: Any) -> Any:
-    """Return the durable view before the newest pending completion event.
+    """Return rows safe to durably write before an outcome-dependent suffix.
 
     The returned object is the original list when no barrier exists and a
     shallow prefix copy when it does.  Live messages are never mutated.  Every
-    full-transcript writer/rewrite must use this view so assistant/tool rows
+    full-transcript writer/rewrite must use this view so new assistant/tool rows
     after an outcome-dependent completion event cannot be orphaned durably.
+
+    An active completion may already have persisted its event and tool intent
+    before executing the tool.  Preserve that contiguous persisted prefix so a
+    compaction rewrite cannot erase the rows its finalizer must compare-and-set.
     """
     if not isinstance(messages, list):
         return messages
     start = completion_delivery_suffix_start(messages)
     if start is not None:
-        return messages[:start]
+        end = start
+        if messages[start].get("_completion_delivery_active"):
+            while (
+                end < len(messages)
+                and isinstance(messages[end], dict)
+                and messages[end].get("_db_persisted")
+            ):
+                end += 1
+        return messages[:end]
     return messages
 
 

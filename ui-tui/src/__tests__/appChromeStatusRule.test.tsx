@@ -247,6 +247,16 @@ describe('StatusRule runtime heartbeat cadence', () => {
     expect(runtimeHeartbeatLabel(runtimeHeartbeat, 1_700_000_043_000)).toBe('→checkin 43s/1700s +1')
   })
 
+  it('resets elapsed when the backend publishes a new cadence origin', () => {
+    const rearmed = {
+      ...runtimeHeartbeat,
+      targets: [{ ...runtimeHeartbeat.targets[0], started_at: 1_700_000_042 }]
+    }
+
+    expect(runtimeHeartbeatLabel(runtimeHeartbeat, 1_700_000_042_000)).toBe('→checkin 42s/1700s +1')
+    expect(runtimeHeartbeatLabel(rearmed, 1_700_000_042_000)).toBe('→checkin 0s/1700s +1')
+  })
+
   it('renders one footer segment for all active targets', () => {
     const element = StatusRule({
       ...baseProps,

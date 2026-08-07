@@ -284,6 +284,37 @@ describe('StatusRule runtime heartbeat cadence', () => {
     }
   )
 
+  it.each([77, 78, 79, 80, 81, 82, 83, 84, 85, 86])(
+    'does not displace cache or idle stop time at %i columns',
+    cols => {
+      const narrowHeartbeat = {
+        active_count: 1,
+        targets: [
+          {
+            ...runtimeHeartbeat.targets[0],
+            started_at: Date.now() / 1000 - 42
+          }
+        ]
+      }
+      const common = {
+        ...baseProps,
+        cols,
+        lastTurnEndedAt: Date.now() - 42_000,
+        sessionStartedAt: null
+      }
+      const withoutHeartbeat = StatusRule(common)
+      const withHeartbeat = StatusRule({
+        ...common,
+        usage: { ...common.usage, runtime_heartbeat: narrowHeartbeat }
+      })
+
+      expect(textContent(withoutHeartbeat)).toContain('25%')
+      expect(textContent(withHeartbeat)).toContain('25%')
+      expect(findComponentByName(withoutHeartbeat, 'IdleSince')).not.toBeNull()
+      expect(findComponentByName(withHeartbeat, 'IdleSince')).not.toBeNull()
+    }
+  )
+
   it('clears the footer when the reconciled snapshot is empty', () => {
     const element = StatusRule({
       ...baseProps,

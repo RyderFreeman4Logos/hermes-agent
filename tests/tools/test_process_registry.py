@@ -201,42 +201,90 @@ class TestGetAndPoll:
         assert result["exit_code"] == 0
 
 
-class TestProcessPollStrike:
+class TestProcessPollThrottle:
     def _install(self, monkeypatch, session):
         from tools import process_registry as process_module
 
         registry = ProcessRegistry()
         registry._running[session.id] = session
         monkeypatch.setattr(process_module, "process_registry", registry)
-        monkeypatch.setattr(
-            process_module, "_get_process_poll_strike_config", lambda: (3, 120)
-        )
+        monkeypatch.setattr(process_module, "_get_process_poll_interval", lambda: 10.0)
         return process_module
 
-    def test_poll_strike_trips_after_three_no_progress_repolls(self, monkeypatch):
+    def test_first_poll_is_allowed_and_sets_next_allowed_at(self, monkeypatch):
         process_module = self._install(monkeypatch, _make_session())
         args = {"action": "poll", "session_id": "proc_test123"}
 
-        replies = [json.loads(process_module._handle_process(args)) for _ in range(4)]
+        monkeypatch.setattr(process_module.time, "monotonic", lambda: 100.0)
+        reply = json.loads(process_module._handle_process(args))
 
-        assert all("error" not in reply for reply in replies[:3])
-        assert "error" in replies[3]
-        assert "notify_on_complete" in replies[3]["error"]
+        assert reply["status"] == "running"
+        assert reply["poll_interval_s"] == 10.0
+        assert reply["next_allowed_at"] == 110.0
 
-    def test_poll_strike_resets_when_output_arrives(self, monkeypatch):
-        session = _make_session()
-        process_module = self._install(monkeypatch, session)
-        args = {"action": "poll", "session_id": session.id}
+    def test_repeated_poll_returns_structured_throttle(self, monkeypatch):
+        process_module = self._install(monkeypatch, _make_session())
+        args = {"action": "poll", "session_id": "proc_test123"}
 
-        for _ in range(3):
-            assert "error" not in json.loads(process_module._handle_process(args))
-        with session._lock:
-            session.output_buffer += "progress\n"
-            session.output_size += len("progress\n")
-        assert "error" not in json.loads(process_module._handle_process(args))
-        for _ in range(2):
-            assert "error" not in json.loads(process_module._handle_process(args))
-        assert "error" in json.loads(process_module._handle_process(args))
+        now = iter((100.0, 105.0))
+        monkeypatch.setattr(process_module.time, "monotonic", lambda: next(now))
+        assert json.loads(process_module._handle_process(args))["status"] == "running"
+        reply = json.loads(process_module._handle_process(args))
+
+        assert reply["error"] == "POLL_THROTTLED"
+        assert reply["code"] == "POLL_THROTTLED"
+        assert reply["session_id"] == "proc_test123"
+        assert reply["next_allowed_at"] == 110.0
+        assert reply["retry_after"] == 5.0
+
+    def test_poll_is_allowed_after_interval_expiry(self, monkeypatch):
+        process_module = self._install(monkeypatch, _make_session())
+        args = {"action": "poll", "session_id": "proc_test123"}
+
+        now = iter((100.0, 110.0))
+        monkeypatch.setattr(process_module.time, "monotonic", lambda: next(now))
+        json.loads(process_module._handle_process(args))
+        reply = json.loads(process_module._handle_process(args))
+
+        assert reply["status"] == "running"
+        assert reply["next_allowed_at"] == 120.0
+
+    def test_unrelated_target_has_independent_poll_window(self, monkeypatch):
+        process_module = self._install(monkeypatch, _make_session())
+        other = _make_session(sid="proc_other")
+        process_module.process_registry._running[other.id] = other
+        now = iter((100.0, 105.0))
+        monkeypatch.setattr(process_module.time, "monotonic", lambda: next(now))
+
+        assert json.loads(process_module._handle_process({
+            "action": "poll", "session_id": "proc_test123"
+        }))["status"] == "running"
+        other_reply = json.loads(process_module._handle_process({
+            "action": "poll", "session_id": "proc_other"
+        }))
+
+        assert other_reply["status"] == "running"
+
+    def test_poll_interval_uses_active_warm_kv_interval(self, monkeypatch):
+        import hermes_cli.config as config_module
+        from tools import process_registry as process_module
+        from tools import runtime_heartbeat
+
+        monkeypatch.setattr(
+            config_module,
+            "load_config_readonly",
+            lambda: {
+                "runtime": {
+                    "warm_kv_timeout": {
+                        "default": 3300,
+                        "providers": {"custom:pm": 1700},
+                    }
+                }
+            },
+        )
+        monkeypatch.setattr(runtime_heartbeat, "get_current_provider", lambda: "custom:pm")
+
+        assert process_module._get_process_poll_interval() == 1700.0
 
     def test_second_poll_of_exited_process_is_a_short_final_note(self, monkeypatch):
         session = _make_session(exited=True, exit_code=0, output="done")
@@ -288,40 +336,6 @@ class TestProcessPollStrike:
         assert second["output_preview"] == "final"
         assert session._poll_terminal_reported
         assert "output_preview" not in third
-
-    def test_poll_strike_only_resets_for_output_in_the_returned_snapshot(self, monkeypatch):
-        session = _make_session(output="partial")
-        session.output_size = len(session.output_buffer)
-        process_module = self._install(monkeypatch, session)
-        registry = process_module.process_registry
-        real_snapshot = registry._poll_snapshot
-        with session._lock:
-            session._poll_last_status = "running"
-            session._poll_last_output_size = session.output_size
-            session._poll_last_at = time.monotonic()
-            session._poll_consecutive_strikes = 1
-
-        def old_snapshot_then_new_output(session_id):
-            snapshot = real_snapshot(session_id)
-            with session._lock:
-                session.output_buffer += "\nnew output"
-                session.output_size = len(session.output_buffer)
-            return snapshot
-
-        monkeypatch.setattr(registry, "_poll_snapshot", old_snapshot_then_new_output)
-        args = {"action": "poll", "session_id": session.id}
-
-        first = json.loads(process_module._handle_process(args))
-
-        assert first["output_preview"] == "partial"
-        assert session._poll_consecutive_strikes == 2
-
-        monkeypatch.setattr(registry, "_poll_snapshot", real_snapshot)
-        second = json.loads(process_module._handle_process(args))
-
-        assert second["output_preview"].endswith("new output")
-        assert session._poll_consecutive_strikes == 0
-
 
 def test_process_poll_strike_config_is_hot_read(monkeypatch):
     import hermes_cli.config as config_module

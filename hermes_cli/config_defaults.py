@@ -31,7 +31,7 @@ DEFAULT_CONFIG = {
     # Warm-KV heartbeats are opt-in and exist only for explicitly managed
     # background targets. Provider intervals have no fallback semantics.
     "runtime": {
-        "warm_kv_timeout": {"providers": {}},
+        "warm_kv_timeout": {"default": 3300, "providers": {}},
         "heartbeat": {"enabled": False, "mode": "per_target"},
     },
     "agent": {

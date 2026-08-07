@@ -155,6 +155,7 @@ class ProcessSession:
     _poll_last_at: float = field(default=0.0, repr=False)
     _poll_consecutive_strikes: int = field(default=0, repr=False)
     _poll_terminal_reported: bool = field(default=False, repr=False)
+    _poll_next_allowed_at: float = field(default=0.0, repr=False)
     _completion_event: threading.Event = field(default_factory=threading.Event, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
@@ -2828,8 +2829,26 @@ def _get_process_poll_strike_config() -> tuple[int, int]:
     return 3, 120
 
 
+def _get_process_poll_interval() -> float:
+    """Resolve a provider-aware warm-KV interval for model-facing polls."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        from tools.runtime_heartbeat import get_current_provider
+
+        runtime = (load_config_readonly() or {}).get("runtime") or {}
+        warm_kv = runtime.get("warm_kv_timeout") or {}
+        providers = warm_kv.get("providers") or {}
+        provider = get_current_provider()
+        interval = providers.get(provider, warm_kv.get("default", 3300))
+        if isinstance(interval, (int, float)) and not isinstance(interval, bool) and interval > 0:
+            return float(interval)
+    except Exception:
+        logger.debug("Could not resolve warm-KV poll interval", exc_info=True)
+    return 3300.0
+
+
 def _reset_process_poll_strikes(session_id: str) -> None:
-    """Break a consecutive model-poll sequence after another process action."""
+    """Allow a deliberate status/output action to start a fresh poll window."""
     session = process_registry.get(session_id)
     if session is None:
         return
@@ -2838,18 +2857,35 @@ def _reset_process_poll_strikes(session_id: str) -> None:
         session._poll_last_output_size = -1
         session._poll_last_at = 0.0
         session._poll_consecutive_strikes = 0
+        session._poll_next_allowed_at = 0.0
 
 
-def _poll_process_for_model(session_id: str) -> tuple[dict, "str | None"]:
-    """Poll once and detect unproductive consecutive model polls."""
-    result, session, exited, output_size = process_registry._poll_snapshot(session_id)
+def _poll_process_for_model(session_id: str) -> tuple[dict, "dict | None"]:
+    """Poll once, throttling repeated reads of a still-running target."""
+    session = process_registry.get(session_id)
+    if session is None:
+        return process_registry._poll_snapshot(session_id)[0], None
+
+    now = time.monotonic()
+    interval = 0.0
+    with session._lock:
+        if not session.exited:
+            if now < session._poll_next_allowed_at:
+                return {}, {
+                    "error": "POLL_THROTTLED",
+                    "code": "POLL_THROTTLED",
+                    "session_id": session.id,
+                    "next_allowed_at": session._poll_next_allowed_at,
+                    "retry_after": max(0.0, session._poll_next_allowed_at - now),
+                }
+            interval = _get_process_poll_interval()
+            session._poll_next_allowed_at = now + interval
+
+    result, session, exited, _ = process_registry._poll_snapshot(session_id)
     if session is None or result.get("status") not in {"running", "exited"}:
         return result, None
-
-    limit, window_s = _get_process_poll_strike_config()
-    now = time.monotonic()
-    with session._lock:
-        if exited:
+    if exited:
+        with session._lock:
             if session._poll_terminal_reported:
                 return {
                     "session_id": session.id,
@@ -2861,25 +2897,10 @@ def _poll_process_for_model(session_id: str) -> tuple[dict, "str | None"]:
                     ),
                 }, None
             session._poll_terminal_reported = True
-            return result, None
+        return result, None
 
-        unchanged = (
-            session._poll_last_status == result["status"]
-            and session._poll_last_output_size == output_size
-            and now - session._poll_last_at <= window_s
-        )
-        session._poll_consecutive_strikes = (
-            session._poll_consecutive_strikes + 1 if unchanged else 0
-        )
-        session._poll_last_status = result["status"]
-        session._poll_last_output_size = output_size
-        session._poll_last_at = now
-        if session._poll_consecutive_strikes >= limit:
-            return result, (
-                f"Process {session.id} has had {limit} consecutive polls with no new output "
-                f"or status change. Stop polling this process. Use notify_on_complete for "
-                "completion, or use list/log sparingly when you need a status or output check."
-            )
+    result["poll_interval_s"] = interval
+    result["next_allowed_at"] = session._poll_next_allowed_at
     return result, None
 
 
@@ -2906,9 +2927,9 @@ def _handle_process(args, **kw):
         if not session_id:
             return tool_error(f"session_id is required for {action}")
         if action == "poll":
-            result, strike_error = _poll_process_for_model(session_id)
-            if strike_error:
-                return tool_error(strike_error, session_id=session_id)
+            result, poll_error = _poll_process_for_model(session_id)
+            if poll_error:
+                return json.dumps(poll_error, ensure_ascii=False)
             return json.dumps(_redact_process_result(result), ensure_ascii=False)
         _reset_process_poll_strikes(session_id)
         if action == "log":

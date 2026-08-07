@@ -4369,6 +4369,18 @@ def test_tui_heartbeat_routes_to_idle_owner_as_silent_turn(
     assert session.get("_heartbeat_running") is None
 
 
+def test_tui_does_not_duplicate_runtime_owned_warm(monkeypatch, current_heartbeat):
+    class _Agent:
+        def run_conversation(self, *_args, **_kwargs):
+            pytest.fail("TUI duplicated the exact owner's runtime warm")
+
+    session = _session(agent=_Agent(), session_key="heartbeat-owner")
+    event = _runtime_heartbeat_event(heartbeat_warm_owned=True)
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+
+    server._handle_heartbeat_event("heartbeat-sid", session, event)
+
+
 @pytest.mark.parametrize("status", ["STUCK", "UNKNOWN"])
 def test_tui_unhealthy_heartbeat_is_visible_and_warms_only_when_live(
     monkeypatch, current_heartbeat, status

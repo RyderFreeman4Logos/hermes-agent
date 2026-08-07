@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import queue
 import tempfile
 import unittest
 from pathlib import Path
@@ -232,3 +233,169 @@ def test_run_prompt_passes_home_when_parent_env_is_clean(monkeypatch, tmp_path):
 
     assert "env" in captured["kwargs"]
     assert captured["kwargs"]["env"]["HOME"]
+
+
+class _QueueLines:
+    def __init__(self):
+        self._lines = queue.Queue()
+
+    def put(self, payload):
+        self._lines.put(json.dumps(payload) + "\n")
+
+    def close(self):
+        self._lines.put(None)
+
+    def __iter__(self):
+        while True:
+            line = self._lines.get()
+            if line is None:
+                return
+            yield line
+
+
+class _ReactiveACPStdin:
+    def __init__(self, process):
+        self.process = process
+        self.payloads = []
+
+    def write(self, text):
+        payload = json.loads(text)
+        self.payloads.append(payload)
+        method = payload.get("method")
+        if method == "initialize":
+            self.process.stdout.put({"jsonrpc": "2.0", "id": payload["id"], "result": {}})
+        elif method == "session/new":
+            self.process.stdout.put(
+                {
+                    "jsonrpc": "2.0",
+                    "id": payload["id"],
+                    "result": {"sessionId": "warm-session"},
+                }
+            )
+        elif method == "session/prompt":
+            self.process.prompt_id = payload["id"]
+            if self.process.write_target is not None:
+                self.process.stdout.put(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 44,
+                        "method": "fs/write_text_file",
+                        "params": {
+                            "path": str(self.process.write_target),
+                            "content": "must-not-write",
+                        },
+                    }
+                )
+            else:
+                self._emit_update()
+        elif method == "session/cancel":
+            self.process.stdout.put(
+                {
+                    "jsonrpc": "2.0",
+                    "id": self.process.prompt_id,
+                    "result": {"stopReason": "cancelled"},
+                }
+            )
+        elif payload.get("id") == 44:
+            self.process.write_response = payload
+            self._emit_update()
+        return len(text)
+
+    def _emit_update(self):
+            self.process.stdout.put(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": "warm-session",
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": {"type": "text", "text": "x"},
+                        },
+                    },
+                }
+            )
+
+    def flush(self):
+        return None
+
+
+class _ReactiveACPProcess:
+    def __init__(self, *, write_target=None):
+        self.stdout = _QueueLines()
+        self.stderr = io.StringIO("")
+        self.stdin = _ReactiveACPStdin(self)
+        self.prompt_id = None
+        self.write_target = write_target
+        self.write_response = None
+        self.terminated = False
+
+    def poll(self):
+        return 0 if self.terminated else None
+
+    def terminate(self):
+        self.terminated = True
+        self.stdout.close()
+
+    def wait(self, timeout=None):
+        return 0
+
+    def kill(self):
+        self.terminate()
+
+
+def test_heartbeat_warm_cancels_acp_after_first_transport_update(tmp_path):
+    client = _make_home_client(tmp_path)
+    process = _ReactiveACPProcess()
+
+    with _patch(
+        "agent.copilot_acp_client.subprocess.Popen",
+        return_value=process,
+    ):
+        stream = client.chat.completions.heartbeat_warm_create(
+            model="copilot-acp",
+            messages=[{"role": "user", "content": "stable prefix"}],
+            stream=True,
+            tool_choice="none",
+        )
+        chunks = list(stream)
+        stream.close()
+
+    methods = [payload.get("method") for payload in process.stdin.payloads]
+    assert methods == [
+        "initialize",
+        "session/new",
+        "session/prompt",
+        "session/cancel",
+    ]
+    cancel = process.stdin.payloads[-1]
+    assert "id" not in cancel
+    assert cancel["params"] == {"sessionId": "warm-session"}
+    assert process.terminated is True
+    assert chunks[0].choices
+    assert stream.closed is True
+
+
+def test_heartbeat_warm_blocks_acp_client_io_before_cancel(tmp_path):
+    client = _make_home_client(tmp_path)
+    target = tmp_path / "side-effect.txt"
+    process = _ReactiveACPProcess(write_target=target)
+
+    with _patch(
+        "agent.copilot_acp_client.subprocess.Popen",
+        return_value=process,
+    ):
+        stream = client.chat.completions.heartbeat_warm_create(
+            model="copilot-acp",
+            messages=[{"role": "user", "content": "stable prefix"}],
+            stream=True,
+        )
+        list(stream)
+        stream.close()
+
+    assert target.exists() is False
+    assert process.write_response["id"] == 44
+    assert "disabled during heartbeat warm replay" in (
+        process.write_response["error"]["message"]
+    )
+    assert process.stdin.payloads[-1]["method"] == "session/cancel"

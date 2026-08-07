@@ -2037,7 +2037,7 @@ describe('createGatewayEventHandler', () => {
 
       expect(appended).toEqual([
         { role: 'assistant', text: 'final answer' },
-        { kind: 'event', role: 'system', text: '完成 14:23:05' }
+        { kind: 'event', role: 'system', text: 'Completed 14:23:05' }
       ])
       expect(formatTime).toHaveBeenCalledWith('en-GB', {
         hour: '2-digit',

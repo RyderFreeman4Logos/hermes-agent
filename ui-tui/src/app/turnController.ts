@@ -83,7 +83,7 @@ const completionFootnote = (completedAt?: number): Msg | null => {
     second: '2-digit'
   })
 
-  return { kind: 'event', role: 'system', text: `完成 ${time}` }
+  return { kind: 'event', role: 'system', text: `Completed ${time}` }
 }
 
 // Extracts the raw patch from a diff-only segment produced by

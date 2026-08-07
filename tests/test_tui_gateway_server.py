@@ -4531,10 +4531,9 @@ def test_tui_heartbeat_snapshot_reconciles_full_owner_state(monkeypatch):
             "target_id": "foreign",
         },
     ]
-    snapshots = iter((owner_snapshots, owner_snapshots, []))
     monkeypatch.setattr(
         "tools.runtime_heartbeat.runtime_heartbeat.active_snapshots",
-        lambda: next(snapshots),
+        lambda: list(owner_snapshots),
     )
     monkeypatch.setattr(
         server,
@@ -4582,6 +4581,7 @@ def test_tui_heartbeat_snapshot_reconciles_full_owner_state(monkeypatch):
     )
     assert len(emitted) == 1
 
+    owner_snapshots.clear()
     previous = server._sync_runtime_heartbeat_status(
         "heartbeat-sid", session, previous=previous
     )
@@ -4591,6 +4591,26 @@ def test_tui_heartbeat_snapshot_reconciles_full_owner_state(monkeypatch):
         "heartbeat-sid",
         {"usage": {"runtime_heartbeat": {"active_count": 0, "targets": []}}},
     )
+
+
+def test_tui_heartbeat_snapshot_suppresses_initial_empty_state(monkeypatch):
+    session = _session(session_key="heartbeat-owner")
+    emitted = []
+    monkeypatch.setattr(
+        "tools.runtime_heartbeat.runtime_heartbeat.active_snapshots", lambda: []
+    )
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event_type, sid, payload: emitted.append((event_type, sid, payload)),
+    )
+
+    previous = server._sync_runtime_heartbeat_status(
+        "heartbeat-sid", session, previous=None
+    )
+
+    assert previous == ()
+    assert emitted == []
 
 
 @pytest.mark.parametrize("existing_snapshot", [None, {

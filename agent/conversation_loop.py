@@ -2129,7 +2129,10 @@ def run_conversation(
         # messages walk inside estimate_request_tokens_rough. Tools added
         # separately (compression needs them: 50+ tools = 20-30K tokens).
         # total_chars is a rough (~) proxy — verbose log + hook metric only.
-        approx_tokens = estimate_messages_tokens_rough(api_messages)
+        approx_tokens = estimate_request_tokens_rough(
+            api_messages,
+            api_mode=getattr(agent, "api_mode", None),
+        )
         request_pressure_tokens = approx_tokens + (
             _estimate_tools_tokens_rough(agent.tools) if agent.tools else 0
         )
@@ -4743,7 +4746,11 @@ def run_conversation(
                         # the true request (msgs + tools + system), not the tool-blind message count.
                         messages, active_system_prompt = agent._compress_context(
                             messages, system_message,
-                            approx_tokens=estimate_request_tokens_rough(api_messages, tools=agent.tools or None),
+                            approx_tokens=estimate_request_tokens_rough(
+                                api_messages,
+                                tools=agent.tools or None,
+                                api_mode=getattr(agent, "api_mode", None),
+                            ),
                             task_id=effective_task_id,
                         )
                         conversation_history = conversation_history_after_compression(
@@ -5002,7 +5009,11 @@ def run_conversation(
                     # true request (msgs + tools + system), not the tool-blind message count.
                     messages, active_system_prompt = agent._compress_context(
                         messages, system_message,
-                        approx_tokens=estimate_request_tokens_rough(api_messages, tools=agent.tools or None),
+                        approx_tokens=estimate_request_tokens_rough(
+                            api_messages,
+                            tools=agent.tools or None,
+                            api_mode=getattr(agent, "api_mode", None),
+                        ),
                         task_id=effective_task_id,
                     )
                     if messages is _overflow_input and compression_skipped_due_to_lock(agent):
@@ -5099,7 +5110,9 @@ def run_conversation(
                         # messages.  Use the smaller budget and apply a small
                         # safety margin.  Do not alter context_length.
                         request_input_estimate = estimate_request_tokens_rough(
-                            api_messages, tools=agent.tools or None,
+                            api_messages,
+                            tools=agent.tools or None,
+                            api_mode=getattr(agent, "api_mode", None),
                         )
                         local_available_out = old_ctx - request_input_estimate
                         if local_available_out > 0:
@@ -5303,7 +5316,11 @@ def run_conversation(
                     # _should_force_overflow_recovery. (approx_tokens stays for the status display.)
                     messages, active_system_prompt = agent._compress_context(
                         messages, system_message,
-                        approx_tokens=estimate_request_tokens_rough(api_messages, tools=agent.tools or None),
+                        approx_tokens=estimate_request_tokens_rough(
+                            api_messages,
+                            tools=agent.tools or None,
+                            api_mode=getattr(agent, "api_mode", None),
+                        ),
                         task_id=effective_task_id,
                     )
                     if messages is _overflow_input and compression_skipped_due_to_lock(agent):
@@ -6845,7 +6862,9 @@ def run_conversation(
                     # estimate misses, which can skip compression
                     # past the configured threshold (#14695).
                     _real_tokens = estimate_request_tokens_rough(
-                        messages, tools=agent.tools or None
+                        messages,
+                        tools=agent.tools or None,
+                        api_mode=getattr(agent, "api_mode", None),
                     )
 
                 if (
@@ -6944,21 +6963,44 @@ def run_conversation(
                                 exc_info=True,
                             )
                             _pruned_msgs, _pruned_n = messages, 0
-                        # Standard no-op caller contract: only commit when the
-                        # engine returned a NEW list object with a non-zero count.
-                        if _pruned_n and _pruned_msgs is not messages:
+                        # A DB-bound no-op may still return a NEW list: after a
+                        # concurrent in-place winner, the compressor adopts the
+                        # authoritative durable view without pruning anything.
+                        # Always adopt a replacement list; the count controls
+                        # prune telemetry, not transcript authority.
+                        if _pruned_msgs is not messages:
                             # Do NOT rebuild conversation_history here. The compressor
-                            # atomically rewrites the active transcript with the durable
-                            # rearm threshold, then stamps every returned row with
-                            # _DB_PERSISTED_MARKER, so the marker-based flush dedup (see
-                            # _flush_messages_to_session_db) prevents duplicate writes.
-                            # Calling
+                            # returns an exact durable replacement plus any explicit
+                            # live-only completion suffix. Seed the existing one-shot
+                            # identity boundary instead of synthesizing persistence
+                            # fields onto decoded durable messages. Calling
                             # conversation_history_after_compression (a compaction-only
                             # helper keyed on the _last_compaction_in_place flag) would be
                             # a no-op at best, and on a stale in-place flag could seed
                             # this turn's fresh, not-yet-persisted rows into history_ids
                             # and skip writing them.
                             messages = _pruned_msgs
+                            if (
+                                getattr(_compressor, "_session_db", None)
+                                and getattr(_compressor, "_session_id", "")
+                                == getattr(agent, "session_id", None)
+                            ):
+                                from agent.message_sanitization import (
+                                    durable_messages_before_pending_completion,
+                                )
+
+                                _durable_pruned = (
+                                    durable_messages_before_pending_completion(
+                                        messages,
+                                    )
+                                )
+                                agent._last_flushed_db_idx = len(_durable_pruned)
+                                agent._flushed_db_message_session_id = agent.session_id
+                                agent._flushed_db_message_ids = {
+                                    id(message)
+                                    for message in _durable_pruned
+                                    if isinstance(message, dict)
+                                }
                 
                 # Save session log incrementally (so progress is visible even if interrupted)
                 agent._session_messages = messages

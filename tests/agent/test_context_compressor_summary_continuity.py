@@ -388,3 +388,45 @@ def test_empty_post_handoff_window_noops_without_summary_call():
     assert compressor._last_compress_aborted is False
     telemetry = compressor._last_compression_telemetry or {}
     assert telemetry.get("failure_class") == "empty_post_handoff_window"
+
+
+def test_soft_ceiling_retries_past_standalone_handoff():
+    """A handoff alone must not hide compressible resumed history in the tail."""
+    compressor = _compressor()
+    compressor.context_length = 100_000
+    compressor.tail_token_budget = 50
+    messages = [
+        {"role": "user", "content": f"{SUMMARY_PREFIX}\nold durable summary"},
+        {"role": "user", "content": "old request"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "later request"},
+        {"role": "assistant", "content": "later answer"},
+        {"role": "user", "content": "recent request"},
+        {"role": "assistant", "content": "recent answer"},
+        {"role": "user", "content": "latest request"},
+        {"role": "assistant", "content": "latest answer"},
+    ]
+    summarized = []
+
+    def _capture(turns, **_kwargs):
+        summarized.extend(turns)
+        return ContextCompressor._with_summary_prefix("fresh summary")
+
+    def _budget_tokens(message):
+        return 80 if ContextCompressor._is_context_summary_message(message) else 8
+
+    with (
+        patch(
+            "agent.context_compressor._estimate_msg_budget_tokens",
+            side_effect=_budget_tokens,
+        ),
+        patch.object(compressor, "_generate_summary", side_effect=_capture) as generate,
+    ):
+        result = compressor.compress(messages, current_tokens=90_000, force=True)
+
+    generate.assert_called_once()
+    assert [message["content"] for message in summarized[:2]] == [
+        "old request",
+        "old answer",
+    ]
+    assert len(result) < len(messages)

@@ -60,11 +60,15 @@ def test_manual_compress_explains_when_token_estimate_rises(capsys):
     shell.agent.compression_enabled = True
     shell.agent._cached_system_prompt = ""
     shell.agent.tools = None
+    shell.agent.api_mode = "codex_responses"
     shell.agent.session_id = shell.session_id  # no-op: no split
     shell.agent._compress_context.return_value = (compressed, "")
     shell.agent._compression_skipped_due_to_lock = False
 
-    def _estimate(messages, **_kwargs):
+    estimate_modes = []
+
+    def _estimate(messages, **kwargs):
+        estimate_modes.append(kwargs.get("api_mode"))
         if messages == history:
             return 100
         if messages == compressed:
@@ -78,6 +82,7 @@ def test_manual_compress_explains_when_token_estimate_rises(capsys):
     assert "✅ Compressed: 4 → 3 messages" in output
     assert "Approx request size: ~100 → ~120 tokens" in output
     assert "denser summaries" in output
+    assert estimate_modes == ["codex_responses", "codex_responses"]
 
 
 def test_manual_compress_syncs_session_id_after_split():

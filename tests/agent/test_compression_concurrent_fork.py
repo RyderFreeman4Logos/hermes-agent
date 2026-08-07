@@ -245,7 +245,9 @@ def test_compression_activity_heartbeat_strict_signature_fallback_releases_lock(
     assert touch_calls[0] == "context compression started"
     assert touch_calls[-1] == "context compression completed"
     assert db.get_compression_lock_holder(session_id) is None
-    assert strict_calls == [120_000]
+    # The caller estimate described the pre-lease snapshot; the durable reload
+    # deliberately asks the engine to re-estimate from its authoritative input.
+    assert strict_calls == [0]
 
 
 def test_compression_activity_heartbeat_nonfinite_interval_falls_back(tmp_path: Path) -> None:
@@ -617,6 +619,283 @@ def test_durable_message_committed_before_lease_is_adopted(
     assert child_id == agent.session_id
 
 
+def test_in_place_winner_fences_stale_full_compression_input(tmp_path: Path) -> None:
+    """A stale in-place caller must summarize the durable winner, not itself."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "FULL_STALE_IN_PLACE_WINNER"
+    db.create_session(session_id, source="tui")
+    original = [
+        {"role": "user", "content": "stale question"},
+        {"role": "assistant", "content": "stale answer"},
+    ]
+    db.append_messages_batch(session_id, original)
+    stale = db.get_messages_as_conversation(session_id)
+    for message in stale:
+        message["_db_persisted"] = True
+
+    agent = _build_agent_with_db(db, session_id)
+    agent.compression_in_place = True
+    agent._persist_user_message_idx = len(stale)
+    winner_messages = [
+        {"role": "user", "content": "winner question"},
+        {"role": "assistant", "content": "winner answer"},
+    ]
+    db.archive_and_compact(
+        session_id,
+        winner_messages,
+        expected_active_fingerprint=db.get_compaction_fingerprint(session_id),
+    )
+
+    returned, _system_prompt = agent._compress_context(
+        stale, "sys", approx_tokens=120_000,
+    )
+
+    agent.context_compressor.compress.assert_called_once()
+    compressed_arg = agent.context_compressor.compress.call_args.args[0]
+    assert [message["content"] for message in compressed_arg] == [
+        "winner question",
+        "winner answer",
+    ]
+    assert returned[0]["content"] == "[CONTEXT COMPACTION] summary"
+    assert [message["content"] for message in db.get_messages_as_conversation(session_id)] == [
+        "[CONTEXT COMPACTION] summary",
+        "tail",
+    ]
+
+
+def test_full_compression_keeps_pending_completion_suffix_live_only(
+    tmp_path: Path,
+) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "FULL_PENDING_COMPLETION_SUFFIX"
+    db.create_session(session_id, source="tui")
+    db.append_messages_batch(session_id, [
+        {"role": "user", "content": "durable question"},
+        {"role": "assistant", "content": "durable answer"},
+    ])
+    durable = db.get_messages_as_conversation(session_id)
+    pending = [
+        {
+            "role": "user",
+            "content": "pending completion payload",
+            "_completion_delivery_synthetic": True,
+        },
+        {"role": "assistant", "content": "pending completion response"},
+    ]
+    messages = [*durable, *pending]
+    agent = _build_agent_with_db(db, session_id)
+    agent.compression_in_place = True
+
+    def _compress_with_live_suffix(incoming, **_kwargs):
+        assert [message["content"] for message in incoming] == [
+            "durable question",
+            "durable answer",
+            "pending completion payload",
+            "pending completion response",
+        ]
+        return [
+            {"role": "user", "content": "compressed durable prefix"},
+            *incoming[-2:],
+        ]
+
+    agent.context_compressor.compress.side_effect = _compress_with_live_suffix
+    returned, _system_prompt = agent._compress_context(
+        messages, "sys", approx_tokens=120_000,
+    )
+
+    assert [message["content"] for message in returned] == [
+        "compressed durable prefix",
+        "pending completion payload",
+        "pending completion response",
+    ]
+    assert [message["content"] for message in db.get_messages_as_conversation(session_id)] == [
+        "compressed durable prefix",
+    ]
+    assert not returned[-1].get("_db_persisted")
+
+
+def test_full_compression_flushes_active_turn_suffix_before_durable_reload(
+    tmp_path: Path,
+) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "FULL_ACTIVE_TURN_SUFFIX"
+    db.create_session(session_id, source="tui")
+    db.append_messages_batch(session_id, [
+        {"role": "user", "content": "durable question"},
+        {"role": "assistant", "content": "durable answer"},
+    ])
+    messages = [
+        *db.get_messages_as_conversation(session_id),
+        {"role": "user", "content": "new active-turn question"},
+        {"role": "assistant", "content": "new active-turn answer"},
+    ]
+    agent = _build_agent_with_db(db, session_id)
+    agent.compression_in_place = True
+    agent._persist_user_message_idx = 2
+
+    def _assert_complete_durable_input(incoming, **_kwargs):
+        assert [message["content"] for message in incoming] == [
+            "durable question",
+            "durable answer",
+            "new active-turn question",
+            "new active-turn answer",
+        ]
+        return [{"role": "user", "content": "complete compressed view"}]
+
+    agent.context_compressor.compress.side_effect = (
+        _assert_complete_durable_input
+    )
+    returned, _system_prompt = agent._compress_context(
+        messages, "sys", approx_tokens=120_000,
+    )
+
+    assert [message["content"] for message in returned] == [
+        "complete compressed view",
+    ]
+    assert [message["content"] for message in db.get_messages_as_conversation(session_id)] == [
+        "complete compressed view",
+    ]
+
+
+def test_required_pre_snapshot_flush_failure_aborts_before_summary(
+    tmp_path: Path,
+) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "FULL_REQUIRED_FLUSH_FAILURE"
+    db.create_session(session_id, source="tui")
+    db.append_message(session_id, "user", "durable history")
+    messages = db.get_messages_as_conversation(session_id)
+    agent = _build_agent_with_db(db, session_id)
+    agent.compression_in_place = True
+
+    with patch.object(
+        agent, "_flush_messages_to_session_db", return_value=False,
+    ) as flush:
+        returned, _system_prompt = agent._compress_context(
+            messages, "sys", approx_tokens=120_000,
+        )
+
+    flush.assert_called_once()
+    agent.context_compressor.compress.assert_not_called()
+    assert returned is messages
+    assert db.get_compression_lock_holder(session_id) is None
+    assert agent.context_compressor._last_compression_telemetry[
+        "failure_class"
+    ] == "transcript_flush_failed"
+
+
+def test_rotation_publish_cas_adopts_rewrite_after_summary_started(
+    tmp_path: Path,
+) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    parent_id = "FULL_ROTATION_PUBLISH_CAS"
+    db.create_session(parent_id, source="tui")
+    db.append_messages_batch(parent_id, [
+        {"role": "user", "content": "summary input"},
+        {"role": "assistant", "content": "summary input reply"},
+    ])
+    pending_suffix = [
+        {
+            "role": "user",
+            "content": "pending completion payload",
+            "_completion_delivery_synthetic": True,
+        },
+        {"role": "assistant", "content": "pending completion response"},
+    ]
+    messages = [
+        *db.get_messages_as_conversation(parent_id),
+        *pending_suffix,
+    ]
+    agent = _build_agent_with_db(db, parent_id)
+
+    winner_messages = [
+        {"role": "user", "content": "winner after summary start"},
+        {"role": "assistant", "content": "winner reply"},
+    ]
+
+    def _rewrite_then_return_stale_summary(*_args, **_kwargs):
+        db.archive_and_compact(
+            parent_id,
+            winner_messages,
+            expected_active_fingerprint=db.get_compaction_fingerprint(parent_id),
+        )
+        return [
+            {"role": "user", "content": "stale compressed handoff"},
+            {"role": "assistant", "content": "stale tail"},
+        ]
+
+    agent.context_compressor.compress.side_effect = (
+        _rewrite_then_return_stale_summary
+    )
+    returned, _system_prompt = agent._compress_context(
+        messages, "sys", approx_tokens=120_000,
+    )
+
+    assert agent.session_id == parent_id
+    assert db.get_session(parent_id)["ended_at"] is None
+    assert _count_children(db, parent_id) == 0
+    assert [message["content"] for message in db.get_messages_as_conversation(parent_id)] == [
+        "winner after summary start",
+        "winner reply",
+    ]
+    assert [message["content"] for message in returned] == [
+        "winner after summary start",
+        "winner reply",
+        "pending completion payload",
+        "pending completion response",
+    ]
+    assert db.get_compression_lock_holder(parent_id) is None
+
+
+def test_in_place_publish_cas_adopts_rewrite_after_summary_started(
+    tmp_path: Path,
+) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "FULL_IN_PLACE_PUBLISH_CAS"
+    db.create_session(session_id, source="tui")
+    db.append_messages_batch(session_id, [
+        {"role": "user", "content": "summary input"},
+        {"role": "assistant", "content": "summary input reply"},
+    ])
+    messages = db.get_messages_as_conversation(session_id)
+    agent = _build_agent_with_db(db, session_id)
+    agent.compression_in_place = True
+
+    winner_messages = [
+        {"role": "user", "content": "winner after summary start"},
+        {"role": "assistant", "content": "winner reply"},
+    ]
+
+    def _rewrite_then_return_stale_summary(*_args, **_kwargs):
+        db.archive_and_compact(
+            session_id,
+            winner_messages,
+            expected_active_fingerprint=db.get_compaction_fingerprint(session_id),
+        )
+        return [
+            {"role": "user", "content": "stale compressed handoff"},
+            {"role": "assistant", "content": "stale tail"},
+        ]
+
+    agent.context_compressor.compress.side_effect = (
+        _rewrite_then_return_stale_summary
+    )
+    returned, _system_prompt = agent._compress_context(
+        messages, "sys", approx_tokens=120_000,
+    )
+
+    assert agent.session_id == session_id
+    assert [message["content"] for message in db.get_messages_as_conversation(session_id)] == [
+        "winner after summary start",
+        "winner reply",
+    ]
+    assert [message["content"] for message in returned] == [
+        "winner after summary start",
+        "winner reply",
+    ]
+    assert db.get_compression_lock_holder(session_id) is None
+
+
 
 
 
@@ -675,7 +954,10 @@ def test_fence_cancelled_compression_leaves_lock_reacquirable(tmp_path: Path) ->
 
     # Cancelled attempt: no mutation, and — the invariant under test — the
     # per-session compression lock is fully released.
-    assert result["value"][0] is messages
+    assert result["value"][0] is not messages
+    assert [message["content"] for message in result["value"][0]] == [
+        message["content"] for message in messages
+    ]
     assert agent.context_compressor._proactive_prune_rearm_tokens == 120_000
     assert db.get_compression_lock_holder(session_id) is None
 
@@ -879,7 +1161,10 @@ def test_rotation_publish_failure_restores_proactive_prune_runway(
             messages, "sys", approx_tokens=120_000,
         )
 
-    assert returned is messages
+    assert returned is not messages
+    assert [message["content"] for message in returned] == [
+        message["content"] for message in messages
+    ]
     assert agent.session_id == parent_sid
     assert agent.context_compressor._proactive_prune_rearm_tokens == 120_000
     assert db.get_messages_as_conversation(parent_sid) == durable_before
@@ -964,7 +1249,10 @@ def test_equal_copy_compression_result_does_not_rewrite_session(
             approx_tokens=120_000,
         )
 
-    assert returned is messages
+    assert returned is not messages
+    assert [message["content"] for message in returned] == [
+        message["content"] for message in messages
+    ]
     assert getattr(agent, "session_id") == parent_sid
     assert _count_children(db, parent_sid) == 0
     parent = db.get_session(parent_sid)
@@ -1354,7 +1642,9 @@ def test_hard_interrupt_aborts_compression_and_unblocks_session_writes(tmp_path:
         messages, "sys", approx_tokens=120_000
     )
 
-    assert compressed == original_messages
+    assert [message["content"] for message in compressed] == [
+        message["content"] for message in original_messages
+    ]
     assert messages == original_messages
     assert db.get_compression_lock_holder(session_id) is None
     db.append_message(session_id, "assistant", "writes recovered")
@@ -1432,7 +1722,10 @@ def test_late_hard_interrupt_restores_full_compressor_attempt_state_and_retry(
     worker.join(timeout=5)
 
     assert not worker.is_alive()
-    assert result["value"][0] is messages
+    assert result["value"][0] is not messages
+    assert [message["content"] for message in result["value"][0]] == [
+        message["content"] for message in messages
+    ]
     assert {
         name: copy.deepcopy(getattr(agent.context_compressor, name))
         for name in state_fields
@@ -1515,7 +1808,10 @@ def test_force_cancel_restores_newer_durable_cooldown_captured_under_lease(
         force=True,
     )
 
-    assert compressed is messages
+    assert compressed is not messages
+    assert [message["content"] for message in compressed] == [
+        message["content"] for message in messages
+    ]
     durable_after = tuple(
         db._conn.execute(
             "SELECT compression_failure_cooldown_until, compression_failure_error "
@@ -1591,7 +1887,10 @@ def test_redirect_interrupt_remains_protected_during_compression(tmp_path: Path)
         messages, "sys", approx_tokens=120_000
     )
 
-    assert compressed == messages
+    assert compressed is not messages
+    assert [message["content"] for message in compressed] == [
+        message["content"] for message in messages
+    ]
     assert db.get_compression_lock_holder(session_id) is None
 
 
@@ -1638,7 +1937,10 @@ def test_hard_cancel_between_compress_return_and_commit_begin_wins_atomically(
     worker.join(timeout=5)
 
     assert not worker.is_alive()
-    assert result["value"][0] is messages
+    assert result["value"][0] is not messages
+    assert [message["content"] for message in result["value"][0]] == [
+        message["content"] for message in messages
+    ]
     archive_spy.assert_not_called()
     assert db.get_compression_lock_holder(session_id) is None
 
@@ -1752,7 +2054,10 @@ def test_force_cancel_restores_exact_expired_or_expiring_cooldown_row(
         force=True,
     )
 
-    assert compressed is messages
+    assert compressed is not messages
+    assert [message["content"] for message in compressed] == [
+        message["content"] for message in messages
+    ]
     assert db.get_compression_failure_cooldown_row(session_id) == before
     assert db.get_compression_lock_holder(session_id) is None
 

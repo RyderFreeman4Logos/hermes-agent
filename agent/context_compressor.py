@@ -16,6 +16,7 @@ Improvements over v2:
   - Richer tool call/result detail in summarizer input
 """
 
+import copy
 import hashlib
 import json
 import logging
@@ -35,11 +36,16 @@ from agent.context_engine import ContextEngine, sanitize_memory_context
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
+    estimate_request_tokens_rough,
     get_model_context_length,
     estimate_messages_tokens_rough,
     estimate_tokens_rough,
 )
 from agent.redact import redact_sensitive_text
+from agent.message_sanitization import (
+    completion_delivery_suffix_start,
+    durable_messages_before_pending_completion,
+)
 from agent.turn_context import drop_stale_api_content
 from tools.todo_tool import TODO_INJECTION_HEADER
 
@@ -177,6 +183,29 @@ MAX_ITERATIONS_SUMMARY_REQUEST = (
     "Please provide a final response summarizing what you've found and accomplished so far, "
     "without calling any more tools."
 )
+
+
+def _pending_completion_suffix(messages: Any) -> List[Dict[str, Any]]:
+    """Return the live-only completion suffix without copying its messages."""
+    start = completion_delivery_suffix_start(messages)
+    if start is None:
+        return []
+    return list(messages[start:])
+
+
+def _capture_durable_compaction_view(
+    session_db: Any,
+    session_id: str,
+    live_messages: Any,
+) -> tuple[List[tuple], List[Dict[str, Any]]]:
+    """Capture one exact durable generation plus the live-only suffix."""
+    snapshot = getattr(type(session_db), "get_compaction_snapshot", None)
+    if not callable(snapshot):
+        raise RuntimeError("durable compaction snapshot is unavailable")
+    fingerprint, durable = snapshot(session_db, session_id)
+    if not isinstance(fingerprint, list) or not isinstance(durable, list):
+        raise RuntimeError("invalid durable compaction snapshot")
+    return fingerprint, [*durable, *_pending_completion_suffix(live_messages)]
 
 
 def _fresh_compaction_message_copy(msg: Dict[str, Any]) -> Dict[str, Any]:
@@ -1623,6 +1652,7 @@ class ContextCompressor(ContextEngine):
         self._active_compression_telemetry = None
         self._compression_telemetry_seed = None
         self._proactive_prune_rearm_tokens = 0
+        self._proactive_prune_runway_authoritative = True
 
         # Micro-compaction state reset
         self._micro_compact_cursor = 0
@@ -1895,6 +1925,7 @@ class ContextCompressor(ContextEngine):
         self._active_compression_telemetry = None
         self._compression_telemetry_seed = None
         self._proactive_prune_rearm_tokens = 0
+        self._proactive_prune_runway_authoritative = True
 
     def bind_session_state(self, session_db: Any = None, session_id: str = "") -> None:
         """Bind the current session row so durable cooldowns can round-trip."""
@@ -1909,6 +1940,7 @@ class ContextCompressor(ContextEngine):
         self._prellm_skip_count = 0
         self._anti_thrash_recovery_deadline = 0.0
         self._proactive_prune_rearm_tokens = 0
+        self._proactive_prune_runway_authoritative = not bool(session_db and session_id)
         self.get_active_compression_failure_cooldown()
         self._load_fallback_compression_streak()
         self._load_ineffective_compression_count()
@@ -1991,15 +2023,31 @@ class ContextCompressor(ContextEngine):
         """Restore the cache-boundary runway for a resumed durable session."""
         session_db = getattr(self, "_session_db", None)
         session_id = getattr(self, "_session_id", "")
-        getter = getattr(session_db, "get_session_model_config_value", None)
+        # This is a prune-safety read, so use the raw row instead of the
+        # tolerant shared config getter. Malformed or unreadable durable state
+        # must remain unknown and fail closed.
+        getter = getattr(session_db, "get_session", None)
         if not session_id or not callable(getter):
             return
         try:
-            value = getter(session_id, PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY, 0)
+            session = getter(session_id)
+            if not isinstance(session, dict):
+                raise TypeError("session row is unavailable")
+            raw = session.get("model_config")
+            if isinstance(raw, str):
+                raw = json.loads(raw) if raw.strip() else {}
+            elif raw is None:
+                raw = {}
+            if not isinstance(raw, dict):
+                raise TypeError("session model_config is not an object")
+            value = raw.get(PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY, 0)
+            if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+                raise TypeError("proactive prune runway is not numeric")
             self._proactive_prune_rearm_tokens = max(
                 0,
-                int(value) if isinstance(value, (int, float, str)) else 0,
+                int(value),
             )
+            self._proactive_prune_runway_authoritative = True
         except (TypeError, ValueError, json.JSONDecodeError, sqlite3.Error) as exc:
             logger.debug("proactive prune runway lookup failed: %s", exc)
         except Exception as exc:
@@ -2589,6 +2637,7 @@ class ContextCompressor(ContextEngine):
         # A committed prune is a prompt-cache boundary. Do not permit the next
         # one until the prompt has regrown the tokens just reclaimed.
         self._proactive_prune_rearm_tokens: int = 0
+        self._proactive_prune_runway_authoritative = True
         self.min_tail_user_messages = min_tail_user_messages
         self.summary_target_ratio = max(0.10, min(summary_target_ratio, 0.80))
         self.quiet_mode = quiet_mode
@@ -3422,84 +3471,142 @@ class ContextCompressor(ContextEngine):
         earliest rewritten message forward — exactly like a compression
         boundary. A prune therefore commits only when it reclaims
         ``proactive_prune_min_reclaim_tokens`` and disarms until message history
-        has regrown a full trigger-sized runway. Below either gate the INPUT list
-        object is returned unchanged — the standard no-op caller contract
-        (callers gate bookkeeping on ``result is not input``).
-
-        Returns ``(messages, 0)`` — the input object — when disabled, below
-        the trigger, or when the reclaim gate rejects the commit.
+        has regrown a full trigger-sized runway. Gates checked before a durable
+        lease return the input object unchanged. Once a DB-bound pass acquires
+        the lease, even a zero-prune result returns the freshly loaded durable
+        active view so a stale caller cannot keep replaying a superseded prefix.
         """
         if self.proactive_prune_tokens <= 0:
             return messages, 0
         if current_tokens is not None and current_tokens < self.proactive_prune_tokens:
             return messages, 0
-        # Nothing to reclaim until there are messages outside the protected tail.
-        if len(messages) <= self.protect_last_n + self._protect_head_size(messages) + 1:
+        if not self._proactive_prune_runway_authoritative:
             return messages, 0
-        before = sum(_estimate_msg_budget_tokens(m) for m in messages)
-        if before < self._proactive_prune_rearm_tokens:
-            return messages, 0
-        # Capability gate BEFORE the expensive 3-pass scan: a bound store that
-        # can't persist the prune atomically (duck-typed/plugin session store
-        # without archive_and_compact) makes every prune a permanent no-op, so
-        # don't pay the scan for it on every eligible iteration.
         session_db = getattr(self, "_session_db", None)
         session_id = getattr(self, "_session_id", "")
-        if (
-            session_db
-            and session_id
-            and not callable(getattr(session_db, "archive_and_compact", None))
-        ):
-            return messages, 0
-        pruned_msgs, pruned_count = self._prune_old_tool_results(
-            messages,
-            protect_tail_count=self.protect_last_n,
-            protect_tail_tokens=None,
-            min_prune_chars=self.proactive_prune_min_result_chars,
-        )
-        if not pruned_count:
-            # Standard no-op contract: hand back the INPUT object so callers
-            # can gate bookkeeping on `result is not input`.
-            return messages, 0
-        # Measured-savings gate (prompt-cache hysteresis): only commit when
-        # the prune reclaims a meaningful batch of tokens. Estimated on the
-        # real before/after messages so dedup + arg truncation count too.
-        after = sum(_estimate_msg_budget_tokens(m) for m in pruned_msgs)
-        reclaimed = max(0, before - after)
-        if reclaimed < self.proactive_prune_min_reclaim_tokens:
-            return messages, 0
-        # ``after`` includes the tool batch appended since the provider's last
-        # usage reading, so both the low-water mark and future gate use the
-        # same message-token estimate. Require a full trigger-sized growth
-        # interval before another cache-breaking rewrite.
-        runway = max(
-            reclaimed,
-            self.proactive_prune_tokens,
-            self.proactive_prune_min_reclaim_tokens,
-        )
-        next_rearm_tokens = after + runway
-        if session_db and session_id:
-            # The capability gate above guarantees archive_and_compact exists.
-            try:
-                session_db.archive_and_compact(
-                    session_id,
-                    pruned_msgs,
-                    model_config_patch={
-                        PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: next_rearm_tokens,
-                    },
+        archive_and_compact = None
+        lock_holder = None
+        release_lock = None
+        durable_fingerprint = None
+        work_messages = messages
+        try:
+            if session_db and session_id:
+                archive_and_compact = getattr(session_db, "archive_and_compact", None)
+                acquire_lock = getattr(
+                    session_db, "try_acquire_compression_lock", None,
                 )
-            except Exception as exc:
-                logger.warning(
-                    "Proactive tool-result prune DB commit failed; keeping the "
-                    "original transcript: %s",
-                    exc,
-                )
-                return messages, 0
-            for msg in pruned_msgs:
-                if isinstance(msg, dict):
-                    msg[_DB_PERSISTED_MARKER] = True
-        self._proactive_prune_rearm_tokens = next_rearm_tokens
-        return pruned_msgs, pruned_count
+                release_lock = getattr(session_db, "release_compression_lock", None)
+                if (
+                    not callable(archive_and_compact)
+                    or not callable(acquire_lock)
+                    or not callable(release_lock)
+                ):
+                    return messages, 0
+                from agent.conversation_compression import _compression_lock_holder
+
+                lock_holder = _compression_lock_holder(self)
+                try:
+                    if not acquire_lock(session_id, lock_holder):
+                        return messages, 0
+                except Exception as exc:
+                    logger.warning(
+                        "Proactive tool-result prune lease acquisition failed; "
+                        "keeping the original transcript: %s",
+                        exc,
+                    )
+                    return messages, 0
+                try:
+                    durable_fingerprint, work_messages = (
+                        _capture_durable_compaction_view(
+                            session_db, session_id, messages,
+                        )
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Proactive tool-result prune durable reload failed; "
+                        "keeping the original transcript: %s",
+                        exc,
+                    )
+                    return messages, 0
+
+            # Nothing to reclaim until there are messages outside the protected
+            # tail.  For DB-bound operation this gate MUST run on the durable
+            # active view loaded under the lease, not the caller's stale list.
+            if (
+                len(work_messages)
+                <= self.protect_last_n
+                + self._protect_head_size(work_messages)
+                + 1
+            ):
+                return work_messages, 0
+            # Match the active request route: private Responses replay fields are
+            # not cache-facing growth and therefore cannot rearm another boundary.
+            before = estimate_request_tokens_rough(
+                work_messages, api_mode=self.api_mode,
+            )
+            if before < self._proactive_prune_rearm_tokens:
+                return work_messages, 0
+
+            pruned_msgs, pruned_count = self._prune_old_tool_results(
+                work_messages,
+                protect_tail_count=self.protect_last_n,
+                protect_tail_tokens=None,
+                min_prune_chars=self.proactive_prune_min_result_chars,
+            )
+            if not pruned_count:
+                # A DB-bound no-op still hands back the authoritative durable
+                # input loaded above; callers adopt any replacement list.
+                return work_messages, 0
+            after = estimate_request_tokens_rough(
+                pruned_msgs, api_mode=self.api_mode,
+            )
+            reclaimed = max(0, before - after)
+            if reclaimed < self.proactive_prune_min_reclaim_tokens:
+                return work_messages, 0
+            runway = max(
+                reclaimed,
+                self.proactive_prune_tokens,
+                self.proactive_prune_min_reclaim_tokens,
+            )
+            next_rearm_tokens = after + runway
+            if session_db and session_id:
+                try:
+                    archive_and_compact(
+                        session_id,
+                        pruned_msgs,
+                        model_config_patch={
+                            PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: next_rearm_tokens,
+                        },
+                        compression_lock_holder=lock_holder,
+                        require_compression_lease=True,
+                        expected_active_fingerprint=durable_fingerprint,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Proactive tool-result prune DB commit failed; adopting "
+                        "the latest durable transcript: %s",
+                        exc,
+                    )
+                    try:
+                        _latest_fingerprint, latest = (
+                            _capture_durable_compaction_view(
+                                session_db, session_id, messages,
+                            )
+                        )
+                        return latest, 0
+                    except Exception:
+                        return work_messages, 0
+                for msg in pruned_msgs:
+                    if isinstance(msg, dict):
+                        msg[_DB_PERSISTED_MARKER] = True
+            self._proactive_prune_rearm_tokens = next_rearm_tokens
+            return pruned_msgs, pruned_count
+        finally:
+            if lock_holder and callable(release_lock):
+                try:
+                    release_lock(session_id, lock_holder)
+                except Exception as exc:
+                    logger.debug("proactive prune lease release failed: %s", exc)
 
     # ------------------------------------------------------------------
     # Summarization
@@ -5505,6 +5612,7 @@ This compaction should PRIORITISE preserving all information related to the focu
     def _find_tail_cut_by_tokens(
         self, messages: List[Dict[str, Any]], head_end: int,
         token_budget: int | None = None,
+        *, use_soft_ceiling: bool = True,
     ) -> int:
         """Walk backward from the end of messages, accumulating tokens until
         the budget is reached. Returns the index where the tail starts.
@@ -5512,6 +5620,8 @@ This compaction should PRIORITISE preserving all information related to the focu
         ``token_budget`` defaults to ``self.tail_token_budget`` which is
         derived from ``summary_target_ratio * context_length``, so it
         scales automatically with the model's context window.
+        ``use_soft_ceiling=False`` applies that raw budget exactly for the
+        resumed-handoff retry in ``compress()``.
 
         Token budget is the primary criterion.  A bounded message-count floor
         keeps a short run of recent turns verbatim even when the budget is
@@ -5539,7 +5649,9 @@ This compaction should PRIORITISE preserving all information related to the focu
             min(min_tail_floor, compressible_tail_cap, available_tail)
             if available_tail > 1 else 0
         )
-        soft_ceiling = int(token_budget * 1.5)
+        soft_ceiling = (
+            int(token_budget * 1.5) if use_soft_ceiling else token_budget
+        )
         accumulated = 0
         cut_idx = n  # start from beyond the end
 
@@ -5983,6 +6095,102 @@ This compaction should PRIORITISE preserving all information related to the focu
         self,
         messages: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
+        """Run micro-compaction from an authoritative durable view when bound.
+
+        A lease serializes commits, but a loser can acquire it after an
+        in-place winner.  Capture the winner's raw row fingerprint first and
+        then load the active transcript used for every gate and summary.  The
+        final raw CAS rejects a writer that changes either read while this
+        holder is computing.
+        """
+        if not self._micro_compact_enabled:
+            return messages
+
+        session_db = getattr(self, "_session_db", None)
+        session_id = getattr(self, "_session_id", "")
+        if not session_db or not session_id:
+            return self._micro_compact_view(messages)
+
+        acquire_lock = getattr(session_db, "try_acquire_compression_lock", None)
+        release_lock = getattr(session_db, "release_compression_lock", None)
+        archive_and_compact = getattr(session_db, "archive_and_compact", None)
+        if not all(
+            callable(fn) for fn in (acquire_lock, release_lock, archive_and_compact)
+        ):
+            return messages
+
+        from agent.conversation_compression import _compression_lock_holder
+
+        lock_holder = _compression_lock_holder(self)
+        try:
+            if not acquire_lock(session_id, lock_holder):
+                return messages
+        except Exception as exc:
+            logger.info(
+                "Micro-compaction lease acquisition failed; retaining the "
+                "original transcript: %s",
+                exc,
+            )
+            return messages
+
+        state_names = (
+            "_micro_compact_cursor",
+            "_micro_compact_rolling_summary",
+            "_micro_compact_consecutive_failures",
+            "_micro_compact_last_failure_cursor",
+            "_micro_compact_passes",
+            "_micro_compact_tokens_saved_total",
+            "_micro_compact_turns_since_pass",
+            "_flush_scan_cursor_invalidated",
+        )
+        rollback_state = {
+            name: copy.deepcopy(getattr(self, name)) for name in state_names
+        }
+        try:
+            try:
+                expected_fingerprint, durable_view = (
+                    _capture_durable_compaction_view(
+                        session_db, session_id, messages,
+                    )
+                )
+            except Exception as exc:
+                logger.info(
+                    "Micro-compaction durable reload failed; retaining the "
+                    "original transcript: %s",
+                    exc,
+                )
+                return messages
+
+            # Cursor/rolling-summary state belongs to the transcript snapshot.
+            # Rebuild it from durable markers instead of pairing a winner's
+            # active rows with this stale caller's in-memory state.
+            self._micro_compact_cursor = 0
+            self._micro_compact_rolling_summary = ""
+            self._micro_compact_consecutive_failures = 0
+            self._micro_compact_last_failure_cursor = -1
+            self._flush_scan_cursor_invalidated = False
+            return self._micro_compact_view(
+                durable_view,
+                expected_active_fingerprint=expected_fingerprint,
+                compression_lock_holder=lock_holder,
+                rollback_state_override=rollback_state,
+                pending_suffix_source=messages,
+            )
+        finally:
+            try:
+                release_lock(session_id, lock_holder)
+            except Exception as exc:
+                logger.debug("micro-compaction lease release failed: %s", exc)
+
+    def _micro_compact_view(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        expected_active_fingerprint: Optional[List[tuple]] = None,
+        compression_lock_holder: Optional[str] = None,
+        rollback_state_override: Optional[Dict[str, Any]] = None,
+        pending_suffix_source: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[Dict[str, Any]]:
         """Run one round of micro-compaction on the conversation.
 
         Absorbs the oldest uncompacted exchange into the rolling summary,
@@ -5998,8 +6206,19 @@ This compaction should PRIORITISE preserving all information related to the focu
         ``archive_and_compact`` on the session DB to soft-archive old rows
         and insert the compacted set atomically.
         """
-        if not self._micro_compact_enabled:
-            return messages
+        rollback_state = rollback_state_override or {
+            name: copy.deepcopy(getattr(self, name))
+            for name in (
+                "_micro_compact_cursor",
+                "_micro_compact_rolling_summary",
+                "_micro_compact_consecutive_failures",
+                "_micro_compact_last_failure_cursor",
+                "_micro_compact_passes",
+                "_micro_compact_tokens_saved_total",
+                "_micro_compact_turns_since_pass",
+                "_flush_scan_cursor_invalidated",
+            )
+        }
 
         # Cadence gate. A pass rewrites already-sent history, so it costs one
         # prompt-cache break; `every_n_turns` is how an operator trades reclaim
@@ -6034,6 +6253,35 @@ This compaction should PRIORITISE preserving all information related to the focu
             return messages
 
         exchange_start, exchange_end = exchange
+        rollback_items = list(messages)
+        rollback_dicts = [
+            (message, copy.deepcopy(message))
+            for message in messages
+            if isinstance(message, dict)
+        ]
+
+        def _rollback_failed_commit() -> List[Dict[str, Any]]:
+            for message, snapshot in rollback_dicts:
+                message.clear()
+                message.update(snapshot)
+            messages[:] = rollback_items
+            for name, value in rollback_state.items():
+                setattr(self, name, value)
+            session_db = getattr(self, "_session_db", None)
+            session_id = getattr(self, "_session_id", "")
+            if compression_lock_holder and session_db and session_id:
+                try:
+                    _latest_fingerprint, latest = (
+                        _capture_durable_compaction_view(
+                            session_db,
+                            session_id,
+                            pending_suffix_source or messages,
+                        )
+                    )
+                    return latest
+                except Exception:
+                    pass
+            return messages
 
         # Baseline for telemetry. Taken only once an exchange is in hand, so
         # turns that no-op early don't pay for the scan.
@@ -6052,7 +6300,13 @@ This compaction should PRIORITISE preserving all information related to the focu
         if self._needs_defrag():
             defragged = self._defrag_rolling_summary(messages)
             if defragged:
-                self._sync_micro_compact_to_db(messages)
+                committed = self._sync_micro_compact_to_db(
+                    messages,
+                    expected_active_fingerprint=expected_active_fingerprint,
+                    compression_lock_holder=compression_lock_holder,
+                )
+                if not committed:
+                    return _rollback_failed_commit()
                 self._micro_compact_consecutive_failures = 0
                 self._micro_compact_last_failure_cursor = -1
             self._emit_micro_compaction_telemetry(
@@ -6118,7 +6372,13 @@ This compaction should PRIORITISE preserving all information related to the focu
             messages, exchange_start, exchange_end, supersede=_cumulative,
         )
         self._micro_compact_cursor = self._cursor_after_splice(result, exchange_start + 1)
-        self._sync_micro_compact_to_db(result)
+        committed = self._sync_micro_compact_to_db(
+            result,
+            expected_active_fingerprint=expected_active_fingerprint,
+            compression_lock_holder=compression_lock_holder,
+        )
+        if not committed:
+            return _rollback_failed_commit()
         self._emit_micro_compaction_telemetry(
             outcome="absorbed",
             messages_before=_messages_before,
@@ -6247,7 +6507,10 @@ This compaction should PRIORITISE preserving all information related to the focu
     def _sync_micro_compact_to_db(
         self,
         compacted_messages: List[Dict[str, Any]],
-    ) -> None:
+        *,
+        expected_active_fingerprint: Optional[List[tuple]],
+        compression_lock_holder: Optional[str] = None,
+    ) -> bool:
         """Persist the micro-compacted message set to the session DB.
 
         Soft-archives every currently-active message row (``active = 0``)
@@ -6257,6 +6520,9 @@ This compaction should PRIORITISE preserving all information related to the focu
         ``_flush_messages_to_session_db_unlocked``) skips them: they are
         already correctly stored.
 
+        Returns whether the rewrite committed (or no durable DB is bound).
+        A false result requires the caller to discard its in-memory rewrite.
+
         Without this, the in-memory-only splice leaves old exchange rows at
         ``active=1``, and a session resume double-loads both the summary and
         the original messages — blowing past the model's context limit.
@@ -6264,17 +6530,47 @@ This compaction should PRIORITISE preserving all information related to the focu
         session_db = getattr(self, "_session_db", None)
         session_id = getattr(self, "_session_id", "")
         if not session_db or not session_id:
-            return
+            return True
+        acquire_lock = getattr(session_db, "try_acquire_compression_lock", None)
+        release_lock = getattr(session_db, "release_compression_lock", None)
+        archive_and_compact = getattr(session_db, "archive_and_compact", None)
+        if not all(callable(fn) for fn in (acquire_lock, release_lock, archive_and_compact)):
+            return False
+
+        from agent.conversation_compression import _compression_lock_holder
+
+        lock_holder = compression_lock_holder or _compression_lock_holder(self)
+        owns_lock = compression_lock_holder is None
+        acquired = False
         try:
-            session_db.archive_and_compact(session_id, compacted_messages)
+            if owns_lock:
+                acquired = bool(acquire_lock(session_id, lock_holder))
+                if not acquired:
+                    return False
+            archive_and_compact(
+                session_id,
+                compacted_messages,
+                compression_lock_holder=lock_holder,
+                require_compression_lease=True,
+                expected_active_fingerprint=expected_active_fingerprint,
+            )
             for msg in compacted_messages:
                 if isinstance(msg, dict):
                     msg[_DB_PERSISTED_MARKER] = True
-        except Exception:
+            return True
+        except Exception as exc:
             logger.info(
-                "Micro-compaction DB sync failed — resume will double-load "
-                "compacted messages until the next batch compression"
+                "Micro-compaction DB sync failed; retaining the original "
+                "transcript: %s",
+                exc,
             )
+            return False
+        finally:
+            if owns_lock and acquired:
+                try:
+                    release_lock(session_id, lock_holder)
+                except Exception as exc:
+                    logger.debug("micro-compaction lease release failed: %s", exc)
 
     def _splice_micro_compact_result(
         self,
@@ -6546,6 +6842,38 @@ This compaction should PRIORITISE preserving all information related to the focu
 
         # Use token-budget tail protection instead of fixed message count
         compress_end = self._find_tail_cut_by_tokens(messages, compress_start)
+
+        # A resumed standalone handoff can be the only row outside the 1.5x
+        # tail allowance.  Stripping that handoff then leaves an empty middle
+        # even though older complete turns are sitting in the protected tail.
+        # Retry at the raw budget only for that exact shape, and include the
+        # first complete pre-active exchange so the retry cannot split a turn.
+        initial_middle = messages[compress_start:compress_end]
+        if (
+            initial_middle
+            and all(
+                self._is_context_summary_message(message)
+                and self._strip_context_summary_handoff_message(
+                    _fresh_compaction_message_copy(message)
+                ) is None
+                for message in initial_middle
+            )
+            and any(
+                not self._is_context_summary_message(message)
+                for message in messages[compress_end:]
+            )
+        ):
+            exchange = self._find_one_exchange(
+                messages, compress_end, latest_actionable_idx
+            )
+            if exchange is not None:
+                raw_compress_end = self._find_tail_cut_by_tokens(
+                    messages,
+                    compress_start,
+                    use_soft_ceiling=False,
+                )
+                if raw_compress_end > compress_end:
+                    compress_end = max(raw_compress_end, exchange[1])
 
         # A double role collision can merge the summary into the first tail
         # row. Keep an actionable user event out of that position by retaining
@@ -7267,6 +7595,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         self._micro_compact_consecutive_failures = 0
         self._micro_compact_last_failure_cursor = -1
         self._proactive_prune_rearm_tokens = 0
+        self._proactive_prune_runway_authoritative = True
 
         return compressed
 

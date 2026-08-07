@@ -779,6 +779,90 @@ def test_run_conversation_codex_plain_text(monkeypatch):
     assert result["messages"][-1]["content"] == "OK"
 
 
+def test_codex_pre_api_pressure_uses_projected_wire_history(monkeypatch):
+    """Private Responses replay state must not cause false-early compaction."""
+    agent = _build_agent(monkeypatch)
+    agent.context_compressor.threshold_tokens = 240_000
+    monkeypatch.setattr(
+        agent,
+        "_interruptible_api_call",
+        lambda api_kwargs: _codex_message_response("OK"),
+    )
+
+    visible = "v" * 40_000
+    history = [
+        {"role": "user", "content": "Earlier request"},
+        {
+            "role": "assistant",
+            "content": visible,
+            "reasoning_content": "r" * 40_000,
+            "codex_reasoning_items": [
+                {
+                    "type": "reasoning",
+                    "encrypted_content": "e" * 900_000,
+                }
+            ],
+            "codex_message_items": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "status": "completed",
+                    "content": [{"type": "output_text", "text": visible}],
+                }
+            ],
+        },
+    ]
+    compression_calls = []
+
+    def _compress(messages, system_message, **kwargs):
+        compression_calls.append(kwargs["approx_tokens"])
+        return [
+            {"role": "user", "content": "Earlier request"},
+            {"role": "assistant", "content": "Summary"},
+            {"role": "user", "content": "Continue"},
+        ], system_message
+
+    monkeypatch.setattr(agent, "_compress_context", _compress)
+
+    result = agent.run_conversation("Continue", conversation_history=history)
+
+    assert result["completed"] is True
+    assert compression_calls == []
+
+
+def test_codex_pre_api_pressure_still_compresses_true_wire_oversize(monkeypatch):
+    """A genuinely oversized Responses request remains a positive control."""
+    agent = _build_agent(monkeypatch)
+    agent.context_compressor.threshold_tokens = 240_000
+    monkeypatch.setattr(
+        agent,
+        "_interruptible_api_call",
+        lambda api_kwargs: _codex_message_response("OK"),
+    )
+
+    history = [
+        {"role": "user", "content": "x" * 1_000_000},
+        {"role": "assistant", "content": "Earlier answer"},
+    ]
+    compression_calls = []
+
+    def _compress(messages, system_message, **kwargs):
+        compression_calls.append(kwargs["approx_tokens"])
+        return [
+            {"role": "user", "content": "Earlier request"},
+            {"role": "assistant", "content": "Summary"},
+            {"role": "user", "content": "Continue"},
+        ], system_message
+
+    monkeypatch.setattr(agent, "_compress_context", _compress)
+
+    result = agent.run_conversation("Continue", conversation_history=history)
+
+    assert result["completed"] is True
+    assert compression_calls
+    assert compression_calls[0] >= 240_000
+
+
 def test_codex_preflight_defangs_harmony_tokens_before_and_after_middleware(monkeypatch):
     """Both mutable request boundaries must reject literal Harmony wire tokens."""
     agent = _build_agent(monkeypatch)

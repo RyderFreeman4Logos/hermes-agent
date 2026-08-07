@@ -4234,7 +4234,10 @@ class GatewaySlashCommandsMixin:
                 _sys_prompt = getattr(tmp_agent, "_cached_system_prompt", "") or ""
                 _tools = getattr(tmp_agent, "tools", None) or None
                 approx_tokens = estimate_request_tokens_rough(
-                    msgs, system_prompt=_sys_prompt, tools=_tools
+                    msgs,
+                    system_prompt=_sys_prompt,
+                    tools=_tools,
+                    api_mode=getattr(tmp_agent, "api_mode", None),
                 )
 
                 compressor = tmp_agent.context_compressor
@@ -4343,7 +4346,10 @@ class GatewaySlashCommandsMixin:
                     session_entry.session_key, last_prompt_tokens=0
                 )
                 new_tokens = estimate_request_tokens_rough(
-                    compressed, system_prompt=_sys_prompt, tools=_tools
+                    compressed,
+                    system_prompt=_sys_prompt,
+                    tools=_tools,
+                    api_mode=getattr(tmp_agent, "api_mode", None),
                 )
                 summary = summarize_manual_compression(
                     msgs,

@@ -2115,7 +2115,7 @@ class ProcessRegistry:
         if session.notify_on_complete:
             from tools.ansi_strip import strip_ansi
             output_tail = strip_ansi(session.output_buffer[-2000:]) if session.output_buffer else ""
-            self.completion_queue.put({
+            event = {
                 "type": "completion",
                 "session_id": session.id,
                 "session_key": session.session_key,
@@ -2128,7 +2128,17 @@ class ProcessRegistry:
                 # a consumer-observed completion timestamp, this does not vary
                 # based on which watcher notices exit first.
                 "started_at": session.started_at,
-            })
+            }
+            identity = self._completion_identity(event)
+            if identity is not None:
+                with self._completion_disposition_lock:
+                    state = self._completion_dispositions.get(identity)
+                    if state in {"queued", "observed_queued", "inflight", "delivered"}:
+                        return
+                    self._set_completion_disposition(
+                        identity, "observed_queued" if state == "observed" else "queued"
+                    )
+            self.completion_queue.put(event)
 
     # ----- Query Methods -----
 
@@ -2214,8 +2224,11 @@ class ProcessRegistry:
         if identity is None:
             return False
         with self._completion_disposition_lock:
-            if self._completion_dispositions.get(identity) not in {"inflight", "delivered"}:
-                self._set_completion_disposition(identity, "observed")
+            state = self._completion_dispositions.get(identity)
+            if state not in {"inflight", "delivered", "observed_queued"}:
+                self._set_completion_disposition(
+                    identity, "observed_queued" if state == "queued" else "observed"
+                )
         return True
 
     def completion_event_should_deliver(self, evt: dict) -> bool:
@@ -2225,9 +2238,9 @@ class ProcessRegistry:
             return True
         with self._completion_disposition_lock:
             state = self._completion_dispositions.get(identity)
-            if state in {"inflight", "delivered"}:
+            if state in {"inflight", "observed_inflight", "delivered"}:
                 return False
-            if state == "observed" and self._is_observed_completion_noop(evt):
+            if state in {"observed", "observed_queued"} and self._is_observed_completion_noop(evt):
                 self._set_completion_disposition(identity, "delivered")
                 return False
         return True
@@ -2239,12 +2252,14 @@ class ProcessRegistry:
             return True
         with self._completion_disposition_lock:
             state = self._completion_dispositions.get(identity)
-            if state in {"inflight", "delivered"}:
+            if state in {"inflight", "observed_inflight", "delivered"}:
                 return False
-            if state == "observed" and self._is_observed_completion_noop(evt):
+            if state in {"observed", "observed_queued"} and self._is_observed_completion_noop(evt):
                 self._set_completion_disposition(identity, "delivered")
                 return False
-            self._set_completion_disposition(identity, "inflight")
+            self._set_completion_disposition(
+                identity, "observed_inflight" if state == "observed_queued" else "inflight"
+            )
         return True
 
     def complete_completion_delivery(self, evt: dict) -> None:
@@ -2257,8 +2272,11 @@ class ProcessRegistry:
         identity = self._completion_identity(evt)
         if identity is not None:
             with self._completion_disposition_lock:
-                if self._completion_dispositions.get(identity) == "inflight":
-                    self._completion_dispositions.pop(identity, None)
+                state = self._completion_dispositions.get(identity)
+                if state == "observed_inflight":
+                    self._set_completion_disposition(identity, "observed_queued")
+                elif state == "inflight":
+                    self._set_completion_disposition(identity, "queued")
 
     def is_session_waiting(self, session_id: str) -> bool:
         """Whether a goal loop parked on this session should still be parked.

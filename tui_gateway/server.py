@@ -9331,6 +9331,8 @@ def _sync_runtime_heartbeat_status(
     if not _notification_poller_is_current(session, stop_event):
         return previous
     current = _runtime_heartbeat_status_key(status)
+    if previous is None and not current:
+        return current
     if previous == current:
         return previous
     lifecycle_lock = session.get("_notif_lifecycle_lock")

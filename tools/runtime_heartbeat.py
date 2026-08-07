@@ -585,7 +585,7 @@ def claim_warm_snapshot(agent) -> Optional[tuple[int, Dict[str, Any], Any]]:
         identity = _warm_snapshot_identity(agent)
     except Exception:
         logger.debug("Could not validate heartbeat request snapshot", exc_info=True)
-        return None
+        return None, "identity_unavailable"
     with lock:
         if (
             state["epoch"] != epoch
@@ -1035,6 +1035,15 @@ class RuntimeHeartbeat:
                 return False
             target.baseline = baseline
             self._schedule_locked(key, target)
+        logger.info(
+            "Runtime heartbeat phase=arm target=%s owner=%s kind=%s "
+            "provider=%s interval_s=%s",
+            target.target_id,
+            target.caller_id,
+            target.kind,
+            target.provider or "-",
+            target.interval,
+        )
         return True
 
     def _schedule_locked(
@@ -1108,6 +1117,12 @@ class RuntimeHeartbeat:
                 self._publication_done.wait()
         if replacement_event is not None:
             self._queue().put(replacement_event)
+        logger.info(
+            "Runtime heartbeat phase=cancel target=%s owner=%s kind=%s",
+            target.target_id,
+            target.caller_id,
+            target.kind,
+        )
         return True
 
     def cancel_for_caller(self, caller_id: str) -> int:
@@ -1260,6 +1275,24 @@ class RuntimeHeartbeat:
                 if target.caller_id == str(caller_id)
             ]
 
+    def active_snapshots(self) -> list[Dict[str, Any]]:
+        """Return immutable UI-safe target timing snapshots."""
+        with self._lock:
+            targets = sorted(
+                self._targets.values(),
+                key=lambda target: (target.started_at, target.target_id),
+            )
+            return [
+                {
+                    "target_id": target.target_id,
+                    "caller_id": target.caller_id,
+                    "kind": target.kind,
+                    "started_at": target.started_at,
+                    "interval_s": target.interval,
+                }
+                for target in targets
+            ]
+
     @staticmethod
     def _assess(target: _Target, snapshot: Dict[str, Any]) -> tuple[str, str]:
         if target.kind == "process":
@@ -1294,6 +1327,14 @@ class RuntimeHeartbeat:
             if target is None or target.generation != generation:
                 return
             target.timer = None
+        logger.info(
+            "Runtime heartbeat phase=due target=%s owner=%s kind=%s "
+            "interval_s=%s",
+            target.target_id,
+            target.caller_id,
+            target.kind,
+            target.interval,
+        )
         inspection_error = None
         try:
             snapshot = dict(target.inspect() or {})

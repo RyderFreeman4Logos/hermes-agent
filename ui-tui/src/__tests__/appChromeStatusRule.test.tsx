@@ -1,7 +1,7 @@
 import React from 'react'
 import { describe, expect, it, vi } from 'vitest'
 
-import { StatusRule } from '../components/appChrome.js'
+import { runtimeHeartbeatLabel, StatusRule } from '../components/appChrome.js'
 import { DEFAULT_THEME } from '../theme.js'
 
 type ReactNodeLike = React.ReactNode
@@ -86,6 +86,34 @@ const findElementWithText = (node: ReactNodeLike, needle: string): React.ReactEl
   }
 
   return textContent(node).includes(needle) ? node : null
+}
+
+const findComponentByName = (node: ReactNodeLike, name: string): React.ReactElement | null => {
+  if (node === null || node === undefined || typeof node === 'boolean') {
+    return null
+  }
+
+  if (Array.isArray(node)) {
+    for (const child of node) {
+      const found = findComponentByName(child, name)
+
+      if (found) {
+        return found
+      }
+    }
+
+    return null
+  }
+
+  if (!React.isValidElement(node)) {
+    return null
+  }
+
+  if (typeof node.type === 'function' && node.type.name === name) {
+    return node
+  }
+
+  return findComponentByName(node.props.children, name)
 }
 
 const baseProps = {
@@ -176,6 +204,54 @@ describe('StatusRule background-subagent indicator', () => {
     })
 
     expect(textContent(element)).not.toContain('⛓')
+  })
+})
+
+describe('StatusRule runtime heartbeat cadence', () => {
+  const runtimeHeartbeat = {
+    active_count: 2,
+    targets: [
+      {
+        interval_s: 1700,
+        kind: 'process',
+        started_at: 1_700_000_000,
+        target_id: 'proc-a'
+      },
+      {
+        interval_s: 3300,
+        kind: 'delegation',
+        started_at: 1_700_000_001,
+        target_id: 'delegate-b'
+      }
+    ]
+  }
+
+  it('advances elapsed time locally and keeps the resolved interval', () => {
+    expect(runtimeHeartbeatLabel(runtimeHeartbeat, 1_700_000_042_000)).toBe('→checkin 42s/1700s +1')
+    expect(runtimeHeartbeatLabel(runtimeHeartbeat, 1_700_000_043_000)).toBe('→checkin 43s/1700s +1')
+  })
+
+  it('renders one footer segment for all active targets', () => {
+    const element = StatusRule({
+      ...baseProps,
+      cols: 140,
+      usage: { ...baseProps.usage, runtime_heartbeat: runtimeHeartbeat }
+    })
+
+    const checkin = findComponentByName(element, 'RuntimeHeartbeatCheckin')
+
+    expect(checkin).not.toBeNull()
+    expect(checkin!.props.heartbeat).toEqual(runtimeHeartbeat)
+  })
+
+  it('clears the footer when the reconciled snapshot is empty', () => {
+    const element = StatusRule({
+      ...baseProps,
+      cols: 140,
+      usage: { ...baseProps.usage, runtime_heartbeat: { active_count: 0, targets: [] } }
+    })
+
+    expect(textContent(element)).not.toContain('→checkin')
   })
 })
 
@@ -403,34 +479,6 @@ describe('StatusRule idle-since read-out', () => {
   // The IdleSince component uses hooks, so it can't be invoked outside a
   // renderer — assert on the element tree instead (same reason the duration
   // tests don't check SessionDuration's text).
-  const findComponentByName = (node: ReactNodeLike, name: string): React.ReactElement | null => {
-    if (node === null || node === undefined || typeof node === 'boolean') {
-      return null
-    }
-
-    if (Array.isArray(node)) {
-      for (const child of node) {
-        const found = findComponentByName(child, name)
-
-        if (found) {
-          return found
-        }
-      }
-
-      return null
-    }
-
-    if (!React.isValidElement(node)) {
-      return null
-    }
-
-    if (typeof node.type === 'function' && node.type.name === name) {
-      return node
-    }
-
-    return findComponentByName(node.props.children, name)
-  }
-
   it('shows time since the last final agent response when idle', () => {
     const endedAt = Date.now() - 42_000
 

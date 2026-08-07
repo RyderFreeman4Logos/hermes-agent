@@ -16,7 +16,7 @@ import { buildSubagentTree, treeTotals, widthByDepth } from '../lib/subagentTree
 import { fmtK } from '../lib/text.js'
 import { useScrollbarSnapshot, useViewportSnapshot } from '../lib/viewportStore.js'
 import type { Theme } from '../theme.js'
-import type { Msg, Usage } from '../types.js'
+import type { Msg, RuntimeHeartbeatStatus, Usage } from '../types.js'
 
 import { scrollbarColors } from './overlayPrimitives.js'
 
@@ -417,6 +417,43 @@ function IdleSince({ endedAt }: { endedAt: number }) {
   return `✓ ${fmtDuration(now - endedAt)}`
 }
 
+export const runtimeHeartbeatLabel = (heartbeat?: RuntimeHeartbeatStatus, now = Date.now()): string => {
+  const target = heartbeat?.targets[0]
+
+  if (
+    !target ||
+    !Number.isFinite(target.started_at) ||
+    !Number.isInteger(target.interval_s) ||
+    target.interval_s <= 0
+  ) {
+    return ''
+  }
+
+  const elapsed = Math.max(0, Math.floor(now / 1000 - target.started_at))
+  const extra = Math.max(heartbeat?.active_count ?? 0, heartbeat?.targets.length ?? 0) - 1
+
+  return `→checkin ${elapsed}s/${target.interval_s}s${extra > 0 ? ` +${extra}` : ''}`
+}
+
+function RuntimeHeartbeatCheckin({ heartbeat }: { heartbeat: RuntimeHeartbeatStatus }) {
+  const [now, setNow] = useState(() => Date.now())
+  const isOccluded = useStore($isStatusRuleOccluded)
+  const target = heartbeat.targets[0]
+
+  useEffect(() => {
+    if (isOccluded || !target) {
+      return
+    }
+
+    setNow(Date.now())
+    const id = setInterval(() => setNow(Date.now()), 1000)
+
+    return () => clearInterval(id)
+  }, [isOccluded, target?.interval_s, target?.started_at, target?.target_id])
+
+  return runtimeHeartbeatLabel(heartbeat, now)
+}
+
 const effortLabel = (effort?: string) => {
   const value = String(effort ?? '')
     .trim()
@@ -562,6 +599,7 @@ export function StatusRule({
 
   const sessionCountText = liveSessionCount > 0 ? statusSessionCountLabel(liveSessionCount) : ''
   const compressions = typeof usage.compressions === 'number' ? usage.compressions : 0
+  const heartbeatText = runtimeHeartbeatLabel(usage.runtime_heartbeat)
 
   // Dev-only readout (HERMES_DEV_CREDITS). The server omits the key entirely unless the
   // flag is on, so this segment self-hides for normal users. micros→cents is allowed money
@@ -573,6 +611,7 @@ export function StatusRule({
       : ''
 
   const showBar = !!bar && fits(SEP + stringWidth(`[${bar}] ${pct != null ? `${pct}%` : ''}`))
+  const showHeartbeat = !!heartbeatText && fits(SEP + stringWidth(heartbeatText))
   const showDuration = segs.duration && !!sessionStartedAt && fits(SEP + MAX_DURATION_WIDTH)
 
   // Idle clock — time since the last final agent response. Hidden while busy
@@ -676,6 +715,12 @@ export function StatusRule({
             <Text color={t.color.muted}>{' │ '}</Text>
             <Text color={t.color.warn}>◉ focus</Text>
           </Box>
+        ) : null}
+        {showHeartbeat ? (
+          <Text color={t.color.muted} wrap="truncate-end">
+            {' │ '}
+            <RuntimeHeartbeatCheckin heartbeat={usage.runtime_heartbeat!} />
+          </Text>
         ) : null}
         {showBar ? (
           <Text color={t.color.muted} wrap="truncate-end">

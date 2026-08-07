@@ -4505,6 +4505,94 @@ def test_tui_foreign_heartbeat_never_crosses_owner(
     )
 
 
+def test_tui_heartbeat_snapshot_reconciles_full_owner_state(monkeypatch):
+    session = _session(session_key="heartbeat-owner")
+    emitted = []
+    owner_snapshots = [
+        {
+            "caller_id": "heartbeat-owner",
+            "interval_s": 1700,
+            "kind": "process",
+            "started_at": 1_700_000_000.25,
+            "target_id": "proc-a",
+        },
+        {
+            "caller_id": "heartbeat-owner",
+            "interval_s": 1700,
+            "kind": "delegation",
+            "started_at": 1_700_000_002.25,
+            "target_id": "delegate-b",
+        },
+        {
+            "caller_id": "foreign-owner",
+            "interval_s": 3300,
+            "kind": "process",
+            "started_at": 1_700_000_003.25,
+            "target_id": "foreign",
+        },
+    ]
+    snapshots = iter((owner_snapshots, owner_snapshots, []))
+    monkeypatch.setattr(
+        "tools.runtime_heartbeat.runtime_heartbeat.active_snapshots",
+        lambda: next(snapshots),
+    )
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event_type, sid, payload: emitted.append((event_type, sid, payload)),
+    )
+
+    previous = server._sync_runtime_heartbeat_status(
+        "heartbeat-sid", session, previous=None
+    )
+    assert previous == (
+        ("proc-a", "process", 1_700_000_000.25, 1700),
+        ("delegate-b", "delegation", 1_700_000_002.25, 1700),
+    )
+    assert emitted == [
+        (
+            "session.usage",
+            "heartbeat-sid",
+            {
+                "usage": {
+                    "runtime_heartbeat": {
+                        "active_count": 2,
+                        "targets": [
+                            {
+                                "interval_s": 1700,
+                                "kind": "process",
+                                "started_at": 1_700_000_000.25,
+                                "target_id": "proc-a",
+                            },
+                            {
+                                "interval_s": 1700,
+                                "kind": "delegation",
+                                "started_at": 1_700_000_002.25,
+                                "target_id": "delegate-b",
+                            },
+                        ],
+                    }
+                }
+            },
+        )
+    ]
+
+    previous = server._sync_runtime_heartbeat_status(
+        "heartbeat-sid", session, previous=previous
+    )
+    assert len(emitted) == 1
+
+    previous = server._sync_runtime_heartbeat_status(
+        "heartbeat-sid", session, previous=previous
+    )
+    assert previous == ()
+    assert emitted[-1] == (
+        "session.usage",
+        "heartbeat-sid",
+        {"usage": {"runtime_heartbeat": {"active_count": 0, "targets": []}}},
+    )
+
+
 @pytest.mark.parametrize("existing_snapshot", [None, {
     "user": "real prompt",
     "assistant": "partial answer",

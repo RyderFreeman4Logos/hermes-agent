@@ -1303,8 +1303,6 @@ def _record_runtime_provider_activity(
     cache_context: str | None = None,
 ) -> None:
     """Rearm only the cache group reached by a successful provider call."""
-    if caller_id is None and getattr(agent, "_delegate_depth", 0):
-        return
     try:
         from tools.approval import get_current_session_key
         from tools.runtime_heartbeat import (
@@ -1329,6 +1327,7 @@ def _record_runtime_provider_activity(
                 else canonical_runtime_cache_context_identity(agent)
             ),
             activity_at=activity_at,
+            owner=agent,
         )
     except Exception:
         logger.debug("Could not reset exact heartbeat cache lease", exc_info=True)
@@ -1347,7 +1346,14 @@ def run_heartbeat_warm(
     retained_history = list(conversation_history or [])
     api_calls = 0
 
-    def finish(*, silent: bool, status: str = "", evidence: str = ""):
+    def finish(
+        *,
+        silent: bool,
+        status: str = "",
+        evidence: str = "",
+        warm_status: str = "skipped",
+        warm_reason: str = "",
+    ):
         final = "" if silent else (
             f"[HEARTBEAT ALERT] {status}: "
             f"{evidence or 'target liveness is uncertain'}"
@@ -1364,47 +1370,65 @@ def run_heartbeat_warm(
                 "heartbeat_silent_noop" if silent else "heartbeat_alert"
             ),
             "response_previewed": False,
+            "heartbeat_warm_status": warm_status,
+            "heartbeat_warm_reason": warm_reason,
         }
 
     from tools.runtime_heartbeat import (
         claim_warm_snapshot,
         commit_warm_snapshot_dispatch,
+        dispatch_warm_snapshot_request,
         release_warm_snapshot,
         runtime_heartbeat,
+        warm_snapshot_claim_reason,
         warm_snapshot_is_current,
     )
 
     if not isinstance(heartbeat_event, dict):
-        return finish(silent=True)
+        return finish(silent=True, warm_reason="missing_event")
     try:
         if not runtime_heartbeat.is_event_current(heartbeat_event, agent):
-            return finish(silent=True)
+            return finish(silent=True, warm_reason="stale_event")
     except Exception:
         logger.debug("Heartbeat event validation failed", exc_info=True)
-        return finish(silent=True)
+        return finish(silent=True, warm_reason="event_validation_error")
     status = str(heartbeat_event.get("status") or "").upper()
     if status in {"STUCK", "UNKNOWN"}:
         return finish(
             silent=False,
             status=status,
             evidence=str(heartbeat_event.get("evidence") or ""),
+            warm_reason="unhealthy_target",
         )
     if status != "ALIVE" or moa_config is not None:
-        return finish(silent=True)
+        return finish(
+            silent=True,
+            warm_status="degraded" if moa_config is not None else "skipped",
+            warm_reason="moa_forbidden" if moa_config is not None else "non_alive",
+        )
     try:
         claim = claim_warm_snapshot(agent)
     except Exception:
         logger.debug("Heartbeat snapshot claim failed", exc_info=True)
-        return finish(silent=True)
+        return finish(
+            silent=True,
+            warm_status="degraded",
+            warm_reason="snapshot_claim_error",
+        )
     if claim is None:
-        return finish(silent=True)
-    epoch, api_kwargs, dispatch_client = claim
+        reason = warm_snapshot_claim_reason(agent) or "snapshot_unavailable"
+        degraded = reason in {
+            "physical_client_unavailable",
+            "replay_not_bounded_or_cancellable",
+        }
+        return finish(
+            silent=True,
+            warm_status="degraded" if degraded else "skipped",
+            warm_reason=reason,
+        )
+    epoch, api_kwargs, dispatch = claim
     physical_client_reusable = True
     try:
-        api_kwargs["stream"] = False
-        api_kwargs.pop("stream_options", None)
-        if api_kwargs.get("tools"):
-            api_kwargs["tool_choice"] = "none"
         configured_limit = int(
             getattr(
                 getattr(agent, "context_compressor", None),
@@ -1417,7 +1441,7 @@ def run_heartbeat_warm(
             limit for limit in (configured_limit, 272_000) if limit > 0
         )
         if estimate_request_context_tokens(api_kwargs) >= pressure_limit:
-            return finish(silent=True)
+            return finish(silent=True, warm_reason="context_pressure")
         if not commit_warm_snapshot_dispatch(
             agent,
             epoch,
@@ -1425,16 +1449,18 @@ def run_heartbeat_warm(
                 heartbeat_event, agent, consume=True
             ),
         ):
-            return finish(silent=True)
+            return finish(silent=True, warm_reason="stale_or_busy")
 
         api_calls = 1
         dispatch_started_at = time.monotonic()
         physical_client_reusable = False
-        response = dispatch_client.chat.completions.create(**api_kwargs)
+        response, response_valid = dispatch_warm_snapshot_request(
+            dispatch, api_kwargs
+        )
         physical_client_reusable = True
         if (
             warm_snapshot_is_current(agent, epoch)
-            and agent._get_transport().validate_response(response)
+            and response_valid
         ):
             _record_runtime_provider_activity(
                 agent,
@@ -1443,13 +1469,24 @@ def run_heartbeat_warm(
                 provider=str(heartbeat_event.get("provider") or ""),
                 cache_context=str(heartbeat_event.get("cache_context") or ""),
             )
-    except Exception:
+            warm_status = "warmed"
+            warm_reason = "physical_success"
+        else:
+            warm_status = "degraded"
+            warm_reason = "response_validation_failed"
+    except Exception as exc:
         logger.debug("Isolated heartbeat warm attempt failed", exc_info=True)
+        warm_status = "degraded"
+        warm_reason = f"provider_error:{type(exc).__name__}"
     finally:
         release_warm_snapshot(
             agent, epoch, reusable=physical_client_reusable
         )
-    return finish(silent=True)
+    return finish(
+        silent=True,
+        warm_status=warm_status,
+        warm_reason=warm_reason,
+    )
 
 
 def run_conversation(

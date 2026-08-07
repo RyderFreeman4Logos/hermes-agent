@@ -295,6 +295,30 @@ def _completion_to_stream_chunks(completion: SimpleNamespace) -> list[SimpleName
     return [data_chunk, usage_chunk]
 
 
+class _ACPHeartbeatWarmStream:
+    """One transport event emitted after ACP confirms session cancellation."""
+
+    def __init__(self, model: str):
+        self._model = model
+        self.closed = False
+
+    def __iter__(self):
+        yield SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    index=0,
+                    delta=SimpleNamespace(role="assistant", content=None),
+                    finish_reason=None,
+                )
+            ],
+            model=self._model,
+            usage=None,
+        )
+
+    def close(self) -> None:
+        self.closed = True
+
+
 def _extract_tool_calls_from_text(text: str) -> tuple[list[ChatCompletionMessageToolCall], str]:
     if not isinstance(text, str) or not text.strip():
         return [], ""
@@ -381,11 +405,26 @@ def _ensure_path_within_cwd(path_text: str, cwd: str) -> Path:
 
 
 class _ACPChatCompletions:
+    # ACP has no OpenAI-style output cap. Heartbeat replay uses the protocol's
+    # required session/cancel notification after the first session/update.
+    heartbeat_warm_output_cap_paths: tuple[tuple[str, ...], ...] = ()
+    heartbeat_warm_stream_cancel = True
+
     def __init__(self, client: "CopilotACPClient"):
         self._client = client
 
     def create(self, **kwargs: Any) -> Any:
         return self._client._create_chat_completion(**kwargs)
+
+    def heartbeat_warm_create(self, **kwargs: Any) -> Any:
+        return self._client._create_heartbeat_warm_stream(**kwargs)
+
+    def heartbeat_warm_claim(self, _client: Any) -> Any:
+        return self._client._clone_for_heartbeat()
+
+    @staticmethod
+    def heartbeat_warm_release(client: Any, _reusable: bool) -> None:
+        client.close()
 
 
 class _ACPChatNamespace:
@@ -437,6 +476,34 @@ class CopilotACPClient:
             except Exception:
                 pass
 
+    def _clone_for_heartbeat(self) -> "CopilotACPClient":
+        """Build the same request-local ACP process facade used by normal calls."""
+        return CopilotACPClient(
+            api_key=self.api_key,
+            base_url=self.base_url,
+            default_headers=self._default_headers,
+            acp_command=self._acp_command,
+            acp_args=self._acp_args,
+            acp_cwd=self._acp_cwd,
+        )
+
+    @staticmethod
+    def _effective_timeout_seconds(timeout: Any) -> float:
+        if timeout is None:
+            return _DEFAULT_TIMEOUT_SECONDS
+        if isinstance(timeout, (int, float)):
+            return float(timeout)
+        candidates = [
+            getattr(timeout, attr, None)
+            for attr in ("read", "write", "connect", "pool", "timeout")
+        ]
+        numeric = [
+            float(value)
+            for value in candidates
+            if isinstance(value, (int, float))
+        ]
+        return max(numeric) if numeric else _DEFAULT_TIMEOUT_SECONDS
+
     def _create_chat_completion(
         self,
         *,
@@ -454,21 +521,8 @@ class CopilotACPClient:
             tools=tools,
             tool_choice=tool_choice,
         )
-        # Normalise timeout: run_agent.py may pass an httpx.Timeout object
-        # (used natively by the OpenAI SDK) rather than a plain float.
-        if timeout is None:
-            _effective_timeout = _DEFAULT_TIMEOUT_SECONDS
-        elif isinstance(timeout, (int, float)):
-            _effective_timeout = float(timeout)
-        else:
-            # httpx.Timeout or similar — pick the largest component so the
-            # subprocess has enough wall-clock time for the full response.
-            _candidates = [
-                getattr(timeout, attr, None)
-                for attr in ("read", "write", "connect", "pool", "timeout")
-            ]
-            _numeric = [float(v) for v in _candidates if isinstance(v, (int, float))]
-            _effective_timeout = max(_numeric) if _numeric else _DEFAULT_TIMEOUT_SECONDS
+        # run_agent.py may pass an httpx.Timeout rather than a plain float.
+        _effective_timeout = self._effective_timeout_seconds(timeout)
 
         response_text, reasoning_text = self._run_prompt(
             prompt_text,
@@ -501,7 +555,36 @@ class CopilotACPClient:
             return _completion_to_stream_chunks(completion)
         return completion
 
-    def _run_prompt(self, prompt_text: str, *, timeout_seconds: float) -> tuple[str, str]:
+    def _create_heartbeat_warm_stream(
+        self,
+        *,
+        model: str | None = None,
+        messages: list[dict[str, Any]] | None = None,
+        timeout: float | None = None,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: Any = None,
+        **_: Any,
+    ) -> _ACPHeartbeatWarmStream:
+        prompt_text = _format_messages_as_prompt(
+            messages or [],
+            model=model,
+            tools=tools,
+            tool_choice=tool_choice,
+        )
+        self._run_prompt(
+            prompt_text,
+            timeout_seconds=self._effective_timeout_seconds(timeout),
+            cancel_after_first_update=True,
+        )
+        return _ACPHeartbeatWarmStream(model or "copilot-acp")
+
+    def _run_prompt(
+        self,
+        prompt_text: str,
+        *,
+        timeout_seconds: float,
+        cancel_after_first_update: bool = False,
+    ) -> tuple[str, str]:
         try:
             # Hide the console the CLI child would otherwise flash on Windows
             # (#56747). Hide-only — stdio pipes stay intact for the ACP wire.
@@ -556,9 +639,19 @@ class CopilotACPClient:
         err_thread.start()
 
         next_id = 0
+        warm_cancel_sent = False
+
+        def _notify(method: str, params: dict[str, Any]) -> None:
+            payload = {
+                "jsonrpc": "2.0",
+                "method": method,
+                "params": params,
+            }
+            proc.stdin.write(json.dumps(payload) + "\n")
+            proc.stdin.flush()
 
         def _request(method: str, params: dict[str, Any], *, text_parts: list[str] | None = None, reasoning_parts: list[str] | None = None) -> Any:
-            nonlocal next_id
+            nonlocal next_id, warm_cancel_sent
             next_id += 1
             request_id = next_id
             payload = {
@@ -586,6 +679,17 @@ class CopilotACPClient:
                     text_parts=text_parts,
                     reasoning_parts=reasoning_parts,
                 ):
+                    if (
+                        cancel_after_first_update
+                        and method == "session/prompt"
+                        and not warm_cancel_sent
+                        and msg.get("method") == "session/update"
+                    ):
+                        _notify(
+                            "session/cancel",
+                            {"sessionId": params["sessionId"]},
+                        )
+                        warm_cancel_sent = True
                     continue
 
                 if msg.get("id") != request_id:
@@ -648,7 +752,7 @@ class CopilotACPClient:
 
             text_parts: list[str] = []
             reasoning_parts: list[str] = []
-            _request(
+            prompt_result = _request(
                 "session/prompt",
                 {
                     "sessionId": session_id,
@@ -662,6 +766,19 @@ class CopilotACPClient:
                 text_parts=text_parts,
                 reasoning_parts=reasoning_parts,
             )
+            if cancel_after_first_update:
+                if not warm_cancel_sent:
+                    raise RuntimeError(
+                        "Copilot ACP completed without a cancellable session/update"
+                    )
+                stop_reason = str(
+                    (prompt_result or {}).get("stopReason") or ""
+                ).strip().lower()
+                if stop_reason != "cancelled":
+                    raise RuntimeError(
+                        "Copilot ACP did not confirm session/cancel "
+                        f"(stopReason={stop_reason or 'missing'})"
+                    )
             return "".join(text_parts), "".join(reasoning_parts)
         finally:
             self.close()

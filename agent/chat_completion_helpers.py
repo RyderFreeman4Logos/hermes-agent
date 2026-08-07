@@ -449,7 +449,116 @@ def _bedrock_reasoning_stale_floor(model_id: object) -> "float | None":
     return None
 
 
-def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
+def _anthropic_warm_replay_plan(agent, *, streaming: bool = False):
+    """Replay the validated Anthropic wire through its request-client factory."""
+    from tools.runtime_heartbeat import build_warm_replay_plan
+
+    def _dispatch(client, kwargs):
+        if not streaming:
+            return agent._anthropic_messages_create(kwargs, client=client)
+        from agent.anthropic_adapter import sanitize_anthropic_kwargs
+
+        wire_kwargs = dict(kwargs)
+        sanitize_anthropic_kwargs(
+            wire_kwargs,
+            log_prefix=getattr(agent, "log_prefix", ""),
+        )
+        manager = client.messages.stream(**wire_kwargs)
+        raw_stream = manager.__enter__()
+
+        class _ManagedWarmStream:
+            def __iter__(self):
+                return iter(raw_stream)
+
+            def close(self):
+                manager.__exit__(None, None, None)
+
+        return _ManagedWarmStream()
+
+    def _valid_event(event):
+        event_type = str(getattr(event, "type", "") or "").lower()
+        if event_type == "error" or event_type.endswith(("_error", ".error")):
+            raise RuntimeError("heartbeat replay Anthropic error event")
+        return bool(event_type)
+
+    return build_warm_replay_plan(
+        name=("anthropic.messages.stream" if streaming else "anthropic.messages.create"),
+        dispatch=_dispatch,
+        claim=lambda _client: agent._create_request_anthropic_client(
+            reason="heartbeat_warm"
+        ),
+        release=lambda client, reusable: agent._close_request_anthropic_client(
+            client,
+            reason=(
+                "heartbeat_warm_complete"
+                if reusable
+                else "heartbeat_warm_error_cleanup"
+            ),
+        ),
+        validate_response=lambda response: bool(
+            agent._get_transport().validate_response(response)
+        ),
+        output_cap_paths=(("max_tokens",),),
+        identity=lambda: getattr(agent, "_anthropic_client", None),
+        stream_cancel=streaming,
+        stream_when_bounded=streaming,
+        validate_event=_valid_event if streaming else None,
+    )
+
+
+def _bedrock_warm_replay_plan(agent, *, region: str, streaming: bool):
+    """Replay one validated Bedrock Converse wire without agent-loop effects."""
+    from agent.bedrock_adapter import (
+        _get_bedrock_runtime_client,
+        invalidate_runtime_client,
+        is_stale_connection_error,
+        normalize_converse_response,
+    )
+    from tools.runtime_heartbeat import build_warm_replay_plan
+
+    def _claim(expected):
+        current = _get_bedrock_runtime_client(region)
+        return current if current is expected else None
+
+    def _dispatch(client, kwargs):
+        wire_kwargs = dict(kwargs)
+        wire_kwargs.pop("__bedrock_region__", None)
+        wire_kwargs.pop("__bedrock_converse__", None)
+        try:
+            if streaming:
+                return client.converse_stream(**wire_kwargs).get("stream", [])
+            return normalize_converse_response(client.converse(**wire_kwargs))
+        except Exception as exc:
+            if is_stale_connection_error(exc):
+                invalidate_runtime_client(region)
+            raise
+
+    def _valid_bedrock_event(event):
+        if not isinstance(event, dict):
+            return False
+        if any(str(key).lower().endswith(("exception", "error")) for key in event):
+            raise RuntimeError("heartbeat replay Bedrock error event")
+        return bool(event)
+
+    return build_warm_replay_plan(
+        name=("bedrock.converse_stream" if streaming else "bedrock.converse"),
+        dispatch=_dispatch,
+        claim=_claim,
+        release=lambda _client, _reusable: None,
+        validate_response=lambda response: bool(
+            agent._get_transport().validate_response(response)
+        ),
+        output_cap_paths=(("inferenceConfig", "maxTokens"),),
+        identity=lambda: _get_bedrock_runtime_client(region),
+        stream_cancel=streaming,
+        stream_when_bounded=streaming,
+        validate_event=_valid_bedrock_event if streaming else None,
+    )
+
+
+def _dispatch_nonstreaming_api_request(
+    agent, api_kwargs: dict, *, make_client, bind_warm=lambda *_args, **_kwargs: None
+):
     """Run one non-streaming LLM request for the active api_mode and return it.
 
     Shared by the interrupt-worker path (``interruptible_api_call``) and the
@@ -494,6 +603,12 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         region = api_kwargs.pop("__bedrock_region__", "us-east-1")
         api_kwargs.pop("__bedrock_converse__", None)
         client = _get_bedrock_runtime_client(region)
+        bind_warm(
+            client,
+            replay=_bedrock_warm_replay_plan(
+                agent, region=region, streaming=False
+            ),
+        )
         try:
             raw_response = client.converse(**api_kwargs)
         except Exception as _bedrock_exc:
@@ -507,6 +622,7 @@ def _dispatch_nonstreaming_api_request(agent, api_kwargs: dict, *, make_client):
         # MoA is a virtual chat-completions provider backed by the
         # in-process MoAClient facade. Do not rebuild a request-local
         # OpenAI client from the virtual runtime metadata.
+        bind_warm(agent.client)
         return agent.client.chat.completions.create(**api_kwargs)
     request_client = make_client("chat_completion_request")
     return request_client.chat.completions.create(**api_kwargs)
@@ -739,10 +855,23 @@ def interruptible_api_call(agent, api_kwargs: dict):
             # only shuts the connection down rather than racing the worker
             # for FD ownership during ``client.close()``.
             request_client_holder["owner_tid"] = threading.get_ident()
-        if kind == "openai":
-            warm_token = bind_normal_warm_snapshot_client(
-                agent, warm_token, client
-            )
+        warm_token = bind_normal_warm_snapshot_client(
+            agent,
+            warm_token,
+            client,
+            replay=(
+                _anthropic_warm_replay_plan(agent)
+                if kind == "anthropic_messages"
+                else None
+            ),
+        )
+        return client
+
+    def _bind_warm_client(client, *, replay=None):
+        nonlocal warm_token
+        warm_token = bind_normal_warm_snapshot_client(
+            agent, warm_token, client, replay=replay
+        )
         return client
 
     def _close_request_client_once(reason: str) -> None:
@@ -809,6 +938,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
                     ),
                     kind=kind,
                 ),
+                bind_warm=_bind_warm_client,
             )
             finish_normal_warm_snapshot(agent, warm_token, succeeded=False)
             result["response"] = defer_normal_warm_snapshot_until_validated(
@@ -2694,12 +2824,40 @@ def interruptible_streaming_api_call(
                 )
                 intercepted_events = []
                 writer_token = {"value": None}
+                warm_token_holder = {"value": None}
+
+                def _defer_bedrock_snapshot(response: Any) -> Any:
+                    from tools.runtime_heartbeat import (
+                        defer_normal_warm_snapshot_until_validated,
+                    )
+
+                    warm_token = warm_token_holder.pop("value", None)
+                    if warm_token is None:
+                        return response
+                    return defer_normal_warm_snapshot_until_validated(
+                        agent, warm_token, response
+                    )
 
                 def _open_bedrock_stream(next_api_kwargs: dict[str, Any]):
+                    from tools.runtime_heartbeat import (
+                        begin_normal_warm_snapshot,
+                        bind_normal_warm_snapshot_client,
+                        finish_normal_warm_snapshot,
+                    )
+
                     final_kwargs = dict(next_api_kwargs)
                     region = final_kwargs.pop("__bedrock_region__", "us-east-1")
                     final_kwargs.pop("__bedrock_converse__", None)
                     client = _get_bedrock_runtime_client(region)
+                    warm_token = begin_normal_warm_snapshot(agent, final_kwargs)
+                    warm_token = bind_normal_warm_snapshot_client(
+                        agent,
+                        warm_token,
+                        client,
+                        replay=_bedrock_warm_replay_plan(
+                            agent, region=region, streaming=True
+                        ),
+                    )
                     try:
                         raw_response = client.converse_stream(**final_kwargs)
                     except Exception as _bedrock_exc:
@@ -2708,6 +2866,9 @@ def interruptible_streaming_api_call(
                         # the real provider request and terminal response still
                         # share one lifecycle boundary.
                         if is_streaming_access_denied_error(_bedrock_exc):
+                            finish_normal_warm_snapshot(
+                                agent, warm_token, succeeded=False
+                            )
                             agent._disable_streaming = True
                             agent._safe_print(
                                 "\n⚠  AWS IAM denied bedrock:InvokeModelWithResponseStream — "
@@ -2719,12 +2880,39 @@ def interruptible_streaming_api_call(
                                 "using non-streaming converse() for this session.",
                                 type(_bedrock_exc).__name__,
                             )
-                            return normalize_converse_response(
-                                client.converse(**final_kwargs)
+                            warm_token = begin_normal_warm_snapshot(
+                                agent, final_kwargs
                             )
+                            warm_token = bind_normal_warm_snapshot_client(
+                                agent,
+                                warm_token,
+                                client,
+                                replay=_bedrock_warm_replay_plan(
+                                    agent, region=region, streaming=False
+                                ),
+                            )
+                            try:
+                                response = normalize_converse_response(
+                                    client.converse(**final_kwargs)
+                                )
+                            except BaseException:
+                                finish_normal_warm_snapshot(
+                                    agent, warm_token, succeeded=False
+                                )
+                                raise
+                            finish_normal_warm_snapshot(
+                                agent, warm_token, succeeded=False
+                            )
+                            warm_token_holder["value"] = warm_token
+                            return response
                         if is_stale_connection_error(_bedrock_exc):
                             invalidate_runtime_client(region)
+                        finish_normal_warm_snapshot(
+                            agent, warm_token, succeeded=False
+                        )
                         raise
+                    finish_normal_warm_snapshot(agent, warm_token, succeeded=False)
+                    warm_token_holder["value"] = warm_token
                     return raw_response.get("stream", [])
 
                 def _on_text(text):
@@ -2789,7 +2977,9 @@ def interruptible_streaming_api_call(
                     on_interrupt_check=lambda: agent._interrupt_requested,
                     on_event=lambda: _bedrock_last_event.__setitem__("t", time.time()),
                 )
-                result["response"] = stream.final_response or streamed_response
+                result["response"] = _defer_bedrock_snapshot(
+                    stream.final_response or streamed_response
+                )
             except Exception as e:
                 result["error"] = e
             finally:
@@ -3704,6 +3894,7 @@ def interruptible_streaming_api_call(
         request_client_holder["diag"] = _diag
         _writer_token = {"value": None}
         _stream_context = {"manager": None, "stream": None}
+        warm_token_holder = {"value": None}
         base_final_message = None
 
         from agent import relay_llm
@@ -3711,15 +3902,47 @@ def interruptible_streaming_api_call(
 
         accumulator = relay_llm.AnthropicStreamAccumulator()
 
+        def _defer_anthropic_snapshot(response: Any) -> Any:
+            from tools.runtime_heartbeat import (
+                defer_normal_warm_snapshot_until_validated,
+            )
+
+            warm_token = warm_token_holder.pop("value", None)
+            if warm_token is None:
+                return response
+            return defer_normal_warm_snapshot_until_validated(
+                agent, warm_token, response
+            )
+
         def _open_anthropic_stream(next_api_kwargs: dict[str, Any]):
+            from tools.runtime_heartbeat import (
+                begin_normal_warm_snapshot,
+                bind_normal_warm_snapshot_client,
+                finish_normal_warm_snapshot,
+            )
+
             final_kwargs = dict(next_api_kwargs)
             sanitize_anthropic_kwargs(
                 final_kwargs,
                 log_prefix=getattr(agent, "log_prefix", ""),
             )
-            manager = request_client.messages.stream(**final_kwargs)
-            _stream_context["manager"] = manager
-            return manager.__enter__()
+            warm_token = begin_normal_warm_snapshot(agent, final_kwargs)
+            warm_token = bind_normal_warm_snapshot_client(
+                agent,
+                warm_token,
+                request_client,
+                replay=_anthropic_warm_replay_plan(agent, streaming=True),
+            )
+            try:
+                manager = request_client.messages.stream(**final_kwargs)
+                _stream_context["manager"] = manager
+                raw_stream = manager.__enter__()
+            except BaseException:
+                finish_normal_warm_snapshot(agent, warm_token, succeeded=False)
+                raise
+            finish_normal_warm_snapshot(agent, warm_token, succeeded=False)
+            warm_token_holder["value"] = warm_token
+            return raw_stream
 
         def _anthropic_stream_created(raw_stream: Any) -> None:
             _stream_context["stream"] = raw_stream
@@ -3843,7 +4066,7 @@ def interruptible_streaming_api_call(
                 "(possible upstream error or malformed event stream)."
             )
         if base_final_message is not None and not stream.output_modified:
-            return base_final_message
+            return _defer_anthropic_snapshot(base_final_message)
         final_message = accumulator.response(base_final_message)
         if (
             not getattr(final_message, "content", None)
@@ -3853,7 +4076,7 @@ def interruptible_streaming_api_call(
                 "Provider returned an empty stream with no stop_reason "
                 "(possible upstream error or malformed event stream)."
             )
-        return final_message
+        return _defer_anthropic_snapshot(final_message)
 
     def _call():
         import httpx as _httpx

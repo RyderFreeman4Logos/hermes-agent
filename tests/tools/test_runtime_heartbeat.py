@@ -330,6 +330,169 @@ def test_due_targets_for_one_owner_coalesce_to_one_warm_event():
     assert len(FakeTimer.created) == 4
 
 
+def test_same_visible_session_keeps_distinct_agent_owners_and_warms_each(monkeypatch):
+    from tools.runtime_heartbeat import (
+        RuntimeHeartbeat,
+        bind_agent_provider,
+        reset_current_provider,
+    )
+
+    class ImmediateThread:
+        def __init__(self, target, **_kwargs):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    class Owner:
+        provider = "openai"
+        requested_provider = "openai"
+        base_url = "https://api.openai.invalid/v1"
+        model = "model"
+        api_mode = "chat_completions"
+
+        def __init__(self):
+            self.calls = []
+
+        def run_conversation(self, message, **kwargs):
+            self.calls.append((message, kwargs))
+            return {
+                "silent_noop": True,
+                "heartbeat_warm_status": "warmed",
+                "heartbeat_warm_reason": "physical_success",
+            }
+
+    monkeypatch.setattr("tools.runtime_heartbeat.threading.Thread", ImmediateThread)
+    FakeTimer.created = []
+    events = queue.Queue()
+    manager = RuntimeHeartbeat(event_queue=events, timer_factory=FakeTimer)
+    owners = [Owner(), Owner()]
+    alive = lambda: {"alive": True, "progress": True}
+
+    for index, owner in enumerate(owners):
+        token = bind_agent_provider(owner)
+        try:
+            assert manager.arm(
+                f"target-{index}",
+                caller_id="visible-root-session",
+                kind="delegation",
+                interval=1700,
+                inspect=alive,
+            )
+        finally:
+            reset_current_provider(token)
+
+    first, second = FakeTimer.created
+    first.callback()
+    second.callback()
+
+    published = [events.get_nowait(), events.get_nowait()]
+    assert {event["target_id"] for event in published} == {
+        "target-0",
+        "target-1",
+    }
+    assert [len(owner.calls) for owner in owners] == [1, 1]
+    assert owners[0].calls[0][1]["heartbeat_event"]["target_id"] == "target-0"
+    assert owners[1].calls[0][1]["heartbeat_event"]["target_id"] == "target-1"
+    assert all(event["heartbeat_warm_owned"] is True for event in published)
+
+
+def test_provider_activity_resets_only_the_exact_agent_owner(monkeypatch):
+    from tools.runtime_heartbeat import RuntimeHeartbeat
+
+    class Owner:
+        pass
+
+    FakeTimer.created = []
+    clock = SimpleNamespace(now=100.0)
+    monkeypatch.setattr("tools.runtime_heartbeat.time.monotonic", lambda: clock.now)
+    manager = RuntimeHeartbeat(event_queue=queue.Queue(), timer_factory=FakeTimer)
+    owners = [Owner(), Owner()]
+    alive = lambda: {"alive": True, "progress": True}
+    for index, owner in enumerate(owners):
+        assert manager.arm(
+            f"target-{index}",
+            caller_id="visible-root-session",
+            kind="delegation",
+            interval=1700,
+            inspect=alive,
+            provider="openai",
+            cache_context="cache",
+            owner=owner,
+        )
+    first, second = FakeTimer.created
+    clock.now = 200.0
+
+    assert manager.reset_for_caller(
+        "visible-root-session",
+        provider="openai",
+        cache_context="cache",
+        owner=owners[0],
+    ) == 1
+    assert first.cancelled is True
+    assert second.cancelled is False
+
+
+def test_successful_owned_warm_outcome_survives_its_lease_rearm(monkeypatch):
+    from tools.runtime_heartbeat import RuntimeHeartbeat
+
+    class ImmediateThread:
+        def __init__(self, target, **_kwargs):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    class Owner:
+        provider = "openai"
+        requested_provider = "openai"
+        base_url = "https://api.openai.invalid/v1"
+        model = "model"
+        api_mode = "chat_completions"
+
+        def run_conversation(self, _message, **kwargs):
+            clock.now += 1.0
+            assert manager.reset_for_caller(
+                "visible-root-session",
+                provider="openai",
+                cache_context="cache",
+                activity_at=clock.now,
+                owner=self,
+            ) == 1
+            return {
+                "heartbeat_warm_status": "warmed",
+                "heartbeat_warm_reason": "physical_success",
+            }
+
+    monkeypatch.setattr("tools.runtime_heartbeat.threading.Thread", ImmediateThread)
+    FakeTimer.created = []
+    clock = SimpleNamespace(now=100.0)
+    monkeypatch.setattr("tools.runtime_heartbeat.time.monotonic", lambda: clock.now)
+    events = queue.Queue()
+    manager = RuntimeHeartbeat(event_queue=events, timer_factory=FakeTimer)
+    owner = Owner()
+    assert manager.arm(
+        "target",
+        caller_id="visible-root-session",
+        kind="delegation",
+        interval=1700,
+        inspect=lambda: {"alive": True, "progress": True},
+        provider="openai",
+        cache_context="cache",
+        owner=owner,
+    )
+
+    FakeTimer.created[0].callback()
+
+    event = events.get_nowait()
+    target = manager._targets["target"]
+    assert target.generation != event["generation"]
+    assert event["heartbeat_warm_capability"] == "warmed"
+    assert event["heartbeat_warm_reason"] == "physical_success"
+    assert target.warm_capability == "warmed"
+    assert target.warm_reason == "physical_success"
+
+
 def test_alive_coalescing_does_not_suppress_unhealthy_group_event():
     from tools.runtime_heartbeat import RuntimeHeartbeat
 

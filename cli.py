@@ -11096,6 +11096,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 if status != "ALIVE":
                     complete_event_delivery(event, claim)
                     continue
+                if event.get("heartbeat_warm_owned"):
+                    complete_event_delivery(event, claim)
+                    continue
                 agent = getattr(self, "agent", None)
 
                 def _warm(agent=agent, event=event) -> None:

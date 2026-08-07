@@ -5338,6 +5338,7 @@ This compaction should PRIORITISE preserving all information related to the focu
     def _find_tail_cut_by_tokens(
         self, messages: List[Dict[str, Any]], head_end: int,
         token_budget: int | None = None,
+        *, use_soft_ceiling: bool = True,
     ) -> int:
         """Walk backward from the end of messages, accumulating tokens until
         the budget is reached. Returns the index where the tail starts.
@@ -5345,6 +5346,8 @@ This compaction should PRIORITISE preserving all information related to the focu
         ``token_budget`` defaults to ``self.tail_token_budget`` which is
         derived from ``summary_target_ratio * context_length``, so it
         scales automatically with the model's context window.
+        ``use_soft_ceiling=False`` applies that raw budget exactly for the
+        resumed-handoff retry in ``compress()``.
 
         Token budget is the primary criterion.  A bounded message-count floor
         keeps a short run of recent turns verbatim even when the budget is
@@ -5372,7 +5375,9 @@ This compaction should PRIORITISE preserving all information related to the focu
             min(min_tail_floor, compressible_tail_cap, available_tail)
             if available_tail > 1 else 0
         )
-        soft_ceiling = int(token_budget * 1.5)
+        soft_ceiling = (
+            int(token_budget * 1.5) if use_soft_ceiling else token_budget
+        )
         accumulated = 0
         cut_idx = n  # start from beyond the end
 
@@ -6493,6 +6498,38 @@ This compaction should PRIORITISE preserving all information related to the focu
 
         # Use token-budget tail protection instead of fixed message count
         compress_end = self._find_tail_cut_by_tokens(messages, compress_start)
+
+        # A resumed standalone handoff can be the only row outside the 1.5x
+        # tail allowance.  Stripping that handoff then leaves an empty middle
+        # even though older complete turns are sitting in the protected tail.
+        # Retry at the raw budget only for that exact shape, and include the
+        # first complete pre-active exchange so the retry cannot split a turn.
+        initial_middle = messages[compress_start:compress_end]
+        if (
+            initial_middle
+            and all(
+                self._is_context_summary_message(message)
+                and self._strip_context_summary_handoff_message(
+                    _fresh_compaction_message_copy(message)
+                ) is None
+                for message in initial_middle
+            )
+            and any(
+                not self._is_context_summary_message(message)
+                for message in messages[compress_end:]
+            )
+        ):
+            exchange = self._find_one_exchange(
+                messages, compress_end, latest_actionable_idx
+            )
+            if exchange is not None:
+                raw_compress_end = self._find_tail_cut_by_tokens(
+                    messages,
+                    compress_start,
+                    use_soft_ceiling=False,
+                )
+                if raw_compress_end > compress_end:
+                    compress_end = max(raw_compress_end, exchange[1])
 
         # A double role collision can merge the summary into the first tail
         # row. Keep an actionable user event out of that position by retaining

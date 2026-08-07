@@ -189,6 +189,55 @@ def test_cli_heartbeat_routes_only_to_owner_as_silent_warm_turn(monkeypatch):
     assert cli._pending_input.empty()
 
 
+def test_cli_does_not_duplicate_runtime_owned_warm(monkeypatch):
+    from tools.process_registry import ProcessRegistry
+
+    cli = HermesCLI.__new__(HermesCLI)
+    cli.session_id = "visible-session"
+    cli._pending_input = queue.Queue()
+    cli._session_db = None
+    calls = []
+    cli.agent = types.SimpleNamespace(
+        run_conversation=lambda *args, **kwargs: calls.append((args, kwargs))
+    )
+    class _ImmediateThread:
+        def __init__(self, target=None, **_kwargs):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    monkeypatch.setattr("cli.threading.Thread", _ImmediateThread)
+    registry = ProcessRegistry()
+    monkeypatch.setattr("tools.process_registry.process_registry", registry)
+    monkeypatch.setattr(
+        "tools.async_delegation.claim_event_delivery",
+        lambda _event, _consumer: "claim-token",
+    )
+    completed = []
+    monkeypatch.setattr(
+        "tools.async_delegation.complete_event_delivery",
+        lambda *args: completed.append(args),
+    )
+    monkeypatch.setattr(
+        "tools.runtime_heartbeat.runtime_heartbeat.is_event_current",
+        lambda _event: True,
+    )
+    event = {
+        "type": "heartbeat",
+        "target_id": "proc-heartbeat",
+        "session_key": "visible-session",
+        "status": "ALIVE",
+        "heartbeat_warm_owned": True,
+    }
+    registry.completion_queue.put(event)
+
+    cli._drain_process_notifications("cli-idle")
+
+    assert calls == []
+    assert completed == [(event, "claim-token")]
+
+
 def test_cli_unhealthy_heartbeat_is_printed_without_agent_turn(monkeypatch):
     from tools.process_registry import ProcessRegistry
 

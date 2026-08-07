@@ -9751,7 +9751,8 @@ def _handle_heartbeat_event(sid: str, session: dict, evt: dict) -> None:
         return
     if status != "ALIVE":
         return
-
+    if evt.get("heartbeat_warm_owned"):
+        return
     agent = session.get("agent")
     if agent is None:
         return

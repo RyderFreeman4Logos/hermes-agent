@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from agent.context_compressor import _capture_durable_compaction_view
 from agent.replay_cleanup import sanitize_replay_history
 from hermes_state import SessionDB
 from run_agent import AIAgent
@@ -138,6 +139,237 @@ def _assert_provider_protocol_is_closed(messages: list[dict]) -> None:
             assert row.get("tool_call_id") in outstanding_tool_calls
             outstanding_tool_calls.discard(row.get("tool_call_id"))
     assert not outstanding_tool_calls
+
+
+def _large_tool_history() -> list[dict]:
+    messages: list[dict] = [{"role": "user", "content": "original request"}]
+    for index in range(8):
+        call_id = f"call-history-{index}"
+        messages.extend([
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": "web_search", "arguments": "{}"},
+                }],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": call_id,
+                "name": "web_search",
+                "content": (chr(65 + index) * 24_000 if index < 3 else "checked"),
+            },
+        ])
+    messages.append({"role": "assistant", "content": "working in background"})
+    return messages
+
+
+def test_durable_compaction_view_overlays_persisted_completion_prefix_once(tmp_path):
+    """The live completion suffix replaces, rather than duplicates, its DB rows."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "completion-active-durable-view"
+    db.create_session(session_id, source="tui", model="test-model")
+    canonical, wire = _completion_texts()
+    call = {
+        "id": "call-completion-view",
+        "type": "function",
+        "function": {"name": "web_search", "arguments": "{}"},
+    }
+    db.append_messages_batch(session_id, [
+        {"role": "user", "content": "original request"},
+        {"role": "assistant", "content": "working in background"},
+        {
+            "role": "user",
+            "content": canonical,
+            "api_content": wire,
+            "display_kind": "hidden",
+            "display_metadata": {"completion_delivery_status": "effect_started"},
+        },
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [call],
+        },
+    ])
+
+    try:
+        expected_fingerprint, live = db.get_compaction_snapshot(session_id)
+        for row in live:
+            row["_db_persisted"] = True
+        live[-2]["_completion_delivery_active"] = True
+        live.append({
+            "role": "tool",
+            "tool_call_id": "call-completion-view",
+            "name": "web_search",
+            "content": "checked",
+        })
+
+        fingerprint, view = _capture_durable_compaction_view(db, session_id, live)
+
+        assert fingerprint == expected_fingerprint
+        assert sum(row.get("content") == canonical for row in view) == 1
+        assert sum(
+            row.get("role") == "assistant"
+            and any(
+                item.get("id") == "call-completion-view"
+                for item in row.get("tool_calls", [])
+            )
+            for row in view
+        ) == 1
+        assert view[-3:] == live[-3:]
+    finally:
+        db.close()
+
+
+def test_stale_active_completion_aborts_prune_without_rewriting_db(tmp_path):
+    """A live suffix that no longer matches its DB rows cannot rewrite them."""
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "completion-active-stale-prune"
+    db.create_session(session_id, source="tui", model="test-model")
+    canonical, wire = _completion_texts()
+    intent = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{
+            "id": "call-completion-stale",
+            "type": "function",
+            "function": {"name": "web_search", "arguments": "{}"},
+        }],
+    }
+    db.append_messages_batch(session_id, [
+        *_large_tool_history(),
+        {
+            "role": "user",
+            "content": canonical,
+            "api_content": wire,
+            "display_kind": "hidden",
+            "display_metadata": {"completion_delivery_status": "effect_started"},
+        },
+        intent,
+    ])
+    before_fingerprint, live = db.get_compaction_snapshot(session_id)
+    for row in live:
+        row["_db_persisted"] = True
+    live[-2]["_completion_delivery_active"] = True
+    live[-1]["tool_calls"][0]["function"]["arguments"] = '{"stale":true}'
+    live.append({
+        "role": "tool",
+        "tool_call_id": "call-completion-stale",
+        "name": "web_search",
+        "content": "checked",
+    })
+    agent = _make_agent(tmp_path, db, session_id)
+    compressor = agent.context_compressor
+    compressor.proactive_prune_tokens = 48_000
+    compressor.proactive_prune_min_result_chars = 8_000
+    compressor.proactive_prune_min_reclaim_tokens = 4_096
+    compressor.protect_first_n = 2
+    compressor.protect_last_n = 4
+    compressor._proactive_prune_runway_authoritative = True
+
+    try:
+        result, pruned = compressor.prune_tool_results_only(
+            live, current_tokens=120_000
+        )
+        after_fingerprint, _after = db.get_compaction_snapshot(session_id)
+
+        assert result is live
+        assert pruned == 0
+        assert after_fingerprint == before_fingerprint
+    finally:
+        db.close()
+
+
+def test_effect_started_completion_survives_proactive_prune_exactly_once(
+    tmp_path, monkeypatch
+):
+    """A durable tool intent is not duplicated by a cache-breaking prune."""
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "completion-active-proactive-prune"
+    db.create_session(session_id, source="tui", model="test-model")
+    db.append_messages_batch(session_id, _large_tool_history())
+    canonical, wire = _completion_texts()
+
+    try:
+        history = db.get_messages_as_conversation(session_id)
+        agent = _make_agent(tmp_path, db, session_id)
+        agent.compression_enabled = True
+        compressor = agent.context_compressor
+        compressor.proactive_prune_tokens = 48_000
+        compressor.proactive_prune_min_result_chars = 8_000
+        compressor.proactive_prune_min_reclaim_tokens = 4_096
+        compressor.protect_first_n = 2
+        compressor.protect_last_n = 4
+        compressor._proactive_prune_runway_authoritative = True
+        _stage_completion(agent, wire)
+        requests = _capture_client(agent, [
+            _mock_response(
+                content="",
+                finish_reason="tool_calls",
+                tool_calls=[
+                    _mock_tool_call(
+                        name="web_search",
+                        arguments="{}",
+                        call_id="call-completion-prune",
+                    )
+                ],
+                usage={
+                    "prompt_tokens": 120_000,
+                    "completion_tokens": 1,
+                    "total_tokens": 120_001,
+                },
+            ),
+            _mock_response(
+                content="Build passed",
+                finish_reason="stop",
+                usage={
+                    "prompt_tokens": 80_000,
+                    "completion_tokens": 2,
+                    "total_tokens": 80_002,
+                },
+            ),
+        ])
+
+        with (
+            patch.object(compressor, "should_compress", return_value=False),
+            patch("run_agent.handle_function_call", return_value="checked"),
+        ):
+            result = agent.run_conversation(
+                wire,
+                conversation_history=history,
+                task_id="completion-proactive-prune",
+            )
+
+        assert result["completion_delivery_status"] == "committed"
+        assert result["failed"] is False
+        assert agent._completion_delivery_commit_failed is False
+        assert len(requests) == 2
+        first_wire_event = next(
+            row["content"]
+            for row in requests[0]
+            if row.get("role") == "user" and row.get("content", "").startswith(wire)
+        )
+        assert sum(
+            row.get("role") == "user" and row.get("content") == first_wire_event
+            for row in requests[1]
+        ) == 1
+
+        active = db.get_messages_as_conversation(session_id)
+        events = [
+            row
+            for row in active
+            if row.get("role") == "user" and row.get("content") == canonical
+        ]
+        assert len(events) == 1
+        assert events[0]["display_metadata"] == {
+            "completion_delivery_status": "complete"
+        }
+        _assert_provider_protocol_is_closed(active)
+    finally:
+        db.close()
 
 
 @pytest.mark.parametrize("with_tool", [False, True])

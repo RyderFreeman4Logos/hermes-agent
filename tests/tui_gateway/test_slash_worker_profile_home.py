@@ -3,6 +3,7 @@
 import os
 import subprocess
 import sys
+from pathlib import Path
 from unittest.mock import MagicMock, patch, call
 
 import pytest
@@ -11,7 +12,9 @@ import pytest
 def test_slash_worker_accepts_profile_home():
     """_SlashWorker.__init__ accepts profile_home parameter."""
     with patch.dict("sys.modules", {
-        "hermes_constants": MagicMock(get_hermes_home=MagicMock(return_value="/tmp/hermes_test")),
+        "hermes_constants": MagicMock(
+            get_hermes_home=MagicMock(return_value=Path("/tmp/hermes_test"))
+        ),
     }):
         with patch("subprocess.Popen") as mock_popen:
             mock_popen.return_value.stdout = MagicMock()
@@ -33,5 +36,4 @@ def test_slash_worker_accepts_profile_home():
             call_kwargs = mock_popen.call_args[1]
             assert "env" in call_kwargs
             assert call_kwargs["env"]["HERMES_HOME"] == "/home/luke/.hermes/profiles/work"
-
 

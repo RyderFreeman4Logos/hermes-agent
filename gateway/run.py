@@ -23242,6 +23242,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
         if status != "ALIVE":
             return
+        if evt.get("heartbeat_warm_owned"):
+            return
         source = self._build_process_event_source(evt)
         if source is None or source.platform == Platform.API_SERVER:
             return

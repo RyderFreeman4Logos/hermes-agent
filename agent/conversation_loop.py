@@ -1345,11 +1345,6 @@ def run_heartbeat_warm(
 ) -> Dict[str, Any]:
     """Run one isolated cache-warm attempt without entering the turn lifecycle."""
     retained_history = list(conversation_history or [])
-    request_history = list(
-        conversation_history
-        if conversation_history is not None
-        else (getattr(agent, "_session_messages", None) or [])
-    )
     api_calls = 0
 
     def finish(*, silent: bool, status: str = "", evidence: str = ""):
@@ -1371,151 +1366,88 @@ def run_heartbeat_warm(
             "response_previewed": False,
         }
 
-    from tools.runtime_heartbeat import runtime_heartbeat
+    from tools.runtime_heartbeat import (
+        claim_warm_snapshot,
+        commit_warm_snapshot_dispatch,
+        release_warm_snapshot,
+        runtime_heartbeat,
+        warm_snapshot_is_current,
+    )
 
-    if not isinstance(heartbeat_event, dict) or not runtime_heartbeat.is_event_current(
-        heartbeat_event, agent
-    ):
+    if not isinstance(heartbeat_event, dict):
+        return finish(silent=True)
+    try:
+        if not runtime_heartbeat.is_event_current(heartbeat_event, agent):
+            return finish(silent=True)
+    except Exception:
+        logger.debug("Heartbeat event validation failed", exc_info=True)
         return finish(silent=True)
     status = str(heartbeat_event.get("status") or "").upper()
-    if status == "UNKNOWN":
+    if status in {"STUCK", "UNKNOWN"}:
         return finish(
             silent=False,
             status=status,
             evidence=str(heartbeat_event.get("evidence") or ""),
         )
-    api_mode = str(getattr(agent, "api_mode", "") or "").lower()
-    provider = str(getattr(agent, "provider", "") or "").lower()
-    base_url = str(getattr(agent, "base_url", "") or "").lower()
-    dispatch_client = agent.client
-    from agent.copilot_acp_client import CopilotACPClient
-    from agent.gemini_native_adapter import GeminiNativeClient
-
-    if (
-        status not in {"ALIVE", "STUCK"}
-        or moa_config is not None
-        or provider in {
-            "anthropic",
-            "copilot-acp",
-            "gemini",
-            "moa",
-            "openai-codex",
-        }
-        or base_url.startswith(("acp://copilot", "acp+tcp://"))
-        or isinstance(dispatch_client, (CopilotACPClient, GeminiNativeClient))
-        or api_mode != "chat_completions"
-    ):
+    if status != "ALIVE" or moa_config is not None:
         return finish(silent=True)
-
-    api_messages = []
-    for message in request_history:
-        if not isinstance(message, dict):
-            continue
-        api_message = deepcopy(message)
-        api_content = api_message.pop("api_content", None)
-        if (
-            isinstance(api_content, str)
-            and api_content
-            and message.get("role") in {"user", "assistant"}
-        ):
-            api_message["content"] = api_content
-        for field in (
-            "display_kind",
-            "display_metadata",
-            "_row_id",
-            "reasoning",
-            "finish_reason",
-            "_thinking_prefill",
-        ):
-            api_message.pop(field, None)
-        agent._copy_reasoning_content_for_api(message, api_message)
-        if agent._should_sanitize_tool_calls():
-            agent._sanitize_tool_calls_for_strict_api(api_message, model=agent.model)
-        api_messages.append(api_message)
-    api_messages.append({"role": "user", "content": deepcopy(user_message)})
-
-    active_system_prompt = (
-        system_message
-        if system_message is not None
-        else getattr(agent, "_cached_system_prompt", None)
-    )
-    effective_system = _effective_system_prompt(agent, active_system_prompt)
-    if effective_system:
-        api_messages.insert(0, {"role": "system", "content": effective_system})
-    if agent.prefill_messages:
-        system_offset = int(
-            bool(api_messages and api_messages[0].get("role") == "system")
-        )
-        for index, prefill in enumerate(agent.prefill_messages):
-            api_messages.insert(system_offset + index, deepcopy(prefill))
-    api_messages = agent._sanitize_api_messages(api_messages)
-    api_messages = agent._drop_thinking_only_and_merge_users(
-        api_messages,
-        drop_codex_reasoning_items=True,
-    )
-    for message in api_messages:
-        if isinstance(message.get("content"), str):
-            message["content"] = message["content"].strip()
-        for tool_call in message.get("tool_calls") or ():
-            try:
-                arguments = json.loads(tool_call["function"]["arguments"])
-                tool_call["function"]["arguments"] = json.dumps(
-                    arguments, separators=(",", ":"), sort_keys=True
-                )
-            except Exception:
-                try:
-                    tool_call["function"]["arguments"] = _repair_tool_call_arguments(
-                        tool_call["function"].get("arguments"),
-                        tool_call["function"].get("name", "?"),
-                    )
-                except Exception:
-                    pass
-    if agent._use_prompt_caching:
-        static_system_prefix = getattr(agent, "_cached_system_prompt_static", None)
-        api_messages = apply_anthropic_cache_control(
-            api_messages,
-            cache_ttl=agent._cache_ttl,
-            native_anthropic=agent._use_native_cache_layout,
-            static_system_prefix=(
-                static_system_prefix
-                if isinstance(static_system_prefix, str)
-                else None
-            ),
-        )
-
-    api_kwargs = agent._build_api_kwargs(api_messages)
-    if api_kwargs.get("tools"):
-        api_kwargs["tool_choice"] = "none"
-    api_kwargs["stream"] = False
-    configured_limit = int(
-        getattr(getattr(agent, "context_compressor", None), "threshold_tokens", 0)
-        or 0
-    )
-    pressure_limit = min(
-        limit for limit in (configured_limit, 272_000) if limit > 0
-    )
-    if estimate_request_context_tokens(api_kwargs) >= pressure_limit:
-        return finish(silent=True)
-    if not runtime_heartbeat.is_event_current(
-        heartbeat_event, agent, consume=True
-    ):
-        return finish(silent=True)
-
-    api_calls = 1
-    dispatch_started_at = time.monotonic()
     try:
-        response = dispatch_client.chat.completions.create(**api_kwargs)
-        if not agent._get_transport().validate_response(response):
+        claim = claim_warm_snapshot(agent)
+    except Exception:
+        logger.debug("Heartbeat snapshot claim failed", exc_info=True)
+        return finish(silent=True)
+    if claim is None:
+        return finish(silent=True)
+    epoch, api_kwargs, dispatch_client = claim
+    physical_client_reusable = True
+    try:
+        api_kwargs["stream"] = False
+        api_kwargs.pop("stream_options", None)
+        if api_kwargs.get("tools"):
+            api_kwargs["tool_choice"] = "none"
+        configured_limit = int(
+            getattr(
+                getattr(agent, "context_compressor", None),
+                "threshold_tokens",
+                0,
+            )
+            or 0
+        )
+        pressure_limit = min(
+            limit for limit in (configured_limit, 272_000) if limit > 0
+        )
+        if estimate_request_context_tokens(api_kwargs) >= pressure_limit:
             return finish(silent=True)
+        if not commit_warm_snapshot_dispatch(
+            agent,
+            epoch,
+            lambda: runtime_heartbeat.is_event_current(
+                heartbeat_event, agent, consume=True
+            ),
+        ):
+            return finish(silent=True)
+
+        api_calls = 1
+        dispatch_started_at = time.monotonic()
+        physical_client_reusable = False
+        response = dispatch_client.chat.completions.create(**api_kwargs)
+        physical_client_reusable = True
+        if (
+            warm_snapshot_is_current(agent, epoch)
+            and agent._get_transport().validate_response(response)
+        ):
+            _record_runtime_provider_activity(
+                agent,
+                dispatch_started_at,
+                caller_id=str(heartbeat_event.get("session_key") or ""),
+                provider=str(heartbeat_event.get("provider") or ""),
+                cache_context=str(heartbeat_event.get("cache_context") or ""),
+            )
     except Exception:
         logger.debug("Isolated heartbeat warm attempt failed", exc_info=True)
-    else:
-        _record_runtime_provider_activity(
-            agent,
-            dispatch_started_at,
-            caller_id=str(heartbeat_event.get("session_key") or ""),
-            provider=str(heartbeat_event.get("provider") or ""),
-            cache_context=str(heartbeat_event.get("cache_context") or ""),
+    finally:
+        release_warm_snapshot(
+            agent, epoch, reusable=physical_client_reusable
         )
     return finish(silent=True)
 
@@ -2906,6 +2838,14 @@ def run_conversation(
                             error_details.append("response.choices is None")
                         else:
                             error_details.append("response.choices is empty")
+
+                from tools.runtime_heartbeat import (
+                    finish_deferred_normal_warm_snapshot,
+                )
+
+                finish_deferred_normal_warm_snapshot(
+                    agent, response, succeeded=not response_invalid
+                )
 
                 if response_invalid:
                     agent._invoke_api_request_error_hook(

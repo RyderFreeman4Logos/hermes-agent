@@ -137,7 +137,7 @@ def test_main_runtime_refresh_preserves_scoped_cache_namespace():
 
 
 @pytest.mark.parametrize("terminal", ["return", "exception"])
-def test_heartbeat_warm_binds_logical_scope_without_leaking(
+def test_heartbeat_warm_preserves_ambient_runtime_without_leaking(
     tmp_path, monkeypatch, terminal
 ):
     from agent.auxiliary_client import _runtime_main_value, scoped_runtime_main
@@ -189,7 +189,10 @@ def test_heartbeat_warm_binds_logical_scope_without_leaking(
                 assert result == {"final_response": "ok"}
             assert runtime_snapshot() == caller_runtime
 
-        assert observed == [{**caller_runtime, "cache_scope": "root"}]
+        # Heartbeat replay bypasses the ordinary turn's auxiliary runtime.
+        # Its exact cache scope/key already live in the validated physical
+        # request snapshot, so the ambient caller scope must remain untouched.
+        assert observed == [caller_runtime]
         assert runtime_snapshot() == {field: "" for field in runtime_fields}
     finally:
         db.close()

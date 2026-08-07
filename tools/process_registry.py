@@ -108,6 +108,7 @@ class ProcessSession:
     id: str                                     # Unique session ID ("proc_xxxxxxxxxxxx")
     command: str                                 # Original command string
     task_id: str = ""                           # Task/sandbox isolation key
+    delegation_id: str = ""                     # Async delegation lifecycle owner
     session_key: str = ""                       # Gateway session key (for reset protection)
     pid: Optional[int] = None                   # OS process ID
     process: Optional[subprocess.Popen] = None  # Popen handle (local only)
@@ -189,6 +190,9 @@ class ProcessRegistry:
         self._running: Dict[str, ProcessSession] = {}
         self._finished: Dict[str, ProcessSession] = {}
         self._lock = threading.Lock()
+        self._delegation_state_changed = threading.Condition()
+        self._delegation_by_session_key: Dict[str, str] = {}
+        self._closing_delegations: set[str] = set()
 
         # Side-channel for check_interval watchers (gateway reads after agent run)
         self.pending_watchers: List[Dict[str, Any]] = []
@@ -640,6 +644,57 @@ class ProcessRegistry:
         if not isinstance(rc, int) or not self._local_descendants_settled(session):
             return False, rc if isinstance(rc, int) else None
         return True, rc
+
+    def wait_for_delegation_processes(self, delegation_id: str) -> None:
+        """Wait for terminal processes adopted by one async delegation.
+
+        The condition is signalled by the normal process settlement path, so
+        delegation finalization never needs a polling loop or a guessed delay.
+        """
+        if not delegation_id:
+            return
+        while True:
+            with self._lock:
+                pending = any(
+                    session.delegation_id == delegation_id
+                    and session.notify_on_complete
+                    for session in self._running.values()
+                )
+            if not pending:
+                return
+            with self._delegation_state_changed:
+                with self._lock:
+                    pending = any(
+                        session.delegation_id == delegation_id
+                        and session.notify_on_complete
+                        for session in self._running.values()
+                    )
+                if pending:
+                    self._delegation_state_changed.wait()
+
+    def bind_delegation_session(self, session_key: str, delegation_id: str) -> None:
+        """Remember the owner of a child session after it starts terminal work."""
+        if session_key and delegation_id:
+            with self._lock:
+                self._delegation_by_session_key[session_key] = delegation_id
+
+    def delegation_for_session(self, session_key: str) -> str:
+        with self._lock:
+            return self._delegation_by_session_key.get(session_key, "")
+
+    def begin_delegation_finalization(self, delegation_id: str) -> None:
+        """Prevent completed child lineages from starting new terminal work."""
+        if delegation_id:
+            with self._lock:
+                self._closing_delegations.add(delegation_id)
+
+    def require_open_delegation(self, delegation_id: str) -> None:
+        if delegation_id:
+            with self._lock:
+                if delegation_id in self._closing_delegations:
+                    raise RuntimeError(
+                        "Delegation is finalizing; its child can no longer start terminal work."
+                    )
 
     def _ensure_local_completion_supervisor(self, session: ProcessSession) -> None:
         """Keep a refused premature completion under autonomous supervision."""
@@ -1589,6 +1644,8 @@ class ProcessRegistry:
                 exc_info=True,
             )
         session._completion_event.set()
+        with self._delegation_state_changed:
+            self._delegation_state_changed.notify_all()
         self._write_checkpoint()
 
         # Only enqueue completion notification on the FIRST move.  Without

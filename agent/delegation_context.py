@@ -16,6 +16,10 @@ _DELEGATED_CHILD_CONTEXT: ContextVar[bool] = ContextVar(
     "hermes_delegated_child_context",
     default=False,
 )
+_DELEGATION_LIFECYCLE_ID: ContextVar[str] = ContextVar(
+    "hermes_delegation_lifecycle_id",
+    default="",
+)
 
 DELEGATED_CHILD_ENV_MARKER = "HERMES_DELEGATED_CHILD_CONTEXT"
 
@@ -28,6 +32,16 @@ KANBAN_ENV_KEYS: tuple[str, ...] = (
     "HERMES_KANBAN_BOARD",
     "HERMES_KANBAN_DB",
 )
+
+
+@contextmanager
+def delegated_lifecycle_context(delegation_id: str) -> Iterator[None]:
+    """Bind the async delegation that owns child background work."""
+    token = _DELEGATION_LIFECYCLE_ID.set(delegation_id or "")
+    try:
+        yield
+    finally:
+        _DELEGATION_LIFECYCLE_ID.reset(token)
 
 
 @contextmanager
@@ -53,6 +67,11 @@ def delegated_child_context(session_id: str | None = None) -> Iterator[None]:
 def is_delegated_child_context() -> bool:
     """Return True while code is running for a delegate_task child."""
     return bool(_DELEGATED_CHILD_CONTEXT.get())
+
+
+def get_delegation_lifecycle_id() -> str:
+    """Return the current async delegation owner, if any."""
+    return _DELEGATION_LIFECYCLE_ID.get()
 
 
 def is_delegated_child_process_context() -> bool:

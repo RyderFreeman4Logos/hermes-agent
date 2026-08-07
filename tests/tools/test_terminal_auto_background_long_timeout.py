@@ -228,6 +228,19 @@ def test_long_foreground_calls_promote_to_managed_background(config, kwargs):
     env.execute.assert_not_called()
 
 
+def test_delegated_background_process_keeps_its_lifecycle_owner():
+    from agent.delegation_context import delegated_lifecycle_context
+
+    with delegated_lifecycle_context("deleg_terminal_owner"):
+        result, _, proc, _, _ = _run(
+            background=True,
+            notify_on_complete=True,
+        )
+
+    assert result["session_id"] == proc.id
+    assert proc.delegation_id == "deleg_terminal_owner"
+
+
 def test_auto_promotion_preserves_requested_execution_deadline():
     result, _, _, registry, create_environment = _run(
         timeout=21,

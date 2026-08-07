@@ -2733,6 +2733,14 @@ def terminal_tool(
         from tools.approval import get_current_session_key
 
         session_key = get_current_session_key(default="") or (task_id or "")
+        from agent.delegation_context import get_delegation_lifecycle_id
+        from tools.process_registry import process_registry
+
+        delegation_lifecycle_id = (
+            get_delegation_lifecycle_id()
+            or process_registry.delegation_for_session(session_key)
+        )
+        process_registry.require_open_delegation(delegation_lifecycle_id)
 
         # Hard-block: gateway lifecycle commands (systemctl/launchctl/hermes
         # restart|stop targeting hermes-gateway) must never run inside the
@@ -2916,10 +2924,12 @@ def terminal_tool(
                     watch_patterns=watch_patterns,
                     background=True,
                 )
-                notification_metadata = {
+                notification_metadata: Dict[str, Any] = {
                     "notify_on_complete": bool(notify_on_complete),
                     "watch_patterns": list(watch_patterns or []),
                 }
+                if delegation_lifecycle_id:
+                    notification_metadata["delegation_id"] = delegation_lifecycle_id
 
                 if (notify_on_complete or watch_patterns) and not auto_background_candidate:
                     from gateway.session_context import (
@@ -2999,6 +3009,10 @@ def terminal_tool(
                         **spawn_lifecycle,
                     )
                 proc_session.command = command
+                if delegation_lifecycle_id:
+                    process_registry.bind_delegation_session(
+                        session_key, delegation_lifecycle_id
+                    )
 
                 if auto_background_candidate:
                     def _finish_inline(returncode=None):

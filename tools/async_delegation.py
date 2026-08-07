@@ -850,7 +850,10 @@ def dispatch_async_delegation(
         result: Dict[str, Any] = {}
         status = "error"
         try:
-            result = runner() or {}
+            from agent.delegation_context import delegated_lifecycle_context
+
+            with delegated_lifecycle_context(delegation_id):
+                result = runner() or {}
             status = result.get("status") or "completed"
         except Exception as exc:  # noqa: BLE001 — must never crash the worker
             logger.exception("Async delegation %s crashed", delegation_id)
@@ -911,6 +914,7 @@ def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
         return
     event_record, _interrupt_fn, on_not_started = claimed
 
+    _wait_for_adopted_processes(event_record)
     _invoke_not_started(on_not_started, status)
     _push_completion_event(event_record, result, status)
     _finish_finalization(delegation_id, status)
@@ -967,6 +971,15 @@ def _finish_finalization(delegation_id: str, status: str) -> None:
         if record is not None:
             record["status"] = status
         _prune_completed_locked()
+
+
+def _wait_for_adopted_processes(record: Dict[str, Any]) -> None:
+    """Settle terminal process work before publishing delegation completion."""
+    from tools.process_registry import process_registry
+
+    delegation_id = str(record.get("delegation_id") or "")
+    process_registry.begin_delegation_finalization(delegation_id)
+    process_registry.wait_for_delegation_processes(delegation_id)
 
 
 def _push_completion_event(
@@ -1126,7 +1139,10 @@ def dispatch_async_delegation_batch(
         combined: Dict[str, Any] = {}
         status = "error"
         try:
-            combined = runner() or {}
+            from agent.delegation_context import delegated_lifecycle_context
+
+            with delegated_lifecycle_context(delegation_id):
+                combined = runner() or {}
             # Batch status: completed unless every child errored/was interrupted.
             child_results = combined.get("results") or []
             if child_results and all(
@@ -1194,6 +1210,7 @@ def _finalize_batch(
         return
     event_record, _interrupt_fn, on_not_started = claimed
 
+    _wait_for_adopted_processes(event_record)
     _invoke_not_started(on_not_started, status)
     _push_batch_completion_event(event_record, combined, status)
     _finish_finalization(delegation_id, status)

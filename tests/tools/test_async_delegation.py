@@ -156,6 +156,56 @@ def test_delegation_arms_after_submit_and_cancels_on_completion(monkeypatch):
     cancel.assert_called_once_with(result["delegation_id"])
 
 
+def test_batch_completion_waits_for_adopted_process_and_publishes_once(monkeypatch):
+    """A batch cannot publish while its adopted terminal process is running."""
+    from tools.process_registry import ProcessSession
+
+    delegation_id = "deleg_adopted_process"
+    finalizing = threading.Event()
+    begin_finalization = process_registry.begin_delegation_finalization
+
+    def mark_finalizing(owner):
+        begin_finalization(owner)
+        finalizing.set()
+
+    monkeypatch.setattr(
+        process_registry, "begin_delegation_finalization", mark_finalizing
+    )
+    process_registry.bind_delegation_session("owner", delegation_id)
+    adopted = ProcessSession(
+        id="proc_adopted_process",
+        command="just test",
+        delegation_id=delegation_id,
+        notify_on_complete=True,
+    )
+    process_registry._running[adopted.id] = adopted
+
+    result = ad.dispatch_async_delegation_batch(
+        goals=["g"], context=None, toolsets=None, role="leaf", model="m",
+        session_key="owner", delegation_id=delegation_id,
+        runner=lambda: {"results": [{"status": "completed", "summary": "done"}]},
+    )
+    assert result["status"] == "dispatched"
+    assert finalizing.wait(2)
+    with pytest.raises(RuntimeError, match="finalizing"):
+        process_registry.require_open_delegation(
+            process_registry.delegation_for_session("owner")
+        )
+    with pytest.raises(queue.Empty):
+        process_registry.completion_queue.get(timeout=0.1)
+
+    adopted.exited = True
+    adopted.exit_code = 0
+    process_registry._move_to_finished(adopted)
+
+    adopted_event = process_registry.completion_queue.get(timeout=2)
+    assert adopted_event["session_id"] == adopted.id
+    event = process_registry.completion_queue.get(timeout=2)
+    assert event["delegation_id"] == delegation_id
+    with pytest.raises(queue.Empty):
+        process_registry.completion_queue.get(timeout=0.1)
+
+
 @pytest.mark.parametrize("batch", [False, True])
 def test_fast_completion_cannot_cancel_before_heartbeat_arm(monkeypatch, batch):
     from tools.runtime_heartbeat import runtime_heartbeat

@@ -246,6 +246,8 @@ def _capture_durable_compaction_baseline(
 
     repaired = copy.deepcopy(raw)
     from agent.agent_runtime_helpers import repair_message_sequence
+    from agent.replay_cleanup import sanitize_replay_history
+
     repair_message_sequence(None, repaired)
 
     durable_live = [
@@ -261,14 +263,17 @@ def _capture_durable_compaction_baseline(
     live_projection = _compaction_replay_projection(durable_live)
     legal_durable_projections = []
     for durable_view in (raw, repaired):
-        legal_durable_projections.append(
-            _compaction_replay_projection(durable_view)
-        )
-        legal_durable_projections.append(
-            _compaction_replay_projection(
-                durable_view, substitute_api_content=True,
+        for replay_view in (
+            durable_view,
+            sanitize_replay_history(copy.deepcopy(durable_view)),
+        ):
+            legal_durable_projections.append(_compaction_replay_projection(replay_view))
+            legal_durable_projections.append(
+                _compaction_replay_projection(
+                    replay_view,
+                    substitute_api_content=True,
+                )
             )
-        )
     if live_projection not in legal_durable_projections:
         from hermes_state import CompressionSessionBusyError
         raise CompressionSessionBusyError(

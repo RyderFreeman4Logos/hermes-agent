@@ -16,6 +16,7 @@ from agent.context_compressor import (
     _capture_durable_compaction_baseline,
     _estimate_msg_budget_tokens,
 )
+from agent.replay_cleanup import sanitize_replay_history
 from hermes_state import (
     CompressionSessionBusyError,
     CompressionSessionClosedError,
@@ -417,6 +418,54 @@ def test_repaired_restore_uses_raw_rows_for_exact_compaction_fence(
         (message["role"], message["content"])
         for message in db.get_messages_as_conversation(session_id)
     ] == [("user", "summary")]
+
+
+def test_manual_compression_accepts_resumed_interrupted_tool_projection(
+    tmp_path: Path,
+) -> None:
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "RESUMED_INTERRUPTED_TOOL"
+    db.create_session(session_id, source="tui")
+    db.append_messages_batch(
+        session_id,
+        [
+            {"role": "user", "content": "run it"},
+            _assistant_call("interrupted"),
+            _tool_result("interrupted", "[Command interrupted]\n" + "x" * 2_000),
+            {"role": "user", "content": "continue"},
+            {"role": "assistant", "content": "ready"},
+        ],
+    )
+    raw_history, _ = db.get_resume_conversations(session_id)
+    resumed = sanitize_replay_history(raw_history)
+    assert resumed != raw_history
+    assert resumed[2]["effect_disposition"] == "unknown"
+
+    agent = _build_agent(db, session_id, platform="tui")
+    compacted = [{"role": "user", "content": "compacted"}]
+    with patch.object(
+        agent.context_compressor,
+        "compress",
+        return_value=compacted,
+    ) as compress:
+        result, _ = agent._compress_context(
+            resumed,
+            None,
+            approx_tokens=120_000,
+            force=True,
+            defer_context_engine_notification=True,
+        )
+
+    compress.assert_called_once()
+    assert result == compacted
+    assert (
+        agent.context_compressor._last_compression_telemetry["commit_status"]
+        == "committed"
+    )
+    assert (
+        agent.context_compressor._last_compression_telemetry["split_status"]
+        == "in_place_committed"
+    )
 
 
 def test_persisted_text_and_live_multimodal_projection_share_raw_fence(

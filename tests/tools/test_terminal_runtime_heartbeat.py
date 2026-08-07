@@ -234,3 +234,58 @@ def test_child_credential_resolution_keeps_named_custom_identity(
         {"provider": alias}, SimpleNamespace()
     )["provider"] == canonical
 
+
+def test_cancel_waits_for_owner_warm_before_releasing_target():
+    from tools.runtime_heartbeat import RuntimeHeartbeat
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    class Owner:
+        provider = "openai"
+        requested_provider = "openai"
+        base_url = "https://api.openai.invalid/v1"
+        model = "model"
+        api_mode = "chat_completions"
+
+        def run_conversation(self, *_args, **_kwargs):
+            entered.set()
+            assert release.wait(timeout=2)
+            return {"heartbeat_warm_status": "warmed"}
+
+    timers = []
+
+    class Timer:
+        def __init__(self, _delay, callback):
+            self.callback = callback
+            timers.append(self)
+
+        def start(self):
+            pass
+
+        def cancel(self):
+            pass
+
+    manager = RuntimeHeartbeat(event_queue=queue.Queue(), timer_factory=Timer)
+    owner = Owner()
+    assert manager.arm(
+        "target",
+        caller_id="owner",
+        kind="delegation",
+        interval=1,
+        provider="openai",
+        cache_context="ctx",
+        inspect=lambda: {"alive": True, "progress": True},
+        owner=owner,
+    )
+    timers[0].callback()
+    assert entered.wait(timeout=2)
+    cancelled = threading.Thread(target=lambda: manager.cancel("target"))
+    cancelled.start()
+    time.sleep(0.05)
+    try:
+        assert cancelled.is_alive()
+    finally:
+        release.set()
+    cancelled.join(timeout=2)
+    assert not cancelled.is_alive()

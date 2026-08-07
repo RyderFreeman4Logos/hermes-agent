@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import atexit
+import copy
 import contextvars
 import logging
 import queue
@@ -10,6 +11,8 @@ import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Optional
+
+from hermes_constants import PARTIAL_STREAM_STUB_ID
 
 logger = logging.getLogger(__name__)
 
@@ -19,10 +22,465 @@ _current_provider: contextvars.ContextVar[str] = contextvars.ContextVar(
 _current_cache_context: contextvars.ContextVar[str] = contextvars.ContextVar(
     "runtime_heartbeat_cache_context", default=""
 )
+_warm_snapshot_init_lock = threading.Lock()
+_WARM_OUTPUT_CAP_FIELDS = (
+    "max_tokens",
+    "max_completion_tokens",
+    "max_output_tokens",
+)
 
 
 class HeartbeatConfigError(ValueError):
     """The active provider has no valid exact heartbeat interval."""
+
+
+@dataclass(frozen=True)
+class _WarmRequestDraft:
+    epoch: int
+    api_kwargs: Dict[str, Any]
+    provider: str
+    cache_context: str
+    model: str
+    runtime_client: Any
+    tools: Any
+    system: Any
+    compression_attempt: str
+    cache_scope: str
+
+
+@dataclass(frozen=True)
+class _WarmRequestSnapshot(_WarmRequestDraft):
+    physical_client: Any
+
+
+def _warm_snapshot_state(agent) -> tuple[threading.RLock, Dict[str, Any]]:
+    # Real heartbeats can race the first normal request on a freshly built
+    # agent. Pair the lazy lock and state atomically so two first callers
+    # cannot retain different locks and lose an epoch/publication.
+    lock = getattr(agent, "_heartbeat_warm_snapshot_lock", None)
+    state = getattr(agent, "_heartbeat_warm_snapshot_state", None)
+    if lock is not None and state is not None:
+        return lock, state
+    with _warm_snapshot_init_lock:
+        lock = getattr(agent, "_heartbeat_warm_snapshot_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            agent._heartbeat_warm_snapshot_lock = lock
+        state = getattr(agent, "_heartbeat_warm_snapshot_state", None)
+        if state is None:
+            state = {
+                "epoch": 0,
+                "active": set(),
+                "snapshot": None,
+                "warm_epoch": None,
+                "warm_phase": None,
+                "pending_responses": {},
+            }
+            agent._heartbeat_warm_snapshot_state = state
+    return lock, state
+
+
+def _snapshot_identity_matches(
+    snapshot: _WarmRequestSnapshot, identity: Dict[str, Any]
+) -> bool:
+    # A replacement client with surprising equality semantics is still a
+    # different transport.  The remaining immutable values compare by value.
+    return snapshot.runtime_client is identity.get("runtime_client") and all(
+        getattr(snapshot, key) == value
+        for key, value in identity.items()
+        if key != "runtime_client"
+    )
+
+
+def _build_warm_api_kwargs(
+    snapshot: _WarmRequestSnapshot,
+) -> Optional[Dict[str, Any]]:
+    """Copy a normal request and bound only its existing output-cap field.
+
+    Provider APIs disagree on the output-cap parameter name. Replaying a cap
+    field that the validated physical request did not contain can make an
+    otherwise compatible endpoint reject the warm, so this fails closed
+    unless at least one known field already carries a positive integer.
+    """
+    try:
+        api_kwargs = copy.deepcopy(snapshot.api_kwargs)
+    except Exception:
+        logger.debug("Could not copy heartbeat request snapshot", exc_info=True)
+        return None
+    bounded = False
+    for field_name in _WARM_OUTPUT_CAP_FIELDS:
+        value = api_kwargs.get(field_name)
+        if type(value) is int and value > 0:
+            api_kwargs[field_name] = 1
+            bounded = True
+    return api_kwargs if bounded else None
+
+
+def _warm_snapshot_identity(agent) -> Dict[str, Any]:
+    scope_resolver = getattr(agent, "_prompt_cache_scope_id", None)
+    return {
+        "provider": canonical_runtime_provider_identity(agent),
+        "cache_context": canonical_runtime_cache_context_identity(agent),
+        "model": str(getattr(agent, "model", "") or ""),
+        "runtime_client": getattr(agent, "client", None),
+        "tools": copy.deepcopy(getattr(agent, "tools", None)),
+        "system": copy.deepcopy(
+            (
+                getattr(agent, "_cached_system_prompt", None),
+                getattr(agent, "_cached_system_prompt_static", None),
+                getattr(agent, "ephemeral_system_prompt", None),
+                getattr(agent, "prefill_messages", None),
+            )
+        ),
+        "compression_attempt": str(
+            getattr(agent, "_compression_attempt_id", "") or ""
+        ),
+        "cache_scope": str(scope_resolver() or "") if callable(scope_resolver) else "",
+    }
+
+
+def _supported_openai_warm_client(agent, physical_client: Any) -> Any:
+    """Return the proven OpenAI-wire client, otherwise fail closed.
+
+    A ``chat_completions`` label alone is insufficient: native Gemini and
+    Copilot ACP expose a compatibility facade with the same method shape but
+    can reinterpret the call or launch a subprocess.  Production publication
+    is restricted to the standard OpenAI SDK client Hermes creates for
+    OpenAI-compatible HTTP endpoints. Tests use ``Mock`` clients deliberately.
+    """
+    if str(getattr(agent, "api_mode", "") or "").lower() != "chat_completions":
+        return None
+    if str(getattr(agent, "provider", "") or "").lower() == "moa":
+        return None
+    if physical_client is None:
+        return None
+    try:
+        from unittest.mock import Mock
+
+        if isinstance(physical_client, Mock):
+            return physical_client
+    except Exception:
+        pass
+    try:
+        from openai import OpenAI
+
+        if isinstance(physical_client, OpenAI):
+            return physical_client
+    except Exception:
+        pass
+    return None
+
+
+def begin_normal_warm_snapshot(
+    agent,
+    api_kwargs: Dict[str, Any],
+    *,
+    physical_client: Any = None,
+) -> tuple[int, Any]:
+    """Start a physical normal request that may become the warm replay source."""
+    lock, state = _warm_snapshot_state(agent)
+    with lock:
+        state["epoch"] += 1
+        epoch = int(state["epoch"])
+        state["active"].add(epoch)
+        state["snapshot"] = None
+        # Every deferred response from an older epoch is now incapable of
+        # publication. Drop its strong reference instead of retaining it if
+        # that older validator later raises before consuming the entry.
+        state["pending_responses"].clear()
+    draft = None
+    try:
+        if (
+            str(getattr(agent, "api_mode", "") or "").lower()
+            != "chat_completions"
+            or str(getattr(agent, "provider", "") or "").lower() == "moa"
+        ):
+            return epoch, None
+        identity = _warm_snapshot_identity(agent)
+        draft = _WarmRequestDraft(
+            epoch=epoch,
+            api_kwargs=copy.deepcopy(api_kwargs),
+            **identity,
+        )
+    except Exception:
+        logger.debug("Could not snapshot normal request for heartbeat", exc_info=True)
+    token = (epoch, draft)
+    if physical_client is not None:
+        return bind_normal_warm_snapshot_client(agent, token, physical_client)
+    return token
+
+
+def bind_normal_warm_snapshot_client(
+    agent, token: tuple[int, Any], physical_client: Any
+) -> tuple[int, Any]:
+    """Bind the exact request-local client that issued the physical call."""
+    epoch, draft = token
+    if not isinstance(draft, _WarmRequestDraft):
+        return epoch, None
+    if _supported_openai_warm_client(agent, physical_client) is None:
+        return epoch, None
+    lock, state = _warm_snapshot_state(agent)
+    with lock:
+        if epoch != state["epoch"] or epoch not in state["active"]:
+            return epoch, None
+    return epoch, _WarmRequestSnapshot(
+        **draft.__dict__,
+        physical_client=physical_client,
+    )
+
+
+def finish_normal_warm_snapshot(
+    agent, token: tuple[int, Any], *, succeeded: bool
+) -> None:
+    """Publish only the newest successfully validated physical request."""
+    epoch, candidate = token
+    lock, state = _warm_snapshot_state(agent)
+    with lock:
+        state["active"].discard(epoch)
+        if epoch == state["epoch"]:
+            state["snapshot"] = (
+                candidate
+                if succeeded and isinstance(candidate, _WarmRequestSnapshot)
+                else None
+            )
+
+
+def _claim_physical_client(agent, physical_client: Any) -> Any:
+    try:
+        from unittest.mock import Mock
+
+        if isinstance(physical_client, Mock):
+            return physical_client
+    except Exception:
+        pass
+    claim = getattr(agent, "_claim_request_openai_client_for_heartbeat", None)
+    if not callable(claim):
+        return None
+    try:
+        return claim(physical_client)
+    except Exception:
+        logger.debug("Could not lease heartbeat physical client", exc_info=True)
+        return None
+
+
+def _release_physical_client(agent, physical_client: Any, *, reusable: bool) -> None:
+    try:
+        from unittest.mock import Mock
+
+        if isinstance(physical_client, Mock):
+            return
+    except Exception:
+        pass
+    release = getattr(agent, "_release_request_openai_client_from_heartbeat", None)
+    if not callable(release):
+        return
+    try:
+        release(physical_client, reusable=reusable)
+    except Exception:
+        logger.debug("Could not release heartbeat physical client", exc_info=True)
+
+
+def defer_normal_warm_snapshot_until_validated(
+    agent, token: tuple[int, Any], response: Any
+) -> Any:
+    """Associate a physical request with the response validator's result.
+
+    Opening an SSE iterator is not provider success.  Callers first finish the
+    physical-open phase with ``succeeded=False`` (which removes its in-flight
+    fence without publishing), then defer the immutable candidate here.  The
+    conversation loop consumes it only after the existing transport validator
+    has accepted or rejected the completed response.
+    """
+    lock, state = _warm_snapshot_state(agent)
+    with lock:
+        state.setdefault("pending_responses", {})[id(response)] = (response, token)
+    return response
+
+
+def finish_deferred_normal_warm_snapshot(
+    agent, response: Any, *, succeeded: bool
+) -> None:
+    """Publish a deferred physical request only after response validation."""
+    lock, state = _warm_snapshot_state(agent)
+    with lock:
+        pending = state.setdefault("pending_responses", {}).pop(id(response), None)
+    if pending is None or pending[0] is not response:
+        return
+    # The transport validator accepts this internal recovery envelope because
+    # the ordinary loop must inspect and surface its partial content.  It is
+    # nevertheless proof that the physical stream failed, never a successful
+    # last-known-good request suitable for cache warming.
+    publishable = succeeded and (
+        getattr(response, "id", "") != PARTIAL_STREAM_STUB_ID
+    )
+    finish_normal_warm_snapshot(agent, pending[1], succeeded=publishable)
+
+
+def claim_warm_snapshot(agent) -> Optional[tuple[int, Dict[str, Any], Any]]:
+    """Claim one immutable last-known-good request for isolated replay."""
+    lock, state = _warm_snapshot_state(agent)
+    with lock:
+        snapshot = state.get("snapshot")
+        if state["active"] or state.get("warm_epoch") is not None or snapshot is None:
+            return None
+        epoch = int(state["epoch"])
+    try:
+        identity = _warm_snapshot_identity(agent)
+    except Exception:
+        logger.debug("Could not validate heartbeat request snapshot", exc_info=True)
+        return None
+    with lock:
+        if (
+            state["epoch"] != epoch
+            or state["active"]
+            or state.get("warm_epoch") is not None
+            or state.get("snapshot") is not snapshot
+            or not _snapshot_identity_matches(snapshot, identity)
+        ):
+            return None
+        api_kwargs = _build_warm_api_kwargs(snapshot)
+        if api_kwargs is None:
+            return None
+        state["warm_epoch"] = epoch
+    physical_client = _claim_physical_client(agent, snapshot.physical_client)
+    if physical_client is None:
+        with lock:
+            if state.get("warm_epoch") == epoch:
+                state["warm_epoch"] = None
+        return None
+    with lock:
+        if (
+            state["epoch"] != epoch
+            or state["active"]
+            or state.get("warm_epoch") != epoch
+            or state.get("snapshot") is not snapshot
+        ):
+            state["warm_epoch"] = None
+            warm_phase = state.get("warm_phase")
+            if isinstance(warm_phase, tuple) and warm_phase[0] == epoch:
+                state["warm_phase"] = None
+            stale = True
+        else:
+            state["warm_client"] = (epoch, physical_client)
+            state["warm_phase"] = (epoch, "precall")
+            stale = False
+    if stale:
+        _release_physical_client(agent, physical_client, reusable=True)
+        return None
+    return epoch, api_kwargs, physical_client
+
+
+def commit_warm_snapshot_dispatch(
+    agent, epoch: int, event_current: Callable[[], bool]
+) -> bool:
+    """Atomically authorize the claimed warm's single provider dispatch.
+
+    The transition from ``precall`` to ``committed`` is the dispatch
+    linearization point shared with normal-request epoch publication. A normal
+    request that wins the snapshot lock first invalidates this warm before any
+    provider call. Once committed, the provider call may run without holding
+    the lock; a later normal request still wins publication and lease refresh.
+    """
+    lock, state = _warm_snapshot_state(agent)
+    with lock:
+        snapshot = state.get("snapshot")
+        warm_client = state.get("warm_client")
+        if (
+            state["epoch"] != epoch
+            or state["active"]
+            or state.get("warm_epoch") != epoch
+            or state.get("warm_phase") != (epoch, "precall")
+            or snapshot is None
+            or not isinstance(warm_client, tuple)
+            or warm_client[0] != epoch
+            or warm_client[1] is not snapshot.physical_client
+        ):
+            return False
+    try:
+        identity = _warm_snapshot_identity(agent)
+    except Exception:
+        return False
+    with lock:
+        snapshot = state.get("snapshot")
+        warm_client = state.get("warm_client")
+        if (
+            state["epoch"] != epoch
+            or state["active"]
+            or state.get("warm_epoch") != epoch
+            or state.get("warm_phase") != (epoch, "precall")
+            or snapshot is None
+            or not isinstance(warm_client, tuple)
+            or warm_client[0] != epoch
+            or warm_client[1] is not snapshot.physical_client
+            or not _snapshot_identity_matches(snapshot, identity)
+        ):
+            return False
+        try:
+            if not event_current():
+                return False
+        except Exception:
+            logger.debug("Heartbeat dispatch event validation failed", exc_info=True)
+            return False
+        # The snapshot lock has excluded begin_normal_warm_snapshot throughout
+        # the final event check and this one-shot phase transition.
+        if (
+            state["epoch"] != epoch
+            or state["active"]
+            or state.get("warm_phase") != (epoch, "precall")
+        ):
+            return False
+        state["warm_phase"] = (epoch, "committed")
+        return True
+
+
+def warm_snapshot_is_current(agent, epoch: int) -> bool:
+    """Revalidate a committed warm before accepting its response."""
+    lock, state = _warm_snapshot_state(agent)
+    with lock:
+        snapshot = state.get("snapshot")
+        if (
+            state["epoch"] != epoch
+            or state["active"]
+            or state.get("warm_epoch") != epoch
+            or state.get("warm_phase") != (epoch, "committed")
+            or snapshot is None
+            or state.get("warm_client", (None, None))[0] != epoch
+            or state.get("warm_client", (None, None))[1]
+            is not snapshot.physical_client
+        ):
+            return False
+    try:
+        identity = _warm_snapshot_identity(agent)
+    except Exception:
+        return False
+    with lock:
+        warm_client = state.get("warm_client")
+        return (
+            state["epoch"] == epoch
+            and not state["active"]
+            and state.get("warm_epoch") == epoch
+            and state.get("warm_phase") == (epoch, "committed")
+            and state.get("snapshot") is snapshot
+            and isinstance(warm_client, tuple)
+            and warm_client[0] == epoch
+            and warm_client[1] is snapshot.physical_client
+            and _snapshot_identity_matches(snapshot, identity)
+        )
+
+
+def release_warm_snapshot(agent, epoch: int, *, reusable: bool = True) -> None:
+    lock, state = _warm_snapshot_state(agent)
+    with lock:
+        warm_client = state.get("warm_client")
+        if isinstance(warm_client, tuple) and warm_client[0] == epoch:
+            state.pop("warm_client", None)
+        if state.get("warm_epoch") == epoch:
+            state["warm_epoch"] = None
+        warm_phase = state.get("warm_phase")
+        if isinstance(warm_phase, tuple) and warm_phase[0] == epoch:
+            state["warm_phase"] = None
+    if isinstance(warm_client, tuple) and warm_client[0] == epoch:
+        _release_physical_client(agent, warm_client[1], reusable=reusable)
 
 
 def canonical_runtime_provider_identity(agent) -> str:

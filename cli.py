@@ -11067,6 +11067,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             claim_event_delivery,
             complete_event_delivery,
         )
+        from tools.runtime_heartbeat import runtime_heartbeat
 
         session_key = getattr(self, "session_id", "") or ""
         for event, synthetic_message in process_registry.drain_notifications(
@@ -11077,6 +11078,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             if claim is None:
                 continue
             if event.get("type") == "heartbeat":
+                try:
+                    event_is_current = runtime_heartbeat.is_event_current(event)
+                except Exception:
+                    logging.debug(
+                        "CLI heartbeat event validation failed", exc_info=True
+                    )
+                    event_is_current = False
+                if not event_is_current:
+                    complete_event_delivery(event, claim)
+                    continue
                 status = str(event.get("status") or "").upper()
                 if status in {"STUCK", "UNKNOWN"}:
                     _cprint(f"\n⚠ {synthetic_message}")
@@ -11085,7 +11096,29 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 if status != "ALIVE":
                     complete_event_delivery(event, claim)
                     continue
-                queued_message = _HeartbeatWarmMessage(synthetic_message, event)
+                agent = getattr(self, "agent", None)
+
+                def _warm(agent=agent, event=event) -> None:
+                    if agent is None:
+                        return
+                    try:
+                        agent.run_conversation(
+                            "",
+                            turn_origin="heartbeat_warm",
+                            heartbeat_event=event,
+                        )
+                    except Exception:
+                        logging.debug(
+                            "CLI heartbeat warm request failed", exc_info=True
+                        )
+
+                threading.Thread(
+                    target=_warm,
+                    daemon=True,
+                    name="heartbeat-warm",
+                ).start()
+                complete_event_delivery(event, claim)
+                continue
             elif event.get("type", "completion") == "completion":
                 queued_message = _CompletionDeliveryMessage(synthetic_message)
             else:
@@ -14586,6 +14619,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # so we skip interrupt processing to avoid stealing that input.
             interrupt_msg = None
             while agent_thread.is_alive():
+                try:
+                    self._drain_process_notifications("cli-busy")
+                except Exception:
+                    logging.debug(
+                        "busy CLI notification drain failed", exc_info=True
+                    )
                 if hasattr(self, '_interrupt_queue'):
                     try:
                         interrupt_msg = self._interrupt_queue.get(timeout=0.1)

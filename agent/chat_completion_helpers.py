@@ -669,6 +669,14 @@ def direct_api_call(agent, api_kwargs: dict):
     request_state = {"client": None, "done": False, "stale": False, "cancelled": False}
     request_client_lock = threading.Lock()
     activity_hb_stop = threading.Event()
+    from tools.runtime_heartbeat import (
+        begin_normal_warm_snapshot,
+        bind_normal_warm_snapshot_client,
+        defer_normal_warm_snapshot_until_validated,
+        finish_normal_warm_snapshot,
+    )
+
+    warm_token = None
 
     def _abort_active_request(reason: str) -> bool:
         """Abort the inline request from a watchdog/interrupt thread.
@@ -717,8 +725,10 @@ def direct_api_call(agent, api_kwargs: dict):
         # requests (see should_use_direct_api_call), so the anthropic branch of
         # the dispatch — the only caller that passes kind — is never reached
         # here; the ``kind`` parameter exists purely for signature parity.
+        nonlocal warm_token
         client = agent._create_request_openai_client(reason=reason, api_kwargs=api_kwargs)
         stale_before_dispatch = False
+        warm_token = bind_normal_warm_snapshot_client(agent, warm_token, client)
         with request_client_lock:
             request_state["client"] = client
             if request_state["stale"]:
@@ -798,6 +808,7 @@ def direct_api_call(agent, api_kwargs: dict):
     # retry builds a fresh pool (see _REQUEST_CLIENT_REUSE_REASONS).
     succeeded = False
     try:
+        warm_token = begin_normal_warm_snapshot(agent, api_kwargs)
         response = _dispatch_nonstreaming_api_request(
             agent, api_kwargs, make_client=_make_client
         )
@@ -831,12 +842,17 @@ def direct_api_call(agent, api_kwargs: dict):
             request_state["done"] = True
         _reset_stale_streak(agent)
         succeeded = True
-        return response
+        finish_normal_warm_snapshot(agent, warm_token, succeeded=False)
+        return defer_normal_warm_snapshot_until_validated(
+            agent, warm_token, response
+        )
     finally:
         if stale_watchdog is not None:
             stale_watchdog.cancel()
         with request_client_lock:
             request_state["done"] = True
+        if not succeeded and warm_token is not None:
+            finish_normal_warm_snapshot(agent, warm_token, succeeded=False)
         activity_hb_stop.set()
         activity_hb.join(timeout=2.0)
         if getattr(agent, "_active_request_abort", None) is _abort_active_request:
@@ -871,6 +887,15 @@ def interruptible_api_call(agent, api_kwargs: dict):
     if should_use_direct_api_call(agent):
         return direct_api_call(agent, api_kwargs)
 
+    from tools.runtime_heartbeat import (
+        begin_normal_warm_snapshot,
+        bind_normal_warm_snapshot_client,
+        defer_normal_warm_snapshot_until_validated,
+        finish_normal_warm_snapshot,
+    )
+
+    warm_token = None
+
     result = {"response": None, "error": None}
 
     # Cross-turn stale-call circuit breaker (#58962) — non-streaming sibling
@@ -896,6 +921,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
     _request_cancelled = {"value": False}
 
     def _set_request_client(client, *, kind: str = "openai"):
+        nonlocal warm_token
         with request_client_lock:
             request_client_holder["client"] = client
             request_client_kind["value"] = kind
@@ -903,6 +929,10 @@ def interruptible_api_call(agent, api_kwargs: dict):
             # only shuts the connection down rather than racing the worker
             # for FD ownership during ``client.close()``.
             request_client_holder["owner_tid"] = threading.get_ident()
+        if kind == "openai":
+            warm_token = bind_normal_warm_snapshot_client(
+                agent, warm_token, client
+            )
         return client
 
     def _close_request_client_once(reason: str) -> None:
@@ -958,7 +988,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
             # builds it via this callback (openai- or anthropic-kind) so the
             # interrupt / stale-call detectors can force-close the worker's
             # connection without touching the shared client (#67142).
-            result["response"] = _dispatch_nonstreaming_api_request(
+            response = _dispatch_nonstreaming_api_request(
                 agent,
                 api_kwargs,
                 make_client=lambda reason, kind="openai": _set_request_client(
@@ -970,7 +1000,12 @@ def interruptible_api_call(agent, api_kwargs: dict):
                     kind=kind,
                 ),
             )
+            finish_normal_warm_snapshot(agent, warm_token, succeeded=False)
+            result["response"] = defer_normal_warm_snapshot_until_validated(
+                agent, warm_token, response
+            )
         except Exception as e:
+            finish_normal_warm_snapshot(agent, warm_token, succeeded=False)
             # If the request was cancelled by the main thread's interrupt
             # handler, the transport error is the expected consequence of our
             # own force-close, NOT a network bug. Swallow it instead of
@@ -984,6 +1019,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 return
             result["error"] = e
         finally:
+            finish_normal_warm_snapshot(agent, warm_token, succeeded=False)
             # Reuse reason only on a clean response; any other outcome —
             # error, or the cancel-swallow return above (which leaves both
             # result slots None) — really closes so the next attempt builds
@@ -1119,8 +1155,13 @@ def interruptible_api_call(agent, api_kwargs: dict):
     _call_start = time.time()
     agent._touch_activity("waiting for non-streaming API response")
 
-    t = threading.Thread(target=_context_thread_target(_call), daemon=True)
-    t.start()
+    warm_token = begin_normal_warm_snapshot(agent, api_kwargs)
+    try:
+        t = threading.Thread(target=_context_thread_target(_call), daemon=True)
+        t.start()
+    except BaseException:
+        finish_normal_warm_snapshot(agent, warm_token, succeeded=False)
+        raise
     _poll_count = 0
     while t.is_alive():
         t.join(timeout=0.3)
@@ -3320,8 +3361,27 @@ def interruptible_streaming_api_call(
         request_client_holder["diag"] = _diag
         _writer_token = {"value": None}
         attempt_request_client = {"value": None}
+        warm_token_holder = {"value": None}
+
+        def _defer_stream_snapshot(response: Any) -> Any:
+            from tools.runtime_heartbeat import (
+                defer_normal_warm_snapshot_until_validated,
+            )
+
+            warm_token = warm_token_holder.pop("value", None)
+            if warm_token is None:
+                return response
+            return defer_normal_warm_snapshot_until_validated(
+                agent, warm_token, response
+            )
 
         def _open_stream(next_api_kwargs: dict[str, Any]):
+            from tools.runtime_heartbeat import (
+                begin_normal_warm_snapshot,
+                bind_normal_warm_snapshot_client,
+                finish_normal_warm_snapshot,
+            )
+
             stream_kwargs = {
                 **next_api_kwargs,
                 "stream": True,
@@ -3335,24 +3395,35 @@ def interruptible_streaming_api_call(
             # Native Gemini rejects OpenAI's usage-streaming extension.
             if not is_native_gemini_base_url(agent.base_url):
                 stream_kwargs["stream_options"] = {"include_usage": True}
-            request_client = _set_request_client(
-                agent._create_request_openai_client(
-                    reason="chat_completion_stream_request",
-                    api_kwargs=stream_kwargs,
-                )
-            )
-            attempt_request_client["value"] = request_client
-            last_chunk_time["t"] = time.time()
-            agent._touch_activity("waiting for provider response (streaming)")
-            dispatch_started_at = time.monotonic()
-            if on_provider_dispatch is not None:
-                on_provider_dispatch(dispatch_started_at)
+            warm_token = begin_normal_warm_snapshot(agent, stream_kwargs)
             try:
-                return request_client.chat.completions.create(**stream_kwargs)
+                request_client = _set_request_client(
+                    agent._create_request_openai_client(
+                        reason="chat_completion_stream_request",
+                        api_kwargs=stream_kwargs,
+                    )
+                )
+                warm_token = bind_normal_warm_snapshot_client(
+                    agent, warm_token, request_client
+                )
+                attempt_request_client["value"] = request_client
+                last_chunk_time["t"] = time.time()
+                agent._touch_activity("waiting for provider response (streaming)")
+                dispatch_started_at = time.monotonic()
+                if on_provider_dispatch is not None:
+                    on_provider_dispatch(dispatch_started_at)
+                stream = request_client.chat.completions.create(**stream_kwargs)
             except BaseException:
+                finish_normal_warm_snapshot(agent, warm_token, succeeded=False)
                 if on_provider_dispatch is not None:
                     on_provider_dispatch(None)
                 raise
+            # A returned iterator is only an opened transport, not a valid
+            # provider response.  Keep the candidate private until the normal
+            # response validator accepts the fully accumulated response.
+            finish_normal_warm_snapshot(agent, warm_token, succeeded=False)
+            warm_token_holder["value"] = warm_token
+            return stream
 
         def _stream_created(raw_stream: Any) -> None:
             response = getattr(raw_stream, "response", None)
@@ -3669,7 +3740,7 @@ def interruptible_streaming_api_call(
                 if isinstance(content, str) and content:
                     _fire_first_delta()
                     agent._fire_stream_delta(content)
-            return final_response
+            return _defer_stream_snapshot(final_response)
 
         # Build mock response matching non-streaming shape
         full_content = "".join(content_parts) or None
@@ -3768,12 +3839,12 @@ def interruptible_streaming_api_call(
                 "mid-tool-call stream drop, not an output-length truncation.",
                 _dropped_names,
             )
-            return _build_partial_stream_stub(
+            return _defer_stream_snapshot(_build_partial_stream_stub(
                 role, full_content,
                 "".join(reasoning_parts) or None,
                 model_name, usage_obj,
                 dropped_tool_names=_dropped_names or None,
-            )
+            ))
 
         # Text-only stream drop: the upstream closed the connection (or the
         # SSE stream simply ended) with no finish_reason after delivering
@@ -3790,11 +3861,11 @@ def interruptible_streaming_api_call(
                 "Stream ended with no finish_reason after delivering text "
                 "with no tool calls; treating as a mid-stream drop."
             )
-            return _build_partial_stream_stub(
+            return _defer_stream_snapshot(_build_partial_stream_stub(
                 role, full_content,
                 "".join(reasoning_parts) or None,
                 model_name, usage_obj,
-            )
+            ))
 
         effective_finish_reason = finish_reason or "stop"
         if has_truncated_tool_args:
@@ -3812,12 +3883,12 @@ def interruptible_streaming_api_call(
             message=mock_message,
             finish_reason=effective_finish_reason,
         )
-        return SimpleNamespace(
+        return _defer_stream_snapshot(SimpleNamespace(
             id="stream-" + str(uuid.uuid4()),
             model=model_name,
             choices=[mock_choice],
             usage=usage_obj,
-        )
+        ))
 
     def _call_anthropic(request_client):
         """Stream an Anthropic Messages API response.

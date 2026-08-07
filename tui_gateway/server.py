@@ -9896,29 +9896,28 @@ def _handle_heartbeat_event(sid: str, session: dict, evt: dict) -> None:
         if not runtime_heartbeat.is_event_current(evt):
             return
         _emit("status.update", sid, {"kind": "process", "text": prompt})
-        if status == "UNKNOWN":
-            return
-    if status not in {"ALIVE", "STUCK"}:
         return
-    with session["history_lock"]:
-        if session.get("running"):
-            return
-        session["running"] = True
-        session["_heartbeat_running"] = True
-    try:
-        _run_prompt_submit(
-            f"__heartbeat__{int(time.time() * 1000)}",
-            sid,
-            session,
-            prompt,
-            turn_origin="heartbeat_warm",
-            heartbeat_event=evt,
-        )
-    except Exception:
-        with session["history_lock"]:
-            session["running"] = False
-            session.pop("_heartbeat_running", None)
-        logger.warning("Heartbeat warm check-in dispatch failed", exc_info=True)
+    if status != "ALIVE":
+        return
+
+    agent = session.get("agent")
+    if agent is None:
+        return
+
+    def _warm() -> None:
+        try:
+            agent.run_conversation(
+                "",
+                turn_origin="heartbeat_warm",
+                heartbeat_event=evt,
+            )
+        except Exception:
+            logger.debug("TUI heartbeat warm request failed", exc_info=True)
+
+    # The warm path owns no user-turn state and never waits for the foreground
+    # turn. Snapshot single-flight inside AIAgent prevents duplicate provider
+    # calls while preserving the ordinary session/history lifecycle.
+    threading.Thread(target=_warm, daemon=True).start()
 
 
 def _async_delegation_display_metadata(evt: dict) -> dict:

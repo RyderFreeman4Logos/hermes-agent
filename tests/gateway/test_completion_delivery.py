@@ -121,11 +121,46 @@ def test_gateway_heartbeat_routes_to_exact_idle_owner(monkeypatch, current_heart
     isolated = AsyncMock()
     monkeypatch.setattr(runner, "_run_isolated_heartbeat", isolated)
 
-    asyncio.run(runner._handle_heartbeat_event(event))
+    async def run_and_drain():
+        await runner._handle_heartbeat_event(event)
+        await runner._heartbeat_warm_tasks[event["session_key"]]
+
+    asyncio.run(run_and_drain())
 
     isolated.assert_awaited_once()
-    assert isolated.await_args.args[1:] == (event["session_key"], event)
+    assert isolated.await_args.args == (event["session_key"], event)
     assert not runner._is_session_running(event["session_key"])
+
+
+@pytest.mark.asyncio
+async def test_gateway_isolated_heartbeat_never_reads_live_history(monkeypatch):
+    event = _runtime_heartbeat_event()
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter, origins={event["session_key"]: object()})
+    calls = []
+
+    class _Agent:
+        @property
+        def _session_messages(self):
+            raise AssertionError("heartbeat read live conversation history")
+
+        def run_conversation(self, message, **kwargs):
+            calls.append((message, kwargs))
+
+    runner._agent_cache_lock = threading.Lock()
+    runner._agent_cache = {event["session_key"]: (_Agent(), 0)}
+
+    async def run_inline(callback):
+        callback()
+
+    monkeypatch.setattr(runner, "_run_in_executor_with_context", run_inline)
+
+    await runner._run_isolated_heartbeat(event["session_key"], event)
+
+    assert calls == [("", {
+        "turn_origin": "heartbeat_warm",
+        "heartbeat_event": event,
+    })]
 
 
 def test_gateway_raw_api_heartbeat_never_runs_or_self_posts(
@@ -145,29 +180,40 @@ def test_gateway_raw_api_heartbeat_never_runs_or_self_posts(
     adapter.handle_message.assert_not_awaited()
 
 
-def test_gateway_alive_heartbeat_does_not_duplicate_busy_turn(
+def test_gateway_alive_heartbeat_warms_independently_of_busy_turn(
     monkeypatch, current_heartbeat
 ):
     event = _runtime_heartbeat_event()
     adapter = SimpleNamespace(handle_message=AsyncMock())
     runner = _runner(adapter, origins={event["session_key"]: object()})
-    runner._running_agents = {event["session_key"]: object()}
+    ordinary_owner = object()
+    runner._running_agents = {event["session_key"]: ordinary_owner}
+    state = runner._session_state(event["session_key"])
+    state.turn.agent = ordinary_owner
     isolated = AsyncMock()
     monkeypatch.setattr(runner, "_run_isolated_heartbeat", isolated)
 
-    asyncio.run(runner._handle_heartbeat_event(event))
+    async def run_and_drain():
+        await runner._handle_heartbeat_event(event)
+        await runner._heartbeat_warm_tasks[event["session_key"]]
 
-    isolated.assert_not_awaited()
+    asyncio.run(run_and_drain())
+
+    isolated.assert_awaited_once()
+    assert state.turn.agent is ordinary_owner
 
 
 @pytest.mark.asyncio
-async def test_gateway_heartbeat_reserves_busy_slot_and_releases_only_its_owner(
+async def test_gateway_heartbeat_never_reserves_or_mutates_busy_slot(
     monkeypatch, current_heartbeat
 ):
     event = _runtime_heartbeat_event()
     adapter = SimpleNamespace(handle_message=AsyncMock())
     runner = _runner(adapter, origins={event["session_key"]: object()})
-    runner._running_agents = {}
+    ordinary_owner = object()
+    runner._running_agents = {event["session_key"]: ordinary_owner}
+    state = runner._session_state(event["session_key"])
+    state.turn.agent = ordinary_owner
     started = asyncio.Event()
     release = asyncio.Event()
 
@@ -176,19 +222,55 @@ async def test_gateway_heartbeat_reserves_busy_slot_and_releases_only_its_owner(
         await release.wait()
 
     monkeypatch.setattr(runner, "_run_isolated_heartbeat", blocked)
-    task = asyncio.create_task(runner._handle_heartbeat_event(event))
-    await started.wait()
-
-    assert runner._is_session_running(event["session_key"])
-    ordinary_owner = object()
-    state = runner._session_state(event["session_key"])
-    state.turn.agent = ordinary_owner
-    state.turn.heartbeat_owner = None
-    release.set()
-    await task
+    await runner._handle_heartbeat_event(event)
+    task = runner._heartbeat_warm_tasks[event["session_key"]]
+    await asyncio.wait_for(started.wait(), timeout=1)
 
     assert state.turn.agent is ordinary_owner
     assert state.turn.heartbeat_owner is None
+    release.set()
+    await asyncio.wait_for(task, timeout=1)
+
+    assert state.turn.agent is ordinary_owner
+    assert state.turn.heartbeat_owner is None
+
+
+@pytest.mark.asyncio
+async def test_gateway_blocked_warm_does_not_block_later_unhealthy_notice(
+    monkeypatch, current_heartbeat
+):
+    alive = _runtime_heartbeat_event()
+    stuck = _runtime_heartbeat_event(status="STUCK", evidence="no progress")
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter, origins={alive["session_key"]: object()})
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocked(*_args):
+        started.set()
+        await release.wait()
+
+    deliver = AsyncMock(return_value=True)
+    monkeypatch.setattr(runner, "_run_isolated_heartbeat", blocked)
+    monkeypatch.setattr(runner, "_deliver_platform_notice", deliver)
+
+    handler = asyncio.create_task(runner._handle_heartbeat_event(alive))
+    await asyncio.wait_for(started.wait(), timeout=1)
+    try:
+        # The watcher awaits each handler serially. Therefore the ALIVE
+        # handler itself must detach its tracked warm before a later event can
+        # be processed.
+        await asyncio.wait_for(asyncio.shield(handler), timeout=0.05)
+        await runner._handle_heartbeat_event(stuck)
+    finally:
+        release.set()
+        await asyncio.wait_for(handler, timeout=1)
+        warm_task = runner._heartbeat_warm_tasks.get(alive["session_key"])
+        if warm_task is not None:
+            await asyncio.wait_for(warm_task, timeout=1)
+
+    deliver.assert_awaited_once()
+    assert "STUCK" in deliver.await_args.args[1]
 
 
 @pytest.mark.asyncio
@@ -212,19 +294,59 @@ async def test_gateway_heartbeat_releases_its_reservation_on_early_exit(
     isolated = AsyncMock(side_effect=fail if exit_kind == "exception" else None)
     monkeypatch.setattr(runner, "_run_isolated_heartbeat", isolated)
 
-    if exit_kind == "exception":
-        with pytest.raises(RuntimeError, match="heartbeat failed"):
-            await runner._handle_heartbeat_event(event)
-    else:
-        await runner._handle_heartbeat_event(event)
+    await runner._handle_heartbeat_event(event)
+    task = getattr(runner, "_heartbeat_warm_tasks", {}).get(
+        event["session_key"]
+    )
+    if task is not None:
+        if exit_kind == "exception":
+            with pytest.raises(RuntimeError, match="heartbeat failed"):
+                await task
+        else:
+            await task
+    if exit_kind == "stale":
         isolated.assert_not_awaited()
 
     assert not runner._is_session_running(event["session_key"])
 
 
-@pytest.mark.parametrize(("status", "warm_turns"), [("STUCK", 1), ("UNKNOWN", 0)])
+@pytest.mark.asyncio
+async def test_gateway_heartbeat_schedule_is_single_flight_and_cancel_cleans_up(
+    monkeypatch,
+):
+    event = _runtime_heartbeat_event()
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter, origins={event["session_key"]: object()})
+    started = asyncio.Event()
+    calls = 0
+
+    async def blocked(*_args):
+        nonlocal calls
+        calls += 1
+        started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(runner, "_run_isolated_heartbeat", blocked)
+
+    first = runner._schedule_isolated_heartbeat(event["session_key"], event)
+    second = runner._schedule_isolated_heartbeat(event["session_key"], event)
+    assert first is second
+    await asyncio.wait_for(started.wait(), timeout=1)
+    assert calls == 1
+    assert first in runner._background_tasks
+
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    await asyncio.sleep(0)
+
+    assert event["session_key"] not in runner._heartbeat_warm_tasks
+    assert first not in runner._background_tasks
+
+
+@pytest.mark.parametrize("status", ["STUCK", "UNKNOWN"])
 def test_gateway_unhealthy_heartbeat_is_visible_and_warms_only_when_live(
-    monkeypatch, current_heartbeat, status, warm_turns
+    monkeypatch, current_heartbeat, status
 ):
     event = _runtime_heartbeat_event(status=status, evidence="no progress")
     adapter = SimpleNamespace(handle_message=AsyncMock())
@@ -243,7 +365,7 @@ def test_gateway_unhealthy_heartbeat_is_visible_and_warms_only_when_live(
     deliver.assert_awaited_once()
     assert status in deliver.await_args.args[1]
     assert "no progress" in deliver.await_args.args[1]
-    assert isolated.await_count == warm_turns
+    isolated.assert_not_awaited()
 
 
 def test_gateway_unhealthy_heartbeat_revalidates_at_notice_boundary(monkeypatch):

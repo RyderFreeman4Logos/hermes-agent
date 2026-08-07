@@ -186,6 +186,19 @@ def finalize_completion_delivery_suffix(
         if close_interrupted_tool_sequence(staged, closure):
             staged[-1]["display_kind"] = "hidden"
 
+    # The TUI stages completion delivery with the provider-facing prompt as
+    # ``persist_user_message``.  Override it before the first atomic intent
+    # flush: otherwise the generic persistence layer writes that prompt over
+    # the canonical event in SQLite while this staged/live copy keeps the
+    # canonical text.  Every later durable-tail comparison and final metadata
+    # CAS then targets two different ``content`` values.
+    previous_persist_idx = getattr(agent, "_persist_user_message_idx", None)
+    previous_persist_override = getattr(
+        agent, "_persist_user_message_override", None
+    )
+    agent._persist_user_message_idx = start
+    agent._persist_user_message_override = clean_content
+
     # The normal incremental writer is already atomic for a new suffix.  Use
     # its marker protocol on the staged copy; only publish those exact dicts to
     # the live list after SessionDB accepts them.  One immediate retry covers a
@@ -208,6 +221,9 @@ def finalize_completion_delivery_suffix(
             if committed:
                 break
     if not committed:
+        if commit_tool_intent:
+            agent._persist_user_message_idx = previous_persist_idx
+            agent._persist_user_message_override = previous_persist_override
         agent._pending_completion_delivery_suffix = copy.deepcopy(staged[start:])
         agent._pending_completion_delivery_display_metadata_cas = copy.deepcopy(
             metadata_cas
@@ -222,10 +238,8 @@ def finalize_completion_delivery_suffix(
     agent._pending_completion_delivery_suffix = None
     agent._pending_completion_delivery_display_metadata_cas = None
     agent._completion_delivery_commit_failed = False
-    # The normal finalizer applies this override after response repair.  Point
-    # it at the canonical event so it cannot restore the API-only instruction.
-    agent._persist_user_message_idx = start
-    agent._persist_user_message_override = clean_content
+    # Keep the canonical override after response repair so later incremental
+    # suffix flushes cannot restore the API-only instruction.
     # Earlier incremental flushes intentionally stopped at this same dict.
     # Force the marker scanner to revisit it now that its disposition changed.
     if not db_bound:

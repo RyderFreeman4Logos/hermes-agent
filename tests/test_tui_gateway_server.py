@@ -6498,9 +6498,10 @@ def test_run_prompt_submit_delivers_completion_observed_by_poll(monkeypatch, tmp
         process_registry._poll_observed.discard(event["session_id"])
 
 
-def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_threading(
+def test_run_prompt_submit_batches_post_turn_completions_with_real_threading(
     monkeypatch, tmp_path
 ):
+    """Post-turn drain coalesces multiple completions into one nested turn."""
     import queue as _queue_mod
 
     from tools.process_registry import process_registry
@@ -6522,7 +6523,9 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
     class _BlockingNotificationAgent(_RecordingAgent):
         def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
             turns.append(prompt)
-            if "proc_batch_1" in prompt:
+            if "background completions arrived as a backlog" in prompt or (
+                "proc_batch_1" in prompt and "proc_batch_2" in prompt
+            ):
                 nested_started.set()
                 if not release_nested.wait(timeout=5):
                     raise TimeoutError("notification turn was not released")
@@ -6539,8 +6542,11 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
             "type": "completion",
             "session_id": f"proc_batch_{index}",
             "session_key": "session-a",
+            "started_at": float(index),
             "command": "safe-test-command",
             "exit_code": 0,
+            "completion_reason": "exited",
+            "termination_source": "",
             "output": f"owned-{index}",
         }
         for index in range(1, 4)
@@ -6555,28 +6561,17 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
         server._run_prompt_submit("rid-a", "sid_a", session, "session-a-turn")
 
         assert nested_started.wait(timeout=5)
-        threads[0].join(timeout=5)
-        assert not threads[0].is_alive()
-        # Membership, not order: the completion_queue is process-global, and
-        # notification pollers leaked by earlier session.init tests in this
-        # file legitimately steal-and-requeue foreign-session events (see
-        # _notification_poller_loop's belongs-elsewhere branch), rotating the
-        # queue. The requeue contract is that batch_2 and batch_3 both remain
-        # queued (never consumed) while batch_1's turn is in flight — so drain
-        # with a deadline (an event may be transiently held by a poller
-        # mid-cycle) and assert exactly {batch_2, batch_3} come back.
-        queued: dict = {}
-        deadline = time.time() + 5.0
-        while time.time() < deadline and set(queued) != {
-            "proc_batch_2",
-            "proc_batch_3",
-        }:
-            try:
-                evt = isolated_queue.get(timeout=0.1)
-            except _queue_mod.Empty:
-                continue
-            queued[evt["session_id"]] = evt
-        assert set(queued) == {"proc_batch_2", "proc_batch_3"}
+        # Nested batch turn is still in flight; queue should be empty (all claimed).
+        assert isolated_queue.empty()
+        assert any(
+            "proc_batch_1" in t and "proc_batch_2" in t and "proc_batch_3" in t
+            for t in turns[1:]
+        ) or any("background completions arrived as a backlog" in t for t in turns[1:])
+        release_nested.set()
+        for thread in threads:
+            thread.join(timeout=5)
+        assert turns[0] == "session-a-turn"
+        assert len(turns) == 2
     finally:
         release_nested.set()
         for thread in threads:
@@ -6585,6 +6580,7 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
         while not isolated_queue.empty():
             isolated_queue.get_nowait()
         for event in events:
+            process_registry.release_completion_delivery(event)
             process_registry._completion_consumed.discard(event["session_id"])
             process_registry._poll_observed.discard(event["session_id"])
 
@@ -16100,54 +16096,63 @@ def test_notification_poller_skips_completed_lifecycle(monkeypatch):
         server._sessions.pop("sid_skip", None)
 
 
-def test_notification_poller_requeues_when_busy(monkeypatch):
-    """When the agent is busy, the poller requeues the event."""
-    import queue as _queue_mod
-
-    from tools.process_registry import process_registry
+def test_notification_poller_steers_when_busy(monkeypatch):
+    """When the agent is busy and supports steer, completions are accepted not requeued."""
+    import tools.process_registry as process_registry_module
+    from tools.process_registry import ProcessRegistry
 
     emitted = []
+    steered = []
 
-    sess = _session(running=True)  # agent is busy
-    server._sessions["sid_busy"] = sess
+    class _Agent:
+        def steer(self, text: str) -> bool:
+            steered.append(text)
+            return True
+
+    class _StopAfterOneLoop:
+        def __init__(self):
+            self._checks = 0
+
+        def is_set(self):
+            self._checks += 1
+            # while + liveness probe = 2 checks per iteration
+            return self._checks > 2
+
+    registry = ProcessRegistry()
+    monkeypatch.setattr(process_registry_module, "process_registry", registry)
+    monkeypatch.setattr(server, "_collect_kanban_notifications", lambda _s: [])
+    monkeypatch.setattr(server, "_sync_runtime_heartbeat_status", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_NOTIFICATION_REQUEUE_BACKOFF_SECONDS", 0.0)
     monkeypatch.setattr(server, "_emit", lambda *a, **kw: emitted.append(a))
 
-    # Isolate the completion queue for the duration of this test. The poller
-    # reads process_registry.completion_queue by attribute at runtime, so a
-    # fresh Queue here means no concurrently-running test in the same xdist
-    # worker can put/get on the shared singleton mid-run and drain the event
-    # we expect to be requeued. monkeypatch restores the original on teardown.
-    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
-    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
-    process_registry._completion_consumed.discard("proc_busy_test")
+    sess = _session(agent=_Agent(), running=True)  # agent is busy
+    server._sessions["sid_busy"] = sess
 
     evt = {
         "type": "completion",
         "session_id": "proc_busy_test",
+        "session_key": "session-key",
+        "started_at": 1.0,
         "command": "make build",
         "exit_code": 0,
+        "completion_reason": "exited",
+        "termination_source": "",
         "output": "ok",
     }
-    isolated_queue.put(evt)
-
-    stop = threading.Event()
-    stop.set()
+    registry.completion_queue.put(evt)
 
     try:
-        server._notification_poller_loop(stop, "sid_busy", sess)
+        server._notification_poller_loop(_StopAfterOneLoop(), "sid_busy", sess)
 
-        # Status update was emitted (user sees it)
         status_calls = [a for a in emitted if a[0] == "status.update"]
         assert len(status_calls) == 1
-
-        # Event was requeued (agent was busy, no turn triggered)
-        assert not isolated_queue.empty()
-        requeued = isolated_queue.get_nowait()
-        assert requeued["session_id"] == "proc_busy_test"
+        assert len(steered) == 1
+        assert registry.completion_queue.empty()
+        pending = sess.get("_completion_steer_pending") or []
+        assert len(pending) == 1
+        assert pending[0]["state"] == "steer_accepted"
     finally:
         server._sessions.pop("sid_busy", None)
-        while not process_registry.completion_queue.empty():
-            process_registry.completion_queue.get_nowait()
 
 
 def test_session_save_writes_under_hermes_home_with_system_prompt(monkeypatch, tmp_path):

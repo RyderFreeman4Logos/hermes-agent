@@ -184,20 +184,22 @@ def _same_persisted_completion_row(
     """Compare one persisted completion row without process-local metadata."""
     if not isinstance(durable_message, dict) or not isinstance(live_message, dict):
         return False
-    ignored = {
-        "timestamp",
-        _DB_PERSISTED_MARKER,
-        "_completion_delivery_active",
-    }
-    return {
-        key: value
-        for key, value in durable_message.items()
-        if key not in ignored
-    } == {
-        key: value
-        for key, value in live_message.items()
-        if key not in ignored
-    }
+
+    def _persisted_shape(message: Dict[str, Any]) -> Dict[str, Any]:
+        shape = {
+            key: value
+            for key, value in message.items()
+            if not key.startswith("_")
+            and key not in {"timestamp", "tool_name"}
+            and value is not None
+        }
+        if message.get("role") == "tool" and not shape.get("name"):
+            tool_name = message.get("tool_name")
+            if tool_name:
+                shape["name"] = tool_name
+        return shape
+
+    return _persisted_shape(durable_message) == _persisted_shape(live_message)
 
 
 def _capture_durable_compaction_view(

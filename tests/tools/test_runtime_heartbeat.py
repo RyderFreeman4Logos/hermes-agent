@@ -276,6 +276,76 @@ def test_active_snapshots_are_complete_stable_and_clear_on_cancel(
     assert "phase=cancel" in caplog.text
 
 
+def test_active_snapshot_cadence_resets_after_periodic_rearm(monkeypatch):
+    from tools.runtime_heartbeat import RuntimeHeartbeat
+
+    FakeTimer.created = []
+    clock = SimpleNamespace(monotonic=100.0, wall=1_700_000_000.0)
+    monkeypatch.setattr(
+        "tools.runtime_heartbeat.time.monotonic", lambda: clock.monotonic
+    )
+    monkeypatch.setattr("tools.runtime_heartbeat.time.time", lambda: clock.wall)
+    manager = RuntimeHeartbeat(event_queue=queue.Queue(), timer_factory=FakeTimer)
+
+    assert manager.arm(
+        "delegate",
+        caller_id="owner",
+        kind="delegation",
+        interval=1700,
+        inspect=lambda: {"alive": True, "progress": True},
+    )
+    assert manager.active_snapshots()[0]["started_at"] == 1_700_000_000.0
+
+    clock.monotonic += 1700
+    clock.wall += 1700
+    FakeTimer.created[0].callback()
+
+    assert manager.active_snapshots()[0]["started_at"] == 1_700_001_700.0
+
+
+def test_active_snapshot_cadence_tracks_accepted_provider_activity(monkeypatch):
+    from tools.runtime_heartbeat import RuntimeHeartbeat
+
+    FakeTimer.created = []
+    clock = SimpleNamespace(monotonic=80.0, wall=1_700_000_000.0)
+    monkeypatch.setattr(
+        "tools.runtime_heartbeat.time.monotonic", lambda: clock.monotonic
+    )
+    monkeypatch.setattr("tools.runtime_heartbeat.time.time", lambda: clock.wall)
+    manager = RuntimeHeartbeat(event_queue=queue.Queue(), timer_factory=FakeTimer)
+    alive = lambda: {"alive": True, "progress": True}
+
+    assert manager.arm(
+        "delegate",
+        caller_id="owner",
+        kind="delegation",
+        interval=1700,
+        inspect=alive,
+        provider="openai",
+        cache_context="cache-a",
+    )
+    clock.monotonic = 100.0
+    clock.wall += 20.0
+    assert manager.reset_for_caller(
+        "owner",
+        provider="openai",
+        cache_context="cache-a",
+        activity_at=90.0,
+    ) == 1
+    accepted = manager.active_snapshots()[0]["started_at"]
+    assert accepted == 1_700_000_010.0
+
+    clock.monotonic = 400.0
+    clock.wall += 300.0
+    assert manager.reset_for_caller(
+        "owner",
+        provider="openai",
+        cache_context="cache-a",
+        activity_at=0.0,
+    ) == 0
+    assert manager.active_snapshots()[0]["started_at"] == accepted
+
+
 def test_alive_fires_once_and_rearms_from_checkin_at_exact_interval(caplog):
     from tools.runtime_heartbeat import RuntimeHeartbeat
 

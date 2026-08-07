@@ -9293,6 +9293,8 @@ def _sync_runtime_heartbeat_status(
     if status is None:
         return previous
     current = _runtime_heartbeat_status_key(status)
+    if previous is None and not current:
+        return current
     if previous == current:
         return previous
     _emit("session.usage", sid, {"usage": {"runtime_heartbeat": status}})

@@ -316,19 +316,25 @@ def finish_deferred_normal_warm_snapshot(
     finish_normal_warm_snapshot(agent, pending[1], succeeded=publishable)
 
 
-def claim_warm_snapshot(agent) -> Optional[tuple[int, Dict[str, Any], Any]]:
-    """Claim one immutable last-known-good request for isolated replay."""
+def claim_warm_snapshot(
+    agent,
+) -> tuple[Optional[tuple[int, Dict[str, Any], Any]], str]:
+    """Claim one immutable last-known-good request and explain safe skips."""
     lock, state = _warm_snapshot_state(agent)
     with lock:
         snapshot = state.get("snapshot")
-        if state["active"] or state.get("warm_epoch") is not None or snapshot is None:
-            return None
+        if state["active"]:
+            return None, "normal_request_in_flight"
+        if state.get("warm_epoch") is not None:
+            return None, "checkin_already_in_flight"
+        if snapshot is None:
+            return None, "no_validated_snapshot"
         epoch = int(state["epoch"])
     try:
         identity = _warm_snapshot_identity(agent)
     except Exception:
         logger.debug("Could not validate heartbeat request snapshot", exc_info=True)
-        return None
+        return None, "identity_unavailable"
     with lock:
         if (
             state["epoch"] != epoch
@@ -337,17 +343,17 @@ def claim_warm_snapshot(agent) -> Optional[tuple[int, Dict[str, Any], Any]]:
             or state.get("snapshot") is not snapshot
             or not _snapshot_identity_matches(snapshot, identity)
         ):
-            return None
+            return None, "snapshot_stale"
         api_kwargs = _build_warm_api_kwargs(snapshot)
         if api_kwargs is None:
-            return None
+            return None, "no_bounded_output_cap"
         state["warm_epoch"] = epoch
     physical_client = _claim_physical_client(agent, snapshot.physical_client)
     if physical_client is None:
         with lock:
             if state.get("warm_epoch") == epoch:
                 state["warm_epoch"] = None
-        return None
+        return None, "client_lease_unavailable"
     with lock:
         if (
             state["epoch"] != epoch
@@ -366,8 +372,8 @@ def claim_warm_snapshot(agent) -> Optional[tuple[int, Dict[str, Any], Any]]:
             stale = False
     if stale:
         _release_physical_client(agent, physical_client, reusable=True)
-        return None
-    return epoch, api_kwargs, physical_client
+        return None, "snapshot_stale_after_lease"
+    return (epoch, api_kwargs, physical_client), ""
 
 
 def commit_warm_snapshot_dispatch(
@@ -696,6 +702,15 @@ class RuntimeHeartbeat:
                 return False
             target.baseline = baseline
             self._schedule_locked(key, target)
+        logger.info(
+            "Runtime heartbeat phase=arm target=%s owner=%s kind=%s "
+            "provider=%s interval_s=%s",
+            target.target_id,
+            target.caller_id,
+            target.kind,
+            target.provider or "-",
+            target.interval,
+        )
         return True
 
     def _schedule_locked(
@@ -768,6 +783,12 @@ class RuntimeHeartbeat:
                 self._publication_done.wait()
         if replacement_event is not None:
             self._queue().put(replacement_event)
+        logger.info(
+            "Runtime heartbeat phase=cancel target=%s owner=%s kind=%s",
+            target.target_id,
+            target.caller_id,
+            target.kind,
+        )
         return True
 
     def cancel_for_caller(self, caller_id: str) -> int:
@@ -914,6 +935,24 @@ class RuntimeHeartbeat:
                 if target.caller_id == str(caller_id)
             ]
 
+    def active_snapshots(self) -> list[Dict[str, Any]]:
+        """Return immutable UI-safe target timing snapshots."""
+        with self._lock:
+            targets = sorted(
+                self._targets.values(),
+                key=lambda target: (target.started_at, target.target_id),
+            )
+            return [
+                {
+                    "target_id": target.target_id,
+                    "caller_id": target.caller_id,
+                    "kind": target.kind,
+                    "started_at": target.started_at,
+                    "interval_s": target.interval,
+                }
+                for target in targets
+            ]
+
     @staticmethod
     def _assess(target: _Target, snapshot: Dict[str, Any]) -> tuple[str, str]:
         if target.kind == "process":
@@ -948,6 +987,14 @@ class RuntimeHeartbeat:
             if target is None or target.generation != generation:
                 return
             target.timer = None
+        logger.info(
+            "Runtime heartbeat phase=due target=%s owner=%s kind=%s "
+            "interval_s=%s",
+            target.target_id,
+            target.caller_id,
+            target.kind,
+            target.interval,
+        )
         inspection_error = None
         try:
             snapshot = dict(target.inspect() or {})

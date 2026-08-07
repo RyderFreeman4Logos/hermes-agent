@@ -638,6 +638,11 @@ _NON_GATEWAY_SOURCES = frozenset({
     "", "tui", "cli", "webui", "desktop", "cron", "kanban", "subagent", "test",
     "local", "acp", "webhook", "api_server", "msgraph_webhook",
 })
+_NOTIFICATION_QUEUE_WAIT_SECONDS = 0.5
+_NOTIFICATION_REQUEUE_BACKOFF_SECONDS = 0.25
+_NOTIFICATION_POLLER_JOIN_TIMEOUT_SECONDS = (
+    _NOTIFICATION_QUEUE_WAIT_SECONDS + _NOTIFICATION_REQUEUE_BACKOFF_SECONDS
+)
 
 
 def _is_gateway_owned_source(source: str) -> bool:
@@ -664,6 +669,15 @@ def _is_gateway_owned_source(source: str) -> bool:
         return False
 
 
+def _join_notification_poller(poller_thread) -> None:
+    if poller_thread is None or poller_thread is threading.current_thread():
+        return
+    try:
+        poller_thread.join(timeout=_NOTIFICATION_POLLER_JOIN_TIMEOUT_SECONDS)
+    except (AttributeError, RuntimeError):
+        pass
+
+
 def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> None:
     """Best-effort finalize hook + memory commit for a session.
 
@@ -673,13 +687,29 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     force-quit (double Ctrl‑C, terminal‑close, SIGHUP) while the agent
     is mid‑turn.
     """
-    if not session or session.get("_finalized"):
+    if not session:
         return
-    session["_finalized"] = True
+    poller_thread = None
+    lifecycle_lock = session.get("_notif_lifecycle_lock")
+    if lifecycle_lock is not None:
+        with lifecycle_lock:
+            if session.get("_finalized"):
+                return
+            session["_finalized"] = True
+            stop_event = session.get("_notif_stop")
+            if stop_event is not None:
+                stop_event.set()
+            poller_thread = session.get("_notif_thread")
+    else:
+        if session.get("_finalized"):
+            return
+        session["_finalized"] = True
+        stop_event = session.get("_notif_stop")
+        if stop_event is not None:
+            stop_event.set()
+        poller_thread = session.get("_notif_thread")
     _release_active_session_slot(session)
-    stop_event = session.get("_notif_stop")
-    if stop_event is not None:
-        stop_event.set()
+    _join_notification_poller(poller_thread)
 
     agent = session.get("agent")
     lock = session.get("history_lock")
@@ -5440,10 +5470,17 @@ def _session_usage_snapshot(session: dict | None) -> dict:
     agent = (session or {}).get("agent")
     mirror_usage = _metadata_mirror(session).get("usage")
     if (session or {}).get("_compute_host_active") and isinstance(mirror_usage, dict):
-        return dict(mirror_usage)
-    if agent is not None:
-        return _get_usage(agent)
-    return dict(mirror_usage) if isinstance(mirror_usage, dict) else {}
+        usage = dict(mirror_usage)
+    elif agent is not None:
+        usage = _get_usage(agent)
+    else:
+        usage = dict(mirror_usage) if isinstance(mirror_usage, dict) else {}
+    heartbeat = _runtime_heartbeat_status_for_session(
+        _session_lookup_key(session or {}, fallback=""), session or {}
+    )
+    if heartbeat is not None:
+        usage["runtime_heartbeat"] = heartbeat
+    return usage
 
 
 def _project_info_for_cwd(cwd: str) -> dict | None:
@@ -9366,6 +9403,110 @@ def _notification_event_requires_owner(evt: dict) -> bool:
     )
 
 
+def _runtime_heartbeat_status_for_session(
+    sid: str, session: dict
+) -> dict | None:
+    """Build one complete, owner-filtered, nonpersistent TUI snapshot."""
+    try:
+        from tools.runtime_heartbeat import runtime_heartbeat
+
+        snapshots = runtime_heartbeat.active_snapshots()
+    except Exception:
+        logger.debug("Could not snapshot runtime heartbeat targets", exc_info=True)
+        return None
+
+    targets = []
+    for snapshot in snapshots:
+        if not isinstance(snapshot, dict) or not _session_owns_notification_event(
+            sid,
+            session,
+            {
+                "type": "heartbeat",
+                "session_key": snapshot.get("caller_id"),
+            },
+        ):
+            continue
+        target_id = str(snapshot.get("target_id") or "")
+        kind = str(snapshot.get("kind") or "")
+        started_at = snapshot.get("started_at")
+        interval_s = snapshot.get("interval_s")
+        if (
+            not target_id
+            or not kind
+            or not isinstance(started_at, (int, float))
+            or isinstance(started_at, bool)
+            or not isinstance(interval_s, int)
+            or isinstance(interval_s, bool)
+            or interval_s <= 0
+        ):
+            continue
+        targets.append(
+            {
+                "target_id": target_id,
+                "kind": kind,
+                "started_at": float(started_at),
+                "interval_s": interval_s,
+            }
+        )
+    return {"active_count": len(targets), "targets": targets}
+
+
+def _runtime_heartbeat_status_key(status: dict) -> tuple:
+    return tuple(
+        (
+            target["target_id"],
+            target["kind"],
+            target["started_at"],
+            target["interval_s"],
+        )
+        for target in status["targets"]
+    )
+
+
+def _sync_runtime_heartbeat_status(
+    sid: str,
+    session: dict,
+    *,
+    previous: tuple | None,
+    stop_event: threading.Event | None = None,
+) -> tuple | None:
+    """Emit only target-set changes; elapsed time advances in the TUI."""
+    if not _notification_poller_is_current(session, stop_event):
+        return previous
+    status = _runtime_heartbeat_status_for_session(sid, session)
+    if status is None:
+        return previous
+    if not _notification_poller_is_current(session, stop_event):
+        return previous
+    current = _runtime_heartbeat_status_key(status)
+    if previous == current:
+        return previous
+    lifecycle_lock = session.get("_notif_lifecycle_lock")
+    if lifecycle_lock is None:
+        if not _notification_poller_is_current(session, stop_event):
+            return previous
+        _emit("session.usage", sid, {"usage": {"runtime_heartbeat": status}})
+    else:
+        with lifecycle_lock:
+            if not _notification_poller_is_current(session, stop_event):
+                return previous
+            _emit("session.usage", sid, {"usage": {"runtime_heartbeat": status}})
+    return current
+
+
+def _notification_poller_is_current(
+    session: dict, stop_event: threading.Event | None
+) -> bool:
+    if session.get("_finalized") or (stop_event is not None and stop_event.is_set()):
+        return False
+    registered_stop = session.get("_notif_stop")
+    return (
+        stop_event is None
+        or registered_stop is None
+        or registered_stop is stop_event
+    )
+
+
 def _notification_event_dedup_key(evt: dict) -> tuple:
     """Return the UI-emission identity for a process notification event.
 
@@ -9595,7 +9736,18 @@ def _notification_poller_loop(
 
     _emitted = set()  # dedup re-queued events so same completion isn't emitted 50 times while session is busy
     _last_kanban_poll = 0.0
+    _heartbeat_status = None
     while not stop_event.is_set() and not session.get("_finalized"):
+        # This is a lock-only local registry snapshot, not an agent/provider
+        # poll. Emit only arm/cancel changes; Ink advances elapsed time itself.
+        _heartbeat_status = _sync_runtime_heartbeat_status(
+            sid,
+            session,
+            previous=_heartbeat_status,
+            stop_event=stop_event,
+        )
+        if not _notification_poller_is_current(session, stop_event):
+            break
         _now = time.monotonic()
         if _now - _last_kanban_poll >= _KANBAN_POLL_SECONDS:
             _last_kanban_poll = _now
@@ -9636,7 +9788,9 @@ def _notification_poller_loop(
                         with session["history_lock"]:
                             session["running"] = False
         try:
-            evt = process_registry.completion_queue.get(timeout=0.5)
+            evt = process_registry.completion_queue.get(
+                timeout=_NOTIFICATION_QUEUE_WAIT_SECONDS
+            )
         except Exception:
             continue
 
@@ -9707,7 +9861,7 @@ def _notification_poller_loop(
             # Back off before re-polling: the re-queued event keeps the queue
             # non-empty, so without a sleep this loop spins at full speed
             # (100% CPU, GIL churn) for as long as the session stays busy.
-            time.sleep(0.25)
+            time.sleep(_NOTIFICATION_REQUEUE_BACKOFF_SECONDS)
             continue
 
         if not process_registry.claim_completion_delivery(evt):
@@ -10025,6 +10179,17 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
         args=(stop, sid, session),
         daemon=True,
     )
+    lifecycle_lock = session.setdefault("_notif_lifecycle_lock", threading.RLock())
+    with lifecycle_lock:
+        previous_stop = session.get("_notif_stop")
+        previous_thread = session.get("_notif_thread")
+        if previous_stop is not None:
+            previous_stop.set()
+        session["_notif_stop"] = stop
+        session["_notif_thread"] = t
+        if session.get("_finalized"):
+            stop.set()
+    _join_notification_poller(previous_thread)
     t.start()
     return stop
 

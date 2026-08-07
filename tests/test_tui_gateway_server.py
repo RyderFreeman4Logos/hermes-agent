@@ -4610,6 +4610,364 @@ def test_tui_foreign_heartbeat_never_crosses_owner(
     )
 
 
+def test_notification_poller_teardown_fences_blocked_heartbeat_snapshot(
+    monkeypatch,
+):
+    import queue as _queue_mod
+
+    from tools.process_registry import process_registry
+    from tools.runtime_heartbeat import runtime_heartbeat
+
+    sid = "heartbeat-teardown-race"
+    session = _session(session_key="heartbeat-owner")
+    snapshot_blocked = threading.Event()
+    release_snapshot = threading.Event()
+    snapshot_calls = 0
+    emitted = []
+    target_thread = {}
+    real_thread = threading.Thread
+    real_active_snapshots = runtime_heartbeat.active_snapshots
+
+    def _active_snapshots():
+        nonlocal snapshot_calls
+        if threading.current_thread() is not target_thread.get("value"):
+            return real_active_snapshots()
+        snapshot_calls += 1
+        if snapshot_calls == 2:
+            snapshot_blocked.set()
+            assert release_snapshot.wait(timeout=5)
+        return [
+            {
+                "caller_id": "heartbeat-owner",
+                "interval_s": 1700,
+                "kind": "process",
+                "started_at": 1_700_000_000.25,
+                "target_id": "proc-a",
+            }
+        ]
+
+    def _capture_thread(*args, **kwargs):
+        thread = real_thread(*args, **kwargs)
+        thread_args = kwargs.get("args", ())
+        if (
+            kwargs.get("target") is server._notification_poller_loop
+            and len(thread_args) >= 2
+            and thread_args[1] == sid
+        ):
+            target_thread["value"] = thread
+        return thread
+
+    def _capture_emit(event_type, event_sid, payload):
+        if event_sid != sid:
+            return
+        stop = session.get("_notif_stop")
+        emitted.append(
+            (
+                event_type,
+                event_sid,
+                payload,
+                bool(session.get("_finalized")),
+                bool(stop and stop.is_set()),
+            )
+        )
+
+    monkeypatch.setattr(
+        "tools.runtime_heartbeat.runtime_heartbeat.active_snapshots",
+        _active_snapshots,
+    )
+    monkeypatch.setattr(process_registry, "completion_queue", _queue_mod.Queue())
+    monkeypatch.setattr(server, "_emit", _capture_emit)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_release_active_session_slot", lambda _s: None)
+    monkeypatch.setattr(server.threading, "Thread", _capture_thread)
+
+    stop = server._start_notification_poller(sid, session)
+    session["_notif_stop"] = stop
+    assert snapshot_blocked.wait(timeout=5)
+
+    server._teardown_session(session)
+    emitted_at_teardown = len(emitted)
+    release_snapshot.set()
+    poller_thread = target_thread["value"]
+    poller_thread.join(timeout=2)
+
+    assert snapshot_calls == 2
+    assert emitted[0][0:3] == (
+        "session.usage",
+        sid,
+        {
+            "usage": {
+                "runtime_heartbeat": {
+                    "active_count": 1,
+                    "targets": [
+                        {
+                            "interval_s": 1700,
+                            "kind": "process",
+                            "started_at": 1_700_000_000.25,
+                            "target_id": "proc-a",
+                        }
+                    ],
+                }
+            }
+        },
+    )
+    assert emitted[0][3:] == (False, False)
+    assert emitted[emitted_at_teardown:] == []
+    assert session.get("_notif_thread") is poller_thread
+    assert stop.is_set()
+    assert not poller_thread.is_alive()
+
+
+def test_notification_poller_teardown_stops_and_joins_once(monkeypatch):
+    import queue as _queue_mod
+
+    from tools.process_registry import process_registry
+
+    sid = "heartbeat-normal-stop"
+    session = _session(session_key="heartbeat-owner")
+    snapshot_called = threading.Event()
+    threads = []
+    real_thread = threading.Thread
+
+    def _active_snapshots():
+        snapshot_called.set()
+        return []
+
+    def _capture_thread(*args, **kwargs):
+        thread = real_thread(*args, **kwargs)
+        threads.append(thread)
+        return thread
+
+    monkeypatch.setattr(
+        "tools.runtime_heartbeat.runtime_heartbeat.active_snapshots",
+        _active_snapshots,
+    )
+    monkeypatch.setattr(process_registry, "completion_queue", _queue_mod.Queue())
+    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_release_active_session_slot", lambda _s: None)
+    monkeypatch.setattr(server.threading, "Thread", _capture_thread)
+
+    stop = server._start_notification_poller(sid, session)
+    session["_notif_stop"] = stop
+    assert snapshot_called.wait(timeout=5)
+
+    server._teardown_session(session)
+    server._teardown_session(session)
+
+    assert session.get("_notif_thread") is threads[0]
+    assert stop.is_set()
+    assert not threads[0].is_alive()
+
+
+def test_finalize_session_does_not_join_current_notification_thread(monkeypatch):
+    stop = threading.Event()
+    session = _session(
+        _notif_stop=stop,
+        _notif_thread=threading.current_thread(),
+    )
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_release_active_session_slot", lambda _s: None)
+
+    server._finalize_session(session)
+    server._finalize_session(session)
+
+    assert session.get("_finalized") is True
+    assert stop.is_set()
+
+
+def test_notification_poller_emit_callback_can_teardown_without_self_deadlock(
+    monkeypatch,
+):
+    import queue as _queue_mod
+
+    from tools.process_registry import process_registry
+
+    sid = "heartbeat-emit-teardown"
+    session = _session(session_key="heartbeat-owner")
+    teardown_returned = threading.Event()
+    threads = []
+    real_thread = threading.Thread
+
+    def _capture_thread(*args, **kwargs):
+        thread = real_thread(*args, **kwargs)
+        threads.append(thread)
+        return thread
+
+    def _emit_and_teardown(*_args):
+        server._teardown_session(session)
+        teardown_returned.set()
+
+    monkeypatch.setattr(
+        "tools.runtime_heartbeat.runtime_heartbeat.active_snapshots",
+        lambda: [
+            {
+                "caller_id": "heartbeat-owner",
+                "interval_s": 1700,
+                "kind": "process",
+                "started_at": 1_700_000_000.25,
+                "target_id": "proc-a",
+            }
+        ],
+    )
+    monkeypatch.setattr(process_registry, "completion_queue", _queue_mod.Queue())
+    monkeypatch.setattr(server, "_emit", _emit_and_teardown)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_release_active_session_slot", lambda _s: None)
+    monkeypatch.setattr(server.threading, "Thread", _capture_thread)
+
+    stop = server._start_notification_poller(sid, session)
+
+    assert teardown_returned.wait(timeout=2)
+    threads[0].join(timeout=2)
+    assert session.get("_notif_thread") is threads[0]
+    assert stop.is_set()
+    assert not threads[0].is_alive()
+
+
+def test_notification_poller_restart_stops_prior_generation(monkeypatch):
+    import queue as _queue_mod
+
+    from tools.process_registry import process_registry
+
+    sid = "heartbeat-poller-restart"
+    session = _session(session_key="heartbeat-owner")
+    snapshot_calls = 0
+    first_snapshot = threading.Event()
+    second_snapshot = threading.Event()
+    threads = []
+    real_thread = threading.Thread
+
+    def _active_snapshots():
+        nonlocal snapshot_calls
+        snapshot_calls += 1
+        (first_snapshot if snapshot_calls == 1 else second_snapshot).set()
+        return []
+
+    def _capture_thread(*args, **kwargs):
+        thread = real_thread(*args, **kwargs)
+        threads.append(thread)
+        return thread
+
+    monkeypatch.setattr(
+        "tools.runtime_heartbeat.runtime_heartbeat.active_snapshots",
+        _active_snapshots,
+    )
+    monkeypatch.setattr(process_registry, "completion_queue", _queue_mod.Queue())
+    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_release_active_session_slot", lambda _s: None)
+    monkeypatch.setattr(server.threading, "Thread", _capture_thread)
+
+    first_stop = server._start_notification_poller(sid, session)
+    assert first_snapshot.wait(timeout=2)
+    second_stop = server._start_notification_poller(sid, session)
+    assert second_snapshot.wait(timeout=2)
+
+    server._teardown_session(session)
+    for thread in threads:
+        thread.join(timeout=2)
+
+    assert first_stop.is_set()
+    assert second_stop.is_set()
+    assert len(threads) == 2
+    assert session.get("_notif_thread") is threads[1]
+    assert not any(thread.is_alive() for thread in threads)
+
+
+def test_tui_heartbeat_snapshot_reconciles_full_owner_state(monkeypatch):
+    session = _session(session_key="heartbeat-owner")
+    emitted = []
+    owner_snapshots = [
+        {
+            "caller_id": "heartbeat-owner",
+            "interval_s": 1700,
+            "kind": "process",
+            "started_at": 1_700_000_000.25,
+            "target_id": "proc-a",
+        },
+        {
+            "caller_id": "heartbeat-owner",
+            "interval_s": 1700,
+            "kind": "delegation",
+            "started_at": 1_700_000_002.25,
+            "target_id": "delegate-b",
+        },
+        {
+            "caller_id": "foreign-owner",
+            "interval_s": 3300,
+            "kind": "process",
+            "started_at": 1_700_000_003.25,
+            "target_id": "foreign",
+        },
+    ]
+    snapshots = iter((owner_snapshots, owner_snapshots, []))
+    monkeypatch.setattr(
+        "tools.runtime_heartbeat.runtime_heartbeat.active_snapshots",
+        lambda: next(snapshots),
+    )
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event_type, sid, payload: emitted.append((event_type, sid, payload)),
+    )
+
+    previous = server._sync_runtime_heartbeat_status(
+        "heartbeat-sid", session, previous=None
+    )
+    assert previous == (
+        ("proc-a", "process", 1_700_000_000.25, 1700),
+        ("delegate-b", "delegation", 1_700_000_002.25, 1700),
+    )
+    assert emitted == [
+        (
+            "session.usage",
+            "heartbeat-sid",
+            {
+                "usage": {
+                    "runtime_heartbeat": {
+                        "active_count": 2,
+                        "targets": [
+                            {
+                                "interval_s": 1700,
+                                "kind": "process",
+                                "started_at": 1_700_000_000.25,
+                                "target_id": "proc-a",
+                            },
+                            {
+                                "interval_s": 1700,
+                                "kind": "delegation",
+                                "started_at": 1_700_000_002.25,
+                                "target_id": "delegate-b",
+                            },
+                        ],
+                    }
+                }
+            },
+        )
+    ]
+
+    previous = server._sync_runtime_heartbeat_status(
+        "heartbeat-sid", session, previous=previous
+    )
+    assert len(emitted) == 1
+
+    previous = server._sync_runtime_heartbeat_status(
+        "heartbeat-sid", session, previous=previous
+    )
+    assert previous == ()
+    assert emitted[-1] == (
+        "session.usage",
+        "heartbeat-sid",
+        {"usage": {"runtime_heartbeat": {"active_count": 0, "targets": []}}},
+    )
+
+
 @pytest.mark.parametrize("existing_snapshot", [None, {
     "user": "real prompt",
     "assistant": "partial answer",

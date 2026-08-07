@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import agent.context_compressor as context_compressor_module
 from agent.context_compressor import _capture_durable_compaction_view
 from agent.replay_cleanup import sanitize_replay_history
 from hermes_state import SessionDB
@@ -367,6 +368,191 @@ def test_effect_started_completion_survives_proactive_prune_exactly_once(
         assert events[0]["display_metadata"] == {
             "completion_delivery_status": "complete"
         }
+        _assert_provider_protocol_is_closed(active)
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("force_later_retry", [False, True])
+def test_effect_started_completion_survives_repeated_prune_and_final_cas(
+    tmp_path, monkeypatch, caplog, force_later_retry
+):
+    """Repeated prune/reload keeps the active event CAS-identical."""
+    injected_context = "PLUGIN-CTX\n" * 400
+    monkeypatch.setattr(
+        "hermes_cli.plugins.invoke_hook",
+        lambda hook, **_kw: (
+            [{"context": injected_context}] if hook == "pre_llm_call" else []
+        ),
+    )
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "completion-active-repeated-prune"
+    db.create_session(session_id, source="tui", model="test-model")
+    db.append_messages_batch(session_id, _large_tool_history())
+    canonical, wire = _completion_texts()
+    field_mismatches: list[set[str]] = []
+    original_compare = context_compressor_module._same_persisted_completion_row
+
+    def capture_field_mismatch(durable_message, live_message):
+        matches = original_compare(durable_message, live_message)
+        if not matches:
+            ignored = {
+                "timestamp",
+                "_db_persisted",
+                "_completion_delivery_active",
+            }
+            durable_fields = {
+                key: value
+                for key, value in durable_message.items()
+                if key not in ignored
+            }
+            live_fields = {
+                key: value
+                for key, value in live_message.items()
+                if key not in ignored
+            }
+            field_mismatches.append({
+                key
+                for key in durable_fields.keys() | live_fields.keys()
+                if (
+                    key not in durable_fields
+                    or key not in live_fields
+                    or durable_fields[key] != live_fields[key]
+                )
+            })
+        return matches
+
+    monkeypatch.setattr(
+        context_compressor_module,
+        "_same_persisted_completion_row",
+        capture_field_mismatch,
+    )
+
+    try:
+        history = db.get_messages_as_conversation(session_id)
+        agent = _make_agent(tmp_path, db, session_id)
+        agent.compression_enabled = True
+        compressor = agent.context_compressor
+        compressor.proactive_prune_tokens = 48_000
+        compressor.proactive_prune_min_result_chars = 8_000
+        compressor.proactive_prune_min_reclaim_tokens = 4_096
+        compressor.protect_first_n = 2
+        compressor.protect_last_n = 4
+        compressor._proactive_prune_runway_authoritative = True
+        agent._pending_cli_user_message = {
+            "role": "user",
+            "content": wire,
+            "_completion_delivery_synthetic": True,
+        }
+        original_append = db.append_messages_batch
+        storage_available = not force_later_retry
+        final_cas_attempts = 0
+
+        def append_with_optional_outage(*args, **kwargs):
+            nonlocal final_cas_attempts
+            if kwargs.get("display_metadata_cas"):
+                final_cas_attempts += 1
+                if not storage_available:
+                    raise RuntimeError("simulated final CAS storage outage")
+            return original_append(*args, **kwargs)
+
+        monkeypatch.setattr(
+            db, "append_messages_batch", append_with_optional_outage
+        )
+        requests = _capture_client(agent, [
+            _mock_response(
+                content="",
+                finish_reason="tool_calls",
+                tool_calls=[
+                    _mock_tool_call(
+                        name="web_search",
+                        arguments="{}",
+                        call_id=f"call-completion-prune-{index}",
+                    )
+                ],
+                usage={
+                    "prompt_tokens": 120_000,
+                    "completion_tokens": 1,
+                    "total_tokens": 120_001,
+                },
+            )
+            for index in range(3)
+        ] + [
+            _mock_response(
+                content="Build passed",
+                finish_reason="stop",
+                usage={
+                    "prompt_tokens": 120_000,
+                    "completion_tokens": 2,
+                    "total_tokens": 120_002,
+                },
+            ),
+        ])
+
+        with (
+            patch.object(compressor, "should_compress", return_value=False),
+            patch("run_agent.handle_function_call", return_value="checked"),
+            caplog.at_level("WARNING"),
+        ):
+            result = agent.run_conversation(
+                wire,
+                conversation_history=history,
+                persist_user_message=wire,
+                task_id="completion-repeated-proactive-prune",
+            )
+
+        assert len(requests) == 4
+        assert field_mismatches == []
+        if force_later_retry:
+            assert result["completion_delivery_status"] == "pending"
+            assert result["failed"] is True
+            assert agent._completion_delivery_commit_failed is True
+            assert final_cas_attempts == 2
+            pending_event = next(
+                row
+                for row in db.get_messages_as_conversation(session_id)
+                if row.get("role") == "user" and row.get("content") == canonical
+            )
+            assert pending_event["display_metadata"] == {
+                "completion_delivery_status": "effect_started"
+            }
+
+            storage_available = True
+            retry_requests = _capture_client(
+                agent, [_mock_response(content="Reviewed", finish_reason="stop")]
+            )
+            recovered = agent.run_conversation(
+                "review again", conversation_history=result["messages"]
+            )
+
+            assert final_cas_attempts == 3
+            assert len(retry_requests) == 1
+            assert recovered["failed"] is False
+            assert agent._completion_delivery_commit_failed is False
+        else:
+            assert result["completion_delivery_status"] == "committed"
+            assert result["failed"] is False
+            assert agent._completion_delivery_commit_failed is False
+            assert final_cas_attempts == 1
+        assert "active completion delivery does not match durable transcript tail" not in (
+            caplog.text
+        )
+        assert "display metadata compare-and-set matched no active message" not in (
+            caplog.text
+        )
+
+        active = db.get_messages_as_conversation(session_id)
+        events = [
+            row
+            for row in active
+            if row.get("role") == "user" and row.get("content") == canonical
+        ]
+        assert len(events) == 1
+        assert events[0]["api_content"].endswith(injected_context)
+        assert events[0]["display_metadata"] == {
+            "completion_delivery_status": "complete"
+        }
+        assert sum(row.get("role") == "tool" for row in active[-8:]) == 3
         _assert_provider_protocol_is_closed(active)
     finally:
         db.close()

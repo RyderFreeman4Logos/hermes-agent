@@ -1069,6 +1069,9 @@ class TestToolResultPreflightCompression:
         agent.compression_enabled = True
         agent.context_compressor.context_length = 200_000
         agent.context_compressor.threshold_tokens = 130_000
+        # Keep the post-response gate on its real-usage branch so this test
+        # isolates the next loop's fully assembled pre-API request estimate.
+        agent.context_compressor.last_prompt_tokens = 1
 
         tc = SimpleNamespace(
             id="tc1", type="function",
@@ -1086,16 +1089,15 @@ class TestToolResultPreflightCompression:
 
         # First provider request is small. The tool result pushes the fully
         # assembled request over threshold; rebuilding after compression only
-        # trims it from 150K to 148K. Raw-message estimation is much smaller,
-        # which previously made the no-op pass look successful and allowed two
-        # more immediate summaries.
+        # trims it from 150K to 148K. Comparing any other request shape could
+        # make the no-op pass look successful and allow more immediate summaries.
         assembled_estimates = iter(
             [1_000, 150_000, 148_000, 148_000, 148_000]
         )
 
         with (
             patch(
-                "agent.conversation_loop.estimate_messages_tokens_rough",
+                "agent.conversation_loop.estimate_request_tokens_rough",
                 side_effect=lambda *_a, **_k: next(assembled_estimates),
             ),
             patch("run_agent.handle_function_call", return_value="x" * 100_000),

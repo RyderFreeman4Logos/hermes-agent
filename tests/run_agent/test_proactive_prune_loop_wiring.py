@@ -189,6 +189,34 @@ class TestProactivePruneLoopWiring:
         assert tool_rows, "expected tool rows in the final transcript"
         assert all(m["content"] == marker for m in tool_rows)
 
+    def test_db_bound_replacement_seeds_durable_identities(self, agent):
+        """Raw durable replacements stay marker-free without re-flushing."""
+        agent.session_id = "seeded-prune-session"
+        agent.context_compressor._session_db = object()
+        agent.context_compressor._session_id = agent.session_id
+        captured_seed_ids = set()
+
+        def _prune(messages, current_tokens=None):
+            replacement = [dict(message) for message in messages]
+            captured_seed_ids.update(
+                id(message) for message in replacement
+                if isinstance(message, dict)
+            )
+            return replacement, 0
+
+        agent.context_compressor.prune_tool_results_only = _prune
+        result = _run_tool_loop(agent, n_tool_iterations=1)
+
+        assert result["completed"] is True
+        assert agent._flushed_db_message_session_id == agent.session_id
+        assert agent._flushed_db_message_ids == captured_seed_ids
+        assert agent._last_flushed_db_idx == len(captured_seed_ids)
+        assert all(
+            "_db_persisted" not in message
+            for message in result["messages"]
+            if id(message) in captured_seed_ids
+        )
+
     def test_noop_input_object_commits_nothing(self, agent):
         """Engine returns the INPUT object with a (bogus) non-zero count —
         the caller's ``result is not input`` gate must refuse the commit."""

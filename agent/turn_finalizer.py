@@ -382,8 +382,40 @@ def finalize_turn(
                     # exact write class _persist_disabled exists to stop.
                     and not getattr(agent, "_persist_disabled", False)
                 ):
+                    # A DB-bound micro pass must include this just-finalized
+                    # turn in the authoritative active view it reloads under
+                    # the compression lease. The existing flush protocol
+                    # excludes any live-only pending completion suffix.
+                    _micro_flush_ready = True
+                    if (
+                        getattr(_compressor, "_session_db", None)
+                        and getattr(_compressor, "_session_id", "")
+                    ):
+                        _flush = getattr(
+                            agent, "_flush_messages_to_session_db", None
+                        )
+                        try:
+                            _micro_flush_ready = bool(
+                                callable(_flush)
+                                and _flush(
+                                    messages,
+                                    conversation_history=conversation_history,
+                                )
+                                is True
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "Micro-compaction pre-snapshot flush failed; "
+                                "skipping this pass: %s",
+                                exc,
+                            )
+                            _micro_flush_ready = False
                     _before = len(messages)
-                    _compacted = _compressor._micro_compact(messages)
+                    _compacted = (
+                        _compressor._micro_compact(messages)
+                        if _micro_flush_ready
+                        else messages
+                    )
                     # Micro-compaction defrag rewrites the newest MICRO
                     # marker's content and pops _db_persisted from the live
                     # dict in place — the sibling of the pop site above. The
@@ -398,6 +430,27 @@ def finalize_turn(
                         agent._db_flush_scan_prefix = None
                     if isinstance(_compacted, list) and _compacted:
                         messages[:] = _compacted
+                        if (
+                            getattr(_compressor, "_session_db", None)
+                            and getattr(_compressor, "_session_id", "")
+                            == getattr(agent, "session_id", None)
+                        ):
+                            from agent.message_sanitization import (
+                                durable_messages_before_pending_completion,
+                            )
+
+                            _durable_compacted = (
+                                durable_messages_before_pending_completion(
+                                    messages,
+                                )
+                            )
+                            agent._last_flushed_db_idx = len(_durable_compacted)
+                            agent._flushed_db_message_session_id = agent.session_id
+                            agent._flushed_db_message_ids = {
+                                id(message)
+                                for message in _durable_compacted
+                                if isinstance(message, dict)
+                            }
                     _after = len(messages)
                     if _before != _after:
                         logger.info(

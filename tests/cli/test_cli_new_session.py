@@ -175,6 +175,49 @@ def test_new_command_creates_real_fresh_session_and_resets_agent_state(tmp_path)
     cli.agent._invalidate_system_prompt.assert_called_once()
 
 
+def test_new_command_reloads_runway_after_creating_real_session_row(tmp_path):
+    cli = _make_cli()
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session(session_id=cli.session_id, source="cli", model=cli.model)
+
+    with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url=cli.base_url,
+            model=cli.model,
+            provider=cli.provider,
+            quiet_mode=True,
+            session_db=db,
+            session_id=cli.session_id,
+            platform="cli",
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+    cli._session_db = db
+    cli.agent = agent
+    cli.conversation_history = []
+    cli._confirm_destructive_slash = lambda *_a, **_kw: "once"
+    states_before_create = []
+    real_create = db.create_session
+
+    def create_session(*args, **kwargs):
+        states_before_create.append(
+            agent.context_compressor._proactive_prune_runway_authoritative
+        )
+        return real_create(*args, **kwargs)
+
+    with patch.object(db, "create_session", side_effect=create_session):
+        cli.process_command("/new")
+
+    assert states_before_create == [False]
+    assert db.get_session(cli.session_id) is not None
+    assert agent.context_compressor._proactive_prune_runway_authoritative is True
+    assert agent.context_compressor._proactive_prune_rearm_tokens == 0
+
+
 
 
 
@@ -295,5 +338,4 @@ def test_new_session_with_title(capsys):
 
     captured = capsys.readouterr()
     assert "My Test Session" in captured.out
-
 

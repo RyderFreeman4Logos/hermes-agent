@@ -18,15 +18,21 @@ The invariants that matter:
   times and then skipped, so a poison exchange can't stall every turn.
 """
 
-from unittest.mock import patch
+import copy
+import os
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from agent.context_compressor import (
     COMPRESSED_SUMMARY_METADATA_KEY,
     ContextCompressor,
+    _DB_PERSISTED_MARKER,
     _MICRO_COMPACT_MAX_CONSECUTIVE_FAILURES,
+    MICRO_COMPACT_MARKER_KEY,
 )
+from hermes_state import SessionDB
 
 
 def _compressor(summary="ROLLING SUMMARY") -> ContextCompressor:
@@ -55,6 +61,22 @@ def _conversation(exchanges: int = 6) -> list:
 
 def _summary_markers(messages: list) -> list:
     return [m for m in messages if m.get(COMPRESSED_SUMMARY_METADATA_KEY)]
+
+
+def _agent_with_db(db: SessionDB, session_id: str):
+    with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
+        from run_agent import AIAgent
+
+        return AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            session_db=db,
+            session_id=session_id,
+            skip_context_files=True,
+            skip_memory=True,
+        )
 
 
 class TestMicroCompaction:
@@ -724,6 +746,21 @@ class TestMicroCompaction:
             "micro-compaction gate must check agent._persist_disabled"
         )
 
+    def test_db_bound_finalizer_requires_flush_before_micro_compaction(self):
+        """The final assistant turn must be durable before the DB reload."""
+        import inspect
+
+        from agent import turn_finalizer
+
+        src = inspect.getsource(turn_finalizer.finalize_turn)
+        micro_block = src.split("Post-turn micro-compaction", 1)[1]
+        micro_block = micro_block.split("agent._persist_session", 1)[0]
+        assert "_flush_messages_to_session_db" in micro_block
+        assert "_micro_flush_ready" in micro_block
+        assert "is True" in micro_block
+        assert "durable_messages_before_pending_completion" in micro_block
+        assert "_flushed_db_message_ids" in micro_block
+
     def test_splice_preserves_db_persisted_stamps(self):
         """Surviving messages keep their _db_persisted stamps through a splice.
 
@@ -752,6 +789,249 @@ class TestMicroCompaction:
         assert not unstamped, (
             "splice must not strip _db_persisted from surviving messages"
         )
+
+    def test_concurrent_rewrite_during_summary_rolls_back_micro_compaction(
+        self, tmp_path: Path,
+    ):
+        """A rewrite after fingerprint capture cannot leak through the next flush."""
+        db = SessionDB(db_path=tmp_path / "state.db")
+        session_id = "STALE_MICRO_COMPACTION"
+        db.create_session(session_id, source="cli")
+        db.append_messages_batch(session_id, _conversation(exchanges=8))
+        stale = db.get_messages_as_conversation(session_id)
+        for message in stale:
+            message[_DB_PERSISTED_MARKER] = True
+
+        winner_messages = [
+            {"role": "user", "content": "winner summary"},
+            {"role": "assistant", "content": "winner reply"},
+        ]
+        agent = _agent_with_db(db, session_id)
+        compressor = agent.context_compressor
+        compressor._micro_compact_enabled = True
+
+        def _publish_winner(_text):
+            fingerprint = db.get_compaction_fingerprint(session_id)
+            db.archive_and_compact(
+                session_id,
+                winner_messages,
+                expected_active_fingerprint=fingerprint,
+            )
+            return "STALE SUMMARY"
+
+        compressor._micro_summarize_one = MagicMock(side_effect=_publish_winner)
+        state_names = (
+            "_micro_compact_cursor",
+            "_micro_compact_rolling_summary",
+            "_micro_compact_consecutive_failures",
+            "_micro_compact_last_failure_cursor",
+            "_micro_compact_passes",
+            "_micro_compact_tokens_saved_total",
+            "_micro_compact_turns_since_pass",
+            "_flush_scan_cursor_invalidated",
+        )
+        state_before = {
+            name: copy.deepcopy(getattr(compressor, name)) for name in state_names
+        }
+        with patch.object(
+            db, "archive_and_compact", wraps=db.archive_and_compact,
+        ) as archive:
+            result = compressor._micro_compact(stale)
+
+        assert archive.call_count == 2
+        compressor._micro_summarize_one.assert_called_once()
+        assert result is not stale
+        assert [message["content"] for message in result] == [
+            "winner summary",
+            "winner reply",
+        ]
+        assert {
+            name: copy.deepcopy(getattr(compressor, name)) for name in state_names
+        } == state_before
+
+        durable_before = db.get_messages_as_conversation(session_id)
+        rows_before = db.get_messages(session_id, include_inactive=True)
+        assert [message["content"] for message in durable_before] == [
+            "winner summary",
+            "winner reply",
+        ]
+
+        # Reproduce turn_finalizer's one-shot identity seed. Raw snapshot
+        # decoding must not synthesize _db_persisted onto durable messages.
+        assert all(not message.get(_DB_PERSISTED_MARKER) for message in result)
+        agent._last_flushed_db_idx = len(result)
+        agent._flushed_db_message_session_id = session_id
+        agent._flushed_db_message_ids = {
+            id(message) for message in result if isinstance(message, dict)
+        }
+        agent._flush_messages_to_session_db(result, conversation_history=[])
+        assert db.get_messages_as_conversation(session_id) == durable_before
+        assert db.get_messages(session_id, include_inactive=True) == rows_before
+        assert db.get_compression_lock_holder(session_id) is None
+
+    def test_in_place_winner_fences_stale_micro_compaction_input(
+        self, tmp_path: Path,
+    ):
+        """A post-winner loser computes only from the durable active view."""
+        db = SessionDB(db_path=tmp_path / "state.db")
+        session_id = "STALE_MICRO_AFTER_IN_PLACE_WINNER"
+        db.create_session(session_id, source="tui")
+        db.append_messages_batch(session_id, _conversation(exchanges=8))
+        stale = db.get_messages_as_conversation(session_id)
+        for message in stale:
+            message[_DB_PERSISTED_MARKER] = True
+
+        agent = _agent_with_db(db, session_id)
+        compressor = agent.context_compressor
+        compressor._micro_compact_enabled = True
+        compressor._micro_summarize_one = MagicMock(return_value="STALE SUMMARY")
+
+        winner_messages = [
+            {"role": "user", "content": "winner summary"},
+            {"role": "assistant", "content": "winner reply"},
+        ]
+        db.archive_and_compact(
+            session_id,
+            winner_messages,
+            expected_active_fingerprint=db.get_compaction_fingerprint(session_id),
+        )
+        pending_suffix = [
+            {
+                "role": "user",
+                "content": "pending completion payload",
+                "_completion_delivery_synthetic": True,
+            },
+            {"role": "assistant", "content": "pending completion reply"},
+        ]
+
+        result = compressor._micro_compact([*stale, *pending_suffix])
+
+        compressor._micro_summarize_one.assert_not_called()
+        assert [message["content"] for message in result] == [
+            "winner summary",
+            "winner reply",
+            "pending completion payload",
+            "pending completion reply",
+        ]
+        assert [message["content"] for message in db.get_messages_as_conversation(session_id)] == [
+            "winner summary",
+            "winner reply",
+        ]
+
+    @pytest.mark.parametrize("binding_kind", ["subclass", "adapter"])
+    @pytest.mark.parametrize(
+        "missing_api",
+        [
+            "get_compaction_snapshot",
+            "try_acquire_compression_lock",
+            "release_compression_lock",
+            "archive_and_compact",
+        ],
+    )
+    def test_bound_db_missing_fence_api_rolls_back_before_follow_on_flush(
+        self, tmp_path: Path, binding_kind: str, missing_api: str,
+    ):
+        class LegacySessionDB(SessionDB):
+            pass
+
+        class SessionDBAdapter:
+            def __init__(self, wrapped):
+                self._wrapped = wrapped
+
+            def __getattr__(self, name):
+                return getattr(self._wrapped, name)
+
+        session_id = f"MISSING_MICRO_FENCE_{binding_kind.upper()}_{missing_api}"
+        if binding_kind == "subclass":
+            durable_db = LegacySessionDB(db_path=tmp_path / "state.db")
+            bound_db = durable_db
+        else:
+            durable_db = SessionDB(db_path=tmp_path / "state.db")
+            bound_db = SessionDBAdapter(durable_db)
+        durable_db.create_session(session_id, source="cli")
+        durable_db.append_messages_batch(session_id, _conversation(exchanges=8))
+        stale = durable_db.get_messages_as_conversation(session_id)
+        for message in stale:
+            message[_DB_PERSISTED_MARKER] = True
+
+        fingerprint = durable_db.get_compaction_fingerprint(session_id)
+        durable_db.archive_and_compact(
+            session_id,
+            [{"role": "assistant", "content": "winner summary"}],
+            expected_active_fingerprint=fingerprint,
+        )
+        durable_before = durable_db.get_messages_as_conversation(session_id)
+        rows_before = durable_db.get_messages(session_id, include_inactive=True)
+        if binding_kind == "subclass":
+            setattr(LegacySessionDB, missing_api, None)
+        else:
+            setattr(bound_db, missing_api, None)
+
+        agent = _agent_with_db(bound_db, session_id)
+        compressor = agent.context_compressor
+        compressor._micro_compact_enabled = True
+        compressor._micro_summarize_one = lambda _text: "UNFENCED SUMMARY"
+        original_messages = copy.deepcopy(stale)
+        original_message_ids = [id(message) for message in stale]
+
+        result = compressor._micro_compact(stale)
+
+        assert result is stale
+        assert result == original_messages
+        assert [id(message) for message in result] == original_message_ids
+        agent._flush_messages_to_session_db(result, conversation_history=[])
+        assert durable_db.get_messages_as_conversation(session_id) == durable_before
+        assert durable_db.get_messages(session_id, include_inactive=True) == rows_before
+
+    def test_summary_rejects_same_content_replaced_with_new_row_ids(
+        self, tmp_path: Path,
+    ):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        session_id = "MICRO_DEFRAG_ROW_ID_FENCE"
+        db.create_session(session_id, source="cli")
+        seeded = _conversation(exchanges=8)
+        db.append_messages_batch(session_id, seeded)
+        live = db.get_messages_as_conversation(session_id)
+        for message in live:
+            message[_DB_PERSISTED_MARKER] = True
+
+        agent = _agent_with_db(db, session_id)
+        compressor = agent.context_compressor
+        compressor._micro_compact_enabled = True
+        replacement_row_ids: list[int] = []
+
+        def _replace_rows_then_summarize(_text):
+            durable = db.get_messages_as_conversation(session_id)
+            fingerprint = db.get_compaction_fingerprint(session_id)
+            db.archive_and_compact(
+                session_id,
+                durable,
+                expected_active_fingerprint=fingerprint,
+            )
+            replacement_row_ids.extend(
+                message["_row_id"]
+                for message in db.get_messages_as_conversation(
+                    session_id, include_row_ids=True,
+                )
+            )
+            return "STALE SUMMARY"
+
+        compressor._micro_summarize_one = MagicMock(
+            side_effect=_replace_rows_then_summarize,
+        )
+        result = compressor._micro_compact(live)
+
+        assert result is not live
+        assert [message["content"] for message in result] == [
+            message["content"] for message in seeded
+        ]
+        assert [
+            message["_row_id"]
+            for message in db.get_messages_as_conversation(
+                session_id, include_row_ids=True,
+            )
+        ] == replacement_row_ids
+        assert db.get_compression_lock_holder(session_id) is None
 
 
 class TestDefragFlushCursorInvalidation:

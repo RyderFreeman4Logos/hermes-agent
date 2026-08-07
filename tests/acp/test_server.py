@@ -266,17 +266,19 @@ class TestSessionOps:
         state.agent.context_compressor = MagicMock(context_length=100_000)
         state.agent._cached_system_prompt = "system"
         state.agent.tools = [{"type": "function", "function": {"name": "demo"}}]
+        state.agent.api_mode = "codex_responses"
 
         with patch(
             "agent.model_metadata.estimate_request_tokens_rough",
             return_value=25_000,
-        ):
+        ) as estimate:
             update = agent._build_usage_update(state)
 
         assert isinstance(update, UsageUpdate)
         assert update.session_update == "usage_update"
         assert update.size == 100_000
         assert update.used == 25_000
+        assert estimate.call_args.kwargs["api_mode"] == "codex_responses"
 
 
 

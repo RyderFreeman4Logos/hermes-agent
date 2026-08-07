@@ -3964,6 +3964,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         billing_mode: str = None,
         compression_lock_holder: str = None,
         require_compression_lease: bool = True,
+        expected_active_fingerprint: Optional[List[tuple]] = None,
     ) -> None:
         """Atomically close a parent and publish its durable compression child.
 
@@ -3988,6 +3989,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 raise CompressionSessionBusyError(
                     f"Compression lease lost before publication: {parent_session_id}"
                 )
+            if expected_active_fingerprint is not None:
+                current_rows = conn.execute(
+                    "SELECT * FROM messages "
+                    "WHERE session_id = ? AND active = 1 ORDER BY id",
+                    (parent_session_id,),
+                ).fetchall()
+                if [tuple(row) for row in current_rows] != expected_active_fingerprint:
+                    raise CompressionSessionBusyError(
+                        "Durable transcript changed before compression child "
+                        f"publication: {parent_session_id}"
+                    )
             parent = conn.execute(
                 """SELECT ended_at, cwd, git_branch, git_repo_root,
                           user_id, session_key, chat_id, chat_type,
@@ -7472,6 +7484,38 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             return cursor.fetchone() is not None
 
+    def get_compaction_fingerprint(self, session_id: str) -> List[tuple]:
+        """Return the exact active message rows a compaction intends to replace."""
+        fingerprint, _messages = self.get_compaction_snapshot(session_id)
+        return fingerprint
+
+    def get_compaction_snapshot(
+        self,
+        session_id: str,
+    ) -> Tuple[List[tuple], List[Dict[str, Any]]]:
+        """Return raw CAS rows and their exact decoded compaction view.
+
+        Both values come from one ordered ``SELECT *`` so the fingerprint can
+        never describe a different active generation than the messages used
+        for summary/prune computation.  Unlike replay loading, this path does
+        not sanitize, repair, filter, or synthesize persistence markers.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM messages "
+                "WHERE session_id = ? AND active = 1 ORDER BY id",
+                (session_id,),
+            ).fetchall()
+        fingerprint = [tuple(row) for row in rows]
+        messages = self._rows_to_conversation(
+            rows,
+            session_id=session_id,
+            include_ancestors=False,
+            repair_alternation=False,
+            preserve_raw=True,
+        )
+        return fingerprint, messages
+
     def archive_and_compact(
         self,
         session_id: str,
@@ -7484,6 +7528,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         billing_provider: Optional[str] = None,
         billing_base_url: Optional[str] = None,
         billing_mode: Optional[str] = None,
+        compression_lock_holder: Optional[str] = None,
+        require_compression_lease: bool = False,
+        expected_active_fingerprint: Optional[List[tuple]] = None,
     ) -> int:
         """Non-destructive in-place compaction for a single durable session id.
 
@@ -7515,6 +7562,42 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             self.flush_token_counts()
 
         def _do(conn):
+            session = conn.execute(
+                "SELECT ended_at, end_reason FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if session is None:
+                raise ValueError(f"Session not found: {session_id}")
+            if (
+                session["ended_at"] is not None
+                and session["end_reason"] == "compression"
+            ):
+                raise CompressionSessionClosedError(session_id)
+            if require_compression_lease:
+                lock_row = conn.execute(
+                    "SELECT holder, expires_at FROM compression_locks "
+                    "WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                if (
+                    lock_row is None
+                    or not compression_lock_holder
+                    or lock_row["holder"] != compression_lock_holder
+                    or float(lock_row["expires_at"]) <= time.time()
+                ):
+                    raise CompressionSessionBusyError(
+                        f"Compression lease lost before compaction: {session_id}"
+                    )
+            if expected_active_fingerprint is not None:
+                current_rows = conn.execute(
+                    "SELECT * FROM messages "
+                    "WHERE session_id = ? AND active = 1 ORDER BY id",
+                    (session_id,),
+                ).fetchall()
+                if [tuple(row) for row in current_rows] != expected_active_fingerprint:
+                    raise CompressionSessionBusyError(
+                        f"Durable transcript changed before compaction: {session_id}"
+                    )
             if model_config_json is not None:
                 conn.execute(
                     """UPDATE sessions SET
@@ -7537,10 +7620,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 )
             patched_model_config = None
             if model_config_patch is not None:
-                # on_missing="raise": a prune/compaction must not commit
-                # against a vanished session row (the compressor's caller
-                # converts the raised error into a safe keep-the-original
-                # no-op), unlike the flag setters which tolerate missing rows.
                 patched_model_config = self._merge_model_config_json(
                     conn, session_id, model_config_patch, on_missing="raise"
                 )
@@ -7902,6 +7981,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         include_ancestors: bool,
         repair_alternation: bool,
         include_row_ids: bool = False,
+        preserve_raw: bool = False,
     ) -> List[Dict[str, Any]]:
         """Decode fetched message rows into the OpenAI conversation format.
 
@@ -7913,9 +7993,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         messages = []
         for row in rows:
             content = self._decode_content(row["content"])
-            if row["role"] in {"user", "assistant"} and isinstance(content, str):
+            if (
+                not preserve_raw
+                and row["role"] in {"user", "assistant"}
+                and isinstance(content, str)
+            ):
                 content = sanitize_context(content).strip()
             msg = {"role": row["role"], "content": content}
+            if (
+                preserve_raw
+                and "token_count" in row.keys()
+                and row["token_count"] is not None
+            ):
+                msg["token_count"] = row["token_count"]
             # Durable per-message identity for surfaces that need to address a
             # specific row later (desktop reactions). OPT-IN: only the gateway
             # asks for it — every other consumer (ACP restore, export,
@@ -7992,6 +8082,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if include_ancestors and self._is_duplicate_replayed_user_message(messages, msg):
                 continue
             messages.append(msg)
+        if preserve_raw:
+            return messages
         # DEFENSE-IN-DEPTH against background-review session pollution: a forked
         # skill/memory review that (in older builds, before the _persist_disabled
         # fix) shared the parent's session_id wrote its harness turn into this

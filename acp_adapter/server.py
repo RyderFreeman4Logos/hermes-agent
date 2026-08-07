@@ -862,6 +862,7 @@ class HermesACPAgent(acp.Agent):
                 state.history,
                 system_prompt=getattr(agent, "_cached_system_prompt", "") or "",
                 tools=getattr(agent, "tools", None) or None,
+                api_mode=getattr(agent, "api_mode", None),
             )
         except Exception:
             logger.debug("Could not estimate ACP native context usage", exc_info=True)
@@ -2275,6 +2276,7 @@ class HermesACPAgent(acp.Agent):
                 state.history,
                 system_prompt=system_prompt,
                 tools=tools,
+                api_mode=getattr(agent, "api_mode", None),
             )
         except Exception:
             logger.debug("Could not estimate ACP context usage", exc_info=True)
@@ -2368,7 +2370,10 @@ class HermesACPAgent(acp.Agent):
             _sys_prompt = getattr(agent, "_cached_system_prompt", "") or ""
             _tools = getattr(agent, "tools", None) or None
             approx_tokens = estimate_request_tokens_rough(
-                state.history, system_prompt=_sys_prompt, tools=_tools
+                state.history,
+                system_prompt=_sys_prompt,
+                tools=_tools,
+                api_mode=getattr(agent, "api_mode", None),
             )
             original_session_db = getattr(agent, "_session_db", None)
 
@@ -2396,6 +2401,7 @@ class HermesACPAgent(acp.Agent):
                 state.history,
                 system_prompt=_sys_prompt_after,
                 tools=_tools_after,
+                api_mode=getattr(agent, "api_mode", None),
             )
             return (
                 f"Context compressed: {original_count} -> {new_count} messages\n"

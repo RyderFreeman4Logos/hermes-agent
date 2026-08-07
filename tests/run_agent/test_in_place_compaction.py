@@ -71,9 +71,17 @@ class TestInPlaceCompaction:
             agent = _make_agent(db, sid, in_place=True)
             agent._last_flushed_db_idx = 5
 
-            messages = [{"role": "user", "content": f"m{i}"} for i in range(8)]
-            compressed, _sp = compress_context(
-                agent, messages, approx_tokens=100_000, system_message="sys"
+            messages = db.get_messages_as_conversation(sid)
+            expected_fingerprint = db.get_compaction_fingerprint(sid)
+            with patch.object(
+                db, "archive_and_compact", wraps=db.archive_and_compact,
+            ) as archive:
+                compressed, _sp = compress_context(
+                    agent, messages, approx_tokens=100_000, system_message="sys"
+                )
+
+            assert archive.call_args.kwargs["expected_active_fingerprint"] == (
+                expected_fingerprint
             )
 
             # Identity never moved.
@@ -186,7 +194,7 @@ class TestInPlaceCompaction:
             with patch.object(db, "archive_and_compact", side_effect=observe_publish):
                 compress_context(
                     agent,
-                    [{"role": "user", "content": f"m{i}"} for i in range(8)],
+                    db.get_messages_as_conversation(sid),
                     approx_tokens=100_000,
                     system_message="sys",
                 )
@@ -220,7 +228,7 @@ class TestInPlaceCompaction:
             sid = "20260619_120500_cccccc"
             _seed(db, sid, "alt")
             agent = _make_agent(db, sid, in_place=True)
-            messages = [{"role": "user", "content": f"m{i}"} for i in range(8)]
+            messages = db.get_messages_as_conversation(sid)
             compressed, _ = compress_context(
                 agent, messages, approx_tokens=100_000, system_message="sys"
             )
@@ -304,7 +312,7 @@ class TestInPlaceSignalForGateway:
             _seed(db, "s_ip", "ip")
             a_ip = _make_agent(db, "s_ip", in_place=True)
             compress_context(
-                a_ip, [{"role": "user", "content": "x"}] * 8,
+                a_ip, db.get_messages_as_conversation("s_ip"),
                 approx_tokens=100_000, system_message="sys",
             )
             assert a_ip._last_compaction_in_place is True

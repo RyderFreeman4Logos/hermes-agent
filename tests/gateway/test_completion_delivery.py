@@ -132,6 +132,21 @@ def test_gateway_heartbeat_routes_to_exact_idle_owner(monkeypatch, current_heart
     assert not runner._is_session_running(event["session_key"])
 
 
+def test_gateway_does_not_duplicate_runtime_owned_warm(
+    monkeypatch, current_heartbeat
+):
+    event = _runtime_heartbeat_event(heartbeat_warm_owned=True)
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter, origins={event["session_key"]: object()})
+    runner._running_agents = {}
+    isolated = AsyncMock()
+    monkeypatch.setattr(runner, "_run_isolated_heartbeat", isolated)
+
+    asyncio.run(runner._handle_heartbeat_event(event))
+
+    isolated.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_gateway_isolated_heartbeat_never_reads_live_history(monkeypatch):
     event = _runtime_heartbeat_event()

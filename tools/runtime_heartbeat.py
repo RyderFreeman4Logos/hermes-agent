@@ -927,6 +927,7 @@ class _Target:
     generation: int = 0
     timer: Any = None
     deadline: float = 0.0
+    scheduled_at: float = 0.0
     baseline: Dict[str, Any] = field(default_factory=dict)
     publishing: bool = False
 
@@ -1056,16 +1057,18 @@ class RuntimeHeartbeat:
         delay: Optional[float] = None,
         deadline: Optional[float] = None,
     ) -> None:
+        now = time.monotonic()
         if deadline is None:
             delay = float(target.interval if delay is None else max(0.0, delay))
-            deadline = time.monotonic() + delay
+            deadline = now + delay
         else:
             delay = float(
-                max(0.0, deadline - time.monotonic())
+                max(0.0, deadline - now)
                 if delay is None
                 else max(0.0, delay)
             )
         target.deadline = deadline
+        target.scheduled_at = time.time() + deadline - target.interval - now
         self._next_generation += 1
         target.generation = self._next_generation
         generation = target.generation
@@ -1289,7 +1292,7 @@ class RuntimeHeartbeat:
                     "target_id": target.target_id,
                     "caller_id": target.caller_id,
                     "kind": target.kind,
-                    "started_at": target.started_at,
+                    "started_at": target.scheduled_at,
                     "interval_s": target.interval,
                 }
                 for target in targets

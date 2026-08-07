@@ -59,13 +59,12 @@ def _session(**overrides):
 
 def _run(
     *, command="make build", config=None, async_delivery=True,
-    fresh_environment=False, promotion_state="running", proc=None,
-    env_cwd=None, **kwargs,
+    fresh_environment=False, proc=None, **kwargs,
 ):
     from tools.terminal_tool import terminal_tool
 
     env = MagicMock(env={})
-    env.cwd = env_cwd or (config or _config())["cwd"]
+    env.cwd = (config or _config())["cwd"]
     env.execute.return_value = {"output": "foreground", "returncode": 0}
     proc = proc or _session()
     registry = MagicMock(pending_watchers=[])
@@ -76,7 +75,6 @@ def _run(
 
     registry.spawn_local.side_effect = fake_spawn
     registry.spawn_via_env.side_effect = fake_spawn
-    registry.wait_for_promotion.return_value = promotion_state
 
     def fake_promote(session, notification_metadata=None):
         for key, value in (notification_metadata or {}).items():
@@ -139,7 +137,16 @@ def terminal_runtime(monkeypatch):
     monkeypatch.setattr(
         terminal_tool,
         "_active_environments",
-        {"default": SimpleNamespace(env={})},
+        {
+            "default": SimpleNamespace(
+                env={},
+                cwd="/tmp",
+                execute=lambda *_args, **_kwargs: {
+                    "output": "short",
+                    "returncode": 0,
+                },
+            )
+        },
     )
     monkeypatch.setattr(terminal_tool, "_last_activity", {"default": 0})
     monkeypatch.setattr(
@@ -182,8 +189,43 @@ def _pid_is_running(pid):
         return False
 
 
+def test_omitted_long_budget_is_promoted_before_spawn_without_threshold_wait():
+    result, env, proc, registry, create_environment = _run(
+        config=_config(timeout=21),
+        fresh_environment=True,
+    )
+
+    assert result["session_id"] == proc.id
+    assert result["notify_on_complete"] is True
+    assert create_environment.call_args.kwargs["timeout"] == 7200
+    assert registry.spawn_local.call_args.kwargs["execution_timeout"] == 7200
+    assert registry.spawn_local.call_args.kwargs["notification_metadata"][
+        "notify_on_complete"
+    ] is True
+    registry.wait_for_promotion.assert_not_called()
+    registry.promote.assert_not_called()
+    env.execute.assert_not_called()
+
+
+@pytest.mark.parametrize("task_id", ["main", "nested-subagent"])
+def test_model_handler_preserves_omitted_flags_for_every_caller(monkeypatch, task_id):
+    import tools.terminal_tool as terminal_module
+
+    call = MagicMock(return_value="{}")
+    monkeypatch.setattr(terminal_module, "terminal_tool", call)
+
+    terminal_module._handle_terminal(
+        {"command": "make build", "timeout": 21},
+        task_id=task_id,
+    )
+
+    assert call.call_args.kwargs["task_id"] == task_id
+    assert call.call_args.kwargs["background"] is None
+    assert call.call_args.kwargs["notify_on_complete"] is None
+
+
 @pytest.mark.parametrize("requested_timeout", [2, None], ids=["requested", "configured"])
-def test_short_command_with_large_timeout_stays_inline(
+def test_explicit_notify_without_background_stays_inline(
     terminal_runtime, requested_timeout
 ):
     terminal_tool, registry = terminal_runtime
@@ -209,11 +251,6 @@ def test_short_command_with_large_timeout_stays_inline(
     [
         pytest.param(_config(timeout=21), {}, id="omitted-timeout-and-flags"),
         pytest.param(_config(timeout=5), {"timeout": 21}, id="explicit-timeout"),
-        pytest.param(
-            _config(timeout=5),
-            {"timeout": 21, "background": False, "notify_on_complete": False},
-            id="explicit-unsafe-false",
-        ),
     ],
 )
 def test_long_foreground_calls_promote_to_managed_background(config, kwargs):
@@ -223,42 +260,41 @@ def test_long_foreground_calls_promote_to_managed_background(config, kwargs):
     assert result["notify_on_complete"] is True
     assert proc.notify_on_complete is True
     registry.spawn_local.assert_called_once()
-    registry.wait_for_promotion.assert_called_once_with(proc, 20)
-    registry.promote.assert_called_once()
+    assert registry.spawn_local.call_args.kwargs["execution_timeout"] == 7200
+    registry.wait_for_promotion.assert_not_called()
+    registry.promote.assert_not_called()
     env.execute.assert_not_called()
 
 
-def test_auto_promotion_preserves_requested_execution_deadline():
+def test_auto_promotion_rewrites_execution_deadline_to_7200():
     result, _, _, registry, create_environment = _run(
         timeout=21,
-        background=False,
-        notify_on_complete=False,
         fresh_environment=True,
     )
 
     assert result["session_id"] == "proc_auto_bg"
-    assert create_environment.call_args.kwargs["timeout"] == 21
-    assert registry.spawn_local.call_args.kwargs["execution_timeout"] == 21
+    assert create_environment.call_args.kwargs["timeout"] == 7200
+    assert registry.spawn_local.call_args.kwargs["execution_timeout"] == 7200
     registry.spawn_local.assert_called_once()
 
 
 def test_auto_promotion_carries_deadline_to_remote_spawn():
     result, _, _, registry, _ = _run(
-        config=_config(env_type="docker"),
+        config=_config(env_type="docker", timeout=21),
         timeout=21,
-        background=False,
     )
 
     assert result["session_id"] == "proc_auto_bg"
-    assert registry.spawn_via_env.call_args.kwargs["execution_timeout"] == 21
-    assert registry.spawn_via_env.call_args.kwargs["defer_registration"] is True
+    assert registry.spawn_via_env.call_args.kwargs["execution_timeout"] == 7200
+    assert "defer_registration" not in registry.spawn_via_env.call_args.kwargs
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-tree regression")
 def test_promoted_execution_deadline_kills_process_tree_once(
-    terminal_runtime, tmp_path
+    terminal_runtime, monkeypatch, tmp_path
 ):
     terminal_tool, registry = terminal_runtime
+    monkeypatch.setattr(terminal_tool, "AUTO_BACKGROUND_TIMEOUT", 1)
     child_pid_path = tmp_path / "child.pid"
     child_code = "import time; time.sleep(30)"
     parent_code = (
@@ -270,7 +306,7 @@ def test_promoted_execution_deadline_kills_process_tree_once(
     command = f"{shlex.quote(sys.executable)} -c {shlex.quote(parent_code)}"
 
     result = json.loads(
-        terminal_tool.terminal_tool(command=command, timeout=2, background=False)
+        terminal_tool.terminal_tool(command=command, timeout=2)
     )
     session_id = result["session_id"]
     child_pid = None
@@ -298,7 +334,7 @@ def test_promoted_execution_deadline_kills_process_tree_once(
             os.kill(child_pid, signal.SIGKILL)
 
 
-def test_completion_before_spawn_returns_stays_inline_without_notification(
+def test_completion_before_spawn_returns_keeps_background_notification(
     terminal_runtime, monkeypatch
 ):
     terminal_tool, registry = terminal_runtime
@@ -310,56 +346,36 @@ def test_completion_before_spawn_returns_stays_inline_without_notification(
         return session
 
     monkeypatch.setattr(registry, "spawn_local", complete_before_return)
-    result = json.loads(
-        terminal_tool.terminal_tool(command="true", timeout=2, background=False)
-    )
+    result = json.loads(terminal_tool.terminal_tool(command="true", timeout=2))
 
     assert result["exit_code"] == 0
-    assert "session_id" not in result
-    assert registry.list_sessions() == []
-    assert registry.completion_queue.empty()
+    assert result["session_id"]
+    assert result["notify_on_complete"] is True
+    events = []
+    while not registry.completion_queue.empty():
+        events.append(registry.completion_queue.get_nowait())
+    assert len(
+        [event for event in events if event.get("session_id") == result["session_id"]]
+    ) == 1
 
 
-def test_deferred_completion_keeps_full_foreground_finish_contract(monkeypatch):
-    proc = _session(
-        output_buffer="bash: python: command not found",
-        exit_code=127,
-    )
-    recorded_cwds = []
-    evidence = {
-        "status": "failed",
-        "kind": "test",
-        "scope": "unit",
-        "canonical_command": "python missing.py",
-    }
-    monkeypatch.setattr(
-        "hermes_cli.lifecycle.invoke_hook",
-        lambda _name, **kwargs: ["hooked: " + kwargs["output"]],
-    )
-    monkeypatch.setattr(
-        "agent.verification_evidence.record_terminal_result",
-        lambda **_kwargs: evidence,
-    )
-    monkeypatch.setattr(
-        "tools.terminal_tool.record_session_cwd",
-        lambda key, cwd: recorded_cwds.append((key, cwd)),
-    )
+@pytest.mark.parametrize(
+    "explicit_flags",
+    [
+        pytest.param({"background": False}, id="background-false"),
+        pytest.param({"notify_on_complete": False}, id="notify-false"),
+        pytest.param(
+            {"background": False, "notify_on_complete": False},
+            id="both-false",
+        ),
+    ],
+)
+def test_explicit_false_flags_are_not_auto_promoted(explicit_flags):
+    result, env, _, registry, _ = _run(timeout=21, **explicit_flags)
 
-    result, _, _, registry, _ = _run(
-        command="python missing.py",
-        timeout=21,
-        session_id="session-1",
-        promotion_state="exited",
-        proc=proc,
-        env_cwd="/tmp/finished",
-    )
-
-    assert result["output"].startswith("hooked:")
-    assert result["cwd"] == "/tmp/finished"
-    assert result["hint"]
-    assert result["verification_evidence"] == evidence
-    assert recorded_cwds[-1][1] == "/tmp/finished"
-    registry.promote.assert_not_called()
+    assert result["output"] == "foreground"
+    env.execute.assert_called_once()
+    registry.spawn_local.assert_not_called()
 
 
 def test_timeout_at_threshold_stays_foreground():
@@ -389,7 +405,7 @@ def test_explicit_background_call_is_not_rewritten_or_forced_to_notify():
 @pytest.mark.parametrize(
     "kwargs",
     [
-        {"timeout": 21, "command": "python -m http.server"},
+        {"timeout": 21, "command": "python -m http.server", "background": False},
         {"timeout": 21, "watch_patterns": ["ready"]},
     ],
 )
@@ -408,19 +424,16 @@ def test_server_and_watch_requests_keep_explicit_background_guidance(kwargs):
     ids=["unsupported", "probe-error"],
 )
 def test_auto_promotion_stops_without_completion_route(async_delivery):
-    result, env, proc, registry, _ = _run(
+    result, env, _, registry, _ = _run(
         timeout=21,
-        background=False,
         async_delivery=async_delivery,
     )
 
-    assert "stopped" in result["error"].lower() or "setup failed" in result[
-        "error"
-    ].lower()
+    assert "not started" in result["error"].lower()
     env.execute.assert_not_called()
-    registry.spawn_local.assert_called_once()
-    registry.wait_for_promotion.assert_called_once_with(proc, 20)
-    registry.discard.assert_called_once()
+    registry.spawn_local.assert_not_called()
+    registry.wait_for_promotion.assert_not_called()
+    registry.discard.assert_not_called()
     registry.promote.assert_not_called()
 
 
@@ -448,9 +461,9 @@ def test_hot_reload_does_not_change_inflight_promotion_threshold():
             return value
 
     config = ReloadingConfig(_config())
-    _, _, proc, registry, _ = _run(config=config, timeout=21)
+    _, _, _, registry, _ = _run(config=config, timeout=21)
 
-    registry.wait_for_promotion.assert_called_once_with(proc, 20)
+    registry.wait_for_promotion.assert_not_called()
     assert config["auto_background_timeout_threshold"] == 1
 
 
@@ -461,6 +474,6 @@ def test_terminal_schema_describes_auto_promotion():
     description = TERMINAL_SCHEMA["parameters"]["properties"]["timeout"]["description"]
     assert DEFAULT_CONFIG["terminal"]["auto_background_timeout_threshold"] == 200
     assert "auto_background_timeout_threshold" in description
-    assert "still running" in description
-    assert "execution deadline" in description
+    assert "before execution" in description
+    assert "7200" in description
     assert "auto_background_timeout_threshold" in TERMINAL_TOOL_DESCRIPTION

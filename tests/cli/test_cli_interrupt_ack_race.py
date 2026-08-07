@@ -123,6 +123,35 @@ class _StubAgent:
         self._interrupt_message = None
 
 
+def test_chat_polls_process_heartbeats_while_foreground_turn_is_running(
+    monkeypatch,
+):
+    cli = _make_cli()
+    cli.agent = _StubAgent(cli.session_id, turn_seconds=0.3)
+    cli._interrupt_queue = queue.Queue()
+    cli._pending_input = queue.Queue()
+    consumers = []
+    monkeypatch.setattr(
+        cli,
+        "_drain_process_notifications",
+        lambda consumer: consumers.append(consumer),
+    )
+
+    with patch.object(cli, "_ensure_runtime_credentials", return_value=True), patch.object(
+        cli,
+        "_resolve_turn_agent_config",
+        return_value={
+            "signature": cli._active_agent_route_signature,
+            "model": None,
+            "runtime": None,
+            "request_overrides": None,
+        },
+    ), patch.object(cli, "_init_agent", return_value=True):
+        cli.chat("ordinary long-running turn")
+
+    assert "cli-busy" in consumers
+
+
 def test_unacknowledged_interrupt_message_is_requeued_not_dropped():
     cli = _make_cli()
     agent = _StubAgent(cli.session_id)

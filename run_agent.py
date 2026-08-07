@@ -5173,6 +5173,32 @@ class AIAgent:
                 cache["in_use"] = False
         self._close_openai_client(client, reason=reason, shared=False)
 
+    def _claim_request_openai_client_for_heartbeat(self, expected: Any) -> Any:
+        """Lease the exact healthy request-local client captured by a turn."""
+        with self._openai_client_lock():
+            cache = self._request_client_cache_ref()
+            if (
+                cache["client"] is not expected
+                or cache["in_use"]
+                or cache["poisoned"]
+                or self._is_openai_client_closed(expected)
+            ):
+                return None
+            cache["in_use"] = True
+            return expected
+
+    def _release_request_openai_client_from_heartbeat(
+        self, client: Any, *, reusable: bool
+    ) -> None:
+        self._close_request_openai_client(
+            client,
+            reason=(
+                "request_complete"
+                if reusable
+                else "heartbeat_warm_error_cleanup"
+            ),
+        )
+
     def _close_cached_request_openai_client(self, *, reason: str) -> None:
         """Teardown hook: really close the cached per-request wire client."""
         with self._openai_client_lock():
@@ -7916,25 +7942,16 @@ class AIAgent:
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         if turn_origin == "heartbeat_warm":
-            from agent.auxiliary_client import (
-                _normalize_main_runtime,
-                scoped_runtime_main,
-            )
             from agent.conversation_loop import run_heartbeat_warm
 
-            heartbeat_runtime = _normalize_main_runtime(None)
-            heartbeat_runtime["cache_scope"] = (
-                AIAgent._prompt_cache_scope_id(self) or ""
+            return run_heartbeat_warm(
+                self,
+                user_message,
+                system_message,
+                conversation_history,
+                moa_config=moa_config,
+                heartbeat_event=heartbeat_event,
             )
-            with scoped_runtime_main(heartbeat_runtime):
-                return run_heartbeat_warm(
-                    self,
-                    user_message,
-                    system_message,
-                    conversation_history,
-                    moa_config=moa_config,
-                    heartbeat_event=heartbeat_event,
-                )
         if getattr(self, "_completion_delivery_commit_failed", False):
             from agent.message_sanitization import (
                 durable_messages_before_pending_completion,

@@ -667,12 +667,25 @@ class AIAgent:
                 profile_name=_profile_for_session,
             )
             self._session_db_created = True
+            self._reload_proactive_prune_runway_after_session_open()
         except Exception as e:
             # Transient failure (e.g. SQLite lock). Keep _session_db alive —
             # _session_db_created stays False so next run_conversation() retries.
             logger.warning(
                 "Session DB creation failed (will retry next turn): %s", e
             )
+
+    def _reload_proactive_prune_runway_after_session_open(self) -> None:
+        """Reload the strict prune runway after a lazy row becomes readable."""
+        engine = getattr(self, "context_compressor", None)
+        if (
+            engine is None
+            or getattr(engine, "_session_id", "") != (self.session_id or "")
+        ):
+            return
+        reload_runway = getattr(engine, "_load_proactive_prune_rearm_tokens", None)
+        if callable(reload_runway):
+            reload_runway()
 
     def _transition_context_engine_session(
         self,

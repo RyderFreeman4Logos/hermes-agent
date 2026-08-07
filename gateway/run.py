@@ -17436,13 +17436,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Token source priority:
         # 1. Actual API-reported prompt_tokens from the last turn
         #    (stored in session_entry.last_prompt_tokens)
-        # 2. Rough char-based estimate (str(msg)//4). Overestimates
-        #    by 30-50% on code/JSON-heavy sessions, but that just
-        #    means hygiene fires a bit early — safe and harmless.
+        # 2. Rough estimate of the provider request shape. Responses history
+        #    is projected through its wire adapter so persisted private replay
+        #    state does not trigger compression by itself.
         # -----------------------------------------------------------------
         if history and len(history) >= 4:
             from agent.model_metadata import (
                 estimate_messages_tokens_rough,
+                estimate_request_tokens_rough,
                 get_model_context_length_async,
             )
 
@@ -17465,6 +17466,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _hyg_provider = None
             _hyg_base_url = None
             _hyg_api_key = None
+            _hyg_api_mode = None
             _hyg_configured_model = None
             _hyg_configured_provider = None
             _hyg_configured_base_url = None
@@ -17549,6 +17551,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _hyg_provider = _hyg_runtime.get("provider") or _hyg_provider
                     _hyg_base_url = _hyg_runtime.get("base_url") or _hyg_base_url
                     _hyg_api_key = _hyg_runtime.get("api_key") or _hyg_api_key
+                    _hyg_api_mode = _hyg_runtime.get("api_mode") or _hyg_api_mode
                 except Exception:
                     pass
 
@@ -17617,15 +17620,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _approx_tokens = _stored_tokens
                     _token_source = "actual"
                 else:
-                    _approx_tokens = estimate_messages_tokens_rough(history)
+                    _approx_tokens = estimate_request_tokens_rough(
+                        history,
+                        api_mode=_hyg_api_mode,
+                    )
                     _token_source = "estimated"
-                    # Note: rough estimates overestimate by 30-50% for code/JSON-heavy
-                    # sessions, but that just means hygiene fires a bit early — which
-                    # is safe and harmless.  The 85% threshold already provides ample
-                    # headroom (agent's own compressor runs at 50%).  A previous 1.4x
-                    # multiplier tried to compensate by inflating the threshold, but
-                    # 85% * 1.4 = 119% of context — which exceeds the model's limit
-                    # and prevented hygiene from ever firing for ~200K models (GLM-5).
+                    # Remaining rough estimates can overcount code/JSON, but
+                    # the 85% threshold still provides headroom (the agent's
+                    # own compressor runs at 50%). A previous 1.4x multiplier
+                    # inflated the threshold to 119% of context and prevented
+                    # hygiene from firing for ~200K models (GLM-5).
 
                 # Hard safety valve: force compression if message count is
                 # extreme, regardless of token estimates.  This breaks the

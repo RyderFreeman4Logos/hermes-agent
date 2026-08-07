@@ -16,6 +16,7 @@ from agent.context_compressor import (
     _PRUNED_TOOL_PLACEHOLDER,
     _estimate_msg_budget_tokens,
 )
+from agent.model_metadata import estimate_request_tokens_rough
 
 LARGE_WINDOW = 1_000_000
 
@@ -141,6 +142,67 @@ def test_rearms_only_after_reclaimed_token_runway():
     assert sum(map(_estimate_msg_budget_tokens, regrown)) >= rearm_tokens
     rearmed, n3 = c.prune_tool_results_only(regrown, current_tokens=1_000_000)
     assert n3 >= 2
+    assert rearmed is not regrown
+
+
+def test_codex_private_replay_does_not_rearm_without_visible_growth():
+    c = _compressor(
+        api_mode="codex_responses",
+        proactive_prune_tokens=48_000,
+        proactive_prune_min_result_chars=8_000,
+    )
+    first, first_count = c.prune_tool_results_only(
+        _build(8, big_indices={0, 1, 2, 6, 7}), current_tokens=120_000,
+    )
+    assert first_count >= 3
+    runway = c._proactive_prune_rearm_tokens
+
+    grown = first + [
+        _assistant_call("call_8"),
+        _tool_msg("call_8", "ok"),
+        _assistant_call("call_9"),
+        _tool_msg("call_9", "ok"),
+    ]
+    private_replay = {
+        "role": "assistant",
+        "content": "ok",
+        "codex_reasoning_items": [{
+            "type": "reasoning",
+            "encrypted_content": "e" * 240_000,
+        }],
+    }
+    visible_baseline = grown + [{"role": "assistant", "content": "ok"}]
+    replayed = grown + [private_replay]
+    raw_delta = (
+        sum(map(_estimate_msg_budget_tokens, replayed))
+        - sum(map(_estimate_msg_budget_tokens, visible_baseline))
+    )
+    projected_delta = (
+        estimate_request_tokens_rough(replayed, api_mode=c.api_mode)
+        - estimate_request_tokens_rough(visible_baseline, api_mode=c.api_mode)
+    )
+    assert raw_delta == 60_012
+    assert projected_delta == 6
+    assert sum(map(_estimate_msg_budget_tokens, replayed)) >= runway
+    projected = estimate_request_tokens_rough(replayed, api_mode=c.api_mode)
+    assert projected < runway
+
+    blocked, blocked_count = c.prune_tool_results_only(
+        replayed, current_tokens=1_000_000,
+    )
+    assert blocked is replayed
+    assert blocked_count == 0
+
+    visible_growth = {
+        "role": "user",
+        "content": "v" * ((runway - projected + 32) * 4),
+    }
+    regrown = replayed + [visible_growth]
+    assert estimate_request_tokens_rough(regrown, api_mode=c.api_mode) >= runway
+    rearmed, rearmed_count = c.prune_tool_results_only(
+        regrown, current_tokens=1_000_000,
+    )
+    assert rearmed_count >= 2
     assert rearmed is not regrown
 
 

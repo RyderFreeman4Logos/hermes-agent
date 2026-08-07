@@ -216,7 +216,67 @@ def test_per_target_owner_isolation_and_cancel():
     assert FakeTimer.created[1].cancelled is False
 
 
-def test_alive_fires_once_and_rearms_from_checkin_at_exact_interval():
+def test_active_snapshots_are_complete_stable_and_clear_on_cancel(
+    monkeypatch, caplog
+):
+    from tools.runtime_heartbeat import RuntimeHeartbeat
+
+    FakeTimer.created = []
+    wall_clock = SimpleNamespace(now=1_700_000_000.25)
+    monkeypatch.setattr("tools.runtime_heartbeat.time.time", lambda: wall_clock.now)
+    caplog.set_level("INFO", logger="tools.runtime_heartbeat")
+    manager = RuntimeHeartbeat(event_queue=queue.Queue(), timer_factory=FakeTimer)
+    alive = lambda: {"alive": True, "progress": True}
+
+    assert manager.arm(
+        "delegate-b",
+        caller_id="owner-b",
+        kind="delegation",
+        interval=3300,
+        inspect=alive,
+    )
+    wall_clock.now += 2
+    assert manager.arm(
+        "proc-a",
+        caller_id="owner-a",
+        kind="process",
+        interval=1700,
+        inspect=alive,
+    )
+
+    assert manager.active_snapshots() == [
+        {
+            "caller_id": "owner-b",
+            "interval_s": 3300,
+            "kind": "delegation",
+            "started_at": 1_700_000_000.25,
+            "target_id": "delegate-b",
+        },
+        {
+            "caller_id": "owner-a",
+            "interval_s": 1700,
+            "kind": "process",
+            "started_at": 1_700_000_002.25,
+            "target_id": "proc-a",
+        },
+    ]
+
+    assert manager.cancel("delegate-b") is True
+    assert manager.active_snapshots() == [
+        {
+            "caller_id": "owner-a",
+            "interval_s": 1700,
+            "kind": "process",
+            "started_at": 1_700_000_002.25,
+            "target_id": "proc-a",
+        }
+    ]
+    assert manager.cancel("proc-a") is True
+    assert manager.active_snapshots() == []
+    assert "phase=cancel" in caplog.text
+
+
+def test_alive_fires_once_and_rearms_from_checkin_at_exact_interval(caplog):
     from tools.runtime_heartbeat import RuntimeHeartbeat
 
     FakeTimer.created = []
@@ -228,17 +288,18 @@ def test_alive_fires_once_and_rearms_from_checkin_at_exact_interval():
             {"alive": True, "output_size": 8, "cpu_seconds": 0.0},
         ]
     )
-    assert manager.arm(
-        "proc",
-        caller_id="owner",
-        kind="process",
-        interval=1700,
-        inspect=lambda: next(snapshots),
-    )
-    first = FakeTimer.created[-1]
-    assert first.interval == 1700
+    with caplog.at_level("INFO", logger="tools.runtime_heartbeat"):
+        assert manager.arm(
+            "proc",
+            caller_id="owner",
+            kind="process",
+            interval=1700,
+            inspect=lambda: next(snapshots),
+        )
+        first = FakeTimer.created[-1]
+        assert first.interval == 1700
 
-    first.callback()
+        first.callback()
     event = events.get_nowait()
     assert event["status"] == "ALIVE"
     assert event["session_key"] == "owner"
@@ -246,6 +307,8 @@ def test_alive_fires_once_and_rearms_from_checkin_at_exact_interval():
     assert len(FakeTimer.created) == 2
     assert FakeTimer.created[-1].interval == 1700
     assert manager.outstanding_for_caller("owner") == ["proc"]
+    assert "phase=arm" in caplog.text
+    assert "phase=due" in caplog.text
 
 
 def test_stuck_live_target_emits_once_and_rearms_exactly_once():

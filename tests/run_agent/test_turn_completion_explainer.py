@@ -561,18 +561,61 @@ def test_heartbeat_caps_existing_output_param_without_mutating_snapshot(
 
 
 def test_alive_heartbeat_without_validated_snapshot_makes_no_provider_call(
-    heartbeat_event,
+    heartbeat_event, caplog,
 ):
     agent = _make_agent(max_iterations=10)
 
-    result = agent.run_conversation(
-        "[HEARTBEAT] no normal request has succeeded yet",
-        turn_origin="heartbeat_warm",
-        heartbeat_event=heartbeat_event,
-    )
+    with caplog.at_level("INFO", logger="agent.conversation_loop"):
+        result = agent.run_conversation(
+            "[HEARTBEAT] no normal request has succeeded yet",
+            turn_origin="heartbeat_warm",
+            heartbeat_event=heartbeat_event,
+        )
 
     assert result["silent_noop"] is True
     agent.client.chat.completions.create.assert_not_called()
+    assert "phase=attempt" in caplog.text
+    assert "outcome=safe-skip" in caplog.text
+    assert "reason=no_validated_snapshot" in caplog.text
+
+
+def test_heartbeat_logs_success_without_persisting_a_turn(heartbeat_event, caplog):
+    agent = _make_agent(max_iterations=10)
+    _prime_heartbeat_snapshot(agent)
+    agent.client.chat.completions.create.return_value = _mock_response("warm")
+
+    with caplog.at_level("INFO", logger="agent.conversation_loop"):
+        result = agent.run_conversation(
+            "",
+            turn_origin="heartbeat_warm",
+            heartbeat_event=heartbeat_event,
+        )
+
+    assert result["silent_noop"] is True
+    assert result["messages"] == []
+    assert "phase=attempt" in caplog.text
+    assert "outcome=success" in caplog.text
+    assert "reason=response_validated" in caplog.text
+
+
+def test_heartbeat_logs_provider_failure_without_user_turn(
+    heartbeat_event, caplog
+):
+    agent = _make_agent(max_iterations=10)
+    _prime_heartbeat_snapshot(agent)
+    agent.client.chat.completions.create.side_effect = RuntimeError("wire failed")
+
+    with caplog.at_level("INFO", logger="agent.conversation_loop"):
+        result = agent.run_conversation(
+            "",
+            turn_origin="heartbeat_warm",
+            heartbeat_event=heartbeat_event,
+        )
+
+    assert result["silent_noop"] is True
+    assert result["messages"] == []
+    assert "outcome=failure" in caplog.text
+    assert "reason=provider_exception:RuntimeError" in caplog.text
 
 
 def test_heartbeat_skips_when_exact_physical_client_cannot_be_leased(
@@ -1351,6 +1394,47 @@ def test_snapshot_request_is_immutable_after_capture(heartbeat_event):
     assert warm_request["messages"] == [
         {"role": "user", "content": "captured"}
     ]
+
+
+def test_heartbeat_identity_exception_preserves_optional_claim_contract(
+    monkeypatch,
+):
+    from tools.runtime_heartbeat import (
+        claim_warm_snapshot,
+        warm_snapshot_claim_reason,
+    )
+
+    agent = _make_agent(max_iterations=10)
+    _prime_heartbeat_snapshot(agent)
+    monkeypatch.setattr(
+        "tools.runtime_heartbeat._warm_snapshot_identity",
+        MagicMock(side_effect=RuntimeError("identity unavailable")),
+    )
+
+    assert claim_warm_snapshot(agent) is None
+    assert warm_snapshot_claim_reason(agent) == "identity_unavailable"
+
+
+def test_heartbeat_identity_exception_safe_skips_without_dispatch(
+    heartbeat_event, monkeypatch
+):
+    agent = _make_agent(max_iterations=10)
+    _prime_heartbeat_snapshot(agent)
+    monkeypatch.setattr(
+        "tools.runtime_heartbeat._warm_snapshot_identity",
+        MagicMock(side_effect=RuntimeError("identity unavailable")),
+    )
+
+    result = agent.run_conversation(
+        "",
+        turn_origin="heartbeat_warm",
+        heartbeat_event=heartbeat_event,
+    )
+
+    assert result["silent_noop"] is True
+    assert result["heartbeat_warm_status"] == "skipped"
+    assert result["heartbeat_warm_reason"] == "identity_unavailable"
+    agent.client.chat.completions.create.assert_not_called()
 
 
 @pytest.mark.parametrize(

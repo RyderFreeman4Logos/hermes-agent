@@ -1346,6 +1346,19 @@ def run_heartbeat_warm(
     retained_history = list(conversation_history or [])
     api_calls = 0
 
+    def observe(outcome: str, reason: str) -> None:
+        event = heartbeat_event if isinstance(heartbeat_event, dict) else {}
+        logger.info(
+            "Runtime heartbeat phase=%s outcome=%s target=%s owner=%s "
+            "provider=%s reason=%s",
+            "attempt" if outcome == "attempt" else "checkin",
+            outcome,
+            str(event.get("target_id") or "-")[:500],
+            str(event.get("session_key") or "-")[:500],
+            str(event.get("provider") or "-")[:500],
+            reason,
+        )
+
     def finish(
         *,
         silent: bool,
@@ -1353,7 +1366,11 @@ def run_heartbeat_warm(
         evidence: str = "",
         warm_status: str = "skipped",
         warm_reason: str = "",
+        outcome: str | None = None,
+        reason: str = "",
     ):
+        if outcome:
+            observe(outcome, reason)
         final = "" if silent else (
             f"[HEARTBEAT ALERT] {status}: "
             f"{evidence or 'target liveness is uncertain'}"
@@ -1384,14 +1401,31 @@ def run_heartbeat_warm(
         warm_snapshot_is_current,
     )
 
+    observe("attempt", "due_event")
     if not isinstance(heartbeat_event, dict):
-        return finish(silent=True, warm_reason="missing_event")
+        return finish(
+            silent=True,
+            warm_reason="missing_event",
+            outcome="safe-skip",
+            reason="invalid_event",
+        )
     try:
         if not runtime_heartbeat.is_event_current(heartbeat_event, agent):
-            return finish(silent=True, warm_reason="stale_event")
-    except Exception:
+            return finish(
+                silent=True,
+                warm_reason="stale_event",
+                outcome="safe-skip",
+                reason="stale_event",
+            )
+    except Exception as exc:
         logger.debug("Heartbeat event validation failed", exc_info=True)
-        return finish(silent=True, warm_reason="event_validation_error")
+        return finish(
+            silent=True,
+            warm_status="degraded",
+            warm_reason="event_validation_error",
+            outcome="failure",
+            reason=f"event_validation_exception:{type(exc).__name__}",
+        )
     status = str(heartbeat_event.get("status") or "").upper()
     if status in {"STUCK", "UNKNOWN"}:
         return finish(
@@ -1399,32 +1433,56 @@ def run_heartbeat_warm(
             status=status,
             evidence=str(heartbeat_event.get("evidence") or ""),
             warm_reason="unhealthy_target",
+            outcome="alert",
+            reason=status.lower(),
         )
-    if status != "ALIVE" or moa_config is not None:
+    if status != "ALIVE":
         return finish(
             silent=True,
-            warm_status="degraded" if moa_config is not None else "skipped",
-            warm_reason="moa_forbidden" if moa_config is not None else "non_alive",
+            warm_reason="non_alive",
+            outcome="safe-skip",
+            reason="non_alive_event",
+        )
+    if moa_config is not None:
+        return finish(
+            silent=True,
+            warm_status="degraded",
+            warm_reason="moa_forbidden",
+            outcome="safe-skip",
+            reason="unsupported_moa",
         )
     try:
         claim = claim_warm_snapshot(agent)
-    except Exception:
+    except Exception as exc:
         logger.debug("Heartbeat snapshot claim failed", exc_info=True)
         return finish(
             silent=True,
             warm_status="degraded",
             warm_reason="snapshot_claim_error",
+            outcome="failure",
+            reason=f"snapshot_claim_exception:{type(exc).__name__}",
         )
     if claim is None:
-        reason = warm_snapshot_claim_reason(agent) or "snapshot_unavailable"
-        degraded = reason in {
+        warm_reason = warm_snapshot_claim_reason(agent) or "snapshot_unavailable"
+        degraded = warm_reason in {
             "physical_client_unavailable",
             "replay_not_bounded_or_cancellable",
         }
+        observed_reason = {
+            "normal_request_active": "normal_request_in_flight",
+            "warm_inflight": "checkin_already_in_flight",
+            "snapshot_unavailable": "no_validated_snapshot",
+            "snapshot_identity_changed": "snapshot_stale",
+            "replay_not_bounded_or_cancellable": "no_bounded_output_cap",
+            "physical_client_unavailable": "client_lease_unavailable",
+            "snapshot_stale": "snapshot_stale_after_lease",
+        }.get(warm_reason, warm_reason)
         return finish(
             silent=True,
             warm_status="degraded" if degraded else "skipped",
-            warm_reason=reason,
+            warm_reason=warm_reason,
+            outcome="safe-skip",
+            reason=observed_reason,
         )
     epoch, api_kwargs, dispatch = claim
     physical_client_reusable = True
@@ -1441,7 +1499,12 @@ def run_heartbeat_warm(
             limit for limit in (configured_limit, 272_000) if limit > 0
         )
         if estimate_request_context_tokens(api_kwargs) >= pressure_limit:
-            return finish(silent=True, warm_reason="context_pressure")
+            return finish(
+                silent=True,
+                warm_reason="context_pressure",
+                outcome="safe-skip",
+                reason="context_pressure",
+            )
         if not commit_warm_snapshot_dispatch(
             agent,
             epoch,
@@ -1449,7 +1512,12 @@ def run_heartbeat_warm(
                 heartbeat_event, agent, consume=True
             ),
         ):
-            return finish(silent=True, warm_reason="stale_or_busy")
+            return finish(
+                silent=True,
+                warm_reason="stale_or_busy",
+                outcome="safe-skip",
+                reason="dispatch_stale",
+            )
 
         api_calls = 1
         dispatch_started_at = time.monotonic()
@@ -1471,13 +1539,19 @@ def run_heartbeat_warm(
             )
             warm_status = "warmed"
             warm_reason = "physical_success"
+            outcome = "success"
+            observed_reason = "response_validated"
         else:
             warm_status = "degraded"
             warm_reason = "response_validation_failed"
+            outcome = "failure"
+            observed_reason = "response_invalid"
     except Exception as exc:
         logger.debug("Isolated heartbeat warm attempt failed", exc_info=True)
         warm_status = "degraded"
         warm_reason = f"provider_error:{type(exc).__name__}"
+        outcome = "failure"
+        observed_reason = f"provider_exception:{type(exc).__name__}"
     finally:
         release_warm_snapshot(
             agent, epoch, reusable=physical_client_reusable
@@ -1486,6 +1560,8 @@ def run_heartbeat_warm(
         silent=True,
         warm_status=warm_status,
         warm_reason=warm_reason,
+        outcome=outcome,
+        reason=observed_reason,
     )
 
 

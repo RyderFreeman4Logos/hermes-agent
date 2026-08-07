@@ -4304,6 +4304,13 @@ def apply_pending_steer_to_tool_results(agent, messages: list, num_tool_msgs: in
 
     target["content"] = replacement_content
     drop_stale_api_content(target)
+    # Optional surface callback (TUI) completes durable busy-steer claims on apply.
+    try:
+        notify = getattr(agent, "_on_steer_applied", None)
+        if callable(notify):
+            notify(steer_text)
+    except Exception:
+        pass
     _ra().logger.info(
         "Delivered /steer to agent after tool batch (%d chars): %s",
         len(steer_text),

@@ -240,6 +240,11 @@ DEFAULT_CONFIG = {
         "modal_mode": "auto",
         "cwd": ".",  # Use current directory
         "timeout": 180,
+        # Opt-in long-timeout admission. Defaults preserve the historical
+        # foreground behavior until explicitly enabled in config.yaml.
+        "auto_background_long_timeout": False,
+        "auto_background_timeout_threshold": 19,
+        "default_notify_on_background": False,
         # Bounded grace period (seconds) between SIGTERM and an escalated
         # SIGKILL when terminating a host process tree (browser daemons, etc.).
         # A daemon that stalls in its SIGTERM handler is force-killed after this
@@ -1615,6 +1620,7 @@ DEFAULT_CONFIG = {
         # raise deliberately, each level multiplies API cost.
         "max_spawn_depth": 1,        # depth (1 = flat [default], 2 = orchestrator→leaf, 3+ = deeper)
         "orchestrator_enabled": True,  # kill switch for role="orchestrator"
+        "force_background": False,
         # When a subagent hits a dangerous-command approval prompt, the parent's
         # prompt_toolkit TUI owns stdin — a thread-local input() call from the
         # subagent worker would deadlock the parent UI. To avoid the deadlock,

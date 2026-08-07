@@ -2865,6 +2865,7 @@ def delegate_task(
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
     background: Optional[bool] = None,
+    force_background: Optional[bool] = None,
     model_profile: Optional[str] = None,
     parent_agent=None,
 ) -> str:
@@ -2905,6 +2906,9 @@ def delegate_task(
     # as one message once ALL children finish — the chat is not blocked while
     # they run.
     background = is_truthy_value(background, default=False) if background is not None else False
+    force_background = _resolve_force_background(force_background)
+    if force_background:
+        background = True
 
     # Depth limit — configurable via delegation.max_spawn_depth,
     # default 2 for parity with the original MAX_DEPTH constant.
@@ -3280,7 +3284,9 @@ def delegate_task(
             from gateway.session_context import async_delivery_supported
             _async_ok = async_delivery_supported()
         except Exception:
-            _async_ok = True
+            # force_background is a no-inline guarantee; an unknown delivery
+            # capability cannot safely fall back to the synchronous path.
+            _async_ok = not force_background
 
         _wake_sid = ""
         if not _async_ok:
@@ -3304,6 +3310,22 @@ def delegate_task(
                     _wake_sid,
                 )
                 _async_ok = True
+
+        if not _async_ok and force_background:
+            _finalize_unstarted_children(children, parent_agent, "error")
+            if live_deleg_id:
+                shutil.rmtree(live_transcript_root() / live_deleg_id, ignore_errors=True)
+            return json.dumps(
+                {
+                    "status": "rejected",
+                    "mode": "background",
+                    "error": (
+                        "delegation.force_background=true requires a durable async "
+                        "completion route; the child was not started."
+                    ),
+                },
+                ensure_ascii=False,
+            )
 
         if not _async_ok:
             logger.info(
@@ -4342,7 +4364,22 @@ def _model_background_value(args: dict, parent_agent=None) -> bool:
     keep the historical synchronous default.
     """
     is_subagent = getattr(parent_agent, "_delegate_depth", 0) > 0
-    return not is_subagent
+    return _force_background_enabled() or not is_subagent
+
+
+def _resolve_force_background(explicit=None) -> bool:
+    """Use config by default; an explicit false opts out."""
+    if explicit is not None:
+        return is_truthy_value(explicit, default=False)
+    try:
+        return bool(_load_config().get("force_background", False))
+    except Exception:
+        return False
+
+
+def _force_background_enabled() -> bool:
+    """Return the configured no-inline guarantee for every delegation depth."""
+    return _resolve_force_background()
 
 
 _MODEL_HIDDEN_TASK_FIELDS = {"acp_command", "acp_args"}

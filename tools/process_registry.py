@@ -2571,6 +2571,30 @@ def _handle_process(args, **kw):
             return json.dumps(_redact_process_result(process_registry.read_log(
                 session_id, offset=args.get("offset", 0), limit=args.get("limit", 200))), ensure_ascii=False)
         elif action == "wait":
+            try:
+                from tools.terminal_tool import _get_env_config
+                terminal_config = _get_env_config()
+            except Exception:
+                terminal_config = {}
+            effective_timeout = args.get("timeout") or terminal_config.get("timeout", 180)
+            threshold = terminal_config.get("auto_background_timeout_threshold", 19)
+            if (
+                terminal_config.get("auto_background_long_timeout", False)
+                and isinstance(effective_timeout, (int, float))
+                and effective_timeout > threshold
+            ):
+                return json.dumps(
+                    {
+                        **_redact_process_result(process_registry.poll(session_id)),
+                        "wait_skipped": True,
+                        "note": (
+                            f"process(wait) timeout={int(effective_timeout)}s exceeds "
+                            f"auto_background_timeout_threshold={threshold}s; "
+                            "the process is already backgrounded."
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
             return json.dumps(_redact_process_result(process_registry.wait(session_id, timeout=args.get("timeout"))), ensure_ascii=False)
         elif action == "kill":
             return json.dumps(

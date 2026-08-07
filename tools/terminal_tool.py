@@ -1497,6 +1497,15 @@ def _get_env_config() -> Dict[str, Any]:
         "host_cwd": host_cwd,
         "docker_mount_cwd_to_workspace": mount_docker_cwd,
         "timeout": _parse_env_var("TERMINAL_TIMEOUT", "180"),
+        "auto_background_long_timeout": os.getenv(
+            "TERMINAL_AUTO_BACKGROUND_LONG_TIMEOUT", "false"
+        ).lower() in {"true", "1", "yes", "on"},
+        "auto_background_timeout_threshold": _parse_env_var(
+            "TERMINAL_AUTO_BACKGROUND_TIMEOUT_THRESHOLD", "19"
+        ),
+        "default_notify_on_background": os.getenv(
+            "TERMINAL_DEFAULT_NOTIFY_ON_BACKGROUND", "false"
+        ).lower() in {"true", "1", "yes", "on"},
         "lifetime_seconds": _parse_env_var("TERMINAL_LIFETIME_SECONDS", "300"),
         # SSH-specific config
         "ssh_host": os.getenv("TERMINAL_SSH_HOST", ""),
@@ -2183,14 +2192,14 @@ def _resolve_command_cwd(
 
 def terminal_tool(
     command: str,
-    background: bool = False,
+    background: Optional[bool] = None,
     timeout: Optional[int] = None,
     task_id: Optional[str] = None,
     session_id: Optional[str] = None,
     force: bool = False,
     workdir: Optional[str] = None,
     pty: bool = False,
-    notify_on_complete: bool = False,
+    notify_on_complete: Optional[bool] = None,
     watch_patterns: Optional[List[str]] = None,
 ) -> str:
     """
@@ -2289,6 +2298,25 @@ def terminal_tool(
             cwd = config["cwd"]
         default_timeout = config["timeout"]
         effective_timeout = timeout or default_timeout
+        background_was_omitted = background is None
+        if background_was_omitted:
+            background = False
+        notify_was_omitted = notify_on_complete is None
+        if notify_was_omitted:
+            notify_on_complete = False
+        if (
+            config.get("auto_background_long_timeout", False)
+            and background_was_omitted
+            and effective_timeout > config.get("auto_background_timeout_threshold", 19)
+        ):
+            background = True
+        if (
+            background
+            and notify_was_omitted
+            and config.get("default_notify_on_background", False)
+            and not watch_patterns
+        ):
+            notify_on_complete = True
 
         # Reject foreground commands where the model explicitly requests
         # a timeout above FOREGROUND_MAX_TIMEOUT — nudge it toward background.
@@ -3204,13 +3232,13 @@ TERMINAL_SCHEMA = {
 def _handle_terminal(args, **kw):
     return terminal_tool(
         command=args.get("command"),
-        background=args.get("background", False),
+        background=args.get("background"),
         timeout=args.get("timeout"),
         task_id=kw.get("task_id"),
         session_id=kw.get("session_id"),
         workdir=args.get("workdir"),
         pty=args.get("pty", False),
-        notify_on_complete=args.get("notify_on_complete", False),
+        notify_on_complete=args.get("notify_on_complete"),
         watch_patterns=args.get("watch_patterns"),
     )
 

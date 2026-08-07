@@ -196,7 +196,20 @@ export interface Usage {
   input: number
   output: number
   reasoning?: number
+  runtime_heartbeat?: RuntimeHeartbeatStatus
   total: number
+}
+
+export interface RuntimeHeartbeatTarget {
+  interval_s: number
+  kind: string
+  started_at: number
+  target_id: string
+}
+
+export interface RuntimeHeartbeatStatus {
+  active_count: number
+  targets: RuntimeHeartbeatTarget[]
 }
 
 export interface SudoReq {

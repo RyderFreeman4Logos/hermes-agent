@@ -123,6 +123,9 @@ FOREGROUND_MAX_TIMEOUT = _safe_parse_import_env(
     "integer",
 )
 
+# Fixed execution budget for model calls promoted off the foreground turn.
+AUTO_BACKGROUND_TIMEOUT = 7200
+
 # Disk usage warning threshold (in GB)
 DISK_USAGE_WARNING_THRESHOLD_GB = _safe_parse_import_env(
     "TERMINAL_DISK_WARNING_GB",
@@ -1079,7 +1082,7 @@ TERMINAL_TOOL_DESCRIPTION = """Execute shell commands on a Linux environment. Fi
 Do NOT use cat/head/tail (use read_file), grep/rg/find/ls (use search_files), sed/awk (use patch), or echo/heredoc file creation (use write_file). Reserve terminal for: builds, installs, git, processes, scripts, network, package managers, and anything that needs a shell.
 Environment state persists: activate a virtualenv or export variables once per session, not before every command.
 
-Foreground (default): Short commands return INSTANTLY when done. A command still running after terminal.auto_background_timeout_threshold is promoted to managed background execution with completion notification; its requested timeout remains the execution deadline.
+Foreground (default): Short commands return INSTANTLY when done. When timeout exceeds terminal.auto_background_timeout_threshold and background/notify_on_complete are omitted, Hermes promotes the call before execution to managed background mode with completion notification and a 7200s budget.
 Background: set background=true and notify_on_complete=true for bounded long work; leave notifications off only for servers, watchers, and daemons. Never use nohup, setsid, disown, or trailing '&' because Hermes must track the process.
 After starting a server, verify readiness with a health check or log signal, then act in a separate call. Avoid blind sleep loops.
 Use process(action="poll") only for occasional progress checks. Keep process(wait) short and bounded; for long work, rely on notify_on_complete instead of blocking the turn.
@@ -2511,47 +2514,6 @@ def _foreground_process_response(
     return json.dumps(result_dict, ensure_ascii=False)
 
 
-def _inline_process_response(
-    proc_session,
-    command: str,
-    env,
-    env_type: str,
-    command_cwd: str,
-    session_key: str,
-    *,
-    workdir: Optional[str],
-    effective_task_id: str,
-    evidence_session_id: str,
-    returncode: Optional[int] = None,
-    approval_note: Optional[str] = None,
-    pty_note: Optional[str] = None,
-) -> str:
-    """Finish a deferred process inline through the foreground contract."""
-    from tools.process_registry import ProcessRegistry
-
-    with proc_session._lock:
-        output = ProcessRegistry._clean_shell_noise(proc_session.output_buffer)
-        exit_code = proc_session.exit_code if returncode is None else returncode
-    result = {"output": output, "returncode": exit_code}
-    update_cwd = getattr(env, "_update_cwd", None)
-    if callable(update_cwd):
-        update_cwd(result)
-    return _foreground_process_response(
-        result,
-        command,
-        env,
-        env_type,
-        command_cwd,
-        session_key,
-        workdir=workdir,
-        effective_task_id=effective_task_id,
-        evidence_session_id=evidence_session_id,
-        approval_note=approval_note,
-        pty_note=pty_note,
-        interrupted=returncode == 130,
-    )
-
-
 def _resolve_command_cwd(
     *,
     workdir: Optional[str],
@@ -2574,14 +2536,14 @@ def _resolve_command_cwd(
 
 def terminal_tool(
     command: str,
-    background: bool = False,
+    background: Optional[bool] = None,
     timeout: Optional[int] = None,
     task_id: Optional[str] = None,
     session_id: Optional[str] = None,
     force: bool = False,
     workdir: Optional[str] = None,
     pty: bool = False,
-    notify_on_complete: bool = False,
+    notify_on_complete: Optional[bool] = None,
     watch_patterns: Optional[List[str]] = None,
 ) -> str:
     """
@@ -2589,14 +2551,14 @@ def terminal_tool(
 
     Args:
         command: The command to execute
-        background: Whether to run in background (default: False)
+        background: Whether to run in background. None means omitted.
         timeout: Command timeout in seconds (default: from config)
         task_id: Unique identifier for environment isolation (optional)
         session_id: Conversation/session identifier for durable observability
         force: If True, skip dangerous command check (use after user confirms)
         workdir: Working directory for this command (optional, uses session cwd if not set)
         pty: If True, use pseudo-terminal for interactive CLI tools (local backend only)
-        notify_on_complete: If True and background=True, you'll be notified exactly once when the process exits. The right choice for almost every long task. MUTUALLY EXCLUSIVE with watch_patterns.
+        notify_on_complete: If True and background=True, you'll be notified exactly once when the process exits. None means omitted. MUTUALLY EXCLUSIVE with watch_patterns.
         watch_patterns: List of strings to watch for in background output. HARD rate limit: 1 notification per 15s per process. After 3 strike windows in a row, watch_patterns is disabled and the session is auto-promoted to notify_on_complete. Use ONLY for rare, one-shot mid-process signals on long-lived processes (server readiness, migration-done markers). NEVER use in loops/batch jobs — error patterns there will hit the strike limit and get disabled. MUTUALLY EXCLUSIVE with notify_on_complete — set one, not both.
 
     Returns:
@@ -2691,6 +2653,45 @@ def terminal_tool(
             )
         effective_timeout = timeout or default_timeout
         execution_timeout = None
+        async_delivery_verified = False
+
+        background_was_omitted = background is None
+        notify_was_omitted = notify_on_complete is None
+        background = False if background_was_omitted else bool(background)
+        notify_on_complete = (
+            False if notify_was_omitted else bool(notify_on_complete)
+        )
+
+        auto_background_threshold = int(
+            config.get("auto_background_timeout_threshold", 200)
+        )
+        auto_promoted = (
+            background_was_omitted
+            and notify_was_omitted
+            and not watch_patterns
+            and effective_timeout > auto_background_threshold
+        )
+        if auto_promoted:
+            try:
+                from gateway.session_context import async_delivery_supported
+
+                if not async_delivery_supported():
+                    return tool_error(
+                        "Long terminal command was not started: this session cannot "
+                        "deliver a managed background completion. Use a short bounded "
+                        f"timeout at or below {auto_background_threshold}s."
+                    )
+                async_delivery_verified = True
+            except Exception:
+                return tool_error(
+                    "Long terminal command was not started because async completion "
+                    "delivery could not be verified."
+                )
+
+            background = True
+            notify_on_complete = True
+            effective_timeout = AUTO_BACKGROUND_TIMEOUT
+            execution_timeout = effective_timeout
 
         # Guardrail: long-lived server/watch commands should run as managed
         # background sessions, not foreground shell hacks.
@@ -2710,22 +2711,8 @@ def terminal_tool(
                 "as a managed background process instead of occupying the foreground turn."
             )
 
-        auto_background_threshold = int(
-            config.get("auto_background_timeout_threshold", 200)
-        )
-        auto_background_candidate = (
-            not background and effective_timeout > auto_background_threshold
-        )
-        if auto_background_candidate:
-            execution_timeout = effective_timeout
-
-        # Last-resort cap for foreground work that cannot be released by the
-        # managed background lifecycle.
-        if (
-            not background
-            and not auto_background_candidate
-            and effective_timeout > FOREGROUND_MAX_TIMEOUT
-        ):
+        # Last-resort cap for foreground work that was explicitly kept inline.
+        if not background and effective_timeout > FOREGROUND_MAX_TIMEOUT:
             return tool_error(
                 f"Foreground timeout {effective_timeout}s exceeds the maximum of "
                 f"{FOREGROUND_MAX_TIMEOUT}s. Use background=true with "
@@ -3037,10 +3024,8 @@ def terminal_tool(
             )
 
         # The session key is already computed above the gateway guard.
-        if background or auto_background_candidate:
-            # Spawn through the managed process lifecycle. Auto-background
-            # candidates stay unregistered until their actual runtime crosses
-            # the configured threshold.
+        if background:
+            # Spawn through the managed process lifecycle.
             from tools.process_registry import process_registry
 
             effective_cwd = _resolve_command_cwd(
@@ -3048,13 +3033,7 @@ def terminal_tool(
                 default_cwd=cwd,
                 session_key=session_key,
             )
-            if auto_background_candidate and _approved_run:
-                from tools.interrupt import clear_current_thread_interrupt
-
-                clear_current_thread_interrupt()
             try:
-                if auto_background_candidate:
-                    notify_on_complete = True
                 heartbeat_interval = None
                 notification_requested = bool(notify_on_complete or watch_patterns)
                 notify_unsupported = None
@@ -3068,13 +3047,13 @@ def terminal_tool(
                     "watch_patterns": list(watch_patterns or []),
                 }
 
-                if (notify_on_complete or watch_patterns) and not auto_background_candidate:
+                if notify_on_complete or watch_patterns:
                     from gateway.session_context import (
                         async_delivery_supported as _async_ok,
                         get_session_env as _gse,
                     )
 
-                    if not _async_ok():
+                    if not async_delivery_verified and not _async_ok():
                         notify_on_complete = False
                         watch_patterns = None
                         notification_metadata = {
@@ -3111,20 +3090,10 @@ def terminal_tool(
                 spawn_lifecycle = {}
                 if execution_timeout is not None:
                     spawn_lifecycle["execution_timeout"] = execution_timeout
-                if notification_requested and not auto_background_candidate:
+                if notification_requested:
                     spawn_lifecycle["notification_metadata"] = notification_metadata
-                if auto_background_candidate:
-                    spawn_lifecycle["defer_registration"] = True
 
                 spawn_command = command
-                if auto_background_candidate and callable(
-                    getattr(type(env), "_wrap_command", None)
-                ):
-                    prepared_command, prepared_stdin = env._prepare_command(command)
-                    if prepared_stdin is None:
-                        spawn_command = env._wrap_command(
-                            prepared_command, effective_cwd
-                        )
 
                 if env_type == "local":
                     proc_session = process_registry.spawn_local(
@@ -3146,103 +3115,6 @@ def terminal_tool(
                         **spawn_lifecycle,
                     )
                 proc_session.command = command
-
-                if auto_background_candidate:
-                    def _finish_inline(returncode=None):
-                        return _inline_process_response(
-                            proc_session,
-                            command,
-                            env,
-                            env_type,
-                            effective_cwd,
-                            session_key,
-                            workdir=workdir,
-                            effective_task_id=effective_task_id,
-                            evidence_session_id=(
-                                session_id
-                                or task_id
-                                or effective_task_id
-                                or "default"
-                            ),
-                            returncode=returncode,
-                            approval_note=approval_note,
-                            pty_note=pty_disabled_reason,
-                        )
-
-                    promotion_state = process_registry.wait_for_promotion(
-                        proc_session, auto_background_threshold
-                    )
-                    if promotion_state == "interrupted":
-                        stopped = process_registry.discard(
-                            proc_session, source="foreground_interrupt"
-                        )
-                        if stopped.get("status") == "error":
-                            return tool_error(
-                                "Interrupted terminal command could not be stopped; "
-                                "it remains managed until its execution deadline.",
-                                session_id=stopped.get("session_id", proc_session.id),
-                            )
-                        return _finish_inline(returncode=130)
-                    if promotion_state == "exited":
-                        return _finish_inline()
-
-                    promotion_error = None
-                    try:
-                        from gateway.session_context import (
-                            async_delivery_supported as _async_ok,
-                            get_session_env as _gse,
-                        )
-
-                        if not _async_ok():
-                            promotion_error = (
-                                "Terminal command exceeded the foreground threshold, "
-                                "but this session cannot deliver a managed background "
-                                "completion. The command was stopped."
-                            )
-                        else:
-                            from tools.runtime_heartbeat import (
-                                preflight_current_heartbeat,
-                            )
-
-                            heartbeat_interval = preflight_current_heartbeat()
-                            gw_platform = _gse("HERMES_SESSION_PLATFORM", "")
-                            if gw_platform:
-                                notification_metadata.update({
-                                    "watcher_platform": gw_platform,
-                                    "watcher_chat_id": _gse("HERMES_SESSION_CHAT_ID", ""),
-                                    "watcher_user_id": _gse("HERMES_SESSION_USER_ID", ""),
-                                    "watcher_user_name": _gse("HERMES_SESSION_USER_NAME", ""),
-                                    "watcher_thread_id": _gse("HERMES_SESSION_THREAD_ID", ""),
-                                    "watcher_message_id": _gse("HERMES_SESSION_MESSAGE_ID", ""),
-                                    "watcher_interval": 5,
-                                })
-                    except Exception as exc:
-                        promotion_error = (
-                            "Terminal command exceeded the foreground threshold, but "
-                            f"background completion setup failed: {exc}"
-                        )
-
-                    if promotion_error:
-                        stopped = process_registry.discard(
-                            proc_session, source="background_promotion_failed"
-                        )
-                        if stopped.get("status") == "already_exited":
-                            return _finish_inline()
-                        if stopped.get("status") == "error":
-                            return tool_error(
-                                promotion_error
-                                + " Stop failed; the process remains managed until "
-                                "its execution deadline.",
-                                session_id=stopped.get("session_id", proc_session.id),
-                            )
-                        return tool_error(promotion_error)
-
-                    if not process_registry.promote(
-                        proc_session,
-                        notification_metadata=notification_metadata,
-                    ):
-                        return _finish_inline()
-                    background = True
 
                 result_data = {
                     "output": "Background process started",
@@ -3767,12 +3639,12 @@ TERMINAL_SCHEMA = {
             },
             "background": {
                 "type": "boolean",
-                "description": "Run in the background, returning a session_id. Pair with notify_on_complete=true for anything with a defined end (tests, builds, deploys) — without it the process runs silently. Only servers/watchers/daemons that never exit should stay silent. Short commands: prefer foreground with a generous timeout.",
+                "description": "Run in the background, returning a session_id. When this and notify_on_complete are omitted and timeout exceeds terminal.auto_background_timeout_threshold, Hermes enables both before execution. Explicit values are preserved. Pair background=true with notify_on_complete=true for bounded work; leave notifications off only for servers, watchers, and daemons.",
                 "default": False
             },
             "timeout": {
                 "type": "integer",
-                "description": f"Maximum execution budget in seconds (default: 180). Commands still running after terminal.auto_background_timeout_threshold are promoted to background=true with notify_on_complete=true while this timeout remains their execution deadline; any foreground command ineligible for promotion above {FOREGROUND_MAX_TIMEOUT}s is rejected.",
+                "description": f"Maximum execution budget in seconds (default: 180). When this exceeds terminal.auto_background_timeout_threshold and background/notify_on_complete are omitted, Hermes promotes the call before execution to background=true, notify_on_complete=true and rewrites its managed budget to {AUTO_BACKGROUND_TIMEOUT}s; any remaining foreground budget above {FOREGROUND_MAX_TIMEOUT}s is rejected.",
                 "minimum": 1
             },
             "workdir": {
@@ -3803,13 +3675,13 @@ TERMINAL_SCHEMA = {
 def _handle_terminal(args, **kw):
     return terminal_tool(
         command=args.get("command"),
-        background=args.get("background", False),
+        background=args.get("background"),
         timeout=args.get("timeout"),
         task_id=kw.get("task_id"),
         session_id=kw.get("session_id"),
         workdir=args.get("workdir"),
         pty=args.get("pty", False),
-        notify_on_complete=args.get("notify_on_complete", False),
+        notify_on_complete=args.get("notify_on_complete"),
         watch_patterns=args.get("watch_patterns"),
     )
 

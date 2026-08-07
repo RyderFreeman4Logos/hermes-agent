@@ -496,7 +496,7 @@ class TestLongRunningNotificationOwnership:
 
 
 @pytest.mark.asyncio
-async def test_heartbeat_queue_owner_blocks_redrain_and_reports_stop_busy():
+async def test_heartbeat_warm_never_owns_or_blocks_the_foreground_session():
     from gateway.run import GatewayRunner
 
     adapter = _HeartbeatAdapter()
@@ -548,10 +548,7 @@ async def test_heartbeat_queue_owner_blocks_redrain_and_reports_stop_busy():
     async def counted_handler(inbound):
         nonlocal handler_calls
         handler_calls += 1
-        result = await runner._handle_message(inbound)
-        if handler_calls > 1 and not release_heartbeat.is_set():
-            adapter._pending_messages.pop(session_key, None)
-        return result
+        return await runner._handle_message(inbound)
 
     adapter.set_message_handler(counted_handler)
     adapter.set_busy_session_handler(runner._handle_active_session_busy_message)
@@ -563,10 +560,9 @@ async def test_heartbeat_queue_owner_blocks_redrain_and_reports_stop_busy():
         ),
         patch("hermes_cli.plugins.invoke_hook", return_value=[]) as hook,
     ):
-        heartbeat_task = asyncio.create_task(
-            runner._handle_heartbeat_event(heartbeat_event)
-        )
+        await runner._handle_heartbeat_event(heartbeat_event)
         await heartbeat_started.wait()
+        heartbeat_task = runner._heartbeat_warm_tasks[session_key]
         owner = runner._session_state(session_key).turn.heartbeat_owner
 
         stop_result = await runner._handle_message(
@@ -579,19 +575,12 @@ async def test_heartbeat_queue_owner_blocks_redrain_and_reports_stop_busy():
         await adapter.handle_message(ordinary)
         first_task = adapter._session_tasks[session_key]
         await first_task
-        spawned = adapter._session_tasks.get(session_key)
-        if spawned is not None:
-            await spawned
         calls_before_release = handler_calls
         hooks_before_release = hook.call_count - hook_baseline
-        queued_before_release = adapter._pending_messages.get(session_key) is ordinary
-        no_redrain_task = session_key not in adapter._session_tasks
+        queued_before_release = session_key in adapter._pending_messages
 
         release_heartbeat.set()
         await heartbeat_task
-        drain_task = adapter._session_tasks.get(session_key)
-        if drain_task is not None:
-            await drain_task
         calls_after_release = handler_calls
         hooks_after_release = hook.call_count - hook_baseline
 
@@ -604,19 +593,16 @@ async def test_heartbeat_queue_owner_blocks_redrain_and_reports_stop_busy():
         await adapter._session_tasks[session_key]
 
     stop_text = str(stop_result).lower()
-    assert "heartbeat" in stop_text and "busy" in stop_text
-    assert "stopped" not in stop_text and "unlocked" not in stop_text
-    assert owner is not None and owner_after_stop is owner
+    assert "no active task" in stop_text
+    assert owner is None and owner_after_stop is None
     assert cached_after_stop is not None and cached_after_stop[0] is cached_agent
     assert calls_before_release == 1
     assert hooks_before_release == 1
-    assert queued_before_release is True
-    assert no_redrain_task is True
-    assert calls_after_release == 2
-    assert hooks_after_release == 2
+    assert queued_before_release is False
+    assert calls_after_release == 1
+    assert hooks_after_release == 1
     assert session_key not in adapter._pending_messages
     assert runner._session_state(session_key).turn.heartbeat_owner is None
     assert runner._session_state(session_key).turn.agent is None
-    assert handler_calls == 3
-
+    assert handler_calls == 2
 

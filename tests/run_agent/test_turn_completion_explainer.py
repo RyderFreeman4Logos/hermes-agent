@@ -17,11 +17,14 @@ suite (we patch ``run_agent.OpenAI`` and drive ``agent.client``), so they
 pass identically in CI and locally.
 """
 
+import copy
+import json
 import os
 import queue
 import threading
 import uuid
 from contextlib import nullcontext
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -75,6 +78,70 @@ def _make_agent(max_iterations: int = 10, config: dict | None = None) -> AIAgent
     # No fallback chain so empty responses exhaust deterministically.
     agent._fallback_chain = []
     return agent
+
+
+def _prime_heartbeat_snapshot(agent, messages=None):
+    from tools.runtime_heartbeat import (
+        begin_normal_warm_snapshot,
+        finish_normal_warm_snapshot,
+    )
+
+    token = begin_normal_warm_snapshot(
+        agent,
+        {
+            "model": agent.model,
+            "messages": [
+                {"role": "system", "content": agent._cached_system_prompt},
+                *list(
+                    messages
+                    or [{"role": "user", "content": "last physical request"}]
+                ),
+            ],
+            "tools": list(agent.tools or []),
+            "max_tokens": 4_096,
+        },
+        physical_client=agent.client,
+    )
+    finish_normal_warm_snapshot(agent, token, succeeded=True)
+    agent.client.chat.completions.create.reset_mock()
+
+
+def test_partial_stream_stub_cannot_publish_heartbeat_snapshot(heartbeat_event):
+    from hermes_constants import PARTIAL_STREAM_STUB_ID
+    from tools.runtime_heartbeat import (
+        begin_normal_warm_snapshot,
+        defer_normal_warm_snapshot_until_validated,
+        finish_deferred_normal_warm_snapshot,
+        finish_normal_warm_snapshot,
+    )
+
+    agent = _make_agent(max_iterations=10)
+    token = begin_normal_warm_snapshot(
+        agent,
+        {
+            "model": agent.model,
+            "messages": [{"role": "user", "content": "partial request"}],
+        },
+        physical_client=agent.client,
+    )
+    finish_normal_warm_snapshot(agent, token, succeeded=False)
+    partial = _mock_response("partial", finish_reason="length")
+    partial.id = PARTIAL_STREAM_STUB_ID
+    defer_normal_warm_snapshot_until_validated(agent, token, partial)
+
+    # The generic validator can accept the recovery envelope so the normal
+    # loop can surface its partial text. Publication must still fail closed.
+    finish_deferred_normal_warm_snapshot(agent, partial, succeeded=True)
+    agent.client.chat.completions.create.reset_mock()
+
+    result = agent.run_conversation(
+        "",
+        turn_origin="heartbeat_warm",
+        heartbeat_event=heartbeat_event,
+    )
+
+    assert result["silent_noop"] is True
+    agent.client.chat.completions.create.assert_not_called()
 
 
 @pytest.fixture
@@ -333,6 +400,7 @@ def test_heartbeat_silent_noop_leaves_no_durable_or_live_history(heartbeat_event
         {"role": "assistant", "content": "real answer"},
     ]
     agent._session_messages = history
+    _prime_heartbeat_snapshot(agent, history)
 
     with (
         patch.object(agent, "_persist_session") as persist,
@@ -356,11 +424,9 @@ def test_heartbeat_silent_noop_leaves_no_durable_or_live_history(heartbeat_event
     external_memory.assert_not_called()
 
 
-@pytest.mark.parametrize("status", ["ALIVE", "STUCK"])
 def test_live_heartbeat_uses_one_provider_response_with_tools_disabled_on_wire(
-    heartbeat_event, status,
+    heartbeat_event,
 ):
-    heartbeat_event["status"] = status
     agent = _make_agent(max_iterations=10)
     agent.tools = [
         {
@@ -382,6 +448,7 @@ def test_live_heartbeat_uses_one_provider_response_with_tools_disabled_on_wire(
         {"role": "assistant", "content": "real answer"},
     ]
     agent._session_messages = history
+    _prime_heartbeat_snapshot(agent, history)
     persisted = []
 
     with (
@@ -417,8 +484,26 @@ def test_live_heartbeat_uses_one_provider_response_with_tools_disabled_on_wire(
     assert request["stream"] is False
 
 
+def test_stuck_heartbeat_is_structured_visible_without_model_call(heartbeat_event):
+    agent = _make_agent(max_iterations=10)
+    heartbeat_event["status"] = "STUCK"
+    heartbeat_event["evidence"] = "process is alive but made no progress"
+
+    result = agent.run_conversation(
+        "[HEARTBEAT] inspect target",
+        turn_origin="heartbeat_warm",
+        heartbeat_event=heartbeat_event,
+    )
+
+    assert result["silent_noop"] is False
+    assert "STUCK" in result["final_response"]
+    assert "process is alive but made no progress" in result["final_response"]
+    agent.client.chat.completions.create.assert_not_called()
+
+
 def test_heartbeat_matches_ordinary_effective_cache_prefix(heartbeat_event):
     agent = _make_agent(max_iterations=10)
+    agent.max_tokens = 4_096
     agent.ephemeral_system_prompt = "EPHEMERAL-SYSTEM"
     agent.tools = [
         {
@@ -428,14 +513,6 @@ def test_heartbeat_matches_ordinary_effective_cache_prefix(heartbeat_event):
     ]
     agent.client.chat.completions.create.return_value = _mock_response("ok")
 
-    heartbeat = agent.run_conversation(
-        "[HEARTBEAT] inspect target",
-        turn_origin="heartbeat_warm",
-        heartbeat_event=heartbeat_event,
-    )
-    heartbeat_request = agent.client.chat.completions.create.call_args.kwargs
-    agent.client.chat.completions.create.reset_mock()
-
     with (
         patch.object(agent, "_persist_session"),
         patch.object(agent, "_save_trajectory"),
@@ -443,10 +520,1048 @@ def test_heartbeat_matches_ordinary_effective_cache_prefix(heartbeat_event):
     ):
         agent.run_conversation("ordinary request")
     ordinary_request = agent.client.chat.completions.create.call_args.kwargs
+    agent.client.chat.completions.create.reset_mock()
+
+    heartbeat = agent.run_conversation(
+        "[HEARTBEAT] this text must never enter the replayed request",
+        turn_origin="heartbeat_warm",
+        heartbeat_event=heartbeat_event,
+    )
+    heartbeat_request = agent.client.chat.completions.create.call_args.kwargs
 
     assert heartbeat["silent_noop"] is True
-    assert heartbeat_request["messages"][0] == ordinary_request["messages"][0]
+    assert heartbeat_request["messages"] == ordinary_request["messages"]
     assert heartbeat_request["tools"] == ordinary_request["tools"]
+    assert heartbeat_request["stream"] is False
+    assert heartbeat_request["tool_choice"] == "none"
+
+
+def test_heartbeat_replays_exact_prompt_cache_key_and_api_kwargs(
+    heartbeat_event,
+):
+    from tools.runtime_heartbeat import (
+        begin_normal_warm_snapshot,
+        finish_normal_warm_snapshot,
+    )
+
+    agent = _make_agent(max_iterations=10)
+    physical_request = {
+        "model": agent.model,
+        "messages": [
+            {"role": "system", "content": "stable prefix"},
+            {"role": "user", "content": "last physical request"},
+        ],
+        "tools": [
+            {
+                "type": "function",
+                "function": {"name": "read_file", "parameters": {}},
+            }
+        ],
+        "prompt_cache_key": "exact-normal-scope",
+        "max_tokens": 4_096,
+        "temperature": 0.25,
+        "extra_headers": {"X-Request-Lineage": "normal-physical-request"},
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+    token = begin_normal_warm_snapshot(
+        agent,
+        physical_request,
+        physical_client=agent.client,
+    )
+    finish_normal_warm_snapshot(agent, token, succeeded=True)
+    agent.client.chat.completions.create.reset_mock()
+
+    result = agent.run_conversation(
+        "",
+        turn_origin="heartbeat_warm",
+        heartbeat_event=heartbeat_event,
+    )
+
+    assert result["silent_noop"] is True
+    warm_request = agent.client.chat.completions.create.call_args.kwargs
+    expected_request = dict(physical_request)
+    expected_request["max_tokens"] = 1
+    expected_request["stream"] = False
+    expected_request["tool_choice"] = "none"
+    expected_request.pop("stream_options")
+    assert warm_request == expected_request
+
+
+@pytest.mark.parametrize(
+    "cap_kwargs",
+    [
+        pytest.param({}, id="missing"),
+        *[
+            pytest.param({field: value}, id=f"{field}-{label}")
+            for field in (
+                "max_tokens",
+                "max_completion_tokens",
+                "max_output_tokens",
+            )
+            for value, label in ((None, "none"), (0, "zero"), (-1, "negative"))
+        ],
+    ],
+)
+def test_heartbeat_without_positive_existing_output_cap_skips_provider(
+    heartbeat_event, cap_kwargs
+):
+    from tools.runtime_heartbeat import (
+        begin_normal_warm_snapshot,
+        finish_normal_warm_snapshot,
+    )
+
+    agent = _make_agent(max_iterations=10)
+    normal_request = {
+        "model": agent.model,
+        "messages": [{"role": "user", "content": "normal"}],
+        **cap_kwargs,
+    }
+    token = begin_normal_warm_snapshot(
+        agent,
+        normal_request,
+        physical_client=agent.client,
+    )
+    finish_normal_warm_snapshot(agent, token, succeeded=True)
+
+    result = agent.run_conversation(
+        "",
+        turn_origin="heartbeat_warm",
+        heartbeat_event=heartbeat_event,
+    )
+
+    assert result["silent_noop"] is True
+    assert result["api_calls"] == 0
+    agent.client.chat.completions.create.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "cap_field",
+    ["max_tokens", "max_completion_tokens", "max_output_tokens"],
+)
+def test_heartbeat_caps_existing_output_param_without_mutating_snapshot(
+    heartbeat_event, cap_field
+):
+    from tools.runtime_heartbeat import (
+        begin_normal_warm_snapshot,
+        finish_normal_warm_snapshot,
+    )
+
+    agent = _make_agent(max_iterations=10)
+    normal_request = {
+        "model": agent.model,
+        "messages": [
+            {"role": "system", "content": "stable prefix"},
+            {"role": "user", "content": "normal"},
+        ],
+        "tools": [
+            {
+                "type": "function",
+                "function": {"name": "read_file", "parameters": {}},
+            }
+        ],
+        "prompt_cache_key": "exact-normal-scope",
+        cap_field: 65_536,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+    unchanged_request = copy.deepcopy(normal_request)
+    token = begin_normal_warm_snapshot(
+        agent,
+        normal_request,
+        physical_client=agent.client,
+    )
+    finish_normal_warm_snapshot(agent, token, succeeded=True)
+
+    result = agent.run_conversation(
+        "",
+        turn_origin="heartbeat_warm",
+        heartbeat_event=heartbeat_event,
+    )
+
+    assert result["silent_noop"] is True
+    warm_request = agent.client.chat.completions.create.call_args.kwargs
+    expected_request = copy.deepcopy(unchanged_request)
+    expected_request[cap_field] = 1
+    expected_request["stream"] = False
+    expected_request["tool_choice"] = "none"
+    expected_request.pop("stream_options")
+    assert warm_request == expected_request
+    assert normal_request == unchanged_request
+
+
+def test_alive_heartbeat_without_validated_snapshot_makes_no_provider_call(
+    heartbeat_event,
+):
+    agent = _make_agent(max_iterations=10)
+
+    result = agent.run_conversation(
+        "[HEARTBEAT] no normal request has succeeded yet",
+        turn_origin="heartbeat_warm",
+        heartbeat_event=heartbeat_event,
+    )
+
+    assert result["silent_noop"] is True
+    agent.client.chat.completions.create.assert_not_called()
+
+
+def test_heartbeat_skips_when_exact_physical_client_cannot_be_leased(
+    heartbeat_event, monkeypatch
+):
+    from tools.runtime_heartbeat import (
+        begin_normal_warm_snapshot,
+        finish_normal_warm_snapshot,
+    )
+
+    agent = _make_agent(max_iterations=10)
+    physical_client = SimpleNamespace(
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(create=MagicMock())
+        )
+    )
+    monkeypatch.setattr(
+        "tools.runtime_heartbeat._supported_openai_warm_client",
+        lambda _agent, client: client,
+    )
+    token = begin_normal_warm_snapshot(
+        agent,
+        {
+            "model": agent.model,
+            "messages": [{"role": "user", "content": "physical"}],
+        },
+        physical_client=physical_client,
+    )
+    finish_normal_warm_snapshot(agent, token, succeeded=True)
+    monkeypatch.setattr(
+        agent,
+        "_claim_request_openai_client_for_heartbeat",
+        MagicMock(return_value=None),
+    )
+
+    result = agent.run_conversation(
+        "",
+        turn_origin="heartbeat_warm",
+        heartbeat_event=heartbeat_event,
+    )
+
+    assert result["silent_noop"] is True
+    physical_client.chat.completions.create.assert_not_called()
+    agent.client.chat.completions.create.assert_not_called()
+
+
+@pytest.mark.parametrize("failure", ["first_chunk_error", "malformed_chunk"])
+def test_stream_open_without_validated_response_does_not_publish_snapshot(
+    heartbeat_event, failure
+):
+    agent = _make_agent(max_iterations=10)
+    agent._api_max_retries = 1
+    wire_client = MagicMock()
+
+    if failure == "first_chunk_error":
+        class _BrokenStream:
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                raise RuntimeError("first chunk failed")
+
+        wire_client.chat.completions.create.return_value = _BrokenStream()
+    else:
+        wire_client.chat.completions.create.return_value = iter(
+            [SimpleNamespace(not_choices="malformed")]
+        )
+
+    with (
+        patch.object(
+            agent, "_create_request_openai_client", return_value=wire_client
+        ),
+        patch.object(agent, "_close_request_openai_client"),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        agent.run_conversation(
+            "ordinary streaming request",
+            stream_callback=lambda _delta: None,
+        )
+
+    agent.client.chat.completions.create.reset_mock()
+    result = agent.run_conversation(
+        "[HEARTBEAT] invalid stream must not seed a warm request",
+        turn_origin="heartbeat_warm",
+        heartbeat_event=heartbeat_event,
+    )
+
+    assert result["silent_noop"] is True
+    agent.client.chat.completions.create.assert_not_called()
+
+
+def test_validated_stream_publishes_exact_physical_request_snapshot(
+    heartbeat_event,
+):
+    agent = _make_agent(max_iterations=10)
+    agent.max_tokens = 4_096
+    agent.tools = [
+        {
+            "type": "function",
+            "function": {"name": "web_search", "parameters": {}},
+        }
+    ]
+    wire_client = MagicMock()
+    wire_client.chat.completions.create.return_value = iter(
+        [
+            _mock_stream_chunk(content="streamed reply"),
+            _mock_stream_chunk(finish_reason="stop"),
+        ]
+    )
+
+    with (
+        patch.object(
+            agent, "_create_request_openai_client", return_value=wire_client
+        ),
+        patch.object(agent, "_close_request_openai_client"),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation(
+            "ordinary streaming request",
+            stream_callback=lambda _delta: None,
+        )
+
+    assert result["completed"] is True
+    physical_request = wire_client.chat.completions.create.call_args.kwargs
+    wire_client.chat.completions.create.reset_mock()
+    agent.client.chat.completions.create.reset_mock()
+
+    heartbeat = agent.run_conversation(
+        "[HEARTBEAT] replay the validated stream prefix",
+        turn_origin="heartbeat_warm",
+        heartbeat_event=heartbeat_event,
+    )
+
+    assert heartbeat["silent_noop"] is True
+    warm_request = wire_client.chat.completions.create.call_args.kwargs
+    assert warm_request["messages"] == physical_request["messages"]
+    assert warm_request["tools"] == physical_request["tools"]
+    assert warm_request["stream"] is False
+    wire_client.chat.completions.create.assert_called_once()
+    agent.client.chat.completions.create.assert_not_called()
+
+
+def test_older_stream_validation_cannot_overwrite_newer_success(
+    heartbeat_event,
+):
+    from tools.runtime_heartbeat import (
+        begin_normal_warm_snapshot,
+        defer_normal_warm_snapshot_until_validated,
+        finish_deferred_normal_warm_snapshot,
+        finish_normal_warm_snapshot,
+    )
+
+    agent = _make_agent(max_iterations=10)
+    old_request = {
+        "model": agent.model,
+        "messages": [{"role": "user", "content": "old stream"}],
+        "tools": [],
+        "stream": True,
+        "max_tokens": 4_096,
+    }
+    new_request = {
+        "model": agent.model,
+        "messages": [{"role": "user", "content": "new success"}],
+        "tools": [],
+        "max_tokens": 4_096,
+    }
+
+    old_token = begin_normal_warm_snapshot(
+        agent, old_request, physical_client=agent.client
+    )
+    finish_normal_warm_snapshot(agent, old_token, succeeded=False)
+    new_token = begin_normal_warm_snapshot(
+        agent, new_request, physical_client=agent.client
+    )
+    finish_normal_warm_snapshot(agent, new_token, succeeded=False)
+
+    new_response = _mock_response("new response")
+    defer_normal_warm_snapshot_until_validated(agent, new_token, new_response)
+    finish_deferred_normal_warm_snapshot(agent, new_response, succeeded=True)
+
+    # The older stream finishes validation after the newer physical call.
+    old_response = _mock_response("late old response")
+    defer_normal_warm_snapshot_until_validated(agent, old_token, old_response)
+    finish_deferred_normal_warm_snapshot(agent, old_response, succeeded=True)
+
+    agent.run_conversation(
+        "[HEARTBEAT] newest physical request must win",
+        turn_origin="heartbeat_warm",
+        heartbeat_event=heartbeat_event,
+    )
+
+    warm_request = agent.client.chat.completions.create.call_args.kwargs
+    assert warm_request["messages"] == new_request["messages"]
+
+
+def test_heartbeat_snapshot_is_single_flight(heartbeat_event):
+    agent = _make_agent(max_iterations=10)
+    _prime_heartbeat_snapshot(agent)
+    entered = threading.Event()
+    release = threading.Event()
+
+    def blocked_create(**_kwargs):
+        entered.set()
+        assert release.wait(timeout=2)
+        return _mock_response("warm")
+
+    agent.client.chat.completions.create.side_effect = blocked_create
+    results = []
+    first = threading.Thread(
+        target=lambda: results.append(
+            agent.run_conversation(
+                "",
+                turn_origin="heartbeat_warm",
+                heartbeat_event=heartbeat_event,
+            )
+        )
+    )
+    first.start()
+    assert entered.wait(timeout=2)
+
+    second = threading.Thread(
+        target=lambda: results.append(
+            agent.run_conversation(
+                "",
+                turn_origin="heartbeat_warm",
+                heartbeat_event=heartbeat_event,
+            )
+        )
+    )
+    second.start()
+    second.join(timeout=2)
+    assert not second.is_alive()
+    release.set()
+    first.join(timeout=2)
+
+    assert not first.is_alive()
+    assert len(results) == 2
+    assert all(result["silent_noop"] is True for result in results)
+    assert agent.client.chat.completions.create.call_count == 1
+
+
+def test_normal_request_wins_before_warm_dispatch_commit(
+    heartbeat_event, monkeypatch
+):
+    from tools import runtime_heartbeat as heartbeat_module
+    from tools.runtime_heartbeat import (
+        begin_normal_warm_snapshot,
+        finish_normal_warm_snapshot,
+    )
+
+    agent = _make_agent(max_iterations=10)
+    _prime_heartbeat_snapshot(agent)
+    original_identity = heartbeat_module._warm_snapshot_identity
+    commit_entered = threading.Event()
+    release_commit = threading.Event()
+    identity_calls = 0
+
+    def block_commit_identity(candidate):
+        nonlocal identity_calls
+        identity = original_identity(candidate)
+        identity_calls += 1
+        # The claim performs the first identity check. Pause the second check,
+        # immediately before the atomic precall -> committed transition.
+        if identity_calls == 2:
+            commit_entered.set()
+            assert release_commit.wait(timeout=2)
+        return identity
+
+    monkeypatch.setattr(
+        heartbeat_module, "_warm_snapshot_identity", block_commit_identity
+    )
+    results = []
+    warm = threading.Thread(
+        target=lambda: results.append(
+            agent.run_conversation(
+                "",
+                turn_origin="heartbeat_warm",
+                heartbeat_event=heartbeat_event,
+            )
+        )
+    )
+    warm.start()
+    assert commit_entered.wait(timeout=2)
+    newer_token = begin_normal_warm_snapshot(
+        agent,
+        {
+            "model": agent.model,
+            "messages": [{"role": "user", "content": "new normal"}],
+        },
+        physical_client=agent.client,
+    )
+    release_commit.set()
+    warm.join(timeout=2)
+    finish_normal_warm_snapshot(agent, newer_token, succeeded=False)
+
+    assert not warm.is_alive()
+    assert results[0]["silent_noop"] is True
+    assert results[0]["api_calls"] == 0
+    agent.client.chat.completions.create.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "provider",
+        "model",
+        "client",
+        "tools",
+        "system",
+        "compression",
+        "cache_scope",
+    ],
+)
+def test_heartbeat_snapshot_skips_after_cache_identity_mutation(
+    heartbeat_event, monkeypatch, mutation
+):
+    agent = _make_agent(max_iterations=10)
+    agent.tools = [{"type": "function", "function": {"name": "read_file"}}]
+    _prime_heartbeat_snapshot(agent)
+    original_client = agent.client
+
+    if mutation == "provider":
+        agent.provider = "openai"
+    elif mutation == "model":
+        agent.model = "different-model"
+    elif mutation == "client":
+        agent.client = MagicMock()
+    elif mutation == "tools":
+        agent.tools.append(
+            {"type": "function", "function": {"name": "write_file"}}
+        )
+    elif mutation == "system":
+        agent._cached_system_prompt = "changed system prompt"
+    elif mutation == "compression":
+        agent._compression_attempt_id = "new-compression-attempt"
+    else:
+        monkeypatch.setattr(agent, "_prompt_cache_scope_id", lambda: "new-scope")
+
+    result = agent.run_conversation(
+        "",
+        turn_origin="heartbeat_warm",
+        heartbeat_event=heartbeat_event,
+    )
+
+    assert result["silent_noop"] is True
+    original_client.chat.completions.create.assert_not_called()
+    if agent.client is not original_client:
+        agent.client.chat.completions.create.assert_not_called()
+
+
+def test_normal_request_inflight_invalidates_previous_snapshot(heartbeat_event):
+    from tools.runtime_heartbeat import (
+        begin_normal_warm_snapshot,
+        finish_normal_warm_snapshot,
+    )
+
+    agent = _make_agent(max_iterations=10)
+    _prime_heartbeat_snapshot(agent)
+    token = begin_normal_warm_snapshot(
+        agent,
+        {
+            "model": agent.model,
+            "messages": [{"role": "user", "content": "new inflight"}],
+        },
+    )
+    try:
+        result = agent.run_conversation(
+            "",
+            turn_origin="heartbeat_warm",
+            heartbeat_event=heartbeat_event,
+        )
+    finally:
+        finish_normal_warm_snapshot(agent, token, succeeded=False)
+
+    assert result["silent_noop"] is True
+    agent.client.chat.completions.create.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "transport",
+    [
+        "anthropic_messages",
+        "codex_responses",
+        "bedrock_converse",
+        "moa",
+        "native_gemini",
+        "copilot_acp",
+    ],
+)
+def test_unsupported_successful_physical_request_cannot_seed_warm_snapshot(
+    heartbeat_event, transport
+):
+    from agent.gemini_native_adapter import GeminiNativeClient
+    from tools.runtime_heartbeat import (
+        begin_normal_warm_snapshot,
+        finish_normal_warm_snapshot,
+    )
+
+    agent = _make_agent(max_iterations=10)
+    old_client = agent.client
+    _prime_heartbeat_snapshot(agent)
+
+    if transport in {"anthropic_messages", "codex_responses", "bedrock_converse"}:
+        agent.api_mode = transport
+    elif transport == "moa":
+        agent.provider = "moa"
+    elif transport == "native_gemini":
+        agent.provider = "custom"
+        agent.client = GeminiNativeClient(
+            api_key="test-key", http_client=MagicMock()
+        )
+        agent.client._create_chat_completion = MagicMock()
+    else:
+        agent.provider = "custom"
+        agent.client = CopilotACPClient(base_url="acp://copilot")
+        agent.client._run_prompt = MagicMock(return_value=("", ""))
+
+    token = begin_normal_warm_snapshot(
+        agent,
+        {
+            "model": agent.model,
+            "messages": [{"role": "user", "content": "unsupported physical"}],
+        },
+        physical_client=agent.client,
+    )
+    finish_normal_warm_snapshot(agent, token, succeeded=True)
+
+    result = agent.run_conversation(
+        "",
+        turn_origin="heartbeat_warm",
+        heartbeat_event=heartbeat_event,
+    )
+
+    assert result["silent_noop"] is True
+    old_client.chat.completions.create.assert_not_called()
+    if transport == "native_gemini":
+        agent.client._create_chat_completion.assert_not_called()
+    elif transport == "copilot_acp":
+        agent.client._run_prompt.assert_not_called()
+
+
+def test_snapshot_request_is_immutable_after_capture(heartbeat_event):
+    from tools.runtime_heartbeat import (
+        begin_normal_warm_snapshot,
+        finish_normal_warm_snapshot,
+    )
+
+    agent = _make_agent(max_iterations=10)
+    request = {
+        "model": agent.model,
+        "messages": [{"role": "user", "content": "captured"}],
+        "tools": [],
+        "max_tokens": 4_096,
+    }
+    token = begin_normal_warm_snapshot(
+        agent, request, physical_client=agent.client
+    )
+    request["messages"][0]["content"] = "mutated later"
+    finish_normal_warm_snapshot(agent, token, succeeded=True)
+
+    agent.run_conversation(
+        "",
+        turn_origin="heartbeat_warm",
+        heartbeat_event=heartbeat_event,
+    )
+
+    warm_request = agent.client.chat.completions.create.call_args.kwargs
+    assert warm_request["messages"] == [
+        {"role": "user", "content": "captured"}
+    ]
+
+
+@pytest.mark.parametrize(
+    "failure_stage", ["event", "claim", "estimate", "create"]
+)
+def test_heartbeat_early_path_exceptions_are_silent(
+    heartbeat_event, monkeypatch, failure_stage
+):
+    agent = _make_agent(max_iterations=10)
+    _prime_heartbeat_snapshot(agent)
+
+    if failure_stage == "event":
+        monkeypatch.setattr(
+            "tools.runtime_heartbeat.runtime_heartbeat.is_event_current",
+            MagicMock(side_effect=RuntimeError("event failed")),
+        )
+    elif failure_stage == "claim":
+        monkeypatch.setattr(
+            "tools.runtime_heartbeat.claim_warm_snapshot",
+            MagicMock(side_effect=RuntimeError("claim failed")),
+        )
+    elif failure_stage == "estimate":
+        monkeypatch.setattr(
+            "agent.conversation_loop.estimate_request_context_tokens",
+            MagicMock(side_effect=RuntimeError("estimate failed")),
+        )
+    else:
+        agent.client.chat.completions.create.side_effect = RuntimeError(
+            "create failed"
+        )
+
+    result = agent.run_conversation(
+        "",
+        turn_origin="heartbeat_warm",
+        heartbeat_event=heartbeat_event,
+    )
+
+    assert result["silent_noop"] is True
+    assert result["final_response"] == ""
+    assert agent.client.chat.completions.create.call_count == (
+        1 if failure_stage == "create" else 0
+    )
+
+
+def test_heartbeat_cache_scope_lookup_exception_does_not_escape(heartbeat_event):
+    agent = _make_agent(max_iterations=10)
+    _prime_heartbeat_snapshot(agent)
+
+    class _BrokenSessionDB:
+        def get_session(self, _session_id):
+            raise RuntimeError("SessionDB unavailable")
+
+    agent._session_db = _BrokenSessionDB()
+
+    result = agent.run_conversation(
+        "",
+        turn_origin="heartbeat_warm",
+        heartbeat_event=heartbeat_event,
+    )
+
+    assert result["silent_noop"] is True
+    # Prompt-cache scope resolution intentionally falls back to the stable
+    # session id when SessionDB is unavailable, so the existing snapshot is
+    # still safe to replay.
+    agent.client.chat.completions.create.assert_called_once()
+
+
+def test_heartbeat_never_enters_auxiliary_runtime_scope(heartbeat_event):
+    agent = _make_agent(max_iterations=10)
+    _prime_heartbeat_snapshot(agent)
+
+    with (
+        patch(
+            "agent.auxiliary_client._normalize_main_runtime",
+            side_effect=AssertionError("auxiliary runtime entered"),
+        ) as normalize,
+        patch(
+            "agent.auxiliary_client.scoped_runtime_main",
+            side_effect=AssertionError("auxiliary scope entered"),
+        ) as scope,
+    ):
+        result = agent.run_conversation(
+            "",
+            turn_origin="heartbeat_warm",
+            heartbeat_event=heartbeat_event,
+        )
+
+    assert result["silent_noop"] is True
+    normalize.assert_not_called()
+    scope.assert_not_called()
+
+
+def test_superseded_warm_response_does_not_refresh_heartbeat_lease(
+    heartbeat_event,
+):
+    from tools.runtime_heartbeat import (
+        begin_normal_warm_snapshot,
+        finish_normal_warm_snapshot,
+    )
+
+    agent = _make_agent(max_iterations=10)
+    _prime_heartbeat_snapshot(agent)
+    newer_token = None
+
+    def supersede_before_response(**_kwargs):
+        nonlocal newer_token
+        newer_token = begin_normal_warm_snapshot(
+            agent,
+            {
+                "model": agent.model,
+                "messages": [{"role": "user", "content": "new normal"}],
+                "max_tokens": 4_096,
+            },
+            physical_client=agent.client,
+        )
+        finish_normal_warm_snapshot(agent, newer_token, succeeded=True)
+        return _mock_response("stale warm response")
+
+    agent.client.chat.completions.create.side_effect = supersede_before_response
+    with patch(
+        "tools.runtime_heartbeat.runtime_heartbeat.reset_for_caller"
+    ) as reset_deadline:
+        result = agent.run_conversation(
+            "",
+            turn_origin="heartbeat_warm",
+            heartbeat_event=heartbeat_event,
+        )
+
+    assert result["silent_noop"] is True
+    agent.client.chat.completions.create.assert_called_once()
+    reset_deadline.assert_not_called()
+
+    # The post-commit normal request wins snapshot publication. The next warm
+    # replays it after the old committed warm releases its lease/phase.
+    agent.client.chat.completions.create.reset_mock()
+    agent.client.chat.completions.create.side_effect = None
+    agent.client.chat.completions.create.return_value = _mock_response("new warm")
+    agent.run_conversation(
+        "",
+        turn_origin="heartbeat_warm",
+        heartbeat_event=heartbeat_event,
+    )
+    warm_request = agent.client.chat.completions.create.call_args.kwargs
+    assert warm_request["messages"] == [
+        {"role": "user", "content": "new normal"}
+    ]
+
+
+def test_failed_committed_warm_releases_dispatch_phase(heartbeat_event):
+    agent = _make_agent(max_iterations=10)
+    _prime_heartbeat_snapshot(agent)
+    agent.client.chat.completions.create.side_effect = RuntimeError("warm failed")
+
+    failed = agent.run_conversation(
+        "",
+        turn_origin="heartbeat_warm",
+        heartbeat_event=heartbeat_event,
+    )
+
+    assert failed["silent_noop"] is True
+    agent.client.chat.completions.create.assert_called_once()
+    agent.client.chat.completions.create.reset_mock()
+    agent.client.chat.completions.create.side_effect = None
+    agent.client.chat.completions.create.return_value = _mock_response("retry")
+
+    retried = agent.run_conversation(
+        "",
+        turn_origin="heartbeat_warm",
+        heartbeat_event=heartbeat_event,
+    )
+
+    assert retried["silent_noop"] is True
+    agent.client.chat.completions.create.assert_called_once()
+
+
+def test_heartbeat_does_not_mutate_usage_tokens_history_or_session_db(
+    heartbeat_event,
+):
+    agent = _make_agent(max_iterations=10)
+    history = [
+        {"role": "user", "content": "ordinary"},
+        {"role": "assistant", "content": "answer"},
+    ]
+    agent._session_messages = history
+    agent._first_turn_usage = {"input_tokens": 100, "cache_read_tokens": 90}
+    agent._last_turn_usage = {"input_tokens": 110, "output_tokens": 5}
+    counter_names = (
+        "session_prompt_tokens",
+        "session_completion_tokens",
+        "session_total_tokens",
+        "session_input_tokens",
+        "session_output_tokens",
+        "session_cache_read_tokens",
+        "session_cache_write_tokens",
+        "session_reasoning_tokens",
+    )
+    for index, name in enumerate(counter_names, start=1):
+        setattr(agent, name, index * 10)
+    before_counters = {name: getattr(agent, name) for name in counter_names}
+    first_usage = dict(agent._first_turn_usage)
+    last_usage = dict(agent._last_turn_usage)
+    class _ReadOnlySessionDB:
+        reads = 0
+
+        def get_session(self, _session_id):
+            self.reads += 1
+            return None
+
+        def __getattr__(self, name):
+            raise AssertionError(f"heartbeat attempted SessionDB mutation: {name}")
+
+    session_db = _ReadOnlySessionDB()
+    agent._session_db = session_db
+    _prime_heartbeat_snapshot(agent, history)
+    response = _mock_response("warm")
+    response.usage = SimpleNamespace(
+        prompt_tokens=99_999,
+        completion_tokens=999,
+        total_tokens=100_998,
+    )
+    agent.client.chat.completions.create.return_value = response
+
+    result = agent.run_conversation(
+        "",
+        conversation_history=history,
+        turn_origin="heartbeat_warm",
+        heartbeat_event=heartbeat_event,
+    )
+
+    assert result["messages"] == history
+    assert agent._session_messages is history
+    assert agent._first_turn_usage == first_usage
+    assert agent._last_turn_usage == last_usage
+    assert {name: getattr(agent, name) for name in counter_names} == before_counters
+    # Cache-lineage identity may read the session row, but no mutating DB
+    # surface is available to this isolated path.
+    assert session_db.reads >= 1
+
+
+def test_deepinfra_style_fake_upstream_warm_is_one_token_and_side_effect_free(
+    heartbeat_event,
+):
+    from openai import OpenAI
+
+    from tools.runtime_heartbeat import (
+        begin_normal_warm_snapshot,
+        finish_normal_warm_snapshot,
+    )
+
+    captured = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            captured.append(json.loads(self.rfile.read(length)))
+            response = json.dumps(
+                {
+                    "id": f"chatcmpl-{len(captured)}",
+                    "object": "chat.completion",
+                    "created": 1,
+                    "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": "x"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 10,
+                        "completion_tokens": 1,
+                        "total_tokens": 11,
+                    },
+                }
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(response)))
+            self.end_headers()
+            self.wfile.write(response)
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+    base_url = f"http://127.0.0.1:{server.server_port}/v1"
+    client = OpenAI(api_key="test-key", base_url=base_url, max_retries=0)
+    try:
+        agent = _make_agent(max_iterations=10)
+        agent.provider = "custom"
+        agent.requested_provider = "custom"
+        agent.base_url = base_url
+        agent.model = "deepseek-ai/DeepSeek-V4-Flash-0731"
+        agent.client = client
+        agent._request_client_cache = {
+            "client": client,
+            "kwargs": {},
+            "poisoned": False,
+            "in_use": True,
+        }
+        normal_request = {
+            "model": agent.model,
+            "messages": [
+                {"role": "system", "content": "stable prefix"},
+                {"role": "user", "content": "long running tool"},
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "terminal",
+                        "description": "Run a command",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ],
+            "prompt_cache_key": "deepinfra-normal-prefix",
+            "max_tokens": 65_536,
+            "stream": False,
+        }
+        token = begin_normal_warm_snapshot(
+            agent,
+            normal_request,
+            physical_client=client,
+        )
+        normal_response = client.chat.completions.create(**normal_request)
+        assert normal_response.choices[0].message.content == "x"
+        finish_normal_warm_snapshot(agent, token, succeeded=True)
+        agent._request_client_cache["in_use"] = False
+
+        history = [
+            {"role": "user", "content": "ordinary"},
+            {"role": "assistant", "content": "answer"},
+        ]
+        agent._session_messages = history
+        agent._first_turn_usage = {"input_tokens": 10, "cache_read_tokens": 9}
+        agent._last_turn_usage = {"input_tokens": 11, "output_tokens": 1}
+        before_first_usage = dict(agent._first_turn_usage)
+        before_last_usage = dict(agent._last_turn_usage)
+        before_total = agent.session_total_tokens
+
+        class ReadOnlySessionDB:
+            reads = 0
+
+            def get_session(self, _session_id):
+                self.reads += 1
+                return None
+
+            def __getattr__(self, name):
+                raise AssertionError(
+                    f"heartbeat attempted SessionDB mutation: {name}"
+                )
+
+        session_db = ReadOnlySessionDB()
+        agent._session_db = session_db
+
+        result = agent.run_conversation(
+            "",
+            conversation_history=history,
+            turn_origin="heartbeat_warm",
+            heartbeat_event=heartbeat_event,
+        )
+
+        assert result["silent_noop"] is True
+        assert len(captured) == 2
+        normal_body, warm_body = captured
+        assert normal_body["max_tokens"] == 65_536
+        assert warm_body["max_tokens"] == 1
+        assert warm_body["messages"] == normal_body["messages"]
+        assert warm_body["tools"] == normal_body["tools"]
+        assert warm_body["prompt_cache_key"] == normal_body["prompt_cache_key"]
+        assert warm_body["stream"] is False
+        assert warm_body["tool_choice"] == "none"
+        assert agent._session_messages is history
+        assert agent._first_turn_usage == before_first_usage
+        assert agent._last_turn_usage == before_last_usage
+        assert agent.session_total_tokens == before_total
+        assert session_db.reads >= 1
+    finally:
+        client.close()
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=2)
 
 
 @pytest.mark.parametrize(
@@ -459,6 +1574,7 @@ def test_heartbeat_skips_provider_at_compression_or_hard_limit(
     agent = _make_agent(max_iterations=10)
     agent.context_compressor.threshold_tokens = threshold
     agent.client.chat.completions.create.return_value = _mock_response("unexpected")
+    _prime_heartbeat_snapshot(agent)
 
     with (
         patch(
@@ -492,6 +1608,7 @@ def test_successful_provider_dispatches_reset_exact_heartbeat_group(heartbeat_ev
         _mock_response(content="", finish_reason="stop"),
         _mock_response(content="real reply", finish_reason="stop"),
     ]
+    _prime_heartbeat_snapshot(agent)
     token = set_current_session_key("owner-session")
     try:
         with (
@@ -667,6 +1784,7 @@ def test_heartbeat_early_error_leaves_no_unmatched_synthetic_user_row(
         {"role": "assistant", "content": "real answer"},
     ]
     agent._session_messages = history
+    _prime_heartbeat_snapshot(agent, history)
 
     with (
         patch("agent.nous_rate_guard.nous_rate_limit_remaining", return_value=60),
@@ -694,6 +1812,7 @@ def test_heartbeat_early_error_leaves_no_unmatched_synthetic_user_row(
 def test_heartbeat_bypasses_ordinary_lifecycle_hooks(heartbeat_event):
     agent = _make_agent(max_iterations=10)
     agent.client.chat.completions.create.return_value = _mock_response("still alive")
+    _prime_heartbeat_snapshot(agent)
 
     with (
         patch.dict(os.environ, {"HERMES_DUMP_REQUESTS": "1"}),
@@ -965,6 +2084,7 @@ def test_run_conversation_partial_stream_recovery_surfaces_explanation():
 
 def test_heartbeat_malformed_response_never_retries_or_falls_back(heartbeat_event):
     agent = _make_agent(max_iterations=10)
+    _prime_heartbeat_snapshot(agent)
     agent.client.chat.completions.create.side_effect = [
         SimpleNamespace(choices=[], usage=None),
         _mock_response(content="unexpected retry", finish_reason="stop"),
@@ -1113,6 +2233,7 @@ def test_heartbeat_skips_provider_switched_during_final_target_inspection(
     agent = _make_agent(max_iterations=10)
     old_client = agent.client
     old_client.chat.completions.create.return_value = _mock_response("old")
+    _prime_heartbeat_snapshot(agent)
     manager.arm(
         "target",
         caller_id="owner-session",
@@ -1158,6 +2279,7 @@ def test_heartbeat_revalidates_generation_at_provider_boundary(
     heartbeat_event, monkeypatch
 ):
     agent = _make_agent(max_iterations=10)
+    _prime_heartbeat_snapshot(agent)
     checks = iter((True, False))
     calls = []
 
@@ -1188,6 +2310,7 @@ def test_heartbeat_revalidates_generation_at_provider_boundary(
 
 def test_heartbeat_never_enters_request_middleware(heartbeat_event):
     agent = _make_agent(max_iterations=10)
+    _prime_heartbeat_snapshot(agent)
     agent.client.chat.completions.create.return_value = _mock_response("still alive")
 
     with (
@@ -1235,6 +2358,7 @@ def test_heartbeat_completion_preserves_unowned_marker_and_history(heartbeat_eve
         return _mock_response(content="", finish_reason="stop")
 
     agent.client.chat.completions.create.side_effect = complete_heartbeat
+    _prime_heartbeat_snapshot(agent, heartbeat_history)
 
     with (
         patch.object(agent, "_persist_session"),
@@ -1297,6 +2421,7 @@ def test_heartbeat_allows_supported_custom_openai_transport(heartbeat_event):
     agent = _make_agent()
     agent.provider = "custom"
     agent.base_url = "https://custom.invalid/v1"
+    _prime_heartbeat_snapshot(agent)
 
     result = agent.run_conversation(
         "[HEARTBEAT] inspect target",

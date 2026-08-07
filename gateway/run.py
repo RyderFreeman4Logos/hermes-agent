@@ -6487,6 +6487,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
+        # One detached cache-warm task per owning session. These tasks are
+        # retained with the gateway's normal background set so shutdown
+        # cancellation and cached-agent cleanup close their physical client;
+        # they never block the serial notification watcher.
+        self._heartbeat_warm_tasks: Dict[str, asyncio.Task] = {}
 
         # Event-loop liveness heartbeat (#66892): rewritten every 30s while
         # the loop is dispatching. External supervisors use the file mtime /
@@ -13423,6 +13428,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     continue
                 _task.cancel()
             self._background_tasks.clear()
+            heartbeat_warm_tasks = getattr(self, "_heartbeat_warm_tasks", None)
+            if isinstance(heartbeat_warm_tasks, dict):
+                heartbeat_warm_tasks.clear()
 
             self.adapters.clear()
             for _session_key in list(self._running_agents):
@@ -16933,7 +16941,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return source
 
     async def _run_isolated_heartbeat(
-        self, message: str, session_key: str, heartbeat_event: Any
+        self, session_key: str, heartbeat_event: Any
     ) -> None:
         """Use only the session's existing agent for an isolated warm request."""
         cache = getattr(self, "_agent_cache", None)
@@ -16945,18 +16953,52 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             agent = cached[0] if isinstance(cached, tuple) and cached else None
         if agent is None or agent is _AGENT_PENDING_SENTINEL:
             return
-        history = list(getattr(agent, "_session_messages", None) or [])
         try:
             await self._run_in_executor_with_context(
                 lambda: agent.run_conversation(
-                    message,
-                    conversation_history=history,
+                    "",
                     turn_origin="heartbeat_warm",
                     heartbeat_event=heartbeat_event,
                 )
             )
         except Exception:
             logger.debug("Isolated gateway heartbeat failed", exc_info=True)
+
+    def _schedule_isolated_heartbeat(
+        self, session_key: str, heartbeat_event: Any
+    ) -> Optional[asyncio.Task]:
+        """Detach one tracked warm without blocking notification delivery."""
+        tasks = getattr(self, "_heartbeat_warm_tasks", None)
+        if tasks is None:
+            tasks = self._heartbeat_warm_tasks = {}
+        current = tasks.get(session_key)
+        if current is not None and not current.done():
+            return current
+
+        background = getattr(self, "_background_tasks", None)
+        if background is None:
+            background = self._background_tasks = set()
+        task = asyncio.create_task(
+            self._run_isolated_heartbeat(session_key, heartbeat_event)
+        )
+        tasks[session_key] = task
+        background.add(task)
+
+        def _done(done: asyncio.Task) -> None:
+            background.discard(done)
+            if tasks.get(session_key) is done:
+                tasks.pop(session_key, None)
+            if done.cancelled():
+                return
+            try:
+                done.exception()
+            except Exception:
+                logger.debug(
+                    "Gateway heartbeat task completion failed", exc_info=True
+                )
+
+        task.add_done_callback(_done)
+        return task
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
@@ -23195,58 +23237,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "created_at": datetime.now(timezone.utc).isoformat(),
                     }
                 )
-                if status == "UNKNOWN":
-                    return
             else:
                 await self._deliver_platform_notice(source, text)
-                if status == "UNKNOWN":
-                    return
-        if status not in {"ALIVE", "STUCK"}:
+            return
+        if status != "ALIVE":
             return
         source = self._build_process_event_source(evt)
         if source is None or source.platform == Platform.API_SERVER:
             return
-        adapter = self._adapter_for_source(source)
-        if adapter is None:
+        if self._adapter_for_source(source) is None:
             return
-        pending_drain_owners = getattr(adapter, "_pending_drain_owners", None)
-        state = self._session_state(caller_id)
-        if state.turn.agent is not None:
+        if not runtime_heartbeat.is_event_current(evt):
             return
-        heartbeat_owner = object()
-        state.turn.agent = _AGENT_PENDING_SENTINEL
-        state.turn.started_ts = time.time()
-        state.turn.heartbeat_owner = heartbeat_owner
-        if isinstance(pending_drain_owners, dict):
-            pending_drain_owners[caller_id] = heartbeat_owner
-        self._persist_active_agents()
-        try:
-            if not runtime_heartbeat.is_event_current(evt):
-                return
-            await self._run_isolated_heartbeat(text, caller_id, evt)
-        finally:
-            released = self._release_running_agent_state(
-                caller_id, heartbeat_owner=heartbeat_owner
-            )
-            if (
-                isinstance(pending_drain_owners, dict)
-                and pending_drain_owners.get(caller_id) is heartbeat_owner
-            ):
-                pending_drain_owners.pop(caller_id, None)
-                active_sessions = getattr(adapter, "_active_sessions", {})
-                get_pending_message = getattr(adapter, "get_pending_message", None)
-                start_session_processing = getattr(
-                    adapter, "_start_session_processing", None
-                )
-                if (
-                    released
-                    and caller_id not in active_sessions
-                    and callable(get_pending_message)
-                    and callable(start_session_processing)
-                ):
-                    pending = get_pending_message(caller_id)
-                    if pending is not None:
-                        start_session_processing(pending, caller_id)
+        # This is an isolated snapshot replay, not a conversation turn.  It
+        # must not reserve, inspect, or release the foreground running slot.
+        self._schedule_isolated_heartbeat(caller_id, evt)
 
     async def _async_delegation_watcher(self, interval: float = 2.0) -> None:
         """Drain async-delegation completions and inject them as new turns.

@@ -1,8 +1,9 @@
 """Regression coverage for CLI async-delegation completion ownership."""
 
 import queue
+import types
 
-from cli import HermesCLI, _CompletionDeliveryMessage, _HeartbeatWarmMessage
+from cli import HermesCLI, _CompletionDeliveryMessage
 
 
 def test_cli_completion_drain_uses_visible_session_identity(monkeypatch):
@@ -137,6 +138,19 @@ def test_cli_heartbeat_routes_only_to_owner_as_silent_warm_turn(monkeypatch):
     cli.session_id = "visible-session"
     cli._pending_input = queue.Queue()
     cli._session_db = None
+    calls = []
+    cli.agent = types.SimpleNamespace(
+        run_conversation=lambda message, **kwargs: calls.append((message, kwargs))
+    )
+
+    class _ImmediateThread:
+        def __init__(self, target=None, **_kwargs):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    monkeypatch.setattr("cli.threading.Thread", _ImmediateThread)
     registry = ProcessRegistry()
     monkeypatch.setattr("tools.process_registry.process_registry", registry)
     monkeypatch.setattr(
@@ -168,10 +182,10 @@ def test_cli_heartbeat_routes_only_to_owner_as_silent_warm_turn(monkeypatch):
 
     cli._drain_process_notifications("cli-idle")
 
-    prompt = cli._pending_input.get_nowait()
-    assert isinstance(prompt, _HeartbeatWarmMessage)
-    assert "proc-heartbeat" in prompt
-    assert prompt.heartbeat_event == event
+    assert calls == [("", {
+        "turn_origin": "heartbeat_warm",
+        "heartbeat_event": event,
+    })]
     assert cli._pending_input.empty()
 
 
@@ -213,3 +227,48 @@ def test_cli_unhealthy_heartbeat_is_printed_without_agent_turn(monkeypatch):
     assert len(printed) == 1
     assert "STUCK" in printed[0]
     assert "no progress" in printed[0]
+
+
+def test_cli_stale_unhealthy_heartbeat_is_not_printed_or_run(monkeypatch):
+    from tools.process_registry import ProcessRegistry
+
+    cli = HermesCLI.__new__(HermesCLI)
+    cli.session_id = "visible-session"
+    cli._pending_input = queue.Queue()
+    cli._session_db = None
+    calls = []
+    cli.agent = types.SimpleNamespace(
+        run_conversation=lambda message, **kwargs: calls.append((message, kwargs))
+    )
+    registry = ProcessRegistry()
+    monkeypatch.setattr("tools.process_registry.process_registry", registry)
+    monkeypatch.setattr(
+        "tools.async_delegation.claim_event_delivery",
+        lambda _event, _consumer: "claim-token",
+    )
+    completed = []
+    monkeypatch.setattr(
+        "tools.async_delegation.complete_event_delivery",
+        lambda *args: completed.append(args),
+    )
+    monkeypatch.setattr(
+        "tools.runtime_heartbeat.runtime_heartbeat.is_event_current",
+        lambda _event: False,
+    )
+    printed = []
+    monkeypatch.setattr("cli._cprint", lambda message, **_kwargs: printed.append(message))
+    event = {
+        "type": "heartbeat",
+        "target_id": "proc-heartbeat",
+        "session_key": "visible-session",
+        "status": "STUCK",
+        "evidence": "old observation",
+    }
+    registry.completion_queue.put(event)
+
+    cli._drain_process_notifications("cli-idle")
+
+    assert printed == []
+    assert calls == []
+    assert cli._pending_input.empty()
+    assert completed == [(event, "claim-token")]

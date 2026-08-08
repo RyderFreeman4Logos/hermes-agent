@@ -822,7 +822,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
     warm_token = None
 
-    result = {"response": None, "error": None}
+    result: dict[str, Any] = {"response": None, "error": None}
 
     # Cross-turn stale-call circuit breaker (#58962) — non-streaming sibling
     # of the guard in interruptible_streaming_api_call.  Quiet-mode /
@@ -1002,28 +1002,14 @@ def interruptible_api_call(agent, api_kwargs: dict):
         if _codex_floor:
             _stale_timeout = max(_stale_timeout, _codex_floor)
 
-    # ── Codex absolute hard ceiling (#64507) ──────────────────────────
-    # ``openai_codex_stale_timeout_floor`` *raises* the stale timeout (up to
-    # 1200s at >100k tokens) so healthy gateway-scale payloads aren't aborted.
-    # The scaled no-byte TTFB watchdog catches dead streams that never emit a
-    # first byte, but a request that emits SOME bytes and then wedges (the
-    # issue-64507 symptom: vision-inflated request, worker idle, no ended_at)
-    # is only reclaimed at the (high) stale floor. Add a flat, finite hard
-    # ceiling on total request time that ALWAYS applies to openai-codex
-    # requests regardless of the TTFB/stale interaction, so a stalled request
-    # is recovered (retry loop / visible failure) instead of hanging
-    # indefinitely. The default sits ABOVE the maximum stale floor (1200s) so
-    # it never clamps an intentionally-raised timeout for healthy large
-    # requests — it is a backstop against unbounded growth, not a tighter
-    # limit. Tunable via HERMES_CODEX_HARD_TIMEOUT_SECONDS (set to 0 to
-    # disable the ceiling entirely; that restores the pre-fix behavior).
-    _codex_hard_timeout = _env_float("HERMES_CODEX_HARD_TIMEOUT_SECONDS", 1500.0)
-    if (
-        _codex_watchdog_enabled
-        and _openai_codex_backend
-        and _codex_hard_timeout > 0
-    ):
-        _stale_timeout = min(_stale_timeout, _codex_hard_timeout)
+    # Codex has separate no-progress and total-request limits.  Honor the
+    # existing provider/model request timeout for the latter, rather than
+    # silently clamping it with an environment-only 1500s ceiling.
+    _total_request_timeout = float("inf")
+    if _codex_watchdog_enabled:
+        _total_request_timeout = agent._resolved_api_call_timeout()
+        if not math.isfinite(_total_request_timeout) or _total_request_timeout <= 0:
+            _total_request_timeout = 1800.0
 
     if _est_tokens_for_codex_watchdog > 100_000:
         _codex_idle_timeout_default = 180.0
@@ -1155,9 +1141,8 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 except Exception:
                     _silent_hint = None
             logger.warning(
-                "Codex stream produced no bytes within TTFB cutoff "
-                "(%.0fs > %.0fs, model=%s). Backend accepted the connection "
-                "but sent no stream events. Killing connection so the retry "
+                "Codex timeout_class=ttfb_timeout: no bytes within TTFB cutoff "
+                "(%.0fs > %.0fs, model=%s). Killing connection so the retry "
                 "loop can reconnect.",
                 _elapsed, _ttfb_timeout, api_kwargs.get("model", "unknown"),
             )
@@ -1189,12 +1174,12 @@ def interruptible_api_call(agent, api_kwargs: dict):
             if result["error"] is None and result["response"] is None:
                 if _silent_hint:
                     result["error"] = TimeoutError(
-                        f"Codex stream produced no bytes within {int(_elapsed)}s "
+                        f"timeout_class=ttfb_timeout; Codex stream produced no bytes within {int(_elapsed)}s "
                         f"(TTFB threshold: {int(_ttfb_timeout)}s). {_silent_hint}"
                     )
                 else:
                     result["error"] = TimeoutError(
-                        f"Codex stream produced no bytes within {int(_elapsed)}s "
+                        f"timeout_class=ttfb_timeout; Codex stream produced no bytes within {int(_elapsed)}s "
                         f"(TTFB threshold: {int(_ttfb_timeout)}s)"
                     )
             break
@@ -1210,9 +1195,9 @@ def interruptible_api_call(agent, api_kwargs: dict):
         ):
             _event_stale_elapsed = time.time() - _last_codex_event_ts
             logger.warning(
-                "Codex stream produced no SSE events for %.0fs after first byte "
-                "(threshold %.0fs, model=%s, context=~%s tokens). Killing "
-                "connection so the retry loop can reconnect.",
+                "Codex timeout_class=sse_idle_timeout: no SSE events for %.0fs "
+                "after first byte (threshold %.0fs, model=%s, context=~%s tokens). "
+                "Killing connection so the retry loop can reconnect.",
                 _event_stale_elapsed,
                 _codex_idle_timeout,
                 api_kwargs.get("model", "unknown"),
@@ -1233,14 +1218,19 @@ def interruptible_api_call(agent, api_kwargs: dict):
             t.join(timeout=2.0)
             if result["error"] is None and result["response"] is None:
                 result["error"] = TimeoutError(
-                    f"Codex stream produced no SSE events for {int(_event_stale_elapsed)}s "
+                    f"timeout_class=sse_idle_timeout; Codex stream produced no SSE events for {int(_event_stale_elapsed)}s "
                     f"after first byte (threshold: {int(_codex_idle_timeout)}s)"
                 )
             break
 
-        # Stale-call detector: kill the connection if no response
-        # arrives within the configured timeout.
-        if _elapsed > _stale_timeout:
+        # For Codex, stale means no semantic output/reasoning/tool progress;
+        # raw SSE keepalives remain covered by the separate idle watchdog.
+        _stale_elapsed = _elapsed
+        if _codex_watchdog_enabled:
+            _last_progress_ts = getattr(agent, "_codex_stream_last_progress_ts", None)
+            if _last_progress_ts is not None:
+                _stale_elapsed = time.time() - _last_progress_ts
+        if _stale_elapsed > _stale_timeout:
             _est_ctx = estimate_request_context_tokens(api_kwargs)
             _silent_hint: Optional[str] = None
             _hint_fn = getattr(agent, "_codex_silent_hang_hint", None)
@@ -1249,51 +1239,95 @@ def interruptible_api_call(agent, api_kwargs: dict):
                     _silent_hint = _hint_fn(model=api_kwargs.get("model"))
                 except Exception:
                     _silent_hint = None
-            logger.warning(
-                "Non-streaming API call stale for %.0fs (threshold %.0fs). "
-                "model=%s context=~%s tokens. Killing connection.",
-                _elapsed, _stale_timeout,
-                api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
-            )
-            if _silent_hint:
-                agent._buffer_status(
-                    f"⚠️ No response from provider for {int(_elapsed)}s "
-                    f"(non-streaming, model: {api_kwargs.get('model', 'unknown')}). "
-                    f"{_silent_hint}"
+            if _codex_watchdog_enabled:
+                logger.warning(
+                    "Codex timeout_class=no_progress_timeout: no semantic progress "
+                    "for %.0fs (threshold %.0fs, total_elapsed=%.0fs). model=%s "
+                    "context=~%s tokens. Killing connection.",
+                    _stale_elapsed, _stale_timeout, _elapsed,
+                    api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
                 )
+                agent._buffer_status(
+                    f"⚠️ Codex stream made no semantic progress for {int(_stale_elapsed)}s "
+                    f"(model: {api_kwargs.get('model', 'unknown')}). Reconnecting."
+                )
+                _close_reason = "codex_no_progress_timeout"
             else:
-                agent._buffer_status(
-                    f"⚠️ No response from provider for {int(_elapsed)}s "
-                    f"(non-streaming, model: {api_kwargs.get('model', 'unknown')}). "
-                    f"Aborting call."
+                logger.warning(
+                    "Non-streaming API call stale for %.0fs (threshold %.0fs). "
+                    "model=%s context=~%s tokens. Killing connection.",
+                    _stale_elapsed, _stale_timeout,
+                    api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
                 )
+                if _silent_hint:
+                    agent._buffer_status(
+                        f"⚠️ No response from provider for {int(_stale_elapsed)}s "
+                        f"(non-streaming, model: {api_kwargs.get('model', 'unknown')}). "
+                        f"{_silent_hint}"
+                    )
+                else:
+                    agent._buffer_status(
+                        f"⚠️ No response from provider for {int(_stale_elapsed)}s "
+                        f"(non-streaming, model: {api_kwargs.get('model', 'unknown')}). "
+                        f"Aborting call."
+                    )
+                _close_reason = "stale_call_kill"
             try:
-                # #67142: routes by client kind — anthropic now aborts the
-                # request-local client's sockets from this poll (stranger)
-                # thread instead of closing the shared _anthropic_client.
-                _close_request_client_once("stale_call_kill")
+                _close_request_client_once(_close_reason)
             except Exception:
                 pass
-            # Circuit breaker (#58962): count the stale kill.  See the
-            # canonical comment block above ``_stale_streak()``.
             _bump_stale_streak(agent)
             agent._touch_activity(
-                f"stale non-streaming call killed after {int(_elapsed)}s"
+                f"stale non-streaming call killed after {int(_stale_elapsed)}s"
             )
-            # Wait briefly for the thread to notice the closed connection.
             t.join(timeout=2.0)
             if result["error"] is None and result["response"] is None:
-                if _silent_hint:
+                if _codex_watchdog_enabled:
                     result["error"] = TimeoutError(
-                        f"Non-streaming API call timed out after {int(_elapsed)}s "
+                        f"timeout_class=no_progress_timeout; Codex stream made no semantic progress for "
+                        f"{int(_stale_elapsed)}s (threshold: {int(_stale_timeout)}s, "
+                        f"total elapsed: {int(_elapsed)}s)"
+                    )
+                elif _silent_hint:
+                    result["error"] = TimeoutError(
+                        f"Non-streaming API call timed out after {int(_stale_elapsed)}s "
                         f"with no response (threshold: {int(_stale_timeout)}s). "
                         f"{_silent_hint}"
                     )
                 else:
                     result["error"] = TimeoutError(
-                        f"Non-streaming API call timed out after {int(_elapsed)}s "
+                        f"Non-streaming API call timed out after {int(_stale_elapsed)}s "
                         f"with no response (threshold: {int(_stale_timeout)}s)"
                     )
+            break
+
+        if _codex_watchdog_enabled and _elapsed >= _total_request_timeout:
+            logger.warning(
+                "Codex timeout_class=total_request_timeout: total elapsed %.0fs "
+                "reached configured threshold %.0fs (model=%s, context=~%s tokens). "
+                "Killing connection so the retry loop can recover.",
+                _elapsed, _total_request_timeout, api_kwargs.get("model", "unknown"),
+                f"{_est_tokens_for_codex_watchdog:,}",
+            )
+            agent._buffer_status(
+                f"⚠️ Codex request reached its configured total timeout after "
+                f"{int(_elapsed)}s (model: {api_kwargs.get('model', 'unknown')}). "
+                "Reconnecting."
+            )
+            try:
+                _close_request_client_once("codex_total_request_timeout")
+            except Exception:
+                pass
+            _bump_stale_streak(agent)
+            agent._touch_activity(
+                f"codex request killed at {int(_elapsed)}s total timeout"
+            )
+            t.join(timeout=2.0)
+            if result["error"] is None and result["response"] is None:
+                result["error"] = TimeoutError(
+                    f"timeout_class=total_request_timeout; Codex request timed out "
+                    f"after {int(_elapsed)}s (threshold: {int(_total_request_timeout)}s)"
+                )
             break
 
         if agent._interrupt_requested:

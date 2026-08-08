@@ -1746,7 +1746,10 @@ def _build_child_agent(
     # Share a credential pool with the child when possible so subagents can
     # rotate credentials on rate limits instead of getting pinned to one key.
     child_pool = _resolve_child_credential_pool(
-        effective_provider, parent_agent, effective_base_url
+        effective_provider,
+        parent_agent,
+        effective_base_url,
+        effective_requested_provider,
     )
     if child_pool is not None:
         child._credential_pool = child_pool
@@ -3848,6 +3851,7 @@ def _resolve_child_credential_pool(
     effective_provider: Optional[str],
     parent_agent,
     effective_base_url: Optional[str] = None,
+    effective_requested_provider: Optional[str] = None,
 ):
     """Resolve a credential pool for the child agent.
 
@@ -3873,14 +3877,43 @@ def _resolve_child_credential_pool(
     parent_provider = getattr(parent_agent, "provider", None) or ""
     parent_pool = getattr(parent_agent, "_credential_pool", None)
 
+    try:
+        from hermes_cli.runtime_provider import canonical_custom_identity
+
+        child_identity = canonical_custom_identity(
+            base_url=effective_base_url,
+            config_provider=effective_requested_provider or effective_provider,
+            model=getattr(parent_agent, "model", None),
+        )
+        parent_identity = canonical_custom_identity(
+            base_url=getattr(parent_agent, "base_url", None),
+            config_provider=getattr(parent_agent, "requested_provider", None)
+            or parent_provider,
+            model=getattr(parent_agent, "model", None),
+        )
+    except Exception:
+        child_identity = None
+        parent_identity = None
+    if child_identity:
+        effective_provider = child_identity
+    if parent_identity:
+        parent_provider = parent_identity
+
     # Custom endpoints: distinguish by endpoint identity, not the bare "custom"
     # provider string. Two custom runtimes are only interchangeable when they
     # resolve to the same custom:<name> pool key.
-    if effective_provider == "custom":
+    if effective_provider == "custom" or str(effective_provider or "").startswith("custom:"):
         try:
             from agent.credential_pool import get_custom_provider_pool_key, load_pool
 
-            child_key = get_custom_provider_pool_key(effective_base_url)
+            child_key = get_custom_provider_pool_key(
+                effective_base_url,
+                str(effective_provider).removeprefix("custom:")
+                if str(effective_provider).startswith("custom:")
+                else None,
+            )
+            if child_key is None and str(effective_provider).startswith("custom:"):
+                child_key = str(effective_provider).strip().lower()
             if child_key is None:
                 # Unregistered endpoint (raw delegation.base_url with no
                 # matching custom_providers entry) -> no shared pool exists.
@@ -3894,7 +3927,10 @@ def _resolve_child_credential_pool(
             )
             if (
                 parent_pool is not None
-                and parent_provider == "custom"
+                and (
+                    parent_provider == "custom"
+                    or str(parent_provider).startswith("custom:")
+                )
                 and parent_key is not None
                 and parent_key == child_key
             ):
@@ -4232,9 +4268,19 @@ def _resolve_delegation_credentials(
             f"Set the appropriate environment variable or run 'hermes auth'."
         )
 
+    provider = runtime.get("provider")
+    if provider == _RUNTIME_PROVIDER_CUSTOM:
+        from hermes_cli.runtime_provider import canonical_custom_identity
+
+        provider = canonical_custom_identity(
+            base_url=runtime.get("base_url"),
+            config_provider=configured_provider,
+            model=configured_model or runtime.get("model"),
+        ) or configured_provider
+
     return {
         "model": configured_model or runtime.get("model") or None,
-        "provider": configured_provider if runtime.get("provider") == _RUNTIME_PROVIDER_CUSTOM else runtime.get("provider"),
+        "provider": provider,
         "base_url": runtime.get("base_url"),
         "api_key": api_key,
         "inherit_parent_api_key": False if model_profile else None,

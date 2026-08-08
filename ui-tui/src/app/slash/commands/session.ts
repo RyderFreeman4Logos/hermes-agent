@@ -145,13 +145,21 @@ export const sessionCommands: SlashCommand[] = [
                 return ctx.transcript.sys('error: invalid response: model switch')
               }
 
-              ctx.transcript.sys(r.deferred ? `model → ${r.value} (applies next turn)` : `model → ${r.value}`)
+              ctx.transcript.sys(
+                r.pending
+                  ? `model → ${r.value} (applies after compression)`
+                  : r.deferred
+                    ? `model → ${r.value} (applies next turn)`
+                    : `model → ${r.value}`
+              )
               ctx.local.maybeWarn(r)
 
-              patchUiState(state => ({
-                ...state,
-                info: state.info ? { ...state.info, model: r.value! } : { model: r.value!, skills: {}, tools: {} }
-              }))
+              if (!r.pending) {
+                patchUiState(state => ({
+                  ...state,
+                  info: state.info ? { ...state.info, model: r.value! } : { model: r.value!, skills: {}, tools: {} }
+                }))
+              }
             })
           )
 

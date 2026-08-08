@@ -1,11 +1,9 @@
 """Tests for wait-state visibility — the live "what are we waiting on" notices.
 
 Long provider waits (slow/overloaded backend, no first byte, reasoning model
-thinking for minutes) used to leave CLI/TUI/Desktop users staring at a generic
-"cogitating..." spinner with no explanation. ``AIAgent._emit_wait_notice``
-rewrites the live spinner/status line (via ``thinking_callback``, bridged to
-``thinking.delta`` for TUI/Desktop) and updates the activity tracker (which the
-gateway's "⏳ Working — N min" heartbeat includes).
+thinking for minutes) update a live status snapshot and the activity tracker
+(which the gateway's "⏳ Working — N min" heartbeat includes). CLI keeps its
+spinner callback; gateway clients receive ``status.update(kind="wait")``.
 """
 
 from __future__ import annotations
@@ -41,14 +39,21 @@ def _make_agent(tmp_path, monkeypatch, **kwargs):
     )
 
 
-def test_emit_wait_notice_updates_spinner_and_activity(tmp_path, monkeypatch):
-    """The notice reaches the live display callback AND the activity tracker."""
-    seen: list = []
-    agent = _make_agent(tmp_path, monkeypatch, thinking_callback=seen.append)
+def test_emit_wait_notice_uses_replaceable_status_and_activity(tmp_path, monkeypatch):
+    """Gateway wait notices are status snapshots, never reasoning deltas."""
+    status: list = []
+    thinking: list = []
+    agent = _make_agent(
+        tmp_path,
+        monkeypatch,
+        status_callback=lambda kind, text: status.append((kind, text)),
+        thinking_callback=thinking.append,
+    )
 
     agent._emit_wait_notice("⏳ waiting on test-model — 30s with no response yet")
 
-    assert seen == ["⏳ waiting on test-model — 30s with no response yet"]
+    assert status == [("wait", "⏳ waiting on test-model — 30s with no response yet")]
+    assert thinking == []
     summary = agent.get_activity_summary()
     assert "waiting on test-model" in summary["last_activity_desc"]
 

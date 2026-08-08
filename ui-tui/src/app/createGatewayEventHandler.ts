@@ -803,6 +803,10 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
         setStatus(p.text)
 
+        if (p.kind === 'wait') {
+          return
+        }
+
         if (p.kind === 'compressing') {
           sys(p.text)
 

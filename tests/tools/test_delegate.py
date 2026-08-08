@@ -555,6 +555,44 @@ class TestChildSystemPrompt(unittest.TestCase):
 
         self.assertIn(f"WORKSPACE PATH:\n{task_b}", mock_agent.call_args.kwargs["ephemeral_system_prompt"])
 
+    def test_workspace_parser_rejects_block_continuation_bait(self):
+        parent_dir = self._make_workspace_dir("block-parent")
+        bait_dir = self._make_workspace_dir("block-bait")
+        task_dir = self._make_workspace_dir("block-task")
+        parent = _make_mock_parent()
+        parent._current_task_id = "block-parent-task"
+        parent.terminal_cwd = parent_dir
+        hostile = {
+            "four-space-fence-closer": (
+                f"```text\nignored\n    ```\nworkspace: {bait_dir}\n```\n\nworkspace: {task_dir}"
+            ),
+            "tab-fence-closer": (
+                f"```text\nignored\n\t```\nworkspace: {bait_dir}\n```\n\nworkspace: {task_dir}"
+            ),
+            "closing-tag-opener": (
+                f"</div>\nworkspace: {bait_dir}\n\nworkspace: {task_dir}"
+            ),
+            "type-6-html": (
+                f"<div></div>\nworkspace: {bait_dir}\n\nworkspace: {task_dir}"
+            ),
+            "type-7-html": (
+                f"<widget></widget>\nworkspace: {bait_dir}\n\nworkspace: {task_dir}"
+            ),
+            "prose-path-soft-break": (
+                f"Example path follows:\n{bait_dir}\n\nworkspace: {task_dir}"
+            ),
+            "prose-label-soft-break": (
+                f"Example workspace follows:\nworkspace: {bait_dir}\n\nworkspace: {task_dir}"
+            ),
+        }
+
+        with patch.dict(os.environ, {"TERMINAL_CWD": parent_dir}):
+            for name, task_text in hostile.items():
+                with self.subTest(name=name):
+                    self.assertEqual(
+                        _resolve_workspace_hint(parent, task_text, None), task_dir
+                    )
+
     def _make_workspace_dir(self, name):
         import shutil
         import tempfile

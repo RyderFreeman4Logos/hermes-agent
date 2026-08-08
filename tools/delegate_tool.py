@@ -979,9 +979,13 @@ _TASK_WORKSPACE_DECLARATION_RE = re.compile(
     re.IGNORECASE,
 )
 _MARKDOWN_FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})(.*)$")
+_MARKDOWN_FENCE_CLOSE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*$")
 _MARKDOWN_CONTAINER_RE = re.compile(r"^( {0,3})(?:(>)|([-+*]|\d{1,9}[.)])([ \t]+|$))")
 _MARKDOWN_HTML_OPEN_RE = re.compile(
     r"^ {0,3}<([A-Za-z][A-Za-z0-9-]*)(?=[\s/>]|$)", re.IGNORECASE
+)
+_MARKDOWN_HTML_CLOSE_RE = re.compile(
+    r"^ {0,3}</[A-Za-z][A-Za-z0-9-]*\s*>", re.IGNORECASE
 )
 _MARKDOWN_HTML_SPECIAL_RE = re.compile(r"^ {0,3}(<\?|<!\[CDATA\[|<![A-Z])")
 _MARKDOWN_RAW_HTML_TAGS = frozenset({"code", "pre", "script", "style", "textarea"})
@@ -1033,16 +1037,14 @@ def _resolve_workspace_hint(
         markdown_container = False
         container_indent = 0
         container_break = False
+        markdown_paragraph = False
         for line in task_text.splitlines():
             fence_match = _MARKDOWN_FENCE_RE.match(line)
             if fence is not None:
-                if fence_match:
-                    marker, suffix = fence_match.groups()
-                    if (
-                        marker[0] == fence[0]
-                        and len(marker) >= fence[1]
-                        and not suffix.strip()
-                    ):
+                fence_close = _MARKDOWN_FENCE_CLOSE_RE.match(line)
+                if fence_close:
+                    marker = fence_close.group(1)
+                    if marker[0] == fence[0] and len(marker) >= fence[1]:
                         fence = None
                 continue
             if html_special_end is not None:
@@ -1050,7 +1052,9 @@ def _resolve_workspace_hint(
                     html_special_end = None
                 continue
             if html_block is not None:
-                if re.search(rf"</{re.escape(html_block)}\s*>", line, re.IGNORECASE):
+                if html_block_raw and re.search(
+                    rf"</{re.escape(html_block)}\s*>", line, re.IGNORECASE
+                ):
                     html_block = None
                     html_block_raw = False
                 elif not html_block_raw and not line.strip():
@@ -1061,6 +1065,7 @@ def _resolve_workspace_hint(
                     html_comment = False
                 continue
             if not line.strip():
+                markdown_paragraph = False
                 if markdown_container:
                     container_break = True
                 continue
@@ -1098,9 +1103,11 @@ def _resolve_workspace_hint(
             if fence_match:
                 marker = fence_match.group(1)
                 fence = (marker[0], len(marker))
+                markdown_paragraph = False
                 continue
             if "<!--" in line:
                 html_comment = "-->" not in line.split("<!--", 1)[1]
+                markdown_paragraph = False
                 continue
             html_special = _MARKDOWN_HTML_SPECIAL_RE.match(line)
             if html_special:
@@ -1108,25 +1115,35 @@ def _resolve_workspace_hint(
                 terminator = {"<?": "?>", "<![CDATA[": "]]>"}.get(opener, ">")
                 if terminator not in line[html_special.end() :]:
                     html_special_end = terminator
+                markdown_paragraph = False
+                continue
+            if _MARKDOWN_HTML_CLOSE_RE.match(line):
+                html_block = ""
+                markdown_paragraph = False
                 continue
             html_match = _MARKDOWN_HTML_OPEN_RE.match(line)
             if html_match:
                 tag = html_match.group(1).lower()
-                if not re.search(
+                html_block = tag
+                html_block_raw = tag in _MARKDOWN_RAW_HTML_TAGS
+                if html_block_raw and re.search(
                     rf"</{re.escape(tag)}\s*>", line[html_match.end() :], re.IGNORECASE
                 ):
-                    html_block = tag
-                    html_block_raw = tag in _MARKDOWN_RAW_HTML_TAGS
+                    html_block = None
+                    html_block_raw = False
+                markdown_paragraph = False
                 continue
             if line.startswith("\t") or len(line) - len(line.lstrip(" ")) >= 4:
+                markdown_paragraph = True
                 continue
             declaration = _TASK_WORKSPACE_DECLARATION_RE.fullmatch(line)
             workspace = _existing_workspace_directory(
                 declaration.group(1) if declaration else line.strip(),
                 container_paths=container_paths,
             )
-            if workspace:
+            if workspace and not markdown_paragraph:
                 return workspace
+            markdown_paragraph = True
 
     live_parent_cwd = None
     if isinstance(parent_task_id, str) and parent_task_id:

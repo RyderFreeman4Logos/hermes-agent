@@ -161,8 +161,21 @@ class TestChildSystemPrompt(unittest.TestCase):
         terminal_tool.record_session_cwd("parent-task", parent_dir)
         self.addCleanup(terminal_tool.clear_session_cwd, "parent-task")
 
-        self.assertEqual(_resolve_workspace_hint(parent, "inspect", f"{task_link}\nbranch: task-branch"), spaced_task_dir)
-        self.assertEqual(_resolve_workspace_hint(parent, "inspect", f"workspace: {spaced_task_dir}"), spaced_task_dir)
+        self.assertEqual(_resolve_workspace_hint(parent, "inspect", spaced_task_dir), spaced_task_dir)
+        with patch(
+            "tools.delegate_tool.os.path.realpath", wraps=os.path.realpath
+        ) as canonicalize:
+            self.assertEqual(
+                _resolve_workspace_hint(
+                    parent, "inspect", f"{task_link}\nbranch: task-branch"
+                ),
+                spaced_task_dir,
+            )
+        canonicalize.assert_called_once_with(task_link)
+        self.assertEqual(
+            _resolve_workspace_hint(parent, "inspect", f"workspace: {spaced_task_dir}"),
+            spaced_task_dir,
+        )
         for task_text in (
             f"inspect {spaced_task_dir}",
             f"evidence lives at {spaced_task_dir}",
@@ -213,6 +226,87 @@ class TestChildSystemPrompt(unittest.TestCase):
         self.assertEqual(terminal_tool.get_session_cwd(captured["task_id"]), spaced_task_dir)
         self.assertEqual(captured["relative_path"], file_tools.Path(spaced_task_dir) / "target.py")
         self.assertNotEqual(captured["relative_path"], file_tools.Path(parent_dir) / "target.py")
+
+    def test_workspace_parser_rejects_relative_and_fenced_candidates(self):
+        parent_dir = self._make_workspace_dir("parent-parser")
+        task_dir = self._make_workspace_dir("task-parser")
+        unrelated_file = self._make_workspace_file("parser-evidence.txt")
+        parent = _make_mock_parent()
+        parent._current_task_id = "parent-parser-task"
+        parent.terminal_cwd = parent_dir
+
+        with patch.dict(os.environ, {"TERMINAL_CWD": parent_dir}):
+            for task_text in (
+                ".",
+                "tools",
+                "~",
+                f"```text\n{task_dir}\n```",
+                f"```sh\nworkspace: {task_dir}\n```",
+                f"~~~command\nrepository: {task_dir}\n~~~",
+                f"inspect {task_dir}",
+                f"https://example.test{task_dir}",
+                f"[workspace]({task_dir})",
+                unrelated_file,
+            ):
+                with self.subTest(task_text=task_text):
+                    self.assertEqual(
+                        _resolve_workspace_hint(parent, task_text, None), parent_dir
+                    )
+
+    def test_live_parent_session_cwd_precedes_stale_fallbacks(self):
+        from tools import terminal_tool
+
+        live_parent_dir = self._make_workspace_dir("live-parent")
+        stale_env_dir = self._make_workspace_dir("stale-env")
+        parent = _make_mock_parent()
+        parent._current_task_id = "live-parent-task"
+        parent.terminal_cwd = stale_env_dir
+        terminal_tool.record_session_cwd("live-parent-task", live_parent_dir)
+        self.addCleanup(terminal_tool.clear_session_cwd, "live-parent-task")
+
+        with patch.dict(os.environ, {"TERMINAL_CWD": stale_env_dir}):
+            self.assertEqual(
+                _resolve_workspace_hint(parent, "Inspect the parent checkout", None),
+                live_parent_dir,
+            )
+
+    def test_container_guard_checks_lexical_path_before_canonicalizing(self):
+        parent_dir = self._make_workspace_dir("container-parent")
+        task_dir = self._make_workspace_dir("container-task")
+        spaced_task_dir = os.path.join(task_dir, "task workspace")
+        os.mkdir(spaced_task_dir)
+        safe_link = os.path.join(parent_dir, "safe-link")
+        os.symlink(spaced_task_dir, safe_link)
+        self.addCleanup(os.unlink, safe_link)
+        guarded_link = "/home/user/guarded-workspace-link"
+        parent = _make_mock_parent()
+        parent.terminal_cwd = parent_dir
+        host_realpath = os.path.realpath
+
+        def canonicalize(path):
+            return spaced_task_dir if path == guarded_link else host_realpath(path)
+
+        with (
+            patch.dict(os.environ, {"TERMINAL_CWD": parent_dir}),
+            patch("tools.file_tools._uses_container_paths", return_value=True),
+            patch("tools.delegate_tool.os.path.realpath", side_effect=canonicalize) as realpath,
+        ):
+            self.assertEqual(
+                _resolve_workspace_hint(parent, guarded_link, None), parent_dir
+            )
+        self.assertNotIn(guarded_link, [call.args[0] for call in realpath.call_args_list])
+
+        with (
+            patch.dict(os.environ, {"TERMINAL_CWD": parent_dir}),
+            patch("tools.file_tools._uses_container_paths", return_value=True),
+            patch(
+                "tools.delegate_tool.os.path.realpath", wraps=os.path.realpath
+            ) as canonicalize_safe,
+        ):
+            self.assertEqual(
+                _resolve_workspace_hint(parent, safe_link, None), spaced_task_dir
+            )
+        canonicalize_safe.assert_called_once_with(safe_link)
 
     def test_batch_and_orchestrator_workspace_hints_are_isolated(self):
         parent_dir = self._make_workspace_dir("parent")

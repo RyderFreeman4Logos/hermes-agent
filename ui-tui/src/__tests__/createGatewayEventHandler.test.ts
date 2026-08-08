@@ -254,6 +254,9 @@ describe('createGatewayEventHandler', () => {
       vi.advanceTimersByTime(4001)
       expect(getUiState().status).toBe('⏳ waiting — 90s')
 
+      onEvent({ payload: {}, type: 'message.start' } as any)
+      expect(getUiState().status).toBe('running…')
+
       onEvent({ payload: { text: 'actual reasoning' }, type: 'thinking.delta' } as any)
       vi.runOnlyPendingTimers()
       expect(getTurnState().reasoning).toBe('actual reasoning')

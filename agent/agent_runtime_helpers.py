@@ -2504,7 +2504,7 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     # OpenAI/aggregator client passes through (init, switch_model, recovery,
     # restore, request-scoped); auxiliary_client builds its own clients and keeps
     # SDK retries because it is NOT wrapped by the conversation loop.
-    client_kwargs.setdefault("max_retries", 0)
+    client_kwargs["max_retries"] = 0
     # Defense-in-depth: guarantee Copilot requests carry the integration
     # headers regardless of which build path we came through. The primary
     # header wiring lives in `_apply_client_headers_for_base_url`, but two

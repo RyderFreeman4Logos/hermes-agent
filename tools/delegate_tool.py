@@ -978,35 +978,76 @@ _TASK_WORKSPACE_DECLARATION_RE = re.compile(
     r"^\s*(?:repo|repository|workspace|worktree|checkout)\s*:\s*(/.*)\s*$",
     re.IGNORECASE,
 )
+_MARKDOWN_FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})(.*)$")
 
 
-def _existing_workspace_directory(candidate: Any) -> Optional[str]:
-    """Return a canonical existing directory for a task path candidate."""
-    if not isinstance(candidate, str) or not candidate or candidate.startswith("//"):
+def _existing_workspace_directory(
+    candidate: Any, *, container_paths: bool = False
+) -> Optional[str]:
+    """Return a canonical existing directory for an absolute path candidate."""
+    if not isinstance(candidate, str):
         return None
+    candidate = candidate.strip()
+    if not candidate or candidate.startswith("//") or not os.path.isabs(candidate):
+        return None
+    if container_paths:
+        from tools.terminal_tool import _is_unusable_container_cwd
+
+        if _is_unusable_container_cwd(candidate):
+            return None
     try:
         path = os.path.realpath(os.path.expanduser(candidate))
     except (OSError, TypeError, ValueError):
         return None
-    return path if os.path.isabs(path) and os.path.isdir(path) else None
+    return path if os.path.isdir(path) else None
 
 
 def _resolve_workspace_hint(
     parent_agent, goal: Optional[str] = None, context: Optional[str] = None
 ) -> Optional[str]:
     """Resolve a task-explicit workspace before falling back to the parent cwd."""
+    parent_task_id = getattr(parent_agent, "_current_task_id", None)
+    from tools.file_tools import _uses_container_paths
+
+    container_paths = _uses_container_paths(
+        parent_task_id
+        if isinstance(parent_task_id, str) and parent_task_id
+        else "default"
+    )
     for task_text in (goal, context):
         if not isinstance(task_text, str):
             continue
+        fence: Optional[tuple[str, int]] = None
         for line in task_text.splitlines():
+            fence_match = _MARKDOWN_FENCE_RE.match(line)
+            if fence is not None:
+                if fence_match:
+                    marker, suffix = fence_match.groups()
+                    if marker[0] == fence[0] and len(marker) >= fence[1] and not suffix.strip():
+                        fence = None
+                continue
+            if fence_match:
+                marker = fence_match.group(1)
+                fence = (marker[0], len(marker))
+                continue
             declaration = _TASK_WORKSPACE_DECLARATION_RE.fullmatch(line)
             workspace = _existing_workspace_directory(
-                declaration.group(1) if declaration else line.strip()
+                declaration.group(1) if declaration else line.strip(),
+                container_paths=container_paths,
             )
             if workspace:
                 return workspace
 
+    live_parent_cwd = None
+    if isinstance(parent_task_id, str) and parent_task_id:
+        try:
+            from tools.terminal_tool import get_session_cwd
+
+            live_parent_cwd = get_session_cwd(parent_task_id)
+        except Exception:
+            pass
     candidates = [
+        live_parent_cwd,
         os.getenv("TERMINAL_CWD"),
         getattr(
             getattr(parent_agent, "_subdirectory_hints", None), "working_dir", None
@@ -1015,7 +1056,9 @@ def _resolve_workspace_hint(
         getattr(parent_agent, "cwd", None),
     ]
     for candidate in candidates:
-        workspace = _existing_workspace_directory(candidate)
+        workspace = _existing_workspace_directory(
+            candidate, container_paths=container_paths
+        )
         if workspace:
             return workspace
     return None

@@ -1049,6 +1049,7 @@ class TurnController {
   }
 
   startMessage() {
+    this.clearStatusTimer()
     this.endReasoningPhase()
     this.clearReasoning()
     this.activeTools = []
@@ -1072,7 +1073,7 @@ class TurnController {
       this.clearNotice(yieldingNoticeKey)
     }
 
-    patchUiState({ busy: true })
+    patchUiState({ busy: true, status: 'running…' })
     patchTurnState({ activity: [], outcome: '', subagents: [], toolTokens: 0, tools: [], turnTrail: [] })
   }
 

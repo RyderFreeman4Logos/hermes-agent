@@ -756,7 +756,36 @@ holds across gateway crashes, restarts, and updates:
 | Gateway routing index | `gateway_routing` table in `~/.hermes/state.db` | Maps session keys to active session IDs (origin metadata, expiry flags) |
 | Legacy routing mirror | `~/.hermes/sessions/sessions.json` | Backward-compat mirror of the routing index, written when `gateway.write_sessions_json: true` (the default) |
 
-The SQLite database uses WAL mode for concurrent readers and a single writer, which suits the gateway's multi-platform architecture well.
+The SQLite database normally uses WAL mode for concurrent readers and a single writer, which suits the gateway's multi-platform architecture well. On a SQLite build affected by the WAL-reset bug, Hermes does not enable WAL for a fresh/non-WAL database; an already-WAL database is deliberately left unchanged until the runtime is upgraded, because changing its journal mode while another process has it open can lose committed WAL data.
+
+### WAL-reset safety and large-database recovery
+
+Run `hermes doctor` to see the SQLite library linked by the running Hermes interpreter. A WAL-reset warning means upgrade first: `hermes update` repairs Hermes-managed Python runtimes, then run `hermes doctor` again to confirm SQLite 3.51.3+ (or the 3.50.7 / 3.44.6 backports). The journal-mode guard applies to `state.db` regardless of database size; it does not run an unbounded `quick_check` during normal startup.
+
+For a multi-GB database, do maintenance offline and backup first:
+
+1. Stop every Hermes process for the profile (gateway, Desktop/TUI/CLI, cron, and workers). Do **not** run `VACUUM`, `wal_checkpoint(TRUNCATE)`, or `PRAGMA journal_mode=DELETE` while any opener remains.
+2. Make a full SQLite-consistent backup on storage with room for the database snapshot and archive:
+
+   ```bash
+   hermes backup --output /safe-volume/hermes-pre-maintenance.zip
+   ```
+
+3. Upgrade and re-check the linked runtime:
+
+   ```bash
+   hermes update
+   hermes doctor
+   ```
+
+4. If `doctor` reports a schema/write-health problem, use `hermes sessions repair` (it backs up before its narrow repair). For suspected damage, inspect and rebuild into a **new** file; the source is never replaced automatically:
+
+   ```bash
+   hermes sessions recover --source ~/.hermes/state.db --inspect-only --work-dir /safe-volume
+   hermes sessions recover --source ~/.hermes/state.db --output /safe-volume/recovered-state.db --work-dir /safe-volume
+   ```
+
+   Review the recovery report and preserve the original database and its `-wal`/`-shm` sidecars before any manual cutover. Recovery checks its required free space up front; do not delete the original to make space.
 
 :::warning `sessions.json` is not the session list
 The gateway routing index lives in the `gateway_routing` table inside

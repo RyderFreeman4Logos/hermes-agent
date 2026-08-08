@@ -211,6 +211,25 @@ class TestClassifyApiError:
         assert result.reason == FailoverReason.billing
         assert result.retryable is False
 
+    def test_429_usage_limit_reached_is_terminal_billing(self):
+        e = MockAPIError(
+            "Too Many Requests",
+            status_code=429,
+            body={
+                "error": {
+                    "type": "usage_limit_reached",
+                    "message": "The usage limit has been reached",
+                }
+            },
+        )
+
+        result = classify_api_error(e, provider="openai-codex")
+
+        assert result.reason == FailoverReason.billing
+        assert result.retryable is False
+        assert result.should_rotate_credential is True
+        assert result.should_fallback is True
+
 
 
 

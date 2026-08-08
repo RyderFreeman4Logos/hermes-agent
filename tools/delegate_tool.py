@@ -980,6 +980,12 @@ _TASK_WORKSPACE_DECLARATION_RE = re.compile(
     re.IGNORECASE,
 )
 _MARKDOWN_FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})(.*)$")
+_MARKDOWN_CONTAINER_RE = re.compile(r"^( {0,3})(?:(>)|([-+*]|\d{1,9}[.)])([ \t]+|$))")
+_MARKDOWN_HTML_OPEN_RE = re.compile(
+    r"^ {0,3}<([A-Za-z][A-Za-z0-9-]*)(?=[\s/>]|$)", re.IGNORECASE
+)
+_MARKDOWN_HTML_SPECIAL_RE = re.compile(r"^ {0,3}(<\?|<!\[CDATA\[|<![A-Z])")
+_MARKDOWN_RAW_HTML_TAGS = frozenset({"code", "pre", "script", "style", "textarea"})
 
 
 def _existing_workspace_directory(
@@ -1022,24 +1028,96 @@ def _resolve_workspace_hint(
         task_text = task_text.removeprefix("\ufeff")
         fence: Optional[tuple[str, int]] = None
         html_comment = False
+        html_block: Optional[str] = None
+        html_block_raw = False
+        html_special_end: Optional[str] = None
+        markdown_container = False
+        container_indent = 0
+        container_break = False
         for line in task_text.splitlines():
             fence_match = _MARKDOWN_FENCE_RE.match(line)
             if fence is not None:
                 if fence_match:
                     marker, suffix = fence_match.groups()
-                    if marker[0] == fence[0] and len(marker) >= fence[1] and not suffix.strip():
+                    if (
+                        marker[0] == fence[0]
+                        and len(marker) >= fence[1]
+                        and not suffix.strip()
+                    ):
                         fence = None
                 continue
-            if fence_match:
-                marker = fence_match.group(1)
-                fence = (marker[0], len(marker))
+            if html_special_end is not None:
+                if html_special_end in line:
+                    html_special_end = None
+                continue
+            if html_block is not None:
+                if re.search(rf"</{re.escape(html_block)}\s*>", line, re.IGNORECASE):
+                    html_block = None
+                    html_block_raw = False
+                elif not html_block_raw and not line.strip():
+                    html_block = None
                 continue
             if html_comment:
                 if "-->" in line:
                     html_comment = False
                 continue
+            if not line.strip():
+                if markdown_container:
+                    container_break = True
+                continue
+            container_match = _MARKDOWN_CONTAINER_RE.match(line)
+            if container_match:
+                if not markdown_container:
+                    leading, quote, marker, spacing = container_match.groups()
+                    if quote:
+                        container_indent = 4
+                    else:
+                        prefix_width = len(leading) + len(marker or "")
+                        spacing_width = (
+                            len((" " * prefix_width + (spacing or "")).expandtabs(4))
+                            - prefix_width
+                        )
+                        if not 1 <= spacing_width <= 4:
+                            spacing_width = 1
+                        container_indent = prefix_width + spacing_width
+                markdown_container = True
+                container_break = False
+                continue
+            if markdown_container:
+                line_indent = len(line) - len(line.lstrip(" "))
+                if (
+                    container_break
+                    and not line.startswith("\t")
+                    and line_indent < container_indent
+                ):
+                    markdown_container = False
+                    container_indent = 0
+                    container_break = False
+                else:
+                    container_break = False
+                    continue
+            if fence_match:
+                marker = fence_match.group(1)
+                fence = (marker[0], len(marker))
+                continue
             if "<!--" in line:
                 html_comment = "-->" not in line.split("<!--", 1)[1]
+                continue
+            html_special = _MARKDOWN_HTML_SPECIAL_RE.match(line)
+            if html_special:
+                opener = html_special.group(1)
+                terminator = {"<?": "?>", "<![CDATA[": "]]>"}.get(opener, ">")
+                if terminator not in line[html_special.end() :]:
+                    html_special_end = terminator
+                continue
+            html_match = _MARKDOWN_HTML_OPEN_RE.match(line)
+            if html_match:
+                tag = html_match.group(1).lower()
+                if not re.search(
+                    rf"</{re.escape(tag)}\s*>", line[html_match.end() :], re.IGNORECASE
+                ):
+                    html_block = tag
+                    html_block_raw = tag in _MARKDOWN_RAW_HTML_TAGS
                 continue
             if line.startswith("\t") or len(line) - len(line.lstrip(" ")) >= 4:
                 continue

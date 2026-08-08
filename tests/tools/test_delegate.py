@@ -30,6 +30,7 @@ from tools.delegate_tool import (
     _strip_blocked_tools,
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
+    _resolve_workspace_hint,
 )
 
 
@@ -137,6 +138,91 @@ class TestChildSystemPrompt(unittest.TestCase):
         self.assertIn("Fix the tests", prompt)
         self.assertIn("YOUR TASK", prompt)
         self.assertNotIn("CONTEXT", prompt)
+
+    def test_task_workspace_precedes_parent_cwd_and_seeds_child_tools(self):
+        """A task's existing workspace wins before any child tool runs."""
+        from tools import file_tools, terminal_tool
+
+        parent_dir = self._make_workspace_dir("parent")
+        task_dir = self._make_workspace_dir("task")
+        unrelated_file = self._make_workspace_file("unrelated.txt")
+        missing_dir = os.path.join(parent_dir, "missing")
+        parent = _make_mock_parent()
+        parent._current_task_id = "parent-task"
+        parent.terminal_cwd = parent_dir
+        terminal_cwd = patch.dict(os.environ, {"TERMINAL_CWD": parent_dir})
+        terminal_cwd.start()
+        self.addCleanup(terminal_cwd.stop)
+        terminal_tool.record_session_cwd("parent-task", parent_dir)
+        self.addCleanup(terminal_tool.clear_session_cwd, "parent-task")
+        task_context = f"{task_dir}\nbranch: task-branch\nHEAD: {'0' * 40}"
+
+        self.assertEqual(
+            _resolve_workspace_hint(parent, "inspect", task_context),
+            task_dir,
+        )
+        self.assertEqual(_resolve_workspace_hint(parent, f"inspect {task_dir}", None), task_dir)
+        self.assertEqual(
+            _resolve_workspace_hint(parent, "inspect", f"{unrelated_file}\n{missing_dir}"),
+            parent_dir,
+        )
+
+        captured = {}
+        child = MagicMock()
+        child._credential_pool = None
+        child._delegate_output_schema = None
+        child.tool_progress_callback = None
+
+        def run_without_model(*, task_id, **_kwargs):
+            self.addCleanup(terminal_tool.clear_session_cwd, task_id)
+            captured["task_id"] = task_id
+            captured["relative_path"] = file_tools._resolve_path_for_task(
+                "target.py", task_id=task_id
+            )
+            return {"final_response": "done", "completed": True, "api_calls": 0}
+
+        child.run_conversation.side_effect = run_without_model
+        credentials = {
+            "model": None,
+            "provider": None,
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+        }
+        with (
+            patch("tools.delegate_tool._load_config", return_value={}),
+            patch("tools.delegate_tool._resolve_delegation_credentials", return_value=credentials),
+            patch("tools.delegation_live_log.create_live_transcripts", return_value=("test", [], [])),
+            patch("run_agent.AIAgent", return_value=child) as mock_agent,
+        ):
+            delegate_task(
+                goal="Inspect the requested checkout",
+                context=task_context,
+                parent_agent=parent,
+            )
+
+        prompt = mock_agent.call_args.kwargs["ephemeral_system_prompt"]
+        self.assertIn(f"WORKSPACE PATH:\n{task_dir}", prompt)
+        self.assertTrue(captured["task_id"].startswith("sa-0-"))
+        self.assertEqual(terminal_tool.get_session_cwd(captured["task_id"]), task_dir)
+        self.assertEqual(captured["relative_path"], file_tools.Path(task_dir) / "target.py")
+        self.assertNotEqual(captured["relative_path"], file_tools.Path(parent_dir) / "target.py")
+
+    def _make_workspace_dir(self, name):
+        import shutil
+        import tempfile
+
+        path = tempfile.mkdtemp(prefix=f"delegate-{name}-")
+        self.addCleanup(shutil.rmtree, path)
+        return path
+
+    def _make_workspace_file(self, name):
+        import tempfile
+
+        fd, path = tempfile.mkstemp(prefix="delegate-", suffix=f"-{name}")
+        os.close(fd)
+        self.addCleanup(os.unlink, path)
+        return path
 
 class TestStripBlockedTools(unittest.TestCase):
     def test_removes_blocked_toolsets(self):

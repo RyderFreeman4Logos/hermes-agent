@@ -265,6 +265,143 @@ class TestChildSystemPrompt(unittest.TestCase):
                 _resolve_workspace_hint(parent, f"\ufeff{task_dir}", None), task_dir
             )
 
+    def test_workspace_parser_rejects_nested_markdown_candidates(self):
+        parent_dir = self._make_workspace_dir("nested-markdown-parent")
+        task_dir = self._make_workspace_dir("nested-markdown-task")
+        other_dir = self._make_workspace_dir("nested-markdown-other")
+        parent = _make_mock_parent()
+        parent._current_task_id = "nested-markdown-parent-task"
+        parent.terminal_cwd = parent_dir
+        hostile = {
+            "unordered-list-fence-path": f"- ```text\n  {task_dir}\n  ```",
+            "unordered-list-fence-label": f"- ```sh\n  workspace: {task_dir}\n  ```",
+            "ordered-list-fence-path": f"1. ```text\n   {task_dir}\n   ```",
+            "unordered-list-tilde-fence": f"- ~~~text\n  {task_dir}\n  ~~~",
+            "html-pre": f"<pre>\n{task_dir}\n</pre>",
+            "html-code": f"<code>\nworkspace: {task_dir}\n</code>",
+            "nested-list-example-label": f"- example\n  workspace: {task_dir}",
+            "asterisk-list-fence": f"* ```text\n  {task_dir}\n  ```",
+            "plus-list-fence": f"+ ```text\n  {task_dir}\n  ```",
+            "ordered-parenthesis-fence": f"1) ```text\n   {task_dir}\n   ```",
+            "nested-unordered-list-fence": (
+                f"- example\n  - ```text\n    {task_dir}\n    ```"
+            ),
+            "nested-ordered-list-fence": (
+                f"1. example\n   1. ```text\n      {task_dir}\n      ```"
+            ),
+            "two-space-list-path": f"- example\n  {task_dir}",
+            "lazy-list-path": f"- example\n{task_dir}",
+            "lazy-list-label": f"- example\nworkspace: {task_dir}",
+            "second-paragraph-lazy-path": (
+                f"- example\n\n  nested paragraph\n{task_dir}"
+            ),
+            "second-paragraph-lazy-label": (
+                f"- example\n\n  nested paragraph\nworkspace: {task_dir}"
+            ),
+            "unordered-list-label": f"- workspace: {task_dir}",
+            "ordered-list-path": f"1. {task_dir}",
+            "blockquote-list-fence": (f"> - ```text\n>   {task_dir}\n>   ```"),
+            "list-blockquote-fence": (f"- > ```text\n  > {task_dir}\n  > ```"),
+            "blockquote-list-label": (f"> - example\n>   workspace: {task_dir}"),
+            "nested-list-path": f"- example\n  - nested\n    {task_dir}",
+            "html-div": f"<div>\n{task_dir}\n</div>",
+            "html-details-label": (f"<details>\nworkspace: {task_dir}\n</details>"),
+            "html-pre-multiline-open": (f"<pre\nclass=example>\n{task_dir}\n</pre>"),
+            "html-div-multiline-open": (
+                f"<div\nclass=example>\nworkspace: {task_dir}\n</div>"
+            ),
+            "html-processing-instruction": f"<?example\n{task_dir}\n?>",
+            "html-cdata": f"<![CDATA[\nworkspace: {task_dir}\n]]>",
+            "html-declaration": f"<!DOCTYPE\n{task_dir}\n>",
+        }
+
+        with patch.dict(os.environ, {"TERMINAL_CWD": parent_dir}):
+            for name, task_text in hostile.items():
+                with self.subTest(name=name):
+                    self.assertEqual(
+                        _resolve_workspace_hint(parent, task_text, None), parent_dir
+                    )
+            for name, task_text in {
+                "standalone": task_dir,
+                "label": f"workspace: {task_dir}",
+                "bom-label": f"\ufeffrepository: {task_dir}",
+                "after-list": f"- example\n\nworkspace: {task_dir}",
+                "after-unordered-dedent": (f"- example\n\n workspace: {task_dir}"),
+                "after-ordered-dedent": f"1. example\n\n  {task_dir}",
+                "after-blockquote-dedent": (f"> example\n\n   workspace: {task_dir}"),
+                "after-fence": (f"```text\n{other_dir}\n```\nworkspace: {task_dir}"),
+                "after-html": (f"<pre>\n{other_dir}\n</pre>\nworkspace: {task_dir}"),
+            }.items():
+                with self.subTest(name=f"top-level-{name}"):
+                    self.assertEqual(
+                        _resolve_workspace_hint(parent, task_text, None), task_dir
+                    )
+
+    def test_list_nested_workspace_cannot_change_child_identity(self):
+        from tools import file_tools, terminal_tool
+
+        parent_dir = self._make_workspace_dir("hostile-parent")
+        bait_dir = self._make_workspace_dir("hostile-bait")
+        decoy_dir = self._make_workspace_dir("hostile-decoy")
+        parent = _make_mock_parent()
+        parent._current_task_id = "hostile-parent-task"
+        parent.terminal_cwd = parent_dir
+        terminal_tool.record_session_cwd("hostile-parent-task", parent_dir)
+        self.addCleanup(terminal_tool.clear_session_cwd, "hostile-parent-task")
+        captured = {}
+        child = MagicMock()
+        child._credential_pool = None
+        child._delegate_output_schema = None
+        child.tool_progress_callback = None
+
+        def run_without_model(*, task_id, **_kwargs):
+            self.addCleanup(terminal_tool.clear_session_cwd, task_id)
+            captured.update(
+                workspace=child._delegate_workspace_path,
+                record=terminal_tool.get_session_cwd(task_id),
+                terminal=terminal_tool._resolve_command_cwd(
+                    workdir=None, default_cwd=decoy_dir, session_key=task_id
+                ),
+                file=file_tools._resolve_path_for_task("first.txt", task_id=task_id),
+            )
+            return {"final_response": "done", "completed": True, "api_calls": 0}
+
+        child.run_conversation.side_effect = run_without_model
+        credentials = {
+            "model": None,
+            "provider": None,
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+        }
+        with (
+            patch.dict(os.environ, {"TERMINAL_CWD": decoy_dir}),
+            patch("tools.delegate_tool._load_config", return_value={}),
+            patch(
+                "tools.delegate_tool._resolve_delegation_credentials",
+                return_value=credentials,
+            ),
+            patch(
+                "tools.delegation_live_log.create_live_transcripts",
+                return_value=("test", [], []),
+            ),
+            patch("run_agent.AIAgent", return_value=child) as mock_agent,
+        ):
+            delegate_task(
+                goal="Inspect safely",
+                context=f"- ```text\n  {bait_dir}\n  ```",
+                parent_agent=parent,
+            )
+
+        expected = os.path.realpath(parent_dir)
+        prompt = mock_agent.call_args.kwargs["ephemeral_system_prompt"]
+        self.assertEqual(captured["workspace"], expected)
+        self.assertEqual(captured["record"], expected)
+        self.assertEqual(captured["terminal"], expected)
+        self.assertEqual(captured["file"], file_tools.Path(expected) / "first.txt")
+        self.assertIn(f"WORKSPACE PATH:\n{expected}\n", prompt)
+        self.assertNotIn(f"WORKSPACE PATH:\n{os.path.realpath(bait_dir)}\n", prompt)
+
     def test_live_parent_session_cwd_precedes_stale_fallbacks(self):
         from tools import terminal_tool
 

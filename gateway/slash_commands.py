@@ -1284,10 +1284,17 @@ class GatewaySlashCommandsMixin:
         # (#51690): api calls, current tool, seconds since last activity.
         delegations: list[dict] = []
         try:
-            from tools.async_delegation import list_async_delegations
+            from tools.async_delegation import list_async_delegations_for_owner
+
+            session_entry = await self.async_session_store.get_or_create_session(
+                current_session_key
+            )
             delegations = [
-                d for d in list_async_delegations()
-                if d.get("status") in ("running", "stalling", "finalizing")
+                d
+                for d in list_async_delegations_for_owner(
+                    parent_session_id=str(session_entry.session_id or "")
+                )
+                if d.get("status") in ("running", "stalling", "cancelling", "finalizing")
             ]
         except Exception:
             delegations = []
@@ -1302,9 +1309,6 @@ class GatewaySlashCommandsMixin:
                 ]
             )
             for d in delegations[:12]:
-                goal = " ".join(str(d.get("goal") or "").split())
-                if len(goal) > 70:
-                    goal = goal[:67] + "..."
                 status = d.get("status", "?")
                 row = f"- `{d.get('delegation_id', '?')}` · {status}"
                 if status == "stalling":
@@ -1313,8 +1317,6 @@ class GatewaySlashCommandsMixin:
                         row += f" · no progress {quiet:.0f}s"
                 elif d.get("seconds_since_progress", 0) >= 60:
                     row += f" · quiet {d['seconds_since_progress']:.0f}s"
-                if goal:
-                    row += f" · {goal}"
                 lines.append(row)
                 for i, child in enumerate(d.get("children_activity") or []):
                     if not isinstance(child, dict):

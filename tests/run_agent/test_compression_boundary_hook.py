@@ -211,6 +211,56 @@ class TestCompressionBoundaryHook:
                 child["model_config"] or ""
             )
 
+    def test_tui_host_applies_deferred_switch_before_compression_returns(self):
+        from hermes_state import SessionDB
+
+        events = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+            agent = self._make_agent(db)
+            compressor = MagicMock()
+            compressor.compress.return_value = [{"role": "user", "content": "summary"}]
+            compressor.compression_count = 1
+            compressor.last_prompt_tokens = 0
+            compressor.last_completion_tokens = 0
+            compressor._last_summary_error = None
+            compressor._last_compress_aborted = False
+            compressor.on_session_start.side_effect = (
+                lambda *_args, **kwargs: events.append(kwargs.get("boundary_reason"))
+            )
+            agent.context_compressor = compressor
+            agent._defer_host_compression_publication = True
+            agent._compression_host_publication_callback = lambda: events.append("host")
+
+            def _switch(model, provider, *_args):
+                events.append("switch")
+                agent.model = model
+                agent.provider = provider
+
+            agent.switch_model = _switch
+            schedule_model_switch_after_compression(
+                agent,
+                ModelSwitchResult(
+                    success=True,
+                    new_model="new-model",
+                    target_provider="new-provider",
+                    context_length=128_000,
+                ),
+                on_applied=lambda *_args: events.append("frontend-sync"),
+            )
+
+            agent._compress_context(
+                [{"role": "user", "content": "request"}],
+                "sys",
+                approx_tokens=100,
+                defer_context_engine_notification=True,
+            )
+
+            assert events == ["host", "switch", "frontend-sync", "compression"]
+            assert agent.model == "new-model"
+            assert get_model_switch_after_compression(agent) is None
+            assert getattr(agent, "_pending_context_engine_compression_notification") is None
+
     def test_deferred_notification_still_publishes_target_route_atomically(self):
         import json
 
@@ -499,7 +549,12 @@ class TestCompressionBoundaryHook:
                     approx_tokens=100,
                 )
 
-            assert returned == messages
+            # Compression may stamp metadata (e.g. timestamp) on the returned
+            # transcript even when publication aborts the boundary rewrite.
+            assert [m.get("role") for m in returned] == [m.get("role") for m in messages]
+            assert [m.get("content") for m in returned] == [
+                m.get("content") for m in messages
+            ]
             assert agent.session_id == original_sid
             assert (agent.model, agent.provider, agent.api_key, agent.base_url) == original_route
             agent.switch_model.assert_not_called()
@@ -554,7 +609,12 @@ class TestCompressionBoundaryHook:
                 approx_tokens=100,
             )
 
-            assert returned is messages
+            # No-progress may still stamp metadata; content must stay intact
+            # and the context-engine boundary hook must not fire.
+            assert [m.get("role") for m in returned] == [m.get("role") for m in messages]
+            assert [m.get("content") for m in returned] == [
+                m.get("content") for m in messages
+            ]
             compressor.on_session_start.assert_not_called()
 
 

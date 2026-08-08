@@ -10579,13 +10579,33 @@ def _run_prompt_submit(
                 "session.title", sid, {"session_id": _k, "title": t}
             )
             _usage_stop, _usage_thread = _start_usage_ticker(sid, agent)
-            # Auto-compression must activate only after the outer TUI
-            # publication fence reanchors the session.
+            # Auto-compression must re-anchor through the TUI host after its
+            # durable transcript write, but before the next same-turn provider
+            # request can observe the old deferred route.
+            _host_publish_attr = "_compression_host_publication_callback"
+            _host_publish_missing = object()
+            _previous_host_publish = getattr(
+                agent, _host_publish_attr, _host_publish_missing
+            )
+
+            def _publish_compression_boundary() -> None:
+                _sync_session_key_after_compress(
+                    sid,
+                    session,
+                    clear_pending_title=False,
+                    restart_slash_worker=False,
+                )
+
+            setattr(agent, _host_publish_attr, _publish_compression_boundary)
             agent._defer_host_compression_publication = True
             try:
                 result = agent.run_conversation(run_message, **run_kwargs)
             finally:
                 agent._defer_host_compression_publication = False
+                if _previous_host_publish is _host_publish_missing:
+                    delattr(agent, _host_publish_attr)
+                else:
+                    setattr(agent, _host_publish_attr, _previous_host_publish)
                 # Stop and join before terminal events so a stale live tick
                 # cannot arrive after message.complete.
                 _usage_stop.set()

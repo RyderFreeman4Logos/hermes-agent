@@ -2385,12 +2385,13 @@ def _compress_context_impl(
         no-op via ``len(returned) == len(input)`` and stop the retry loop.
     """
     # Hosts may defer activation until their outer publication fence commits.
-    if not defer_context_engine_notification:
-        defer_context_engine_notification = bool(
-            getattr(agent, "__dict__", {}).get(
-                "_defer_host_compression_publication", False
-            )
+    host_deferred_publication = bool(
+        getattr(agent, "__dict__", {}).get(
+            "_defer_host_compression_publication", False
         )
+    )
+    if not defer_context_engine_notification:
+        defer_context_engine_notification = host_deferred_publication
     _compressor_attempt_snapshot = _snapshot_compressor_attempt_state(
         agent.context_compressor
     )
@@ -3864,7 +3865,21 @@ def _compress_context_impl(
                 old_session_id=_boundary_parent,
                 system_message=system_message,
             )
-            if not defer_context_engine_notification:
+            if host_deferred_publication:
+                host_publish = getattr(
+                    agent, "_compression_host_publication_callback", None
+                )
+                if callable(host_publish):
+                    host_publish()
+                    finalize_context_engine_compression_notification(
+                        agent,
+                        committed=True,
+                    )
+                    new_system_prompt = (
+                        getattr(agent, "_cached_system_prompt", None)
+                        or new_system_prompt
+                    )
+            elif not defer_context_engine_notification:
                 finalize_context_engine_compression_notification(
                     agent,
                     committed=True,

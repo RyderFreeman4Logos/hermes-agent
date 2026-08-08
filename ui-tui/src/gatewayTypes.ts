@@ -147,6 +147,9 @@ export interface ConfigSetResponse {
   // A model pick made mid-turn is queued and applied at the next turn start,
   // not live yet — the handler says "next turn" instead of "model → X".
   deferred?: boolean
+  // An after-compression route is resolved but must not replace the active
+  // session model until a compression boundary commits it.
+  pending?: boolean
   history_reset?: boolean
   info?: SessionInfo
   value?: string

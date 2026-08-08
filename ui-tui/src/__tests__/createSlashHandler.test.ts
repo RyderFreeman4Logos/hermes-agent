@@ -204,6 +204,22 @@ describe('createSlashHandler', () => {
     })
   })
 
+  it('keeps the live model while an after-compression switch is pending', async () => {
+    patchUiState({
+      sid: 'sid-abc',
+      info: { model: 'old-model', skills: {}, tools: {} }
+    })
+    const rpc = vi.fn(() => Promise.resolve({ value: 'new-model', pending: true }))
+    const ctx = buildCtx({ gateway: { ...buildGateway(), rpc } })
+
+    expect(createSlashHandler(ctx)('/model new-model --after-compression')).toBe(true)
+    await vi.waitFor(() => {
+      expect(ctx.transcript.sys).toHaveBeenCalledWith('model → new-model (applies after compression)')
+    })
+
+    expect(getUiState().info?.model).toBe('old-model')
+  })
+
   it('opens the model picker with refresh for /model --refresh', () => {
     patchUiState({ sid: 'sid-abc' })
     const ctx = buildCtx()

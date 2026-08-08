@@ -140,11 +140,16 @@ class TestChildSystemPrompt(unittest.TestCase):
         self.assertNotIn("CONTEXT", prompt)
 
     def test_task_workspace_precedes_parent_cwd_and_seeds_child_tools(self):
-        """A task's existing workspace wins before any child tool runs."""
+        """Only structured task declarations can replace the parent workspace."""
         from tools import file_tools, terminal_tool
 
         parent_dir = self._make_workspace_dir("parent")
         task_dir = self._make_workspace_dir("task")
+        spaced_task_dir = os.path.join(task_dir, "task workspace")
+        os.mkdir(spaced_task_dir)
+        task_link = os.path.join(parent_dir, "task-link")
+        os.symlink(spaced_task_dir, task_link)
+        self.addCleanup(os.unlink, task_link)
         unrelated_file = self._make_workspace_file("unrelated.txt")
         missing_dir = os.path.join(parent_dir, "missing")
         parent = _make_mock_parent()
@@ -155,17 +160,18 @@ class TestChildSystemPrompt(unittest.TestCase):
         self.addCleanup(terminal_cwd.stop)
         terminal_tool.record_session_cwd("parent-task", parent_dir)
         self.addCleanup(terminal_tool.clear_session_cwd, "parent-task")
-        task_context = f"{task_dir}\nbranch: task-branch\nHEAD: {'0' * 40}"
 
-        self.assertEqual(
-            _resolve_workspace_hint(parent, "inspect", task_context),
-            task_dir,
-        )
-        self.assertEqual(_resolve_workspace_hint(parent, f"inspect {task_dir}", None), task_dir)
-        self.assertEqual(
-            _resolve_workspace_hint(parent, "inspect", f"{unrelated_file}\n{missing_dir}"),
-            parent_dir,
-        )
+        self.assertEqual(_resolve_workspace_hint(parent, "inspect", f"{task_link}\nbranch: task-branch"), spaced_task_dir)
+        self.assertEqual(_resolve_workspace_hint(parent, "inspect", f"workspace: {spaced_task_dir}"), spaced_task_dir)
+        for task_text in (
+            f"inspect {spaced_task_dir}",
+            f"evidence lives at {spaced_task_dir}",
+            f"repo: {unrelated_file}",
+            f"repo: {missing_dir}",
+            "repo: https://example.test/checkout",
+            "repo: relative/checkout",
+        ):
+            self.assertEqual(_resolve_workspace_hint(parent, task_text, None), parent_dir)
 
         captured = {}
         child = MagicMock()
@@ -197,16 +203,81 @@ class TestChildSystemPrompt(unittest.TestCase):
         ):
             delegate_task(
                 goal="Inspect the requested checkout",
-                context=task_context,
+                context=f"{task_link}\nbranch: task-branch\nHEAD: {'0' * 40}",
                 parent_agent=parent,
             )
 
         prompt = mock_agent.call_args.kwargs["ephemeral_system_prompt"]
-        self.assertIn(f"WORKSPACE PATH:\n{task_dir}", prompt)
+        self.assertIn(f"WORKSPACE PATH:\n{spaced_task_dir}", prompt)
         self.assertTrue(captured["task_id"].startswith("sa-0-"))
-        self.assertEqual(terminal_tool.get_session_cwd(captured["task_id"]), task_dir)
-        self.assertEqual(captured["relative_path"], file_tools.Path(task_dir) / "target.py")
+        self.assertEqual(terminal_tool.get_session_cwd(captured["task_id"]), spaced_task_dir)
+        self.assertEqual(captured["relative_path"], file_tools.Path(spaced_task_dir) / "target.py")
         self.assertNotEqual(captured["relative_path"], file_tools.Path(parent_dir) / "target.py")
+
+    def test_batch_and_orchestrator_workspace_hints_are_isolated(self):
+        parent_dir = self._make_workspace_dir("parent")
+        task_a = self._make_workspace_dir("task-a")
+        task_b = self._make_workspace_dir("task-b")
+        parent = _make_mock_parent()
+        parent.terminal_cwd = parent_dir
+        terminal_cwd = patch.dict(os.environ, {"TERMINAL_CWD": parent_dir})
+        terminal_cwd.start()
+        self.addCleanup(terminal_cwd.stop)
+        credentials = {
+            "model": None,
+            "provider": None,
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+        }
+
+        def completed_child(*args, **kwargs):
+            return {
+                "task_index": kwargs["task_index"] if "task_index" in kwargs else args[0],
+                "status": "completed",
+                "summary": "done",
+                "api_calls": 0,
+                "duration_seconds": 0.0,
+                "_child_role": "leaf",
+                "_child_cost_usd": 0.0,
+            }
+
+        with (
+            patch("tools.delegate_tool._load_config", return_value={}),
+            patch("tools.delegate_tool._resolve_delegation_credentials", return_value=credentials),
+            patch("tools.delegate_tool._run_single_child", side_effect=completed_child),
+            patch("tools.delegation_live_log.create_live_transcripts", return_value=("test", [], [])),
+            patch("run_agent.AIAgent") as mock_agent,
+        ):
+            delegate_task(
+                tasks=[
+                    {"goal": "Inspect task A", "context": f"repository: {task_a}"},
+                    {"goal": "Inspect task B", "context": f"evidence: {task_b}"},
+                ],
+                parent_agent=parent,
+            )
+            batch_prompts = [call.kwargs["ephemeral_system_prompt"] for call in mock_agent.call_args_list]
+
+        self.assertIn(f"WORKSPACE PATH:\n{task_a}", batch_prompts[0])
+        self.assertIn(f"WORKSPACE PATH:\n{parent_dir}", batch_prompts[1])
+
+        with (
+            patch("tools.delegate_tool._load_config", return_value={}),
+            patch("tools.delegate_tool._resolve_delegation_credentials", return_value=credentials),
+            patch("tools.delegate_tool._run_single_child", side_effect=completed_child),
+            patch("tools.delegation_live_log.create_live_transcripts", return_value=("test", [], [])),
+            patch("tools.delegate_tool._get_orchestrator_enabled", return_value=True),
+            patch("tools.delegate_tool._get_max_spawn_depth", return_value=2),
+            patch("run_agent.AIAgent") as mock_agent,
+        ):
+            delegate_task(
+                goal="Coordinate task B",
+                context=f"checkout: {task_b}",
+                role="orchestrator",
+                parent_agent=parent,
+            )
+
+        self.assertIn(f"WORKSPACE PATH:\n{task_b}", mock_agent.call_args.kwargs["ephemeral_system_prompt"])
 
     def _make_workspace_dir(self, name):
         import shutil

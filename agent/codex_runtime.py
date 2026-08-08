@@ -1083,6 +1083,7 @@ def _consume_codex_event_stream(
     on_commentary_message=None,
     on_first_delta=None,
     on_event=None,
+    on_progress=None,
     interrupt_check=None,
 ) -> SimpleNamespace:
     """Consume a Codex Responses SSE event stream and return a final response.
@@ -1120,6 +1121,8 @@ def _consume_codex_event_stream(
     * ``on_first_delta()`` — one-shot, fires on the first text delta only.
     * ``on_event(event)`` — fires for every event before any other processing.
       Used for watchdog activity, debug logging, anything wire-shape-agnostic.
+    * ``on_progress()`` — fires only for nonempty text, reasoning, or tool-call
+      progress and carries no SSE content.
     * ``interrupt_check()`` — returns True to break the loop early.
     """
     collected_output_items: List[Any] = []
@@ -1138,6 +1141,14 @@ def _consume_codex_event_stream(
     terminal_incomplete_details: Any = None
     terminal_error: Any = None
     saw_terminal = False
+
+    def _notify_progress() -> None:
+        if on_progress is None:
+            return
+        try:
+            on_progress()
+        except Exception:
+            logger.debug("Codex stream on_progress raised", exc_info=True)
 
     for event in event_iter:
         if on_event is not None:
@@ -1180,12 +1191,15 @@ def _consume_codex_event_stream(
                     commentary_text_deltas = []
             else:
                 active_message_phase = None
-            if "function_call" in str(item_type):
+            if "_call" in str(item_type):
                 has_tool_calls = True
+                _notify_progress()
             continue
 
         if "output_text.delta" in event_type or event_type == "response.output_text.delta":
             delta_text = _event_field(event, "delta", "")
+            if delta_text:
+                _notify_progress()
             if delta_text and active_message_phase == "commentary":
                 commentary_text_deltas.append(delta_text)
                 # Preserve CLI/backward compatibility when no first-class
@@ -1218,12 +1232,16 @@ def _consume_codex_event_stream(
                             logger.debug("Codex stream on_text_delta raised", exc_info=True)
             continue
 
-        if "function_call" in event_type:
+        if "_call" in event_type:
             has_tool_calls = True
+            if _event_field(event, "delta", None) or _event_field(event, "arguments", None) or not event_type.endswith(".delta"):
+                _notify_progress()
             # fall through — function_call items still get added on output_item.done
 
         if "reasoning" in event_type and "delta" in event_type:
             reasoning_text = _event_field(event, "delta", "")
+            if reasoning_text:
+                _notify_progress()
             if reasoning_text and on_reasoning_delta is not None:
                 # Summary parts stream one after another with no separator of
                 # their own; summary_index is the boundary the wire gives us.
@@ -1246,6 +1264,8 @@ def _consume_codex_event_stream(
             done_item = _event_field(event, "item")
             if done_item is not None:
                 collected_output_items.append(done_item)
+                if "_call" in str(_item_field(done_item, "type", "")):
+                    _notify_progress()
                 done_phase = _item_field(done_item, "phase", None)
                 done_phase = done_phase.strip().lower() if isinstance(done_phase, str) else None
                 if done_phase == "commentary" and on_commentary_message is not None:
@@ -1384,6 +1404,9 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         agent._codex_stream_last_event_ts = time.time()
         agent._touch_activity("receiving stream response")
 
+    def _on_progress() -> None:
+        agent._codex_stream_last_progress_ts = time.time()
+
     for attempt in range(max_stream_retries + 1):
         if agent._interrupt_requested:
             raise InterruptedError("Agent interrupted before Codex stream retry")
@@ -1456,14 +1479,20 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         ) as exc:
             if attempt < max_stream_retries:
                 logger.debug(
-                    "Codex Responses stream connect failed (attempt %s/%s); "
-                    "retrying. %s error=%s",
+                    "Codex Responses failure_class=transport_failure phase=connect "
+                    "attempt=%s/%s; retrying. %s error=%s",
                     attempt + 1,
                     max_stream_retries + 1,
                     agent._client_log_context(),
                     exc,
                 )
                 continue
+            logger.warning(
+                "Codex Responses failure_class=transport_failure phase=connect "
+                "attempt=%s/%s error_type=%s. %s",
+                attempt + 1, max_stream_retries + 1, type(exc).__name__,
+                agent._client_log_context(),
+            )
             raise
 
         def _interrupt_or_superseded() -> bool:
@@ -1486,6 +1515,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     ),
                     on_first_delta=on_first_delta,
                     on_event=_on_event,
+                    on_progress=_on_progress,
                     interrupt_check=_interrupt_or_superseded,
                 )
             except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
@@ -1497,6 +1527,12 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                         agent._client_log_context(), exc,
                     )
                     continue
+                logger.warning(
+                    "Codex Responses failure_class=transport_failure phase=stream "
+                    "attempt=%s/%s error_type=%s. %s",
+                    attempt + 1, max_stream_retries + 1, type(exc).__name__,
+                    agent._client_log_context(),
+                )
                 raise
             except RuntimeError:
                 if event_stream.final_response is not None:
@@ -1515,7 +1551,8 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                         pass
                 except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
                     logger.warning(
-                        "Codex Responses stream transport finalization failed "
+                        "Codex Responses failure_class=transport_failure "
+                        "phase=finalization: transport finalization failed "
                         "after a terminal response was already received; "
                         "returning the completed response instead of "
                         "retrying. %s error=%s",

@@ -974,7 +974,10 @@ def _build_child_system_prompt(
     return "\n".join(parts)
 
 
-_TASK_WORKSPACE_PATH_RE = re.compile(r"(?<!\S)(/[^\s'\"`<>|]+)")
+_TASK_WORKSPACE_DECLARATION_RE = re.compile(
+    r"^\s*(?:repo|repository|workspace|worktree|checkout)\s*:\s*(/.*)\s*$",
+    re.IGNORECASE,
+)
 
 
 def _existing_workspace_directory(candidate: Any) -> Optional[str]:
@@ -995,8 +998,11 @@ def _resolve_workspace_hint(
     for task_text in (goal, context):
         if not isinstance(task_text, str):
             continue
-        for candidate in _TASK_WORKSPACE_PATH_RE.findall(task_text):
-            workspace = _existing_workspace_directory(candidate.rstrip(".,;:)]}"))
+        for line in task_text.splitlines():
+            declaration = _TASK_WORKSPACE_DECLARATION_RE.fullmatch(line)
+            workspace = _existing_workspace_directory(
+                declaration.group(1) if declaration else line.strip()
+            )
             if workspace:
                 return workspace
 

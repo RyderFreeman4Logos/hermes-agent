@@ -47,9 +47,8 @@ def test_create_openai_client_disables_sdk_retries(mock_openai):
 
 
 @patch("run_agent.OpenAI")
-def test_create_openai_client_honors_explicit_max_retries(mock_openai):
-    """An explicit max_retries in client_kwargs is respected (setdefault, not
-    clobber) — future callers can opt back into SDK retries if needed."""
+def test_create_openai_client_overrides_explicit_sdk_retries(mock_openai):
+    """Primary clients must never hide physical attempts inside the SDK."""
     mock_openai.return_value = MagicMock()
     agent = AIAgent(
         api_key="test-key",
@@ -75,4 +74,4 @@ def test_create_openai_client_honors_explicit_max_retries(mock_openai):
         if c.kwargs.get("base_url") == "https://explicit.example.com/v1"
     ]
     assert matching, "OpenAI was never constructed with the explicit base_url"
-    assert matching[-1].kwargs.get("max_retries") == 5
+    assert matching[-1].kwargs.get("max_retries") == 0

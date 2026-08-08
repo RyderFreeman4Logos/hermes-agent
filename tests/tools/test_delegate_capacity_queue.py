@@ -25,7 +25,9 @@ def _clean_async_state(tmp_path, monkeypatch):
         process_registry.completion_queue.get_nowait()
 
 
-def _dispatch_batch(runner, capacity, *, session_key="owner", interrupt_fn=None):
+def _dispatch_batch(
+    runner, capacity, *, session_key="owner", parent_session_id=None, interrupt_fn=None
+):
     return ad.dispatch_async_delegation_batch(
         goals=["capacity test"],
         context=None,
@@ -33,11 +35,11 @@ def _dispatch_batch(runner, capacity, *, session_key="owner", interrupt_fn=None)
         role="leaf",
         model="m",
         session_key=session_key,
+        parent_session_id=parent_session_id,
         runner=runner,
         interrupt_fn=interrupt_fn,
         max_async_children=capacity,
     )
-
 
 def _dispatch_single(runner, capacity, *, session_key="owner", interrupt_fn=None):
     return ad.dispatch_async_delegation(
@@ -679,6 +681,7 @@ def test_cancel_queued_delegation_completes_once_without_starting_runner(
         lambda: queued_started.set() or {"results": []},
         2,
         session_key="queued-owner",
+        parent_session_id="queued-parent",
         interrupt_fn=queued_interrupted.set,
     )
     assert queued["status"] == "dispatched"
@@ -687,7 +690,7 @@ def test_cancel_queued_delegation_completes_once_without_starting_runner(
     if cancel_scope == "stop":
         assert ad.interrupt_all(reason="/stop") == 3
     else:
-        assert ad.interrupt_for_session(session_key="queued-owner", reason="test") == 1
+        assert ad.interrupt_for_session(parent_session_id="queued-parent", reason="test") == 1
     assert queued_interrupted.is_set()
     assert not queued_started.is_set()
 

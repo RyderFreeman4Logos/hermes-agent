@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -65,37 +66,70 @@ def _drain_for(delegation_id, timeout=5.0):
     return None
 
 
-def test_active_for_session_counts_every_live_delegation_state():
+@pytest.mark.parametrize(
+    "status",
+    sorted(ad._ACTIVE_STATUSES | {"completed", "error", "interrupted", "stalled"}),
+)
+def test_session_live_predicates_follow_authoritative_statuses(status):
     with ad._records_lock:
-        ad._records.update(
-            {
-                "running": {
-                    "status": "running",
-                    "origin_ui_session_id": "desktop-sid",
-                },
-                "stalling": {
-                    "status": "stalling",
-                    "origin_ui_session_id": "desktop-sid",
-                },
-                "finalizing": {
-                    "status": "finalizing",
-                    "origin_ui_session_id": "desktop-sid",
-                },
-                "completed": {
-                    "status": "completed",
-                    "origin_ui_session_id": "desktop-sid",
-                },
-                "other-session": {
-                    "status": "running",
-                    "origin_ui_session_id": "other-sid",
-                },
-            }
+        ad._records[status] = {
+            "status": status,
+            "session_key": "session-key",
+            "origin_ui_session_id": "desktop-sid",
+            "parent_session_id": "parent-session",
+        }
+
+    expected = status in ad._ACTIVE_STATUSES
+    assert ad.active_for_session("desktop-sid") == int(expected)
+    assert ad.active_for_session("other-sid") == 0
+    assert ad.active_for_session("") == 0
+    assert not ad.has_live_for_session(session_key="session-key")
+    assert not ad.has_live_for_session(origin_ui_session_id="desktop-sid")
+    assert ad.has_live_for_session(parent_session_id="parent-session") is expected
+    assert not ad.has_live_for_session(parent_session_id="other-parent")
+    assert not ad.has_live_for_session()
+
+
+def test_stall_grace_retains_capacity_until_worker_returns():
+    with ad._records_lock:
+        ad._records["wedged"] = {
+            "delegation_id": "wedged",
+            "status": "stalling",
+            "dispatched_at": time.time(),
+            "parent_session_id": "parent-session",
+        }
+
+    ad._finalize_stalled("wedged")
+
+    assert ad._records["wedged"]["status"] == "stalling"
+    assert ad.active_count() == 1
+
+
+def test_heartbeat_config_is_validated_before_delegation_submit(monkeypatch):
+    from tools.runtime_heartbeat import HeartbeatConfigError
+
+    monkeypatch.setattr(
+        "tools.runtime_heartbeat.preflight_current_heartbeat",
+        lambda: (_ for _ in ()).throw(
+            HeartbeatConfigError("missing exact mapping for custom:pm")
+        ),
+    )
+    get_executor = MagicMock()
+    monkeypatch.setattr(ad, "_get_executor", get_executor)
+
+    with pytest.raises(HeartbeatConfigError, match="custom:pm"):
+        ad.dispatch_async_delegation(
+            goal="g",
+            context=None,
+            toolsets=None,
+            role="leaf",
+            model="m",
+            session_key="owner",
+            runner=lambda: {"status": "completed"},
         )
 
-    assert ad.active_for_session("desktop-sid") == 3
-    assert ad.active_for_session("other-sid") == 1
-    assert ad.active_for_session("") == 0
-
+    get_executor.assert_not_called()
+    assert ad.active_count() == 0
 
 def test_dispatch_returns_immediately_without_blocking():
     gate = threading.Event()
@@ -300,23 +334,24 @@ def test_stalled_runner_is_interrupted_then_finalized(monkeypatch):
     )
     assert res["status"] == "dispatched"
 
-    evt = _drain_for(res["delegation_id"], timeout=5.0)
-    try:
-        assert evt is not None
-        assert evt["type"] == "async_delegation"
-        assert evt["status"] == "stalled"
-        assert evt["delegation_id"] == res["delegation_id"]
-        assert evt["api_calls"] == 0
-        assert "stalled" in evt["error"]
-        # Interrupt was requested BEFORE force-finalization (grace window).
-        assert interrupted["count"] >= 1
-        assert ad.active_count() == 0
-    finally:
-        gate.set()
+    deadline = time.monotonic() + 5.0
+    while not interrupted["count"] and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert interrupted["count"] >= 1
+    while not ad._records[res["delegation_id"]].get("_stall_grace_expired") and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert ad.active_count() == 1
+    assert process_registry.completion_queue.empty()
 
-    # If the ignored runner eventually returns, it must not enqueue a second
-    # completion for a delegation the monitor already finalized.
-    assert _drain_one(timeout=0.5) is None
+    gate.set()
+    evt = _drain_for(res["delegation_id"], timeout=5.0)
+    assert evt is not None
+    assert evt["type"] == "async_delegation"
+    assert evt["status"] == "stalled"
+    assert evt["delegation_id"] == res["delegation_id"]
+    assert evt["api_calls"] == 0
+    assert "stalled" in evt["error"]
+    assert ad.active_count() == 0
 
 
 def test_progressing_runner_is_never_stalled(monkeypatch):
@@ -437,16 +472,20 @@ def test_stalled_event_carries_structured_stall_metadata(monkeypatch):
     )
     assert res["status"] == "dispatched"
 
+    deadline = time.monotonic() + 5.0
+    while not ad._records[res["delegation_id"]].get("_stall_grace_expired") and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert ad.active_count() == 1
+    assert process_registry.completion_queue.empty()
+
+    gate.set()
     evt = _drain_for(res["delegation_id"], timeout=5.0)
-    try:
-        assert evt is not None
-        assert evt["status"] == "stalled"
-        assert evt["stalled_after_quiet_seconds"] >= 0.3  # in-tool threshold
-        assert evt["stall_threshold_seconds"] == ad._STALE_IN_TOOL_SECONDS
-        assert evt["stall_phase"] == "in_tool"
-        assert evt["stall_grace_seconds"] == ad._STALL_GRACE_SECONDS
-    finally:
-        gate.set()
+    assert evt is not None
+    assert evt["status"] == "stalled"
+    assert evt["stalled_after_quiet_seconds"] >= 0.3  # in-tool threshold
+    assert evt["stall_threshold_seconds"] == ad._STALE_IN_TOOL_SECONDS
+    assert evt["stall_phase"] == "in_tool"
+    assert evt["stall_grace_seconds"] == ad._STALL_GRACE_SECONDS
 
 
 def test_list_async_delegations_exposes_live_activity(monkeypatch):

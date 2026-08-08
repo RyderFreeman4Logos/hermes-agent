@@ -21,6 +21,7 @@ import enum
 import contextvars
 import json
 import logging
+import re
 import shutil
 
 logger = logging.getLogger(__name__)

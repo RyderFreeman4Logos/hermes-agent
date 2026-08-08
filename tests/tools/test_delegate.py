@@ -243,6 +243,11 @@ class TestChildSystemPrompt(unittest.TestCase):
                 f"```text\n{task_dir}\n```",
                 f"```sh\nworkspace: {task_dir}\n```",
                 f"~~~command\nrepository: {task_dir}\n~~~",
+                f"\ufeff```text\n{task_dir}\n```",
+                f"    {task_dir}",
+                f"    workspace: {task_dir}",
+                f"<!--\n{task_dir}\n-->",
+                f"<!--\nworkspace: {task_dir}\n-->",
                 f"inspect {task_dir}",
                 f"https://example.test{task_dir}",
                 f"[workspace]({task_dir})",
@@ -252,6 +257,13 @@ class TestChildSystemPrompt(unittest.TestCase):
                     self.assertEqual(
                         _resolve_workspace_hint(parent, task_text, None), parent_dir
                     )
+            self.assertEqual(
+                _resolve_workspace_hint(parent, f"\ufeffworkspace: {task_dir}", None),
+                task_dir,
+            )
+            self.assertEqual(
+                _resolve_workspace_hint(parent, f"\ufeff{task_dir}", None), task_dir
+            )
 
     def test_live_parent_session_cwd_precedes_stale_fallbacks(self):
         from tools import terminal_tool
@@ -278,7 +290,12 @@ class TestChildSystemPrompt(unittest.TestCase):
         safe_link = os.path.join(parent_dir, "safe-link")
         os.symlink(spaced_task_dir, safe_link)
         self.addCleanup(os.unlink, safe_link)
+        inward_link = os.path.join(parent_dir, "inward-link")
+        inward_target = "/home/obj" if os.path.isdir("/home/obj") else "/home"
+        os.symlink(inward_target, inward_link)
+        self.addCleanup(os.unlink, inward_link)
         guarded_link = "/home/user/guarded-workspace-link"
+        traversal = "/tmp/../home/obj"
         parent = _make_mock_parent()
         parent.terminal_cwd = parent_dir
         host_realpath = os.path.realpath
@@ -295,6 +312,34 @@ class TestChildSystemPrompt(unittest.TestCase):
                 _resolve_workspace_hint(parent, guarded_link, None), parent_dir
             )
         self.assertNotIn(guarded_link, [call.args[0] for call in realpath.call_args_list])
+
+        with (
+            patch.dict(os.environ, {"TERMINAL_CWD": parent_dir}),
+            patch("tools.file_tools._uses_container_paths", return_value=True),
+            patch(
+                "tools.delegate_tool.os.path.realpath", wraps=os.path.realpath
+            ) as canonicalize_traversal,
+        ):
+            self.assertEqual(
+                _resolve_workspace_hint(parent, traversal, None), parent_dir
+            )
+        self.assertNotIn(
+            traversal, [call.args[0] for call in canonicalize_traversal.call_args_list]
+        )
+
+        with (
+            patch.dict(os.environ, {"TERMINAL_CWD": parent_dir}),
+            patch("tools.file_tools._uses_container_paths", return_value=True),
+            patch(
+                "tools.delegate_tool.os.path.realpath", wraps=os.path.realpath
+            ) as canonicalize_inward,
+        ):
+            self.assertEqual(
+                _resolve_workspace_hint(parent, inward_link, None), parent_dir
+            )
+        self.assertIn(
+            inward_link, [call.args[0] for call in canonicalize_inward.call_args_list]
+        )
 
         with (
             patch.dict(os.environ, {"TERMINAL_CWD": parent_dir}),

@@ -974,13 +974,32 @@ def _build_child_system_prompt(
     return "\n".join(parts)
 
 
-def _resolve_workspace_hint(parent_agent) -> Optional[str]:
-    """Best-effort local workspace hint for child prompts.
+_TASK_WORKSPACE_PATH_RE = re.compile(r"(?<!\S)(/[^\s'\"`<>|]+)")
 
-    We only inject a path when we have a concrete absolute directory. This avoids
-    teaching subagents a fake container path while still helping them avoid
-    guessing `/workspace/...` for local repo tasks.
-    """
+
+def _existing_workspace_directory(candidate: Any) -> Optional[str]:
+    """Return a canonical existing directory for a task path candidate."""
+    if not isinstance(candidate, str) or not candidate or candidate.startswith("//"):
+        return None
+    try:
+        path = os.path.realpath(os.path.expanduser(candidate))
+    except (OSError, TypeError, ValueError):
+        return None
+    return path if os.path.isabs(path) and os.path.isdir(path) else None
+
+
+def _resolve_workspace_hint(
+    parent_agent, goal: Optional[str] = None, context: Optional[str] = None
+) -> Optional[str]:
+    """Resolve a task-explicit workspace before falling back to the parent cwd."""
+    for task_text in (goal, context):
+        if not isinstance(task_text, str):
+            continue
+        for candidate in _TASK_WORKSPACE_PATH_RE.findall(task_text):
+            workspace = _existing_workspace_directory(candidate.rstrip(".,;:)]}"))
+            if workspace:
+                return workspace
+
     candidates = [
         os.getenv("TERMINAL_CWD"),
         getattr(
@@ -990,14 +1009,9 @@ def _resolve_workspace_hint(parent_agent) -> Optional[str]:
         getattr(parent_agent, "cwd", None),
     ]
     for candidate in candidates:
-        if not candidate:
-            continue
-        try:
-            text = os.path.abspath(os.path.expanduser(str(candidate)))
-        except Exception:
-            continue
-        if os.path.isabs(text) and os.path.isdir(text):
-            return text
+        workspace = _existing_workspace_directory(candidate)
+        if workspace:
+            return workspace
     return None
 
 
@@ -1428,7 +1442,7 @@ def _build_child_agent(
     if effective_role == "orchestrator" and "delegation" not in child_toolsets:
         child_toolsets.append("delegation")
 
-    workspace_hint = _resolve_workspace_hint(parent_agent)
+    workspace_hint = _resolve_workspace_hint(parent_agent, goal, context)
     child_prompt = _build_child_system_prompt(
         goal,
         context,
@@ -1734,6 +1748,7 @@ def _build_child_agent(
     child._subagent_id = subagent_id
     child._parent_subagent_id = parent_subagent_id
     child._subagent_goal = goal
+    setattr(child, "_delegate_workspace_path", workspace_hint)
     child._parent_turn_id = getattr(parent_agent, "_current_turn_id", "") or ""
     # Stable sidebar marker: delegate subagent sessions must stay out of
     # session pickers even when a parent delete orphans them (parent_session_id
@@ -2339,16 +2354,22 @@ def _run_single_child(
 
         child_task_id = _subagent_id or f"subagent-{task_index}-{_uuid.uuid4().hex[:8]}"
         parent_task_id = getattr(parent_agent, "_current_task_id", None)
-        # Seed the child's session-cwd record from the parent's (cwd rearch):
+        # Seed the child's session-cwd record from its task workspace or parent.
         # children share the parent's container, and today they inherit the
         # parent's live env.cwd implicitly. Seeding at spawn preserves that
-        # starting directory while keeping the child's subsequent `cd`s
+        # fallback directory while keeping the child's subsequent `cd`s
         # isolated in its own record (a child's cd no longer bleeds back into
         # the parent once readers flip to the record store).
         try:
             from tools.terminal_tool import get_session_cwd, record_session_cwd
 
-            record_session_cwd(child_task_id, get_session_cwd(parent_task_id))
+            workspace_path = getattr(child, "_delegate_workspace_path", None)
+            record_session_cwd(
+                child_task_id,
+                workspace_path
+                if isinstance(workspace_path, str) and workspace_path
+                else get_session_cwd(parent_task_id),
+            )
         except Exception as e:
             logger.debug("Child cwd seed failed: %s", e)
         wall_start = time.time()

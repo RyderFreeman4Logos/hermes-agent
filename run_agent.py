@@ -1077,14 +1077,21 @@ class AIAgent:
         This helper rewrites the live status line with an explanation:
 
         - CLI: ``thinking_callback`` updates the prompt_toolkit spinner text.
-        - TUI / Desktop: the same callback is bridged to the ``thinking.delta``
-          event, which both render as the live spinner/status line.
+        - TUI / Desktop: ``status_callback`` bridges it to a replaceable
+          ``status.update`` event; other drivers keep the spinner callback.
         - Gateway: ``_touch_activity`` stores the text as the activity
           description, which the "⏳ Working — N min" heartbeat includes.
 
         Never raises — a wait notice must not break the API-call wait loop.
         """
         self._touch_activity(text)
+        _status_cb = getattr(self, "status_callback", None)
+        if _status_cb:
+            try:
+                _status_cb("wait", text)
+                return
+            except Exception:
+                logger.debug("status_callback error in _emit_wait_notice", exc_info=True)
         _thinking_cb = getattr(self, "thinking_callback", None)
         if _thinking_cb:
             try:

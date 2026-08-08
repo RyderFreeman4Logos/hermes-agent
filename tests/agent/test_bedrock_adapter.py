@@ -840,6 +840,33 @@ class TestEmptyTextBlockFix:
 class TestInvalidateRuntimeClient:
     """Per-region eviction used to discard dead/stale bedrock-runtime clients."""
 
+    def test_runtime_client_disables_botocore_retries(self):
+        """One telemetry record must correspond to one Bedrock wire attempt."""
+        from agent import bedrock_adapter
+
+        class Config:
+            def __init__(self, *, retries):
+                self.retries = retries
+
+        botocore_mod = ModuleType("botocore")
+        config_mod = ModuleType("botocore.config")
+        config_mod.Config = Config
+        botocore_mod.config = config_mod
+        boto3 = MagicMock()
+        bedrock_adapter.reset_client_cache()
+        with (
+            patch.dict(
+                "sys.modules",
+                {"botocore": botocore_mod, "botocore.config": config_mod},
+            ),
+            patch.object(bedrock_adapter, "_require_boto3", return_value=boto3),
+        ):
+            bedrock_adapter._get_bedrock_runtime_client("us-east-1")
+
+        assert boto3.client.call_args.kwargs["config"].retries == {
+            "total_max_attempts": 1,
+        }
+
     def test_evicts_only_the_target_region(self):
         from agent.bedrock_adapter import (
             _bedrock_runtime_client_cache,

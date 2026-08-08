@@ -88,6 +88,13 @@ def test_invalid_exact_mapping_cannot_leave_spawned_orphan(monkeypatch):
     registry.spawn_local.assert_not_called()
 
 
+def test_missing_heartbeat_interval_cannot_leave_spawned_orphan(monkeypatch):
+    result, registry, _proc = _run(monkeypatch, preflight=lambda: None)
+
+    assert "interval is unavailable" in result["error"]
+    registry.spawn_local.assert_not_called()
+
+
 def test_terminal_arms_only_after_successful_spawn(monkeypatch):
     from tools.runtime_heartbeat import runtime_heartbeat
 

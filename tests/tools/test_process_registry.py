@@ -1236,6 +1236,107 @@ class TestSpawnRewriteCompoundBackground:
 # =========================================================================
 
 class TestCheckpoint:
+    def test_recovery_rearms_notify_heartbeat(self, registry, tmp_path, monkeypatch):
+        from tools import process_registry as process_registry_module
+        from tools.runtime_heartbeat import RuntimeHeartbeat
+
+        class Timer:
+            def __init__(self, _interval, _callback):
+                self.daemon = False
+
+            def start(self):
+                pass
+
+            def cancel(self):
+                pass
+
+        heartbeat = RuntimeHeartbeat(timer_factory=Timer)
+        monkeypatch.setattr(process_registry_module, "process_registry", registry)
+        monkeypatch.setattr(
+            "tools.runtime_heartbeat.runtime_heartbeat", heartbeat
+        )
+        providers = []
+
+        def preflight(provider=None):
+            providers.append(provider)
+            return 1700
+
+        monkeypatch.setattr(
+            "tools.runtime_heartbeat.preflight_current_heartbeat", preflight
+        )
+        checkpoint = tmp_path / "procs.json"
+        checkpoint.write_text(json.dumps([{
+            "session_id": "proc_recovered",
+            "command": "sleep 999",
+            "pid": os.getpid(),
+            "pid_scope": "host",
+            "host_start_time": registry._safe_host_start_time(os.getpid()),
+            "task_id": "task-a",
+            "session_key": "owner-a",
+            "notify_on_complete": True,
+            "heartbeat_provider": "openai-codex",
+        }]))
+
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+            assert registry.recover_from_checkpoint() == 1
+
+        snapshots = heartbeat.active_snapshots()
+        assert snapshots == [{
+            "target_id": "proc_recovered",
+            "caller_id": "owner-a",
+            "kind": "process",
+            "started_at": snapshots[0]["started_at"],
+            "interval_s": 1700,
+        }]
+        assert providers == ["openai-codex"]
+
+    def test_recovery_logs_degraded_when_heartbeat_interval_missing(
+        self, registry, tmp_path, monkeypatch, caplog
+    ):
+        from tools import process_registry as process_registry_module
+        from tools.runtime_heartbeat import HeartbeatConfigError, RuntimeHeartbeat
+
+        class Timer:
+            def __init__(self, _interval, _callback):
+                self.daemon = False
+
+            def start(self):
+                pass
+
+            def cancel(self):
+                pass
+
+        heartbeat = RuntimeHeartbeat(timer_factory=Timer)
+        monkeypatch.setattr(process_registry_module, "process_registry", registry)
+        monkeypatch.setattr(
+            "tools.runtime_heartbeat.runtime_heartbeat", heartbeat
+        )
+        monkeypatch.setattr(
+            "tools.runtime_heartbeat.preflight_current_heartbeat",
+            lambda: (_ for _ in ()).throw(
+                HeartbeatConfigError("missing exact provider mapping")
+            ),
+        )
+        checkpoint = tmp_path / "procs.json"
+        checkpoint.write_text(json.dumps([{
+            "session_id": "proc_degraded",
+            "command": "sleep 999",
+            "pid": os.getpid(),
+            "pid_scope": "host",
+            "host_start_time": registry._safe_host_start_time(os.getpid()),
+            "task_id": "task-a",
+            "session_key": "owner-a",
+            "notify_on_complete": True,
+        }]))
+
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint), caplog.at_level(
+            "WARNING", logger="tools.process_registry"
+        ):
+            assert registry.recover_from_checkpoint() == 1
+
+        assert heartbeat.active_snapshots() == []
+        assert "check-in is degraded" in caplog.text
+
     def test_recover_dead_pid(self, registry, tmp_path):
         checkpoint = tmp_path / "procs.json"
         checkpoint.write_text(json.dumps([{

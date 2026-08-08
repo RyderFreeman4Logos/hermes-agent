@@ -918,9 +918,11 @@ def _runtime_config() -> Dict[str, Any]:
     return runtime if isinstance(runtime, dict) else {}
 
 
-def preflight_current_heartbeat() -> Optional[int]:
+def preflight_current_heartbeat(provider: str | None = None) -> Optional[int]:
     """Validate the current provider before a managed target is created."""
-    return resolve_heartbeat_interval(_runtime_config(), get_current_provider())
+    return resolve_heartbeat_interval(
+        _runtime_config(), provider if provider is not None else get_current_provider()
+    )
 
 
 @dataclass

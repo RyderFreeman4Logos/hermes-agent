@@ -2950,10 +2950,20 @@ def terminal_tool(
                     else:
                         if notify_on_complete:
                             from tools.runtime_heartbeat import (
+                                HeartbeatConfigError,
+                                get_current_provider,
                                 preflight_current_heartbeat,
                             )
 
                             heartbeat_interval = preflight_current_heartbeat()
+                            if heartbeat_interval is None:
+                                raise HeartbeatConfigError(
+                                    "runtime heartbeat interval is unavailable for "
+                                    "notify_on_complete"
+                                )
+                            notification_metadata["heartbeat_provider"] = (
+                                get_current_provider()
+                            )
                         gw_platform = _gse("HERMES_SESSION_PLATFORM", "")
                         if gw_platform:
                             notification_metadata.update({
@@ -3135,21 +3145,24 @@ def terminal_tool(
                     result_data["notify_on_complete"] = True
 
                     from tools.runtime_heartbeat import (
-                        inspect_process,
-                        runtime_heartbeat,
+                        HeartbeatConfigError,
                     )
+                    from tools.process_registry import arm_process_heartbeat
 
-                    runtime_heartbeat.arm(
-                        proc_session.id,
-                        caller_id=session_key,
-                        kind="process",
-                        interval=heartbeat_interval,
-                        inspect=lambda _id=proc_session.id: inspect_process(_id),
-                    )
-                    # Completion may have won before the heartbeat was armed.
-                    completion_event = getattr(proc_session, "_completion_event", None)
-                    if completion_event is not None and completion_event.is_set():
-                        runtime_heartbeat.cancel(proc_session.id)
+                    try:
+                        arm_process_heartbeat(
+                            proc_session,
+                            interval=heartbeat_interval,
+                            caller_id=session_key,
+                        )
+                    except (HeartbeatConfigError, RuntimeError):
+                        proc_session.notify_on_complete = False
+                        process_registry.kill_process(
+                            proc_session.id,
+                            source="heartbeat_arm_failed",
+                            consume_output=False,
+                        )
+                        raise
 
                     # In gateway mode, auto-register a fast watcher so the
                     # gateway can detect completion and trigger a new agent

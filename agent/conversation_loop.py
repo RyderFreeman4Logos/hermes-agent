@@ -1104,6 +1104,8 @@ _CODEX_INCOMPLETE_NUDGE = (
     "Produce your final answer as plain text now (or make the tool call "
     "you were planning).]"
 )
+# The retry counter includes the initial incomplete response, not just follow-ups.
+_CODEX_INCOMPLETE_CONTINUATION_LIMIT = 3
 
 
 # Re-prompt sent after a Codex/Responses turn ends with an acknowledgment-only
@@ -7177,72 +7179,100 @@ def run_conversation(
                         messages.append(interim_msg)
                         agent._emit_interim_assistant_message(interim_msg)
 
-                # When the interim message has nothing the Responses input
-                # converter will replay (no visible content, no encrypted
-                # reasoning items, no replayable message items — plain-text
-                # reasoning only), a bare retry is byte-identical to the
-                # request that just came back incomplete. Append a user-role
-                # nudge so that retry actually differs.
-                interim_replayable = (
-                    interim_has_content
-                    or interim_has_codex_reasoning
-                    or interim_has_codex_message_items
-                )
-                if not interim_replayable:
-                    _last_msg = messages[-1] if messages else None
-                    _already_nudged = (
-                        isinstance(_last_msg, dict)
-                        and _last_msg.get("role") == "user"
-                        and _last_msg.get("content") == _CODEX_INCOMPLETE_NUDGE
+                if agent._codex_incomplete_retries <= _CODEX_INCOMPLETE_CONTINUATION_LIMIT:
+                    # When the interim message has nothing the Responses input
+                    # converter will replay (no visible content, no encrypted
+                    # reasoning items, no replayable message items — plain-text
+                    # reasoning only), a bare retry is byte-identical to the
+                    # request that just came back incomplete. Append a user-role
+                    # nudge so that retry actually differs.
+                    interim_replayable = (
+                        interim_has_content
+                        or interim_has_codex_reasoning
+                        or interim_has_codex_message_items
                     )
-                    _last_is_assistant = (
-                        isinstance(_last_msg, dict)
-                        and _last_msg.get("role") == "assistant"
-                    )
-                    if not _already_nudged and _last_is_assistant:
-                        messages.append({
-                            "role": "user",
-                            "content": _CODEX_INCOMPLETE_NUDGE,
-                        })
-
-                if not interim_replayable or replayable_no_progress:
-                    wait_time = jittered_backoff(
-                        agent._codex_incomplete_retries,
-                        base_delay=1.0,
-                        max_delay=15.0,
-                    )
-                    if wait_time > 0:
-                        agent._emit_wait_notice(
-                            (
-                                "↻ identical Codex continuation state; waiting "
-                                if replayable_no_progress
-                                else "↻ no replayable continuation state; waiting "
-                            )
-                            + f"{wait_time:.1f}s before another billed request"
+                    if not interim_replayable:
+                        _last_msg = messages[-1] if messages else None
+                        _already_nudged = (
+                            isinstance(_last_msg, dict)
+                            and _last_msg.get("role") == "user"
+                            and _last_msg.get("content") == _CODEX_INCOMPLETE_NUDGE
                         )
-                        sleep_end = time.time() + wait_time
-                        while time.time() < sleep_end:
-                            if agent._interrupt_requested:
-                                interrupted = True
-                                _turn_exit_reason = (
-                                    "interrupted_during_codex_replay_backoff"
-                                )
-                                break
-                            time.sleep(min(0.2, sleep_end - time.time()))
-                        if interrupted:
-                            break
+                        # Alternation guard: the nudge is a user-role message,
+                        # so it may only follow an assistant message. When the
+                        # interim was too empty to append (no content AND no
+                        # reasoning), the last message is still the prior
+                        # user/tool turn — appending the nudge there would
+                        # create a user→user / tool→user sequence that strict
+                        # providers reject.
+                        _last_is_assistant = (
+                            isinstance(_last_msg, dict)
+                            and _last_msg.get("role") == "assistant"
+                        )
+                        if not _already_nudged and _last_is_assistant:
+                            messages.append({
+                                "role": "user",
+                                "content": _CODEX_INCOMPLETE_NUDGE,
+                            })
 
-                if not agent.quiet_mode:
-                    agent._vprint(
-                        f"{agent.log_prefix}↻ Codex response incomplete; "
-                        f"continuing turn ({agent._codex_incomplete_retries})"
+                    if not interim_replayable or replayable_no_progress:
+                        wait_time = jittered_backoff(
+                            agent._codex_incomplete_retries,
+                            base_delay=1.0,
+                            max_delay=15.0,
+                        )
+                        if wait_time > 0:
+                            agent._emit_wait_notice(
+                                (
+                                    "↻ identical Codex continuation state; waiting "
+                                    if replayable_no_progress
+                                    else "↻ no replayable continuation state; waiting "
+                                )
+                                + f"{wait_time:.1f}s before another billed request"
+                            )
+                            sleep_end = time.time() + wait_time
+                            while time.time() < sleep_end:
+                                if agent._interrupt_requested:
+                                    interrupted = True
+                                    _turn_exit_reason = (
+                                        "interrupted_during_codex_replay_backoff"
+                                    )
+                                    break
+                                time.sleep(min(0.2, sleep_end - time.time()))
+                            if interrupted:
+                                break
+
+                    if not agent.quiet_mode:
+                        agent._vprint(
+                            f"{agent.log_prefix}↻ Codex response incomplete; "
+                            "continuing turn "
+                            f"({agent._codex_incomplete_retries}/"
+                            f"{_CODEX_INCOMPLETE_CONTINUATION_LIMIT})"
+                        )
+                    agent._emit_wait_notice(
+                        "↻ model returned reasoning with no final answer — "
+                        "asking it to continue "
+                        f"({agent._codex_incomplete_retries}/"
+                        f"{_CODEX_INCOMPLETE_CONTINUATION_LIMIT})"
                     )
-                agent._emit_wait_notice(
-                    "↻ model returned reasoning with no final answer — "
-                    f"asking it to continue ({agent._codex_incomplete_retries})"
+                    agent._session_messages = messages
+                    continue
+
+                continuation_attempts = agent._codex_incomplete_retries - 1
+                continuation_error = (
+                    f"Codex response remained incomplete after "
+                    f"{continuation_attempts} continuation attempts"
                 )
-                agent._session_messages = messages
-                continue
+                agent._codex_incomplete_retries = 0
+                agent._persist_session(messages, conversation_history)
+                return {
+                    "final_response": continuation_error,
+                    "messages": messages,
+                    "api_calls": api_call_count,
+                    "completed": False,
+                    "partial": True,
+                    "error": continuation_error,
+                }
             elif hasattr(agent, "_codex_incomplete_retries"):
                 agent._codex_incomplete_retries = 0
             

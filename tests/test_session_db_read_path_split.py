@@ -1,11 +1,8 @@
-"""Tests for the SessionDB read-path split (per-thread read-only connections).
+"""Tests for the SessionDB WAL read-path split.
 
 The gateway shares ONE SessionDB across every agent, so recall/browse reads
-used to queue behind writer flushes on self._lock — a measured production
-convoy (a 0.2s FTS query stretched to 112s while 6-8 concurrent turns
-flushed tool results). These tests pin the new contract: reads run on a
-per-thread read-only connection under WAL, never touch self._lock, and fall
-back to the legacy locked path when WAL or the read connection is missing.
+must not queue behind writer flushes on self._lock. WAL readers lease from a
+bounded pool; saturation falls back to the legacy locked path.
 """
 
 import threading
@@ -25,22 +22,22 @@ def db(tmp_path):
     d.close()
 
 
-@pytest.mark.requires_wal
-def test_read_conn_is_per_thread(db):
-    conns = {}
-
-    def grab(key):
-        conns[key] = db._get_read_conn()
-
-    t1 = threading.Thread(target=grab, args=(1,))
-    t2 = threading.Thread(target=grab, args=(2,))
-    t1.start(); t2.start(); t1.join(); t2.join()
-    assert conns[1] is not None and conns[2] is not None
-    assert conns[1] is not conns[2]
-
-
 def test_read_conn_reused_within_thread(db):
     assert db._get_read_conn() is db._get_read_conn()
+
+
+def test_read_pool_caps_physical_readers(db):
+    """Historical workers must not retain one WAL reader each until shutdown."""
+    db._wal_active = True
+    readers = [db._acquire_read_conn() for _ in range(db._READ_POOL_MAX + 1)]
+    try:
+        assert all(readers[:db._READ_POOL_MAX])
+        assert readers[-1] is None
+        assert len(db._read_pool_all) == db._READ_POOL_MAX
+    finally:
+        for reader in readers:
+            if reader is not None:
+                db._release_read_conn(reader)
 
 
 @pytest.mark.requires_wal

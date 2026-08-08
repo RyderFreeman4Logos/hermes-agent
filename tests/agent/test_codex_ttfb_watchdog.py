@@ -17,6 +17,7 @@ stall.
 from __future__ import annotations
 
 import sys
+import threading
 import time
 import types
 from types import SimpleNamespace
@@ -28,11 +29,20 @@ sys.modules.setdefault("fire", types.SimpleNamespace(Fire=lambda *a, **k: None))
 sys.modules.setdefault("firecrawl", types.SimpleNamespace(Firecrawl=object))
 sys.modules.setdefault("fal_client", types.SimpleNamespace())
 
+_CODEX_7200_CONFIG = """\
+providers:
+  openai-codex:
+    request_timeout_seconds: 3600
+    models:
+      gpt-5.5:
+        timeout_seconds: 7200
+"""
 
-def _make_codex_agent(tmp_path, monkeypatch):
+
+def _make_codex_agent(tmp_path, monkeypatch, config="{}\n"):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     (tmp_path / ".env").write_text("", encoding="utf-8")
-    (tmp_path / "config.yaml").write_text("{}\n", encoding="utf-8")
+    (tmp_path / "config.yaml").write_text(config, encoding="utf-8")
     from run_agent import AIAgent
 
     agent = AIAgent(
@@ -57,8 +67,84 @@ def _make_codex_agent(tmp_path, monkeypatch):
     return agent
 
 
+class _FakeClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def time(self):
+        return self.now
 
 
+def _install_clocked_worker(monkeypatch, helpers, clock, ready, *, step, on_poll):
+    """Run the real worker while each main-thread poll advances fake time."""
+    real_thread = helpers.threading.Thread
+    workers = []
+
+    class ClockedThread:
+        def __init__(self, *, target, daemon):
+            self._thread = real_thread(target=target, daemon=daemon)
+            workers.append(self)
+
+        def start(self):
+            self._thread.start()
+            assert ready.wait(1), "Codex worker did not reach the fake stream"
+
+        def is_alive(self):
+            return self._thread.is_alive()
+
+        def join(self, timeout=None):
+            if timeout == 0.3:
+                clock.now += step
+                on_poll(clock.now)
+            self._thread.join(0.05)
+
+        def wait(self):
+            self._thread.join(1)
+
+    monkeypatch.setattr(helpers.time, "time", clock.time)
+    monkeypatch.setattr(helpers.threading, "Thread", ClockedThread)
+    return workers
+
+
+def _prepare_clocked_call(agent, monkeypatch, clock, *, first_event=False):
+    closes = []
+    ready = threading.Event()
+    release = threading.Event()
+    complete = {"value": False}
+    sentinel = SimpleNamespace(ok=True)
+    dummy_client = SimpleNamespace()
+
+    monkeypatch.setattr(
+        agent, "_create_request_openai_client", lambda **_k: dummy_client
+    )
+    monkeypatch.setattr(
+        agent,
+        "_abort_request_openai_client",
+        lambda _client, reason=None: closes.append(reason),
+    )
+    monkeypatch.setattr(
+        agent,
+        "_close_request_openai_client",
+        lambda _client, reason=None: closes.append(reason),
+    )
+
+    def fake_stream(_api_kwargs, client=None, on_first_delta=None):
+        if first_event:
+            agent._codex_stream_last_event_ts = clock.time()
+        ready.set()
+        release.wait()
+        if complete["value"]:
+            return sentinel
+        raise ConnectionError("incomplete chunked read")
+
+    monkeypatch.setattr(agent, "_run_codex_stream", fake_stream)
+    return SimpleNamespace(
+        closes=closes,
+        ready=ready,
+        release=release,
+        complete=complete,
+        sentinel=sentinel,
+    )
 
 
 def test_ttfb_includes_silent_hang_hint_for_gpt_5_5(tmp_path, monkeypatch):
@@ -72,15 +158,19 @@ def test_ttfb_includes_silent_hang_hint_for_gpt_5_5(tmp_path, monkeypatch):
     closes: list = []
     statuses: list[str] = []
     dummy_client = SimpleNamespace()
-    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: dummy_client)
+    monkeypatch.setattr(
+        agent, "_create_request_openai_client", lambda **k: dummy_client
+    )
     monkeypatch.setattr(agent, "_buffer_status", lambda msg: statuses.append(msg))
     monkeypatch.setattr(agent, "_emit_status", lambda msg: statuses.append(msg))
     monkeypatch.setattr(
-        agent, "_abort_request_openai_client",
+        agent,
+        "_abort_request_openai_client",
         lambda c, reason=None: closes.append(reason),
     )
     monkeypatch.setattr(
-        agent, "_close_request_openai_client",
+        agent,
+        "_close_request_openai_client",
         lambda c, reason=None: closes.append(reason),
     )
 
@@ -88,7 +178,11 @@ def test_ttfb_includes_silent_hang_hint_for_gpt_5_5(tmp_path, monkeypatch):
 
     def fake_hang(api_kwargs, client=None, on_first_delta=None):
         deadline = time.time() + 30
-        while time.time() < deadline and not stop["flag"] and not agent._interrupt_requested:
+        while (
+            time.time() < deadline
+            and not stop["flag"]
+            and not agent._interrupt_requested
+        ):
             time.sleep(0.02)
         raise RuntimeError("connection closed")
 
@@ -108,8 +202,6 @@ def test_ttfb_includes_silent_hang_hint_for_gpt_5_5(tmp_path, monkeypatch):
         stop["flag"] = True
 
 
-
-
 def test_ttfb_does_not_kill_when_events_flow(tmp_path, monkeypatch):
     """Once a stream event has arrived, a generation that runs past the TTFB
     cutoff is NOT killed by the watchdog — it completes normally."""
@@ -120,13 +212,17 @@ def test_ttfb_does_not_kill_when_events_flow(tmp_path, monkeypatch):
 
     closes: list = []
     dummy_client = SimpleNamespace()
-    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: dummy_client)
     monkeypatch.setattr(
-        agent, "_abort_request_openai_client",
+        agent, "_create_request_openai_client", lambda **k: dummy_client
+    )
+    monkeypatch.setattr(
+        agent,
+        "_abort_request_openai_client",
         lambda c, reason=None: closes.append(reason),
     )
     monkeypatch.setattr(
-        agent, "_close_request_openai_client",
+        agent,
+        "_close_request_openai_client",
         lambda c, reason=None: closes.append(reason),
     )
 
@@ -146,12 +242,6 @@ def test_ttfb_does_not_kill_when_events_flow(tmp_path, monkeypatch):
     resp = h.interruptible_api_call(agent, {"model": "gpt-5.5", "input": "hi"})
     assert resp is sentinel
     assert "codex_ttfb_kill" not in closes
-
-
-
-
-
-
 
 
 @pytest.mark.parametrize(
@@ -176,10 +266,6 @@ def test_wait_notice_omits_reconnect_when_all_deadlines_are_non_finite(
     )
 
     assert recovery == ""
-
-
-
-
 
 
 def test_moa_heartbeat_survives_infinite_stale_timeout(monkeypatch):
@@ -285,67 +371,161 @@ def test_wait_notice_formatting_error_does_not_abort_request(monkeypatch):
     assert result is response
 
 
-
-
-
-
-
-
-
-
-def test_large_codex_request_hard_ceiling_reclaims_silent_stall(tmp_path, monkeypatch):
-    """#64507 regression: a large Codex request (TTFB watchdog disabled by the
-    size gate, stale floor *raised*) that never emits a single byte must still
-    be reclaimed at a finite hard ceiling — not hang for 13+ minutes while the
-    worker stays idle and the session shows as active.
-
-    Uses the real default TTFB threshold (120s) and asserts the request dies at
-    the hard ceiling regardless of the size-based TTFB disable.
-    """
+@pytest.mark.parametrize(
+    "mode,step,expected_now,timeout_class,close_reason,first_event",
+    [
+        ("none", 121.0, 121.0, "ttfb_timeout", "codex_ttfb_kill", False),
+        ("none", 13.0, 13.0, "sse_idle_timeout", "codex_stream_idle_kill", True),
+        # #64507: keepalives cannot hide a request with no semantic progress.
+        (
+            "keepalive",
+            600.0,
+            1800.0,
+            "no_progress_timeout",
+            "codex_no_progress_timeout",
+            False,
+        ),
+        (
+            "semantic",
+            600.0,
+            7200.0,
+            "total_request_timeout",
+            "codex_total_request_timeout",
+            False,
+        ),
+    ],
+    ids=["ttfb", "sse-idle", "no-progress", "configured-total"],
+)
+def test_codex_timeout_classes_use_fake_clock_and_retry_path(
+    tmp_path,
+    monkeypatch,
+    mode,
+    step,
+    expected_now,
+    timeout_class,
+    close_reason,
+    first_event,
+):
     from agent import chat_completion_helpers as h
+    from agent.error_classifier import classify_api_error
 
-    agent = _make_codex_agent(tmp_path, monkeypatch)
-    # Real default TTFB threshold (no HERMES_CODEX_TTFB_* override) → for a
-    # >10k-token request the no-byte TTFB watchdog is auto-disabled.
-    monkeypatch.setenv("HERMES_CODEX_HARD_TIMEOUT_SECONDS", "3")
-
-    closes: list = []
-    dummy_client = SimpleNamespace()
-    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: dummy_client)
-    monkeypatch.setattr(
-        agent, "_abort_request_openai_client",
-        lambda c, reason=None: closes.append(reason),
+    agent = _make_codex_agent(
+        tmp_path,
+        monkeypatch,
+        config=_CODEX_7200_CONFIG,
     )
-    monkeypatch.setattr(
-        agent, "_close_request_openai_client",
-        lambda c, reason=None: closes.append(reason),
+    assert agent._resolved_api_call_timeout() == 7200.0
+    monkeypatch.setattr(agent, "_compute_non_stream_stale_timeout", lambda *_a: 1200.0)
+    clock = _FakeClock()
+    call = _prepare_clocked_call(agent, monkeypatch, clock, first_event=first_event)
+
+    def activity(now):
+        if mode in {"keepalive", "semantic"}:
+            setattr(agent, "_codex_stream_last_event_ts", now)
+        if mode == "semantic":
+            setattr(agent, "_codex_stream_last_progress_ts", now)
+
+    workers = _install_clocked_worker(
+        monkeypatch, h, clock, call.ready, step=step, on_poll=activity
     )
-
-    stop = {"flag": False}
-
-    def fake_hang(api_kwargs, client=None, on_first_delta=None):
-        # No event marker AND no event ever: the exact issue-64507 stall.
-        deadline = time.time() + 120
-        while time.time() < deadline and not stop["flag"] and not agent._interrupt_requested:
-            time.sleep(0.02)
-        raise RuntimeError("connection closed")
-
-    monkeypatch.setattr(agent, "_run_codex_stream", fake_hang)
-
-    large_input = "x" * 44_000  # ~11k estimated tokens → TTFB disabled, stale raised
-    t0 = time.time()
     try:
         with pytest.raises(TimeoutError) as excinfo:
-            h.interruptible_api_call(agent, {"model": "gpt-5.5", "input": large_input})
-        elapsed = time.time() - t0
-        # Must die at the hard ceiling (3s), nowhere near the raised stale floor.
-        assert elapsed < 30, f"hard ceiling took {elapsed:.1f}s — stall not reclaimed"
-        assert "stale_call_kill" in closes, f"stale kill expected, got {closes}"
-        assert "timed out after" in str(excinfo.value)
-        assert "with no response" in str(excinfo.value)
+            h.interruptible_api_call(agent, {"model": "gpt-5.5", "input": "hi"})
+        assert clock.now == expected_now
+        assert f"timeout_class={timeout_class}" in str(excinfo.value)
+        assert call.closes.count(close_reason) == 1
+        assert classify_api_error(excinfo.value).retryable is True
     finally:
-        stop["flag"] = True
+        call.release.set()
+        for worker in workers:
+            worker.wait()
 
 
+def test_semantic_progress_survives_1200_and_1500_seconds(tmp_path, monkeypatch):
+    from agent import chat_completion_helpers as h
+
+    agent = _make_codex_agent(
+        tmp_path,
+        monkeypatch,
+        config=_CODEX_7200_CONFIG,
+    )
+    monkeypatch.setattr(agent, "_compute_non_stream_stale_timeout", lambda *_a: 1200.0)
+    clock = _FakeClock()
+    call = _prepare_clocked_call(agent, monkeypatch, clock)
+
+    def semantic_progress(now):
+        setattr(agent, "_codex_stream_last_event_ts", now)
+        setattr(agent, "_codex_stream_last_progress_ts", now)
+        if now >= 2400.0:
+            call.complete["value"] = True
+            call.release.set()
+
+    workers = _install_clocked_worker(
+        monkeypatch, h, clock, call.ready, step=600.0, on_poll=semantic_progress
+    )
+    try:
+        response = h.interruptible_api_call(agent, {"model": "gpt-5.5", "input": "hi"})
+        assert response is call.sentinel
+        assert clock.now == 2400.0
+        assert not any(reason and "timeout" in reason for reason in call.closes)
+    finally:
+        call.release.set()
+        for worker in workers:
+            worker.wait()
 
 
+def test_broken_codex_transport_surfaces_to_bounded_recovery(tmp_path, monkeypatch):
+    from agent import chat_completion_helpers as h
+    from agent.error_classifier import classify_api_error
+
+    agent = _make_codex_agent(tmp_path, monkeypatch)
+    transport_error = ConnectionError("incomplete chunked read")
+    dummy_client = SimpleNamespace()
+    closes = []
+    monkeypatch.setattr(
+        agent, "_create_request_openai_client", lambda **_k: dummy_client
+    )
+    monkeypatch.setattr(
+        agent,
+        "_close_request_openai_client",
+        lambda _client, reason=None: closes.append(reason),
+    )
+    monkeypatch.setattr(
+        agent,
+        "_run_codex_stream",
+        lambda *_a, **_k: (_ for _ in ()).throw(transport_error),
+    )
+
+    with pytest.raises(ConnectionError) as excinfo:
+        h.interruptible_api_call(agent, {"model": "gpt-5.5", "input": "hi"})
+
+    assert excinfo.value is transport_error
+    assert closes.count("request_error_cleanup") == 1
+    assert classify_api_error(excinfo.value).retryable is True
+
+
+def test_codex_parser_counts_only_semantic_sse_progress():
+    from agent.codex_runtime import _consume_codex_event_stream
+
+    progress = []
+    response = _consume_codex_event_stream(
+        [
+            SimpleNamespace(type="response.created"),
+            SimpleNamespace(type="response.in_progress"),
+            SimpleNamespace(type="response.output_text.delta", delta="answer"),
+            SimpleNamespace(type="response.reasoning_text.delta", delta="thinking"),
+            SimpleNamespace(type="response.function_call_arguments.delta", delta="{}"),
+            SimpleNamespace(
+                type="response.custom_tool_call_input.delta", delta="search query"
+            ),
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(status="completed"),
+            ),
+        ],
+        model="gpt-5.5",
+        on_progress=lambda: progress.append(True),
+    )
+
+    assert response.status == "completed"
+    assert len(progress) == 4

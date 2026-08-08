@@ -1248,6 +1248,15 @@ def _classify_by_status(
                 should_fallback=True,
                 error_context=ctx,
             )
+        # Codex's account usage ceiling is terminal once pool rotation has no
+        # credential left; ordinary 429 throttles remain retryable below.
+        if error_code.lower() == "usage_limit_reached":
+            return result_fn(
+                FailoverReason.billing,
+                retryable=False,
+                should_rotate_credential=True,
+                should_fallback=True,
+            )
         return result_fn(
             FailoverReason.rate_limit,
             retryable=True,

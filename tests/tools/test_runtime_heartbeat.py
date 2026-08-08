@@ -93,6 +93,18 @@ def test_exact_1700_ignores_family_default_ratio_and_clamps():
     assert resolve_heartbeat_interval(_runtime(), "openai-codex") == 1700
 
 
+def test_named_custom_openai_codex_uses_base_mapping_but_unknown_alias_fails_closed():
+    from tools.runtime_heartbeat import HeartbeatConfigError, resolve_heartbeat_interval
+
+    runtime = _runtime()
+    runtime["warm_kv_timeout"]["providers"] = {"openai-codex": 1700}
+    assert resolve_heartbeat_interval(runtime, "custom:openai-codex") == 1700
+
+    runtime["warm_kv_timeout"]["providers"] = {"pm": 1700}
+    with pytest.raises(HeartbeatConfigError, match="custom:pm"):
+        resolve_heartbeat_interval(runtime, "custom:pm")
+
+
 def test_bound_custom_identity_reaches_live_target_with_exact_interval(monkeypatch):
     from tools.runtime_heartbeat import (
         RuntimeHeartbeat,

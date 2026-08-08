@@ -991,14 +991,15 @@ def _existing_workspace_directory(
     candidate = candidate.strip()
     if not candidate or candidate.startswith("//") or not os.path.isabs(candidate):
         return None
-    if container_paths:
-        from tools.terminal_tool import _is_unusable_container_cwd
+    from tools.terminal_tool import _is_unusable_container_cwd
 
-        if _is_unusable_container_cwd(candidate):
-            return None
+    if container_paths and _is_unusable_container_cwd(os.path.normpath(candidate)):
+        return None
     try:
         path = os.path.realpath(os.path.expanduser(candidate))
     except (OSError, TypeError, ValueError):
+        return None
+    if container_paths and _is_unusable_container_cwd(path):
         return None
     return path if os.path.isdir(path) else None
 
@@ -1018,7 +1019,9 @@ def _resolve_workspace_hint(
     for task_text in (goal, context):
         if not isinstance(task_text, str):
             continue
+        task_text = task_text.removeprefix("\ufeff")
         fence: Optional[tuple[str, int]] = None
+        html_comment = False
         for line in task_text.splitlines():
             fence_match = _MARKDOWN_FENCE_RE.match(line)
             if fence is not None:
@@ -1030,6 +1033,15 @@ def _resolve_workspace_hint(
             if fence_match:
                 marker = fence_match.group(1)
                 fence = (marker[0], len(marker))
+                continue
+            if html_comment:
+                if "-->" in line:
+                    html_comment = False
+                continue
+            if "<!--" in line:
+                html_comment = "-->" not in line.split("<!--", 1)[1]
+                continue
+            if line.startswith("\t") or len(line) - len(line.lstrip(" ")) >= 4:
                 continue
             declaration = _TASK_WORKSPACE_DECLARATION_RE.fullmatch(line)
             workspace = _existing_workspace_directory(

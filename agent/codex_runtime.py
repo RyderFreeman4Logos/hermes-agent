@@ -1520,19 +1520,21 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             ConnectionError,
         ) as exc:
             _finish_diagnostic(None, "error")
-            if attempt < max_stream_retries:
+            if attempt < max_stream_retries and isinstance(exc, _httpx.ConnectError):
                 logger.debug(
-                    "Codex Responses failure_class=transport_failure phase=connect "
-                    "attempt=%s/%s; retrying. %s error=%s",
+                    "Codex Responses connect failure before acceptance; retrying "
+                    "attempt=%s/%s. %s error=%s",
                     attempt + 1,
                     max_stream_retries + 1,
                     agent._client_log_context(),
                     exc,
                 )
                 continue
+            setattr(exc, "_hermes_ambiguous_provider_acceptance", True)
             logger.warning(
-                "Codex Responses failure_class=transport_failure phase=connect "
-                "attempt=%s/%s error_type=%s. %s",
+                "Codex Responses transport failure may follow provider acceptance; "
+                "not replaying a fresh request. phase=connect attempt=%s/%s "
+                "error_type=%s. %s",
                 attempt + 1, max_stream_retries + 1, type(exc).__name__,
                 agent._client_log_context(),
             )
@@ -1563,28 +1565,23 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 )
             except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
                 _finish_diagnostic(None, "error")
-                if attempt < max_stream_retries:
-                    logger.debug(
-                        "Codex Responses stream transport failed mid-iteration "
-                        "(attempt %s/%s); retrying. %s error=%s",
-                        attempt + 1, max_stream_retries + 1,
-                        agent._client_log_context(), exc,
-                    )
-                    continue
+                setattr(exc, "_hermes_ambiguous_provider_acceptance", True)
                 logger.warning(
-                    "Codex Responses failure_class=transport_failure phase=stream "
-                    "attempt=%s/%s error_type=%s. %s",
-                    attempt + 1, max_stream_retries + 1, type(exc).__name__,
-                    agent._client_log_context(),
+                    "Codex Responses stream transport failed after dispatch; "
+                    "not replaying a fresh request. attempt=%s/%s "
+                    "error_type=%s. %s",
+                    attempt + 1, max_stream_retries + 1,
+                    type(exc).__name__, agent._client_log_context(), exc,
                 )
                 raise
-            except RuntimeError:
+            except RuntimeError as exc:
                 if event_stream.final_response is not None:
                     _finish_diagnostic(
                         getattr(event_stream.final_response, "usage", None),
                         str(getattr(event_stream.final_response, "status", None) or "completed"),
                     )
                     return event_stream.final_response
+                setattr(exc, "_hermes_ambiguous_provider_acceptance", True)
                 _finish_diagnostic(None, "error")
                 raise
 

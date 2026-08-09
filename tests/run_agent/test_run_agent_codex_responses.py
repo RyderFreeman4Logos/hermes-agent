@@ -1734,12 +1734,12 @@ def _codex_unreplayable_reasoning_response(text: str):
 
 
 def test_codex_incomplete_budget_issues_three_continuations(monkeypatch):
-    """Three declared continuations produce three physical follow-up calls."""
+    """Three declared continuations remain exactly three physical follow-ups."""
     agent = _build_agent(monkeypatch)
     responses = [
         _codex_unreplayable_reasoning_response(f"Thinking {index}")
-        for index in range(4)
-    ]
+        for index in range(3)
+    ] + [_codex_message_response("Completed after three continuations")]
     calls = []
     notices = []
 
@@ -1759,10 +1759,8 @@ def test_codex_incomplete_budget_issues_three_continuations(monkeypatch):
         "(3/3)",
     ]
     assert result["api_calls"] == 4
-    assert result["final_response"] == (
-        "Codex response remained incomplete after 3 continuation attempts"
-    )
-    assert result["error"] == result["final_response"]
+    assert result["completed"] is True
+    assert result["final_response"] == "Completed after three continuations"
     assert getattr(agent, "_codex_incomplete_retries") == 0
 
     nudge_count = sum(
@@ -1779,6 +1777,81 @@ def test_codex_incomplete_budget_issues_three_continuations(monkeypatch):
         pair not in (("user", "user"), ("tool", "user"))
         for pair in zip(roles, roles[1:])
     )
+
+
+def test_codex_incomplete_continues_past_local_count_until_late_completion(monkeypatch):
+    """A local continuation count is progress reporting, never a turn terminator."""
+    agent = _build_agent(monkeypatch)
+    agent.max_iterations = 4  # The old fixed continuation path ended here.
+    responses = [
+        _codex_incomplete_with_reasoning(f"Partial {index}", f"rs_{index}")
+        for index in range(10)
+    ] + [_codex_message_response("Late completion")]
+    lineage = []
+
+    def _fake_api_call(api_kwargs):
+        lineage.append(getattr(agent, "_codex_incomplete_retries", None))
+        return responses.pop(0)
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _fake_api_call)
+
+    result = agent.run_conversation("continue the same turn")
+
+    assert result["completed"] is True
+    assert result["final_response"] == "Late completion"
+    assert result["api_calls"] == 11
+    assert lineage == list(range(11))
+    assert getattr(agent, "_codex_incomplete_retries") == 0
+
+
+def test_codex_ambiguous_post_accept_failure_is_not_replayed(monkeypatch):
+    """Without a provider resume handle, preserve ambiguity instead of rebilling."""
+    agent = _build_agent(monkeypatch)
+    calls = []
+    ambiguous = RuntimeError("stream ended after dispatch")
+    ambiguous._hermes_ambiguous_provider_acceptance = True
+
+    def _fake_api_call(_kwargs):
+        calls.append(None)
+        if len(calls) == 1:
+            raise ambiguous
+        return _codex_message_response("This must not be requested")
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _fake_api_call)
+
+    result = agent.run_conversation("do not replay an ambiguous request")
+
+    assert len(calls) == 1
+    assert result["completed"] is False
+    assert result["partial"] is True
+    assert result["ambiguous_provider_attempt"] is True
+
+
+def test_codex_unreplayable_incomplete_backs_off_without_ending_turn(monkeypatch):
+    """No replay state waits before the next billed continuation, not a busy loop."""
+    from agent import conversation_loop
+
+    agent = _build_agent(monkeypatch)
+    responses = [
+        _codex_unreplayable_reasoning_response("Still thinking"),
+        _codex_message_response("Finished after backoff"),
+    ]
+    now = [0.0]
+    sleeps = []
+    monkeypatch.setattr(agent, "_interruptible_api_call", lambda _kwargs: responses.pop(0))
+    monkeypatch.setattr(conversation_loop, "jittered_backoff", lambda *_args, **_kwargs: 0.4)
+    clock = types.SimpleNamespace(
+        time=lambda: now[0],
+        monotonic=lambda: now[0],
+        sleep=lambda delay: (sleeps.append(delay), now.__setitem__(0, now[0] + delay)),
+    )
+    monkeypatch.setattr(conversation_loop, "time", clock)
+
+    result = agent.run_conversation("wait for the same continuation")
+
+    assert result["completed"] is True
+    assert result["final_response"] == "Finished after backoff"
+    assert sleeps == [0.2, 0.2]
 
 
 def test_codex_incomplete_counter_resets_after_completion_and_new_turn(monkeypatch):

@@ -561,6 +561,28 @@ describe('createGatewayEventHandler', () => {
     expect(appended[1]).toMatchObject({ role: 'assistant', text: 'final answer' })
   })
 
+  it('replaces an overflowed reasoning phase from terminal authority without moving its tool boundary', () => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+    onEvent({ payload: {}, type: 'message.start' } as any)
+    onEvent({ payload: { text: 'reasoning before tool' }, type: 'reasoning.delta' } as any)
+    onEvent({ payload: { context: 'repo', name: 'search', tool_id: 'tool-1' }, type: 'tool.start' } as any)
+    onEvent({ payload: { name: 'search', summary: 'done', tool_id: 'tool-1' }, type: 'tool.complete' } as any)
+    onEvent({ payload: { resync: true }, type: 'reasoning.delta' } as any)
+    onEvent({ payload: { text: 'trailing fragment' }, type: 'reasoning.delta' } as any)
+    onEvent({
+      payload: { reasoning: 'authoritative reasoning after tool', text: 'final answer' },
+      type: 'message.complete'
+    } as any)
+
+    const reasoning = appended.map(msg => msg.thinking).filter(Boolean)
+
+    expect(reasoning).toEqual(['reasoning before tool', 'authoritative reasoning after tool'])
+    expect(appended[0]?.tools?.[0]).toContain('Search')
+    expect(appended[appended.length - 1]).toMatchObject({ role: 'assistant', text: 'final answer' })
+  })
+
   it('renders browser.progress events as system transcript lines as they stream in', () => {
     const appended: Msg[] = []
     const ctx = buildCtx(appended)

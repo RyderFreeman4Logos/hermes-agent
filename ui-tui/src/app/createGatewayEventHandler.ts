@@ -1058,8 +1058,12 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         return
 
       case 'reasoning.delta':
-        if (ev.payload?.text) {
-          turnController.recordReasoningDelta(ev.payload.text, Boolean(ev.payload.verbose))
+        if (ev.payload?.text || ev.payload?.resync) {
+          turnController.recordReasoningDelta(
+            String(ev.payload.text ?? ''),
+            Boolean(ev.payload.verbose),
+            Boolean(ev.payload.resync)
+          )
         }
 
         return

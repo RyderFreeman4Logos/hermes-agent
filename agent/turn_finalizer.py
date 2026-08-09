@@ -250,7 +250,24 @@ def retry_pending_completion_delivery_commit(agent, messages) -> str:
     pending = getattr(agent, "_pending_completion_delivery_suffix", None)
     start = completion_delivery_suffix_start(messages)
     if not isinstance(pending, list) or not pending or start is None:
-        return "none"
+        outcome = (
+            "missing_pending_suffix"
+            if not isinstance(pending, list) or not pending
+            else "missing_active_marker"
+        )
+        if start is not None:
+            del messages[start:]
+        agent._pending_completion_delivery_suffix = None
+        agent._pending_completion_delivery_display_metadata_cas = None
+        agent._completion_delivery_commit_failed = False
+        agent._persist_user_message_idx = None
+        agent._persist_user_message_override = None
+        agent._db_flush_scan_prefix = None
+        try:
+            agent._save_session_log(messages)
+        except Exception:
+            pass
+        return outcome
     staged = list(messages[:start]) + copy.deepcopy(pending)
     metadata_cas = copy.deepcopy(getattr(
         agent, "_pending_completion_delivery_display_metadata_cas", None

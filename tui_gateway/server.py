@@ -5271,9 +5271,9 @@ def _cache_info_from_usage(usage: Any) -> dict[str, int | str] | None:
         if read_tokens
         else "cold_write"
         if write_tokens
-        else "unknown"
-        if prompt_tokens < 1024
         else "miss"
+        if telemetry_present is True
+        else "unknown"
     )
     cache_info: dict[str, int | str] = {
         "read_tokens": read_tokens,
@@ -6109,8 +6109,24 @@ def _agent_cbs(sid: str) -> dict:
 
 
 def _attach_tui_cache_callback(agent, sid: str):
-    """Attach the first-provider-call cache signal to a live TUI agent."""
-    def emit_cache_state(state: str, pct: int, read: int, prompt: int) -> None:
+    """Attach content-free provider-response cache records to one TUI session."""
+    agent._tui_cache_owner_session = sid
+
+    def emit_cache_state(
+        state: str, pct: int, read: int, prompt: int, record: dict | None = None
+    ) -> None:
+        session = _sessions.get(sid)
+        publish_record = (
+            isinstance(record, dict) and isinstance(session, dict) and session.get("agent") is agent
+        )
+        if publish_record:
+            saved = dict(record)
+            session.setdefault("provider_response_records", []).append(saved)
+            session.setdefault("first_provider_response", saved)
+        # Later calls remain observable in the session record but never replace
+        # the first response displayed for this attribution boundary.
+        if isinstance(record, dict) and int(record.get("request_index", 1)) > 1:
+            return
         cache_info = _cache_info_from_usage(
             getattr(agent, "_first_turn_usage", None)
         ) or {
@@ -6120,8 +6136,12 @@ def _attach_tui_cache_callback(agent, sid: str):
             "state": state,
             "level": _cache_level(pct),
         }
-        state = str(cache_info["state"])
-        pct = int(cache_info["pct"])
+        if isinstance(record, dict):
+            state = str(record.get("state", state))
+            pct = int(record.get("pct", 0))
+        else:
+            state = str(cache_info["state"])
+            pct = int(cache_info["pct"])
         text = (
             f"cache {pct}%"
             if state == "hit"
@@ -6133,19 +6153,14 @@ def _attach_tui_cache_callback(agent, sid: str):
             text += f" · {cache_info['note']}"
         kind = "error" if cache_info["level"] == "error" else "cache_hit"
         payload = {"kind": kind, "text": text}
-        if (
-            getattr(agent, "_tui_first_provider_response_record_enabled", False)
-            and not getattr(agent, "_tui_first_provider_response_recorded", False)
-        ):
-            agent._tui_first_provider_response_recorded = True
+        if publish_record:
+            wire_record = dict(record)
+            wire_record.pop("owner_session_id", None)
             identity = f"{sid}:{getattr(agent, 'session_id', '')}".encode()
-            payload["first_provider_response"] = {
-                "turn_origin": str(getattr(agent, "_tui_turn_origin", "user")),
-                "request_index": 1,
-                "timestamp": time.time(),
-                "owner": "tui_gateway",
-                "session": hashlib.sha256(identity).hexdigest(),
-            }
+            wire_record.update(
+                owner="tui_gateway", session=hashlib.sha256(identity).hexdigest()
+            )
+            payload["cache_record"] = wire_record
         _emit("status.update", sid, payload)
 
     agent._tui_cache_callback = emit_cache_state
@@ -9669,7 +9684,7 @@ def _dispatch_completion_batch(
                 text,
                 display_kind="async_delegation_complete",
                 display_metadata=_async_delegation_display_metadata(evt),
-                turn_origin="subagent-result",
+                turn_origin="subagent_result",
                 completion_delivery_callback=lambda outcome: [
                     _finish_async_completion_claim(item["evt"], claim, outcome)
                     for item, claim in async_claims
@@ -9678,7 +9693,7 @@ def _dispatch_completion_batch(
             )
         else:
             _run_prompt_submit(
-                rid, sid, session, prompt, turn_origin="background-completion", **kwargs
+                rid, sid, session, prompt, turn_origin="background_completion", **kwargs
             )
         for item, claim in claimed:
             if item["evt"].get("type") != "async_delegation":
@@ -10010,7 +10025,10 @@ def _notification_poller_loop(
                     rid = f"__notif__{int(time.time() * 1000)}"
                     try:
                         _emit("message.start", sid)
-                        _run_prompt_submit(rid, sid, session, "\n".join(_batch))
+                        _run_prompt_submit(
+                            rid, sid, session, "\n".join(_batch),
+                            turn_origin="background_completion",
+                        )
                     except Exception as exc:
                         print(
                             f"[tui_gateway] kanban notification dispatch failed: "
@@ -10248,9 +10266,6 @@ def _handle_heartbeat_event(sid: str, session: dict, evt: dict) -> None:
 
     def _warm() -> None:
         try:
-            agent._tui_turn_origin = "heartbeat_warm"
-            agent._tui_first_provider_response_record_enabled = True
-            agent._tui_first_provider_response_recorded = False
             agent.run_conversation(
                 "",
                 turn_origin="heartbeat_warm",
@@ -10463,6 +10478,9 @@ def _run_prompt_submit(
     turn_origin: str | None = None,
     heartbeat_event: Any = None,
 ) -> None:
+    turn_origin = turn_origin or (
+        "background_completion" if completion_delivery else "user"
+    )
     heartbeat_turn = turn_origin == "heartbeat_warm"
     with session["history_lock"]:
         if (
@@ -10485,12 +10503,10 @@ def _run_prompt_submit(
             not isinstance(inflight, dict) or inflight.get("status") == "error"
         ):
             _start_inflight_turn(session, text)
+        if not heartbeat_turn:
+            session.pop("first_provider_response", None)
+            session["provider_response_records"] = []
         agent = session["agent"]
-        agent._tui_turn_origin = turn_origin or (
-            "background-completion" if completion_delivery else "user"
-        )
-        agent._tui_first_provider_response_record_enabled = True
-        agent._tui_first_provider_response_recorded = False
         if not heartbeat_turn and hasattr(agent, "clear_interrupt"):
             try:
                 agent.clear_interrupt()

@@ -17,6 +17,7 @@ compatibility.
 from __future__ import annotations
 
 import json
+import inspect
 import logging
 import time
 from types import SimpleNamespace
@@ -1378,7 +1379,11 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     from agent import physical_attempt_diagnostics, relay_llm
 
     active_client = client or agent._ensure_primary_openai_client(reason="codex_stream_direct")
-    raw_client = getattr(active_client, "_real_client", active_client)
+    raw_client = (
+        getattr(active_client, "_real_client")
+        if inspect.getattr_static(active_client, "_real_client", None) is not None
+        else active_client
+    )
     response_create = getattr(getattr(raw_client, "responses", None), "create", None)
     if not callable(response_create):
         raise TypeError(

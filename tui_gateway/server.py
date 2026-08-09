@@ -9640,21 +9640,33 @@ def _dispatch_completion_batch(
         kwargs: dict[str, Any] = {}
         if is_completion:
             kwargs["completion_delivery"] = True
-        if len(claimed) == 1 and claimed[0][0]["evt"].get("type") == "async_delegation":
-            evt = claimed[0][0]["evt"]
+        async_claims = [
+            (item, claim)
+            for item, claim in claimed
+            if item["evt"].get("type") == "async_delegation"
+        ]
+        if async_claims:
+            evt = async_claims[0][0]["evt"]
+            text = claimed[0][0].get("text") or prompt if len(claimed) == 1 else prompt
             _run_prompt_submit(
                 rid,
                 sid,
                 session,
-                claimed[0][0].get("text") or prompt,
+                text,
                 display_kind="async_delegation_complete",
                 display_metadata=_async_delegation_display_metadata(evt),
+                completion_delivery_callback=lambda outcome: [
+                    _finish_async_completion_claim(item["evt"], claim, outcome)
+                    for item, claim in async_claims
+                ],
+                **kwargs,
             )
         else:
             _run_prompt_submit(rid, sid, session, prompt, **kwargs)
         for item, claim in claimed:
-            complete_event_delivery(item["evt"], claim)
-            process_registry.complete_completion_delivery(item["evt"])
+            if item["evt"].get("type") != "async_delegation":
+                complete_event_delivery(item["evt"], claim)
+                process_registry.complete_completion_delivery(item["evt"])
     except Exception as exc:
         for item, claim in claimed:
             release_event_delivery(item["evt"], claim)
@@ -9667,6 +9679,27 @@ def _dispatch_completion_batch(
         )
         with session["history_lock"]:
             session["running"] = False
+
+
+def _finish_async_completion_claim(evt: dict, claim_id: str, outcome: str) -> None:
+    """ACK a durable completion only after its provider turn and suffix commit."""
+    from tools.async_delegation import (
+        complete_event_delivery,
+        mark_completion_delivery_recovery,
+        release_event_delivery,
+    )
+    from tools.process_registry import process_registry
+
+    if outcome == "committed":
+        complete_event_delivery(evt, claim_id)
+        process_registry.complete_completion_delivery(evt)
+    elif outcome == "missing_active_marker":
+        mark_completion_delivery_recovery(evt, claim_id, outcome)
+        process_registry.complete_completion_delivery(evt)
+    else:
+        release_event_delivery(evt, claim_id)
+        process_registry.release_completion_delivery(evt)
+        process_registry.completion_queue.put(evt)
 
 
 def _collect_idle_completion_batch(
@@ -10406,6 +10439,7 @@ def _run_prompt_submit(
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
     completion_delivery: bool = False,
+    completion_delivery_callback: Callable[[str], None] | None = None,
     turn_origin: str | None = None,
     heartbeat_event: Any = None,
 ) -> None:
@@ -10459,6 +10493,19 @@ def _run_prompt_submit(
         # True once a failed turn's snapshot was retained for resume replay —
         # tells the finally below to skip the normal inflight clear.
         turn_error_retained = False
+        completion_delivery_finished = False
+
+        def _finish_completion_delivery(outcome: str) -> None:
+            """Resolve the durable claim only after this turn has concluded."""
+            nonlocal completion_delivery_finished
+            if completion_delivery_finished or completion_delivery_callback is None:
+                return
+            completion_delivery_finished = True
+            try:
+                completion_delivery_callback(outcome)
+            except Exception:
+                logger.warning("completion delivery callback failed", exc_info=True)
+
         # Durable crash marker: written before the turn runs, retired the
         # moment its outcome reaches the client (see _retire_turn_marker).
         # Any concluded turn — success, handled error, interrupt — retires
@@ -10778,20 +10825,24 @@ def _run_prompt_submit(
                 and isinstance(result, dict)
                 and result.get("silent_noop") is True
             )
+            completion_suffix_committed = completion_delivery_callback is None
             if display_kind and isinstance(text, str):
                 db = getattr(agent, "_session_db", None)
                 current_session_id = getattr(agent, "session_id", None) or session.get("session_key")
                 if db is not None:
                     try:
-                        db.set_latest_matching_message_display_kind(
-                            current_session_id,
-                            role="user",
-                            content=text,
-                            display_kind=display_kind,
-                            display_metadata=display_metadata,
+                        completion_suffix_committed = bool(
+                            db.set_latest_matching_message_display_kind(
+                                current_session_id,
+                                role="user",
+                                content=text,
+                                display_kind=display_kind,
+                                display_metadata=display_metadata,
+                            )
                         )
                     except Exception:
                         logger.debug("failed to stamp synthetic display kind", exc_info=True)
+                        completion_suffix_committed = False
                 if isinstance(result, dict) and isinstance(result.get("messages"), list):
                     for message in reversed(result["messages"]):
                         if message.get("role") == "user" and message.get("content") == text:
@@ -11007,6 +11058,11 @@ def _run_prompt_submit(
                     (result.get("error") if isinstance(result, dict) else "") or raw
                 )
                 payload["recoverable"] = True
+            _finish_completion_delivery(
+                "committed" if status == "complete" and completion_suffix_committed
+                else "missing_active_marker" if status == "complete"
+                else "provider_failed"
+            )
             if not heartbeat_turn:
                 _retire_turn_marker(session, marker_key)
             if not heartbeat_silent_noop:
@@ -11184,6 +11240,7 @@ def _run_prompt_submit(
             # Keep the partial turn available to the next prompt; the durable
             # inflight record still carries the recoverable error state.
             _restore_agent_history_after_turn_error(session, agent)
+            _finish_completion_delivery("provider_failed")
             try:
                 # Close the turn with the same terminal error frame shape as
                 # the returned-error path (uniform client handling), retaining

@@ -30,8 +30,8 @@ def _make_agent():
     return agent
 
 
-def _chunk(content=None, finish_reason=None, model=None):
-    delta = SimpleNamespace(content=content, tool_calls=None, reasoning_content=None, reasoning=None)
+def _chunk(content=None, tool_calls=None, finish_reason=None, model=None):
+    delta = SimpleNamespace(content=content, tool_calls=tool_calls, reasoning_content=None, reasoning=None)
     choice = SimpleNamespace(index=0, delta=delta, finish_reason=finish_reason)
     return SimpleNamespace(choices=[choice], model=model, usage=None)
 
@@ -86,6 +86,66 @@ def test_stream_callbacks_mark_visible_categories_and_callback_time(monkeypatch)
         ("visible", "text"), ("begin", "text"),
         ("delivered", "text"), ("end", "text"),
     ]
+
+
+def test_tool_call_content_uses_callback_and_transport_diagnostics(monkeypatch):
+    from agent import physical_attempt_diagnostics as diagnostics
+    from tui_gateway import server
+
+    attempt = diagnostics.Attempt(
+        "tool-call-content-attempt",
+        streamed=True,
+        started_ns=diagnostics.time.monotonic_ns(),
+    )
+    records = []
+    frames = []
+    tts = []
+
+    monkeypatch.setattr(diagnostics, "start_attempt", lambda *_args, **_kwargs: attempt)
+    monkeypatch.setattr(diagnostics, "_append", records.append)
+
+    class StdioTransport:
+        def write(self, obj):
+            frames.append(obj)
+            return True
+
+    monkeypatch.setattr(server, "current_transport", lambda: None)
+    monkeypatch.setattr(server, "_stdio_transport", StdioTransport())
+
+    tool_call = SimpleNamespace(
+        index=0,
+        id="call-1",
+        function=SimpleNamespace(name="terminal", arguments='{"command":"pwd"}'),
+    )
+    chunks = [
+        _chunk(tool_calls=[tool_call]),
+        _chunk(content="<think>suppressed tool-turn content</think>"),
+        _chunk(finish_reason="tool_calls", model="test-model"),
+    ]
+    client = MagicMock()
+    client.chat.completions.create.return_value = iter(chunks)
+    agent = _make_agent()
+    setattr(
+        agent,
+        "stream_delta_callback",
+        lambda text: server.write_json({"delta": text}),
+    )
+    setattr(agent, "_stream_callback", tts.append)
+    setattr(agent, "tool_gen_callback", None)
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda *_a, **_k: client)
+    monkeypatch.setattr(agent, "_close_request_openai_client", lambda *_a, **_k: None)
+
+    agent._interruptible_streaming_api_call({})
+
+    terminal = records[-1]
+    stage = terminal["stage_latency"]
+    assert terminal["attempt_digest"] == attempt.digest
+    assert frames == [{"delta": "<think>suppressed tool-turn content</think>"}]
+    assert tts == []
+    assert stage["first_visible_category"] == "text"
+    assert stage["visible_event_count"] == 1
+    assert stage["callbacks"]["text"]["count"] == 1
+    assert stage["transports"]["stdio"]["count"] == 1
 
 
 class TestSingleWriterSink:

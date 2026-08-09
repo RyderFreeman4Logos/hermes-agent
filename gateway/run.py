@@ -18355,7 +18355,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         task.add_done_callback(_done)
         return task
 
-    async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
+    async def _handle_message_with_agent(
+        self, event, source, _quick_key: str, run_generation: int
+    ):
+        """Run one guarded turn and always release completion receipts on cancel."""
+        try:
+            return await self._handle_message_with_agent_inner(
+                event, source, _quick_key, run_generation
+            )
+        except asyncio.CancelledError:
+            await self._finish_completion_delivery_receipt(
+                event, "provider_failed"
+            )
+            raise
+
+    async def _handle_message_with_agent_inner(
+        self, event, source, _quick_key: str, run_generation: int
+    ):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
@@ -20302,8 +20318,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key, session_entry.session_id
             )
 
-            if (getattr(event, "metadata", None) or {}).get(
-                "_completion_delivery_receipt"
+            if any(
+                (getattr(event, "metadata", None) or {}).get(key)
+                for key in (
+                    "_completion_delivery_receipt",
+                    "_completion_delivery_receipts",
+                )
             ):
                 from tools.process_registry import completion_result_delivery_outcome
 
@@ -20374,7 +20394,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return None
 
             return response
-            
+
         except Exception as e:
             await self._finish_completion_delivery_receipt(
                 event, "provider_failed"
@@ -24622,34 +24642,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     async def _finish_completion_delivery_receipt(
         self, event: MessageEvent, outcome: str
     ) -> None:
-        """Resolve a push completion only after the gateway turn is terminal."""
+        """Resolve push completions only after the gateway turn is terminal."""
         metadata = getattr(event, "metadata", None) or {}
-        receipt = metadata.pop("_completion_delivery_receipt", None)
-        if not isinstance(receipt, dict):
-            return
-        delivery_event = receipt.get("event")
-        claim_id = str(receipt.get("claim_id") or "")
-        if not isinstance(delivery_event, dict) or not claim_id:
-            return
         from tools.process_registry import finish_completion_event_delivery
 
-        terminal = await asyncio.to_thread(
-            finish_completion_event_delivery,
-            delivery_event,
-            claim_id,
-            outcome,
-        )
-        identity = self._completion_delivery_identity(delivery_event)
-        if identity is not None:
-            with self._completion_delivery_lock:
-                self._completion_deliveries_inflight.discard(identity)
-                if terminal:
-                    self._completion_deliveries_delivered[identity] = None
-                    while (
-                        len(self._completion_deliveries_delivered)
-                        > self._completion_delivery_retention
-                    ):
-                        self._completion_deliveries_delivered.popitem(last=False)
+        while True:
+            receipt = metadata.pop("_completion_delivery_receipt", None)
+            if not isinstance(receipt, dict):
+                receipts = metadata.get("_completion_delivery_receipts")
+                if not isinstance(receipts, list) or not receipts:
+                    metadata.pop("_completion_delivery_receipts", None)
+                    return
+                receipt = receipts.pop(0)
+                if not receipts:
+                    metadata.pop("_completion_delivery_receipts", None)
+            if not isinstance(receipt, dict):
+                continue
+            delivery_event = receipt.get("event")
+            claim_id = str(receipt.get("claim_id") or "")
+            if not isinstance(delivery_event, dict) or not claim_id:
+                continue
+            terminal = await asyncio.to_thread(
+                finish_completion_event_delivery,
+                delivery_event,
+                claim_id,
+                outcome,
+            )
+            identity = self._completion_delivery_identity(delivery_event)
+            if identity is not None:
+                with self._completion_delivery_lock:
+                    self._completion_deliveries_inflight.discard(identity)
+                    if terminal:
+                        self._completion_deliveries_delivered[identity] = None
+                        while (
+                            len(self._completion_deliveries_delivered)
+                            > self._completion_delivery_retention
+                        ):
+                            self._completion_deliveries_delivered.popitem(last=False)
 
     @staticmethod
     def _completion_delivery_identity(evt: dict) -> Optional[tuple[str, str, object]]:

@@ -400,6 +400,187 @@ def test_non_stream_defers_logical_success_and_reuses_scope_for_retry(relay_turn
     assert turn.logical_llm_calls == {}
 
 
+def test_non_responses_diagnostics_wrap_final_rewritten_physical_request(
+    relay_turn, monkeypatch
+):
+    relay, _turn = relay_turn
+    from agent import physical_attempt_diagnostics as diagnostics
+
+    starts = []
+    finishes = []
+    token = object()
+
+    def rewrite_request(_name, request, annotated):
+        return relay.LLMRequestInterceptOutcome(
+            relay.LLMRequest(request.headers, {**request.content, "temperature": 0.25}),
+            annotated,
+        )
+
+    monkeypatch.setattr(
+        diagnostics,
+        "start_attempt",
+        lambda request, **metadata: starts.append((request, metadata)) or token,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        diagnostics,
+        "finish_attempt",
+        lambda attempt, **terminal: finishes.append((attempt, terminal)),
+        raising=False,
+    )
+    relay.intercepts.register_llm_request(
+        "issue68-nonresponses-request", 1, False, rewrite_request
+    )
+    usage = SimpleNamespace(
+        prompt_tokens=13,
+        completion_tokens=3,
+        prompt_tokens_details=SimpleNamespace(cached_tokens=0),
+    )
+    try:
+        result = relay_llm.execute(
+            {"model": "test-model", "messages": []},
+            lambda _request: SimpleNamespace(usage=usage, content="done"),
+            session_id="session-1",
+            name="test-provider",
+            model_name="test-model",
+            metadata={
+                "api_mode": "custom",
+                "api_request_id": "request-diagnostics",
+                "call_role": "primary",
+                "platform": "reviewer",
+                "retry_count": 2,
+                "continuation": 1,
+            },
+        )
+    finally:
+        relay.intercepts.deregister_llm_request("issue68-nonresponses-request")
+
+    assert result.content == "done"
+    assert starts[0][0]["temperature"] == 0.25
+    assert starts[0][1] == {
+        "api_mode": "custom",
+        "route": "custom",
+        "provider": "test-provider",
+        "model": "test-model",
+        "role": "reviewer",
+        "retry": 2,
+        "continuation": 1,
+    }
+    assert finishes == [
+        (
+            token,
+            {
+                "usage": usage,
+                "outcome": "completed",
+                "api_mode": "custom",
+                "provider": "test-provider",
+            },
+        )
+    ]
+
+
+def test_bypassed_stream_diagnostics_finish_with_reported_usage(
+    relay_turn, monkeypatch
+):
+    _relay, turn = relay_turn
+    from agent import physical_attempt_diagnostics as diagnostics
+
+    turn.lease.host.release_managed_execution("test.relay_llm")
+    starts = []
+    finishes = []
+    token = object()
+    usage = SimpleNamespace(
+        prompt_tokens=21,
+        completion_tokens=5,
+        prompt_tokens_details=SimpleNamespace(cached_tokens=8),
+    )
+    monkeypatch.setattr(
+        diagnostics,
+        "start_attempt",
+        lambda request, **metadata: starts.append((request, metadata)) or token,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        diagnostics,
+        "finish_attempt",
+        lambda attempt, **terminal: finishes.append((attempt, terminal)),
+        raising=False,
+    )
+
+    stream = relay_llm.stream(
+        {"model": "test-model", "messages": []},
+        lambda _request: iter([SimpleNamespace(choices=[], usage=usage)]),
+        session_id="session-1",
+        name="test-provider",
+        model_name="test-model",
+        finalizer=dict,
+        metadata={
+            "api_mode": "chat_completions",
+            "call_role": "delegated",
+            "retry_count": 1,
+            "continuation": 2,
+        },
+    )
+
+    assert len(list(stream)) == 1
+    assert starts[0][1]["role"] == "subagent"
+    assert finishes == [
+        (
+            token,
+            {
+                "usage": usage,
+                "outcome": "completed",
+                "api_mode": "chat_completions",
+                "provider": "test-provider",
+            },
+        )
+    ]
+
+
+def test_internal_provider_fallback_starts_a_distinct_physical_attempt(
+    relay_turn, monkeypatch
+):
+    _relay, turn = relay_turn
+    from agent import physical_attempt_diagnostics as diagnostics
+
+    turn.lease.host.release_managed_execution("test.relay_llm")
+    starts = []
+    finishes = []
+    attempts = [object(), object()]
+    usage = SimpleNamespace(prompt_tokens=8, completion_tokens=2)
+    monkeypatch.setattr(
+        diagnostics,
+        "start_attempt",
+        lambda request, **metadata: starts.append((request, metadata))
+        or attempts[len(starts) - 1],
+    )
+    monkeypatch.setattr(
+        diagnostics,
+        "finish_attempt",
+        lambda attempt, **terminal: finishes.append((attempt, terminal)),
+    )
+
+    def dispatch(request):
+        relay_llm.start_fallback_attempt({**request, "stream": False})
+        return SimpleNamespace(usage=usage)
+
+    relay_llm.execute(
+        {"model": "test-model", "messages": [], "stream": True},
+        dispatch,
+        session_id="session-1",
+        name="test-provider",
+        model_name="test-model",
+        metadata={"api_mode": "anthropic_messages", "call_role": "primary"},
+    )
+
+    assert [request["stream"] for request, _metadata in starts] == [True, False]
+    assert [(attempt, terminal["outcome"]) for attempt, terminal in finishes] == [
+        (attempts[0], "error"),
+        (attempts[1], "completed"),
+    ]
+    assert finishes[1][1]["usage"] is usage
+
+
 def test_non_stream_result_survives_logical_scope_close_failure(
     relay_turn, monkeypatch
 ):

@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any
 
-from agent import relay_runtime
+from agent import physical_attempt_diagnostics, relay_runtime
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +27,204 @@ _TEXT_ONLY_REQUEST = contextvars.ContextVar(
     "relay_text_only_request",
     default=False,
 )
+_PHYSICAL_ATTEMPT = contextvars.ContextVar(
+    "relay_physical_attempt",
+    default=None,
+)
+
+
+def _field(value: Any, name: str) -> Any:
+    return value.get(name) if isinstance(value, dict) else getattr(value, name, None)
+
+
+def _attempt_role(metadata: dict[str, Any] | None) -> str:
+    if str((metadata or {}).get("platform") or "").lower() == "reviewer":
+        return "reviewer"
+    role = str((metadata or {}).get("call_role") or "").lower()
+    if role == "delegated":
+        return "subagent"
+    if role == "fallback":
+        return "fallback"
+    if role.startswith("auxiliary:"):
+        return "auxiliary"
+    return "main" if role in {"primary", "iteration_summary"} else "unknown"
+
+
+def _start_attempt(
+    request: dict[str, Any],
+    *,
+    name: str,
+    model_name: str,
+    metadata: dict[str, Any] | None,
+):
+    api_mode = str(
+        (metadata or {}).get("physical_api_mode")
+        or (metadata or {}).get("api_mode")
+        or "unknown"
+    )
+    if api_mode == "codex_responses":
+        return None
+    return physical_attempt_diagnostics.start_attempt(
+        request,
+        api_mode=api_mode,
+        route=api_mode,
+        provider=name,
+        model=str(request.get("model") or model_name or "unknown"),
+        role=_attempt_role(metadata),
+        retry=max(0, int((metadata or {}).get("retry_count") or 0)),
+        continuation=max(0, int((metadata or {}).get("continuation") or 0)),
+    )
+
+
+def _response_usage(response: Any) -> Any:
+    return _field(response, "usage")
+
+
+def _stream_usage(current: Any, chunk: Any) -> Any:
+    usage = _response_usage(chunk)
+    if usage is None:
+        usage = _field(_field(chunk, "message"), "usage")
+    if usage is None:
+        bedrock = _field(_field(chunk, "metadata"), "usage")
+        if isinstance(bedrock, dict):
+            from agent.bedrock_adapter import _normalize_converse_usage
+
+            usage = _normalize_converse_usage(bedrock)
+    if usage is None:
+        return current
+    if current is None:
+        return usage
+    previous = _jsonable(current)
+    update = _jsonable(usage)
+    if isinstance(previous, dict) and isinstance(update, dict):
+        return _namespace({**previous, **update})
+    return usage
+
+
+def _finish_attempt(
+    attempt: Any,
+    *,
+    response: Any = None,
+    usage: Any = None,
+    outcome: str,
+    name: str,
+    metadata: dict[str, Any] | None,
+) -> None:
+    physical_attempt_diagnostics.finish_attempt(
+        attempt,
+        usage=usage if usage is not None else _response_usage(response),
+        outcome=outcome,
+        api_mode=str(
+            (metadata or {}).get("physical_api_mode")
+            or (metadata or {}).get("api_mode")
+            or "unknown"
+        ),
+        provider=name,
+    )
+
+
+def _attempt_tracker(
+    request: dict[str, Any],
+    *,
+    name: str,
+    model_name: str,
+    metadata: dict[str, Any] | None,
+) -> dict[str, Any]:
+    return {
+        "attempt": _start_attempt(
+            request, name=name, model_name=model_name, metadata=metadata
+        ),
+        "usage": None,
+        "name": name,
+        "model_name": model_name,
+        "metadata": metadata,
+        "finished": False,
+    }
+
+
+def _finish_tracker(
+    tracker: dict[str, Any], outcome: str, *, response: Any = None
+) -> None:
+    if tracker["finished"]:
+        return
+    tracker["finished"] = True
+    _finish_attempt(
+        tracker["attempt"],
+        response=response,
+        usage=tracker["usage"],
+        outcome=outcome,
+        name=tracker["name"],
+        metadata=tracker["metadata"],
+    )
+
+
+@contextmanager
+def _physical_attempt_context(tracker: dict[str, Any]) -> Iterator[None]:
+    token = _PHYSICAL_ATTEMPT.set(tracker)
+    try:
+        yield
+    finally:
+        _PHYSICAL_ATTEMPT.reset(token)
+
+
+def start_fallback_attempt(request: dict[str, Any]) -> None:
+    """End the active dispatch and identify an in-callback provider fallback."""
+    tracker = _PHYSICAL_ATTEMPT.get()
+    if tracker is None:
+        return
+    _finish_tracker(tracker, "error")
+    metadata = dict(tracker["metadata"] or {})
+    metadata["retry_count"] = int(metadata.get("retry_count") or 0) + 1
+    tracker.update(
+        _attempt_tracker(
+            request,
+            name=tracker["name"],
+            model_name=tracker["model_name"],
+            metadata=metadata,
+        )
+    )
+
+
+def _execute_attempt(
+    request: dict[str, Any],
+    callback: Callable[[dict[str, Any]], Any],
+    *,
+    name: str,
+    model_name: str,
+    metadata: dict[str, Any] | None,
+) -> Any:
+    tracker = _attempt_tracker(
+        request, name=name, model_name=model_name, metadata=metadata
+    )
+    try:
+        with _physical_attempt_context(tracker):
+            response = callback(request)
+    except BaseException:
+        _finish_tracker(tracker, "error")
+        raise
+    _finish_tracker(tracker, "completed", response=response)
+    return response
+
+
+async def _execute_attempt_async(
+    request: dict[str, Any],
+    callback: Callable[[dict[str, Any]], Any],
+    *,
+    name: str,
+    model_name: str,
+    metadata: dict[str, Any] | None,
+) -> Any:
+    tracker = _attempt_tracker(
+        request, name=name, model_name=model_name, metadata=metadata
+    )
+    try:
+        with _physical_attempt_context(tracker):
+            response = await callback(request)
+    except BaseException:
+        _finish_tracker(tracker, "error")
+        raise
+    _finish_tracker(tracker, "completed", response=response)
+    return response
 
 
 def disable_tools(request: dict[str, Any]) -> None:
@@ -57,7 +255,13 @@ def execute(
     """Run one non-streaming physical provider attempt through Relay."""
     runtime, session, parent = relay_runtime.resolve_execution_context(session_id)
     if runtime is None or session is None or not runtime.managed_execution_enabled():
-        return callback(request)
+        return _execute_attempt(
+            request,
+            callback,
+            name=name,
+            model_name=model_name,
+            metadata=metadata,
+        )
     logical = _logical_parent(runtime, session, parent, metadata)
     parent = logical[1] if logical is not None else parent
 
@@ -83,7 +287,14 @@ def execute(
                 codec_baseline_body=codec_baseline_body,
                 metadata=metadata,
             )
-            raw = callback_context.copy().run(callback, final_request)
+            raw = callback_context.copy().run(
+                _execute_attempt,
+                final_request,
+                callback,
+                name=name,
+                model_name=model_name,
+                metadata=metadata,
+            )
         except BaseException as exc:
             callback_error = exc
             raise
@@ -142,7 +353,13 @@ async def execute_async(
     """Run one asynchronous physical provider attempt through Relay."""
     runtime, session, parent = relay_runtime.resolve_execution_context(session_id)
     if runtime is None or session is None or not runtime.managed_execution_enabled():
-        return await callback(request)
+        return await _execute_attempt_async(
+            request,
+            callback,
+            name=name,
+            model_name=model_name,
+            metadata=metadata,
+        )
     logical = _logical_parent(runtime, session, parent, metadata)
     parent = logical[1] if logical is not None else parent
 
@@ -169,7 +386,13 @@ async def execute_async(
                 metadata=metadata,
             )
             async def call_provider() -> Any:
-                return await callback(final_request)
+                return await _execute_attempt_async(
+                    final_request,
+                    callback,
+                    name=name,
+                    model_name=model_name,
+                    metadata=metadata,
+                )
 
             task = callback_context.copy().run(
                 asyncio.create_task,
@@ -411,6 +634,14 @@ class ManagedLlmStream(Iterator[Any]):
         self._provider_completed = False
         self._raw_chunks: list[tuple[Any, Any]] = []
         self.output_modified = False
+        self._diagnostic = {
+            "attempt": None,
+            "usage": None,
+            "name": name,
+            "model_name": model_name,
+            "metadata": metadata,
+            "finished": False,
+        }
         callback_context = contextvars.copy_context()
 
         def run_callback(callback: Callable[..., Any], *args: Any) -> Any:
@@ -424,11 +655,21 @@ class ManagedLlmStream(Iterator[Any]):
             or session is None
             or not runtime.managed_execution_enabled()
         ):
-            raw_stream = stream_factory(request)
+            self._diagnostic = _attempt_tracker(
+                request, name=name, model_name=model_name, metadata=metadata
+            )
+            try:
+                with _physical_attempt_context(self._diagnostic):
+                    raw_stream = stream_factory(request)
+            except BaseException:
+                self._finish_diagnostic("error")
+                raise
             if completed_response_predicate is not None and completed_response_predicate(
                 raw_stream
             ):
                 self.final_response = raw_stream
+                self._diagnostic["usage"] = _response_usage(raw_stream)
+                self._finish_diagnostic("completed")
                 self._stream = iter(())
             else:
                 self._raw_stream_resource = raw_stream
@@ -451,17 +692,27 @@ class ManagedLlmStream(Iterator[Any]):
 
         async def provider_stream(next_request: Any):
             raw_stream = None
+            tracker = None
             try:
-                raw_stream = run_callback(
-                    stream_factory,
-                    _provider_request(
-                        request,
-                        next_request,
-                        relay_request_body=relay_request_body,
-                        codec_baseline_body=codec_baseline_body,
-                        metadata=metadata,
-                    )
+                final_request = _provider_request(
+                    request,
+                    next_request,
+                    relay_request_body=relay_request_body,
+                    codec_baseline_body=codec_baseline_body,
+                    metadata=metadata,
                 )
+                tracker = _attempt_tracker(
+                    final_request,
+                    name=name,
+                    model_name=model_name,
+                    metadata=metadata,
+                )
+
+                def open_stream() -> Any:
+                    with _physical_attempt_context(tracker):
+                        return stream_factory(final_request)
+
+                raw_stream = run_callback(open_stream)
                 if (
                     completed_response_predicate is not None
                     and run_callback(
@@ -470,6 +721,7 @@ class ManagedLlmStream(Iterator[Any]):
                     )
                 ):
                     self.final_response = raw_stream
+                    _finish_tracker(tracker, "completed", response=raw_stream)
                     self._provider_completed = True
                     return
                 if on_stream_created is not None:
@@ -484,12 +736,23 @@ class ManagedLlmStream(Iterator[Any]):
                         self._accept_chunk,
                         chunk,
                     ):
+                        _finish_tracker(tracker, "cancelled")
                         break
+                    if tracker["attempt"] is not None:
+                        tracker["usage"] = _stream_usage(tracker["usage"], chunk)
                     encoded_chunk = _jsonable(chunk)
                     self._raw_chunks.append((encoded_chunk, chunk))
                     yield encoded_chunk
+                _finish_tracker(tracker, "completed")
                 self._provider_completed = True
             except BaseException as exc:
+                if tracker is not None:
+                    _finish_tracker(
+                        tracker,
+                        "cancelled"
+                        if isinstance(exc, GeneratorExit) or _is_cancellation(exc)
+                        else "error",
+                    )
                 self._callback_error = exc
                 raise
             finally:
@@ -579,11 +842,21 @@ class ManagedLlmStream(Iterator[Any]):
             try:
                 chunk = next(self._stream)
             except StopIteration:
+                self._finish_diagnostic("completed")
                 self._close(logical_outcome="cancelled")
                 raise
+            except BaseException:
+                self._finish_diagnostic("error")
+                self._close(logical_outcome="failed")
+                raise
             if self._accept_chunk is not None and not self._accept_chunk(chunk):
+                self._finish_diagnostic("cancelled")
                 self._close(logical_outcome="cancelled")
                 raise StopIteration
+            if self._diagnostic["attempt"] is not None:
+                self._diagnostic["usage"] = _stream_usage(
+                    self._diagnostic["usage"], chunk
+                )
             return chunk
 
         async def next_chunk() -> Any:
@@ -642,11 +915,15 @@ class ManagedLlmStream(Iterator[Any]):
 
     def close(self) -> None:
         """Close an explicitly abandoned stream and cancel its logical call."""
+        self._finish_diagnostic("cancelled")
         self._close(logical_outcome="cancelled")
         close_error = self._close_error
         self._close_error = None
         if close_error is not None:
             raise close_error
+
+    def _finish_diagnostic(self, outcome: str) -> None:
+        _finish_tracker(self._diagnostic, outcome)
 
     def _preserve_pending_provider_chunks(self) -> None:
         """Switch a failed Relay stream to its undelivered provider chunks."""
@@ -686,6 +963,7 @@ class ManagedLlmStream(Iterator[Any]):
     def _close(self, *, logical_outcome: str) -> None:
         if self._closed:
             return
+        self._finish_diagnostic(logical_outcome)
         self._closed = True
         loop = self._loop
         self._loop = None

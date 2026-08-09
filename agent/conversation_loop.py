@@ -2819,6 +2819,8 @@ def run_conversation(
                                 next_api_kwargs,
                                 on_first_delta=_stop_spinner,
                                 on_provider_dispatch=_mark_provider_dispatch,
+                                attempt_retry=retry_count,
+                                continuation=length_continue_retries,
                             )
                         return relay_llm.execute(
                             next_api_kwargs,
@@ -2829,6 +2831,7 @@ def run_conversation(
                             metadata={
                                 "api_mode": agent.api_mode,
                                 "api_request_id": api_request_id,
+                                "platform": agent.platform,
                                 "call_role": (
                                     "delegated"
                                     if getattr(agent, "is_subagent", False)
@@ -2837,6 +2840,7 @@ def run_conversation(
                                     else "primary"
                                 ),
                                 "retry_count": retry_count,
+                                "continuation": length_continue_retries,
                             },
                             defer_logical_completion=True,
                         )

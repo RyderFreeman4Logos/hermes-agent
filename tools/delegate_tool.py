@@ -585,6 +585,27 @@ def _normalize_role(r: Optional[str]) -> str:
     return "leaf"
 
 
+def _resolve_command_policy(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate the explicit terminal policy inherited by delegate children."""
+    raw = cfg.get("command_policy", {})
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("Invalid delegation.command_policy: expected an object.")
+    policy = {}
+    for key in ("read_only", "just_only_cargo"):
+        value = raw.get(key, False)
+        if not isinstance(value, bool):
+            raise ValueError(
+                f"Invalid delegation.command_policy.{key}: expected a boolean."
+            )
+        if value:
+            policy[key] = True
+    if policy:
+        policy["source"] = "delegation.command_policy"
+    return policy
+
+
 def _get_max_concurrent_children() -> int:
     """Read delegation.max_concurrent_children from config, falling back to
     DELEGATION_MAX_CONCURRENT_CHILDREN env var, then the default (3).
@@ -1498,6 +1519,7 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    command_policy: Optional[Dict[str, Any]] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1900,6 +1922,7 @@ def _build_child_agent(
     # Stash the post-degrade role for introspection (leaf if the
     # kill switch or depth bounded the caller's requested role).
     child._delegate_role = effective_role
+    child._delegate_command_policy = dict(command_policy or {})
     # Stash subagent identity for nested-delegation event propagation and
     # for _run_single_child / interrupt_subagent to look up by id.
     child._subagent_id = subagent_id
@@ -2329,6 +2352,8 @@ def _run_single_child(
     Returns a structured result dict.
     """
     child_start = time.monotonic()
+    child_task_id = None
+    child_command_policy_registered = False
 
     # Get the progress callback from the child agent
     child_progress_cb = getattr(child, "tool_progress_callback", None)
@@ -2518,7 +2543,11 @@ def _run_single_child(
         # isolated in its own record (a child's cd no longer bleeds back into
         # the parent once readers flip to the record store).
         try:
-            from tools.terminal_tool import get_session_cwd, record_session_cwd
+            from tools.terminal_tool import (
+                get_session_cwd,
+                record_session_cwd,
+                register_task_env_overrides,
+            )
 
             workspace_path = getattr(child, "_delegate_workspace_path", None)
             record_session_cwd(
@@ -2527,6 +2556,12 @@ def _run_single_child(
                 if isinstance(workspace_path, str) and workspace_path
                 else get_session_cwd(parent_task_id),
             )
+            command_policy = getattr(child, "_delegate_command_policy", {})
+            if command_policy:
+                register_task_env_overrides(
+                    child_task_id, {"command_policy": dict(command_policy)}
+                )
+                child_command_policy_registered = True
         except Exception as e:
             logger.debug("Child cwd seed failed: %s", e)
         wall_start = time.time()
@@ -3076,6 +3111,13 @@ def _run_single_child(
         # exhaustion) the thread was never started and Thread.join() would
         # raise RuntimeError.  ident is None until start() succeeds.
         _heartbeat_stop.set()
+        if child_command_policy_registered and child_task_id:
+            try:
+                from tools.terminal_tool import clear_task_env_overrides
+
+                clear_task_env_overrides(child_task_id)
+            except Exception:
+                logger.debug("Child command-policy cleanup failed", exc_info=True)
         if _heartbeat_thread.ident is not None:
             _heartbeat_thread.join(timeout=5)
 
@@ -3497,6 +3539,10 @@ def delegate_task(
 
     # Load config
     cfg = _load_config()
+    try:
+        command_policy = _resolve_command_policy(cfg)
+    except ValueError as exc:
+        return tool_error(str(exc))
     default_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
     # Model-supplied max_iterations is ignored — the config value is authoritative
     # so users get predictable budgets. The kwarg is retained for internal callers
@@ -3689,6 +3735,7 @@ def delegate_task(
             override_acp_command=task_creds.get("command"),
             override_acp_args=task_creds.get("args"),
             role=effective_role,
+            command_policy=command_policy,
         )
         # Attach the validated schema for the completion-side validation
         # hook in _run_single_child. Absent (None) on schema-less tasks.

@@ -1375,7 +1375,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     """
     import httpx as _httpx
 
-    from agent import relay_llm
+    from agent import physical_attempt_diagnostics, relay_llm
 
     active_client = client or agent._ensure_primary_openai_client(reason="codex_stream_direct")
     raw_client = getattr(active_client, "_real_client", active_client)
@@ -1386,16 +1386,12 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             f"(got {type(raw_client).__name__})"
         )
     max_stream_retries = 1
+    relay_api_kwargs = dict(api_kwargs)
+    diagnostic_scope = relay_api_kwargs.pop(
+        physical_attempt_diagnostics._INTERNAL_SCOPE_KEY, None
+    )
     # Accumulate streamed text so callers / compat shims can read it.
     agent._codex_streamed_text_parts: list = []
-    # This envelope is private to the local digest sink and must never reach
-    # Relay metadata or the provider SDK.
-    attempt_identity = api_kwargs.pop("_hermes_physical_attempt_identity", {})
-    attempt_role = (
-        "reviewer" if getattr(agent, "is_reviewer", False)
-        else "subagent" if getattr(agent, "is_subagent", False)
-        else "main"
-    )
 
     def _on_text_delta(text: str) -> None:
         agent._codex_streamed_text_parts.append(text)
@@ -1419,19 +1415,51 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         if agent._interrupt_requested:
             raise InterruptedError("Agent interrupted before Codex stream retry")
 
-        from agent.attempt_digests import response_usage, start_codex_attempt
-
-        attempt_sink, attempt_record = start_codex_attempt(
-            agent, api_kwargs, retry=attempt, role=attempt_role, identity=attempt_identity
-        )
-        final = None
         intercepted_events = []
         writer_token = {"value": None}
+        diagnostic_attempt = {"value": None, "finished": False}
+
+        platform = str(getattr(agent, "platform", "") or "").lower()
+        diagnostic_role = (
+            "reviewer"
+            if platform == "reviewer"
+            else "subagent"
+            if platform == "subagent" or getattr(agent, "is_subagent", False)
+            else "fallback"
+            if int(getattr(agent, "_fallback_index", 0) or 0) > 0
+            else "main"
+        )
+
+        def _finish_diagnostic(usage: Any, outcome: str) -> None:
+            if diagnostic_attempt["finished"]:
+                return
+            diagnostic_attempt["finished"] = True
+            physical_attempt_diagnostics.finish_responses_attempt(
+                diagnostic_attempt["value"], usage=usage, outcome=outcome
+            )
 
         def _open_codex_stream(next_api_kwargs: dict[str, Any]):
             stream_kwargs = dict(next_api_kwargs)
             stream_kwargs["stream"] = True
-            return response_create(**stream_kwargs)
+            diagnostic_attempt["value"] = (
+                physical_attempt_diagnostics.start_responses_attempt(
+                    stream_kwargs,
+                    scope=diagnostic_scope,
+                    route="codex_responses",
+                    provider=str(getattr(agent, "provider", "") or "codex"),
+                    model=str(stream_kwargs.get("model") or "unknown"),
+                    role=diagnostic_role,
+                    retry=attempt,
+                    continuation=int(
+                        getattr(agent, "_codex_incomplete_retries", 0) or 0
+                    ),
+                )
+            )
+            try:
+                return response_create(**stream_kwargs)
+            except BaseException:
+                _finish_diagnostic(None, "error")
+                raise
 
         def _codex_stream_created(_raw_stream: Any) -> None:
             # Claim the delta sink for THIS physical attempt. A newer attempt
@@ -1458,7 +1486,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
 
         try:
             event_stream = relay_llm.stream(
-                dict(api_kwargs),
+                dict(relay_api_kwargs),
                 _open_codex_stream,
                 session_id=str(getattr(agent, "session_id", "") or ""),
                 name=str(getattr(agent, "provider", "") or "codex"),
@@ -1491,8 +1519,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             _httpx.ConnectError,
             ConnectionError,
         ) as exc:
-            if attempt_sink is not None:
-                attempt_sink.finish(attempt_record, {})
+            _finish_diagnostic(None, "error")
             if attempt < max_stream_retries:
                 logger.debug(
                     "Codex Responses failure_class=transport_failure phase=connect "
@@ -1535,6 +1562,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     interrupt_check=_interrupt_or_superseded,
                 )
             except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
+                _finish_diagnostic(None, "error")
                 if attempt < max_stream_retries:
                     logger.debug(
                         "Codex Responses stream transport failed mid-iteration "
@@ -1552,8 +1580,12 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 raise
             except RuntimeError:
                 if event_stream.final_response is not None:
-                    final = event_stream.final_response
-                    return final
+                    _finish_diagnostic(
+                        getattr(event_stream.final_response, "usage", None),
+                        str(getattr(event_stream.final_response, "status", None) or "completed"),
+                    )
+                    return event_stream.final_response
+                _finish_diagnostic(None, "error")
                 raise
 
             # A terminal response has already been assembled at this point
@@ -1585,10 +1617,12 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     agent._client_log_context(),
                 )
 
+            _finish_diagnostic(
+                getattr(final, "usage", None),
+                str(getattr(final, "status", None) or "completed"),
+            )
             return final
         finally:
-            if attempt_sink is not None:
-                attempt_sink.finish(attempt_record, response_usage(final))
             close_fn = getattr(event_stream, "close", None)
             if callable(close_fn):
                 try:
@@ -1608,6 +1642,10 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                         agent._abort_request_openai_client(
                             active_client, reason="codex_stream_close_failed"
                         )
+            if not diagnostic_attempt["finished"]:
+                _finish_diagnostic(
+                    None, "interrupted" if agent._interrupt_requested else "error"
+                )
 
 
 def run_codex_create_stream_fallback(agent, api_kwargs: dict, client: Any = None):

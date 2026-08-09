@@ -117,17 +117,34 @@ def test_interrupt_requires_the_commissioning_session_transport_and_generation()
 
 
 def test_delegate_control_is_deferred_in_the_delegation_toolset():
-    from toolsets import TOOLSETS
+    from toolsets import TOOLSETS, resolve_toolset
     from tools.delegate_tool import _blocked_toolsets_for_role
 
     entry = registry.get_entry("delegate_control")
     assert entry is not None
     assert entry.toolset == "delegation"
-    delegation_tools = TOOLSETS["delegation"].get("tools")
-    assert isinstance(delegation_tools, list)
-    assert {"delegate_task", "delegate_control"} <= set(delegation_tools)
+    assert TOOLSETS["delegation"].get("tools") == ["delegate_task"]
+    assert {"delegate_task", "delegate_control"} <= set(resolve_toolset("delegation"))
     assert "delegation" in _blocked_toolsets_for_role("leaf")
     assert "delegation" not in _blocked_toolsets_for_role("orchestrator")
+
+
+def test_default_cli_resolves_both_delegation_schemas():
+    from hermes_cli.tools_config import _get_platform_tools
+    from model_tools import get_tool_definitions
+
+    enabled = _get_platform_tools({}, "cli")
+    names = {
+        tool["function"]["name"]
+        for tool in get_tool_definitions(
+            enabled_toolsets=sorted(enabled),
+            quiet_mode=True,
+            skip_tool_search_assembly=True,
+        )
+    }
+
+    assert "delegation" in enabled
+    assert {"delegate_task", "delegate_control"} <= names
 
 
 def test_model_list_returns_only_the_exact_parents_live_children():
@@ -373,6 +390,39 @@ def test_cancel_and_kill_are_cooperative_and_owner_scoped():
         for action, child in children.items():
             _unregister_subagent(f"sid-{action}-owned", agent=child)
         _unregister_subagent("sid-cancel-foreign", agent=foreign_child)
+
+
+def test_model_control_ignores_ambient_ui_id_without_gateway_context(monkeypatch):
+    import tui_gateway.server as srv
+    from gateway.session_context import reset_session_vars
+    from tui_gateway.transport import current_transport
+
+    owner = object()
+    child = _Child()
+    ambient_ui_id = "ambient-outer-ui"
+    reset_session_vars()
+    monkeypatch.setenv("HERMES_UI_SESSION_ID", ambient_ui_id)
+    assert current_transport() is None
+    assert srv._current_runtime_session_record.get() is None
+    assert ambient_ui_id not in srv._sessions
+    _register_subagent(
+        {
+            "subagent_id": "sid-ambient-owner",
+            "status": "running",
+            "agent": child,
+            "owner_agent": owner,
+            "owner_session_id": ambient_ui_id,
+            "owner_transport": None,
+            "owner_session_record": None,
+        }
+    )
+    try:
+        result = _control(owner, {"action": "list"})
+        assert [item["subagent_id"] for item in result["children"]] == [
+            "sid-ambient-owner"
+        ]
+    finally:
+        _unregister_subagent("sid-ambient-owner", agent=child)
 
 
 def test_model_control_rejects_a_recycled_gateway_session_generation():

@@ -226,6 +226,7 @@ class TestNormalizeConverseResponse:
 
     def test_text_response(self):
         from agent.bedrock_adapter import normalize_converse_response
+        from agent.usage_pricing import normalize_usage
         response = {
             "output": {
                 "message": {
@@ -243,6 +244,9 @@ class TestNormalizeConverseResponse:
         assert result.usage.prompt_tokens == 10
         assert result.usage.completion_tokens == 5
         assert result.usage.total_tokens == 15
+        assert normalize_usage(
+            result.usage, provider="bedrock", api_mode="bedrock_converse"
+        ).cache_telemetry_present is False
 
     def test_cache_tokens_folded_into_prompt_tokens(self):
         """Converse's inputTokens excludes cache read/write tokens (unlike
@@ -581,6 +585,20 @@ class TestStreamConverseWithCallbacks:
         assert result.usage.total_tokens == 50 + 900 + 300 + 20
         assert result.usage.cache_read_input_tokens == 900
         assert result.usage.cache_creation_input_tokens == 300
+
+    def test_absent_cache_usage_stays_unknown(self):
+        from agent.bedrock_adapter import stream_converse_with_callbacks
+        from agent.usage_pricing import normalize_usage
+
+        result = stream_converse_with_callbacks({
+            "stream": [{
+                "metadata": {"usage": {"inputTokens": 10, "outputTokens": 2}}
+            }]
+        })
+
+        assert normalize_usage(
+            result.usage, provider="bedrock", api_mode="bedrock_converse"
+        ).cache_telemetry_present is False
 
 
     def test_text_deltas_suppressed_when_tool_use_present(self):

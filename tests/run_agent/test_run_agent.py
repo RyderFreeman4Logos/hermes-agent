@@ -3948,14 +3948,21 @@ class TestRunConversation:
     def test_length_finish_reason_requests_continuation(self, agent):
         """Normal truncation (partial real content) triggers continuation."""
         self._setup_agent(agent)
+        agent.platform = "reviewer"
         first = _mock_response(content="Part 1 ", finish_reason="length")
         second = _mock_response(content="Part 2", finish_reason="stop")
         agent.client.chat.completions.create.side_effect = [first, second]
+        attempt_metadata = []
+
+        def execute(request, callback, **kwargs):
+            attempt_metadata.append(kwargs["metadata"])
+            return callback(request)
 
         with (
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
+            patch("agent.relay_llm.execute", side_effect=execute),
         ):
             result = agent.run_conversation("hello")
 
@@ -3966,6 +3973,8 @@ class TestRunConversation:
         second_call_messages = agent.client.chat.completions.create.call_args_list[1].kwargs["messages"]
         assert second_call_messages[-1]["role"] == "user"
         assert "truncated by the output length limit" in second_call_messages[-1]["content"]
+        assert [metadata["continuation"] for metadata in attempt_metadata] == [0, 1]
+        assert all(metadata["platform"] == "reviewer" for metadata in attempt_metadata)
 
     def test_length_continuation_preserves_large_provider_default_output_cap(self, agent):
         """Continuation retries must not shrink a higher provider default cap."""
@@ -5600,11 +5609,15 @@ class TestAnthropicCredentialRefresh:
         )
         agent._anthropic_client.messages.create.return_value = response
 
-        with patch.object(agent, "_try_refresh_anthropic_client_credentials", return_value=False):
+        with (
+            patch.object(agent, "_try_refresh_anthropic_client_credentials", return_value=False),
+            patch("agent.relay_llm.start_fallback_attempt") as start_fallback,
+        ):
             result = agent._anthropic_messages_create({"model": "claude-sonnet-4-20250514"})
 
         agent._anthropic_client.messages.stream.assert_called_once_with(model="claude-sonnet-4-20250514")
         agent._anthropic_client.messages.create.assert_called_once_with(model="claude-sonnet-4-20250514")
+        start_fallback.assert_called_once_with({"model": "claude-sonnet-4-20250514"})
         assert result is response
 
 

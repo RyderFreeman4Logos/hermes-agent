@@ -6703,6 +6703,8 @@ class AIAgent:
         *,
         on_first_delta: callable = None,
         on_provider_dispatch: callable = None,
+        attempt_retry: int = 0,
+        continuation: int = 0,
     ):
         """Forwarder — see ``agent.chat_completion_helpers.interruptible_streaming_api_call``."""
         from agent.chat_completion_helpers import interruptible_streaming_api_call
@@ -6711,6 +6713,8 @@ class AIAgent:
             api_kwargs,
             on_first_delta=on_first_delta,
             on_provider_dispatch=on_provider_dispatch,
+            attempt_retry=attempt_retry,
+            continuation=continuation,
         )
 
     def _try_activate_fallback(self, reason: "FailoverReason | None" = None) -> bool:

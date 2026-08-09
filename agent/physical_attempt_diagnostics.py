@@ -1,4 +1,4 @@
-"""Opt-in, content-free diagnostics for physical Responses API attempts."""
+"""Opt-in, content-free diagnostics for physical provider attempts."""
 
 from __future__ import annotations
 
@@ -72,21 +72,43 @@ def start_responses_attempt(
     retry: int,
     continuation: int,
 ) -> Attempt | None:
-    """Persist one allowlisted start record at the physical dispatch seam."""
+    return start_attempt(
+        request,
+        api_mode="codex_responses",
+        scope=scope,
+        route=route,
+        provider=provider,
+        model=model,
+        role=role,
+        retry=retry,
+        continuation=continuation,
+    )
+
+
+def start_attempt(
+    request: dict[str, Any],
+    *,
+    api_mode: str,
+    route: str,
+    provider: str,
+    model: str,
+    role: str,
+    retry: int,
+    continuation: int,
+    scope: dict[str, Any] | None = None,
+) -> Attempt | None:
+    """Persist one allowlisted start record at a physical dispatch seam."""
     if not enabled():
         return None
     try:
         key = _digest_key()
         key_value = _effective_cache_key(request)
-        prefix = {
-            "instructions": request.get("instructions"),
-            "input": request.get("input"),
-        }
-        tools = request.get("tools") or []
+        instructions, provider_input, tools = _request_identity(request, api_mode)
+        prefix = {"instructions": instructions, "input": provider_input}
         equivalent = {
             "scope_digest": (scope or {}).get("scope_digest"),
             "cache_key": key_value,
-            "instructions": request.get("instructions"),
+            "instructions": instructions,
             "tools": tools,
         }
         key_digest, key_bytes = _digest_value(key, "key", key_value)
@@ -129,6 +151,23 @@ def start_responses_attempt(
 def finish_responses_attempt(
     attempt: Attempt | None, *, usage: Any, outcome: str
 ) -> None:
+    finish_attempt(
+        attempt,
+        usage=usage,
+        outcome=outcome,
+        api_mode="codex_responses",
+        provider="",
+    )
+
+
+def finish_attempt(
+    attempt: Attempt | None,
+    *,
+    usage: Any,
+    outcome: str,
+    api_mode: str,
+    provider: str,
+) -> None:
     """Pair a start with terminal token/cache metadata when it is available."""
     if attempt is None or attempt.finished:
         return
@@ -136,7 +175,7 @@ def finish_responses_attempt(
     try:
         from agent.usage_pricing import normalize_usage
 
-        canonical = normalize_usage(usage, api_mode="codex_responses")
+        canonical = normalize_usage(usage, api_mode=api_mode, provider=provider)
         cache_present = bool(usage) and canonical.cache_telemetry_present
         cache_state = (
             "unknown"
@@ -161,6 +200,34 @@ def finish_responses_attempt(
         })
     except Exception:
         return
+
+
+def _request_identity(
+    request: dict[str, Any], api_mode: str
+) -> tuple[Any, Any, Any]:
+    if api_mode == "codex_responses":
+        return (
+            request.get("instructions"),
+            request.get("input"),
+            request.get("tools") or [],
+        )
+
+    messages = request.get("messages")
+    instructions = request.get("system")
+    if instructions is None and isinstance(messages, list):
+        static_messages = []
+        for message in messages:
+            if not isinstance(message, dict) or message.get("role") not in {
+                "system",
+                "developer",
+            }:
+                break
+            static_messages.append(message)
+        instructions = static_messages
+    tools = request.get("tools")
+    if tools is None:
+        tools = request.get("toolConfig")
+    return instructions, messages, tools or []
 
 
 def _effective_cache_key(request: dict[str, Any]) -> Any:

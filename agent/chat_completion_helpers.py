@@ -2961,6 +2961,8 @@ def interruptible_streaming_api_call(
     *,
     on_first_delta=None,
     on_provider_dispatch=None,
+    attempt_retry: int = 0,
+    continuation: int = 0,
 ):
     """Streaming variant of _interruptible_api_call for real-time token delivery.
 
@@ -3124,6 +3126,7 @@ def interruptible_streaming_api_call(
                                     agent, region=region, streaming=False
                                 ),
                             )
+                            relay_llm.start_fallback_attempt(final_kwargs)
                             try:
                                 response = normalize_converse_response(
                                     client.converse(**final_kwargs)
@@ -3189,9 +3192,11 @@ def interruptible_streaming_api_call(
                     ),
                     metadata={
                         "api_mode": "custom",
+                        "physical_api_mode": "bedrock_converse",
                         "api_request_id": getattr(
                             agent, "_current_api_request_id", None
                         ),
+                        "platform": getattr(agent, "platform", None),
                         "call_role": (
                             "delegated"
                             if getattr(agent, "is_subagent", False)
@@ -3199,6 +3204,8 @@ def interruptible_streaming_api_call(
                             if int(getattr(agent, "_fallback_index", 0) or 0) > 0
                             else "primary"
                         ),
+                        "retry_count": attempt_retry,
+                        "continuation": continuation,
                     },
                     defer_logical_completion=True,
                 )
@@ -3515,7 +3522,7 @@ def interruptible_streaming_api_call(
             except Exception:
                 pass
 
-    def _call_chat_completions(stream_attempt_id: int):
+    def _call_chat_completions(stream_attempt_id: int, stream_retry: int):
         """Stream a chat completions response."""
         import httpx as _httpx
         # Per-provider / per-model request_timeout_seconds (from config.yaml)
@@ -3723,6 +3730,7 @@ def interruptible_streaming_api_call(
                 metadata={
                     "api_mode": "chat_completions",
                     "api_request_id": getattr(agent, "_current_api_request_id", None),
+                    "platform": getattr(agent, "platform", None),
                     "call_role": (
                         "delegated"
                         if getattr(agent, "is_subagent", False)
@@ -3730,6 +3738,8 @@ def interruptible_streaming_api_call(
                         if int(getattr(agent, "_fallback_index", 0) or 0) > 0
                         else "primary"
                     ),
+                    "retry_count": attempt_retry + stream_retry,
+                    "continuation": continuation,
                 },
                 defer_logical_completion=True,
             )
@@ -4112,7 +4122,7 @@ def interruptible_streaming_api_call(
             usage=usage_obj,
         ))
 
-    def _call_anthropic(request_client):
+    def _call_anthropic(request_client, stream_retry: int):
         """Stream an Anthropic Messages API response.
 
         Fires delta callbacks for real-time token delivery, but returns
@@ -4233,6 +4243,7 @@ def interruptible_streaming_api_call(
                 metadata={
                     "api_mode": "anthropic_messages",
                     "api_request_id": getattr(agent, "_current_api_request_id", None),
+                    "platform": getattr(agent, "platform", None),
                     "call_role": (
                         "delegated"
                         if getattr(agent, "is_subagent", False)
@@ -4240,6 +4251,8 @@ def interruptible_streaming_api_call(
                         if int(getattr(agent, "_fallback_index", 0) or 0) > 0
                         else "primary"
                     ),
+                    "retry_count": attempt_retry + stream_retry,
+                    "continuation": continuation,
                 },
                 defer_logical_completion=True,
             )
@@ -4395,9 +4408,13 @@ def interruptible_streaming_api_call(
                             ),
                             kind="anthropic_messages",
                         )
-                        result["response"] = _call_anthropic(request_client)
+                        result["response"] = _call_anthropic(
+                            request_client, _stream_attempt
+                        )
                     else:
-                        result["response"] = _call_chat_completions(stream_attempt_id)
+                        result["response"] = _call_chat_completions(
+                            stream_attempt_id, _stream_attempt
+                        )
                     return  # success
                 except Exception as e:
                     _close_managed_stream()

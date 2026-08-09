@@ -492,6 +492,7 @@ def test_heartbeat_warm_honors_retained_owner(monkeypatch):
     agent = _build_agent(monkeypatch)
     setattr(agent, "api_mode", "chat_completions")
     physical_calls = []
+    client_releases = []
 
     def create(**kwargs):
         physical_calls.append(kwargs)
@@ -502,7 +503,9 @@ def test_heartbeat_warm_honors_retained_owner(monkeypatch):
     )
     agent.client = client
     agent._claim_request_openai_client_for_heartbeat = lambda expected: expected
-    agent._release_request_openai_client_from_heartbeat = lambda *_a, **_k: None
+    agent._release_request_openai_client_from_heartbeat = (
+        lambda client, *, reusable: client_releases.append(reusable)
+    )
     token = begin_normal_warm_snapshot(
         agent,
         {
@@ -539,9 +542,11 @@ def test_heartbeat_warm_honors_retained_owner(monkeypatch):
             turn_origin="heartbeat_warm",
             heartbeat_event=heartbeat_event,
         )
-        assert result["heartbeat_warm_status"] == "degraded"
-        assert result["heartbeat_warm_reason"] == "provider_error:TimeoutError"
+        assert result["api_calls"] == 0
+        assert result["heartbeat_warm_status"] == "skipped"
+        assert result["heartbeat_warm_reason"] == "retained_owner"
         assert physical_calls == []
+        assert client_releases == [True]
         assert getattr(agent, "_codex_request_owner") is owner
     finally:
         h._release_codex_request_owner(agent, owner)

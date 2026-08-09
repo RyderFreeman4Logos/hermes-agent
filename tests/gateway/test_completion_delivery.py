@@ -536,6 +536,100 @@ def test_gateway_push_keeps_claim_until_turn_commit(isolated_registry):
     assert not isolated_registry.completion_event_should_deliver(event)
 
 
+def test_busy_gateway_merge_finalizes_every_completion_receipt(
+    monkeypatch, isolated_registry
+):
+    """One queued provider turn retains every completion's durable fence."""
+    from gateway.platforms.base import merge_pending_message_event
+    from tools import async_delegation as ad
+
+    pending = {}
+
+    async def queue_while_busy(event):
+        merge_pending_message_event(pending, "busy", event, merge_text=True)
+
+    adapter = SimpleNamespace(
+        handle_message=AsyncMock(side_effect=queue_while_busy),
+        supports_push=True,
+    )
+    runner = _runner(adapter)
+    events = [
+        _completion_event(started_at=2.51, session_id="proc-merge-one"),
+        _completion_event(started_at=2.52, session_id="proc-merge-two"),
+    ]
+
+    assert asyncio.run(
+        runner._deliver_completion_notification("completion-one", events[0])
+    ) is True
+    assert asyncio.run(
+        runner._deliver_completion_notification("completion-two", events[1])
+    ) is True
+
+    merged = pending["busy"]
+    assert merged.text.count("completion-one") == 1
+    assert merged.text.count("completion-two") == 1
+    asyncio.run(runner._finish_completion_delivery_receipt(merged, "committed"))
+
+    for event in events:
+        receipt = ad.get_durable_event_delivery(event)
+        assert receipt is not None
+        assert receipt["delivery_state"] == "delivered"
+    monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: False)
+    restarted_queue = queue.Queue()
+    assert ad.restore_undelivered_completions(restarted_queue) == 0
+    assert restarted_queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_gateway_completion_turn_releases_receipt(
+    monkeypatch, tmp_path, isolated_registry
+):
+    """Task cancellation cannot abandon a gateway receipt under its live PID."""
+    from hermes_state import SessionDB
+    from tests.gateway.test_first_turn_session_meta_rebaseline import (
+        SESSION_ID,
+        SESSION_KEY,
+        _bootstrap,
+        _event,
+        _source,
+    )
+    from tools import async_delegation as ad
+
+    db = SessionDB(db_path=tmp_path / "sessions.db")
+    db.create_session(SESSION_ID, source="telegram")
+    runner = _bootstrap(monkeypatch, tmp_path, db)
+    delivery_event = _completion_event(
+        started_at=2.53, session_id="proc-cancelled-gateway"
+    )
+    delivery_event["session_key"] = SESSION_KEY
+    assert ad.persist_event_delivery(delivery_event)
+    claim = ad.claim_event_delivery(delivery_event, "gateway-test")
+    assert claim
+    event = _event()
+    event.internal = True
+    event.metadata = {
+        "_completion_delivery_synthetic": True,
+        "_completion_delivery_receipt": {
+            "event": delivery_event,
+            "claim_id": claim,
+        },
+    }
+    runner._run_agent = AsyncMock(side_effect=asyncio.CancelledError())
+
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await runner._handle_message_with_agent(event, _source(), SESSION_KEY, 1)
+
+        receipt = ad.get_durable_event_delivery(delivery_event)
+        assert receipt is not None
+        assert receipt["delivery_state"] == "pending"
+        retry_claim = ad.claim_event_delivery(delivery_event, "gateway-retry")
+        assert retry_claim
+        assert ad.release_event_delivery(delivery_event, retry_claim)
+    finally:
+        db.close()
+
+
 def test_legacy_gateway_completion_keeps_terminal_fence(isolated_registry):
     """Legacy events without stable IDs still wait for the push turn to finish."""
     adapter = SimpleNamespace(handle_message=AsyncMock(), supports_push=True)

@@ -82,6 +82,46 @@ def test_cli_completion_ownership_accepts_compression_lineage():
     )
 
 
+def test_cli_visibility_suppression_records_durable_disposition(
+    monkeypatch, tmp_path
+):
+    """A hidden CLI completion is terminally dispositioned, not merely drained."""
+    from tools import async_delegation as ad
+    import tools.process_registry as registry_module
+
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    registry = registry_module.ProcessRegistry()
+    monkeypatch.setattr(registry_module, "process_registry", registry)
+    monkeypatch.setattr(
+        registry_module, "completion_delivery_prompt", lambda _evt, _text: None
+    )
+    cli = HermesCLI.__new__(HermesCLI)
+    cli.session_id = "visible-session"
+    cli._pending_input = queue.Queue()
+    cli._session_db = None
+    event = {
+        "type": "completion",
+        "session_id": "proc-cli-suppressed",
+        "session_key": "visible-session",
+        "started_at": 7.0,
+        "command": "true",
+        "exit_code": 0,
+        "completion_reason": "exited",
+        "termination_source": "",
+        "output": "done",
+    }
+    assert ad.persist_event_delivery(event)
+    registry.completion_queue.put(event)
+
+    cli._drain_process_notifications("cli-idle")
+
+    assert cli._pending_input.empty()
+    assert registry.completion_queue.empty()
+    receipt = ad.get_durable_event_delivery(event)
+    assert receipt is not None
+    assert receipt["delivery_state"] == "recovery_visibility_suppressed"
+
+
 def test_cli_numeric_completion_queues_model_nudge_and_nonterminal_fails_open(
     monkeypatch,
 ):

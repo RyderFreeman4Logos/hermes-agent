@@ -148,3 +148,94 @@ def test_physical_attempt_sink_is_private_content_free_and_preserves_unknown(
     assert (
         stat.S_IMODE((root / "physical_attempt_digests.jsonl").stat().st_mode) == 0o600
     )
+
+
+def test_non_responses_identity_keeps_static_equivalence_across_append_only_tail(
+    monkeypatch, tmp_path
+):
+    from agent import physical_attempt_diagnostics as diagnostics
+    from hermes_cli import config
+
+    sentinel = "PLAINTEXT-ISSUE68-NONRESPONSES"
+    monkeypatch.setattr(diagnostics, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(
+        config,
+        "read_raw_config_readonly",
+        lambda: {"observability": {"physical_attempt_digests": {"enabled": True}}},
+    )
+    request = {
+        "model": "chat-test",
+        "messages": [
+            {"role": "system", "content": sentinel},
+            {"role": "user", "content": sentinel},
+        ],
+        "tools": [{"type": "function", "function": {"name": sentinel}}],
+        "prompt_cache_key": sentinel,
+    }
+
+    first = diagnostics.start_attempt(
+        request,
+        api_mode="chat_completions",
+        route="chat_completions",
+        provider="openai",
+        model="chat-test",
+        role="main",
+        retry=0,
+        continuation=0,
+    )
+    diagnostics.finish_attempt(
+        first,
+        usage=SimpleNamespace(prompt_tokens=11, completion_tokens=2),
+        outcome="completed",
+        api_mode="chat_completions",
+        provider="openai",
+    )
+    continued = {
+        **request,
+        "messages": [
+            *request["messages"],
+            {"role": "assistant", "content": sentinel},
+            {"role": "user", "content": sentinel},
+        ],
+    }
+    second = diagnostics.start_attempt(
+        continued,
+        api_mode="chat_completions",
+        route="chat_completions",
+        provider="openai",
+        model="chat-test",
+        role="reviewer",
+        retry=1,
+        continuation=1,
+    )
+    diagnostics.finish_attempt(
+        second,
+        usage=SimpleNamespace(
+            prompt_tokens=17,
+            completion_tokens=3,
+            prompt_tokens_details=SimpleNamespace(cached_tokens=0),
+        ),
+        outcome="completed",
+        api_mode="chat_completions",
+        provider="openai",
+    )
+
+    records = [
+        json.loads(line)
+        for line in (
+            tmp_path / "observability" / "physical_attempt_digests.jsonl"
+        ).read_text().splitlines()
+    ]
+    starts = [record for record in records if record["phase"] == "start"]
+    terminals = [record for record in records if record["phase"] == "terminal"]
+
+    assert starts[0]["equivalent_digest"] == starts[1]["equivalent_digest"]
+    assert starts[0]["prefix_digest"] != starts[1]["prefix_digest"]
+    assert starts[1]["role"] == "reviewer"
+    assert starts[1]["retry"] == 1
+    assert starts[1]["continuation"] == 1
+    assert terminals[0]["cache_state"] == "unknown"
+    assert terminals[1]["cache_state"] == "miss"
+    assert sentinel.encode() not in b"".join(
+        path.read_bytes() for path in (tmp_path / "observability").iterdir()
+    )

@@ -3190,6 +3190,8 @@ def create_anthropic_message(
     turn loop takes.
     """
     sanitize_anthropic_kwargs(api_kwargs, log_prefix=log_prefix)
+    create_kwargs = dict(api_kwargs)
+    create_kwargs.pop("stream", None)
 
     messages_api = getattr(client, "messages", None)
     stream_fn = getattr(messages_api, "stream", None)
@@ -3228,7 +3230,8 @@ def create_anthropic_message(
                 log_prefix,
                 exc,
             )
+            from agent import relay_llm
 
-    create_kwargs = dict(api_kwargs)
-    create_kwargs.pop("stream", None)
+            relay_llm.start_fallback_attempt(create_kwargs)
+
     return messages_api.create(**create_kwargs)

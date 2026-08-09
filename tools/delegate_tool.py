@@ -50,6 +50,7 @@ from utils import base_url_hostname, is_truthy_value
 DELEGATE_BLOCKED_TOOLS = frozenset(
     [
         "delegate_task",  # no recursive delegation
+        "delegate_control",  # no access to sibling/parent children
         "clarify",  # no user interaction
         "memory",  # no writes to shared MEMORY.md
         "send_message",  # no cross-platform side effects
@@ -186,6 +187,28 @@ def _unregister_subagent(subagent_id: str, *, agent: Any = None) -> None:
             _active_subagents.pop(subagent_id, None)
 
 
+def _matches_subagent_owner(
+    record: Dict[str, Any],
+    *,
+    owner_agent: Any = None,
+    owner_session_id: Optional[str] = None,
+    owner_transport: Any = None,
+    owner_session_record: Any = None,
+) -> bool:
+    """Apply the exact live-session authority used by public controls."""
+    if owner_agent is not None and record.get("owner_agent") is not owner_agent:
+        return False
+    if owner_session_id is not None:
+        return (
+            record.get("owner_session_id") == owner_session_id
+            and owner_transport is not None
+            and record.get("owner_transport") is owner_transport
+            and owner_session_record is not None
+            and record.get("owner_session_record") is owner_session_record
+        )
+    return True
+
+
 def _close_subagent_steering(subagent_id: str, agent: Any) -> Optional[str]:
     """Atomically close steer acceptance and drain its final durable artifact.
 
@@ -210,27 +233,46 @@ def _close_subagent_steering(subagent_id: str, agent: Any) -> Optional[str]:
         return pending if isinstance(pending, str) and pending.strip() else None
 
 
-def interrupt_subagent(subagent_id: str) -> bool:
+def interrupt_subagent(
+    subagent_id: str,
+    *,
+    owner_agent: Any = None,
+    owner_session_id: Optional[str] = None,
+    owner_transport: Any = None,
+    owner_session_record: Any = None,
+    reason: str = "TUI",
+) -> bool:
     """Request that a single running subagent stop at its next iteration boundary.
 
     Does not hard-kill the worker thread (Python can't); sets the child's
     interrupt flag which propagates to in-flight tools and recurses into
     grandchildren via AIAgent.interrupt().  Returns True if a matching
-    subagent was found.
+    subagent was found and, when authority is supplied, owned by the caller.
+    ``owner_session_id=None`` preserves the internal in-process helper contract;
+    public callers must pass the exact commissioning session artifacts.
     """
     with _active_subagents_lock:
         record = _active_subagents.get(subagent_id)
-    if not record:
-        return False
-    agent = record.get("agent")
+        if not record or not _matches_subagent_owner(
+            record,
+            owner_agent=owner_agent,
+            owner_session_id=owner_session_id,
+            owner_transport=owner_transport,
+            owner_session_record=owner_session_record,
+        ):
+            return False
+        agent = record.get("agent")
     if agent is None:
         return False
     try:
-        if not request_hard_interrupt(agent, f"Interrupted via TUI ({subagent_id})"):
+        if not request_hard_interrupt(agent, f"Interrupted via {reason} ({subagent_id})"):
             return False
     except Exception as exc:
         logger.debug("interrupt_subagent(%s) failed: %s", subagent_id, exc)
         return False
+    with _active_subagents_lock:
+        if _active_subagents.get(subagent_id) is record:
+            record["status"] = "cancelling"
     return True
 
 
@@ -263,15 +305,13 @@ def steer_subagent(
         record = _active_subagents.get(subagent_id)
         if not record or not record.get("accepting_steer", False):
             return False
-        if owner_session_id is not None:
-            if (
-                record.get("owner_session_id") != owner_session_id
-                or owner_transport is None
-                or record.get("owner_transport") is not owner_transport
-                or owner_session_record is None
-                or record.get("owner_session_record") is not owner_session_record
-            ):
-                return False
+        if not _matches_subagent_owner(
+            record,
+            owner_session_id=owner_session_id,
+            owner_transport=owner_transport,
+            owner_session_record=owner_session_record,
+        ):
+            return False
         agent = record.get("agent")
         if agent is None:
             return False
@@ -317,6 +357,7 @@ def list_active_subagents() -> List[Dict[str, Any]]:
                     "owner_session_id",
                     "owner_transport",
                     "owner_session_record",
+                    "owner_agent",
                     "accepting_steer",
                 }
             }
@@ -1226,7 +1267,7 @@ def _blocked_toolsets_for_role(role: str) -> List[str]:
     """
     blocked_names = set(DELEGATE_BLOCKED_TOOLS)
     if role == "orchestrator":
-        blocked_names.discard("delegate_task")
+        blocked_names.difference_update({"delegate_task", "delegate_control"})
     return sorted(
         name
         for name, defn in TOOLSETS.items()
@@ -2510,8 +2551,11 @@ def _run_single_child(
                 ),
                 "started_at": time.time(),
                 "status": "running",
+                "role": str(getattr(child, "_delegate_role", "leaf") or "leaf"),
                 "tool_count": 0,
                 "agent": child,
+                # Exact in-process parent generation for model-facing controls.
+                "owner_agent": parent_agent,
                 # Immutable live gateway/TUI session that commissioned this
                 # child. Empty outside those hosts; RPC authority fails closed.
                 "owner_session_id": owner_session_id,
@@ -4874,8 +4918,159 @@ DELEGATE_TASK_SCHEMA = {
 }
 
 
+DELEGATE_CONTROL_SCHEMA = {
+    "name": "delegate_control",
+    "description": "List, inspect, or cooperatively cancel your live delegated children.",
+    "parameters": {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["action"],
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["list", "status", "cancel", "kill"],
+            },
+            "subagent_id": {"type": "string", "maxLength": 128},
+            "cursor": {"type": "integer", "minimum": 0, "maximum": 10_000},
+        },
+    },
+}
+
+
 # --- Registry ---
 from tools.registry import registry, tool_error
+
+
+_DELEGATE_CONTROL_PAGE_SIZE = 20
+_DELEGATE_CONTROL_GOAL_CHARS = 200
+
+
+def _delegate_control_snapshot(record: Dict[str, Any]) -> Dict[str, Any]:
+    goal = str(record.get("goal") or "")
+    return {
+        "subagent_id": str(record.get("subagent_id") or ""),
+        "status": str(record.get("status") or "running"),
+        "started_at": record.get("started_at"),
+        "goal_preview": goal[:_DELEGATE_CONTROL_GOAL_CHARS],
+        "role": str(record.get("role") or "leaf"),
+        "depth": int(record.get("depth") or 0),
+        "tool_count": int(record.get("tool_count") or 0),
+    }
+
+
+def _list_owned_live_subagents(
+    owner: Dict[str, Any],
+    cursor: int,
+) -> Dict[str, Any]:
+    with _active_subagents_lock:
+        records = [
+            record
+            for record in _active_subagents.values()
+            if _matches_subagent_owner(record, **owner)
+        ]
+        records.sort(
+            key=lambda record: (
+                float(record.get("started_at") or 0),
+                str(record.get("subagent_id") or ""),
+            )
+        )
+        page = records[cursor : cursor + _DELEGATE_CONTROL_PAGE_SIZE]
+        next_cursor = (
+            cursor + len(page)
+            if cursor + len(page) < len(records)
+            else None
+        )
+        return {
+            "children": [_delegate_control_snapshot(record) for record in page],
+            "next_cursor": next_cursor,
+        }
+
+
+def _owned_live_subagent_snapshot(
+    subagent_id: str,
+    *,
+    owner: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    with _active_subagents_lock:
+        record = _active_subagents.get(subagent_id)
+        if not record or not _matches_subagent_owner(record, **owner):
+            return None
+        return _delegate_control_snapshot(record)
+
+
+def _current_model_control_owner(parent_agent: Any) -> Optional[Dict[str, Any]]:
+    from gateway.session_context import get_session_env
+
+    owner: Dict[str, Any] = {"owner_agent": parent_agent}
+    owner_session_id = get_session_env("HERMES_UI_SESSION_ID", "") or None
+    if owner_session_id is None:
+        return owner
+    owner_transport, owner_session_record = _capture_gateway_steer_authority(
+        owner_session_id
+    )
+    if owner_transport is None or owner_session_record is None:
+        return None
+    owner.update(
+        owner_session_id=owner_session_id,
+        owner_transport=owner_transport,
+        owner_session_record=owner_session_record,
+    )
+    return owner
+
+
+def delegate_control(args: dict, **_kwargs) -> str:
+    """Control live children from the parent model surface."""
+    from agent.subagent_lifecycle import get_active_subagent_parent
+
+    parent_agent = get_active_subagent_parent()
+    args = args if isinstance(args, dict) else {}
+    cursor = args.get("cursor", 0)
+    if parent_agent is None or isinstance(cursor, bool) or not isinstance(cursor, int):
+        return json.dumps({"status": "rejected"})
+    owner = _current_model_control_owner(parent_agent)
+    if owner is None:
+        return json.dumps({"status": "rejected"})
+    if args.get("action") == "list" and 0 <= cursor <= 10_000:
+        return json.dumps(
+            {"status": "ok", **_list_owned_live_subagents(owner, cursor)},
+            ensure_ascii=False,
+        )
+    raw_subagent_id = args.get("subagent_id")
+    if raw_subagent_id is not None and (
+        not isinstance(raw_subagent_id, str) or len(raw_subagent_id) > 128
+    ):
+        return json.dumps({"status": "rejected"})
+    subagent_id = (raw_subagent_id or "").strip()
+    if args.get("action") == "status" and subagent_id:
+        child = _owned_live_subagent_snapshot(
+            subagent_id,
+            owner=owner,
+        )
+        return json.dumps(
+            {"status": "ok", "child": child}
+            if child is not None
+            else {"status": "not_found", "subagent_id": subagent_id},
+            ensure_ascii=False,
+        )
+    action = args.get("action")
+    if action in {"cancel", "kill"} and subagent_id:
+        accepted = interrupt_subagent(
+            subagent_id,
+            **owner,
+            reason="parent control",
+        )
+        return json.dumps(
+            {
+                "status": "accepted",
+                "action": action,
+                "subagent_id": subagent_id,
+                "cooperative": True,
+            }
+            if accepted
+            else {"status": "not_found", "subagent_id": subagent_id},
+            ensure_ascii=False,
+        )
+    return json.dumps({"status": "rejected"})
 
 
 def _model_background_value(args: dict, parent_agent=None) -> bool:
@@ -4909,6 +5104,15 @@ def _strip_model_hidden_task_fields(tasks: Any) -> Any:
         stripped_tasks.append(stripped)
     return stripped_tasks if changed else tasks
 
+
+registry.register(
+    name="delegate_control",
+    toolset="delegation",
+    schema=DELEGATE_CONTROL_SCHEMA,
+    handler=delegate_control,
+    check_fn=check_delegate_requirements,
+    emoji="🕹️",
+)
 
 registry.register(
     name="delegate_task",

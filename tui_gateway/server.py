@@ -7573,6 +7573,13 @@ def _start_inflight_turn(session: dict, text: Any) -> None:
     }
 
 
+def _inflight_assistant_text(turn: dict) -> str:
+    chunks = turn.get("_assistant_chunks")
+    if isinstance(chunks, list):
+        return "".join(chunks)
+    return str(turn.get("assistant") or "")
+
+
 def _append_inflight_delta(session: dict, delta: Any) -> None:
     text = "" if delta is None else str(delta)
     if not text:
@@ -7580,7 +7587,13 @@ def _append_inflight_delta(session: dict, delta: Any) -> None:
     turn = session.get("inflight_turn")
     if not isinstance(turn, dict):
         turn = {"assistant": "", "streaming": True, "user": ""}
-    turn["assistant"] = f"{turn.get('assistant') or ''}{text}"
+    chunks = turn.get("_assistant_chunks")
+    if not isinstance(chunks, list):
+        assistant = str(turn.get("assistant") or "")
+        chunks = [assistant] if assistant else []
+        turn["assistant"] = ""
+        turn["_assistant_chunks"] = chunks
+    chunks.append(text)
     turn["streaming"] = True
     turn["updated_at"] = time.time()
     session["inflight_turn"] = turn
@@ -7632,7 +7645,8 @@ def _fail_inflight_turn(session: dict, error: Any) -> None:
     turn = session.get("inflight_turn")
     if not isinstance(turn, dict):
         turn = {"assistant": "", "user": "", "started_at": now}
-    turn["assistant"] = str(turn.get("assistant") or "")
+    turn["assistant"] = _inflight_assistant_text(turn)
+    turn.pop("_assistant_chunks", None)
     turn["user"] = str(turn.get("user") or "")
     turn["error"] = message or "turn failed"
     turn["status"] = "error"
@@ -8039,7 +8053,7 @@ def _inflight_snapshot(session: dict) -> dict | None:
     if not isinstance(turn, dict):
         return None
     user = str(turn.get("user") or "").strip()
-    assistant = str(turn.get("assistant") or "")
+    assistant = _inflight_assistant_text(turn)
     streaming = bool(turn.get("streaming"))
     error = str(turn.get("error") or "").strip()
     if not user and not assistant and not streaming and not error:

@@ -12,6 +12,7 @@ hermes_bootstrap.harden_import_path()
 
 import json
 import logging
+import queue
 import signal
 import threading
 import time
@@ -423,73 +424,120 @@ def main():
     previous_transport = server._stdio_transport
     writer = BufferedStreamWriter(previous_transport)
     server._stdio_transport = writer
+    stdin_stop = threading.Event()
 
-    # MCP tool discovery — backgrounded so a slow or unreachable MCP server
-    # can't freeze TUI startup (a dead stdio/http server burns 1+2+4s of
-    # connect retries → ~7s of dead air before the composer appears).  The
-    # agent isn't built until the first prompt, at which point _make_agent
-    # briefly joins the discovery thread (wait_for_mcp_discovery, bounded) so
-    # already-spawning fast servers land in the tool snapshot.  The config
-    # gate inside ensure_mcp_discovery_started keeps the ~200ms MCP SDK
-    # import cost entirely off the path for users with no mcp_servers.
-    ensure_mcp_discovery_started()
-
-    if not write_json({
-        "jsonrpc": "2.0",
-        "method": "event",
-        "params": {
-            "type": "gateway.ready",
-            # change_events: see tui_gateway/ws.py — clients demote legacy polls.
-            "payload": {"skin": resolve_skin(), "change_events": True},
-        },
-    }):
-        _log_exit("startup write failed (broken stdout pipe before first event)")
-        sys.exit(0)
-
-    # Live-apply skins Hermes activates mid-conversation.
-    server._ensure_skin_watcher()
-
-    # Warm the /model picker's provider-models cache off-thread during this
-    # idle window (gateway.ready sent, user about to type). Mirrors the classic
-    # CLI run() loop — the stdio TUI otherwise never prewarms, so the first
-    # /model open blocks on serial /v1/models fetches. Fire-and-forget,
-    # guarded once-per-process, fully exception-isolated.
     try:
-        from hermes_cli.model_switch import prewarm_picker_cache_async
-        prewarm_picker_cache_async()
-    except Exception:
-        logger.debug("picker cache prewarm (tui) failed to start", exc_info=True)
+        # MCP tool discovery — backgrounded so a slow or unreachable MCP server
+        # can't freeze TUI startup (a dead stdio/http server burns 1+2+4s of
+        # connect retries → ~7s of dead air before the composer appears).  The
+        # agent isn't built until the first prompt, at which point _make_agent
+        # briefly joins the discovery thread (wait_for_mcp_discovery, bounded) so
+        # already-spawning fast servers land in the tool snapshot.  The config
+        # gate inside ensure_mcp_discovery_started keeps the ~200ms MCP SDK
+        # import cost entirely off the path for users with no mcp_servers.
+        ensure_mcp_discovery_started()
 
-    while True:
-        raw = sys.stdin.readline()
-        if not raw:
-            # Stdin fell through — check if spurious (O_NONBLOCK flip by a
-            # child on the shared open file description) or genuine EOF.
-            if not handle_spurious_eof(_recovery_times, _log_exit):
-                break
-            continue
+        if (
+            not write_json({
+                "jsonrpc": "2.0",
+                "method": "event",
+                "params": {
+                    "type": "gateway.ready",
+                    # change_events: see tui_gateway/ws.py — clients demote legacy polls.
+                    "payload": {"skin": resolve_skin(), "change_events": True},
+                },
+            })
+            or not writer.wait_for_first_write()
+        ):
+            writer.raise_if_failed()
+            _log_exit("startup write failed (broken or blocked stdout pipe)")
+            return
 
-        line = raw.strip()
-        if not line:
-            continue
+        # Live-apply skins Hermes activates mid-conversation.
+        server._ensure_skin_watcher()
 
+        # Warm the /model picker's provider-models cache off-thread during this
+        # idle window (gateway.ready sent, user about to type). Mirrors the classic
+        # CLI run() loop — the stdio TUI otherwise never prewarms, so the first
+        # /model open blocks on serial /v1/models fetches. Fire-and-forget,
+        # guarded once-per-process, fully exception-isolated.
         try:
-            req = json.loads(line)
-        except json.JSONDecodeError:
-            if not write_json({"jsonrpc": "2.0", "error": {"code": -32700, "message": "parse error"}, "id": None}):
-                _log_exit("parse-error-response write failed (broken stdout pipe)")
-                sys.exit(0)
-            continue
+            from hermes_cli.model_switch import prewarm_picker_cache_async
 
-        method = req.get("method") if isinstance(req, dict) else None
-        resp = dispatch(req)
-        if resp is not None:
-            if not write_json(resp):
-                _log_exit(f"response write failed for method={method!r} (broken stdout pipe)")
-                sys.exit(0)
+            prewarm_picker_cache_async()
+        except Exception:
+            logger.debug("picker cache prewarm (tui) failed to start", exc_info=True)
 
-    writer.close()
-    server._stdio_transport = previous_transport
+        stdin_items: queue.Queue[object] = queue.Queue()
+        writer_closed = object()
+
+        def read_stdin() -> None:
+            while not stdin_stop.is_set():
+                try:
+                    raw = sys.stdin.readline()
+                except BaseException as exc:
+                    stdin_items.put(exc)
+                    return
+                if stdin_stop.is_set():
+                    return
+                # Stdin fell through — check if spurious (O_NONBLOCK flip by a
+                # child on the shared open file description) or genuine EOF.
+                if not raw and handle_spurious_eof(_recovery_times, _log_exit):
+                    continue
+                stdin_items.put(raw)
+                if not raw:
+                    return
+
+        def wake_on_writer_close() -> None:
+            writer.wait_closed()
+            stdin_items.put(writer_closed)
+
+        threading.Thread(
+            target=read_stdin, name="tui-stdin-reader", daemon=True
+        ).start()
+        threading.Thread(
+            target=wake_on_writer_close,
+            name="tui-stdio-failure-waker",
+            daemon=True,
+        ).start()
+
+        while True:
+            item = stdin_items.get()
+            if item is writer_closed:
+                break
+            if isinstance(item, BaseException):
+                raise item
+            raw = str(item)
+            if not raw:
+                break
+
+            line = raw.strip()
+            if not line:
+                continue
+
+            try:
+                req = json.loads(line)
+            except json.JSONDecodeError:
+                if not write_json({
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32700, "message": "parse error"},
+                    "id": None,
+                }):
+                    _log_exit("parse-error-response write failed (broken stdout pipe)")
+                    break
+                continue
+
+            method = req.get("method") if isinstance(req, dict) else None
+            resp = dispatch(req)
+            if resp is not None and not write_json(resp):
+                _log_exit(
+                    f"response write failed for method={method!r} (broken stdout pipe)"
+                )
+                break
+    finally:
+        stdin_stop.set()
+        writer.close()
+        server._stdio_transport = previous_transport
     writer.raise_if_failed()
 
 

@@ -202,6 +202,7 @@ _STREAMING_EVENT_TYPES = frozenset({
 })
 # A full local pipe for 100ms is already far beyond the 30fps drain cadence.
 _STREAM_CONTROL_PUSH_TIMEOUT_S = 0.1
+_STREAM_PENDING_DELTA_BYTES_MAX = 64 * 1024
 
 
 class ControlQueueTimeoutError(TimeoutError):
@@ -217,6 +218,7 @@ class BufferedStreamWriter:
         *,
         queue_maxsize: int = 256,
         max_pending_deltas: int = 512,
+        max_pending_delta_bytes: int = _STREAM_PENDING_DELTA_BYTES_MAX,
         control_push_timeout_s: float = _STREAM_CONTROL_PUSH_TIMEOUT_S,
         coalesce_s: float = 0.033,
         close_timeout_s: float = 1.0,
@@ -224,11 +226,15 @@ class BufferedStreamWriter:
         self._inner = inner
         self._queue: queue.Queue[list[dict]] = queue.Queue(maxsize=queue_maxsize)
         self._pending: deque[dict] = deque(maxlen=max_pending_deltas)
+        self._pending_delta_bytes = 0
         self._pending_lock = threading.Lock()
         self._control_lock = threading.Lock()
         self._control_claimed = 0
         self._closed = False
+        self._closed_event = threading.Event()
+        self._first_write = threading.Event()
         self._failure: BaseException | None = None
+        self._max_pending_delta_bytes = max(0, max_pending_delta_bytes)
         self._control_push_timeout_s = max(0.0, control_push_timeout_s)
         self._coalesce_s = coalesce_s
         self._close_timeout_s = close_timeout_s
@@ -250,12 +256,27 @@ class BufferedStreamWriter:
         return isinstance(params, dict) and params.get("type") == "message.delta"
 
     @staticmethod
+    def _streaming_text_bytes(obj: dict) -> int:
+        params = obj.get("params") if isinstance(obj, dict) else None
+        payload = params.get("payload") if isinstance(params, dict) else None
+        text = payload.get("text") if isinstance(payload, dict) else None
+        return len(str(text or "").encode("utf-8", errors="surrogatepass"))
+
+    def _has_pending_capacity(self, frame_bytes: int) -> bool:
+        pending_limit = self._pending.maxlen
+        return (
+            pending_limit is None or len(self._pending) < pending_limit
+        ) and self._pending_delta_bytes + frame_bytes <= self._max_pending_delta_bytes
+
+    @staticmethod
     def _resync_reasoning_frames(frames: list[dict]) -> list[dict]:
-        """Coalesce undelivered reasoning per session without losing chronology."""
+        """Replace undelivered reasoning with one bounded loss marker per session."""
         merged: dict[str, dict] = {}
         order: list[str] = []
         for frame in frames:
             params = frame.get("params") or {}
+            if params.get("type") == "message.delta":
+                continue
             session_id = str(params.get("session_id") or "")
             payload = params.get("payload") or {}
             if session_id not in merged:
@@ -268,10 +289,8 @@ class BufferedStreamWriter:
                 resync["params"] = resync_params
                 merged[session_id] = resync
                 order.append(session_id)
-            target = merged[session_id]["params"]["payload"]
-            target["text"] += str(payload.get("text") or "")
             if payload.get("verbose"):
-                target["verbose"] = True
+                merged[session_id]["params"]["payload"]["verbose"] = True
         return [merged[session_id] for session_id in order]
 
     @property
@@ -285,7 +304,9 @@ class BufferedStreamWriter:
                 self._failure = failure
             if failure is not None:
                 self._pending.clear()
+                self._pending_delta_bytes = 0
             self._closed = True
+        self._closed_event.set()
 
     def _expire_control_push(self, *, claimed: bool = False) -> bool:
         timeout = ControlQueueTimeoutError(
@@ -299,11 +320,37 @@ class BufferedStreamWriter:
                 self._failure = timeout
             failure = self._failure
             self._pending.clear()
+            self._pending_delta_bytes = 0
             self._closed = True
+        self._closed_event.set()
         if not already_closed:
             logger.warning("stdio stream writer wedged: %s", timeout)
         if failure is not timeout:
             self.raise_if_failed()
+        return False
+
+    def wait_closed(self, timeout: float | None = None) -> bool:
+        return self._closed_event.wait(timeout)
+
+    def wait_for_first_write(self, timeout: float | None = None) -> bool:
+        timeout = self._control_push_timeout_s if timeout is None else timeout
+        if self._first_write.wait(timeout):
+            return True
+
+        failure = ControlQueueTimeoutError(
+            f"initial control frame was not written within {timeout:.3f}s"
+        )
+        with self._pending_lock:
+            if self._first_write.is_set():
+                return True
+            if self._closed:
+                return False
+            self._failure = failure
+            self._pending.clear()
+            self._pending_delta_bytes = 0
+            self._closed = True
+        self._closed_event.set()
+        logger.warning("stdio stream writer wedged: %s", failure)
         return False
 
     def raise_if_failed(self) -> None:
@@ -320,28 +367,39 @@ class BufferedStreamWriter:
             self.raise_if_failed()
             return False
         if self._is_streaming_frame(obj):
+            frame_bytes = self._streaming_text_bytes(obj)
             with self._pending_lock:
                 if not self._closed:
-                    pending_limit = self._pending.maxlen
-                    if pending_limit is None or len(self._pending) < pending_limit:
+                    if self._has_pending_capacity(frame_bytes):
                         self._pending.append(obj)
+                        self._pending_delta_bytes += frame_bytes
                         return True
-                    # Final-answer deltas recover from message.complete. Reasoning
-                    # does not have a per-tool terminal replacement, so compact all
-                    # undelivered reasoning into explicit resync frames instead of
-                    # dropping it or sending the producer through control backpressure.
+                    # Final-answer deltas recover from message.complete. Discard
+                    # them first, then replace reasoning overflow with a bounded
+                    # marker that lets Ink prefer terminal reasoning authority.
                     # ponytail: bounded overflow-only scan; index it only if the
                     # fixed 512-frame ceiling ever shows up in profiles.
-                    for index, pending in enumerate(self._pending):
-                        if self._is_droppable_frame(pending):
-                            del self._pending[index]
-                            self._pending.append(obj)
-                            return True
+                    while not self._has_pending_capacity(frame_bytes):
+                        for index, pending in enumerate(self._pending):
+                            if self._is_droppable_frame(pending):
+                                self._pending_delta_bytes -= self._streaming_text_bytes(
+                                    pending
+                                )
+                                del self._pending[index]
+                                break
+                        else:
+                            break
+                    if self._has_pending_capacity(frame_bytes):
+                        self._pending.append(obj)
+                        self._pending_delta_bytes += frame_bytes
+                        return True
                     if self._is_droppable_frame(obj):
                         return True
+
                     resync = self._resync_reasoning_frames([*self._pending, obj])
                     self._pending.clear()
                     self._pending.extend(resync)
+                    self._pending_delta_bytes = 0
                     return True
             if self._closed:
                 self.raise_if_failed()
@@ -359,6 +417,7 @@ class BufferedStreamWriter:
                 else:
                     batch = list(self._pending)
                     self._pending.clear()
+                    self._pending_delta_bytes = 0
                     batch.append(obj)
                     self._control_claimed += 1
             if batch is None:
@@ -379,6 +438,7 @@ class BufferedStreamWriter:
         for obj in batch:
             try:
                 if self._inner.write(obj):
+                    self._first_write.set()
                     continue
             except Exception as exc:
                 if _is_peer_gone(exc):
@@ -411,6 +471,7 @@ class BufferedStreamWriter:
                     else:
                         pending = list(self._pending)
                         self._pending.clear()
+                        self._pending_delta_bytes = 0
                     done = (
                         self._closed
                         and not self._control_claimed

@@ -929,6 +929,104 @@ def test_failed_completion_prompt_releases_lifecycle_claim_for_retry(monkeypatch
     injected.assert_awaited_once_with("payload", event)
 
 
+@pytest.mark.parametrize(
+    "failure_stage", ["claim", "prompt_release", "inject_release"]
+)
+def test_gateway_storage_failure_retries_once_in_same_process(
+    monkeypatch, isolated_registry, failure_stage
+):
+    """Claim and rollback writes cannot strand an ordinary gateway completion."""
+    from tools import async_delegation as ad
+    import tools.process_registry as registry_module
+
+    event = _completion_event(
+        started_at=5.1, session_id=f"proc-gateway-{failure_stage}"
+    )
+    assert ad.persist_event_delivery(event)
+    runner = _runner(SimpleNamespace(handle_message=AsyncMock()))
+    effects = []
+    inject_calls = 0
+
+    async def inject(_text, _event):
+        nonlocal inject_calls
+        inject_calls += 1
+        if failure_stage == "inject_release" and inject_calls == 1:
+            return False
+        effects.append(_event["session_id"])
+        return True
+
+    monkeypatch.setattr(runner, "_inject_watch_notification", inject)
+    prompt_calls = 0
+
+    def prompt(_event, text):
+        nonlocal prompt_calls
+        prompt_calls += 1
+        if failure_stage == "prompt_release" and prompt_calls == 1:
+            raise RuntimeError("prompt failed")
+        return text
+
+    monkeypatch.setattr(registry_module, "completion_delivery_prompt", prompt)
+    claim = ad.claim_event_delivery
+    claim_calls = 0
+
+    def claim_once(*args):
+        nonlocal claim_calls
+        claim_calls += 1
+        if failure_stage == "claim" and claim_calls == 1:
+            raise OSError("claim storage unavailable")
+        return claim(*args)
+
+    monkeypatch.setattr(ad, "claim_event_delivery", claim_once)
+    release = ad.release_event_delivery
+    release_calls = 0
+
+    def release_once(*args):
+        nonlocal release_calls
+        release_calls += 1
+        if failure_stage.endswith("release") and release_calls == 1:
+            raise OSError("release storage unavailable")
+        return release(*args)
+
+    monkeypatch.setattr(ad, "release_event_delivery", release_once)
+
+    if failure_stage == "prompt_release":
+        with pytest.raises(RuntimeError, match="prompt failed"):
+            asyncio.run(runner._deliver_completion_notification("payload", event))
+    else:
+        expected = False if failure_stage == "inject_release" else None
+        assert (
+            asyncio.run(runner._deliver_completion_notification("payload", event))
+            is expected
+        )
+
+    assert effects == []
+    assert isolated_registry.completion_event_should_deliver(event)
+    retry = isolated_registry.completion_queue.get_nowait()
+    assert isolated_registry.completion_queue.empty()
+    receipt = ad.get_durable_event_delivery(event)
+    assert receipt is not None
+    assert receipt["delivery_state"] == (
+        "pending" if failure_stage == "claim" else "effect_started"
+    )
+    if failure_stage.endswith("release"):
+        assert retry["_completion_delivery_retained_claim_id"] == receipt["delivery_claim"]
+
+    assert asyncio.run(
+        runner._deliver_completion_notification("payload", retry)
+    ) is True
+    assert effects == [event["session_id"]]
+    receipt = ad.get_durable_event_delivery(event)
+    assert receipt is not None
+    assert receipt["delivery_state"] == "delivered"
+    assert isolated_registry.completion_queue.empty()
+    assert not isolated_registry.completion_event_should_deliver(event)
+
+    assert asyncio.run(
+        runner._deliver_completion_notification("payload", dict(event))
+    ) is None
+    assert effects == [event["session_id"]]
+
+
 def test_completion_judge_runs_off_loop_and_delivers_after_timeout(monkeypatch):
     adapter = SimpleNamespace(handle_message=AsyncMock())
     runner = _runner(adapter)

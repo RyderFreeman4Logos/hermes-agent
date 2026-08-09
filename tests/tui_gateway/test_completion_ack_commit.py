@@ -133,6 +133,82 @@ def test_ordinary_idle_dispatch_acks_after_provider_and_history_commit(
     assert acknowledgements == [([True], messages)]
 
 
+def test_completion_preflight_rejection_releases_claim(turn_env, monkeypatch):
+    """A TUI completion rejected before provider startup remains retryable."""
+    monkeypatch.setattr(
+        "agent.context_references.preprocess_context_references",
+        lambda *_args, **_kwargs: types.SimpleNamespace(
+            blocked=True,
+            warnings=["blocked completion context"],
+            message="",
+        ),
+    )
+    agent = types.SimpleNamespace(
+        model="test",
+        provider="test",
+        base_url="",
+        api_key="",
+        clear_interrupt=lambda: None,
+        run_conversation=lambda *_args, **_kwargs: pytest.fail(
+            "provider must not run after preflight rejection"
+        ),
+    )
+    outcomes = []
+
+    server._run_prompt_submit(
+        "rid",
+        "sid",
+        _session(agent),
+        "@blocked",
+        completion_delivery=True,
+        completion_delivery_callback=outcomes.append,
+    )
+
+    assert outcomes == ["provider_failed"]
+
+
+def test_no_effect_provider_failure_releases_ordinary_claim(turn_env, monkeypatch):
+    """A failed provider turn with no durable suffix is never acknowledged."""
+    from tools import async_delegation as ad
+    import tools.process_registry as registry_module
+
+    monkeypatch.setattr(ad, "restore_undelivered_completions", lambda _queue: 0)
+    registry = registry_module.ProcessRegistry()
+    monkeypatch.setattr(registry_module, "process_registry", registry)
+    event = {
+        "type": "completion",
+        "session_id": "proc-provider-failure",
+        "session_key": "active",
+        "started_at": 1.0,
+    }
+    session = _session(types.SimpleNamespace(
+        model="test",
+        provider="test",
+        clear_interrupt=lambda: None,
+        run_conversation=lambda *_args, **_kwargs: {
+            "final_response": "",
+            "messages": [],
+            "failed": True,
+            "partial": True,
+            "error": "provider unavailable",
+            "completion_delivery_status": "dropped",
+        },
+    ))
+
+    server._dispatch_completion_batch(
+        "sid",
+        session,
+        [{"evt": event, "model_text": "[completion event]", "text": "event"}],
+        consumer="tui-test",
+    )
+
+    assert registry.completion_event_should_deliver(event)
+    receipt = ad.get_durable_event_delivery(event)
+    assert receipt is not None
+    assert receipt["delivery_state"] in {"pending", "dropped"}
+    assert session["history"] == []
+
+
 def test_completion_history_conflict_gets_explicit_recovery_outcome(turn_env):
     """A durable suffix cannot be called delivered when live history rejects it."""
     outcomes = []
@@ -168,6 +244,226 @@ def test_completion_history_conflict_gets_explicit_recovery_outcome(turn_env):
 
     assert outcomes == ["history_conflict"]
     assert session["history"] == []
+
+
+def test_history_conflict_commits_ordinary_recovery_before_ack(
+    turn_env, monkeypatch, tmp_path
+):
+    """An ordinary claim gets a durable recovery receipt before suppression."""
+    from tools import async_delegation as ad
+    import tools.process_registry as registry_module
+
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    registry = registry_module.ProcessRegistry()
+    monkeypatch.setattr(registry_module, "process_registry", registry)
+    event = {
+        "type": "completion",
+        "session_id": "proc-history-conflict",
+        "session_key": "active",
+        "started_at": 2.0,
+    }
+    session = _session(None)
+
+    def run_conversation(message, **_kwargs):
+        with session["history_lock"]:
+            session["history_version"] += 1
+        return {
+            "final_response": "terminal",
+            "messages": [
+                {"role": "user", "content": message},
+                {"role": "assistant", "content": "terminal"},
+            ],
+            "completion_delivery_status": "committed",
+        }
+
+    session["agent"] = types.SimpleNamespace(
+        model="test",
+        provider="test",
+        clear_interrupt=lambda: None,
+        run_conversation=run_conversation,
+    )
+
+    server._dispatch_completion_batch(
+        "sid",
+        session,
+        [{"evt": event, "model_text": "[completion event]", "text": "event"}],
+        consumer="tui-test",
+    )
+
+    receipt = ad.get_durable_event_delivery(event)
+    assert receipt is not None
+    assert receipt["delivery_state"] == "recovery_history_conflict"
+    assert not registry.completion_event_should_deliver(event)
+
+
+def test_failed_ordinary_recovery_transition_leaves_claim_for_retry(
+    monkeypatch, tmp_path
+):
+    """A failed recovery write cannot become a process-registry ACK."""
+    from tools import async_delegation as ad
+    import tools.process_registry as registry_module
+
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    registry = registry_module.ProcessRegistry()
+    monkeypatch.setattr(registry_module, "process_registry", registry)
+    event = {
+        "type": "completion",
+        "session_id": "proc-recovery-write-failed",
+        "session_key": "active",
+        "started_at": 3.0,
+    }
+    assert registry.claim_completion_delivery(event)
+    claim = ad.claim_event_delivery(event, "tui-test")
+    assert claim
+    monkeypatch.setattr(ad, "mark_completion_delivery_recovery", lambda *_args: False)
+
+    server._finish_completion_claim(event, claim, "history_conflict")
+
+    assert registry.completion_event_should_deliver(event)
+    assert registry.completion_queue.get_nowait() == event
+    receipt = ad.get_durable_event_delivery(event)
+    assert receipt is not None
+    assert receipt["delivery_state"] == "pending"
+
+
+def test_visibility_noop_requires_durable_ack(monkeypatch, tmp_path):
+    """A suppressed completion is retryable when its durable ACK fails."""
+    from tools import async_delegation as ad
+    import tools.process_registry as registry_module
+
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    registry = registry_module.ProcessRegistry()
+    monkeypatch.setattr(registry_module, "process_registry", registry)
+    monkeypatch.setattr(
+        server, "_compose_completion_batch_prompt", lambda _items: ("", True)
+    )
+    monkeypatch.setattr(ad, "complete_event_delivery", lambda *_args: False)
+    event = {
+        "type": "completion",
+        "session_id": "proc-visibility-noop",
+        "session_key": "active",
+        "started_at": 3.5,
+    }
+
+    server._dispatch_completion_batch(
+        "sid",
+        _session(None),
+        [{"evt": event, "model_text": "ignored", "text": "ignored"}],
+        consumer="tui-test",
+    )
+
+    assert registry.completion_event_should_deliver(event)
+    assert registry.completion_queue.get_nowait() == event
+    receipt = ad.get_durable_event_delivery(event)
+    assert receipt is not None
+    assert receipt["delivery_state"] == "pending"
+
+
+def test_ordinary_completion_claim_restores_after_restart(monkeypatch, tmp_path):
+    """A restart requeues an unfinished ordinary completion from state.db."""
+    import queue
+
+    from tools import async_delegation as ad
+
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    event = {
+        "type": "completion",
+        "session_id": "proc-restart",
+        "session_key": "active",
+        "started_at": 4.0,
+    }
+    assert ad.persist_event_delivery(event)
+    assert ad.claim_event_delivery(event, "dead-consumer")
+    restarted_queue = queue.Queue()
+
+    # A sibling surface may initialize its registry while this claim is live;
+    # it must not steal or replay the in-flight provider effect.
+    assert ad.restore_undelivered_completions(restarted_queue) == 0
+    assert restarted_queue.empty()
+    monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: False)
+
+    assert ad.restore_undelivered_completions(restarted_queue) == 1
+    restored = restarted_queue.get_nowait()
+    assert {key: restored[key] for key in event} == event
+    receipt = ad.get_durable_event_delivery(event)
+    assert receipt is not None
+    assert receipt["delivery_state"] == "pending"
+    assert receipt["delivery_claim"] is None
+
+
+def test_process_completion_is_durable_before_checkpoint_and_queue(
+    monkeypatch, tmp_path
+):
+    """The producer writes the ordinary receipt before retiring its checkpoint."""
+    from tools import async_delegation as ad
+    from tools.process_registry import ProcessRegistry, ProcessSession
+
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    registry = ProcessRegistry()
+    order = []
+    persist = ad.persist_event_delivery
+
+    def record_persist(event):
+        order.append("persist")
+        return persist(event)
+
+    monkeypatch.setattr(ad, "persist_event_delivery", record_persist)
+    monkeypatch.setattr(
+        registry, "_write_checkpoint", lambda: order.append("checkpoint")
+    )
+    process = ProcessSession(
+        id="proc-durable-producer",
+        command="true",
+        session_key="active",
+        started_at=5.0,
+        exited=True,
+        exit_code=0,
+        notify_on_complete=True,
+    )
+    registry._running[process.id] = process
+
+    registry._move_to_finished(process)
+
+    assert order == ["persist", "checkpoint"]
+    event = registry.completion_queue.get_nowait()
+    receipt = ad.get_durable_event_delivery(event)
+    assert receipt is not None
+    assert receipt["delivery_state"] == "pending"
+
+
+def test_process_completion_persist_failure_keeps_restart_checkpoint(
+    monkeypatch,
+):
+    """A failed receipt write cannot erase the producer's restart source."""
+    from tools import async_delegation as ad
+    from tools.process_registry import ProcessRegistry, ProcessSession
+
+    monkeypatch.setattr(ad, "restore_undelivered_completions", lambda _queue: 0)
+    registry = ProcessRegistry()
+    checkpoints = []
+    monkeypatch.setattr(
+        ad,
+        "persist_event_delivery",
+        lambda _event: (_ for _ in ()).throw(OSError("storage unavailable")),
+    )
+    monkeypatch.setattr(
+        registry, "_write_checkpoint", lambda: checkpoints.append(True)
+    )
+    process = ProcessSession(
+        id="proc-persist-failure",
+        command="true",
+        session_key="active",
+        started_at=5.5,
+        exited=True,
+        exit_code=0,
+        notify_on_complete=True,
+    )
+    registry._running[process.id] = process
+
+    registry._move_to_finished(process)
+
+    assert checkpoints == []
+    assert registry.completion_queue.get_nowait()["session_id"] == process.id
 
 
 def test_committed_failure_suffix_is_a_terminal_delivery(turn_env):

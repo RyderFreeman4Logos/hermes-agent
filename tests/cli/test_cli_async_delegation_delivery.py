@@ -3,7 +3,8 @@
 import queue
 import types
 
-from cli import HermesCLI, _CompletionDeliveryMessage
+import cli as cli_module
+from cli import HermesCLI
 
 
 def test_cli_completion_drain_uses_visible_session_identity(monkeypatch):
@@ -43,9 +44,13 @@ def test_cli_completion_drain_uses_visible_session_identity(monkeypatch):
     cli._drain_process_notifications("cli-idle")
 
     assert calls == [("visible-session", True)]
-    assert cli._pending_input.get_nowait() == "completion payload"
+    pending = cli._pending_input.get_nowait()
+    assert pending == "completion payload"
+    assert isinstance(pending, cli_module._CompletionDeliveryMessage)
+    assert pending.event == event
+    assert pending.claim_id == "claim-token"
     assert claimed == [(event, "cli-idle")]
-    assert completed == [(event, "claim-token")]
+    assert completed == []
 
 
 def test_cli_completion_ownership_rejects_foreign_session():
@@ -120,11 +125,11 @@ def test_cli_numeric_completion_queues_model_nudge_and_nonterminal_fails_open(
     cli._drain_process_notifications("cli-idle")
 
     prompt = cli._pending_input.get_nowait()
-    assert isinstance(prompt, _CompletionDeliveryMessage)
+    assert isinstance(prompt, cli_module._CompletionDeliveryMessage)
     assert "Background process proc-done completed normally" in prompt
     assert "must be literally empty (zero characters)" in prompt
     nonterminal = cli._pending_input.get_nowait()
-    assert isinstance(nonterminal, _CompletionDeliveryMessage)
+    assert isinstance(nonterminal, cli_module._CompletionDeliveryMessage)
     assert "Background process proc-running exited (exit code None)" in nonterminal
     assert "Command: sleep 1" in nonterminal
     assert "Output:\nstill running" in nonterminal

@@ -1,9 +1,8 @@
-"""Lifecycle-scoped gateway delivery regressions for terminal completions.
+"""Gateway terminal-fence regressions for completion delivery.
 
-The gateway contract here is deliberately narrower than exactly-once: one live
-GatewayRunner suppresses concurrent/replayed copies after successful adapter
-injection, failed injection remains retryable, and durable async-delegation
-state (when available) is acknowledged through its authoritative SQLite API.
+One live GatewayRunner suppresses concurrent/replayed copies, failed injection
+remains retryable, and push adapters retain durable claims until the provider
+turn and transcript publication finish.
 """
 
 import asyncio
@@ -508,6 +507,55 @@ def test_numeric_completion_gets_nudge_and_unknown_fails_open(monkeypatch):
     assert injected.await_args.args[0] == "not complete"
 
 
+def test_gateway_push_keeps_claim_until_turn_commit(isolated_registry):
+    """Push-adapter acceptance is not the provider/history terminal fence."""
+    from tools import async_delegation as ad
+
+    adapter = SimpleNamespace(handle_message=AsyncMock(), supports_push=True)
+    runner = _runner(adapter)
+    event = _completion_event(started_at=2.5, session_id="proc-push-fence")
+
+    assert asyncio.run(
+        runner._deliver_completion_notification("payload", event)
+    ) is True
+
+    receipt = ad.get_durable_event_delivery(event)
+    assert receipt is not None
+    assert receipt["delivery_state"] == "effect_started"
+    delivered_event = adapter.handle_message.await_args.args[0]
+    assert delivered_event.metadata["_completion_delivery_receipt"]
+
+    asyncio.run(
+        runner._finish_completion_delivery_receipt(
+            delivered_event, "committed"
+        )
+    )
+    receipt = ad.get_durable_event_delivery(event)
+    assert receipt is not None
+    assert receipt["delivery_state"] == "delivered"
+    assert not isolated_registry.completion_event_should_deliver(event)
+
+
+def test_legacy_gateway_completion_keeps_terminal_fence(isolated_registry):
+    """Legacy events without stable IDs still wait for the push turn to finish."""
+    adapter = SimpleNamespace(handle_message=AsyncMock(), supports_push=True)
+    runner = _runner(adapter)
+    event = _completion_event(started_at=2.6, session_id="proc-legacy")
+    event.pop("started_at")
+
+    assert asyncio.run(
+        runner._deliver_completion_notification("payload", event)
+    ) is True
+
+    delivered_event = adapter.handle_message.await_args.args[0]
+    assert delivered_event.metadata["_completion_delivery_receipt"]
+    asyncio.run(
+        runner._finish_completion_delivery_receipt(
+            delivered_event, "committed"
+        )
+    )
+
+
 def test_owner_observed_success_skips_gateway_turn(monkeypatch, isolated_registry):
     adapter = SimpleNamespace(handle_message=AsyncMock())
     runner = _runner(adapter)
@@ -519,8 +567,13 @@ def test_owner_observed_success_skips_gateway_turn(monkeypatch, isolated_registr
     )
     event = _completion_event(started_at=3.0)
     isolated_registry._record_completion_observed(ProcessSession(
-        id=event["session_id"], command=event["command"],
-        session_key=event["session_key"], started_at=event["started_at"],
+        id=event["session_id"],
+        command=event["command"],
+        session_key=event["session_key"],
+        started_at=event["started_at"],
+        exit_code=event["exit_code"],
+        completion_reason=event["completion_reason"],
+        output_buffer=event["output"],
         notify_on_complete=True,
     ))
 
@@ -528,6 +581,15 @@ def test_owner_observed_success_skips_gateway_turn(monkeypatch, isolated_registr
         runner._deliver_completion_notification("payload", event)
     ) is None
     injected.assert_not_awaited()
+
+    from tools import async_delegation as ad
+
+    receipt = ad.get_durable_event_delivery(event)
+    assert receipt is not None
+    assert receipt["delivery_state"] == "delivered"
+    restarted_queue = queue.Queue()
+    assert ad.restore_undelivered_completions(restarted_queue) == 0
+    assert restarted_queue.empty()
 
 
 def test_failed_process_injection_releases_lifecycle_claim(monkeypatch):
@@ -622,6 +684,13 @@ def test_failed_async_injection_is_retried_and_only_success_is_acked(
     asyncio.run(runner._async_delegation_watcher(interval=0))
 
     assert adapter.handle_message.await_count == 2
+    assert acknowledgements == []
+    delivered_event = adapter.handle_message.await_args_list[-1].args[0]
+    asyncio.run(
+        runner._finish_completion_delivery_receipt(
+            delivered_event, "committed"
+        )
+    )
     assert acknowledgements == ["deleg_duplicate"]
 
 

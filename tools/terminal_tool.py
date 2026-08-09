@@ -2590,6 +2590,18 @@ def terminal_tool(
                 "status": "error",
             }, ensure_ascii=False)
 
+        stripped_command = command.strip()
+        if (
+            re.fullmatch(r"(?:\.\.\.|…)?\s*\[truncated\]", stripped_command)
+            or stripped_command.endswith(("...[truncated]", "…[truncated]"))
+        ):
+            return json.dumps({
+                "output": "",
+                "exit_code": -1,
+                "error": "Command was not executed because the payload appears truncated by the UI. Resend the complete command.",
+                "status": "error",
+            }, ensure_ascii=False)
+
         # Get configuration
         config = _get_env_config()
         env_type = config["env_type"]

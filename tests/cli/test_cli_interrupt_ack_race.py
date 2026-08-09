@@ -156,6 +156,103 @@ def test_unacknowledged_interrupt_message_is_requeued_not_dropped():
 
 
 
+def test_cli_completion_preflight_failure_requeues_claim(tmp_path, monkeypatch):
+    """A completion rejected before provider startup remains retryable."""
+    from tools import async_delegation as ad
+    import tools.process_registry as registry_module
+
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    registry = registry_module.ProcessRegistry()
+    monkeypatch.setattr(registry_module, "process_registry", registry)
+    event = {
+        "type": "completion",
+        "session_id": "proc-cli-preflight-failure",
+        "session_key": "active",
+        "started_at": 6.5,
+    }
+    assert registry.claim_completion_delivery(event)
+    claim = ad.claim_event_delivery(event, "cli-test")
+    assert claim
+    cli = _make_cli()
+
+    with patch.object(cli, "_ensure_runtime_credentials", return_value=False):
+        assert cli.chat(
+            "completion prompt",
+            completion_delivery=True,
+            completion_event=event,
+            completion_claim=claim,
+        ) is None
+
+    assert registry.completion_event_should_deliver(event)
+    assert registry.completion_queue.get_nowait() == event
+    receipt = ad.get_durable_event_delivery(event)
+    assert receipt is not None
+    assert receipt["delivery_state"] == "pending"
+
+
+def test_cli_completion_failure_requeues_until_durable_terminal(
+    tmp_path, monkeypatch
+):
+    """Classic CLI resolves the claim only after the agent's durable result."""
+    from tools import async_delegation as ad
+    import tools.process_registry as registry_module
+
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    registry = registry_module.ProcessRegistry()
+    monkeypatch.setattr(registry_module, "process_registry", registry)
+    event = {
+        "type": "completion",
+        "session_id": "proc-cli-failure",
+        "session_key": "active",
+        "started_at": 6.0,
+    }
+    assert registry.claim_completion_delivery(event)
+    claim = ad.claim_event_delivery(event, "cli-test")
+    assert claim
+    cli = _make_cli()
+
+    class CompletionAgent(_StubAgent):
+        def run_conversation(self, **_kwargs):
+            return {
+                "final_response": "",
+                "messages": [],
+                "api_calls": 1,
+                "completed": False,
+                "failed": True,
+                "partial": True,
+                "error": "provider unavailable",
+                "completion_delivery_status": "dropped",
+                "response_previewed": True,
+            }
+
+    cli.agent = CompletionAgent(cli.session_id, turn_seconds=0)
+    cli._interrupt_queue = queue.Queue()
+    cli._pending_input = queue.Queue()
+
+    with patch.object(cli, "_ensure_runtime_credentials", return_value=True), patch.object(
+        cli,
+        "_resolve_turn_agent_config",
+        return_value={
+            "signature": cli._active_agent_route_signature,
+            "model": None,
+            "runtime": None,
+            "request_overrides": None,
+        },
+    ), patch.object(cli, "_init_agent", return_value=True):
+        cli.chat(
+            "completion prompt",
+            completion_delivery=True,
+            completion_event=event,
+            completion_claim=claim,
+        )
+
+    assert registry.completion_event_should_deliver(event)
+    assert registry.completion_queue.get_nowait() == event
+    receipt = ad.get_durable_event_delivery(event)
+    assert receipt is not None
+    assert receipt["delivery_state"] == "pending"
+
+
 def test_chat_persists_clean_input_when_a_queued_note_changes_api_message():
     """Queued notes remain API-local and preserve close-handoff marker identity."""
     cli = _make_cli()

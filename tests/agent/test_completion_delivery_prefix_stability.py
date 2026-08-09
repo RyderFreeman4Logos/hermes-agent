@@ -1426,7 +1426,10 @@ def test_missing_retry_state_does_not_poison_cached_agent(
     tmp_path, monkeypatch, missing
 ):
     """Lost retry state converges once instead of short-circuiting every turn."""
+    from tools import async_delegation as ad
+
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
     db = SessionDB(db_path=tmp_path / "state.db")
     session_id = f"completion-missing-{missing}"
     db.create_session(session_id, source="tui", model="test-model")
@@ -1471,6 +1474,39 @@ def test_missing_retry_state_does_not_poison_cached_agent(
         assert not any(
             row.get("_completion_delivery_synthetic") for row in agent._session_messages
         )
+        recoveries = ad.get_completion_delivery_recoveries(session_id)
+        assert [row["reason"] for row in recoveries] == [
+            "missing_pending_suffix" if missing == "suffix" else "missing_active_marker"
+        ]
+    finally:
+        db.close()
+
+
+def test_missing_retry_state_waits_for_durable_recovery_write(
+    tmp_path, monkeypatch
+):
+    """A failed missing-state disposition keeps the retained retry latch."""
+    from agent.turn_finalizer import retry_pending_completion_delivery_commit
+    from tools import async_delegation as ad
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "completion-missing-write-failed"
+    db.create_session(session_id, source="tui", model="test-model")
+    agent = _make_agent(tmp_path, db, session_id)
+    pending_event = {
+        "role": "user",
+        "content": "lost completion",
+        "_completion_delivery_synthetic": True,
+    }
+    agent._session_messages = []
+    setattr(agent, "_pending_completion_delivery_suffix", [pending_event])
+    setattr(agent, "_completion_delivery_commit_failed", True)
+    monkeypatch.setattr(ad, "record_completion_delivery_recovery", lambda *_a: False)
+
+    try:
+        assert retry_pending_completion_delivery_commit(agent, []) == "pending"
+        assert getattr(agent, "_completion_delivery_commit_failed") is True
+        assert getattr(agent, "_pending_completion_delivery_suffix") == [pending_event]
     finally:
         db.close()
 

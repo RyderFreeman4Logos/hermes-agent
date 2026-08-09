@@ -73,7 +73,9 @@ class _StubChild:
             "seconds_since_activity": 60,
         }
 
-    def run_conversation(self, user_message, task_id=None, stream_callback=None):
+    def run_conversation(
+        self, user_message, task_id=None, stream_callback=None, turn_deadline=None
+    ):
         self._hang.wait(self._hang_seconds)
         return {"final_response": "", "completed": False, "api_calls": self._api_call_count}
 
@@ -238,3 +240,33 @@ class TestRunSingleChildTimeoutDump:
         assert result["timeout_seconds"] is None
         assert result["timed_out_after_seconds"] is None
         assert result["timeout_phase"] is None
+
+    def test_configured_child_timeout_is_propagated_as_turn_deadline(
+        self, hermes_home, monkeypatch
+    ):
+        from tools import delegate_tool
+
+        monkeypatch.setattr(delegate_tool, "_get_child_timeout", lambda: 30.0)
+        child = _StubChild(api_call_count=0, hang_seconds=0.0)
+        observed = {}
+
+        def _capture_deadline(
+            user_message, task_id=None, stream_callback=None, turn_deadline=None
+        ):
+            observed["turn_deadline"] = turn_deadline
+            return {"final_response": "done", "completed": True, "api_calls": 0}
+
+        child.run_conversation = _capture_deadline
+        parent = MagicMock()
+        parent._touch_activity = MagicMock()
+        parent._current_task_id = None
+        before = time.monotonic()
+        delegate_tool._run_single_child(
+            task_index=0,
+            goal="test goal",
+            child=child,
+            parent_agent=parent,
+        )
+        after = time.monotonic()
+
+        assert before + 30.0 <= observed["turn_deadline"] <= after + 30.0

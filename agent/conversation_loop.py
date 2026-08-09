@@ -27,7 +27,10 @@ from copy import deepcopy
 from typing import Any, Dict, List, Optional
 
 from agent import relay_llm
-from agent.chat_completion_helpers import estimate_request_context_tokens
+from agent.chat_completion_helpers import (
+    codex_pre_dispatch_watchdog_allowance,
+    estimate_request_context_tokens,
+)
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.conversation_compression import (
     COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
@@ -1615,6 +1618,7 @@ def run_conversation(
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
     turn_origin: str = "user",
+    turn_deadline: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -1639,7 +1643,8 @@ def run_conversation(
             the message unchanged.
         persist_user_display_metadata: Optional payload for that event
             (e.g. a delegation's task count).
-                or queuing follow-up prefetch work.
+        turn_deadline: Optional absolute ``time.monotonic()`` deadline for this
+            turn. A provider request is not dispatched without watchdog headroom.
 
     Returns:
         Dict: Complete conversation result with final response and message history
@@ -1723,6 +1728,7 @@ def run_conversation(
 
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = 0
+    logical_iteration_count = 0
     final_response = None
     interrupted = False
     failed = False
@@ -1795,14 +1801,17 @@ def run_conversation(
         )
 
     while (
-        (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0)
+        (
+            logical_iteration_count < agent.max_iterations
+            and agent.iteration_budget.remaining > 0
+        )
         or agent._budget_grace_call
         or getattr(agent, "_codex_incomplete_retries", 0)
     ):
         terminal_text_only = (
             getattr(agent, "_delegate_depth", 0) > 0
             and min(
-                agent.max_iterations - api_call_count,
+                agent.max_iterations - logical_iteration_count,
                 agent.iteration_budget.remaining,
             ) == 1
         )
@@ -1834,13 +1843,37 @@ def run_conversation(
         # Grace call: the budget is exhausted but we gave the model one
         # more chance.  Consume the grace flag so the loop exits after
         # this iteration regardless of outcome.
+        codex_continuation = bool(getattr(agent, "_codex_incomplete_retries", 0))
+        logical_slot_consumed = False
+        shared_iteration_consumed = False
         if agent._budget_grace_call:
             agent._budget_grace_call = False
-        elif not getattr(agent, "_codex_incomplete_retries", 0) and not agent.iteration_budget.consume():
-            _turn_exit_reason = "budget_exhausted"
-            if not agent.quiet_mode:
-                agent._safe_print(f"\n⚠️  Iteration budget exhausted ({agent.iteration_budget.used}/{agent.iteration_budget.max_total} iterations used)")
-            break
+            logical_iteration_count += 1
+            logical_slot_consumed = True
+        elif not codex_continuation:
+            if not agent.iteration_budget.consume():
+                _turn_exit_reason = "budget_exhausted"
+                api_call_count -= 1
+                agent._api_call_count = api_call_count
+                if not agent.quiet_mode:
+                    agent._safe_print(f"\n⚠️  Iteration budget exhausted ({agent.iteration_budget.used}/{agent.iteration_budget.max_total} iterations used)")
+                break
+            logical_iteration_count += 1
+            logical_slot_consumed = True
+            shared_iteration_consumed = True
+
+        def _refund_current_logical_iteration():
+            nonlocal logical_iteration_count, logical_slot_consumed
+            nonlocal shared_iteration_consumed
+            if logical_slot_consumed:
+                logical_iteration_count = max(0, logical_iteration_count - 1)
+                logical_slot_consumed = False
+            if shared_iteration_consumed:
+                try:
+                    agent.iteration_budget.refund()
+                except Exception:
+                    pass
+                shared_iteration_consumed = False
 
         # Fire step_callback for gateway hooks (agent:step event)
         if agent.step_callback is not None:
@@ -1873,7 +1906,8 @@ def run_conversation(
         # Track tool-calling iterations for skill nudge.
         # Counter resets whenever skill_manage is actually used.
         if (agent._skill_nudge_interval > 0
-                and "skill_manage" in agent.valid_tool_names):
+                and "skill_manage" in agent.valid_tool_names
+                and not codex_continuation):
             agent._iters_since_skill += 1
         
         # ── Pre-API-call /steer drain ──────────────────────────────────
@@ -2309,10 +2343,7 @@ def run_conversation(
             agent._emit_status("❌ Ollama runtime context is too small for Hermes tool use")
             api_call_count -= 1
             agent._api_call_count = api_call_count
-            try:
-                agent.iteration_budget.refund()
-            except Exception:
-                pass
+            _refund_current_logical_iteration()
             break
 
         # Pre-API pressure check. The turn-prologue preflight only saw the
@@ -2465,7 +2496,7 @@ def run_conversation(
                 )
                 api_call_count -= 1
                 agent._api_call_count = api_call_count
-                agent.iteration_budget.refund()
+                _refund_current_logical_iteration()
                 continue
         elif (
             agent.compression_enabled
@@ -2530,6 +2561,7 @@ def run_conversation(
         finish_reason = "stop"
         response = None  # Guard against UnboundLocalError if all retries fail
         api_kwargs = None  # Guard against UnboundLocalError in except handler
+        _pre_dispatch_deadline_exhausted = False
         api_request_id = f"{turn_id}:api:{api_call_count}"
         agent._current_api_request_id = api_request_id
 
@@ -2817,6 +2849,26 @@ def run_conversation(
                             is_github_responses=agent._is_copilot_url(),
                             sanitize_harmony_tokens=agent._is_codex_backend(),
                         )
+                    if turn_deadline is not None:
+                        remaining_turn_budget = turn_deadline - time.monotonic()
+                        watchdog_allowance = codex_pre_dispatch_watchdog_allowance(
+                            agent, next_api_kwargs
+                        )
+                        if remaining_turn_budget <= 0 or (
+                            watchdog_allowance > 0
+                            and remaining_turn_budget < watchdog_allowance
+                        ):
+                            deadline_error = TimeoutError(
+                                "Turn deadline cannot cover the next provider request "
+                                f"(remaining={max(0.0, remaining_turn_budget):.3f}s, "
+                                f"required_watchdog_allowance={watchdog_allowance:.3f}s)"
+                            )
+                            setattr(
+                                deadline_error,
+                                "_hermes_pre_dispatch_turn_deadline",
+                                True,
+                            )
+                            raise deadline_error
                     with relay_llm.text_only_requests(terminal_text_only):
                         if _use_streaming:
                             return agent._interruptible_streaming_api_call(
@@ -3985,11 +4037,45 @@ def run_conversation(
                 if agent.thinking_callback:
                     agent.thinking_callback("")
 
+                if getattr(api_error, "_hermes_pre_dispatch_turn_deadline", False):
+                    api_call_count -= 1
+                    agent._api_call_count = api_call_count
+                    _refund_current_logical_iteration()
+                    final_response = str(api_error)
+                    failed = True
+                    _turn_exit_reason = "pre_dispatch_turn_deadline"
+                    messages.append({"role": "assistant", "content": final_response})
+                    _pre_dispatch_deadline_exhausted = True
+                    break
+
                 if getattr(api_error, "_hermes_ambiguous_provider_acceptance", False):
                     ambiguous_error = (
                         "Provider request outcome is unknown after acceptance; "
                         "Hermes did not replay it to avoid duplicate billed work."
                     )
+                    ambiguous_message = {
+                        "role": "assistant",
+                        "content": ambiguous_error,
+                        "finish_reason": "ambiguous_provider_attempt",
+                    }
+                    if messages and messages[-1].get("role") == "assistant":
+                        prior_content = str(messages[-1].get("content") or "").strip()
+                        for replay_key in (
+                            "reasoning",
+                            "reasoning_content",
+                            "reasoning_details",
+                            "codex_reasoning_items",
+                            "codex_message_items",
+                            "tool_calls",
+                        ):
+                            messages[-1].pop(replay_key, None)
+                        messages[-1].update(ambiguous_message)
+                        if prior_content:
+                            messages[-1]["content"] = (
+                                f"{prior_content}\n\n{ambiguous_error}"
+                            )
+                    else:
+                        messages.append(ambiguous_message)
                     agent._emit_status(f"⚠️ {ambiguous_error}")
                     agent._persist_session(messages, conversation_history)
                     return {
@@ -6141,12 +6227,15 @@ def run_conversation(
                     # stale request.
                     break
         
+        if _pre_dispatch_deadline_exhausted:
+            break
+
         if _retry.restart_with_redirected_messages:
             # The cancelled request produced no valid assistant item. Reuse the
             # same logical iteration after the outer loop appends the displayed
             # partial context and correction to ``messages``.
             api_call_count -= 1
-            agent.iteration_budget.refund()
+            _refund_current_logical_iteration()
             _retry.restart_with_redirected_messages = False
             continue
 
@@ -6157,7 +6246,7 @@ def run_conversation(
 
         if _retry.restart_with_compressed_messages:
             api_call_count -= 1
-            agent.iteration_budget.refund()
+            _refund_current_logical_iteration()
             # Count compression restarts toward the retry limit to prevent
             # infinite loops when compression reduces messages but not enough
             # to fit the context window.
@@ -6182,7 +6271,7 @@ def run_conversation(
             # the budget/count for the stalled attempt so the fallback gets a
             # fair turn.
             api_call_count -= 1
-            agent.iteration_budget.refund()
+            _refund_current_logical_iteration()
             _retry.restart_with_rebuilt_messages = False
             continue
 
@@ -6322,7 +6411,7 @@ def run_conversation(
                 or finish_reason in {"incomplete", "length", "tool_calls"}
             ):
                 _turn_exit_reason = (
-                    f"terminal_slot_exhausted({api_call_count}/{agent.max_iterations})"
+                    f"terminal_slot_exhausted({logical_iteration_count}/{agent.max_iterations})"
                 )
                 final_response = (
                     "I reached the iteration limit before producing a final response."
@@ -6373,6 +6462,7 @@ def run_conversation(
                 interim_has_reasoning = bool(interim_msg.get("reasoning", "").strip()) if isinstance(interim_msg.get("reasoning"), str) else False
                 interim_has_codex_reasoning = bool(interim_msg.get("codex_reasoning_items"))
                 interim_has_codex_message_items = bool(interim_msg.get("codex_message_items"))
+                replayable_no_progress = False
 
                 if (
                     interim_has_content
@@ -6412,14 +6502,33 @@ def run_conversation(
                         # Update replay state in-place so the latest provider
                         # payload is preserved without re-emitting identical
                         # user-visible commentary.
-                        for _key in (
+                        replay_state_keys = (
                             "content",
                             "reasoning",
                             "reasoning_content",
                             "reasoning_details",
                             "codex_reasoning_items",
                             "codex_message_items",
-                        ):
+                        )
+                        replay_projection_kwargs = {
+                            "is_xai_responses": (
+                                agent.provider in {"xai", "xai-oauth"}
+                                or agent._base_url_hostname == "api.x.ai"
+                            ),
+                            "is_github_responses": agent._is_copilot_url(),
+                            "is_codex_backend": agent._is_codex_backend(),
+                            "base_url": agent.base_url,
+                            "replay_encrypted_reasoning": bool(
+                                getattr(agent, "_codex_reasoning_replay_enabled", True)
+                            ),
+                        }
+                        transport = agent._get_transport()
+                        replayable_no_progress = transport.convert_messages(
+                            [last_msg], **replay_projection_kwargs
+                        ) == transport.convert_messages(
+                            [interim_msg], **replay_projection_kwargs
+                        )
+                        for _key in replay_state_keys:
                             if _key in interim_msg:
                                 last_msg[_key] = interim_msg[_key]
                     else:
@@ -6468,14 +6577,20 @@ def run_conversation(
                             "role": "user",
                             "content": _CODEX_INCOMPLETE_NUDGE,
                         })
+                if not interim_replayable or replayable_no_progress:
                     _continuation_backoff = jittered_backoff(
                         agent._codex_incomplete_retries,
                         base_delay=1.0,
                         max_delay=15.0,
                     )
                     if _continuation_backoff > 0:
+                        _backoff_reason = (
+                            "no semantic continuation progress"
+                            if replayable_no_progress
+                            else "no replayable continuation state"
+                        )
                         agent._emit_wait_notice(
-                            f"↻ no replayable continuation state; waiting "
+                            f"↻ {_backoff_reason}; waiting "
                             f"{_continuation_backoff:.1f}s before retrying"
                         )
                         _backoff_deadline = time.monotonic() + _continuation_backoff
@@ -7946,7 +8061,7 @@ def run_conversation(
             # rather than retrying until the budget is exhausted.
             if (
                 _is_local_processing_error
-                or api_call_count >= agent.max_iterations - 1
+                or logical_iteration_count >= agent.max_iterations - 1
             ):
                 if _is_local_processing_error:
                     _turn_exit_reason = f"local_processing_error({error_msg[:80]})"
@@ -7967,6 +8082,7 @@ def run_conversation(
         agent,
         final_response=final_response,
         api_call_count=api_call_count,
+        logical_iteration_count=logical_iteration_count,
         interrupted=interrupted,
         failed=failed,
         messages=messages,

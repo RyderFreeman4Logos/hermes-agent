@@ -228,6 +228,95 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _resolve_codex_stream_watchdogs(
+    agent, api_kwargs: dict, *, log_adjustments: bool = True
+) -> tuple[bool, bool, int, bool, float, bool, float]:
+    """Resolve the request-sensitive Codex first-event and SSE-idle limits."""
+    enabled = agent.api_mode == "codex_responses"
+    openai_backend = _is_openai_codex_backend(agent)
+    est_tokens = estimate_request_context_tokens(api_kwargs)
+    if est_tokens > 100_000:
+        idle_default = 180.0
+    elif est_tokens > 50_000:
+        idle_default = 120.0
+    elif est_tokens > 10_000:
+        idle_default = 60.0
+    else:
+        idle_default = 12.0
+
+    ttfb_enabled = enabled
+    ttfb_timeout = _env_float("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", 120.0)
+    if ttfb_timeout <= 0:
+        ttfb_enabled = False
+    elif openai_backend:
+        disable_above = _env_float(
+            "HERMES_CODEX_TTFB_DISABLE_ABOVE_TOKENS", 10_000.0
+        )
+        strict = os.environ.get("HERMES_CODEX_TTFB_STRICT", "").strip().lower() in {
+            "1", "true", "yes", "on"
+        }
+        if (
+            not strict
+            and disable_above > 0
+            and est_tokens >= disable_above
+            and ttfb_timeout < idle_default
+        ):
+            if log_adjustments:
+                logger.info(
+                    "Scaling openai-codex no-byte TTFB watchdog from %.0fs to %.0fs "
+                    "for large request (context=~%s tokens >= %.0f). "
+                    "Set HERMES_CODEX_TTFB_STRICT=1 to keep the smaller cutoff.",
+                    ttfb_timeout,
+                    idle_default,
+                    f"{est_tokens:,}",
+                    disable_above,
+                )
+            ttfb_timeout = idle_default
+        ttfb_cap = _env_float("HERMES_CODEX_TTFB_MAX_SECONDS", 120.0)
+        if ttfb_cap > 0 and ttfb_timeout > ttfb_cap:
+            if log_adjustments:
+                logger.info(
+                    "Capping openai-codex no-byte TTFB timeout from %.0fs to %.0fs "
+                    "(context=~%s tokens). Set HERMES_CODEX_TTFB_MAX_SECONDS to tune.",
+                    ttfb_timeout,
+                    ttfb_cap,
+                    f"{est_tokens:,}",
+                )
+            ttfb_timeout = ttfb_cap
+
+    idle_timeout = _env_float(
+        "HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS", idle_default
+    )
+    idle_enabled = enabled and idle_timeout > 0
+    return (
+        enabled,
+        openai_backend,
+        est_tokens,
+        ttfb_enabled,
+        ttfb_timeout,
+        idle_enabled,
+        idle_timeout,
+    )
+
+
+def codex_pre_dispatch_watchdog_allowance(agent, api_kwargs: dict) -> float:
+    """Return the first-event plus stall allowance a Codex call needs."""
+    (
+        enabled,
+        _openai_backend,
+        _est_tokens,
+        ttfb_enabled,
+        ttfb_timeout,
+        idle_enabled,
+        idle_timeout,
+    ) = _resolve_codex_stream_watchdogs(agent, api_kwargs, log_adjustments=False)
+    if not enabled:
+        return 0.0
+    return (ttfb_timeout if ttfb_enabled else 0.0) + (
+        idle_timeout if idle_enabled else 0.0
+    )
+
+
 def _estimate_chunk_bytes(chunk: Any) -> int:
     """Cheap per-chunk size estimate for the stream diagnostic counters.
 
@@ -994,9 +1083,15 @@ def interruptible_api_call(agent, api_kwargs: dict):
     # matches Codex CLI's stream_idle_timeout model: any valid SSE event is
     # activity. Operators can tune via HERMES_CODEX_TTFB_TIMEOUT_SECONDS and
     # HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS (0 disables each).
-    _codex_watchdog_enabled = agent.api_mode == "codex_responses"
-    _openai_codex_backend = _is_openai_codex_backend(agent)
-    _est_tokens_for_codex_watchdog = estimate_request_context_tokens(api_kwargs)
+    (
+        _codex_watchdog_enabled,
+        _openai_codex_backend,
+        _est_tokens_for_codex_watchdog,
+        _ttfb_enabled,
+        _ttfb_timeout,
+        _codex_idle_enabled,
+        _codex_idle_timeout,
+    ) = _resolve_codex_stream_watchdogs(agent, api_kwargs)
     if _codex_watchdog_enabled and _openai_codex_backend:
         _codex_floor = openai_codex_stale_timeout_floor(_est_tokens_for_codex_watchdog)
         if _codex_floor:
@@ -1010,67 +1105,6 @@ def interruptible_api_call(agent, api_kwargs: dict):
         _total_request_timeout = agent._resolved_api_call_timeout()
         if not math.isfinite(_total_request_timeout) or _total_request_timeout <= 0:
             _total_request_timeout = 1800.0
-
-    if _est_tokens_for_codex_watchdog > 100_000:
-        _codex_idle_timeout_default = 180.0
-    elif _est_tokens_for_codex_watchdog > 50_000:
-        _codex_idle_timeout_default = 120.0
-    elif _est_tokens_for_codex_watchdog > 10_000:
-        _codex_idle_timeout_default = 60.0
-    else:
-        _codex_idle_timeout_default = 12.0
-
-    # No-byte TTFB cutoff. The OpenAI SDK's own streaming read timeout is far
-    # longer (openai 2.x DEFAULT_TIMEOUT.read = 600s), so a tight 12s default
-    # killed subscription-backed Codex requests mid-prefill before the backend
-    # had a chance to emit its first SSE event. Default to 120s — long enough to
-    # clear normal backend admission / prompt prefill, short enough to still
-    # reconnect promptly when the socket is genuinely wedged. Set
-    # HERMES_CODEX_TTFB_TIMEOUT_SECONDS=0 to disable this watchdog entirely.
-    _ttfb_enabled = _codex_watchdog_enabled
-    _ttfb_timeout = _env_float("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", 120.0)
-    if _ttfb_timeout <= 0:
-        _ttfb_enabled = False
-    elif _openai_codex_backend:
-        _ttfb_disable_above = _env_float("HERMES_CODEX_TTFB_DISABLE_ABOVE_TOKENS", 10_000.0)
-        _ttfb_strict = os.environ.get("HERMES_CODEX_TTFB_STRICT", "").strip().lower() in {
-            "1", "true", "yes", "on"
-        }
-        if (
-            not _ttfb_strict
-            and _ttfb_disable_above > 0
-            and _est_tokens_for_codex_watchdog >= _ttfb_disable_above
-        ):
-            _large_request_ttfb_timeout = _codex_idle_timeout_default
-            if _ttfb_timeout < _large_request_ttfb_timeout:
-                logger.info(
-                    "Scaling openai-codex no-byte TTFB watchdog from %.0fs to %.0fs "
-                    "for large request (context=~%s tokens >= %.0f). "
-                    "Set HERMES_CODEX_TTFB_STRICT=1 to keep the smaller cutoff.",
-                    _ttfb_timeout,
-                    _large_request_ttfb_timeout,
-                    f"{_est_tokens_for_codex_watchdog:,}",
-                    _ttfb_disable_above,
-                )
-                _ttfb_timeout = _large_request_ttfb_timeout
-        _ttfb_cap = _env_float("HERMES_CODEX_TTFB_MAX_SECONDS", 120.0)
-        if _ttfb_cap > 0 and _ttfb_timeout > _ttfb_cap:
-            logger.info(
-                "Capping openai-codex no-byte TTFB timeout from %.0fs to %.0fs "
-                "(context=~%s tokens). Set HERMES_CODEX_TTFB_MAX_SECONDS to tune.",
-                _ttfb_timeout,
-                _ttfb_cap,
-                f"{_est_tokens_for_codex_watchdog:,}",
-            )
-            _ttfb_timeout = _ttfb_cap
-
-    _codex_idle_enabled = _codex_watchdog_enabled
-    _codex_idle_timeout = _env_float(
-        "HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS",
-        _codex_idle_timeout_default,
-    )
-    if _codex_idle_timeout <= 0:
-        _codex_idle_enabled = False
 
     if _codex_watchdog_enabled:
         # Reset before the worker starts so a marker left over from a previous
@@ -1351,6 +1385,10 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 pass
             raise InterruptedError("Agent interrupted during API call")
     if result["error"] is not None:
+        if _codex_watchdog_enabled and isinstance(result["error"], TimeoutError):
+            # Every watchdog fires after the worker crossed provider dispatch.
+            # Replaying the same request may duplicate billed or side-effecting work.
+            setattr(result["error"], "_hermes_ambiguous_provider_acceptance", True)
         raise result["error"]
     # Success — clear the circuit breaker (#58962): the provider proved
     # responsive.  See the canonical comment block above ``_stale_streak()``.

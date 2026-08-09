@@ -2573,6 +2573,11 @@ def _run_single_child(
         # result(timeout=None) blocks until the child finishes). Stuck-child
         # protection comes from the heartbeat staleness monitor instead.
         child_timeout = _get_child_timeout()
+        child_deadline = (
+            time.monotonic() + child_timeout
+            if child_timeout is not None
+            else None
+        )
         # Daemon worker (tools.daemon_pool): a timed-out child is abandoned
         # below; a stdlib non-daemon worker would then block interpreter
         # exit at atexit-join time if the child never unwinds.
@@ -2606,11 +2611,14 @@ def _run_single_child(
             from agent.delegation_context import delegated_child_context
 
             with delegated_child_context(str(getattr(child, "session_id", "") or "")):
-                return child.run_conversation(
-                    user_message=goal,
-                    task_id=child_task_id,
-                    stream_callback=_relay_child_text,
-                )
+                child_run_kwargs = {
+                    "user_message": goal,
+                    "task_id": child_task_id,
+                    "stream_callback": _relay_child_text,
+                }
+                if child_deadline is not None:
+                    child_run_kwargs["turn_deadline"] = child_deadline
+                return child.run_conversation(**child_run_kwargs)
 
         _child_context = contextvars.copy_context()
         _child_future = _timeout_executor.submit(
@@ -2618,7 +2626,13 @@ def _run_single_child(
             _run_with_thread_capture,
         )
         try:
-            result = _child_future.result(timeout=child_timeout)
+            result = _child_future.result(
+                timeout=(
+                    max(0.0, child_deadline - time.monotonic())
+                    if child_deadline is not None
+                    else None
+                )
+            )
         except Exception as _timeout_exc:
             # No consumer boundary remains once this owner stops waiting for
             # the child. Close acceptance before any completion callback and

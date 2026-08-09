@@ -8083,6 +8083,7 @@ class AIAgent:
                     persist_user_display_kind=persist_user_display_kind,
                     persist_user_display_metadata=persist_user_display_metadata,
                     moa_config=moa_config,
+                    turn_origin=turn_origin,
                 )
             terminal = result if isinstance(result, dict) else {}
             terminal_messages = terminal.get("messages")

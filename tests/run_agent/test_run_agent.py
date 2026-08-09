@@ -1799,6 +1799,9 @@ class TestTerminalQuotaRetryBoundary:
         def time(self):
             return self.now
 
+        def monotonic(self):
+            return self.now
+
         def sleep(self, seconds):
             self.sleeps.append(seconds)
             self.now += seconds

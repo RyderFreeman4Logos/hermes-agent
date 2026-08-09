@@ -1426,15 +1426,21 @@ class TestBedrockIamStreamingFallback:
             "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2},
         }
 
-        with patch(
-            "agent.bedrock_adapter._get_bedrock_runtime_client",
-            return_value=client,
+        with (
+            patch(
+                "agent.bedrock_adapter._get_bedrock_runtime_client",
+                return_value=client,
+            ),
+            patch("agent.relay_llm.start_fallback_attempt") as start_fallback,
         ):
             response = agent._interruptible_streaming_api_call(
                 {"modelId": agent.model, "messages": []}
             )
 
         client.converse.assert_called_once()
+        start_fallback.assert_called_once_with(
+            {"modelId": agent.model, "messages": []}
+        )
         assert response.choices[0].message.content == "hi"
         assert getattr(agent, "_disable_streaming", False) is True
 
@@ -1634,4 +1640,3 @@ class TestBedrockReasoningStaleFloor:
         from agent.chat_completion_helpers import _bedrock_reasoning_stale_floor
 
         assert _bedrock_reasoning_stale_floor(model_id) == expected
-

@@ -751,6 +751,26 @@ def _converse_stop_reason_to_openai(stop_reason: str) -> str:
     return mapping.get(stop_reason, "stop")
 
 
+def _normalize_converse_usage(usage_data: Dict[str, Any]) -> SimpleNamespace:
+    input_tokens = usage_data.get("inputTokens", 0)
+    cache_read_tokens = usage_data.get("cacheReadInputTokens", 0)
+    cache_write_tokens = usage_data.get("cacheWriteInputTokens", 0)
+    output_tokens = usage_data.get("outputTokens", 0)
+    values = {
+        "prompt_tokens": input_tokens + cache_read_tokens + cache_write_tokens,
+        "completion_tokens": output_tokens,
+        "total_tokens": input_tokens
+        + cache_read_tokens
+        + cache_write_tokens
+        + output_tokens,
+    }
+    if "cacheReadInputTokens" in usage_data:
+        values["cache_read_input_tokens"] = cache_read_tokens
+    if "cacheWriteInputTokens" in usage_data:
+        values["cache_creation_input_tokens"] = cache_write_tokens
+    return SimpleNamespace(**values)
+
+
 def normalize_converse_response(response: Dict) -> SimpleNamespace:
     """Convert a Bedrock Converse API response to an OpenAI-compatible object.
 
@@ -806,17 +826,7 @@ def normalize_converse_response(response: Dict) -> SimpleNamespace:
     # normalize_usage() can subtract them back out consistently, and surface
     # the Anthropic-named fields it already falls back to for cache reads.
     usage_data = response.get("usage", {})
-    input_tokens = usage_data.get("inputTokens", 0)
-    cache_read_tokens = usage_data.get("cacheReadInputTokens", 0)
-    cache_write_tokens = usage_data.get("cacheWriteInputTokens", 0)
-    output_tokens = usage_data.get("outputTokens", 0)
-    usage = SimpleNamespace(
-        prompt_tokens=input_tokens + cache_read_tokens + cache_write_tokens,
-        completion_tokens=output_tokens,
-        total_tokens=input_tokens + cache_read_tokens + cache_write_tokens + output_tokens,
-        cache_read_input_tokens=cache_read_tokens,
-        cache_creation_input_tokens=cache_write_tokens,
-    )
+    usage = _normalize_converse_usage(usage_data)
 
     finish_reason = _converse_stop_reason_to_openai(stop_reason)
     if tool_calls and finish_reason == "stop":
@@ -977,12 +987,7 @@ def stream_converse_with_callbacks(
 
         elif "metadata" in event:
             meta_usage = event["metadata"].get("usage", {})
-            usage_data = {
-                "inputTokens": meta_usage.get("inputTokens", 0),
-                "outputTokens": meta_usage.get("outputTokens", 0),
-                "cacheReadInputTokens": meta_usage.get("cacheReadInputTokens", 0),
-                "cacheWriteInputTokens": meta_usage.get("cacheWriteInputTokens", 0),
-            }
+            usage_data = dict(meta_usage)
 
     # Flush remaining text
     if current_text_buffer:
@@ -995,17 +1000,7 @@ def stream_converse_with_callbacks(
         reasoning_content="\n\n".join(reasoning_parts) if reasoning_parts else None,
     )
 
-    input_tokens = usage_data.get("inputTokens", 0)
-    cache_read_tokens = usage_data.get("cacheReadInputTokens", 0)
-    cache_write_tokens = usage_data.get("cacheWriteInputTokens", 0)
-    output_tokens = usage_data.get("outputTokens", 0)
-    usage = SimpleNamespace(
-        prompt_tokens=input_tokens + cache_read_tokens + cache_write_tokens,
-        completion_tokens=output_tokens,
-        total_tokens=input_tokens + cache_read_tokens + cache_write_tokens + output_tokens,
-        cache_read_input_tokens=cache_read_tokens,
-        cache_creation_input_tokens=cache_write_tokens,
-    )
+    usage = _normalize_converse_usage(usage_data)
 
     finish_reason = _converse_stop_reason_to_openai(stop_reason)
     if tool_calls and finish_reason == "stop":

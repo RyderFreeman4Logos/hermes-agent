@@ -149,7 +149,7 @@ def test_busy_tool_chain_steers_once_and_skips_idle_duplicate(isolated_registry,
     assert registry.completion_queue.empty()
     assert len(sess.get("_completion_steer_pending") or []) == 3
 
-    # Tool boundary applies the steers → consumed, no idle fallback.
+    # Tool boundary applies the steers, but terminal publication still owns ACK.
     messages = [
         {"role": "assistant", "tool_calls": [{"id": "t1"}]},
         {"role": "tool", "tool_call_id": "t1", "content": "tool-out"},
@@ -157,11 +157,25 @@ def test_busy_tool_chain_steers_once_and_skips_idle_duplicate(isolated_registry,
     agent._apply_pending_steer_to_tool_results(messages, 1)
     assert "out-1" in messages[-1]["content"]
     assert "out-3" in messages[-1]["content"]
+    pending = sess.get("_completion_steer_pending") or []
+    assert len(pending) == 3
+    assert {item["state"] for item in pending} == {"applied"}
+    from tools.async_delegation import get_durable_event_delivery
+
+    for evt in events:
+        receipt = get_durable_event_delivery(evt)
+        assert receipt is not None
+        assert receipt["delivery_state"] == "effect_started"
+
+    server._finish_steered_completion_claims(sess, "committed")
     assert sess.get("_completion_steer_pending") in (None, [])
     for evt in events:
+        receipt = get_durable_event_delivery(evt)
+        assert receipt is not None
+        assert receipt["delivery_state"] == "delivered"
         assert not registry.completion_event_should_deliver(evt)
 
-    # Idle poll after apply must not open a duplicate turn.
+    # Idle poll after the terminal fence must not open a duplicate turn.
     sess["running"] = False
     server._notification_poller_loop(_StopAfter(1), "sid", sess)
     assert delivered == []

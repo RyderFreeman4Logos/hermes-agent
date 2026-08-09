@@ -16632,6 +16632,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pinned_session_id,
             )
             if resolved_entry is None:
+                await self._finish_completion_delivery_receipt(
+                    event, "provider_failed"
+                )
                 return
             session_entry = resolved_entry
         self._cache_session_source(session_key, source)
@@ -17826,6 +17829,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             session_key=session_key,
         )
         if message_text is None:
+            await self._finish_completion_delivery_receipt(
+                event, "provider_failed"
+            )
             return
 
         # Capture the platform event time as message metadata and keep the
@@ -17952,6 +17958,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                 elif _stale_adapter and hasattr(_stale_adapter, "_post_delivery_callbacks"):
                     _stale_adapter._post_delivery_callbacks.pop(_quick_key, None)
+                await self._finish_completion_delivery_receipt(
+                    event, "provider_failed"
+                )
                 return None
 
             response = agent_result.get("final_response") or ""
@@ -18479,6 +18488,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key, session_entry.session_id
             )
 
+            if (getattr(event, "metadata", None) or {}).get(
+                "_completion_delivery_receipt"
+            ):
+                from tools.process_registry import completion_result_delivery_outcome
+
+                await self._finish_completion_delivery_receipt(
+                    event,
+                    completion_result_delivery_outcome(agent_result),
+                )
+
             # Intentional silence is a delivery decision, not a transcript
             # mutation.  The agent's [SILENT]/NO_REPLY assistant turn above is
             # still persisted in session history so later turns keep normal
@@ -18543,6 +18562,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return response
             
         except Exception as e:
+            await self._finish_completion_delivery_receipt(
+                event, "provider_failed"
+            )
             # Stop typing indicator on error too, retaining Slack thread/workspace
             # routing so a failed turn cannot leave its status visible.
             try:
@@ -22381,6 +22403,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             parent_session_id = str(evt.get("parent_session_id") or "").strip()
             if parent_session_id:
                 metadata["gateway_session_id"] = parent_session_id
+            delivery_claim_id = str(
+                evt.get("_completion_delivery_claim_id") or ""
+            )
+            if delivery_claim_id:
+                metadata["_completion_delivery_receipt"] = {
+                    "event": {
+                        key: value
+                        for key, value in evt.items()
+                        if not key.startswith("_completion_delivery_")
+                    },
+                    "claim_id": delivery_claim_id,
+                }
             synth_event = MessageEvent(
                 text=synth_text,
                 message_type=MessageType.TEXT,
@@ -22399,10 +22433,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 source.thread_id,
             )
             await adapter.handle_message(synth_event)
+            if delivery_claim_id:
+                evt["_completion_delivery_deferred"] = True
             return True
         except Exception as e:
             logger.error("Watch notification injection error: %s", e)
             return False
+
+    async def _finish_completion_delivery_receipt(
+        self, event: MessageEvent, outcome: str
+    ) -> None:
+        """Resolve a push completion only after the gateway turn is terminal."""
+        metadata = getattr(event, "metadata", None) or {}
+        receipt = metadata.pop("_completion_delivery_receipt", None)
+        if not isinstance(receipt, dict):
+            return
+        delivery_event = receipt.get("event")
+        claim_id = str(receipt.get("claim_id") or "")
+        if not isinstance(delivery_event, dict) or not claim_id:
+            return
+        from tools.process_registry import finish_completion_event_delivery
+
+        terminal = await asyncio.to_thread(
+            finish_completion_event_delivery,
+            delivery_event,
+            claim_id,
+            outcome,
+        )
+        identity = self._completion_delivery_identity(delivery_event)
+        if identity is not None:
+            with self._completion_delivery_lock:
+                self._completion_deliveries_inflight.discard(identity)
+                if terminal:
+                    self._completion_deliveries_delivered[identity] = None
+                    while (
+                        len(self._completion_deliveries_delivered)
+                        > self._completion_delivery_retention
+                    ):
+                        self._completion_deliveries_delivered.popitem(last=False)
 
     @staticmethod
     def _completion_delivery_identity(evt: dict) -> Optional[tuple[str, str, object]]:
@@ -22489,25 +22557,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         event or the event has no gateway route. No cross-process exactly-once
         guarantee is claimed.
         """
-        from tools.process_registry import completion_delivery_prompt, process_registry
+        from tools.process_registry import (
+            completion_delivery_prompt,
+            finish_completion_event_delivery,
+            process_registry,
+        )
+        from tools.async_delegation import (
+            claim_event_delivery,
+            release_event_delivery,
+        )
 
         process_claimed = False
+        ordinary_claim_id = ""
         if evt.get("type", "completion") == "completion":
             process_claimed = process_registry.claim_completion_delivery(evt)
             if not process_claimed:
                 return None
+            ordinary_claim = claim_event_delivery(evt, "gateway")
+            if ordinary_claim is None:
+                process_registry.release_completion_delivery(evt)
+                return False
+            ordinary_claim_id = ordinary_claim or "gateway-local"
 
         try:
             model_text = await asyncio.to_thread(
                 completion_delivery_prompt, evt, synth_text
             )
         except BaseException:
+            if ordinary_claim_id:
+                release_event_delivery(evt, ordinary_claim_id)
             if process_claimed:
                 process_registry.release_completion_delivery(evt)
             raise
         if model_text is None:
             if process_claimed:
-                process_registry.complete_completion_delivery(evt)
+                finish_completion_event_delivery(
+                    evt, ordinary_claim_id, "committed"
+                )
             return None
         synth_text = model_text
         identity = None if process_claimed else self._completion_delivery_identity(evt)
@@ -22582,11 +22668,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return None
                 self._completion_deliveries_inflight.add(identity)
 
+        delivery_claim_id = ordinary_claim_id or durable_claim_id
+        if delivery_claim_id:
+            evt["_completion_delivery_claim_id"] = delivery_claim_id
         accepted = False
         try:
             injection_result = await self._inject_watch_notification(synth_text, evt)
             if injection_result is not True:
                 return injection_result
+            if evt.pop("_completion_delivery_deferred", False):
+                accepted = True
+                return True
             accepted = True
 
             if identity is not None:
@@ -22599,7 +22691,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     ):
                         self._completion_deliveries_delivered.popitem(last=False)
             if process_claimed:
-                process_registry.complete_completion_delivery(evt)
+                finish_completion_event_delivery(
+                    evt, ordinary_claim_id, "committed"
+                )
 
             # If the durable async-delegation producer branch is present, its
             # SQLite row remains the authoritative replay state. Acknowledge it
@@ -22621,6 +22715,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if identity is not None and not accepted:
                 with self._completion_delivery_lock:
                     self._completion_deliveries_inflight.discard(identity)
+            if ordinary_claim_id and not accepted:
+                release_event_delivery(evt, ordinary_claim_id)
             if process_claimed and not accepted:
                 process_registry.release_completion_delivery(evt)
             if durable_claim_id and not accepted:

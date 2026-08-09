@@ -43,7 +43,7 @@ from urllib.parse import unquote, urlparse
 from contextlib import contextmanager
 from pathlib import Path
 from datetime import datetime
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -4203,7 +4203,16 @@ class _VoiceInputMessage:
 
 
 class _CompletionDeliveryMessage(str):
-    """Trusted model-only completion turn queued by the process registry."""
+    """Internal queue marker carrying the durable claim to the turn fence."""
+
+    event: Optional[dict]
+    claim_id: str
+
+    def __new__(cls, value: str, *, event: Optional[dict] = None, claim_id: str = ""):
+        obj = super().__new__(cls, value)
+        obj.event = event
+        obj.claim_id = claim_id
+        return obj
 
 
 class _HeartbeatWarmMessage(str):
@@ -10819,12 +10828,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 ).start()
                 complete_event_delivery(event, claim)
                 continue
-            elif event.get("type", "completion") == "completion":
-                queued_message = _CompletionDeliveryMessage(synthetic_message)
+            elif event.get("type") in {"completion", "async_delegation"}:
+                queued_message = _CompletionDeliveryMessage(
+                    synthetic_message,
+                    event=event,
+                    claim_id=claim,
+                )
             else:
                 queued_message = synthetic_message
             self._pending_input.put(queued_message)
-            complete_event_delivery(event, claim)
+            if not isinstance(queued_message, _CompletionDeliveryMessage):
+                complete_event_delivery(event, claim)
 
     def _drain_interrupt_queue_to_pending_input(self) -> None:
         """Move stray messages from ``_interrupt_queue`` into ``_pending_input``.
@@ -13853,9 +13867,50 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     def chat(
         self,
         message,
-        images: list = None,
+        images: Optional[list] = None,
         voice_input: bool = False,
         completion_delivery: bool = False,
+        completion_event: Optional[dict] = None,
+        completion_claim: str = "",
+        heartbeat_warm: bool = False,
+        heartbeat_event: Optional[dict] = None,
+    ) -> Optional[str]:
+        """Run one CLI turn and release any unresolved completion claim."""
+        completion_resolved = False
+
+        def _finish_completion(outcome: str) -> None:
+            nonlocal completion_resolved
+            if completion_resolved or not completion_event or not completion_claim:
+                return
+            completion_resolved = True
+            from tools.process_registry import finish_completion_event_delivery
+
+            finish_completion_event_delivery(
+                completion_event,
+                completion_claim,
+                outcome,
+            )
+
+        try:
+            return self._chat(
+                message,
+                images=images,
+                voice_input=voice_input,
+                completion_delivery=completion_delivery,
+                completion_delivery_callback=_finish_completion,
+                heartbeat_warm=heartbeat_warm,
+                heartbeat_event=heartbeat_event,
+            )
+        finally:
+            _finish_completion("provider_failed")
+
+    def _chat(
+        self,
+        message,
+        images: Optional[list] = None,
+        voice_input: bool = False,
+        completion_delivery: bool = False,
+        completion_delivery_callback: Optional[Callable[[str], None]] = None,
         heartbeat_warm: bool = False,
         heartbeat_event: Optional[dict] = None,
     ) -> Optional[str]:
@@ -14429,6 +14484,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # Update history with full conversation
             if not heartbeat_warm or not (result or {}).get("silent_noop"):
                 self.conversation_history = result.get("messages", self.conversation_history) if result else self.conversation_history
+
+            if completion_delivery_callback and result:
+                from tools.process_registry import completion_result_delivery_outcome
+
+                completion_delivery_callback(
+                    completion_result_delivery_outcome(result)
+                )
 
             # If auto-compression fired mid-turn, the agent created a new
             # continuation session and mutated self.agent.session_id. Sync
@@ -17609,6 +17671,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     is_completion_delivery = isinstance(
                         user_input, _CompletionDeliveryMessage
                     )
+                    completion_event = (
+                        user_input.event if is_completion_delivery else None
+                    )
+                    completion_claim = (
+                        user_input.claim_id if is_completion_delivery else ""
+                    )
                     is_heartbeat_warm = isinstance(user_input, _HeartbeatWarmMessage)
                     heartbeat_event = (
                         user_input.heartbeat_event if is_heartbeat_warm else None
@@ -17735,6 +17803,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                             images=submit_images or None,
                             voice_input=is_voice_input,
                             completion_delivery=is_completion_delivery,
+                            completion_event=completion_event,
+                            completion_claim=completion_claim,
                             heartbeat_warm=is_heartbeat_warm,
                             heartbeat_event=heartbeat_event,
                         )

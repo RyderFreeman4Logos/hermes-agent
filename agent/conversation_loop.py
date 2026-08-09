@@ -1570,17 +1570,25 @@ def run_heartbeat_warm(
             warm_snapshot_is_current(agent, epoch)
             and response_valid
         ):
-            _record_runtime_provider_activity(
-                agent,
-                dispatch_started_at,
-                caller_id=str(heartbeat_event.get("session_key") or ""),
-                provider=str(heartbeat_event.get("provider") or ""),
-                cache_context=str(heartbeat_event.get("cache_context") or ""),
-            )
-            warm_status = "warmed"
-            warm_reason = "physical_success"
-            outcome = "success"
-            observed_reason = "response_validated"
+            if runtime_heartbeat.record_checkin_success(
+                heartbeat_event, agent=agent
+            ):
+                _record_runtime_provider_activity(
+                    agent,
+                    dispatch_started_at,
+                    caller_id=str(heartbeat_event.get("session_key") or ""),
+                    provider=str(heartbeat_event.get("provider") or ""),
+                    cache_context=str(heartbeat_event.get("cache_context") or ""),
+                )
+                warm_status = "warmed"
+                warm_reason = "physical_success"
+                outcome = "success"
+                observed_reason = "response_validated"
+            else:
+                warm_status = "skipped"
+                warm_reason = "stale_event_after_response"
+                outcome = "safe-skip"
+                observed_reason = "stale_event_after_response"
         else:
             warm_status = "degraded"
             warm_reason = "response_validation_failed"

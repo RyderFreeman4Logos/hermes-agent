@@ -202,9 +202,9 @@ export interface Usage {
 
 export interface RuntimeHeartbeatTarget {
   interval_s: number
-  kind: string
+  kind: 'delegation' | 'process'
+  last_success_at: null | number
   started_at: number
-  target_id: string
 }
 
 export interface RuntimeHeartbeatStatus {

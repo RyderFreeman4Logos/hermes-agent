@@ -432,7 +432,21 @@ export const runtimeHeartbeatLabel = (heartbeat?: RuntimeHeartbeatStatus, now = 
   const elapsed = Math.max(0, Math.floor(now / 1000 - target.started_at))
   const extra = Math.max(heartbeat?.active_count ?? 0, heartbeat?.targets.length ?? 0) - 1
 
-  return `→checkin ${elapsed}s/${target.interval_s}s${extra > 0 ? ` +${extra}` : ''}`
+  const lastSuccessAt = Math.max(
+    0,
+    ...heartbeat.targets.map(item =>
+      typeof item.last_success_at === 'number' && Number.isFinite(item.last_success_at) ? item.last_success_at : 0
+    )
+  )
+
+  const successAge =
+    lastSuccessAt > 0
+      ? Math.floor(Math.max(0, now / 1000 - lastSuccessAt)) >= 100 * 3600
+        ? '99h+'
+        : fmtDuration(Math.max(0, now - lastSuccessAt * 1000))
+      : ''
+
+  return `→checkin ${elapsed}s/${target.interval_s}s${extra > 0 ? ` +${extra}` : ''}${successAge ? ` ✓${successAge}` : ''}`
 }
 
 function RuntimeHeartbeatCheckin({ heartbeat }: { heartbeat: RuntimeHeartbeatStatus }) {
@@ -449,7 +463,7 @@ function RuntimeHeartbeatCheckin({ heartbeat }: { heartbeat: RuntimeHeartbeatSta
     const id = setInterval(() => setNow(Date.now()), 1000)
 
     return () => clearInterval(id)
-  }, [isOccluded, target?.interval_s, target?.started_at, target?.target_id])
+  }, [isOccluded, target])
 
   return runtimeHeartbeatLabel(heartbeat, now)
 }

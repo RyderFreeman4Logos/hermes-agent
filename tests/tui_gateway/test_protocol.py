@@ -205,6 +205,27 @@ def test_write_json(capture):
     assert json.loads(buf.getvalue()) == {"test": True}
 
 
+def test_write_json_attributes_transport_handoff(capture, monkeypatch):
+    from agent import physical_attempt_diagnostics as diagnostics
+
+    server, _buf = capture
+    marker = object()
+    events = []
+    monkeypatch.setattr(
+        diagnostics,
+        "begin_transport",
+        lambda kind: events.append(("begin", kind)) or marker,
+    )
+    monkeypatch.setattr(
+        diagnostics,
+        "end_transport",
+        lambda value: events.append(("end", value)),
+    )
+
+    assert server.write_json({"test": True})
+    assert events == [("begin", "stdio"), ("end", marker)]
+
+
 def test_disable_flush_env_var_actually_wires_to_module_constant(monkeypatch):
     """End-to-end: setting `HERMES_TUI_GATEWAY_NO_FLUSH=1` and importing
     `tui_gateway.transport` fresh actually flips `_DISABLE_FLUSH` true.

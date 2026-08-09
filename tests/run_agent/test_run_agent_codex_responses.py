@@ -522,6 +522,7 @@ def test_run_codex_stream_wraps_the_final_physical_attempt(
 
     starts = []
     finishes = []
+    stages = []
     token = object()
 
     def start(request, **metadata):
@@ -533,6 +534,16 @@ def test_run_codex_stream_wraps_the_final_physical_attempt(
 
     monkeypatch.setattr(diagnostics, "start_responses_attempt", start)
     monkeypatch.setattr(diagnostics, "finish_responses_attempt", finish)
+    monkeypatch.setattr(
+        diagnostics,
+        "mark_dispatch",
+        lambda attempt: stages.append("dispatch") if attempt is token else None,
+    )
+    monkeypatch.setattr(
+        diagnostics,
+        "mark_wire_event",
+        lambda attempt: stages.append("wire") if attempt is token else None,
+    )
 
     agent = _build_agent(monkeypatch)
     agent.platform = platform
@@ -574,6 +585,7 @@ def test_run_codex_stream_wraps_the_final_physical_attempt(
         "retry": 0,
         "continuation": 2,
     }
+    assert stages == ["dispatch", "wire"]
     assert finishes == [(token, {"usage": usage, "outcome": "completed"})]
 
 

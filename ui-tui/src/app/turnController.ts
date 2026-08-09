@@ -182,6 +182,7 @@ class TurnController {
 
   private activeTools: ActiveTool[] = []
   private activeReasoningText = ''
+  private reasoningNeedsResync = false
   private reasoningSegmentIndex: null | number = null
   private interimBoundaryIndex: null | number = null
   private activityId = 0
@@ -217,6 +218,7 @@ class TurnController {
   clearReasoning() {
     this.reasoningTimer = clear(this.reasoningTimer)
     this.activeReasoningText = ''
+    this.reasoningNeedsResync = false
     this.reasoningSegmentIndex = null
     this.reasoningText = ''
     this.toolTokenAcc = 0
@@ -442,7 +444,26 @@ class TurnController {
     patchTurnState({ streamSegments: this.segmentMessages })
   }
 
-  private closeReasoningSegment() {
+  private reconcileReasoning(authoritative = '') {
+    if (!this.reasoningNeedsResync) {
+      return
+    }
+
+    const prefix = this.reasoningText.slice(0, Math.max(0, this.reasoningText.length - this.activeReasoningText.length))
+
+    const replacement =
+      authoritative.trim() ||
+      [this.activeReasoningText.trim(), '[reasoning stream truncated]'].filter(Boolean).join('\n')
+
+    this.reasoningText = prefix + replacement
+    this.activeReasoningText = replacement
+    this.reasoningNeedsResync = false
+    this.syncReasoningSegment()
+    patchTurnState({ reasoning: this.reasoningText, reasoningTokens: estimateTokensRough(this.reasoningText) })
+  }
+
+  private closeReasoningSegment(authoritative = '') {
+    this.reconcileReasoning(authoritative)
     this.syncReasoningSegment()
     this.activeReasoningText = ''
     this.reasoningSegmentIndex = null
@@ -620,7 +641,7 @@ class TurnController {
     response_previewed?: boolean
     text?: string
   }) {
-    this.closeReasoningSegment()
+    this.closeReasoningSegment(payload.reasoning)
 
     // Ink renders markdown via <Md>; the gateway's Rich-rendered ANSI
     // (`payload.rendered`) is for terminals that can't.  Prioritising
@@ -834,8 +855,29 @@ class TurnController {
     patchTurnState({ streamSegments: this.segmentMessages })
   }
 
-  recordReasoningDelta(text: string, force = false) {
+  recordReasoningDelta(text: string, force = false, resync = false) {
     if (this.interrupted || (!force && !getUiState().showReasoning)) {
+      return
+    }
+
+    if (resync) {
+      this.reasoningText = this.reasoningText.slice(
+        0,
+        Math.max(0, this.reasoningText.length - this.activeReasoningText.length)
+      )
+      this.activeReasoningText = ''
+
+      if (this.reasoningSegmentIndex !== null) {
+        this.segmentMessages = this.segmentMessages.filter((_, index) => index !== this.reasoningSegmentIndex)
+        this.reasoningSegmentIndex = null
+        patchTurnState({ streamSegments: this.segmentMessages })
+      }
+
+      this.reasoningNeedsResync = true
+      patchTurnState({ reasoning: this.reasoningText, reasoningTokens: estimateTokensRough(this.reasoningText) })
+    }
+
+    if (!text) {
       return
     }
 

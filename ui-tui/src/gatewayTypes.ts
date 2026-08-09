@@ -674,7 +674,7 @@ export type GatewayEvent =
     }
   | { payload?: { preview?: string }; session_id?: string; type: 'gateway.protocol_error' }
   | {
-      payload?: { text?: string; verbose?: boolean }
+      payload?: { resync?: boolean; text?: string; verbose?: boolean }
       session_id?: string
       type: 'reasoning.delta' | 'reasoning.available'
     }

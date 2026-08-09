@@ -2970,7 +2970,9 @@ def _compress_context_impl(
             # withholds a pending completion-delivery suffix, which remains
             # attached only to the in-memory computation view below.
             from agent.context_compressor import (
+                _DB_PERSISTED_MARKER,
                 _capture_durable_compaction_view,
+                _same_persisted_completion_row,
             )
 
             try:
@@ -2986,6 +2988,7 @@ def _compress_context_impl(
                     exc,
                 )
                 pre_flush_fingerprint = None
+                _pre_flush_messages = []
             if pre_flush_fingerprint is None:
                 _release_lock()
                 _emit_compression_attempt_telemetry(
@@ -3000,16 +3003,23 @@ def _compress_context_impl(
                     existing_prompt = agent._build_system_prompt(system_message)
                 return messages, existing_prompt
             current_idx = getattr(agent, "_persist_user_message_idx", None)
-            persisted_history = (
-                messages[:current_idx]
-                if isinstance(current_idx, int)
-                and 0 <= current_idx <= len(messages)
-                # No active turn means the caller list is restored history. If
-                # durable rows already exist, mark the whole list as the
-                # persisted prefix instead of appending a stale copy. An empty
-                # session remains the test/legacy shape where all rows are new.
-                else (messages if pre_flush_fingerprint else None)
-            )
+            persisted_prefix_length = 0
+            if isinstance(current_idx, int) and 0 <= current_idx <= len(messages):
+                persisted_prefix_length = min(current_idx, len(_pre_flush_messages))
+            for durable_message, live_message in zip(
+                _pre_flush_messages[persisted_prefix_length:],
+                messages[persisted_prefix_length:],
+            ):
+                if not _same_persisted_completion_row(durable_message, live_message):
+                    break
+                persisted_prefix_length += 1
+            persisted_history = messages[:persisted_prefix_length]
+            # A process-local marker is not proof that this exact session row
+            # is durable. Reconcile it to the snapshot captured under the lease
+            # so stale cached-agent markers cannot suppress the required flush.
+            for message in messages[persisted_prefix_length:]:
+                if isinstance(message, dict):
+                    message.pop(_DB_PERSISTED_MARKER, None)
             flush_fn = getattr(agent, "_flush_messages_to_session_db", None)
             try:
                 flush_ok = bool(
@@ -3067,6 +3077,12 @@ def _compress_context_impl(
                 if not existing_prompt:
                     existing_prompt = agent._build_system_prompt(system_message)
                 return messages, existing_prompt
+            # Raw SessionDB snapshots deliberately omit process-local markers.
+            # Re-stamp exactly the fingerprinted rows; any appended pending
+            # completion suffix remains live-only and therefore unmarked.
+            for message in messages[: len(_durable_compaction_fingerprint)]:
+                if isinstance(message, dict):
+                    message[_DB_PERSISTED_MARKER] = True
             _pre_msg_count = len(messages)
             # The caller's estimate described its stale snapshot.
             approx_tokens = 0

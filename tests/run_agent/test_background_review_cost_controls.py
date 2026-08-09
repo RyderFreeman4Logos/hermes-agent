@@ -8,8 +8,13 @@ Covers the two behaviors this change adds:
 
 Pure-function / config-driven; no live model calls.
 """
+import copy
+import json
+import threading
 from typing import Any
 from unittest.mock import patch
+
+import pytest
 
 from agent import background_review as br
 
@@ -158,3 +163,170 @@ def test_digest_records_tool_names_in_arc():
     digest = out[0]["content"]
     assert "USER: do the thing" in digest
     assert "tools: skill_view, patch" in digest
+
+
+@pytest.mark.parametrize("routed", [False, True])
+@pytest.mark.parametrize("duplicate_role", ["user", "assistant"])
+def test_review_snapshot_is_owned_during_concurrent_alternation_repair(
+    monkeypatch, tmp_path, routed, duplicate_role
+):
+    """Reviewer repair must not write through to a provider-bound foreground."""
+    from agent import physical_attempt_diagnostics as diagnostics
+    from agent.agent_runtime_helpers import repair_message_sequence
+    from agent.turn_context import substitute_api_content
+    from hermes_cli import config
+
+    history = []
+    for i in range(12):
+        history.extend(
+            [
+                {"role": "user", "content": f"u{i}"},
+                {"role": "assistant", "content": f"a{i}"},
+            ]
+        )
+
+    if duplicate_role == "user":
+        history.extend(
+            [
+                {
+                    "role": "user",
+                    "content": "first user",
+                    "api_content": "first user with private context",
+                    "display_metadata": {"nested": ["foreground"]},
+                },
+                {"role": "user", "content": "second user"},
+                {"role": "assistant", "content": "closing assistant"},
+            ]
+        )
+        survivor = -3
+    else:
+        history.extend(
+            [
+                {"role": "user", "content": "assistant pair follows"},
+                {
+                    "role": "assistant",
+                    "content": "first assistant",
+                    "api_content": "first assistant wire bytes",
+                    "tool_calls": [
+                        {
+                            "id": "call-1",
+                            "function": {"name": "first", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {
+                    "role": "assistant",
+                    "content": "second assistant",
+                    "tool_calls": [
+                        {
+                            "id": "call-2",
+                            "function": {"name": "second", "arguments": "{}"},
+                        }
+                    ],
+                },
+            ]
+        )
+        survivor = -2
+
+    original = copy.deepcopy(history)
+
+    def _wire_projection():
+        projected = copy.deepcopy(history)
+        for message in projected:
+            substitute_api_content(message)
+            message.pop("display_metadata", None)
+        return projected
+
+    before_wire = json.dumps(
+        _wire_projection(), sort_keys=True, separators=(",", ":")
+    ).encode()
+    monkeypatch.setattr(diagnostics, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(
+        config,
+        "read_raw_config_readonly",
+        lambda: {"observability": {"physical_attempt_digests": {"enabled": True}}},
+    )
+
+    def _record_prefix(retry):
+        return diagnostics.start_attempt(
+            {"model": "test", "messages": _wire_projection(), "tools": []},
+            api_mode="chat_completions",
+            route="chat_completions",
+            provider="openai",
+            model="test",
+            role="main",
+            retry=retry,
+            continuation=0,
+        )
+
+    assert _record_prefix(0) is not None
+
+    repair_done = threading.Event()
+    release_review = threading.Event()
+    seen = {}
+    errors = []
+
+    def _repairing_review(_agent, snapshot, prompt):
+        try:
+            seen["snapshot"] = snapshot
+            review_history = br._digest_history(snapshot) if routed else snapshot
+            request_messages = [
+                *review_history,
+                {"role": "user", "content": prompt},
+            ]
+            seen["repairs"] = repair_message_sequence(None, request_messages)
+            seen["request_messages"] = request_messages
+        except BaseException as exc:  # propagate worker failures to the test thread
+            errors.append(exc)
+        finally:
+            repair_done.set()
+        release_review.wait(5)
+
+    monkeypatch.setattr(br, "_run_review_in_thread", _repairing_review)
+    target, _prompt = br.spawn_background_review_thread(
+        object(), history, review_memory=True
+    )
+    worker = threading.Thread(target=target)
+    worker.start()
+    try:
+        assert repair_done.wait(5), "review repair did not reach the barrier"
+        if errors:
+            raise errors[0]
+        after_wire = json.dumps(
+            _wire_projection(), sort_keys=True, separators=(",", ":")
+        ).encode()
+        assert _record_prefix(1) is not None
+    finally:
+        release_review.set()
+        worker.join(5)
+
+    assert not worker.is_alive()
+    assert history == original
+    assert after_wire == before_wire
+
+    starts = [
+        json.loads(line)
+        for line in (
+            tmp_path / "observability" / "physical_attempt_digests.jsonl"
+        ).read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(starts) == 2
+    assert starts[0]["prefix_digest"] == starts[1]["prefix_digest"]
+
+    roles = [message["role"] for message in seen["request_messages"]]
+    assert seen["repairs"] > 0
+    assert all(left != right for left, right in zip(roles, roles[1:]))
+
+    snapshot = seen["snapshot"]
+    assert snapshot is not history
+    assert snapshot[survivor] is not history[survivor]
+    if duplicate_role == "user":
+        assert (
+            snapshot[survivor]["display_metadata"]
+            is not history[survivor]["display_metadata"]
+        )
+    else:
+        assert (
+            snapshot[survivor]["tool_calls"][0]["function"]
+            is not history[survivor]["tool_calls"][0]["function"]
+        )

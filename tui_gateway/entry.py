@@ -499,6 +499,7 @@ def main():
 
     writer.close()
     server._stdio_transport = previous_transport
+    writer.raise_if_failed()
 
 
 if __name__ == "__main__":

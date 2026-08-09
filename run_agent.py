@@ -8473,7 +8473,11 @@ class AIAgent:
             _pending_status = retry_pending_completion_delivery_commit(
                 self, _pending_messages
             )
-            if _pending_status == "committed":
+            if _pending_status in {
+                "committed",
+                "missing_pending_suffix",
+                "missing_active_marker",
+            }:
                 conversation_history = list(_pending_messages)
             else:
                 return {

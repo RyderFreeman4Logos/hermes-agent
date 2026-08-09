@@ -10108,6 +10108,10 @@ def _dispatch_completion_batch(
         kwargs: dict[str, Any] = {}
         if is_completion:
             kwargs["completion_delivery"] = True
+        kwargs["completion_delivery_callback"] = lambda outcome: [
+            _finish_completion_claim(item["evt"], claim, outcome)
+            for item, claim in claimed
+        ]
         async_claims = [
             (item, claim)
             for item, claim in claimed
@@ -10124,10 +10128,6 @@ def _dispatch_completion_batch(
                 display_kind="async_delegation_complete",
                 display_metadata=_async_delegation_display_metadata(evt),
                 turn_origin="subagent_result",
-                completion_delivery_callback=lambda outcome: [
-                    _finish_async_completion_claim(item["evt"], claim, outcome)
-                    for item, claim in async_claims
-                ],
                 **kwargs,
             )
         else:
@@ -10139,10 +10139,6 @@ def _dispatch_completion_batch(
                 turn_origin="background_completion",
                 **kwargs,
             )
-        for item, claim in claimed:
-            if item["evt"].get("type") != "async_delegation":
-                complete_event_delivery(item["evt"], claim)
-                process_registry.complete_completion_delivery(item["evt"])
     except Exception as exc:
         for item, claim in claimed:
             release_event_delivery(item["evt"], claim)
@@ -10157,8 +10153,8 @@ def _dispatch_completion_batch(
             session["running"] = False
 
 
-def _finish_async_completion_claim(evt: dict, claim_id: str, outcome: str) -> None:
-    """ACK a durable completion only after its provider turn and suffix commit."""
+def _finish_completion_claim(evt: dict, claim_id: str, outcome: str) -> None:
+    """Resolve any completion only after its provider and publication fence."""
     from tools.async_delegation import (
         complete_event_delivery,
         mark_completion_delivery_recovery,
@@ -10169,7 +10165,7 @@ def _finish_async_completion_claim(evt: dict, claim_id: str, outcome: str) -> No
     if outcome == "committed":
         complete_event_delivery(evt, claim_id)
         process_registry.complete_completion_delivery(evt)
-    elif outcome == "missing_active_marker":
+    elif outcome in {"missing_active_marker", "history_conflict"}:
         mark_completion_delivery_recovery(evt, claim_id, outcome)
         process_registry.complete_completion_delivery(evt)
     else:
@@ -11537,13 +11533,18 @@ def _run_prompt_submit(
                 and isinstance(result, dict)
                 and result.get("silent_noop") is True
             )
-            completion_suffix_committed = completion_delivery_callback is None
+            completion_suffix_committed = not completion_delivery
+            if completion_delivery and isinstance(result, dict):
+                completion_suffix_committed = result.get(
+                    "completion_delivery_status"
+                ) in {"committed", "dropped"}
+            display_stamp_committed = not bool(display_kind)
             if display_kind and isinstance(text, str):
                 db = getattr(agent, "_session_db", None)
                 current_session_id = getattr(agent, "session_id", None) or session.get("session_key")
                 if db is not None:
                     try:
-                        completion_suffix_committed = bool(
+                        display_stamp_committed = bool(
                             db.set_latest_matching_message_display_kind(
                                 current_session_id,
                                 role="user",
@@ -11554,7 +11555,7 @@ def _run_prompt_submit(
                         )
                     except Exception:
                         logger.debug("failed to stamp synthetic display kind", exc_info=True)
-                        completion_suffix_committed = False
+                        display_stamp_committed = False
                 if isinstance(result, dict) and isinstance(result.get("messages"), list):
                     for message in reversed(result["messages"]):
                         if message.get("role") == "user" and message.get("content") == text:
@@ -11606,6 +11607,7 @@ def _run_prompt_submit(
 
             last_reasoning = None
             status_note = None
+            history_committed = False
             if isinstance(result, dict):
                 if not heartbeat_silent_noop and isinstance(result.get("messages"), list):
                     with session["history_lock"]:
@@ -11613,6 +11615,7 @@ def _run_prompt_submit(
                         if current_version == history_version:
                             session["history"] = result["messages"]
                             session["history_version"] = history_version + 1
+                            history_committed = True
                         else:
                             # History mutated externally during the turn.
                             # Check if the only mutation was a pivot marker
@@ -11656,6 +11659,7 @@ def _run_prompt_submit(
                                     new_messages = list(result["messages"])
                                 session["history"] = current_history + new_messages
                                 session["history_version"] = current_version + 1
+                                history_committed = True
                             else:
                                 # Genuine desync (undo/compress/retry/rollback).
                                 # Surface the desync rather than silently
@@ -11778,11 +11782,15 @@ def _run_prompt_submit(
                     (result.get("error") if isinstance(result, dict) else "") or raw
                 )
                 payload["recoverable"] = True
-            _finish_completion_delivery(
-                "committed" if status == "complete" and completion_suffix_committed
-                else "missing_active_marker" if status == "complete"
-                else "provider_failed"
-            )
+            if not (completion_suffix_committed and display_stamp_committed):
+                completion_outcome = (
+                    "provider_failed" if status != "complete" else "missing_active_marker"
+                )
+            elif not history_committed:
+                completion_outcome = "history_conflict"
+            else:
+                completion_outcome = "committed"
+            _finish_completion_delivery(completion_outcome)
             if not heartbeat_turn:
                 _retire_turn_marker(session, marker_key)
             if not heartbeat_silent_noop:

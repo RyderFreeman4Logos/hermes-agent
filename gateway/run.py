@@ -23429,30 +23429,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         ``True`` means this caller reached adapter acceptance, ``False`` means
         injection failed and the claim was released for retry, and ``None``
-        means either another same-lifecycle caller owns/delivered the producer
-        event or the event has no gateway route. No cross-process exactly-once
+        means another caller owns/delivered the event, no route exists, or a
+        failed durable claim was requeued. No cross-process exactly-once
         guarantee is claimed.
         """
         from tools.process_registry import (
+            claim_completion_event_delivery,
             completion_delivery_prompt,
             finish_completion_event_delivery,
             process_registry,
-        )
-        from tools.async_delegation import (
-            claim_event_delivery,
-            release_event_delivery,
         )
 
         process_claimed = False
         ordinary_claim_id = ""
         if evt.get("type", "completion") == "completion":
-            process_claimed = process_registry.claim_completion_delivery(evt)
-            if not process_claimed:
-                return None
-            ordinary_claim = claim_event_delivery(evt, "gateway")
+            ordinary_claim = claim_completion_event_delivery(evt, "gateway")
             if ordinary_claim is None:
-                process_registry.release_completion_delivery(evt)
-                return False
+                return None
+            process_claimed = True
             ordinary_claim_id = ordinary_claim or "gateway-local"
 
         try:
@@ -23460,10 +23454,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 completion_delivery_prompt, evt, synth_text
             )
         except BaseException:
-            if ordinary_claim_id:
-                release_event_delivery(evt, ordinary_claim_id)
             if process_claimed:
-                process_registry.release_completion_delivery(evt)
+                finish_completion_event_delivery(
+                    evt, ordinary_claim_id, "provider_failed"
+                )
             raise
         if model_text is None:
             if process_claimed:
@@ -23591,10 +23585,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if identity is not None and not accepted:
                 with self._completion_delivery_lock:
                     self._completion_deliveries_inflight.discard(identity)
-            if ordinary_claim_id and not accepted:
-                release_event_delivery(evt, ordinary_claim_id)
             if process_claimed and not accepted:
-                process_registry.release_completion_delivery(evt)
+                finish_completion_event_delivery(
+                    evt, ordinary_claim_id, "provider_failed"
+                )
             if durable_claim_id and not accepted:
                 try:
                     from tools.async_delegation import release_completion_delivery

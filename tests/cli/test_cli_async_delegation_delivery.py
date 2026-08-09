@@ -3,6 +3,8 @@
 import queue
 import types
 
+import pytest
+
 import cli as cli_module
 from cli import HermesCLI
 
@@ -21,9 +23,17 @@ def test_cli_completion_drain_uses_visible_session_identity(monkeypatch):
     calls = []
 
     class FakeRegistry:
+        completion_queue = queue.Queue()
+
         def drain_notifications(self, *, session_key="", owns_event=None):
             calls.append((session_key, owns_event(event)))
             return [(event, "completion payload")]
+
+        def claim_completion_delivery(self, _event):
+            return True
+
+        def release_completion_delivery(self, _event):
+            pass
 
     claimed = []
     completed = []
@@ -51,6 +61,110 @@ def test_cli_completion_drain_uses_visible_session_identity(monkeypatch):
     assert pending.claim_id == "claim-token"
     assert claimed == [(event, "cli-idle")]
     assert completed == []
+
+
+@pytest.mark.parametrize("storage_failure", ["claim", "release"])
+def test_cli_storage_failure_retries_once_in_same_process(
+    monkeypatch, tmp_path, storage_failure
+):
+    """Classic CLI drain preserves an ordinary envelope across SQLite failures."""
+    from tools import async_delegation as ad
+    import tools.process_registry as registry_module
+
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    registry = registry_module.ProcessRegistry()
+    monkeypatch.setattr(registry_module, "process_registry", registry)
+    cli = HermesCLI.__new__(HermesCLI)
+    cli.session_id = "visible-session"
+    cli._session_db = None
+    cli._pending_input = queue.Queue()
+    event = {
+        "type": "completion",
+        "session_id": f"proc-cli-{storage_failure}",
+        "session_key": "visible-session",
+        "started_at": 8.0,
+        "command": "true",
+        "exit_code": 0,
+        "completion_reason": "exited",
+        "termination_source": "",
+        "output": "done",
+    }
+    assert ad.persist_event_delivery(event)
+    registry.completion_queue.put(event)
+    effects = []
+    claim = ad.claim_event_delivery
+    claim_calls = 0
+
+    def claim_once(*args):
+        nonlocal claim_calls
+        claim_calls += 1
+        if storage_failure == "claim" and claim_calls == 1:
+            raise OSError("claim storage unavailable")
+        return claim(*args)
+
+    monkeypatch.setattr(ad, "claim_event_delivery", claim_once)
+    release = ad.release_event_delivery
+    release_calls = 0
+
+    def release_once(*args):
+        nonlocal release_calls
+        release_calls += 1
+        if storage_failure == "release" and release_calls == 1:
+            raise OSError("release storage unavailable")
+        return release(*args)
+
+    monkeypatch.setattr(ad, "release_event_delivery", release_once)
+
+    cli._drain_process_notifications("cli-idle")
+    if storage_failure == "release":
+        first = cli._pending_input.get_nowait()
+        monkeypatch.setattr(cli, "_chat", lambda *_args, **_kwargs: None)
+        assert cli.chat(
+            first,
+            completion_delivery=True,
+            completion_event=first.event,
+            completion_claim=first.claim_id,
+        ) is None
+    assert cli._pending_input.empty()
+    assert effects == []
+    assert registry.completion_event_should_deliver(event)
+    retry = registry.completion_queue.get_nowait()
+    assert registry.completion_queue.empty()
+    receipt = ad.get_durable_event_delivery(event)
+    assert receipt is not None
+    assert receipt["delivery_state"] == (
+        "pending" if storage_failure == "claim" else "effect_started"
+    )
+    if storage_failure == "release":
+        assert retry["_completion_delivery_retained_claim_id"] == receipt["delivery_claim"]
+
+    registry.completion_queue.put(retry)
+    cli._drain_process_notifications("cli-idle")
+    pending = cli._pending_input.get_nowait()
+
+    def committed(message, **kwargs):
+        effects.append(message)
+        kwargs["completion_delivery_callback"]("committed")
+        return "done"
+
+    monkeypatch.setattr(cli, "_chat", committed)
+    assert cli.chat(
+        pending,
+        completion_delivery=True,
+        completion_event=pending.event,
+        completion_claim=pending.claim_id,
+    ) == "done"
+    assert len(effects) == 1
+    receipt = ad.get_durable_event_delivery(event)
+    assert receipt is not None
+    assert receipt["delivery_state"] == "delivered"
+    assert registry.completion_queue.empty()
+    assert not registry.completion_event_should_deliver(event)
+
+    registry.completion_queue.put(dict(event))
+    cli._drain_process_notifications("cli-idle")
+    assert cli._pending_input.empty()
+    assert len(effects) == 1
 
 
 def test_cli_completion_ownership_rejects_foreign_session():

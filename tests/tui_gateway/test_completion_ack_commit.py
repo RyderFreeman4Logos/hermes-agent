@@ -597,6 +597,124 @@ def test_failed_complete_and_release_reuses_live_claim(monkeypatch, tmp_path):
     assert receipt["delivery_state"] == "dropped"
 
 
+@pytest.mark.parametrize("surface", ["busy", "idle"])
+@pytest.mark.parametrize("storage_failure", ["claim", "release"])
+def test_tui_storage_failure_retries_once_in_same_process(
+    monkeypatch, tmp_path, surface, storage_failure
+):
+    """Busy-steer and idle-batch paths preserve claims across SQLite failures."""
+    from tools import async_delegation as ad
+    import tools.process_registry as registry_module
+
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    registry = registry_module.ProcessRegistry()
+    monkeypatch.setattr(registry_module, "process_registry", registry)
+    event = {
+        "type": "completion",
+        "session_id": f"proc-tui-{surface}-{storage_failure}",
+        "session_key": "active",
+        "started_at": 5.7,
+    }
+    assert ad.persist_event_delivery(event)
+    effects = []
+    steer_calls = 0
+
+    def steer(text):
+        nonlocal steer_calls
+        steer_calls += 1
+        if storage_failure == "release" and steer_calls == 1:
+            return False
+        effects.append(text)
+        return True
+
+    session = _session(types.SimpleNamespace(steer=steer))
+    submit_calls = 0
+
+    def submit(_rid, _sid, _session, text, **kwargs):
+        nonlocal submit_calls
+        submit_calls += 1
+        if storage_failure == "release" and submit_calls == 1:
+            raise RuntimeError("submit failed")
+        effects.append(text)
+        kwargs["completion_delivery_callback"]("committed")
+
+    monkeypatch.setattr(server, "_run_prompt_submit", submit)
+    claim = ad.claim_event_delivery
+    claim_calls = 0
+
+    def claim_once(*args):
+        nonlocal claim_calls
+        claim_calls += 1
+        if storage_failure == "claim" and claim_calls == 1:
+            raise OSError("claim storage unavailable")
+        return claim(*args)
+
+    monkeypatch.setattr(ad, "claim_event_delivery", claim_once)
+    release = ad.release_event_delivery
+    release_calls = 0
+
+    def release_once(*args):
+        nonlocal release_calls
+        release_calls += 1
+        if storage_failure == "release" and release_calls == 1:
+            raise OSError("release storage unavailable")
+        return release(*args)
+
+    monkeypatch.setattr(ad, "release_event_delivery", release_once)
+
+    item = {"evt": event, "model_text": "completion", "text": "completion"}
+    if surface == "busy":
+        assert server._try_steer_busy_completion(
+            session, event, "completion", "completion"
+        ) is True
+    else:
+        server._dispatch_completion_batch("sid", session, [item], consumer="tui-test")
+
+    assert effects == []
+    assert registry.completion_event_should_deliver(event)
+    retry = registry.completion_queue.get_nowait()
+    assert registry.completion_queue.empty()
+    receipt = ad.get_durable_event_delivery(event)
+    assert receipt is not None
+    assert receipt["delivery_state"] == (
+        "pending" if storage_failure == "claim" else "effect_started"
+    )
+    if storage_failure == "release":
+        assert retry["_completion_delivery_retained_claim_id"] == receipt["delivery_claim"]
+
+    session["running"] = True
+    if surface == "busy":
+        assert server._try_steer_busy_completion(
+            session, retry, "completion", "completion"
+        ) is True
+        pending = session["_completion_steer_pending"][-1]
+        assert server._finish_completion_claim(
+            pending["evt"], pending["claim"], "committed"
+        )
+    else:
+        server._dispatch_completion_batch(
+            "sid", session, [{**item, "evt": retry}], consumer="tui-test"
+        )
+
+    assert effects == ["completion"]
+    receipt = ad.get_durable_event_delivery(event)
+    assert receipt is not None
+    assert receipt["delivery_state"] == "delivered"
+    assert registry.completion_queue.empty()
+    assert not registry.completion_event_should_deliver(event)
+
+    session["running"] = True
+    if surface == "busy":
+        assert server._try_steer_busy_completion(
+            session, dict(event), "completion", "completion"
+        ) is True
+    else:
+        server._dispatch_completion_batch(
+            "sid", session, [dict(item)], consumer="tui-test"
+        )
+    assert effects == ["completion"]
+
+
 def test_committed_failure_suffix_is_a_terminal_delivery(turn_env):
     """A durable failed/effect suffix is an explicit non-replay disposition."""
     outcomes = []

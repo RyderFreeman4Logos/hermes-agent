@@ -11071,9 +11071,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         session identity when draining so another window cannot claim and mark
         delivered a completion that belongs to this one.
         """
-        from tools.process_registry import process_registry
+        from tools.process_registry import (
+            claim_completion_event_delivery,
+            process_registry,
+        )
         from tools.async_delegation import (
-            claim_event_delivery,
             complete_event_delivery,
         )
         from tools.runtime_heartbeat import runtime_heartbeat
@@ -11083,7 +11085,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             session_key=session_key,
             owns_event=self._owns_process_notification,
         ):
-            claim = claim_event_delivery(event, consumer)
+            claim = claim_completion_event_delivery(event, consumer)
             if claim is None:
                 continue
             if event.get("type") == "heartbeat":

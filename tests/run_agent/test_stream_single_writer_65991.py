@@ -36,6 +36,58 @@ def _chunk(content=None, finish_reason=None, model=None):
     return SimpleNamespace(choices=[choice], model=model, usage=None)
 
 
+def test_stream_callbacks_mark_visible_categories_and_callback_time(monkeypatch):
+    from agent import physical_attempt_diagnostics as diagnostics
+
+    agent = _make_agent()
+    events = []
+
+    def begin(category):
+        events.extend((("visible", category), ("begin", category)))
+        return category
+
+    monkeypatch.setattr(diagnostics, "begin_callback", begin)
+    monkeypatch.setattr(
+        diagnostics, "end_callback", lambda marker: events.append(("end", marker))
+    )
+    setattr(
+        agent,
+        "stream_delta_callback",
+        lambda _text: events.append(("delivered", "text")),
+    )
+    setattr(
+        agent,
+        "reasoning_callback",
+        lambda _text: events.append(("delivered", "reasoning")),
+    )
+    setattr(
+        agent,
+        "tool_gen_callback",
+        lambda _name: events.append(("delivered", "tool")),
+    )
+    setattr(
+        agent,
+        "interim_assistant_callback",
+        lambda _text, **_kwargs: events.append(("delivered", "text")),
+    )
+
+    agent._fire_stream_delta("answer")
+    agent._fire_reasoning_delta("thinking")
+    agent._fire_tool_gen_started("browser")
+    agent._fire_streamed_codex_commentary("commentary")
+
+    assert events == [
+        ("visible", "text"), ("begin", "text"),
+        ("delivered", "text"), ("end", "text"),
+        ("visible", "reasoning"), ("begin", "reasoning"),
+        ("delivered", "reasoning"), ("end", "reasoning"),
+        ("visible", "tool"), ("begin", "tool"),
+        ("delivered", "tool"), ("end", "tool"),
+        ("visible", "text"), ("begin", "text"),
+        ("delivered", "text"), ("end", "text"),
+    ]
+
+
 class TestSingleWriterSink:
     def test_superseded_writer_deltas_are_dropped(self):
         """A stale writer (older token, other thread) is fenced; only the

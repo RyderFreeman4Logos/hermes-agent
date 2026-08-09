@@ -612,12 +612,18 @@ export type GatewayEvent =
   | { payload?: undefined; session_id?: string; type: 'message.start' }
   | {
       payload?: {
-        first_provider_response?: {
+        cache_record?: {
+          cache_attribution?: 'post_compression'
+          cache_read_tokens?: number
+          cache_write_tokens?: number
           owner: 'tui_gateway'
-          request_index: 1
+          pct?: number
+          prompt_tokens?: number
+          request_index: number
           session: string
+          state: 'hit' | 'miss' | 'unknown' | 'no_field' | 'cold_write'
           timestamp: number
-          turn_origin: 'user' | 'background-completion' | 'subagent-result' | 'heartbeat_warm'
+          turn_origin: 'user' | 'background_completion' | 'subagent_result' | 'heartbeat_warm'
         }
         kind?: string
         text?: string

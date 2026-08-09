@@ -9995,7 +9995,7 @@ def _compose_completion_batch_prompt(items: list[dict]) -> tuple[str, bool]:
 def _try_steer_busy_completion(
     session: dict, evt: dict, model_text: str, text: str
 ) -> bool | None:
-    """Attempt busy-steer delivery. True=accepted, False=busy no-steer, None=idle."""
+    """Attempt busy-steer delivery. True=handled, False=no steer, None=idle."""
     with session["history_lock"]:
         if not session.get("running"):
             return None
@@ -10003,23 +10003,21 @@ def _try_steer_busy_completion(
     steer = getattr(agent, "steer", None)
     if not callable(steer):
         return False
-    from tools.async_delegation import claim_event_delivery, release_event_delivery
-    from tools.process_registry import process_registry
+    from tools.process_registry import (
+        claim_completion_event_delivery,
+        finish_completion_event_delivery,
+    )
 
-    if not process_registry.claim_completion_delivery(evt):
-        return True
-    claim = claim_event_delivery(evt, "tui-poller-steer")
+    claim = claim_completion_event_delivery(evt, "tui-poller-steer")
     if claim is None:
-        process_registry.release_completion_delivery(evt)
         return True
     try:
         accepted = bool(steer(model_text))
     except Exception:
         accepted = False
     if not accepted:
-        release_event_delivery(evt, claim)
-        process_registry.release_completion_delivery(evt)
-        return False
+        finish_completion_event_delivery(evt, claim, "provider_failed")
+        return True
     with session["history_lock"]:
         session["last_active"] = time.time()
         _note_steered_completion(session, evt, model_text, text)
@@ -10045,11 +10043,10 @@ def _dispatch_completion_batch(
     consumer: str,
 ) -> None:
     """Claim and submit one idle turn for a bounded completion batch."""
-    from tools.async_delegation import (
-        claim_event_delivery,
-        release_event_delivery,
+    from tools.process_registry import (
+        claim_completion_event_delivery,
+        finish_completion_event_delivery,
     )
-    from tools.process_registry import process_registry
 
     if not items:
         return
@@ -10058,14 +10055,10 @@ def _dispatch_completion_batch(
         for item in items:
             evt = item["evt"]
             # Busy-steer may already hold inflight claim/claim-id.
-            preclaimed = item.get("claim") is not None
-            if not preclaimed and not process_registry.claim_completion_delivery(evt):
-                continue
             claim = item.get("claim")
             if claim is None:
-                claim = claim_event_delivery(evt, consumer)
+                claim = claim_completion_event_delivery(evt, consumer)
                 if claim is None:
-                    process_registry.release_completion_delivery(evt)
                     continue
             claimed.append((item, claim))
         if not claimed:
@@ -10119,9 +10112,9 @@ def _dispatch_completion_batch(
             )
     except Exception as exc:
         for item, claim in claimed:
-            release_event_delivery(item["evt"], claim)
-            process_registry.release_completion_delivery(item["evt"])
-            process_registry.completion_queue.put(item["evt"])
+            finish_completion_event_delivery(
+                item["evt"], claim, "provider_failed"
+            )
         print(
             f"[tui_gateway] completion batch dispatch failed: "
             f"{type(exc).__name__}: {exc}",
@@ -10140,18 +10133,12 @@ def _finish_completion_claim(evt: dict, claim_id: str, outcome: str) -> bool:
 
 def _finish_suppressed_completion(evt: dict, process_registry, consumer: str) -> bool:
     """Durably ACK an explicit visibility no-op without opening a model turn."""
-    from tools.async_delegation import claim_event_delivery
+    from tools.process_registry import claim_completion_event_delivery
 
-    if not process_registry.claim_completion_delivery(evt):
-        return False
-    try:
-        claim = claim_event_delivery(evt, consumer)
-    except Exception:
-        process_registry.release_completion_delivery(evt)
-        process_registry.completion_queue.put(evt)
-        return False
+    claim = claim_completion_event_delivery(
+        evt, consumer, registry=process_registry
+    )
     if claim is None:
-        process_registry.release_completion_delivery(evt)
         return False
     return _finish_completion_claim(evt, claim, "committed")
 
@@ -10642,8 +10629,7 @@ def _notification_poller_loop(
 
         steer_result = _try_steer_busy_completion(session, evt, model_text, text)
         if steer_result is True:
-            # Accepted into active turn (or already owned). Do not requeue —
-            # later events keep draining; applied/fallback is tracked per item.
+            # Accepted, already owned, or retry-queued. Do not requeue here.
             continue
         if steer_result is False:
             # Busy but not steer-capable: legacy requeue until idle.

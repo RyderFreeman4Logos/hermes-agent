@@ -3617,6 +3617,30 @@ def completion_result_delivery_outcome(result: dict) -> str:
     return "missing_active_marker"
 
 
+def claim_completion_event_delivery(
+    evt: dict,
+    consumer: str,
+    *,
+    registry: Optional[ProcessRegistry] = None,
+) -> Optional[str]:
+    """Claim local and durable ownership without stranding a dequeued event."""
+    from tools.async_delegation import claim_event_delivery
+
+    target = registry or process_registry
+    if not target.claim_completion_delivery(evt):
+        return None
+    try:
+        claim_id = claim_event_delivery(evt, consumer)
+    except Exception:
+        logger.debug("Failed to claim durable completion delivery", exc_info=True)
+        target.release_completion_delivery(evt)
+        target.completion_queue.put(evt)
+        return None
+    if claim_id is None:
+        target.release_completion_delivery(evt)
+    return claim_id
+
+
 def finish_completion_event_delivery(
     evt: dict,
     claim_id: str,

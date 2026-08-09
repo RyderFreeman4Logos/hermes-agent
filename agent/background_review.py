@@ -1109,6 +1109,8 @@ def spawn_background_review_thread(
     post-turn reviews pass ``None`` — their prompts are byte-identical to
     before this parameter existed.
     """
+    messages_snapshot = copy.deepcopy(messages_snapshot)
+
     # Pick the right prompt based on which triggers fired.  Allow per-agent
     # override (the prompts moved to module-level constants but old code paths
     # that set agent._MEMORY_REVIEW_PROMPT etc. directly keep working).

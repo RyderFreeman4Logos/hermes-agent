@@ -43,6 +43,83 @@ def test_foreground_command_uses_registered_task_cwd_for_existing_environment(mo
     assert calls == [("pwd", {"timeout": 60, "cwd": "/workspace/acp", "bounded_capture": True})]
 
 
+def test_delegate_command_policy_blocks_cargo_before_execution(monkeypatch):
+    """Explicit delegate policy rejects bare Cargo without creating/running an env."""
+    calls = []
+
+    class FakeEnv:
+        env = {}
+
+        def execute(self, command, **kwargs):
+            calls.append((command, kwargs))
+            return {"output": "ok", "returncode": 0}
+
+    task_id = "delegate-policy"
+    monkeypatch.setattr(terminal_tool, "_active_environments", {task_id: FakeEnv()})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
+    monkeypatch.setattr(
+        terminal_tool,
+        "_task_env_overrides",
+        {task_id: {"command_policy": {"read_only": True, "just_only_cargo": True}}},
+    )
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: _minimal_terminal_config())
+    monkeypatch.setattr(
+        terminal_tool,
+        "_check_all_guards",
+        lambda command, env_type, **kwargs: {"approved": True},
+    )
+
+    rejected = json.loads(
+        terminal_tool.terminal_tool(command="cargo build --locked", task_id=task_id)
+    )
+
+    assert rejected == {
+        "output": "",
+        "exit_code": 1,
+        "error": "Blocked by delegation.command_policy: bare Cargo is prohibited; use the repository Just recipe.",
+        "status": "blocked",
+        "task_id": task_id,
+        "command": "cargo build --locked",
+        "rule": "just_only_cargo",
+        "policy_source": "delegation.command_policy",
+    }
+    assert calls == []
+
+    allowed = json.loads(terminal_tool.terminal_tool(command="just test-f", task_id=task_id))
+    assert allowed["exit_code"] == 0
+    assert calls == [("just test-f", {"timeout": 60, "cwd": "/default", "bounded_capture": True})]
+
+
+def test_delegate_read_only_policy_blocks_cargo_write_before_execution(monkeypatch):
+    calls = []
+
+    class FakeEnv:
+        env = {}
+
+        def execute(self, command, **kwargs):
+            calls.append((command, kwargs))
+            return {"output": "ok", "returncode": 0}
+
+    task_id = "delegate-read-only"
+    monkeypatch.setattr(terminal_tool, "_active_environments", {task_id: FakeEnv()})
+    monkeypatch.setattr(terminal_tool, "_last_activity", {})
+    monkeypatch.setattr(
+        terminal_tool,
+        "_task_env_overrides",
+        {task_id: {"command_policy": {"read_only": True}}},
+    )
+
+    rejected = json.loads(
+        terminal_tool.terminal_tool(command="cargo test --lib", task_id=task_id)
+    )
+
+    assert rejected["exit_code"] == 1
+    assert rejected["status"] == "blocked"
+    assert rejected["rule"] == "read_only"
+    assert "write-capable Cargo" in rejected["error"]
+    assert calls == []
+
+
 def test_explicit_workdir_still_wins_over_registered_task_cwd(monkeypatch):
     calls = []
 

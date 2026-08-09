@@ -808,6 +808,41 @@ class TestDelegateTask(unittest.TestCase):
             _, kwargs = MockAgent.call_args
             self.assertEqual(kwargs["api_mode"], "anthropic_messages")
 
+    def test_child_inherits_structured_command_policy(self):
+        """Delegation config reaches the child's terminal admission task id."""
+        from tools import terminal_tool
+
+        parent = _make_mock_parent(depth=0)
+        parent._current_task_id = None
+        captured = {}
+        child = MagicMock()
+        child._credential_pool = None
+        child._delegate_output_schema = None
+        child.tool_progress_callback = None
+
+        def run_without_model(*, task_id, **_kwargs):
+            captured["policy"] = terminal_tool.resolve_task_overrides(task_id).get(
+                "command_policy"
+            )
+            return {"final_response": "ok", "completed": True, "api_calls": 0}
+
+        child.run_conversation.side_effect = run_without_model
+        with (
+            patch(
+                "tools.delegate_tool._load_config",
+                return_value={"command_policy": {"read_only": True, "just_only_cargo": True}},
+            ),
+            patch("run_agent.AIAgent", return_value=child),
+        ):
+            delegate_task(goal="Review only", parent_agent=parent)
+
+        assert captured["policy"] == {
+            "read_only": True,
+            "just_only_cargo": True,
+            "source": "delegation.command_policy",
+        }
+
+
 class TestToolNamePreservation(unittest.TestCase):
     """Verify _last_resolved_tool_names is restored after subagent runs."""
 

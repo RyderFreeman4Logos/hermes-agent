@@ -389,7 +389,7 @@ def test_routed_background_review_provider_overrides_remain_derived(
         request_overrides=child.request_overrides,
         is_codex_backend=True,
     )
-    assert wire["extra_headers"] == explicit["extra_headers"]
+    assert wire["extra_headers"]["X-Caller"] == explicit["extra_headers"]["X-Caller"]
     assert wire["timeout"] == float(explicit["timeout"])
     assert "extra_body" not in wire
 

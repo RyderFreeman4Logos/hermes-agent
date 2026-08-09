@@ -21,8 +21,10 @@ Contract pinned here:
 
 from __future__ import annotations
 
+import subprocess
 import threading
 import types
+from pathlib import Path
 
 import pytest
 
@@ -155,6 +157,143 @@ def test_inflight_deltas_are_buffered_until_projection_or_terminal():
     terminal_snapshot = server._inflight_snapshot(session)
     assert terminal_snapshot is not None
     assert terminal_snapshot["assistant"] == "one two!"
+
+
+def test_concurrent_live_snapshot_observes_production_stream_prefixes(
+    emits, turn_env, monkeypatch
+):
+    deltas = ("alpha ", "beta ", "gamma ", "omega")
+    snapshot_waiting = [threading.Event() for _ in deltas]
+    race = threading.Barrier(2)
+    snapshot_complete = threading.Barrier(2)
+
+    class _ContendedHistoryLock:
+        def __init__(self):
+            self._lock = threading.Lock()
+            self.expected_snapshot: int | None = None
+
+        def __enter__(self):
+            if self._lock.locked() and self.expected_snapshot is not None:
+                snapshot_waiting[self.expected_snapshot].set()
+            self._lock.acquire()
+            return self
+
+        def __exit__(self, *exc):
+            self._lock.release()
+            return False
+
+    history_lock = _ContendedHistoryLock()
+    session = _session(running=True, history_lock=history_lock)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    append_delta = server._append_inflight_delta
+    append_index = 0
+
+    def _append_while_snapshot_waits(current_session, delta):
+        nonlocal append_index
+        append_delta(current_session, delta)
+        index = append_index
+        append_index += 1
+        history_lock.expected_snapshot = index
+        race.wait(timeout=10)
+        assert snapshot_waiting[index].wait(timeout=10)
+
+    monkeypatch.setattr(server, "_append_inflight_delta", _append_while_snapshot_waits)
+
+    def _run(_message, stream_callback=None, **_kwargs):
+        assert stream_callback is not None
+        for delta in deltas:
+            stream_callback(delta)
+            snapshot_complete.wait(timeout=10)
+        return {"final_response": "", "error": "synthetic provider stop", "failed": True}
+
+    session["agent"] = types.SimpleNamespace(
+        session_id="session-key",
+        run_conversation=_run,
+        clear_interrupt=lambda: None,
+    )
+    observed = []
+    sampler_errors = []
+
+    def _sample_live_resume_payloads():
+        try:
+            for _ in deltas:
+                race.wait(timeout=10)
+                payload = server._live_session_payload("sid", session)
+                observed.append(payload["inflight"]["assistant"])
+                snapshot_complete.wait(timeout=10)
+        except Exception as exc:  # surfaced in the owning test thread below
+            sampler_errors.append(exc)
+
+    sampler = server._RealThread(target=_sample_live_resume_payloads, daemon=True)
+    producer = server._RealThread(
+        target=lambda: server._run_prompt_submit("rid", "sid", session, "prompt"),
+        daemon=True,
+    )
+    sampler.start()
+    producer.start()
+    sampler.join(timeout=20)
+    producer.join(timeout=20)
+
+    assert not sampler.is_alive() and not producer.is_alive()
+    assert not sampler_errors
+    assert observed == ["".join(deltas[:end]) for end in range(1, len(deltas) + 1)]
+
+    terminal = server._live_session_payload("sid", session)["inflight"]
+    assert terminal["assistant"] == "".join(deltas)
+    assert terminal["status"] == "error"
+    assert terminal["error"] == "synthetic provider stop"
+
+
+def test_fixed_size_long_output_does_not_rewrite_assistant_per_delta():
+    """Synthetic operation-count guard; this is not production latency evidence."""
+    delta_count = 16_384
+    delta = "x" * 64
+
+    class _CountingTurn(dict):
+        assistant_writes = 0
+
+        def __setitem__(self, key, value):
+            if key == "assistant":
+                self.assistant_writes += 1
+            super().__setitem__(key, value)
+
+    session = _session()
+    server._start_inflight_turn(session, "long synthetic output")
+    turn = _CountingTurn(session["inflight_turn"])
+    session["inflight_turn"] = turn
+
+    for _ in range(delta_count):
+        server._append_inflight_delta(session, delta)
+
+    assert turn.assistant_writes <= 1
+    snapshot = server._inflight_snapshot(session)
+    assert snapshot is not None
+    assert snapshot["assistant"] == delta * delta_count
+
+    repo = Path(__file__).resolve().parents[2]
+    revision = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    dirty = bool(
+        subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=no"],
+            cwd=repo,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    )
+    print(
+        "issue81 synthetic complexity guard: "
+        f"revision={revision} tree={'dirty' if dirty else 'clean'}; "
+        f"deltas={delta_count}; chars_per_delta={len(delta)}; "
+        f"total_chars={delta_count * len(delta)}; assistant_writes={turn.assistant_writes}; "
+        "deterministic helper operation count, not production end-to-end latency"
+    )
 
 
 # ── Returned-error path (run_conversation returns an error result) ────

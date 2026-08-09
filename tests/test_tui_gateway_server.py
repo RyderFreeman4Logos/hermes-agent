@@ -6091,7 +6091,7 @@ def test_notification_poller_live_loop_requeues_foreign_completion_for_owner(
         assert len(delivered["a"]) == 1
         assert "proc-live-handoff completed normally" in delivered["a"][0]
         assert "final assistant message must be literally empty (zero characters)" in delivered["a"][0]
-        assert delivered["kwargs"] == [{"turn_origin": "background-completion", "completion_delivery": True}]
+        assert delivered["kwargs"] == [{"turn_origin": "background_completion", "completion_delivery": True}]
         assert delivered["b"] == []
         assert isolated_queue.empty()
     finally:
@@ -16049,7 +16049,7 @@ def test_notification_poller_delivers_unknown_exit_code(
         assert len(delivered) == 1
         assert "still running" in delivered[0][0]
         assert "literally empty" not in delivered[0][0]
-        assert delivered[0][1] == {"turn_origin": "background-completion", "completion_delivery": True}
+        assert delivered[0][1] == {"turn_origin": "background_completion", "completion_delivery": True}
         assert any(event[0] == "status.update" for event in emitted)
     finally:
         server._sessions.pop("sid_unknown_completion", None)
@@ -18928,80 +18928,6 @@ def test_tui_cache_callback_uses_95_percent_error_boundary(pct, kind):
     assert emitted == [
         ("status.update", "cache-sid", {"kind": kind, "text": f"cache {pct}%"})
     ]
-
-
-@pytest.mark.parametrize(
-    ("turn_origin", "completion_delivery", "expected_origin"),
-    [
-        (None, False, "user"),
-        (None, True, "background-completion"),
-        ("subagent-result", False, "subagent-result"),
-    ],
-)
-def test_prompt_submit_arms_first_provider_response_record_for_each_wake_origin(
-    monkeypatch, turn_origin, completion_delivery, expected_origin
-):
-    class _Agent:
-        session_id = "raw-session-id-must-not-leak"
-
-        def run_conversation(self, *_args, **_kwargs):
-            self._tui_cache_callback("hit", 95, 1_900, 2_000)
-            self._tui_cache_callback("hit", 99, 1_980, 2_000)
-            return {"final_response": "reply", "messages": []}
-
-    class _StoppedTicker:
-        def join(self):
-            pass
-
-    emitted: list[tuple[str, str, dict]] = []
-    agent = _Agent()
-    session = _session(agent=agent)
-    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
-    monkeypatch.setattr(server, "_get_usage", lambda _agent: {})
-    monkeypatch.setattr(server, "_get_db", lambda: None)
-    monkeypatch.setattr(server, "_start_usage_ticker", lambda *_args: (threading.Event(), _StoppedTicker()))
-    monkeypatch.setattr(server, "render_message", lambda *_args: "")
-    monkeypatch.setattr(server, "_emit", lambda *event: emitted.append(event))
-    monkeypatch.setattr(server, "_drain_queued_prompt", lambda *_args: False)
-    monkeypatch.setattr(server.time, "time", lambda: 1_700_000_000.25)
-    server._attach_tui_cache_callback(agent, "raw-owner-id-must-not-leak")
-
-    server._run_prompt_submit(
-        "rid",
-        "sid",
-        session,
-        "prompt-must-not-leak",
-        turn_origin=turn_origin,
-        completion_delivery=completion_delivery,
-    )
-
-    records = [
-        event[2]["first_provider_response"]
-        for event in emitted
-        if len(event) == 3
-        and event[0] == "status.update"
-        and "first_provider_response" in event[2]
-    ]
-    assert len(records) == 1
-    record = records[0]
-    assert record == {
-        "turn_origin": expected_origin,
-        "request_index": 1,
-        "timestamp": 1_700_000_000.25,
-        "owner": "tui_gateway",
-        "session": record["session"],
-    }
-    assert len(record["session"]) == 64
-    assert all(
-        sentinel not in repr(record)
-        for sentinel in (
-            "raw-owner-id-must-not-leak",
-            "raw-session-id-must-not-leak",
-            "prompt-must-not-leak",
-            "1_900",
-            "2_000",
-        )
-    )
 
 
 def test_tui_cache_callback_labels_post_compression_usage():

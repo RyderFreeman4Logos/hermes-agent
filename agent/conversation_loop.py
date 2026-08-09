@@ -171,7 +171,7 @@ _HANDOFF_SKIP_FINAL_RESPONSE = (
 
 
 def _ingest_successful_provider_usage(agent, usage: dict, *, first_call: bool) -> bool:
-    """Store one real usage reading and consume host-owned cache attribution."""
+    """Store usage and emit content-free cache records for this provider response."""
     agent._last_turn_usage = dict(usage)
     post_compression = bool(
         getattr(agent, "_awaiting_cache_usage_after_compression", False)
@@ -181,35 +181,70 @@ def _ingest_successful_provider_usage(agent, usage: dict, *, first_call: bool) -
         isinstance(prior_cache_usage, dict)
         and prior_cache_usage.get("cache_attribution") == "post_compression"
     )
-    if not (first_call or post_compression or clear_post_compression):
-        return False
 
     cache_usage = dict(usage)
+    telemetry_present = cache_usage.get("cache_telemetry_present")
+    cache_read = cache_usage.get("cache_read_tokens", 0) or 0
+    cache_write = cache_usage.get("cache_write_tokens", 0) or 0
+    prompt_tokens = cache_usage.get("prompt_tokens", 0) or 0
+    if telemetry_present is False:
+        cache_state, cache_pct = "no_field", None
+    elif cache_read > 0:
+        cache_state = "hit"
+        cache_pct = cache_hit_percent(cache_read, prompt_tokens) if prompt_tokens > 0 else None
+    elif cache_write > 0:
+        cache_state, cache_pct = "cold_write", None
+    elif telemetry_present is True:
+        cache_state, cache_pct = "miss", None
+    else:
+        cache_state, cache_pct = "unknown", None
+
     if post_compression:
+        request_index = 1
         cache_usage["cache_attribution"] = "post_compression"
         agent._awaiting_cache_usage_after_compression = False
-    agent._first_turn_usage = cache_usage
+    else:
+        request_index = int(getattr(agent, "_provider_response_request_index", 0)) + 1
+    agent._provider_response_request_index = request_index
+    record = {
+        "owner_session_id": str(
+            getattr(agent, "_tui_cache_owner_session", None)
+            or getattr(agent, "session_id", "")
+        ),
+        "turn_origin": str(getattr(agent, "_cache_turn_origin", "user")),
+        "request_index": request_index,
+        "timestamp": time.monotonic(),
+        "state": cache_state,
+    }
+    if prompt_tokens > 0:
+        record["prompt_tokens"] = int(prompt_tokens)
+    if telemetry_present is True:
+        record["cache_read_tokens"] = int(cache_read)
+        record["cache_write_tokens"] = int(cache_write)
+    if cache_pct is not None:
+        record["pct"] = cache_pct
+    if post_compression:
+        record["cache_attribution"] = "post_compression"
+    agent._provider_response_records = [
+        *getattr(agent, "_provider_response_records", []), record
+    ]
+    if getattr(agent, "_first_provider_response", None) is None:
+        agent._first_provider_response = record
+        agent._cache_attribution_response = record
+    elif post_compression:
+        agent._cache_attribution_response = record
+
+    # Keep the existing usage holder for completion/cost reporting, but make
+    # its first-call semantics match the first successful provider response.
+    if first_call or prior_cache_usage is None or post_compression or clear_post_compression:
+        agent._first_turn_usage = cache_usage
 
     cache_callback = getattr(agent, "_tui_cache_callback", None)
     if callable(cache_callback):
-        cache_read = cache_usage.get("cache_read_tokens", 0) or 0
-        cache_write = cache_usage.get("cache_write_tokens", 0) or 0
-        prompt_tokens = cache_usage.get("prompt_tokens", 0) or 0
-        if cache_usage.get("cache_telemetry_present") is False:
-            cache_state, cache_pct = "unavailable", 0
-        elif cache_read > 0:
-            cache_state = "hit"
-            cache_pct = cache_hit_percent(cache_read, prompt_tokens)
-        elif cache_write > 0:
-            cache_state, cache_pct = "cold_write", 0
-        elif cache_usage.get("cache_telemetry_present") is True:
-            cache_state, cache_pct = "miss", 0
-        else:
-            cache_state, cache_pct = "unknown", 0
         try:
-            cache_callback(cache_state, cache_pct, cache_read, prompt_tokens)
+            cache_callback(cache_state, cache_pct or 0, cache_read, prompt_tokens, record)
         except Exception:
-            logger.debug("TUI first-call cache callback failed", exc_info=True)
+            logger.debug("TUI provider-response cache callback failed", exc_info=True)
     return post_compression
 
 
@@ -1760,6 +1795,7 @@ def run_conversation(
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    turn_origin: str = "user",
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -1949,6 +1985,11 @@ def run_conversation(
     # it tells us whether this turn's inherited prefix hit the prior turn's
     # cache, before later calls naturally reuse the cache written by call #1.
     agent._first_turn_usage = None
+    agent._first_provider_response = None
+    agent._cache_attribution_response = None
+    agent._provider_response_records = []
+    agent._provider_response_request_index = 0
+    agent._cache_turn_origin = turn_origin
 
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
     # turn to the codex app-server subprocess (terminal/file ops/patching

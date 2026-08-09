@@ -534,8 +534,7 @@ class TurnController {
       this.reasoningSegmentIndex === null ? '' : (this.segmentMessages[this.reasoningSegmentIndex]?.thinking ?? '')
 
     const replacement =
-      authoritative.trim() ||
-      [active.trim(), '[reasoning stream truncated]'].filter(Boolean).join('\n')
+      authoritative.trim() || [active.trim(), '[reasoning stream truncated]'].filter(Boolean).join('\n')
 
     const prefix = this.reasoningText.slice(0, Math.max(0, this.reasoningText.length - this.activeReasoningChars))
 

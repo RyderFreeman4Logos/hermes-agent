@@ -586,15 +586,8 @@ class TestCodexStreamCallbacks:
         assert "Hello from Codex!" in deltas
 
 
-    def test_codex_remote_protocol_error_retries_then_raises(self):
-        """Transport errors from ``responses.create`` retry once then re-raise.
-
-        With the migration from ``responses.stream(...)`` to
-        ``responses.create(stream=True)``, there is no longer a separate
-        fallback function — the same call IS the streaming path.  When it
-        raises ``httpx.RemoteProtocolError``, we retry once (matching the
-        old behavior on the helper) and re-raise on the second failure.
-        """
+    def test_codex_remote_protocol_error_after_dispatch_is_not_replayed(self):
+        """An ambiguous post-accept drop must not create a second billed call."""
         from run_agent import AIAgent
         import httpx
 
@@ -620,11 +613,12 @@ class TestCodexStreamCallbacks:
         mock_client = MagicMock()
         mock_client.responses.create.side_effect = _create_side_effect
 
-        with pytest.raises(httpx.RemoteProtocolError):
+        with pytest.raises(RuntimeError):
             agent._run_codex_stream({}, client=mock_client)
 
-        # 1 initial + 1 retry = 2 calls
-        assert call_count["n"] == 2
+        # A RemoteProtocolError can arrive after provider acceptance; do not
+        # blindly replay a potentially billable request.
+        assert call_count["n"] <= 1
 
     def test_codex_create_stream_fallback_refreshes_activity_on_every_event(self):
         from run_agent import AIAgent

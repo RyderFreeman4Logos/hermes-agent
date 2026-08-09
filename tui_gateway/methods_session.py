@@ -3058,12 +3058,27 @@ def _(rid, params: dict) -> dict:
 
 @method("subagent.interrupt")
 def _(rid, params: dict) -> dict:
+    """Cooperatively stop a child owned by this exact live UI session."""
     from tools.delegate_tool import interrupt_subagent
 
     subagent_id = str(params.get("subagent_id") or "").strip()
     if not subagent_id:
         return _err(rid, 4000, "subagent_id required")
-    ok = interrupt_subagent(subagent_id)
+    _invoking_session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    invoking_session_id = str(params.get("session_id") or "").strip()
+    invoking_transport, invoking_session = _current_session_steer_authority(
+        invoking_session_id
+    )
+    ok = False
+    if invoking_transport is not None and invoking_session is not None:
+        ok = interrupt_subagent(
+            subagent_id,
+            owner_session_id=invoking_session_id,
+            owner_transport=invoking_transport,
+            owner_session_record=invoking_session,
+        )
     return _ok(rid, {"found": ok, "subagent_id": subagent_id})
 
 

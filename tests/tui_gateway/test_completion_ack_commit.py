@@ -1,4 +1,4 @@
-"""#66: async completion ACK follows the terminal SessionDB commit."""
+"""#66/#78: completion ACK follows provider and durable publication."""
 
 from __future__ import annotations
 
@@ -23,6 +23,15 @@ class _InlineThread:
 
     def is_alive(self):
         return False
+
+
+class _HeldThread(_InlineThread):
+    def start(self):
+        pass
+
+    def run(self):
+        if self._target:
+            self._target()
 
 
 @pytest.fixture()
@@ -61,6 +70,144 @@ def _session(agent):
         "show_reasoning": False,
         "tool_progress_mode": "all",
     }
+
+
+def test_ordinary_idle_dispatch_acks_after_provider_and_history_commit(
+    turn_env, monkeypatch
+):
+    """Starting the daemon turn is not an ordinary completion ACK."""
+    from tools import async_delegation as ad
+    import tools.process_registry as registry_module
+
+    monkeypatch.setattr(ad, "restore_undelivered_completions", lambda _queue: 0)
+    registry = registry_module.ProcessRegistry()
+    monkeypatch.setattr(registry_module, "process_registry", registry)
+    monkeypatch.setattr(server.threading, "Thread", _HeldThread)
+    provider_finished = []
+    acknowledgements = []
+    prompt = "[ordinary completion event]"
+    messages = [
+        {"role": "user", "content": prompt},
+        {"role": "assistant", "content": "terminal"},
+    ]
+
+    def run_conversation(message, **_kwargs):
+        assert message == prompt
+        provider_finished.append(True)
+        return {
+            "final_response": "terminal",
+            "messages": messages,
+            "completion_delivery_status": "committed",
+        }
+
+    agent = types.SimpleNamespace(
+        model="test",
+        provider="test",
+        clear_interrupt=lambda: None,
+        run_conversation=run_conversation,
+    )
+    session = _session(agent)
+    original_complete = registry.complete_completion_delivery
+
+    def complete(evt):
+        acknowledgements.append((list(provider_finished), list(session["history"])))
+        original_complete(evt)
+
+    monkeypatch.setattr(registry, "complete_completion_delivery", complete)
+    event = {
+        "type": "completion",
+        "session_id": "proc-ordinary",
+        "session_key": "active",
+        "started_at": 1.0,
+    }
+
+    server._dispatch_completion_batch(
+        "sid",
+        session,
+        [{"evt": event, "model_text": prompt, "text": prompt}],
+        consumer="tui-test",
+    )
+
+    assert acknowledgements == []
+    session["_run_thread"].run()
+    assert acknowledgements == [([True], messages)]
+
+
+def test_completion_history_conflict_gets_explicit_recovery_outcome(turn_env):
+    """A durable suffix cannot be called delivered when live history rejects it."""
+    outcomes = []
+    session = _session(None)
+
+    def run_conversation(message, **_kwargs):
+        with session["history_lock"]:
+            session["history_version"] += 1
+        return {
+            "final_response": "terminal",
+            "messages": [
+                {"role": "user", "content": message},
+                {"role": "assistant", "content": "terminal"},
+            ],
+            "completion_delivery_status": "committed",
+        }
+
+    session["agent"] = types.SimpleNamespace(
+        model="test",
+        provider="test",
+        clear_interrupt=lambda: None,
+        run_conversation=run_conversation,
+    )
+
+    server._run_prompt_submit(
+        "rid",
+        "sid",
+        session,
+        "[ordinary completion event]",
+        completion_delivery=True,
+        completion_delivery_callback=outcomes.append,
+    )
+
+    assert outcomes == ["history_conflict"]
+    assert session["history"] == []
+
+
+def test_committed_failure_suffix_is_a_terminal_delivery(turn_env):
+    """A durable failed/effect suffix is an explicit non-replay disposition."""
+    outcomes = []
+    messages = [
+        {"role": "user", "content": "[ordinary completion event]"},
+        {"role": "assistant", "content": "effect failed durably"},
+    ]
+
+    def run_conversation(_message, **_kwargs):
+        return {
+            "final_response": "",
+            "messages": messages,
+            "failed": True,
+            "partial": True,
+            "error": "provider failed after effect",
+            "completion_delivery_status": "committed",
+        }
+
+    session = _session(
+        types.SimpleNamespace(
+            model="test",
+            provider="test",
+            clear_interrupt=lambda: None,
+            run_conversation=run_conversation,
+        )
+    )
+
+    server._run_prompt_submit(
+        "rid",
+        "sid",
+        session,
+        "[ordinary completion event]",
+        completion_delivery=True,
+        completion_delivery_callback=outcomes.append,
+    )
+
+    assert outcomes == ["committed"]
+    assert session["history"] == messages
 
 
 @pytest.mark.parametrize("rotate", [False, True], ids=["active", "rotated"])
@@ -166,7 +313,7 @@ def test_ack_after_suffix_commit_survives_repeated_wakeups(
             "[completion event]",
             display_kind="async_delegation_complete",
             completion_delivery_callback=lambda outcome: (
-                server._finish_async_completion_claim(event, claim, outcome)
+                server._finish_completion_claim(event, claim, outcome)
             ),
         )
         assert (
@@ -287,7 +434,7 @@ def test_recovery_marker_prevents_completion_replay_but_cached_agent_still_runs(
             prompt,
             display_kind="async_delegation_complete",
             completion_delivery_callback=lambda outcome: (
-                server._finish_async_completion_claim(event, claim, outcome)
+                server._finish_completion_claim(event, claim, outcome)
             ),
         )
 

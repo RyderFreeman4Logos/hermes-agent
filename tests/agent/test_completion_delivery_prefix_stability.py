@@ -1423,6 +1423,60 @@ def test_completion_commit_retries_before_publishing_live_state(tmp_path, monkey
         db.close()
 
 
+@pytest.mark.parametrize("missing", ["suffix", "marker"])
+def test_missing_retry_state_does_not_poison_cached_agent(
+    tmp_path, monkeypatch, missing
+):
+    """Lost retry state converges once instead of short-circuiting every turn."""
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = f"completion-missing-{missing}"
+    db.create_session(session_id, source="tui", model="test-model")
+    db.append_messages_batch(
+        session_id,
+        [
+            {"role": "user", "content": "original request"},
+            {"role": "assistant", "content": "background task started"},
+        ],
+    )
+    before = db.get_messages_as_conversation(session_id)
+    agent = _make_agent(tmp_path, db, session_id)
+    pending_event = {
+        "role": "user",
+        "content": "lost completion",
+        "_completion_delivery_synthetic": True,
+    }
+    agent._session_messages = list(before)
+    setattr(agent, "_pending_completion_delivery_suffix", [pending_event])
+    if missing == "suffix":
+        agent._session_messages.append(pending_event)
+        setattr(agent, "_pending_completion_delivery_suffix", None)
+    setattr(
+        agent,
+        "_pending_completion_delivery_display_metadata_cas",
+        {"expected": "stale"},
+    )
+    setattr(agent, "_completion_delivery_commit_failed", True)
+    requests = _capture_client(
+        agent, [_mock_response(content="recovered", finish_reason="stop")]
+    )
+
+    try:
+        result = agent.run_conversation(
+            "real follow-up", conversation_history=list(before)
+        )
+
+        assert len(requests) == 1
+        assert result["failed"] is False
+        assert getattr(agent, "_completion_delivery_commit_failed", False) is False
+        assert getattr(agent, "_pending_completion_delivery_suffix", None) is None
+        assert not any(
+            row.get("_completion_delivery_synthetic") for row in agent._session_messages
+        )
+    finally:
+        db.close()
+
+
 def test_failed_tool_intent_commit_never_executes_or_replays_tool(tmp_path, monkeypatch):
     """A completion tool call must be canonical before its side effect runs."""
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])

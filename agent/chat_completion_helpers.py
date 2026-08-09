@@ -57,6 +57,8 @@ _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
 # billing reasons keep their own 60s cooldown (set above); this is the
 # narrower non-rate-limit case.  See issue #24996.
 _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
+# ponytail: one process-wide reservation lock; split per agent only if contended.
+_CODEX_REQUEST_OWNER_LOCK = threading.Lock()
 
 
 def _context_thread_target(callback):
@@ -386,7 +388,7 @@ def _codex_wait_notice_recovery(
         deadlines.append(max(0.0, last_event_ts - call_start) + idle_timeout)
     if not deadlines or min(deadlines) <= elapsed:
         return ""
-    return f"; auto-reconnect at {int(min(deadlines))}s"
+    return f"; safety timeout at {int(min(deadlines))}s"
 
 
 # ── Cross-turn stale-call circuit breaker (#58962) ─────────────────────
@@ -433,6 +435,50 @@ def _check_stale_giveup(agent) -> None:
             "avoid an indefinite stall. Switch models or start a new "
             "session, then retry."
         )
+
+
+def _reserve_codex_request_owner(agent, lifecycle: dict[str, Any]) -> dict[str, Any]:
+    """Reserve one physical Codex worker or reject a blind overlapping call."""
+    from agent import physical_attempt_diagnostics
+
+    with _CODEX_REQUEST_OWNER_LOCK:
+        previous = getattr(agent, "_codex_request_owner", None)
+        if isinstance(previous, dict):
+            thread = previous.get("thread")
+            if (
+                thread is None
+                or previous.get("started") is False
+                or thread.is_alive()
+            ):
+                previous_lifecycle = previous.get("lifecycle") or {}
+                physical_attempt_diagnostics.record_reconciliation(
+                    previous_lifecycle.get("attempt"),
+                    action="wait",
+                )
+                error = TimeoutError(
+                    "A prior Codex request still owns its physical worker; "
+                    "Hermes did not dispatch another request."
+                )
+                setattr(error, "_hermes_ambiguous_provider_acceptance", True)
+                setattr(error, "_hermes_pre_dispatch_retained_owner", True)
+                raise error
+            physical_attempt_diagnostics.record_reconciliation(
+                (previous.get("lifecycle") or {}).get("attempt"),
+                action="reaped",
+            )
+        owner = {
+            "thread": None,
+            "started": False,
+            "lifecycle": lifecycle,
+        }
+        setattr(agent, "_codex_request_owner", owner)
+        return owner
+
+
+def _release_codex_request_owner(agent, owner: dict[str, Any]) -> None:
+    with _CODEX_REQUEST_OWNER_LOCK:
+        if getattr(agent, "_codex_request_owner", None) is owner:
+            setattr(agent, "_codex_request_owner", None)
 
 
 def _derive_stream_stale_timeout(agent, api_kwargs: dict) -> float:
@@ -912,6 +958,10 @@ def interruptible_api_call(agent, api_kwargs: dict):
     warm_token = None
 
     result: dict[str, Any] = {"response": None, "error": None}
+    result_lock = threading.Lock()
+    worker_api_kwargs = api_kwargs
+    codex_lifecycle: dict[str, Any] | None = None
+    codex_owner: dict[str, Any] | None = None
 
     # Cross-turn stale-call circuit breaker (#58962) — non-streaming sibling
     # of the guard in interruptible_streaming_api_call.  Quiet-mode /
@@ -929,11 +979,23 @@ def interruptible_api_call(agent, api_kwargs: dict):
     # because that flag is cleared at run_conversation() turn boundaries, but
     # this daemon worker thread can outlive the turn (the gateway caches
     # AIAgent instances per session). Tracks whether THIS specific request was
-    # cancelled by the main thread's interrupt handler, so the transport error
-    # that is the expected consequence of our own force-close isn't misread as
-    # a network bug and surfaced to the caller. (PR #6600 — cascading interrupt
-    # hang.)
+    # cancelled by its interrupt or watchdog owner, so the resulting transport
+    # error is not surfaced as a separate network bug. (#6600)
     _request_cancelled = {"value": False}
+
+    def _cancel_request() -> None:
+        _request_cancelled["value"] = True
+        if codex_lifecycle is not None:
+            codex_lifecycle["cancel_event"].set()
+
+    def _request_is_cancelled() -> bool:
+        return bool(
+            _request_cancelled["value"]
+            or (
+                codex_lifecycle is not None
+                and codex_lifecycle["cancel_event"].is_set()
+            )
+        )
 
     def _set_request_client(client, *, kind: str = "openai"):
         nonlocal warm_token
@@ -1018,7 +1080,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
             # connection without touching the shared client (#67142).
             response = _dispatch_nonstreaming_api_request(
                 agent,
-                api_kwargs,
+                worker_api_kwargs,
                 make_client=lambda reason, kind="openai": _set_request_client(
                     agent._create_request_anthropic_client(reason=reason)
                     if kind == "anthropic_messages"
@@ -1030,23 +1092,34 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 bind_warm=_bind_warm_client,
             )
             finish_normal_warm_snapshot(agent, warm_token, succeeded=False)
-            result["response"] = defer_normal_warm_snapshot_until_validated(
+            if _request_is_cancelled():
+                return
+            deferred = defer_normal_warm_snapshot_until_validated(
                 agent, warm_token, response
             )
+            with result_lock:
+                if (
+                    not _request_is_cancelled()
+                    and result["response"] is None
+                    and result["error"] is None
+                ):
+                    result["response"] = deferred
         except Exception as e:
             finish_normal_warm_snapshot(agent, warm_token, succeeded=False)
-            # If the request was cancelled by the main thread's interrupt
-            # handler, the transport error is the expected consequence of our
-            # own force-close, NOT a network bug. Swallow it instead of
-            # surfacing — the main thread raises InterruptedError. (#6600)
-            if _request_cancelled["value"]:
+            # If the request was cancelled by its owner, the transport error is
+            # the expected consequence of our force-close, NOT a second network
+            # failure. The owner thread already holds the terminal control-flow
+            # error. (#6600)
+            if _request_is_cancelled():
                 logger.debug(
                     "Non-streaming worker caught %s after request cancellation — "
                     "exiting without surfacing a network error.",
                     type(e).__name__,
                 )
                 return
-            result["error"] = e
+            with result_lock:
+                if result["response"] is None and result["error"] is None:
+                    result["error"] = e
         finally:
             finish_normal_warm_snapshot(agent, warm_token, succeeded=False)
             # Reuse reason only on a clean response; any other outcome —
@@ -1071,10 +1144,10 @@ def interruptible_api_call(agent, api_kwargs: dict):
     # The chatgpt.com/backend-api/codex endpoint has an intermittent failure
     # mode where it accepts the connection but never emits a single stream
     # event (observed directly: 0 events, no HTTP status, the socket just
-    # hangs). A fresh reconnect succeeds in ~2s, but the wall-clock stale
-    # timeout (often 180–900s) makes us wait minutes before retrying. While no
-    # stream event has arrived yet we apply a much shorter TTFB cutoff so the
-    # main retry loop can reconnect promptly. Large subscription-backed Codex
+    # hangs). A fresh request might succeed, but replaying after provider
+    # acceptance can duplicate billed or side-effecting work. The short TTFB
+    # cutoff therefore aborts and reports an ambiguous outcome without replay.
+    # Large subscription-backed Codex
     # requests can legitimately spend tens of seconds in backend admission /
     # prompt prefill before the first SSE event, so the no-byte TTFB watchdog
     # is disabled for large chatgpt.com/backend-api/codex requests. A second
@@ -1107,6 +1180,17 @@ def interruptible_api_call(agent, api_kwargs: dict):
             _total_request_timeout = 1800.0
 
     if _codex_watchdog_enabled:
+        from agent import physical_attempt_diagnostics
+
+        codex_lifecycle = {
+            "attempt": None,
+            "cancel_event": threading.Event(),
+        }
+        codex_owner = _reserve_codex_request_owner(agent, codex_lifecycle)
+        worker_api_kwargs = dict(api_kwargs)
+        worker_api_kwargs[
+            physical_attempt_diagnostics._INTERNAL_LIFECYCLE_KEY
+        ] = codex_lifecycle
         # Reset before the worker starts so a marker left over from a previous
         # call on this agent can't be misread as first-byte for this one.
         agent._codex_stream_last_event_ts = None
@@ -1115,13 +1199,53 @@ def interruptible_api_call(agent, api_kwargs: dict):
     _call_start = time.time()
     agent._touch_activity("waiting for non-streaming API response")
 
-    warm_token = begin_normal_warm_snapshot(agent, api_kwargs)
     try:
+        warm_token = begin_normal_warm_snapshot(agent, api_kwargs)
         t = threading.Thread(target=_context_thread_target(_call), daemon=True)
+        if codex_owner is not None:
+            codex_owner["thread"] = t
         t.start()
+        if codex_owner is not None:
+            codex_owner["started"] = True
     except BaseException:
-        finish_normal_warm_snapshot(agent, warm_token, succeeded=False)
+        if codex_owner is not None:
+            _release_codex_request_owner(agent, codex_owner)
+        if warm_token is not None:
+            finish_normal_warm_snapshot(agent, warm_token, succeeded=False)
         raise
+
+    def _settle_codex_watchdog_timeout(
+        error: TimeoutError,
+        *,
+        timeout_class: str,
+        close_reason: str,
+    ) -> None:
+        from agent import physical_attempt_diagnostics
+
+        with result_lock:
+            if result["response"] is not None or result["error"] is not None:
+                return
+            setattr(error, "_hermes_ambiguous_provider_acceptance", True)
+            result["error"] = error
+            attempt = (codex_lifecycle or {}).get("attempt")
+            physical_attempt_diagnostics.record_ambiguity(
+                attempt,
+                failure_class=timeout_class,
+            )
+            _cancel_request()
+        try:
+            _close_request_client_once(close_reason)
+        except Exception:
+            pass
+        t.join(timeout=2.0)
+        retained = t.is_alive()
+        physical_attempt_diagnostics.record_reconciliation(
+            attempt,
+            action="retain" if retained else "reaped",
+        )
+        if not retained and codex_owner is not None:
+            _release_codex_request_owner(agent, codex_owner)
+
     _poll_count = 0
     while t.is_alive():
         t.join(timeout=0.3)
@@ -1159,9 +1283,9 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
         # TTFB detector: the Codex stream has produced no event at all and
         # we're past the first-byte cutoff → the backend opened the
-        # connection but isn't responding. Kill it so the retry loop can
-        # reconnect (a fresh connection typically succeeds in seconds),
-        # instead of waiting out the much longer wall-clock stale timeout.
+        # connection but isn't responding. Abort it and report acceptance as
+        # ambiguous instead of waiting out the much longer wall-clock timeout
+        # or replaying a potentially billed request.
         if (
             _ttfb_enabled
             and _elapsed > _ttfb_timeout
@@ -1176,46 +1300,43 @@ def interruptible_api_call(agent, api_kwargs: dict):
                     _silent_hint = None
             logger.warning(
                 "Codex timeout_class=ttfb_timeout: no bytes within TTFB cutoff "
-                "(%.0fs > %.0fs, model=%s). Killing connection so the retry "
-                "loop can reconnect.",
+                "(%.0fs > %.0fs, model=%s). Aborting without replay.",
                 _elapsed, _ttfb_timeout, api_kwargs.get("model", "unknown"),
             )
             if _silent_hint:
                 agent._buffer_status(
                     f"⚠️ No first byte from provider in {int(_elapsed)}s "
                     f"(codex stream, model: {api_kwargs.get('model', 'unknown')}). "
-                    f"Reconnecting. {_silent_hint}"
+                    f"Stopping without replay. {_silent_hint}"
                 )
             else:
                 agent._buffer_status(
                     f"⚠️ No first byte from provider in {int(_elapsed)}s "
                     f"(codex stream, model: {api_kwargs.get('model', 'unknown')}). "
-                    f"Reconnecting."
+                    f"Stopping without replay."
                 )
-            try:
-                _close_request_client_once("codex_ttfb_kill")
-            except Exception:
-                pass
             agent._emit_wait_notice(
                 f"⚠ no response from provider in {int(_elapsed)}s — "
-                f"reconnecting..."
+                f"stopping without replay..."
             )
             agent._touch_activity(
                 f"codex stream killed after {int(_elapsed)}s with no first byte"
             )
-            # Wait briefly for the worker to notice the closed connection.
-            t.join(timeout=2.0)
-            if result["error"] is None and result["response"] is None:
-                if _silent_hint:
-                    result["error"] = TimeoutError(
-                        f"timeout_class=ttfb_timeout; Codex stream produced no bytes within {int(_elapsed)}s "
-                        f"(TTFB threshold: {int(_ttfb_timeout)}s). {_silent_hint}"
-                    )
-                else:
-                    result["error"] = TimeoutError(
-                        f"timeout_class=ttfb_timeout; Codex stream produced no bytes within {int(_elapsed)}s "
-                        f"(TTFB threshold: {int(_ttfb_timeout)}s)"
-                    )
+            if _silent_hint:
+                timeout_error = TimeoutError(
+                    f"timeout_class=ttfb_timeout; Codex stream produced no bytes within {int(_elapsed)}s "
+                    f"(TTFB threshold: {int(_ttfb_timeout)}s). {_silent_hint}"
+                )
+            else:
+                timeout_error = TimeoutError(
+                    f"timeout_class=ttfb_timeout; Codex stream produced no bytes within {int(_elapsed)}s "
+                    f"(TTFB threshold: {int(_ttfb_timeout)}s)"
+                )
+            _settle_codex_watchdog_timeout(
+                timeout_error,
+                timeout_class="ttfb_timeout",
+                close_reason="codex_ttfb_kill",
+            )
             break
 
         # Stream-idle detector: the Codex backend emitted at least one SSE
@@ -1231,7 +1352,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
             logger.warning(
                 "Codex timeout_class=sse_idle_timeout: no SSE events for %.0fs "
                 "after first byte (threshold %.0fs, model=%s, context=~%s tokens). "
-                "Killing connection so the retry loop can reconnect.",
+                "Aborting without replay.",
                 _event_stale_elapsed,
                 _codex_idle_timeout,
                 api_kwargs.get("model", "unknown"),
@@ -1240,21 +1361,19 @@ def interruptible_api_call(agent, api_kwargs: dict):
             agent._buffer_status(
                 f"⚠️ Codex stream sent no events for {int(_event_stale_elapsed)}s "
                 f"after first byte (model: {api_kwargs.get('model', 'unknown')}). "
-                f"Reconnecting."
+                f"Stopping without replay."
             )
-            try:
-                _close_request_client_once("codex_stream_idle_kill")
-            except Exception:
-                pass
             agent._touch_activity(
                 f"codex stream killed after {int(_event_stale_elapsed)}s with no SSE events"
             )
-            t.join(timeout=2.0)
-            if result["error"] is None and result["response"] is None:
-                result["error"] = TimeoutError(
+            _settle_codex_watchdog_timeout(
+                TimeoutError(
                     f"timeout_class=sse_idle_timeout; Codex stream produced no SSE events for {int(_event_stale_elapsed)}s "
                     f"after first byte (threshold: {int(_codex_idle_timeout)}s)"
-                )
+                ),
+                timeout_class="sse_idle_timeout",
+                close_reason="codex_stream_idle_kill",
+            )
             break
 
         # For Codex, stale means no semantic output/reasoning/tool progress;
@@ -1283,7 +1402,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 )
                 agent._buffer_status(
                     f"⚠️ Codex stream made no semantic progress for {int(_stale_elapsed)}s "
-                    f"(model: {api_kwargs.get('model', 'unknown')}). Reconnecting."
+                    f"(model: {api_kwargs.get('model', 'unknown')}). Stopping without replay."
                 )
                 _close_reason = "codex_no_progress_timeout"
             else:
@@ -1306,62 +1425,66 @@ def interruptible_api_call(agent, api_kwargs: dict):
                         f"Aborting call."
                     )
                 _close_reason = "stale_call_kill"
-            try:
-                _close_request_client_once(_close_reason)
-            except Exception:
-                pass
             _bump_stale_streak(agent)
             agent._touch_activity(
                 f"stale non-streaming call killed after {int(_stale_elapsed)}s"
             )
-            t.join(timeout=2.0)
-            if result["error"] is None and result["response"] is None:
-                if _codex_watchdog_enabled:
-                    result["error"] = TimeoutError(
+            if _codex_watchdog_enabled:
+                _settle_codex_watchdog_timeout(
+                    TimeoutError(
                         f"timeout_class=no_progress_timeout; Codex stream made no semantic progress for "
                         f"{int(_stale_elapsed)}s (threshold: {int(_stale_timeout)}s, "
                         f"total elapsed: {int(_elapsed)}s)"
-                    )
-                elif _silent_hint:
-                    result["error"] = TimeoutError(
-                        f"Non-streaming API call timed out after {int(_stale_elapsed)}s "
-                        f"with no response (threshold: {int(_stale_timeout)}s). "
-                        f"{_silent_hint}"
-                    )
-                else:
-                    result["error"] = TimeoutError(
-                        f"Non-streaming API call timed out after {int(_stale_elapsed)}s "
-                        f"with no response (threshold: {int(_stale_timeout)}s)"
-                    )
+                    ),
+                    timeout_class="no_progress_timeout",
+                    close_reason=_close_reason,
+                )
+            else:
+                try:
+                    _close_request_client_once(_close_reason)
+                except Exception:
+                    pass
+                t.join(timeout=2.0)
+                with result_lock:
+                    if result["error"] is None and result["response"] is None:
+                        if _silent_hint:
+                            result["error"] = TimeoutError(
+                                f"Non-streaming API call timed out after {int(_stale_elapsed)}s "
+                                f"with no response (threshold: {int(_stale_timeout)}s). "
+                                f"{_silent_hint}"
+                            )
+                        else:
+                            result["error"] = TimeoutError(
+                                f"Non-streaming API call timed out after {int(_stale_elapsed)}s "
+                                f"with no response (threshold: {int(_stale_timeout)}s)"
+                            )
             break
 
         if _codex_watchdog_enabled and _elapsed >= _total_request_timeout:
             logger.warning(
                 "Codex timeout_class=total_request_timeout: total elapsed %.0fs "
                 "reached configured threshold %.0fs (model=%s, context=~%s tokens). "
-                "Killing connection so the retry loop can recover.",
+                "Aborting without replay.",
                 _elapsed, _total_request_timeout, api_kwargs.get("model", "unknown"),
                 f"{_est_tokens_for_codex_watchdog:,}",
             )
             agent._buffer_status(
                 f"⚠️ Codex request reached its configured total timeout after "
                 f"{int(_elapsed)}s (model: {api_kwargs.get('model', 'unknown')}). "
-                "Reconnecting."
+                "Stopping without replay."
             )
-            try:
-                _close_request_client_once("codex_total_request_timeout")
-            except Exception:
-                pass
             _bump_stale_streak(agent)
             agent._touch_activity(
                 f"codex request killed at {int(_elapsed)}s total timeout"
             )
-            t.join(timeout=2.0)
-            if result["error"] is None and result["response"] is None:
-                result["error"] = TimeoutError(
+            _settle_codex_watchdog_timeout(
+                TimeoutError(
                     f"timeout_class=total_request_timeout; Codex request timed out "
                     f"after {int(_elapsed)}s (threshold: {int(_total_request_timeout)}s)"
-                )
+                ),
+                timeout_class="total_request_timeout",
+                close_reason="codex_total_request_timeout",
+            )
             break
 
         if agent._interrupt_requested:
@@ -1369,7 +1492,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
             # exception handler recognizes the forced transport error as a
             # cancel and exits cleanly instead of surfacing a network error or
             # (in the streaming path) burning full retry cycles. (#6600)
-            _request_cancelled["value"] = True
+            _cancel_request()
             logger.debug(
                 "Force-closing httpx client due to interrupt (not a network error)."
             )
@@ -1384,6 +1507,8 @@ def interruptible_api_call(agent, api_kwargs: dict):
             except Exception:
                 pass
             raise InterruptedError("Agent interrupted during API call")
+    if codex_owner is not None and not t.is_alive():
+        _release_codex_request_owner(agent, codex_owner)
     if result["error"] is not None:
         if _codex_watchdog_enabled and isinstance(result["error"], TimeoutError):
             # Every watchdog fires after the worker crossed provider dispatch.

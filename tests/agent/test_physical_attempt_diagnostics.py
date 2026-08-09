@@ -160,6 +160,12 @@ def test_physical_attempt_sink_is_private_content_free_and_preserves_unknown(
         retry=1,
         continuation=2,
     )
+    diagnostics.record_progress(second, progress="semantic")
+    diagnostics.record_ambiguity(
+        second,
+        failure_class="total_request_timeout",
+    )
+    diagnostics.record_reconciliation(second, action="retain")
     diagnostics.finish_responses_attempt(
         second,
         usage=SimpleNamespace(
@@ -167,7 +173,7 @@ def test_physical_attempt_sink_is_private_content_free_and_preserves_unknown(
             output_tokens=3,
             input_tokens_details=SimpleNamespace(cached_tokens=0),
         ),
-        outcome="completed",
+        outcome="error",
     )
 
     root = tmp_path / "observability"
@@ -176,8 +182,14 @@ def test_physical_attempt_sink_is_private_content_free_and_preserves_unknown(
         for line in (root / "physical_attempt_digests.jsonl").read_text().splitlines()
     ]
     starts = [record for record in records if record["phase"] == "start"]
+    progress = [record for record in records if record["phase"] == "progress"]
+    ambiguities = [record for record in records if record["phase"] == "ambiguity"]
+    reconciliations = [
+        record for record in records if record["phase"] == "reconciliation"
+    ]
     terminals = [record for record in records if record["phase"] == "terminal"]
 
+    assert len(records) == 7
     assert set(starts[0]) == {
         "schema",
         "phase",
@@ -206,6 +218,7 @@ def test_physical_attempt_sink_is_private_content_free_and_preserves_unknown(
         "attempt_digest",
         "monotonic_ns",
         "outcome",
+        "disposition",
         "cache_state",
         "input_tokens",
         "output_tokens",
@@ -213,8 +226,41 @@ def test_physical_attempt_sink_is_private_content_free_and_preserves_unknown(
         "cache_write_tokens",
         "stage_latency",
     }
+    assert set(progress[0]) == {
+        "schema",
+        "phase",
+        "attempt_digest",
+        "monotonic_ns",
+        "progress",
+    }
+    assert set(ambiguities[0]) == {
+        "schema",
+        "phase",
+        "attempt_digest",
+        "monotonic_ns",
+        "failure_class",
+        "acceptance",
+    }
+    assert set(reconciliations[0]) == {
+        "schema",
+        "phase",
+        "attempt_digest",
+        "monotonic_ns",
+        "action",
+    }
     assert starts[0]["attempt_digest"] == terminals[0]["attempt_digest"]
     assert starts[1]["attempt_digest"] == terminals[1]["attempt_digest"]
+    assert {
+        progress[0]["attempt_digest"],
+        ambiguities[0]["attempt_digest"],
+        reconciliations[0]["attempt_digest"],
+        terminals[1]["attempt_digest"],
+    } == {starts[1]["attempt_digest"]}
+    assert progress[0]["progress"] == "semantic"
+    assert ambiguities[0]["failure_class"] == "total_request_timeout"
+    assert ambiguities[0]["acceptance"] == "unknown"
+    assert reconciliations[0]["action"] == "retain"
+    assert terminals[1]["disposition"] == "ambiguous_halt"
     assert starts[0]["equivalent_digest"] == starts[1]["equivalent_digest"]
     assert starts[0]["prefix_digest"] != starts[1]["prefix_digest"]
     assert terminals[0]["cache_state"] == "unknown"

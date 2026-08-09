@@ -934,14 +934,16 @@ class ManagedLlmStream(Iterator[Any]):
             raise
         matched_index = None
         matched_raw = None
-        output_tracker = self._raw_chunks[0][2] if self._raw_chunks else self._diagnostic
+        output_tracker = None
         for index, (encoded, raw, tracker) in enumerate(self._raw_chunks):
             if _json_equal(chunk, encoded):
                 matched_index = index
                 matched_raw = raw
                 output_tracker = tracker
                 break
-        physical_attempt_diagnostics.activate_attempt(output_tracker["attempt"])
+        physical_attempt_diagnostics.activate_attempt(
+            output_tracker["attempt"] if output_tracker is not None else None
+        )
         if not self._relay_observes_chunks and self._on_chunk is not None:
             self._on_chunk(chunk)
         if matched_index is not None:

@@ -166,6 +166,29 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             origin_session_id TEXT NOT NULL DEFAULT ''
         )"""
     )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS ordinary_completion_deliveries (
+            delivery_id TEXT PRIMARY KEY,
+            event_json TEXT NOT NULL,
+            delivery_state TEXT NOT NULL DEFAULT 'pending',
+            delivery_attempts INTEGER NOT NULL DEFAULT 0,
+            updated_at REAL NOT NULL,
+            delivered_at REAL,
+            delivery_claim TEXT,
+            delivery_claimed_at REAL,
+            delivery_owner_pid INTEGER,
+            delivery_owner_started_at INTEGER
+        )"""
+    )
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS completion_delivery_recoveries (
+            session_id TEXT NOT NULL,
+            event_json TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            recovered_at REAL NOT NULL,
+            PRIMARY KEY (session_id, event_json, reason)
+        )"""
+    )
     columns = {row[1] for row in conn.execute("PRAGMA table_info(async_delegations)")}
     for name, sql_type in (
         ("owner_pid", "INTEGER"),
@@ -471,6 +494,56 @@ def restore_undelivered_completions(target_queue) -> int:
                 evt["restored"] = True
             target_queue.put(evt)
             restored += 1
+
+        now = time.time()
+        try:
+            from gateway.status import _pid_exists, get_process_start_time
+        except Exception:
+            _pid_exists = get_process_start_time = None
+        claimed_rows = conn.execute(
+            """SELECT delivery_id, delivery_owner_pid,
+                      delivery_owner_started_at
+               FROM ordinary_completion_deliveries
+               WHERE delivery_state='effect_started'"""
+        ).fetchall()
+        for delivery_id, owner_pid, owner_started_at in claimed_rows:
+            live = bool(owner_pid) if _pid_exists is None else (
+                bool(owner_pid) and _pid_exists(int(owner_pid))
+            )
+            if live and owner_started_at is not None and get_process_start_time:
+                live = (
+                    get_process_start_time(int(owner_pid))
+                    == int(owner_started_at)
+                )
+            if live:
+                continue
+            conn.execute(
+                """UPDATE ordinary_completion_deliveries
+                   SET delivery_state='pending', delivery_claim=NULL,
+                       delivery_claimed_at=NULL, delivery_owner_pid=NULL,
+                       delivery_owner_started_at=NULL, updated_at=?
+                   WHERE delivery_id=? AND delivery_state='effect_started'""",
+                (now, delivery_id),
+            )
+        ordinary_rows = conn.execute(
+            """SELECT delivery_id, event_json, delivery_attempts
+               FROM ordinary_completion_deliveries
+               WHERE delivery_state='pending' ORDER BY updated_at, delivery_id"""
+        ).fetchall()
+        for delivery_id, payload, attempts in ordinary_rows:
+            if int(attempts or 0) >= _MAX_DELIVERY_ATTEMPTS:
+                conn.execute(
+                    """UPDATE ordinary_completion_deliveries
+                       SET delivery_state='dropped', updated_at=?
+                       WHERE delivery_id=?""",
+                    (now, delivery_id),
+                )
+                continue
+            evt = json.loads(payload)
+            if isinstance(evt, dict):
+                evt["restored"] = True
+                target_queue.put(evt)
+                restored += 1
     return restored
 
 
@@ -507,19 +580,128 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
         return cur.rowcount == 1
 
 
+def _ordinary_completion_delivery_id(evt: Dict[str, Any]) -> Optional[str]:
+    """Return the stable ordinary-process completion identity."""
+    session_id = evt.get("session_id")
+    session_key = evt.get("session_key", "")
+    started_at = evt.get("started_at")
+    if (
+        evt.get("type", "completion") != "completion"
+        or not isinstance(session_id, str)
+        or not session_id
+        or not isinstance(session_key, str)
+        or isinstance(started_at, bool)
+        or not isinstance(started_at, (int, float))
+        or started_at <= 0
+    ):
+        return None
+    return json.dumps(
+        ["completion", session_id, started_at, session_key],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def persist_event_delivery(evt: Dict[str, Any]) -> bool:
+    """Create the durable ordinary-completion receipt before queue delivery."""
+    delivery_id = _ordinary_completion_delivery_id(evt)
+    if delivery_id is None:
+        return True
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        conn.execute(
+            """INSERT OR IGNORE INTO ordinary_completion_deliveries
+               (delivery_id, event_json, delivery_state, updated_at)
+               VALUES (?, ?, 'pending', ?)""",
+            (delivery_id, json.dumps(evt, sort_keys=True), now),
+        )
+    return True
+
+
+def record_completion_delivery_recovery(
+    session_id: str, reason: str, event: Dict[str, Any]
+) -> bool:
+    """Persist a missing in-memory suffix/marker disposition before clearing it."""
+    if not session_id or not reason or not isinstance(event, dict):
+        return False
+    payload = json.dumps(event, sort_keys=True, separators=(",", ":"))
+    with _DB_LOCK, _transaction() as conn:
+        conn.execute(
+            """INSERT OR IGNORE INTO completion_delivery_recoveries
+               (session_id, event_json, reason, recovered_at)
+               VALUES (?, ?, ?, ?)""",
+            (session_id, payload, reason, time.time()),
+        )
+    return True
+
+
+def get_completion_delivery_recoveries(session_id: str) -> List[Dict[str, Any]]:
+    """Return durable missing-state dispositions for one session."""
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(
+            """SELECT event_json, reason, recovered_at
+               FROM completion_delivery_recoveries
+               WHERE session_id=? ORDER BY recovered_at, reason""",
+            (session_id,),
+        ).fetchall()
+    return [
+        {
+            "event": json.loads(row[0]),
+            "reason": row[1],
+            "recovered_at": row[2],
+        }
+        for row in rows
+    ]
+
+
 def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
-    """Claim a durable delegation or reject a stale heartbeat event."""
+    """Claim a durable completion or reject a stale heartbeat event."""
     if evt.get("type") == "heartbeat":
         from tools.runtime_heartbeat import runtime_heartbeat
 
         return "" if runtime_heartbeat.is_event_current(evt) else None
-    if evt.get("type") != "async_delegation":
-        return ""
-    delegation_id = str(evt.get("delegation_id") or "")
-    if not delegation_id:
+    if evt.get("type") == "async_delegation":
+        delegation_id = str(evt.get("delegation_id") or "")
+        if not delegation_id:
+            return ""
+        claim_id = f"{consumer}:{__import__('os').getpid()}:{uuid.uuid4().hex}"
+        return claim_id if claim_completion_delivery(delegation_id, claim_id) else None
+    delivery_id = _ordinary_completion_delivery_id(evt)
+    if delivery_id is None:
         return ""
     claim_id = f"{consumer}:{__import__('os').getpid()}:{uuid.uuid4().hex}"
-    return claim_id if claim_completion_delivery(delegation_id, claim_id) else None
+    now = time.time()
+    owner_pid = __import__("os").getpid()
+    try:
+        from gateway.status import get_process_start_time
+
+        owner_started_at = get_process_start_time(owner_pid)
+    except Exception:
+        owner_started_at = None
+    with _DB_LOCK, _transaction() as conn:
+        conn.execute(
+            """INSERT OR IGNORE INTO ordinary_completion_deliveries
+               (delivery_id, event_json, delivery_state, updated_at)
+               VALUES (?, ?, 'pending', ?)""",
+            (delivery_id, json.dumps(evt, sort_keys=True), now),
+        )
+        cur = conn.execute(
+            """UPDATE ordinary_completion_deliveries
+               SET delivery_state='effect_started', delivery_claim=?,
+                   delivery_claimed_at=?, delivery_owner_pid=?,
+                   delivery_owner_started_at=?,
+                   delivery_attempts=delivery_attempts+1, updated_at=?
+               WHERE delivery_id=? AND delivery_state='pending'""",
+            (
+                claim_id,
+                now,
+                owner_pid,
+                owner_started_at,
+                now,
+                delivery_id,
+            ),
+        )
+    return claim_id if cur.rowcount == 1 else None
 
 
 def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
@@ -583,20 +765,35 @@ def drop_completion_delivery(delegation_id: str, claim_id: str) -> bool:
 def mark_completion_delivery_recovery(
     evt: Dict[str, Any], claim_id: str, reason: str
 ) -> bool:
-    """Stop replaying an already-run provider effect whose suffix lost its marker."""
-    if evt.get("type") != "async_delegation" or not claim_id:
-        return False
-    delegation_id = str(evt.get("delegation_id") or "")
-    if not delegation_id:
+    """Durably stop replaying an effect whose suffix lost commit authority."""
+    if not claim_id:
         return False
     now = time.time()
+    if evt.get("type") == "async_delegation":
+        delegation_id = str(evt.get("delegation_id") or "")
+        if not delegation_id:
+            return False
+        with _DB_LOCK, _transaction() as conn:
+            cur = conn.execute(
+                """UPDATE async_delegations SET delivery_state=?, delivery_claim=NULL,
+                          delivery_claimed_at=NULL, updated_at=?
+                   WHERE delegation_id=? AND delivery_state='effect_started'
+                     AND delivery_claim=?""",
+                (f"recovery_{reason}", now, delegation_id, claim_id),
+            )
+            return cur.rowcount == 1
+    delivery_id = _ordinary_completion_delivery_id(evt)
+    if delivery_id is None:
+        return False
     with _DB_LOCK, _transaction() as conn:
         cur = conn.execute(
-            """UPDATE async_delegations SET delivery_state=?, delivery_claim=NULL,
-                      delivery_claimed_at=NULL, updated_at=?
-               WHERE delegation_id=? AND delivery_state='effect_started'
+            """UPDATE ordinary_completion_deliveries
+               SET delivery_state=?, delivery_claim=NULL,
+                   delivery_claimed_at=NULL, delivery_owner_pid=NULL,
+                   delivery_owner_started_at=NULL, updated_at=?
+               WHERE delivery_id=? AND delivery_state='effect_started'
                  AND delivery_claim=?""",
-            (f"recovery_{reason}", now, delegation_id, claim_id),
+            (f"recovery_{reason}", now, delivery_id, claim_id),
         )
         return cur.rowcount == 1
 
@@ -616,14 +813,87 @@ def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
         return cur.rowcount == 1
 
 
-def complete_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
-    if claim_id and evt.get("type") == "async_delegation":
-        complete_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
+def complete_event_delivery(evt: Dict[str, Any], claim_id: str) -> bool:
+    if not claim_id:
+        return True
+    if evt.get("type") == "async_delegation":
+        return complete_completion_delivery(
+            str(evt.get("delegation_id") or ""), claim_id
+        )
+    delivery_id = _ordinary_completion_delivery_id(evt)
+    if delivery_id is None:
+        return True
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE ordinary_completion_deliveries
+               SET delivery_state='delivered', delivered_at=?, updated_at=?,
+                   delivery_claim=NULL, delivery_claimed_at=NULL,
+                   delivery_owner_pid=NULL, delivery_owner_started_at=NULL
+               WHERE delivery_id=? AND delivery_state='effect_started'
+                 AND delivery_claim=?""",
+            (now, now, delivery_id, claim_id),
+        )
+        return cur.rowcount == 1
 
 
-def release_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
-    if claim_id and evt.get("type") == "async_delegation":
-        release_completion_delivery(str(evt.get("delegation_id") or ""), claim_id)
+def release_event_delivery(evt: Dict[str, Any], claim_id: str) -> bool:
+    if not claim_id:
+        return True
+    if evt.get("type") == "async_delegation":
+        return release_completion_delivery(
+            str(evt.get("delegation_id") or ""), claim_id
+        )
+    delivery_id = _ordinary_completion_delivery_id(evt)
+    if delivery_id is None:
+        return True
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        capped = conn.execute(
+            """UPDATE ordinary_completion_deliveries
+               SET delivery_state='dropped', delivery_claim=NULL,
+                   delivery_claimed_at=NULL, delivery_owner_pid=NULL,
+                   delivery_owner_started_at=NULL, updated_at=?
+               WHERE delivery_id=? AND delivery_state='effect_started'
+                 AND delivery_claim=? AND delivery_attempts>=?""",
+            (now, delivery_id, claim_id, _MAX_DELIVERY_ATTEMPTS),
+        )
+        if capped.rowcount == 1:
+            return True
+        cur = conn.execute(
+            """UPDATE ordinary_completion_deliveries
+               SET delivery_state='pending', delivery_claim=NULL,
+                   delivery_claimed_at=NULL, delivery_owner_pid=NULL,
+                   delivery_owner_started_at=NULL, updated_at=?
+               WHERE delivery_id=? AND delivery_state='effect_started'
+                 AND delivery_claim=?""",
+            (now, delivery_id, claim_id),
+        )
+        return cur.rowcount == 1
+
+
+def get_durable_event_delivery(evt: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Return the ordinary completion's durable delivery receipt."""
+    delivery_id = _ordinary_completion_delivery_id(evt)
+    if delivery_id is None:
+        return None
+    with _DB_LOCK, _transaction() as conn:
+        row = conn.execute(
+            """SELECT delivery_state, delivery_attempts, delivered_at,
+                      delivery_claim, event_json
+               FROM ordinary_completion_deliveries WHERE delivery_id=?""",
+            (delivery_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        "delivery_id": delivery_id,
+        "delivery_state": row[0],
+        "delivery_attempts": row[1],
+        "delivered_at": row[2],
+        "delivery_claim": row[3],
+        "event": json.loads(row[4]),
+    }
 
 
 def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:

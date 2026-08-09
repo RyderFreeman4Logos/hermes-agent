@@ -1,4 +1,5 @@
 import sys
+import threading
 import types
 from types import SimpleNamespace
 
@@ -623,6 +624,34 @@ def test_max_iteration_summary_uses_raw_client_behind_auxiliary_facade(monkeypat
 
     assert result == "Summary after iteration limit."
     assert len(calls) == 1
+
+
+def test_max_iteration_summary_honors_retained_codex_owner(monkeypatch):
+    from agent import chat_completion_helpers as h
+
+    agent = _build_agent(monkeypatch)
+    agent._cached_system_prompt = "You are helpful."
+    owner = h._reserve_codex_request_owner(
+        agent, {"attempt": None, "cancel_event": threading.Event()}
+    )
+    owner.update(thread=SimpleNamespace(is_alive=lambda: True), started=True)
+    calls = []
+    monkeypatch.setattr(
+        agent,
+        "_run_codex_stream",
+        lambda _kwargs: calls.append(True)
+        or _codex_ack_message_response("must not dispatch"),
+    )
+
+    try:
+        result = agent._handle_max_iterations(
+            [{"role": "user", "content": "Summarize the work."}], 200
+        )
+        assert "prior Codex request still owns its physical worker" in result
+        assert calls == []
+        assert getattr(agent, "_codex_request_owner") is owner
+    finally:
+        h._release_codex_request_owner(agent, owner)
 
 
 def test_consume_codex_stream_routes_commentary_phase_deltas_to_reasoning(monkeypatch):

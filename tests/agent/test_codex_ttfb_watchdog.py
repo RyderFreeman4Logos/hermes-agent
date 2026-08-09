@@ -168,6 +168,69 @@ def test_codex_owner_reservation_blocks_before_worker_start():
         h._release_codex_request_owner(agent, owner)
 
 
+def test_retained_codex_owner_blocks_non_codex_route_switch(
+    tmp_path, monkeypatch
+):
+    from agent import chat_completion_helpers as h
+
+    agent = _make_codex_agent(tmp_path, monkeypatch)
+    owner = h._reserve_codex_request_owner(
+        agent, {"attempt": None, "cancel_event": threading.Event()}
+    )
+    owner.update(thread=SimpleNamespace(is_alive=lambda: True), started=True)
+    agent.api_mode = "chat_completions"
+    agent.provider = "openrouter"
+    dispatched = []
+    monkeypatch.setattr(
+        h,
+        "_dispatch_nonstreaming_api_request",
+        lambda *_args, **_kwargs: dispatched.append(True),
+    )
+
+    try:
+        with pytest.raises(TimeoutError) as excinfo:
+            h.interruptible_api_call(agent, {"model": "fallback", "messages": []})
+        assert getattr(
+            excinfo.value, "_hermes_pre_dispatch_retained_owner", False
+        ) is True
+        assert dispatched == []
+        assert getattr(agent, "_codex_request_owner") is owner
+    finally:
+        h._release_codex_request_owner(agent, owner)
+
+
+def test_retained_codex_owner_blocks_direct_route_before_early_return(
+    tmp_path, monkeypatch
+):
+    from agent import chat_completion_helpers as h
+
+    agent = _make_codex_agent(tmp_path, monkeypatch)
+    owner = h._reserve_codex_request_owner(
+        agent, {"attempt": None, "cancel_event": threading.Event()}
+    )
+    owner.update(thread=SimpleNamespace(is_alive=lambda: True), started=True)
+    agent.api_mode = "chat_completions"
+    agent.provider = "openrouter"
+    agent.platform = "cron"
+    dispatched = []
+    monkeypatch.setattr(
+        h,
+        "direct_api_call",
+        lambda *_args, **_kwargs: dispatched.append(True),
+    )
+
+    try:
+        with pytest.raises(TimeoutError) as excinfo:
+            h.interruptible_api_call(agent, {"model": "fallback", "messages": []})
+        assert getattr(
+            excinfo.value, "_hermes_pre_dispatch_retained_owner", False
+        ) is True
+        assert dispatched == []
+        assert getattr(agent, "_codex_request_owner") is owner
+    finally:
+        h._release_codex_request_owner(agent, owner)
+
+
 def test_ttfb_includes_silent_hang_hint_for_gpt_5_5(tmp_path, monkeypatch):
     """The no-first-byte watchdog should surface the same actionable hint as the
     stale-call timeout path when the model matches the silent-hang heuristic."""

@@ -495,6 +495,88 @@ def test_run_codex_stream_preserves_raw_responses_client(monkeypatch):
     assert calls == [{**_codex_request_kwargs(), "stream": True}]
 
 
+@pytest.mark.parametrize(
+    ("platform", "is_subagent", "expected_role"),
+    [
+        ("cli", False, "main"),
+        ("cli", True, "subagent"),
+        ("reviewer", False, "reviewer"),
+    ],
+)
+def test_run_codex_stream_wraps_the_final_physical_attempt(
+    monkeypatch, platform, is_subagent, expected_role
+):
+    from agent import physical_attempt_diagnostics as diagnostics
+    from agent.transports.codex import ResponsesApiTransport
+
+    scope = {"scope_digest": "scope-hmac", "scope_bytes": 7}
+    monkeypatch.setattr(diagnostics, "prepare_cache_scope", lambda _value: scope)
+    kwargs = ResponsesApiTransport().build_kwargs(
+        "gpt-5-codex",
+        [{"role": "user", "content": "hello"}],
+        session_id="private-session",
+        provider="openai-codex",
+        is_codex_backend=True,
+    )
+    assert kwargs[diagnostics._INTERNAL_SCOPE_KEY] == scope
+
+    starts = []
+    finishes = []
+    token = object()
+
+    def start(request, **metadata):
+        starts.append((request, metadata))
+        return token
+
+    def finish(attempt, **terminal):
+        finishes.append((attempt, terminal))
+
+    monkeypatch.setattr(diagnostics, "start_responses_attempt", start)
+    monkeypatch.setattr(diagnostics, "finish_responses_attempt", finish)
+
+    agent = _build_agent(monkeypatch)
+    agent.platform = platform
+    agent.is_subagent = is_subagent
+    agent._codex_incomplete_retries = 2
+
+    usage = SimpleNamespace(
+        input_tokens=13,
+        output_tokens=3,
+        input_tokens_details=SimpleNamespace(cached_tokens=0),
+    )
+
+    def _fake_create(**physical):
+        assert diagnostics._INTERNAL_SCOPE_KEY not in physical
+        return _FakeCreateStream(
+            [
+                SimpleNamespace(
+                    type="response.completed",
+                    response=SimpleNamespace(
+                        status="completed", output=[], usage=usage, model="gpt-5-codex"
+                    ),
+                )
+            ]
+        )
+
+    raw_client = SimpleNamespace(responses=SimpleNamespace(create=_fake_create))
+    response = agent._run_codex_stream(kwargs, client=raw_client)
+
+    assert response.usage is usage
+    assert len(starts) == 1
+    physical, metadata = starts[0]
+    assert physical["stream"] is True
+    assert metadata == {
+        "scope": scope,
+        "route": "codex_responses",
+        "provider": "openai-codex",
+        "model": "gpt-5-codex",
+        "role": expected_role,
+        "retry": 0,
+        "continuation": 2,
+    }
+    assert finishes == [(token, {"usage": usage, "outcome": "completed"})]
+
+
 def test_run_codex_stream_rejects_non_responses_client(monkeypatch):
     agent = _build_agent(monkeypatch)
 
@@ -2314,40 +2396,3 @@ def test_consume_codex_stream_leaves_unindexed_reasoning_untouched():
     )
 
     assert "".join(reasoning_streamed) == "Need to inspect files."
-
-
-def test_run_codex_stream_starts_and_finishes_a_private_physical_attempt(monkeypatch):
-    from agent import attempt_digests
-
-    agent = _build_agent(monkeypatch)
-    calls = []
-
-    class Sink:
-        def finish(self, attempt, usage):
-            calls.append(("finish", attempt, usage))
-
-    def start(_agent, kwargs, **metadata):
-        calls.append(("start", kwargs.copy(), metadata))
-        return Sink(), "attempt"
-
-    monkeypatch.setattr(attempt_digests, "start_codex_attempt", start)
-    agent.client = SimpleNamespace(
-        responses=SimpleNamespace(
-            create=lambda **kwargs: _FakeCreateStream([
-                SimpleNamespace(type="response.completed", response=_codex_message_response("ok"))
-            ])
-        )
-    )
-    request = _codex_request_kwargs()
-    request["_hermes_physical_attempt_identity"] = {"wire_prefix": _sentinel_for_digest_test()}
-
-    response = agent._run_codex_stream(request)
-
-    assert response.status == "completed"
-    assert "_hermes_physical_attempt_identity" not in calls[0][1]
-    assert calls[0][2]["retry"] == 0
-    assert calls[1] == ("finish", "attempt", {"input_tokens": 5})
-
-
-def _sentinel_for_digest_test():
-    return "never-reaches-provider"

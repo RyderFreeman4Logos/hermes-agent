@@ -543,16 +543,11 @@ class ResponsesApiTransport(ProviderTransport):
             else:
                 extra_body.pop("prompt_cache_key", None)
 
-        # Internal-only identity material for the default-off local digest sink.
-        # run_codex_stream removes it before Relay and the provider SDK see it.
-        kwargs["_hermes_physical_attempt_identity"] = {
-            "cache_scope": _cache_scope,
-            "cache_key": kwargs.get("prompt_cache_key")
-            or (kwargs.get("extra_body") or {}).get("prompt_cache_key"),
-            "tools": kwargs.get("tools"),
-            "instructions": kwargs.get("instructions"),
-            "wire_prefix": kwargs.get("input"),
-        }
+        from agent import physical_attempt_diagnostics
+
+        scope_identity = physical_attempt_diagnostics.prepare_cache_scope(_cache_scope)
+        if scope_identity is not None:
+            kwargs[physical_attempt_diagnostics._INTERNAL_SCOPE_KEY] = scope_identity
         return kwargs
 
     def normalize_response(self, response: Any, **kwargs) -> NormalizedResponse:

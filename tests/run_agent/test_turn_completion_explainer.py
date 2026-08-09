@@ -162,6 +162,11 @@ def heartbeat_event(monkeypatch):
         "tools.runtime_heartbeat.runtime_heartbeat.is_event_current",
         lambda candidate, agent=None, **_kwargs: candidate is event,
     )
+    monkeypatch.setattr(
+        "tools.runtime_heartbeat.runtime_heartbeat.record_checkin_success",
+        lambda candidate, agent=None: candidate is event,
+        raising=False,
+    )
     return event
 
 
@@ -723,10 +728,61 @@ def test_alive_heartbeat_without_validated_snapshot_makes_no_provider_call(
     assert "reason=no_validated_snapshot" in caplog.text
 
 
-def test_heartbeat_logs_success_without_persisting_a_turn(heartbeat_event, caplog):
+def test_heartbeat_logs_success_without_persisting_a_turn(
+    heartbeat_event, caplog, monkeypatch
+):
+    from tools.runtime_heartbeat import runtime_heartbeat
+
+    agent = _make_agent(max_iterations=10)
+    history = [
+        {"role": "user", "content": "real question"},
+        {"role": "assistant", "content": "real answer"},
+    ]
+    agent._session_messages = history
+    _prime_heartbeat_snapshot(agent, history)
+    agent.client.chat.completions.create.return_value = _mock_response("warm")
+    record_success = MagicMock(return_value=True)
+    monkeypatch.setattr(
+        runtime_heartbeat, "record_checkin_success", record_success, raising=False
+    )
+
+    with (
+        caplog.at_level("INFO", logger="agent.conversation_loop"),
+        patch.object(agent, "_persist_session") as persist,
+        patch.object(agent, "_flush_messages_to_session_db") as flush,
+    ):
+        result = agent.run_conversation(
+            "",
+            conversation_history=history,
+            turn_origin="heartbeat_warm",
+            heartbeat_event=heartbeat_event,
+        )
+
+    assert result["silent_noop"] is True
+    assert result["messages"] == history
+    assert agent._session_messages == history
+    assert "phase=attempt" in caplog.text
+    assert "outcome=success" in caplog.text
+    assert "reason=response_validated" in caplog.text
+    record_success.assert_called_once_with(heartbeat_event, agent=agent)
+    persist.assert_not_called()
+    flush.assert_not_called()
+
+
+def test_heartbeat_cancelled_after_dispatch_is_not_reported_as_success(
+    heartbeat_event, caplog, monkeypatch
+):
+    from tools.runtime_heartbeat import runtime_heartbeat
+
     agent = _make_agent(max_iterations=10)
     _prime_heartbeat_snapshot(agent)
     agent.client.chat.completions.create.return_value = _mock_response("warm")
+    monkeypatch.setattr(
+        runtime_heartbeat,
+        "record_checkin_success",
+        lambda *_a, **_k: False,
+        raising=False,
+    )
 
     with caplog.at_level("INFO", logger="agent.conversation_loop"):
         result = agent.run_conversation(
@@ -737,9 +793,10 @@ def test_heartbeat_logs_success_without_persisting_a_turn(heartbeat_event, caplo
 
     assert result["silent_noop"] is True
     assert result["messages"] == []
-    assert "phase=attempt" in caplog.text
-    assert "outcome=success" in caplog.text
-    assert "reason=response_validated" in caplog.text
+    assert result["heartbeat_warm_status"] == "skipped"
+    assert result["heartbeat_warm_reason"] == "stale_event_after_response"
+    assert "outcome=success" not in caplog.text
+    assert "outcome=safe-skip" in caplog.text
 
 
 def test_heartbeat_logs_provider_failure_without_user_turn(

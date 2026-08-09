@@ -4704,8 +4704,8 @@ def test_notification_poller_teardown_fences_blocked_heartbeat_snapshot(
                         {
                             "interval_s": 1700,
                             "kind": "process",
+                            "last_success_at": None,
                             "started_at": 1_700_000_000.25,
-                            "target_id": "proc-a",
                         }
                     ],
                 }
@@ -4888,6 +4888,7 @@ def test_tui_heartbeat_snapshot_reconciles_full_owner_state(monkeypatch):
             "caller_id": "heartbeat-owner",
             "interval_s": 1700,
             "kind": "process",
+            "last_success_at": 1_700_000_010.25,
             "started_at": 1_700_000_000.25,
             "target_id": "proc-a",
         },
@@ -4905,6 +4906,14 @@ def test_tui_heartbeat_snapshot_reconciles_full_owner_state(monkeypatch):
             "started_at": 1_700_000_003.25,
             "target_id": "foreign",
         },
+        {
+            "caller_id": "heartbeat-owner",
+            "interval_s": 1700,
+            "kind": "unbounded-private-kind",
+            "last_success_at": 1_700_000_011.25,
+            "started_at": 1_700_000_004.25,
+            "target_id": "must-not-surface",
+        },
     ]
     monkeypatch.setattr(
         "tools.runtime_heartbeat.runtime_heartbeat.active_snapshots",
@@ -4920,8 +4929,8 @@ def test_tui_heartbeat_snapshot_reconciles_full_owner_state(monkeypatch):
         "heartbeat-sid", session, previous=None
     )
     assert previous == (
-        ("proc-a", "process", 1_700_000_000.25, 1700),
-        ("delegate-b", "delegation", 1_700_000_002.25, 1700),
+        ("process", 1_700_000_000.25, 1700, 1_700_000_010.25),
+        ("delegation", 1_700_000_002.25, 1700, None),
     )
     assert emitted == [
         (
@@ -4935,14 +4944,14 @@ def test_tui_heartbeat_snapshot_reconciles_full_owner_state(monkeypatch):
                             {
                                 "interval_s": 1700,
                                 "kind": "process",
+                                "last_success_at": 1_700_000_010.25,
                                 "started_at": 1_700_000_000.25,
-                                "target_id": "proc-a",
                             },
                             {
                                 "interval_s": 1700,
                                 "kind": "delegation",
+                                "last_success_at": None,
                                 "started_at": 1_700_000_002.25,
-                                "target_id": "delegate-b",
                             },
                         ],
                     }
@@ -4951,10 +4960,25 @@ def test_tui_heartbeat_snapshot_reconciles_full_owner_state(monkeypatch):
         )
     ]
 
+    owner_snapshots[0]["last_success_at"] = 1_700_000_011.25
     previous = server._sync_runtime_heartbeat_status(
         "heartbeat-sid", session, previous=previous
     )
-    assert len(emitted) == 1
+    assert previous[0][-1] == 1_700_000_011.25
+    assert len(emitted) == 2
+    latest_payload = emitted[-1][2]
+    assert isinstance(latest_payload, dict)
+    assert (
+        latest_payload["usage"]["runtime_heartbeat"]["targets"][0][
+            "last_success_at"
+        ]
+        == 1_700_000_011.25
+    )
+
+    previous = server._sync_runtime_heartbeat_status(
+        "heartbeat-sid", session, previous=previous
+    )
+    assert len(emitted) == 2
 
     owner_snapshots.clear()
     previous = server._sync_runtime_heartbeat_status(

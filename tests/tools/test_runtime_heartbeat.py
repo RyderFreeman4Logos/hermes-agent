@@ -261,6 +261,7 @@ def test_active_snapshots_are_complete_stable_and_clear_on_cancel(
             "caller_id": "owner-b",
             "interval_s": 3300,
             "kind": "delegation",
+            "last_success_at": None,
             "started_at": 1_700_000_000.25,
             "target_id": "delegate-b",
         },
@@ -268,6 +269,7 @@ def test_active_snapshots_are_complete_stable_and_clear_on_cancel(
             "caller_id": "owner-a",
             "interval_s": 1700,
             "kind": "process",
+            "last_success_at": None,
             "started_at": 1_700_000_002.25,
             "target_id": "proc-a",
         },
@@ -279,6 +281,7 @@ def test_active_snapshots_are_complete_stable_and_clear_on_cancel(
             "caller_id": "owner-a",
             "interval_s": 1700,
             "kind": "process",
+            "last_success_at": None,
             "started_at": 1_700_000_002.25,
             "target_id": "proc-a",
         }
@@ -356,6 +359,68 @@ def test_active_snapshot_cadence_tracks_accepted_provider_activity(monkeypatch):
         activity_at=0.0,
     ) == 0
     assert manager.active_snapshots()[0]["started_at"] == accepted
+
+
+def test_validated_alive_checkin_records_content_free_group_success(monkeypatch):
+    from tools.runtime_heartbeat import RuntimeHeartbeat
+
+    FakeTimer.created = []
+    clock = SimpleNamespace(monotonic=100.0, wall=1_700_000_000.0)
+    monkeypatch.setattr(
+        "tools.runtime_heartbeat.time.monotonic", lambda: clock.monotonic
+    )
+    monkeypatch.setattr("tools.runtime_heartbeat.time.time", lambda: clock.wall)
+    events = queue.Queue()
+    manager = RuntimeHeartbeat(event_queue=events, timer_factory=FakeTimer)
+    alive = lambda: {"alive": True, "progress": True}
+
+    for target_id in ("a", "b"):
+        assert manager.arm(
+            target_id,
+            caller_id="owner",
+            kind="delegation",
+            interval=1700,
+            inspect=alive,
+        )
+    assert manager.arm(
+        "foreign",
+        caller_id="other-owner",
+        kind="delegation",
+        interval=1700,
+        inspect=alive,
+    )
+
+    FakeTimer.created[0].callback()
+    event = events.get_nowait()
+    clock.wall += 2.0
+
+    assert manager.record_checkin_success(event) is True
+    snapshots = {item["target_id"]: item for item in manager.active_snapshots()}
+    assert snapshots["a"]["last_success_at"] == clock.wall
+    assert snapshots["b"]["last_success_at"] == clock.wall
+    assert snapshots["foreign"]["last_success_at"] is None
+
+
+def test_non_alive_or_cancelled_checkin_is_not_recorded():
+    from tools.runtime_heartbeat import RuntimeHeartbeat
+
+    FakeTimer.created = []
+    events = queue.Queue()
+    manager = RuntimeHeartbeat(event_queue=events, timer_factory=FakeTimer)
+    assert manager.arm(
+        "target",
+        caller_id="owner",
+        kind="delegation",
+        interval=1700,
+        inspect=lambda: {"alive": True, "progress": True},
+    )
+    FakeTimer.created[0].callback()
+    event = events.get_nowait()
+
+    assert manager.record_checkin_success({**event, "status": "STUCK"}) is False
+    assert manager.active_snapshots()[0]["last_success_at"] is None
+    assert manager.cancel("target") is True
+    assert manager.record_checkin_success(event) is False
 
 
 def test_alive_fires_once_and_rearms_from_checkin_at_exact_interval(caplog):

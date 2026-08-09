@@ -14447,6 +14447,25 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
             # Get the final response
             response = result.get("final_response", "") if result else ""
+            continuation_match = (
+                re.fullmatch(
+                    r"Codex response remained incomplete after (\d+) continuation attempts",
+                    response,
+                )
+                if (
+                    result
+                    and result.get("partial")
+                    and isinstance(response, str)
+                    and result.get("error") == response
+                )
+                else None
+            )
+            if continuation_match:
+                response = (
+                    "The model produced no visible answer after "
+                    f"{continuation_match.group(1)} continuation attempts. "
+                    "Try again, rephrase, or start a new turn with another model."
+                )
 
             # Auto-generate session title after first exchange (non-blocking)
             if (

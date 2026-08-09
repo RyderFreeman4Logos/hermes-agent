@@ -286,6 +286,60 @@ def test_unhealthy_heartbeat_skips_user_voice_and_title_state():
     auto_title.assert_not_called()
 
 
+def test_codex_continuation_exhaustion_renders_actionable_failure(monkeypatch):
+    cli = _make_cli()
+    sentinel = "Codex response remained incomplete after 3 continuation attempts"
+    result = {
+        "final_response": sentinel,
+        "messages": [{"role": "assistant", "content": ""}],
+        "api_calls": 4,
+        "completed": False,
+        "partial": True,
+        "error": sentinel,
+    }
+
+    cli.agent = _StubAgent(cli.session_id, turn_seconds=0)
+    cli.agent.run_conversation = MagicMock(return_value=result)
+    cli._interrupt_queue = queue.Queue()
+    cli._pending_input = queue.Queue()
+    rendered = []
+    chat_globals = type(cli).chat.__globals__
+    monkeypatch.setitem(
+        chat_globals,
+        "_render_final_assistant_content",
+        lambda text, mode: rendered.append(text) or text,
+    )
+    monkeypatch.setitem(
+        chat_globals, "ChatConsole", MagicMock(return_value=MagicMock())
+    )
+
+    with (
+        patch.object(cli, "_ensure_runtime_credentials", return_value=True),
+        patch.object(
+            cli,
+            "_resolve_turn_agent_config",
+            return_value={
+                "signature": cli._active_agent_route_signature,
+                "model": None,
+                "runtime": None,
+                "request_overrides": None,
+            },
+        ),
+        patch.object(cli, "_init_agent", return_value=True),
+    ):
+        response = cli.chat("answer without exposing internal reasoning")
+
+    expected = (
+        "The model produced no visible answer after 3 continuation attempts. "
+        "Try again, rephrase, or start a new turn with another model."
+    )
+    assert response == expected
+    assert rendered == [expected]
+    assert result["partial"] is True
+    assert result["error"] == sentinel
+    assert result["final_response"] == sentinel
+
+
 @pytest.mark.parametrize("heartbeat_warm", [True, False], ids=["heartbeat", "user-control"])
 def test_process_loop_heartbeat_skips_user_turn_automation(
     heartbeat_warm, monkeypatch, tmp_path

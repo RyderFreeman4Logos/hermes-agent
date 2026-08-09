@@ -135,6 +135,28 @@ def test_healthy_snapshot_carries_no_error_keys():
     assert snapshot == {"assistant": "hello", "streaming": True, "user": "hi"}
 
 
+def test_inflight_deltas_are_buffered_until_projection_or_terminal():
+    session = _session()
+    server._start_inflight_turn(session, "hi")
+
+    for delta in ("one", " ", "two"):
+        server._append_inflight_delta(session, delta)
+
+    # Appending a delta must not rebuild the full assistant string each time.
+    assert session["inflight_turn"]["assistant"] == ""
+    snapshot = server._inflight_snapshot(session)
+    assert snapshot is not None
+    assert snapshot["assistant"] == "one two"
+
+    server._append_inflight_delta(session, "!")
+    server._fail_inflight_turn(session, "provider stopped")
+
+    assert session["inflight_turn"]["assistant"] == "one two!"
+    terminal_snapshot = server._inflight_snapshot(session)
+    assert terminal_snapshot is not None
+    assert terminal_snapshot["assistant"] == "one two!"
+
+
 # ── Returned-error path (run_conversation returns an error result) ────
 
 

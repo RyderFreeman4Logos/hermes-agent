@@ -9452,45 +9452,48 @@ def _note_steered_completion(session: dict, evt: dict, model_text: str, text: st
 
 
 def _mark_steered_completions_applied(session: dict, applied_text: str) -> list[dict]:
-    """Mark accepted busy-steer items consumed when tool-boundary apply drains them.
-
-    Acceptance is not delivery. Only items whose text is present in the applied
-    steer payload are completed; remainder stays fallback-pending.
-    """
-    from tools.async_delegation import complete_event_delivery
-    from tools.process_registry import process_registry
-
-    pending = list(session.get("_completion_steer_pending") or [])
-    if not pending:
-        return []
-    applied = applied_text or ""
-    kept: list[dict] = []
-    consumed: list[dict] = []
-    for item in pending:
-        model_text = item.get("model_text") or item.get("text") or ""
-        if model_text and model_text in applied:
-            item["state"] = "consumed"
-            evt = item["evt"]
-            claim = item.get("claim")
-            if claim is not None:
-                try:
-                    complete_event_delivery(evt, claim)
-                except Exception:
-                    logger.debug("steer-applied durable complete failed", exc_info=True)
-            process_registry.complete_completion_delivery(evt)
-            consumed.append(item)
-        else:
-            item["state"] = "fallback_pending"
+    """Retain tool-boundary steers until the enclosing turn is terminal."""
+    with session["history_lock"]:
+        pending = list(session.get("_completion_steer_pending") or [])
+        if not pending:
+            return []
+        applied = applied_text or ""
+        kept: list[dict] = []
+        marked: list[dict] = []
+        for item in pending:
+            model_text = item.get("model_text") or item.get("text") or ""
+            if item.get("state") == "applied" or (
+                model_text and model_text in applied
+            ):
+                item["state"] = "applied"
+                marked.append(item)
+            else:
+                item["state"] = "fallback_pending"
             kept.append(item)
-    session["_completion_steer_pending"] = kept
-    return consumed
+        session["_completion_steer_pending"] = kept
+    return marked
+
+
+def _finish_steered_completion_claims(session: dict, outcome: str) -> list[dict]:
+    """Resolve applied busy steers at the same terminal fence as idle delivery."""
+    with session["history_lock"]:
+        pending = list(session.get("_completion_steer_pending") or [])
+        terminal = [item for item in pending if item.get("state") == "applied"]
+        session["_completion_steer_pending"] = [
+            item for item in pending if item.get("state") != "applied"
+        ]
+    for item in terminal:
+        _finish_completion_claim(item["evt"], item.get("claim") or "", outcome)
+    return terminal
 
 
 def _take_steered_completion_fallback(session: dict) -> list[dict]:
-    """Return and clear unconsumed busy-steer completions for idle fallback."""
+    """Take only unapplied busy steers; applied claims await the terminal fence."""
     with session["history_lock"]:
         pending = list(session.get("_completion_steer_pending") or [])
-        session["_completion_steer_pending"] = []
+        session["_completion_steer_pending"] = [
+            item for item in pending if item.get("state") == "applied"
+        ]
     return [
         item
         for item in pending
@@ -9628,7 +9631,6 @@ def _dispatch_completion_batch(
     """Claim and submit one idle turn for a bounded completion batch."""
     from tools.async_delegation import (
         claim_event_delivery,
-        complete_event_delivery,
         release_event_delivery,
     )
     from tools.process_registry import process_registry
@@ -9659,8 +9661,7 @@ def _dispatch_completion_batch(
         )
         if not prompt:
             for item, claim in claimed:
-                complete_event_delivery(item["evt"], claim)
-                process_registry.complete_completion_delivery(item["evt"])
+                _finish_completion_claim(item["evt"], claim, "committed")
             with session["history_lock"]:
                 session["running"] = False
             return
@@ -9709,25 +9710,29 @@ def _dispatch_completion_batch(
             session["running"] = False
 
 
-def _finish_completion_claim(evt: dict, claim_id: str, outcome: str) -> None:
+def _finish_completion_claim(evt: dict, claim_id: str, outcome: str) -> bool:
     """Resolve any completion only after its provider and publication fence."""
-    from tools.async_delegation import (
-        complete_event_delivery,
-        mark_completion_delivery_recovery,
-        release_event_delivery,
-    )
-    from tools.process_registry import process_registry
+    from tools.process_registry import finish_completion_event_delivery
 
-    if outcome == "committed":
-        complete_event_delivery(evt, claim_id)
-        process_registry.complete_completion_delivery(evt)
-    elif outcome in {"missing_active_marker", "history_conflict"}:
-        mark_completion_delivery_recovery(evt, claim_id, outcome)
-        process_registry.complete_completion_delivery(evt)
-    else:
-        release_event_delivery(evt, claim_id)
+    return finish_completion_event_delivery(evt, claim_id, outcome)
+
+
+def _finish_suppressed_completion(evt: dict, process_registry, consumer: str) -> bool:
+    """Durably ACK an explicit visibility no-op without opening a model turn."""
+    from tools.async_delegation import claim_event_delivery
+
+    if not process_registry.claim_completion_delivery(evt):
+        return False
+    try:
+        claim = claim_event_delivery(evt, consumer)
+    except Exception:
         process_registry.release_completion_delivery(evt)
         process_registry.completion_queue.put(evt)
+        return False
+    if claim is None:
+        process_registry.release_completion_delivery(evt)
+        return False
+    return _finish_completion_claim(evt, claim, "committed")
 
 
 def _collect_idle_completion_batch(
@@ -9772,7 +9777,7 @@ def _collect_idle_completion_batch(
             continue
         model_text = completion_delivery_prompt(evt, text)
         if model_text is None:
-            process_registry.complete_completion_delivery(evt)
+            _finish_suppressed_completion(evt, process_registry, "tui-visibility")
             continue
         dedup = _notification_event_dedup_key(evt)
         if dedup not in emitted:
@@ -10103,7 +10108,7 @@ def _notification_poller_loop(
             continue
         model_text = completion_delivery_prompt(evt, text)
         if model_text is None:
-            process_registry.complete_completion_delivery(evt)
+            _finish_suppressed_completion(evt, process_registry, "tui-visibility")
             continue
 
         # Only emit the same notification identity to TUI once — re-queued
@@ -10188,7 +10193,7 @@ def _notification_poller_loop(
             continue
         model_text = completion_delivery_prompt(evt, text)
         if model_text is None:
-            process_registry.complete_completion_delivery(evt)
+            _finish_suppressed_completion(evt, process_registry, "tui-visibility")
             continue
 
         _dedup_key = _notification_event_dedup_key(evt)
@@ -10484,6 +10489,8 @@ def _run_prompt_submit(
             and int(session.get("_queued_prompt_generation", 0)) != queued_prompt_generation
         ):
             session["running"] = False
+            if completion_delivery_callback is not None:
+                completion_delivery_callback("provider_failed")
             return
         if heartbeat_turn:
             images = []
@@ -10862,11 +10869,16 @@ def _run_prompt_submit(
                 and isinstance(result, dict)
                 and result.get("silent_noop") is True
             )
-            completion_suffix_committed = not completion_delivery
+            completion_suffix_status = "committed" if not completion_delivery else "none"
             if completion_delivery and isinstance(result, dict):
-                completion_suffix_committed = result.get(
-                    "completion_delivery_status"
-                ) in {"committed", "dropped"}
+                completion_suffix_status = str(
+                    result.get("completion_delivery_status") or "none"
+                )
+            completion_suffix_committed = completion_suffix_status == "committed"
+            completion_suffix_dispositioned = completion_suffix_status in {
+                "committed",
+                "dropped",
+            }
             display_stamp_committed = not bool(display_kind)
             if display_kind and isinstance(text, str):
                 db = getattr(agent, "_session_db", None)
@@ -11103,15 +11115,16 @@ def _run_prompt_submit(
                     (result.get("error") if isinstance(result, dict) else "") or raw
                 )
                 payload["recoverable"] = True
-            if not (completion_suffix_committed and display_stamp_committed):
-                completion_outcome = (
-                    "provider_failed" if status != "complete" else "missing_active_marker"
-                )
+            if status != "complete" and not completion_suffix_committed:
+                completion_outcome = "provider_failed"
+            elif not (completion_suffix_dispositioned and display_stamp_committed):
+                completion_outcome = "missing_active_marker"
             elif not history_committed:
                 completion_outcome = "history_conflict"
             else:
                 completion_outcome = "committed"
             _finish_completion_delivery(completion_outcome)
+            _finish_steered_completion_claims(session, completion_outcome)
             if not heartbeat_turn:
                 _retire_turn_marker(session, marker_key)
             if not heartbeat_silent_noop:
@@ -11290,6 +11303,7 @@ def _run_prompt_submit(
             # inflight record still carries the recoverable error state.
             _restore_agent_history_after_turn_error(session, agent)
             _finish_completion_delivery("provider_failed")
+            _finish_steered_completion_claims(session, "provider_failed")
             try:
                 # Close the turn with the same terminal error frame shape as
                 # the returned-error path (uniform client handling), retaining
@@ -11308,6 +11322,9 @@ def _run_prompt_submit(
                 )
                 _emit("error", sid, {"message": str(e)})
         finally:
+            # Every pre-provider return and cleanup failure must release the
+            # durable claim; terminal paths above make this idempotent.
+            _finish_completion_delivery("provider_failed")
             # Drop both local snapshots of the pre-turn history before asking
             # glibc to return pages. session["history"] already points at the
             # new/pruned result; retaining either list defeats this trim.
@@ -11412,6 +11429,9 @@ def _run_prompt_submit(
                                     applied_blob += content
                     if applied_blob:
                         _mark_steered_completions_applied(session, applied_blob)
+                        _finish_steered_completion_claims(
+                            session, locals().get("completion_outcome", "provider_failed")
+                        )
                     else:
                         _finalize_steered_completion_fallback(session, None)
         if _drain_queued_prompt(rid, sid, session):

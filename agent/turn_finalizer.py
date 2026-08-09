@@ -255,6 +255,27 @@ def retry_pending_completion_delivery_commit(agent, messages) -> str:
             if not isinstance(pending, list) or not pending
             else "missing_active_marker"
         )
+        recovery_event = (
+            pending[0]
+            if isinstance(pending, list) and pending and isinstance(pending[0], dict)
+            else messages[start]
+            if start is not None and isinstance(messages[start], dict)
+            else None
+        )
+        try:
+            from tools.async_delegation import record_completion_delivery_recovery
+
+            recovery_committed = bool(recovery_event) and (
+                record_completion_delivery_recovery(
+                    str(getattr(agent, "session_id", "") or ""),
+                    outcome,
+                    recovery_event,
+                )
+            )
+        except Exception:
+            recovery_committed = False
+        if not recovery_committed:
+            return "pending"
         if start is not None:
             del messages[start:]
         agent._pending_completion_delivery_suffix = None

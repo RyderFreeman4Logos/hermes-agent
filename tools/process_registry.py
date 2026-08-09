@@ -257,13 +257,13 @@ class ProcessRegistry:
         # gateway drain this after each agent turn to auto-trigger new turns.
         import queue as _queue_mod
         self.completion_queue: _queue_mod.Queue = _queue_mod.Queue()
-        # Rehydrate durable delegation completions only at registry startup.
+        # Rehydrate durable async and ordinary completions at registry startup.
         # Consumers still inject them as fresh turns through this existing rail.
         try:
             from tools.async_delegation import restore_undelivered_completions
             restore_undelivered_completions(self.completion_queue)
         except Exception as exc:
-            logger.warning("Could not restore async delegation completions: %s", exc)
+            logger.warning("Could not restore durable completions: %s", exc)
 
         # Legacy session-id views used by raw notification paths and callers of
         # is_completion_consumed(). Model-turn delivery uses the stable ledger
@@ -1790,28 +1790,39 @@ class ProcessRegistry:
                 exc_info=True,
             )
         session._completion_event.set()
-        self._write_checkpoint()
 
         # Only enqueue completion notification on the FIRST move.  Without
         # this guard, kill_process() and the reader thread can both call
         # _move_to_finished(), producing duplicate [IMPORTANT: ...] messages.
+        event = None
+        completion_receipt_persisted = True
         if session.notify_on_complete:
-            from tools.ansi_strip import strip_ansi
-            output_tail = strip_ansi(session.output_buffer[-2000:]) if session.output_buffer else ""
-            event = {
-                "type": "completion",
-                "session_id": session.id,
-                "session_key": session.session_key,
-                "command": session.command,
-                "exit_code": session.exit_code,
-                "completion_reason": session.completion_reason,
-                "termination_source": session.termination_source,
-                "output": output_tail,
-                # Stable producer identity across checkpoint recovery; unlike
-                # a consumer-observed completion timestamp, this does not vary
-                # based on which watcher notices exit first.
-                "started_at": session.started_at,
-            }
+            event = self._completion_event(session)
+            try:
+                from tools.async_delegation import persist_event_delivery
+
+                completion_receipt_persisted = bool(persist_event_delivery(event))
+            except Exception:
+                completion_receipt_persisted = False
+                logger.warning(
+                    "Failed to persist completion event for %s before enqueue",
+                    session.id,
+                    exc_info=True,
+                )
+
+        # The prior checkpoint is the restart fallback until the ordinary
+        # completion receipt exists. Retiring it first creates a crash window
+        # where neither source can reproduce the terminal event.
+        if completion_receipt_persisted:
+            self._write_checkpoint()
+        else:
+            logger.warning(
+                "Keeping prior process checkpoint for %s until completion "
+                "delivery can be persisted",
+                session.id,
+            )
+
+        if event is not None:
             identity = self._completion_identity(event)
             if identity is not None:
                 with self._completion_disposition_lock:
@@ -1828,6 +1839,30 @@ class ProcessRegistry:
     def is_completion_consumed(self, session_id: str) -> bool:
         """Check if a completion notification was already consumed via wait/log."""
         return session_id in self._completion_consumed
+
+    @staticmethod
+    def _completion_event(session: ProcessSession) -> dict:
+        """Build the stable ordinary completion payload from its producer."""
+        from tools.ansi_strip import strip_ansi
+
+        output_tail = (
+            strip_ansi(session.output_buffer[-2000:])
+            if session.output_buffer
+            else ""
+        )
+        return {
+            "type": "completion",
+            "session_id": session.id,
+            "session_key": session.session_key,
+            "command": session.command,
+            "exit_code": session.exit_code,
+            "completion_reason": session.completion_reason,
+            "termination_source": session.termination_source,
+            "output": output_tail,
+            # Stable across checkpoint recovery and independent of which
+            # watcher notices the process exit first.
+            "started_at": session.started_at,
+        }
 
     @staticmethod
     def _completion_identity(evt: dict) -> "tuple | None":
@@ -1870,9 +1905,9 @@ class ProcessRegistry:
     def _set_completion_disposition(self, identity: tuple, state: str) -> None:
         self._completion_dispositions.pop(identity, None)
         self._completion_dispositions[identity] = state
-        # ponytail: retain every queued/inflight identity; only accepted
-        # history is capped, and persistence is unnecessary unless ordinary
-        # completions become durable across process restarts.
+        # ponytail: queued/inflight local identities stay unbounded; add expiry
+        # only if measured long-lived registry growth warrants it. SQLite owns
+        # restart recovery, so accepted local history alone is capped here.
         while len(self._completion_dispositions) > COMPLETION_DISPOSITION_RETENTION:
             accepted = next(
                 (
@@ -1898,14 +1933,46 @@ class ProcessRegistry:
             or observer_session_key != session.session_key
         ):
             return False
-        identity = self._completion_identity({
-            "type": "completion",
-            "session_id": session.id,
-            "session_key": session.session_key,
-            "started_at": session.started_at,
-        })
+        event = self._completion_event(session)
+        identity = self._completion_identity(event)
         if identity is None:
             return False
+
+        if self._is_observed_completion_noop(event):
+            claim = None
+            try:
+                from tools.async_delegation import (
+                    claim_event_delivery,
+                    complete_event_delivery,
+                    get_durable_event_delivery,
+                    release_event_delivery,
+                )
+
+                claim = claim_event_delivery(event, "process-observed")
+                if claim is None:
+                    receipt = get_durable_event_delivery(event)
+                    state = str((receipt or {}).get("delivery_state") or "")
+                    if state == "effect_started":
+                        return True
+                    committed = state == "delivered" or state == "dropped" or state.startswith(
+                        "recovery_"
+                    )
+                else:
+                    committed = complete_event_delivery(event, claim)
+                    if not committed:
+                        release_event_delivery(event, claim)
+            except Exception:
+                logger.debug(
+                    "Failed to persist observed completion delivery",
+                    exc_info=True,
+                )
+                committed = False
+            if not committed:
+                return False
+            with self._completion_disposition_lock:
+                self._set_completion_disposition(identity, "delivered")
+            return True
+
         with self._completion_disposition_lock:
             state = self._completion_dispositions.get(identity)
             if state not in {"inflight", "delivered", "observed_queued"}:
@@ -3123,6 +3190,59 @@ class ProcessRegistry:
         self._write_checkpoint()
 
         return recovered
+
+
+def completion_result_delivery_outcome(result: dict) -> str:
+    """Classify an agent result without treating failed no-op drops as committed."""
+    suffix_status = str(result.get("completion_delivery_status") or "none")
+    terminal_failed = bool(
+        result.get("failed")
+        or result.get("interrupted")
+        or result.get("error")
+        or not result.get("completed")
+    )
+    if terminal_failed and suffix_status != "committed":
+        return "provider_failed"
+    if suffix_status in {"committed", "dropped"}:
+        return "committed"
+    return "missing_active_marker"
+
+
+def finish_completion_event_delivery(
+    evt: dict,
+    claim_id: str,
+    outcome: str,
+    *,
+    registry: Optional[ProcessRegistry] = None,
+) -> bool:
+    """Resolve one completion claim only through its durable terminal fence."""
+    from tools.async_delegation import (
+        complete_event_delivery,
+        mark_completion_delivery_recovery,
+        release_event_delivery,
+    )
+
+    target = registry or process_registry
+    terminal = False
+    try:
+        if outcome == "committed":
+            terminal = complete_event_delivery(evt, claim_id)
+        elif outcome in {"missing_active_marker", "history_conflict"}:
+            terminal = mark_completion_delivery_recovery(evt, claim_id, outcome)
+    except Exception:
+        logger.debug("Failed to commit completion delivery transition", exc_info=True)
+
+    if terminal:
+        target.complete_completion_delivery(evt)
+        return True
+
+    try:
+        release_event_delivery(evt, claim_id)
+    except Exception:
+        logger.debug("Failed to release durable completion delivery", exc_info=True)
+    target.release_completion_delivery(evt)
+    target.completion_queue.put(evt)
+    return False
 
 
 # Module-level singleton

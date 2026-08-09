@@ -9316,9 +9316,10 @@ def _runtime_heartbeat_status_for_session(
         kind = str(snapshot.get("kind") or "")
         started_at = snapshot.get("started_at")
         interval_s = snapshot.get("interval_s")
+        last_success_at = snapshot.get("last_success_at")
         if (
             not target_id
-            or not kind
+            or kind not in {"delegation", "process"}
             or not isinstance(started_at, (int, float))
             or isinstance(started_at, bool)
             or not isinstance(interval_s, int)
@@ -9326,12 +9327,20 @@ def _runtime_heartbeat_status_for_session(
             or interval_s <= 0
         ):
             continue
+        if (
+            not isinstance(last_success_at, (int, float))
+            or isinstance(last_success_at, bool)
+            or last_success_at <= 0
+        ):
+            last_success_at = None
         targets.append(
             {
-                "target_id": target_id,
                 "kind": kind,
                 "started_at": float(started_at),
                 "interval_s": interval_s,
+                "last_success_at": (
+                    float(last_success_at) if last_success_at is not None else None
+                ),
             }
         )
     return {"active_count": len(targets), "targets": targets}
@@ -9340,10 +9349,10 @@ def _runtime_heartbeat_status_for_session(
 def _runtime_heartbeat_status_key(status: dict) -> tuple:
     return tuple(
         (
-            target["target_id"],
             target["kind"],
             target["started_at"],
             target["interval_s"],
+            target["last_success_at"],
         )
         for target in status["targets"]
     )
@@ -9356,7 +9365,7 @@ def _sync_runtime_heartbeat_status(
     previous: tuple | None,
     stop_event: threading.Event | None = None,
 ) -> tuple | None:
-    """Emit only target-set changes; elapsed time advances in the TUI."""
+    """Emit target or success changes; elapsed ages advance in the TUI."""
     if not _notification_poller_is_current(session, stop_event):
         return previous
     status = _runtime_heartbeat_status_for_session(sid, session)

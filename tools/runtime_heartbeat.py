@@ -945,6 +945,7 @@ class _Target:
     timer: Any = None
     deadline: float = 0.0
     scheduled_at: float = 0.0
+    last_success_at: Optional[float] = None
     baseline: Dict[str, Any] = field(default_factory=dict)
     publishing: bool = False
 
@@ -1311,9 +1312,35 @@ class RuntimeHeartbeat:
                     "kind": target.kind,
                     "started_at": target.scheduled_at,
                     "interval_s": target.interval,
+                    "last_success_at": target.last_success_at,
                 }
                 for target in targets
             ]
+
+    def record_checkin_success(
+        self, event: Dict[str, Any], *, agent=None
+    ) -> bool:
+        """Record one validated ALIVE replay without retaining event content."""
+        if str(event.get("status") or "").upper() != "ALIVE":
+            return False
+        try:
+            if not self.is_event_current(event, agent):
+                return False
+        except Exception:
+            logger.debug("Could not validate heartbeat success", exc_info=True)
+            return False
+        target_id = str(event.get("target_id") or "")
+        generation = event.get("generation")
+        with self._lock:
+            target = self._targets.get(target_id)
+            if target is None or target.generation != generation:
+                return False
+            group = self._group_key(target)
+            succeeded_at = time.time()
+            for candidate in self._targets.values():
+                if self._group_key(candidate) == group:
+                    candidate.last_success_at = succeeded_at
+        return True
 
     @staticmethod
     def _assess(target: _Target, snapshot: Dict[str, Any]) -> tuple[str, str]:

@@ -390,7 +390,7 @@ def recover_abandoned_delegations() -> int:
 
 
 def restore_undelivered_completions(target_queue) -> int:
-    """Enqueue durable pending completions as fresh turns after process start.
+    """Enqueue durable retryable completions as fresh turns after process start.
 
     Every restored event is stamped ``restored=True`` (in-memory only — the
     stamp is added after the durable payload is deserialized and is never
@@ -412,6 +412,13 @@ def restore_undelivered_completions(target_queue) -> int:
     now = time.time()
     restored = 0
     with _DB_LOCK, _transaction() as conn:
+        conn.execute(
+            """UPDATE async_delegations SET delivery_state='pending',
+                      delivery_claim=NULL, delivery_claimed_at=NULL, updated_at=?
+               WHERE state != 'running' AND delivery_state='effect_started'
+                 AND event_json IS NOT NULL""",
+            (time.time(),),
+        )
         rows = conn.execute(
             """SELECT delegation_id, event_json, completed_at, dispatched_at,
                       delivery_attempts
@@ -490,7 +497,8 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
         if row is None:
             return True  # legacy event created before durable dispatch
         cur = conn.execute(
-            """UPDATE async_delegations SET delivery_claim=?, delivery_claimed_at=?,
+            """UPDATE async_delegations SET delivery_state='effect_started',
+                      delivery_claim=?, delivery_claimed_at=?,
                       delivery_attempts=delivery_attempts+1, updated_at=?
                WHERE delegation_id=? AND delivery_state='pending'
                  AND (delivery_claim IS NULL OR delivery_claimed_at < ?)""",
@@ -529,7 +537,7 @@ def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
         capped = conn.execute(
             """UPDATE async_delegations SET delivery_state='dropped',
                       delivery_claim=NULL, delivery_claimed_at=NULL, updated_at=?
-               WHERE delegation_id=? AND delivery_state='pending'
+               WHERE delegation_id=? AND delivery_state='effect_started'
                  AND delivery_claim=? AND delivery_attempts>=?""",
             (now, delegation_id, claim_id, _MAX_DELIVERY_ATTEMPTS),
         )
@@ -541,9 +549,9 @@ def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
             )
             return True
         cur = conn.execute(
-            """UPDATE async_delegations SET delivery_claim=NULL,
+            """UPDATE async_delegations SET delivery_state='pending', delivery_claim=NULL,
                       delivery_claimed_at=NULL, updated_at=?
-               WHERE delegation_id=? AND delivery_state='pending'
+               WHERE delegation_id=? AND delivery_state='effect_started'
                  AND delivery_claim=?""",
             (now, delegation_id, claim_id),
         )
@@ -565,22 +573,43 @@ def drop_completion_delivery(delegation_id: str, claim_id: str) -> bool:
             """UPDATE async_delegations SET delivery_state='dropped',
                       updated_at=?, delivery_claim=NULL,
                       delivery_claimed_at=NULL
-               WHERE delegation_id=? AND delivery_state='pending'
+               WHERE delegation_id=? AND delivery_state='effect_started'
                  AND delivery_claim=?""",
             (now, delegation_id, claim_id),
         )
         return cur.rowcount == 1
 
 
+def mark_completion_delivery_recovery(
+    evt: Dict[str, Any], claim_id: str, reason: str
+) -> bool:
+    """Stop replaying an already-run provider effect whose suffix lost its marker."""
+    if evt.get("type") != "async_delegation" or not claim_id:
+        return False
+    delegation_id = str(evt.get("delegation_id") or "")
+    if not delegation_id:
+        return False
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE async_delegations SET delivery_state=?, delivery_claim=NULL,
+                      delivery_claimed_at=NULL, updated_at=?
+               WHERE delegation_id=? AND delivery_state='effect_started'
+                 AND delivery_claim=?""",
+            (f"recovery_{reason}", now, delegation_id, claim_id),
+        )
+        return cur.rowcount == 1
+
+
 def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
-    """Acknowledge acceptance for the consumer holding this claim."""
+    """Acknowledge a provider-terminal, SessionDB-committed delivery claim."""
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
         cur = conn.execute(
             """UPDATE async_delegations SET delivery_state='delivered',
                       delivered_at=?, updated_at=?, delivery_claim=NULL,
                       delivery_claimed_at=NULL
-               WHERE delegation_id=? AND delivery_state='pending'
+               WHERE delegation_id=? AND delivery_state='effect_started'
                  AND delivery_claim=?""",
             (now, now, delegation_id, claim_id),
         )

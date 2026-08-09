@@ -537,6 +537,57 @@ def test_bypassed_stream_diagnostics_finish_with_reported_usage(
     ]
 
 
+@pytest.mark.parametrize("managed", [True, False], ids=("managed", "bypassed"))
+def test_stream_marks_dispatch_and_first_wire_event(
+    relay_turn, monkeypatch, tmp_path, managed
+):
+    _relay, turn = relay_turn
+    from agent import physical_attempt_diagnostics as diagnostics
+    from hermes_cli import config
+
+    if not managed:
+        turn.lease.host.release_managed_execution("test.relay_llm")
+    monkeypatch.setattr(diagnostics, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(
+        config,
+        "read_raw_config_readonly",
+        lambda: {"observability": {"physical_attempt_digests": {"enabled": True}}},
+    )
+    chunk = SimpleNamespace(choices=[], usage=None)
+    stream = relay_llm.stream(
+        {"model": "test-model", "messages": []},
+        lambda _request: iter([chunk]),
+        session_id="session-1",
+        name="test-provider",
+        model_name="test-model",
+        finalizer=dict,
+        metadata={"api_mode": "chat_completions", "call_role": "primary"},
+    )
+
+    assert next(stream) is chunk
+    attempt = diagnostics.current_attempt()
+    assert attempt is not None
+    assert attempt.dispatch_ns is not None
+    assert attempt.first_wire_ns is not None
+    assert attempt.first_wire_ns >= attempt.dispatch_ns
+    assert attempt.wire_event_count == 1
+    callback = diagnostics.begin_callback("text")
+    assert callback is not None
+    diagnostics.end_callback(callback)
+
+    with pytest.raises(StopIteration):
+        next(stream)
+    assert attempt.finished is True
+    assert diagnostics.current_attempt() is None
+    records = [
+        json.loads(line)
+        for line in (
+            tmp_path / "observability" / "physical_attempt_digests.jsonl"
+        ).read_text().splitlines()
+    ]
+    assert records[-1]["stage_latency"]["callbacks"]["text"]["count"] == 1
+
+
 def test_internal_provider_fallback_starts_a_distinct_physical_attempt(
     relay_turn, monkeypatch
 ):

@@ -11,6 +11,86 @@ def test_physical_attempt_diagnostics_are_default_off():
     )
 
 
+def test_stream_stage_latency_summary_is_content_free(monkeypatch, tmp_path):
+    from agent import physical_attempt_diagnostics as diagnostics
+    from hermes_cli import config
+
+    sentinel = "PLAINTEXT-ISSUE82-STAGE-SENTINEL"
+    credential_label = f"https://user:{sentinel}@example.invalid"
+    ticks = iter((100, 110, 150, 170, 180, 181, 183, 190, 200, 250))
+    monkeypatch.setattr(diagnostics, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(diagnostics.time, "monotonic_ns", lambda: next(ticks))
+    monkeypatch.setattr(
+        config,
+        "read_raw_config_readonly",
+        lambda: {"observability": {"physical_attempt_digests": {"enabled": True}}},
+    )
+
+    attempt = diagnostics.start_attempt(
+        {
+            "model": "test-model",
+            "messages": [{"role": "user", "content": sentinel}],
+            "extra_headers": {"x-private-response-id": sentinel},
+            "stream": True,
+        },
+        api_mode="chat_completions",
+        route=credential_label,
+        provider=credential_label,
+        model=credential_label,
+        role="main",
+        retry=0,
+        continuation=0,
+        streamed=True,
+    )
+    diagnostics.mark_dispatch(attempt)
+    diagnostics.mark_wire_event(attempt)
+    diagnostics.mark_wire_event(attempt)
+    callback = diagnostics.begin_callback("reasoning")
+    transport = diagnostics.begin_transport("websocket")
+    diagnostics.end_transport(transport)
+    diagnostics.end_callback(callback)
+    diagnostics.finish_attempt(
+        attempt,
+        usage=None,
+        outcome="completed",
+        api_mode="chat_completions",
+        provider="test-provider",
+    )
+
+    records = [
+        json.loads(line)
+        for line in (
+            tmp_path / "observability" / "physical_attempt_digests.jsonl"
+        ).read_text().splitlines()
+    ]
+    start, terminal = records
+    assert (start["route"], start["provider"], start["model"]) == (
+        "unknown",
+        "unknown",
+        "unknown",
+    )
+    assert terminal["stage_latency"] == {
+        "dispatch_monotonic_ns": 110,
+        "dispatch_ns": 10,
+        "duration_ns": 140,
+        "ttfb_ns": 40,
+        "first_visible_ns": 70,
+        "wire_to_visible_ns": 30,
+        "first_visible_category": "reasoning",
+        "wire_event_count": 2,
+        "visible_event_count": 1,
+        "callbacks": {
+            "reasoning": {"count": 1, "total_ns": 19, "max_ns": 19}
+        },
+        "transports": {
+            "websocket": {"count": 1, "total_ns": 7, "max_ns": 7}
+        },
+    }
+    serialized = json.dumps(records, sort_keys=True).encode()
+    assert sentinel.encode() not in serialized
+    assert b"headers" not in serialized
+
+
 def test_physical_attempt_sink_is_private_content_free_and_preserves_unknown(
     monkeypatch, tmp_path
 ):
@@ -131,6 +211,7 @@ def test_physical_attempt_sink_is_private_content_free_and_preserves_unknown(
         "output_tokens",
         "cache_read_tokens",
         "cache_write_tokens",
+        "stage_latency",
     }
     assert starts[0]["attempt_digest"] == terminals[0]["attempt_digest"]
     assert starts[1]["attempt_digest"] == terminals[1]["attempt_digest"]

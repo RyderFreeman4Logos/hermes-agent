@@ -1405,6 +1405,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
 
     def _on_event(event: Any) -> None:
         # TTFB watchdog and activity touch — runs once per SSE event.
+        physical_attempt_diagnostics.mark_wire_event(diagnostic_attempt["value"])
         agent._codex_stream_last_event_ts = time.time()
         agent._touch_activity("receiving stream response")
 
@@ -1455,6 +1456,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     ),
                 )
             )
+            physical_attempt_diagnostics.mark_dispatch(diagnostic_attempt["value"])
             try:
                 return response_create(**stream_kwargs)
             except BaseException:

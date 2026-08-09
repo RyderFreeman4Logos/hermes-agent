@@ -18,6 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, NamedTuple, Optional
 
+from agent import physical_attempt_diagnostics
 from agent.secret_scope import (
     build_profile_secret_scope,
     reset_secret_scope,
@@ -333,6 +334,11 @@ _stdio_transport = StdioTransport(lambda: _real_stdout, _stdout_lock)
 # the gateway in-process and captures stdout into logs, so stale JSON-RPC frames
 # must not fall through there while the session waits for resume or reap.
 _detached_ws_transport = _DropTransport()
+_TRANSPORT_DIAGNOSTIC_KIND = {
+    "StdioTransport": "stdio",
+    "WSTransport": "websocket",
+    "TeeTransport": "tee",
+}
 
 
 class _SlashWorker:
@@ -1596,12 +1602,20 @@ def write_json(obj: dict) -> bool:
     3. Otherwise the module-level stdio transport, matching the historical
        behaviour and keeping tests that monkey-patch ``_real_stdout`` green.
     """
+    transport = None
     if obj.get("method") == "event":
         sid = ((obj.get("params") or {}).get("session_id")) or ""
-        if sid and (t := (_sessions.get(sid) or {}).get("transport")) is not None:
-            return t.write(obj)
-
-    return (current_transport() or _stdio_transport).write(obj)
+        if sid:
+            transport = (_sessions.get(sid) or {}).get("transport")
+    if transport is None:
+        transport = current_transport() or _stdio_transport
+    marker = physical_attempt_diagnostics.begin_transport(
+        _TRANSPORT_DIAGNOSTIC_KIND.get(type(transport).__name__, "other")
+    )
+    try:
+        return transport.write(obj)
+    finally:
+        physical_attempt_diagnostics.end_transport(marker)
 
 
 def _event_frame(event: str, sid: str, payload: dict | None = None) -> dict:

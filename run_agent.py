@@ -147,6 +147,7 @@ from tools.browser_tool import cleanup_browser
 
 
 # Agent internals extracted to agent/ package for modularity
+from agent import physical_attempt_diagnostics
 from agent.memory_manager import sanitize_context
 from agent.memory_provider import is_trivial_prompt
 from agent.error_classifier import FailoverReason
@@ -6475,11 +6476,14 @@ class AIAgent:
             visible = redact_sensitive_text(visible)
         if not visible or visible == "(empty)" or self._interim_text_was_delivered(visible):
             return
+        marker = physical_attempt_diagnostics.begin_callback("text")
         try:
             cb(visible, already_streamed=False)
             self._record_delivered_interim_text(visible)
         except Exception:
             logger.debug("interim_assistant_callback error", exc_info=True)
+        finally:
+            physical_attempt_diagnostics.end_callback(marker)
 
     def _emit_interim_assistant_message(
         self, assistant_msg: Dict[str, Any]
@@ -6655,15 +6659,19 @@ class AIAgent:
         if not text:
             return
         callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
+        marker = physical_attempt_diagnostics.begin_callback("text") if callbacks else None
         delivered = False
-        for cb in callbacks:
-            try:
-                cb(text)
-                delivered = True
-            except Exception:
-                pass
-        if delivered:
-            self._record_streamed_assistant_text(text)
+        try:
+            for cb in callbacks:
+                try:
+                    cb(text)
+                    delivered = True
+                except Exception:
+                    pass
+            if delivered:
+                self._record_streamed_assistant_text(text)
+        finally:
+            physical_attempt_diagnostics.end_callback(marker)
 
     def _fire_reasoning_delta(self, text: str) -> None:
         """Fire reasoning callback if registered."""
@@ -6674,10 +6682,13 @@ class AIAgent:
             return
         cb = self.reasoning_callback
         if cb is not None:
+            marker = physical_attempt_diagnostics.begin_callback("reasoning")
             try:
                 cb(text)
             except Exception:
                 pass
+            finally:
+                physical_attempt_diagnostics.end_callback(marker)
 
     def _fire_tool_gen_started(self, tool_name: str) -> None:
         """Notify display layer that the model is generating tool call arguments.
@@ -6689,10 +6700,13 @@ class AIAgent:
         """
         cb = self.tool_gen_callback
         if cb is not None:
+            marker = physical_attempt_diagnostics.begin_callback("tool")
             try:
                 cb(tool_name)
             except Exception:
                 pass
+            finally:
+                physical_attempt_diagnostics.end_callback(marker)
 
     def _has_stream_consumers(self) -> bool:
         """Return True if any streaming consumer is registered."""

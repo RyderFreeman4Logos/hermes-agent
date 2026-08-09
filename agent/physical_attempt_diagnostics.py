@@ -9,7 +9,8 @@ import os
 import secrets
 import stat
 import time
-from dataclasses import dataclass
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -23,12 +24,171 @@ _RECORDS_FILE = "physical_attempt_digests.jsonl"
 _ROLES = {"main", "subagent", "reviewer", "fallback", "auxiliary", "unknown"}
 _OUTCOMES = {"completed", "incomplete", "failed", "error", "cancelled", "interrupted"}
 _INTERNAL_SCOPE_KEY = "_hermes_physical_attempt_scope"
+_VISIBLE_CATEGORIES = {"text", "reasoning", "thinking", "tool", "terminal"}
+_TRANSPORT_KINDS = {"stdio", "websocket", "tee", "other"}
 
 
 @dataclass
 class Attempt:
     digest: str
+    streamed: bool = False
     finished: bool = False
+    started_ns: int | None = None
+    dispatch_ns: int | None = None
+    first_wire_ns: int | None = None
+    first_visible_ns: int | None = None
+    first_visible_category: str | None = None
+    wire_event_count: int = 0
+    visible_event_count: int = 0
+    callback_depth: int = 0
+    callback_stats: dict[str, list[int]] = field(default_factory=dict)
+    transport_stats: dict[str, list[int]] = field(default_factory=dict)
+
+
+_ACTIVE_ATTEMPT: ContextVar[Attempt | None] = ContextVar(
+    "physical_attempt_stage_latency", default=None
+)
+
+
+def activate_attempt(attempt: Attempt | None) -> None:
+    """Bind an enabled streamed attempt to the current callback context."""
+    if not isinstance(attempt, Attempt) or not attempt.streamed or attempt.finished:
+        return
+    if _ACTIVE_ATTEMPT.get() is not attempt:
+        _ACTIVE_ATTEMPT.set(attempt)
+
+
+def current_attempt() -> Attempt | None:
+    attempt = _ACTIVE_ATTEMPT.get()
+    return (
+        attempt
+        if isinstance(attempt, Attempt) and attempt.streamed and not attempt.finished
+        else None
+    )
+
+
+def mark_dispatch(attempt: Attempt | None) -> None:
+    if not isinstance(attempt, Attempt) or not attempt.streamed or attempt.finished:
+        return
+    try:
+        if attempt.dispatch_ns is None:
+            attempt.dispatch_ns = time.monotonic_ns()
+    except Exception:
+        return
+
+
+def mark_wire_event(attempt: Attempt | None) -> None:
+    if not isinstance(attempt, Attempt) or not attempt.streamed or attempt.finished:
+        return
+    try:
+        now = time.monotonic_ns()
+        if attempt.dispatch_ns is None:
+            attempt.dispatch_ns = now
+        if attempt.first_wire_ns is None:
+            attempt.first_wire_ns = now
+        attempt.wire_event_count += 1
+        activate_attempt(attempt)
+    except Exception:
+        return
+
+
+def begin_callback(category: str) -> tuple[Attempt, str, int] | None:
+    attempt = current_attempt()
+    if attempt is None or category not in _VISIBLE_CATEGORIES:
+        return None
+    try:
+        now = time.monotonic_ns()
+        if attempt.first_visible_ns is None:
+            attempt.first_visible_ns = now
+            attempt.first_visible_category = category
+        attempt.visible_event_count += 1
+        started_ns = time.monotonic_ns()
+        attempt.callback_depth += 1
+        return attempt, category, started_ns
+    except Exception:
+        return None
+
+
+def end_callback(marker: tuple[Attempt, str, int] | None) -> None:
+    _end_stage(marker, transport=False)
+
+
+def begin_transport(kind: str) -> tuple[Attempt, str, int] | None:
+    attempt = current_attempt()
+    if attempt is None or attempt.callback_depth <= 0:
+        return None
+    safe_kind = kind if kind in _TRANSPORT_KINDS else "other"
+    try:
+        return attempt, safe_kind, time.monotonic_ns()
+    except Exception:
+        return None
+
+
+def end_transport(marker: tuple[Attempt, str, int] | None) -> None:
+    _end_stage(marker, transport=True)
+
+
+def _end_stage(
+    marker: tuple[Attempt, str, int] | None, *, transport: bool
+) -> None:
+    if marker is None:
+        return
+    attempt, category, started_ns = marker
+    if not transport:
+        attempt.callback_depth = max(0, attempt.callback_depth - 1)
+    if attempt.finished:
+        return
+    try:
+        elapsed = max(0, time.monotonic_ns() - started_ns)
+        target = attempt.transport_stats if transport else attempt.callback_stats
+        stats = target.setdefault(category, [0, 0, 0])
+        stats[0] += 1
+        stats[1] += elapsed
+        stats[2] = max(stats[2], elapsed)
+    except Exception:
+        return
+
+
+def _stage_stats(values: dict[str, list[int]]) -> dict[str, dict[str, int]]:
+    return {
+        category: {"count": stats[0], "total_ns": stats[1], "max_ns": stats[2]}
+        for category, stats in sorted(values.items())
+    }
+
+
+def _stage_latency(attempt: Attempt, terminal_ns: int) -> dict[str, Any]:
+    dispatch = attempt.dispatch_ns
+    first_wire = attempt.first_wire_ns
+    first_visible = attempt.first_visible_ns
+    return {
+        "dispatch_monotonic_ns": dispatch,
+        "dispatch_ns": (
+            max(0, dispatch - attempt.started_ns)
+            if dispatch is not None and attempt.started_ns is not None
+            else None
+        ),
+        "duration_ns": max(0, terminal_ns - dispatch) if dispatch is not None else None,
+        "ttfb_ns": (
+            max(0, first_wire - dispatch)
+            if dispatch is not None and first_wire is not None
+            else None
+        ),
+        "first_visible_ns": (
+            max(0, first_visible - dispatch)
+            if dispatch is not None and first_visible is not None
+            else None
+        ),
+        "wire_to_visible_ns": (
+            max(0, first_visible - first_wire)
+            if first_wire is not None and first_visible is not None
+            else None
+        ),
+        "first_visible_category": attempt.first_visible_category,
+        "wire_event_count": attempt.wire_event_count,
+        "visible_event_count": attempt.visible_event_count,
+        "callbacks": _stage_stats(attempt.callback_stats),
+        "transports": _stage_stats(attempt.transport_stats),
+    }
 
 
 def enabled() -> bool:
@@ -82,6 +242,7 @@ def start_responses_attempt(
         role=role,
         retry=retry,
         continuation=continuation,
+        streamed=True,
     )
 
 
@@ -96,6 +257,7 @@ def start_attempt(
     retry: int,
     continuation: int,
     scope: dict[str, Any] | None = None,
+    streamed: bool = False,
 ) -> Attempt | None:
     """Persist one allowlisted start record at a physical dispatch seam."""
     if not enabled():
@@ -120,11 +282,13 @@ def start_attempt(
         attempt_digest = hmac.new(
             key, b"attempt\0" + secrets.token_bytes(32), hashlib.sha256
         ).hexdigest()
+        started_ns = time.monotonic_ns()
+        attempt = Attempt(attempt_digest, streamed=streamed, started_ns=started_ns)
         record = {
             "schema": _SCHEMA,
             "phase": "start",
             "attempt_digest": attempt_digest,
-            "monotonic_ns": time.monotonic_ns(),
+            "monotonic_ns": started_ns,
             "route": _safe_label(route, 128),
             "provider": _safe_label(provider, 128),
             "model": _safe_label(model, 128),
@@ -143,7 +307,7 @@ def start_attempt(
             "equivalent_bytes": equivalent_bytes,
         }
         _append(record)
-        return Attempt(attempt_digest)
+        return attempt
     except Exception:
         return None
 
@@ -173,6 +337,9 @@ def finish_attempt(
         return
     attempt.finished = True
     try:
+        terminal_ns = time.monotonic_ns()
+        if _ACTIVE_ATTEMPT.get() is attempt:
+            _ACTIVE_ATTEMPT.set(None)
         from agent.usage_pricing import normalize_usage
 
         canonical = normalize_usage(usage, api_mode=api_mode, provider=provider)
@@ -184,11 +351,11 @@ def finish_attempt(
             if canonical.cache_read_tokens > 0
             else "miss"
         )
-        _append({
+        record: dict[str, Any] = {
             "schema": _SCHEMA,
             "phase": "terminal",
             "attempt_digest": attempt.digest,
-            "monotonic_ns": time.monotonic_ns(),
+            "monotonic_ns": terminal_ns,
             "outcome": outcome if outcome in _OUTCOMES else "unknown",
             "cache_state": cache_state,
             "input_tokens": canonical.input_tokens if usage else None,
@@ -197,7 +364,10 @@ def finish_attempt(
             "cache_write_tokens": canonical.cache_write_tokens
             if cache_present
             else None,
-        })
+        }
+        if attempt.streamed:
+            record["stage_latency"] = _stage_latency(attempt, terminal_ns)
+        _append(record)
     except Exception:
         return
 
@@ -243,8 +413,21 @@ def _effective_cache_key(request: dict[str, Any]) -> Any:
 
 
 def _safe_label(value: Any, limit: int) -> str:
-    text = str(value or "unknown")[:limit]
-    return "".join(char if char.isalnum() or char in "._:/-" else "_" for char in text)
+    text = str(value or "").strip()
+    if not text or len(text) > limit or "://" in text:
+        return "unknown"
+    try:
+        from agent.redact import redact_sensitive_text
+
+        if redact_sensitive_text(
+            text, force=True, redact_url_credentials=True
+        ) != text:
+            return "unknown"
+    except Exception:
+        return "unknown"
+    if not all(ch.isascii() and (ch.isalnum() or ch in "._/:-") for ch in text):
+        return "unknown"
+    return text
 
 
 def _digest_value(key: bytes, label: str, value: Any) -> tuple[str, int]:

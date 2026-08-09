@@ -56,6 +56,7 @@ def _start_attempt(
     name: str,
     model_name: str,
     metadata: dict[str, Any] | None,
+    streamed: bool = False,
 ):
     api_mode = str(
         (metadata or {}).get("physical_api_mode")
@@ -64,6 +65,7 @@ def _start_attempt(
     )
     if api_mode == "codex_responses":
         return None
+    stream_metadata: dict[str, Any] = {"streamed": True} if streamed else {}
     return physical_attempt_diagnostics.start_attempt(
         request,
         api_mode=api_mode,
@@ -73,6 +75,7 @@ def _start_attempt(
         role=_attempt_role(metadata),
         retry=max(0, int((metadata or {}).get("retry_count") or 0)),
         continuation=max(0, int((metadata or {}).get("continuation") or 0)),
+        **stream_metadata,
     )
 
 
@@ -129,15 +132,21 @@ def _attempt_tracker(
     name: str,
     model_name: str,
     metadata: dict[str, Any] | None,
+    streamed: bool = False,
 ) -> dict[str, Any]:
     return {
         "attempt": _start_attempt(
-            request, name=name, model_name=model_name, metadata=metadata
+            request,
+            name=name,
+            model_name=model_name,
+            metadata=metadata,
+            streamed=streamed,
         ),
         "usage": None,
         "name": name,
         "model_name": model_name,
         "metadata": metadata,
+        "streamed": streamed,
         "finished": False,
     }
 
@@ -161,6 +170,7 @@ def _finish_tracker(
 @contextmanager
 def _physical_attempt_context(tracker: dict[str, Any]) -> Iterator[None]:
     token = _PHYSICAL_ATTEMPT.set(tracker)
+    physical_attempt_diagnostics.mark_dispatch(tracker["attempt"])
     try:
         yield
     finally:
@@ -181,8 +191,10 @@ def start_fallback_attempt(request: dict[str, Any]) -> None:
             name=tracker["name"],
             model_name=tracker["model_name"],
             metadata=metadata,
+            streamed=bool(tracker.get("streamed")),
         )
     )
+    physical_attempt_diagnostics.mark_dispatch(tracker["attempt"])
 
 
 def _execute_attempt(
@@ -645,7 +657,8 @@ class ManagedLlmStream(Iterator[Any]):
         self._accept_chunk = accept_chunk
         self._relay_observes_chunks = False
         self._provider_completed = False
-        self._raw_chunks: list[tuple[Any, Any]] = []
+        self._raw_chunks: list[tuple[Any, Any, dict[str, Any]]] = []
+        self._pending_diagnostics: list[tuple[dict[str, Any], str, Any]] = []
         self.output_modified = False
         self._diagnostic = {
             "attempt": None,
@@ -676,7 +689,11 @@ class ManagedLlmStream(Iterator[Any]):
             or not runtime.managed_execution_enabled()
         ):
             self._diagnostic = _attempt_tracker(
-                request, name=name, model_name=model_name, metadata=metadata
+                request,
+                name=name,
+                model_name=model_name,
+                metadata=metadata,
+                streamed=True,
             )
             try:
                 with _physical_attempt_context(self._diagnostic):
@@ -726,7 +743,9 @@ class ManagedLlmStream(Iterator[Any]):
                     name=name,
                     model_name=model_name,
                     metadata=metadata,
+                    streamed=True,
                 )
+                self._diagnostic = tracker
 
                 def open_stream() -> Any:
                     with _physical_attempt_context(tracker):
@@ -741,37 +760,44 @@ class ManagedLlmStream(Iterator[Any]):
                     )
                 ):
                     self.final_response = raw_stream
-                    _finish_tracker(tracker, "completed", response=raw_stream)
+                    self._pending_diagnostics.append(
+                        (tracker, "completed", raw_stream)
+                    )
                     self._provider_completed = True
                     return
                 if on_stream_created is not None:
                     run_callback(on_stream_created, raw_stream)
                 raw_iterator = run_callback(iter, raw_stream)
+                stream_outcome = "completed"
                 while True:
                     try:
                         chunk = run_callback(next, raw_iterator)
                     except StopIteration:
                         break
+                    physical_attempt_diagnostics.mark_wire_event(tracker["attempt"])
                     if self._accept_chunk is not None and not run_callback(
                         self._accept_chunk,
                         chunk,
                     ):
-                        _finish_tracker(tracker, "cancelled")
+                        stream_outcome = "cancelled"
                         break
                     if tracker["attempt"] is not None:
                         tracker["usage"] = _stream_usage(tracker["usage"], chunk)
                     encoded_chunk = _jsonable(chunk)
-                    self._raw_chunks.append((encoded_chunk, chunk))
+                    self._raw_chunks.append((encoded_chunk, chunk, tracker))
                     yield encoded_chunk
-                _finish_tracker(tracker, "completed")
+                self._pending_diagnostics.append((tracker, stream_outcome, None))
                 self._provider_completed = True
             except BaseException as exc:
                 if tracker is not None:
-                    _finish_tracker(
-                        tracker,
-                        "cancelled"
-                        if isinstance(exc, GeneratorExit) or _is_cancellation(exc)
-                        else "error",
+                    self._pending_diagnostics.append(
+                        (
+                            tracker,
+                            "cancelled"
+                            if isinstance(exc, GeneratorExit) or _is_cancellation(exc)
+                            else "error",
+                            None,
+                        )
                     )
                 self._callback_error = exc
                 raise
@@ -839,6 +865,7 @@ class ManagedLlmStream(Iterator[Any]):
                 )
                 self._preserve_pending_provider_chunks()
                 return
+            self._finish_diagnostic("error")
             if not self._defer_logical_completion:
                 _complete_logical(
                     self._logical,
@@ -869,6 +896,9 @@ class ManagedLlmStream(Iterator[Any]):
                 self._finish_diagnostic("error")
                 self._close(logical_outcome="failed")
                 raise
+            physical_attempt_diagnostics.mark_wire_event(
+                self._diagnostic["attempt"]
+            )
             if self._accept_chunk is not None and not self._accept_chunk(chunk):
                 self._finish_diagnostic("cancelled")
                 self._close(logical_outcome="cancelled")
@@ -922,14 +952,23 @@ class ManagedLlmStream(Iterator[Any]):
                 logical_outcome="cancelled" if _is_cancellation(exc) else "failed"
             )
             raise
+        matched_index = None
+        matched_raw = None
+        output_tracker = self._raw_chunks[0][2] if self._raw_chunks else self._diagnostic
+        for index, (encoded, raw, tracker) in enumerate(self._raw_chunks):
+            if _json_equal(chunk, encoded):
+                matched_index = index
+                matched_raw = raw
+                output_tracker = tracker
+                break
+        physical_attempt_diagnostics.activate_attempt(output_tracker["attempt"])
         if not self._relay_observes_chunks and self._on_chunk is not None:
             self._on_chunk(chunk)
-        for index, (encoded, raw) in enumerate(self._raw_chunks):
-            if _json_equal(chunk, encoded):
-                if index > 0:
-                    self.output_modified = True
-                del self._raw_chunks[: index + 1]
-                return raw
+        if matched_index is not None:
+            if matched_index > 0:
+                self.output_modified = True
+            del self._raw_chunks[: matched_index + 1]
+            return matched_raw
         self.output_modified = True
         return self._chunk_adapter(chunk)
 
@@ -943,11 +982,14 @@ class ManagedLlmStream(Iterator[Any]):
             raise close_error
 
     def _finish_diagnostic(self, outcome: str) -> None:
+        for tracker, pending_outcome, response in self._pending_diagnostics:
+            _finish_tracker(tracker, pending_outcome, response=response)
+        self._pending_diagnostics.clear()
         _finish_tracker(self._diagnostic, outcome)
 
     def _preserve_pending_provider_chunks(self) -> None:
         """Switch a failed Relay stream to its undelivered provider chunks."""
-        pending = [raw for _encoded, raw in self._raw_chunks]
+        pending = [raw for _encoded, raw, _tracker in self._raw_chunks]
         self._raw_chunks.clear()
         loop = self._loop
         relay_stream = self._stream
@@ -1037,6 +1079,7 @@ class ManagedLlmStream(Iterator[Any]):
                 response_model_name=self._logical_response_model_name,
             )
             self._logical = None
+        self._finish_diagnostic(logical_outcome)
         loop.close()
 
     def __del__(self) -> None:

@@ -209,7 +209,7 @@ class TestStripBlockedTools(unittest.TestCase):
         self.assertTrue(names & {"terminal", "read_file", "web_search"})
         self.assertTrue(DELEGATE_BLOCKED_TOOLS.isdisjoint(names))
 
-    def test_orchestrator_composite_regains_only_delegate_task(self):
+    def test_orchestrator_composite_regains_only_delegation_controls(self):
         import model_tools
 
         parent = _make_mock_parent()
@@ -245,8 +245,12 @@ class TestStripBlockedTools(unittest.TestCase):
         )
         names = {item["function"]["name"] for item in definitions}
         self.assertIn("delegate_task", names)
+        self.assertIn("delegate_control", names)
         self.assertTrue(
-            (DELEGATE_BLOCKED_TOOLS - {"delegate_task"}).isdisjoint(names)
+            (
+                DELEGATE_BLOCKED_TOOLS
+                - {"delegate_task", "delegate_control"}
+            ).isdisjoint(names)
         )
 
 

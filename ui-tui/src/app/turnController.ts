@@ -29,6 +29,10 @@ const INTERRUPT_COOLDOWN_MS = 1500
 const ACTIVITY_LIMIT = 8
 const TRAIL_LIMIT = 8
 
+export const REASONING_LIVE_COMPACT_AT_CHARS = 80_000
+export const REASONING_LIVE_RETAIN_CHARS = 60_000
+export const REASONING_PENDING_BUFFER_MAX_CHARS = 80_000
+
 type CacheInfo = {
   attribution?: 'post_compression'
   level: 'error' | 'info'
@@ -181,8 +185,14 @@ class TurnController {
   turnTools: string[] = []
 
   private activeTools: ActiveTool[] = []
-  private activeReasoningText = ''
+  private activeReasoningChars = 0
   private reasoningNeedsResync = false
+  // The transcript segment is the complete retained reasoning. These pending
+  // append-only chunks are only the not-yet-published live tail, so drain them
+  // before they can become a second unbounded cumulative copy.
+  private reasoningDeltaBuffer: string[] = []
+  private reasoningDeltaChars = 0
+  private reasoningSegmentDirty = false
   private reasoningSegmentIndex: null | number = null
   private interimBoundaryIndex: null | number = null
   private activityId = 0
@@ -217,8 +227,11 @@ class TurnController {
 
   clearReasoning() {
     this.reasoningTimer = clear(this.reasoningTimer)
-    this.activeReasoningText = ''
+    this.activeReasoningChars = 0
     this.reasoningNeedsResync = false
+    this.reasoningDeltaBuffer = []
+    this.reasoningDeltaChars = 0
+    this.reasoningSegmentDirty = false
     this.reasoningSegmentIndex = null
     this.reasoningText = ''
     this.toolTokenAcc = 0
@@ -418,20 +431,56 @@ class TurnController {
     })
   }
 
-  private syncReasoningSegment() {
-    const thinking = this.activeReasoningText.trim()
+  private appendReasoningDelta(text: string) {
+    this.reasoningText += text
+    this.activeReasoningChars += text.length
+
+    if (this.reasoningText.length > REASONING_LIVE_COMPACT_AT_CHARS) {
+      this.reasoningText = this.reasoningText.slice(-REASONING_LIVE_RETAIN_CHARS)
+    }
+
+    this.reasoningDeltaBuffer.push(text)
+    this.reasoningDeltaChars += text.length
+
+    if (this.reasoningDeltaChars > REASONING_PENDING_BUFFER_MAX_CHARS) {
+      this.drainReasoningDeltaBuffer()
+    }
+  }
+
+  private drainReasoningDeltaBuffer(finalize = false) {
+    if (!this.reasoningDeltaBuffer.length && (!finalize || this.reasoningSegmentIndex === null)) {
+      return
+    }
+
+    const current = this.reasoningSegmentIndex === null ? undefined : this.segmentMessages[this.reasoningSegmentIndex]
+
+    const raw = `${current?.thinking ?? ''}${this.reasoningDeltaBuffer.join('')}`
+    const thinking = finalize ? raw.trim() : raw.trimStart()
+
+    this.reasoningDeltaBuffer = []
+    this.reasoningDeltaChars = 0
 
     if (!thinking) {
       return
     }
 
     const msg: Msg = {
+      ...current,
       kind: 'trail',
       role: 'system',
       text: '',
       thinking,
       thinkingTokens: estimateTokensRough(thinking),
       toolTokens: this.toolTokenAcc || undefined
+    }
+
+    if (
+      current &&
+      current.thinking === msg.thinking &&
+      current.thinkingTokens === msg.thinkingTokens &&
+      current.toolTokens === msg.toolTokens
+    ) {
+      return
     }
 
     if (this.reasoningSegmentIndex === null) {
@@ -441,7 +490,37 @@ class TurnController {
       this.segmentMessages = this.segmentMessages.map((item, i) => (i === this.reasoningSegmentIndex ? msg : item))
     }
 
-    patchTurnState({ streamSegments: this.segmentMessages })
+    this.reasoningSegmentDirty = true
+  }
+
+  private syncReasoningSegment(finalize = false) {
+    this.drainReasoningDeltaBuffer(finalize)
+
+    if (!this.reasoningSegmentDirty) {
+      return false
+    }
+
+    this.reasoningSegmentDirty = false
+
+    return true
+  }
+
+  private flushReasoning(finalize = false) {
+    const hadTimer = Boolean(this.reasoningTimer)
+
+    this.reasoningTimer = clear(this.reasoningTimer)
+
+    const segmentChanged = this.syncReasoningSegment(finalize)
+
+    if (!hadTimer && !segmentChanged) {
+      return
+    }
+
+    patchTurnState({
+      reasoning: this.reasoningText,
+      reasoningTokens: estimateTokensRough(this.reasoningText),
+      ...(segmentChanged && { streamSegments: this.segmentMessages })
+    })
   }
 
   private reconcileReasoning(authoritative = '') {
@@ -449,23 +528,42 @@ class TurnController {
       return
     }
 
-    const prefix = this.reasoningText.slice(0, Math.max(0, this.reasoningText.length - this.activeReasoningText.length))
+    this.syncReasoningSegment(true)
+
+    const active =
+      this.reasoningSegmentIndex === null ? '' : (this.segmentMessages[this.reasoningSegmentIndex]?.thinking ?? '')
 
     const replacement =
       authoritative.trim() ||
-      [this.activeReasoningText.trim(), '[reasoning stream truncated]'].filter(Boolean).join('\n')
+      [active.trim(), '[reasoning stream truncated]'].filter(Boolean).join('\n')
 
-    this.reasoningText = prefix + replacement
-    this.activeReasoningText = replacement
+    const prefix = this.reasoningText.slice(0, Math.max(0, this.reasoningText.length - this.activeReasoningChars))
+
+    if (this.reasoningSegmentIndex !== null) {
+      this.segmentMessages = this.segmentMessages.filter((_, index) => index !== this.reasoningSegmentIndex)
+      this.reasoningSegmentIndex = null
+    }
+
+    this.reasoningText = prefix
+    this.activeReasoningChars = 0
     this.reasoningNeedsResync = false
-    this.syncReasoningSegment()
-    patchTurnState({ reasoning: this.reasoningText, reasoningTokens: estimateTokensRough(this.reasoningText) })
+
+    if (replacement) {
+      this.appendReasoningDelta(replacement)
+      this.syncReasoningSegment(true)
+    }
+
+    patchTurnState({
+      reasoning: this.reasoningText,
+      reasoningTokens: estimateTokensRough(this.reasoningText),
+      streamSegments: this.segmentMessages
+    })
   }
 
   private closeReasoningSegment(authoritative = '') {
     this.reconcileReasoning(authoritative)
-    this.syncReasoningSegment()
-    this.activeReasoningText = ''
+    this.flushReasoning(true)
+    this.activeReasoningChars = 0
     this.reasoningSegmentIndex = null
   }
 
@@ -474,6 +572,8 @@ class TurnController {
   }
 
   flushStreamingSegment() {
+    this.flushReasoning()
+
     const raw = this.bufRef.trimStart()
 
     const split = raw
@@ -483,10 +583,8 @@ class TurnController {
       : { reasoning: '', text: '' }
 
     if (split.reasoning && !this.reasoningText.trim()) {
-      this.reasoningText = split.reasoning
-      this.activeReasoningText = split.reasoning
-      patchTurnState({ reasoning: this.reasoningText, reasoningTokens: estimateTokensRough(this.reasoningText) })
-      this.syncReasoningSegment()
+      this.appendReasoningDelta(split.reasoning)
+      this.flushReasoning()
     }
 
     const msg: Msg = {
@@ -763,6 +861,7 @@ class TurnController {
       return
     }
 
+    this.flushReasoning()
     this.pruneTransient()
     this.endReasoningPhase()
 
@@ -815,10 +914,8 @@ class TurnController {
       return
     }
 
-    this.reasoningText = incoming
-    this.activeReasoningText = incoming
+    this.appendReasoningDelta(incoming)
     this.scheduleReasoning()
-    this.syncReasoningSegment()
     this.pulseReasoningStreaming()
   }
 
@@ -861,39 +958,40 @@ class TurnController {
     }
 
     if (resync) {
+      this.reasoningTimer = clear(this.reasoningTimer)
       this.reasoningText = this.reasoningText.slice(
         0,
-        Math.max(0, this.reasoningText.length - this.activeReasoningText.length)
+        Math.max(0, this.reasoningText.length - this.activeReasoningChars)
       )
-      this.activeReasoningText = ''
+      this.activeReasoningChars = 0
+      this.reasoningDeltaBuffer = []
+      this.reasoningDeltaChars = 0
 
       if (this.reasoningSegmentIndex !== null) {
         this.segmentMessages = this.segmentMessages.filter((_, index) => index !== this.reasoningSegmentIndex)
         this.reasoningSegmentIndex = null
-        patchTurnState({ streamSegments: this.segmentMessages })
       }
 
       this.reasoningNeedsResync = true
-      patchTurnState({ reasoning: this.reasoningText, reasoningTokens: estimateTokensRough(this.reasoningText) })
+      this.reasoningSegmentDirty = false
+      patchTurnState({
+        reasoning: this.reasoningText,
+        reasoningTokens: estimateTokensRough(this.reasoningText),
+        streamSegments: this.segmentMessages
+      })
     }
 
     if (!text) {
       return
     }
 
-    if (!this.activeReasoningText.trim() && this.pendingSegmentTools.length) {
+    if (this.reasoningSegmentIndex === null && this.reasoningDeltaChars === 0 && this.pendingSegmentTools.length) {
       this.flushStreamingSegment()
     }
 
-    this.reasoningText += text
-    this.activeReasoningText += text
-
-    if (this.reasoningText.length > 80_000) {
-      this.reasoningText = this.reasoningText.slice(-60_000)
-    }
+    this.appendReasoningDelta(text)
 
     this.scheduleReasoning()
-    this.syncReasoningSegment()
     this.pulseReasoningStreaming()
   }
 
@@ -1035,7 +1133,6 @@ class TurnController {
     this.bufRef = ''
     this.interrupted = false
     this.lastStatusNote = ''
-    this.activeReasoningText = ''
     this.pendingSegmentTools = []
     this.protocolWarned = false
     this.reasoningSegmentIndex = null
@@ -1061,11 +1158,7 @@ class TurnController {
     }
 
     this.reasoningTimer = setTimeout(() => {
-      this.reasoningTimer = null
-      patchTurnState({
-        reasoning: this.reasoningText,
-        reasoningTokens: estimateTokensRough(this.reasoningText)
-      })
+      this.flushReasoning()
     }, STREAM_BATCH_MS)
   }
 
@@ -1095,7 +1188,6 @@ class TurnController {
     this.endReasoningPhase()
     this.clearReasoning()
     this.activeTools = []
-    this.activeReasoningText = ''
     this.reasoningSegmentIndex = null
     this.interimBoundaryIndex = null
     this.turnTools = []

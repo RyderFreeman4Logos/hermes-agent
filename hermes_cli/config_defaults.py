@@ -39,6 +39,9 @@ DEFAULT_CONFIG = {
         "warm_kv_timeout": {"providers": {}},
         "heartbeat": {"enabled": False, "mode": "per_target"},
     },
+    "observability": {
+        "physical_attempt_digests": {"enabled": False},
+    },
     "agent": {
         "max_turns": 500,
         # Inactivity timeout for gateway agent execution (seconds).

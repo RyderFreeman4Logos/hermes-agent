@@ -3649,7 +3649,7 @@ def _format_gateway_process_notification(evt: dict) -> "str | None":
         text += "]"
         return text
 
-    if evt_type == "async_delegation":
+    if evt_type in {"completion", "async_delegation"}:
         # Reuse the shared rich formatter (self-contained task-source block).
         from tools.process_registry import format_process_notification
         return format_process_notification(evt)
@@ -3660,10 +3660,10 @@ def _format_gateway_process_notification(evt: dict) -> "str | None":
 def _drain_gateway_watch_events(completion_queue) -> "list[dict]":
     """Drain gateway-owned watch events without spinning on requeued events.
 
-    Watch events are handled by the post-turn gateway drain. Process
-    completions are owned by their per-process watcher task, and async
-    delegation completions are owned by ``_async_delegation_watcher``.
-    Requeueing async events inside ``while not queue.empty()`` would make the
+    Watch events are handled by the post-turn gateway drain. Completion and
+    heartbeat events are owned by ``_async_delegation_watcher`` (with ordinary
+    live-process delivery arbitrated against ``_run_process_watcher``).
+    Requeueing those events inside ``while not queue.empty()`` would make the
     loop non-terminating, so detach the current batch first, then requeue any
     events this drain does not own after the queue is empty.
     """
@@ -3682,9 +3682,8 @@ def _drain_gateway_watch_events(completion_queue) -> "list[dict]":
             "watch_overflow_released",
         }:
             watch_events.append(evt)
-        elif evt_type == "async_delegation":
+        elif evt_type in {"completion", "async_delegation", "heartbeat"}:
             requeue.append(evt)
-        # else: process completion events are handled by the watcher task
     for evt in requeue:
         completion_queue.put(evt)
     return watch_events
@@ -12813,10 +12812,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # turn so the agent kicks off the new chat.
         self._spawn_supervised(self._handoff_watcher, "handoff_watcher")
 
-        # Start background async-delegation watcher — drains completion events
-        # from delegate_task(background=true) subagents and injects each
-        # result back into its originating session as a new turn, covering the
-        # idle case where the subagent finishes with no agent turn running.
+        # Start the shared completion-queue watcher. It owns async-delegation
+        # results plus ordinary recovery/retry envelopes; live ordinary events
+        # arbitrate with their per-process watcher through the existing claims.
         self._spawn_supervised(self._async_delegation_watcher, "async_delegation_watcher")
 
         # Start background /loop wakeup watcher — scans persisted loops
@@ -20003,14 +20001,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.error("Process watcher setup error: %s", e)
 
             # Drain watch pattern notifications that arrived during the agent run.
-            # Watch events and completions share the same queue; process
-            # completions are already handled by the per-process watcher task
-            # above, so we only inject watch-type events here.
-            #
-            # Async-delegation completions ALSO ride this shared queue but are
-            # owned by the dedicated _async_delegation_watcher (started at
-            # boot), which covers both the idle and post-turn cases with a
-            # single consumer — so we leave them on the queue here.
+            # Watch events and completions share the same queue. The dedicated
+            # _async_delegation_watcher owns queued completions (including
+            # ordinary recovery/retry envelopes), so this drain leaves them
+            # queued and injects only watch-type events.
             try:
                 from tools.process_registry import process_registry as _pr
                 await self._drain_watch_notifications(_pr.completion_queue)
@@ -25325,7 +25319,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return delivered
 
     async def _async_delegation_watcher(self, interval: float = 2.0) -> None:
-        """Drain async-delegation completions and inject them as new turns.
+        """Drain queued completion envelopes and inject them as new turns.
 
         Background subagents (``delegate_task(background=true)``) run on the
         async-delegation daemon executor — they have no per-process watcher
@@ -25334,27 +25328,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         subagent finishes while no agent turn is running, its result still
         re-enters the originating session promptly.
 
-        Mirrors the CLI's idle ``process_loop`` drain. Stays silent when the
-        queue has nothing for us; ignores non-async event types (those are
-        handled by ``_run_process_watcher`` / the post-turn drain).
+        It also owns ordinary recovery/retry envelopes that have no live
+        per-process watcher. The existing local and durable claims arbitrate
+        live ordinary events against ``_run_process_watcher``.
         """
         await asyncio.sleep(3)  # let platforms finish connecting
         from tools.process_registry import process_registry as _pr
         while self._running:
             try:
-                # Peek the queue for async-delegation events. We must NOT
-                # consume watch/completion events here (other drains own them),
-                # so requeue anything that isn't ours.
+                # Detach the current queue batch so requeued watch events do not
+                # make this pass spin forever.
                 requeue = []
-                async_events = []
+                completion_events = []
                 heartbeat_events = []
                 while not _pr.completion_queue.empty():
                     try:
                         evt = _pr.completion_queue.get_nowait()
                     except Exception:
                         break
-                    if evt.get("type") == "async_delegation":
-                        async_events.append(evt)
+                    if evt.get("type", "completion") in {
+                        "completion",
+                        "async_delegation",
+                    }:
+                        completion_events.append(evt)
                     elif evt.get("type") == "heartbeat":
                         heartbeat_events.append(evt)
                     else:
@@ -25369,7 +25365,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # turn per group.  Events for different sessions never coalesce.
                 groups: dict[tuple[str, ...], list[dict]] = {}
                 group_order: list[tuple[str, ...]] = []
-                for evt in async_events:
+                ordinary_events: list[dict] = []
+                for evt in completion_events:
+                    if evt.get("type") != "async_delegation":
+                        ordinary_events.append(evt)
+                        continue
                     self._enrich_async_delegation_routing(evt)
                     key = self._async_delegation_group_key(evt)
                     if key not in groups:
@@ -25387,6 +25387,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         for evt in group:
                             _pr.completion_queue.put(evt)
                         logger.error("Async delegation injection error: %s", e)
+                for evt in ordinary_events:
+                    synth_text = _format_gateway_process_notification(evt)
+                    if not synth_text:
+                        continue
+                    try:
+                        delivered = await self._deliver_completion_notification(
+                            synth_text, evt
+                        )
+                        if delivered is False:
+                            _pr.completion_queue.put(evt)
+                    except Exception as e:
+                        _pr.completion_queue.put(evt)
+                        logger.error("Completion injection error: %s", e)
+                for evt in heartbeat_events:
+                    try:
+                        await self._handle_heartbeat_event(evt)
+                    except Exception as e:
+                        logger.error("Heartbeat warm check-in injection error: %s", e)
             except Exception as e:
                 logger.debug("Async delegation watcher error: %s", e)
             await asyncio.sleep(interval)

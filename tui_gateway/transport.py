@@ -27,7 +27,9 @@ import errno
 import json
 import logging
 import os
+import queue
 import threading
+from collections import deque
 from typing import Any, Callable, Optional, Protocol, runtime_checkable
 
 # Errno values that mean "the peer is gone" rather than "the host has a
@@ -181,6 +183,122 @@ class StdioTransport:
 
     def close(self) -> None:
         return None
+
+
+_STREAMING_EVENT_TYPES = frozenset({
+    "message.delta",
+    "reasoning.delta",
+    "thinking.delta",
+})
+
+
+class BufferedStreamWriter:
+    """Keep streaming producers off a blocking transport sink."""
+
+    def __init__(
+        self,
+        inner: Transport,
+        *,
+        queue_maxsize: int = 256,
+        max_pending_deltas: int = 512,
+        coalesce_s: float = 0.033,
+        close_timeout_s: float = 1.0,
+    ) -> None:
+        self._inner = inner
+        self._queue: queue.Queue[list[dict]] = queue.Queue(maxsize=queue_maxsize)
+        self._pending: deque[dict] = deque(maxlen=max_pending_deltas)
+        self._pending_lock = threading.Lock()
+        self._control_lock = threading.Lock()
+        self._control_claimed = 0
+        self._closed = threading.Event()
+        self._coalesce_s = coalesce_s
+        self._close_timeout_s = close_timeout_s
+        self._thread = threading.Thread(
+            target=self._drain,
+            name="tui-stdio-writer",
+            daemon=True,
+        )
+        self._thread.start()
+
+    @staticmethod
+    def _is_streaming_frame(obj: dict) -> bool:
+        params = obj.get("params") if isinstance(obj, dict) else None
+        return isinstance(params, dict) and params.get("type") in _STREAMING_EVENT_TYPES
+
+    def write(self, obj: dict) -> bool:
+        if self._closed.is_set():
+            return False
+        if self._is_streaming_frame(obj):
+            with self._pending_lock:
+                if self._closed.is_set():
+                    return False
+                self._pending.append(obj)
+            return True
+
+        # Serialize controls without blocking delta producers. A claimed control
+        # keeps later deltas pending until that control reaches the sink.
+        with self._control_lock:
+            with self._pending_lock:
+                if self._closed.is_set():
+                    return False
+                batch = list(self._pending)
+                self._pending.clear()
+                batch.append(obj)
+                self._control_claimed += 1
+            while not self._closed.is_set():
+                try:
+                    # Controls apply backpressure rather than drop; in particular,
+                    # message.complete is the client's canonical final text.
+                    self._queue.put(batch, timeout=0.05)
+                    return True
+                except queue.Full:
+                    continue
+            with self._pending_lock:
+                self._control_claimed -= 1
+            return False
+
+    def _write_batch(self, batch: list[dict]) -> bool:
+        for obj in batch:
+            if not self._inner.write(obj):
+                self._closed.set()
+                return False
+        return True
+
+    def _drain(self) -> None:
+        try:
+            while True:
+                try:
+                    batch = self._queue.get(timeout=self._coalesce_s)
+                except queue.Empty:
+                    batch = None
+                if batch is not None:
+                    if not self._write_batch(batch):
+                        return
+                    with self._pending_lock:
+                        self._control_claimed -= 1
+
+                with self._pending_lock:
+                    if self._control_claimed:
+                        pending = []
+                    else:
+                        pending = list(self._pending)
+                        self._pending.clear()
+                    done = (
+                        self._closed.is_set()
+                        and not self._control_claimed
+                        and self._queue.empty()
+                        and not pending
+                    )
+                if pending and not self._write_batch(pending):
+                    return
+                if done:
+                    return
+        finally:
+            self._closed.set()
+
+    def close(self) -> None:
+        self._closed.set()
+        self._thread.join(timeout=self._close_timeout_s)
 
 
 class TeeTransport:

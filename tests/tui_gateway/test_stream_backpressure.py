@@ -56,6 +56,18 @@ class _FailingTransport:
         return None
 
 
+class _FailAfterReadyTransport(_FailingTransport):
+    def __init__(self, error: BaseException | None = None) -> None:
+        super().__init__(error)
+        self.writes = 0
+
+    def write(self, obj: dict) -> bool:
+        self.writes += 1
+        if self.writes == 1:
+            return True
+        return super().write(obj)
+
+
 class _RaisingStream:
     def __init__(self, error: BaseException) -> None:
         self.error = error
@@ -67,6 +79,17 @@ class _RaisingStream:
 
     def flush(self) -> None:
         return None
+
+
+class _HeldOpenStdin:
+    def __init__(self) -> None:
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def readline(self) -> str:
+        self.entered.set()
+        assert self.release.wait(10), "held-open stdin was never released"
+        return ""
 
 
 def _event(kind: str, text: str = "", **payload) -> dict:
@@ -220,17 +243,20 @@ def test_delta_overflow_is_bounded_and_completion_survives() -> None:
     ]
 
 
-def test_reasoning_overflow_stays_nonblocking_and_resyncs_losslessly() -> None:
+def test_reasoning_overflow_bounds_payload_bytes_and_marks_resync() -> None:
     sink = _BlockingTransport()
+    payload_ceiling = 1024
+    pending_count_ceiling = 16
     writer = transport.BufferedStreamWriter(
         sink,
         queue_maxsize=1,
-        max_pending_deltas=2,
+        max_pending_deltas=pending_count_ceiling,
+        max_pending_delta_bytes=payload_ceiling,
         control_push_timeout_s=0.05,
         coalesce_s=0.01,
         close_timeout_s=2,
     )
-    parts = [f"reason-{index}" for index in range(8)]
+    parts = [str(index % 10) * 256 for index in range(32)]
     results: list[bool] = []
     producer = None
     try:
@@ -248,7 +274,12 @@ def test_reasoning_overflow_stays_nonblocking_and_resyncs_losslessly() -> None:
         assert not producer.is_alive(), "reasoning producer blocked on overflow"
         assert results == [True] * len(parts)
         with writer._pending_lock:
-            assert len(writer._pending) <= 2
+            assert len(writer._pending) <= pending_count_ceiling
+            retained_payload_bytes = sum(
+                len(str(frame["params"]["payload"].get("text") or "").encode("utf-8"))
+                for frame in writer._pending
+            )
+        assert retained_payload_bytes <= payload_ceiling
     finally:
         sink.release.set()
         if producer is not None:
@@ -258,9 +289,6 @@ def test_reasoning_overflow_stays_nonblocking_and_resyncs_losslessly() -> None:
     reasoning = [
         frame for frame in sink.frames if frame["params"]["type"] == "reasoning.delta"
     ]
-    assert "".join(
-        frame["params"]["payload"]["text"] for frame in reasoning
-    ) == "".join(parts)
     assert any(frame["params"]["payload"].get("resync") for frame in reasoning)
 
 
@@ -294,12 +322,6 @@ def test_reasoning_survives_overflow_on_both_sides_of_tool_boundary() -> None:
     tool_index = types.index("tool.start")
     before_frames = sink.frames[1:tool_index]
     after_frames = sink.frames[tool_index + 1 : -1]
-    assert "".join(
-        frame["params"]["payload"]["text"] for frame in before_frames
-    ) == "".join(before)
-    assert "".join(
-        frame["params"]["payload"]["text"] for frame in after_frames
-    ) == "".join(after)
     assert all(
         frame["params"]["type"] in {"reasoning.delta", "thinking.delta"}
         for frame in before_frames + after_frames
@@ -403,7 +425,7 @@ def test_non_peer_error_is_retained_and_raised_to_next_caller() -> None:
         writer.close()
 
 
-def _prepare_entry_main(monkeypatch, entry) -> None:
+def _prepare_entry_main(monkeypatch, entry, stdin=None) -> None:
     from hermes_cli import model_switch
 
     monkeypatch.setattr(entry, "_install_sidecar_publisher", lambda: None)
@@ -412,7 +434,66 @@ def _prepare_entry_main(monkeypatch, entry) -> None:
     monkeypatch.setattr(entry.server, "_ensure_skin_watcher", lambda: None)
     monkeypatch.setattr(model_switch, "prewarm_picker_cache_async", lambda: None)
     monkeypatch.setattr(entry, "handle_spurious_eof", lambda *args: False)
-    monkeypatch.setattr(entry.sys, "stdin", io.StringIO(""))
+    monkeypatch.setattr(entry.sys, "stdin", stdin or io.StringIO(""))
+
+
+def _run_entry_with_held_stdin(
+    monkeypatch, entry, inner, *, fail_after_ready: bool = True
+) -> list[BaseException]:
+    original = server._stdio_transport
+    stdin = _HeldOpenStdin()
+    created: list[transport.BufferedStreamWriter] = []
+
+    def make_writer(previous):
+        writer = transport.BufferedStreamWriter(
+            previous,
+            control_push_timeout_s=0.05,
+            coalesce_s=0.01,
+            close_timeout_s=0.05,
+        )
+        created.append(writer)
+        return writer
+
+    monkeypatch.setattr(entry, "BufferedStreamWriter", make_writer, raising=False)
+    _prepare_entry_main(monkeypatch, entry, stdin)
+    server._stdio_transport = inner
+    failures: list[BaseException] = []
+    done = threading.Event()
+
+    def run() -> None:
+        try:
+            entry.main()
+        except BaseException as exc:
+            failures.append(exc)
+        finally:
+            done.set()
+
+    runner = threading.Thread(target=run, daemon=True)
+    try:
+        runner.start()
+        if fail_after_ready:
+            assert stdin.entered.wait(2), "entry never began waiting on held-open stdin"
+            assert server.write_json(_event("reasoning.delta", "trigger failure"))
+            assert inner.called.wait(2), "writer never reached the failing sink"
+        assert done.wait(2), (
+            "entry.main did not observe dead stdout while stdin stayed open"
+        )
+        assert not stdin.release.is_set(), (
+            "stdin was released before bounded observation"
+        )
+        assert server._stdio_transport is inner
+    finally:
+        stdin.release.set()
+        sink_release = getattr(inner, "release", None)
+        if isinstance(sink_release, threading.Event):
+            sink_release.set()
+        runner.join(timeout=2)
+        for writer in created:
+            writer.close()
+        server._stdio_transport = original
+
+    assert not runner.is_alive()
+    return failures
 
 
 def test_entry_main_scopes_buffered_writer_to_tui_stdio(monkeypatch) -> None:
@@ -485,3 +566,55 @@ def test_entry_main_handles_peer_gone_stdio_as_clean_disconnect(monkeypatch) -> 
         server._stdio_transport = original
 
     assert stream.called.is_set()
+
+
+def test_entry_main_wakes_with_held_stdin_when_inner_returns_false(monkeypatch) -> None:
+    from tui_gateway import entry
+
+    failures = _run_entry_with_held_stdin(
+        monkeypatch,
+        entry,
+        _FailAfterReadyTransport(),
+    )
+
+    assert failures == []
+
+
+def test_entry_main_wakes_with_held_stdin_on_peer_exception(monkeypatch) -> None:
+    from tui_gateway import entry
+
+    failures = _run_entry_with_held_stdin(
+        monkeypatch,
+        entry,
+        _FailAfterReadyTransport(BrokenPipeError("peer closed")),
+    )
+
+    assert failures == []
+
+
+def test_entry_main_wakes_with_held_stdin_on_non_peer_exception(monkeypatch) -> None:
+    from tui_gateway import entry
+
+    failure = OSError(errno.ENOSPC, "disk full")
+    failures = _run_entry_with_held_stdin(
+        monkeypatch,
+        entry,
+        _FailAfterReadyTransport(failure),
+    )
+
+    assert failures == [failure]
+
+
+def test_entry_main_wakes_with_held_stdin_when_first_control_write_blocks(
+    monkeypatch,
+) -> None:
+    from tui_gateway import entry
+
+    failures = _run_entry_with_held_stdin(
+        monkeypatch,
+        entry,
+        _BlockingTransport(),
+        fail_after_ready=False,
+    )
+
+    assert failures == []

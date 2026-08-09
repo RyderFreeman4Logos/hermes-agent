@@ -1774,11 +1774,19 @@ def run_heartbeat_warm(
             outcome = "failure"
             observed_reason = "response_invalid"
     except Exception as exc:
-        logger.debug("Isolated heartbeat warm attempt failed", exc_info=True)
-        warm_status = "degraded"
-        warm_reason = f"provider_error:{type(exc).__name__}"
-        outcome = "failure"
-        observed_reason = f"provider_exception:{type(exc).__name__}"
+        if getattr(exc, "_hermes_pre_dispatch_retained_owner", False):
+            api_calls = 0
+            physical_client_reusable = True
+            warm_status = "skipped"
+            warm_reason = "retained_owner"
+            outcome = "safe-skip"
+            observed_reason = "retained_owner_pre_dispatch"
+        else:
+            logger.debug("Isolated heartbeat warm attempt failed", exc_info=True)
+            warm_status = "degraded"
+            warm_reason = f"provider_error:{type(exc).__name__}"
+            outcome = "failure"
+            observed_reason = f"provider_exception:{type(exc).__name__}"
     finally:
         release_warm_snapshot(
             agent, epoch, reusable=physical_client_reusable

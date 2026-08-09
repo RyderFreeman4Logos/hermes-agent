@@ -941,6 +941,10 @@ class ManagedLlmStream(Iterator[Any]):
                 matched_raw = raw
                 output_tracker = tracker
                 break
+        if output_tracker is not None and any(
+            candidate is not output_tracker for _, _, candidate in self._raw_chunks
+        ):
+            output_tracker = None
         physical_attempt_diagnostics.activate_attempt(
             output_tracker["attempt"] if output_tracker is not None else None
         )

@@ -6611,8 +6611,8 @@ class AIAgent:
                 where, _n,
             )
 
-    def _fire_stream_delta(self, text: str) -> None:
-        """Fire all registered stream delta callbacks (display + TTS)."""
+    def _fire_stream_delta(self, text: str, *, raw_display_only: bool = False) -> None:
+        """Fire the display callback and, normally, TTS after stream scrubbing."""
         # Single-writer guard (#65991): a superseded stream must not interleave
         # its tokens into the turn alongside the retry that replaced it.
         if self._stream_writer_superseded():
@@ -6622,13 +6622,18 @@ class AIAgent:
         # break before the first real text delta.  This prevents the original
         # problem (text concatenation across tool boundaries) without stacking
         # blank lines when multiple tool iterations run back-to-back.
-        if getattr(self, "_stream_needs_break", False) and text and text.strip():
+        if (
+            not raw_display_only
+            and getattr(self, "_stream_needs_break", False)
+            and text
+            and text.strip()
+        ):
             self._stream_needs_break = False
             text = "\n\n" + text
             prepended_break = True
         else:
             prepended_break = False
-        if isinstance(text, str):
+        if isinstance(text, str) and not raw_display_only:
             # Suppress reasoning/thinking blocks via the stateful
             # scrubber (#17924).  Earlier versions ran _strip_think_blocks
             # per-delta here, which destroyed downstream state machines
@@ -6658,7 +6663,10 @@ class AIAgent:
                 text = text.lstrip("\n")
         if not text:
             return
-        callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
+        callbacks = [getattr(self, "stream_delta_callback", None)]
+        if not raw_display_only:
+            callbacks.append(getattr(self, "_stream_callback", None))
+        callbacks = [callback for callback in callbacks if callback is not None]
         marker = physical_attempt_diagnostics.begin_callback("text") if callbacks else None
         delivered = False
         try:

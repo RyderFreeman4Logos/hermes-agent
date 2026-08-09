@@ -588,6 +588,88 @@ def test_stream_marks_dispatch_and_first_wire_event(
     assert records[-1]["stage_latency"]["callbacks"]["text"]["count"] == 1
 
 
+def test_transformed_second_attempt_is_not_attributed_to_first(
+    relay_turn, monkeypatch, tmp_path
+):
+    relay, _turn = relay_turn
+    from agent import physical_attempt_diagnostics as diagnostics
+    from hermes_cli import config
+
+    monkeypatch.setattr(diagnostics, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(
+        config,
+        "read_raw_config_readonly",
+        lambda: {"observability": {"physical_attempt_digests": {"enabled": True}}},
+    )
+    provider_calls = []
+
+    def provider_stream(_request):
+        provider_calls.append(len(provider_calls) + 1)
+        return iter([{"delta": f"attempt-{provider_calls[-1]}"}])
+
+    async def retry_then_rewrite(
+        _name,
+        request,
+        callback,
+        observe_chunk,
+        finalizer,
+        **_kwargs,
+    ):
+        async def generate():
+            first = callback(request)
+            observe_chunk(await anext(first))
+            with pytest.raises(StopAsyncIteration):
+                await anext(first)
+
+            second = callback(request)
+            raw_second = await anext(second)
+            observe_chunk(raw_second)
+            yield {"delta": raw_second["delta"].upper()}
+            with pytest.raises(StopAsyncIteration):
+                await anext(second)
+            finalizer()
+
+        return generate()
+
+    monkeypatch.setattr(relay.llm, "stream_execute", retry_then_rewrite)
+    stream = relay_llm.stream(
+        {"model": "test-model", "messages": []},
+        provider_stream,
+        session_id="session-1",
+        name="test-provider",
+        model_name="test-model",
+        finalizer=lambda: {"content": "complete"},
+        metadata={"api_mode": "chat_completions", "call_role": "primary"},
+    )
+
+    delivered = next(stream)
+    active = diagnostics.current_attempt()
+    callback_marker = diagnostics.begin_callback("text")
+    diagnostics.end_callback(callback_marker)
+    with pytest.raises(StopIteration):
+        next(stream)
+
+    records = [
+        json.loads(line)
+        for line in (
+            tmp_path / "observability" / "physical_attempt_digests.jsonl"
+        ).read_text().splitlines()
+    ]
+    starts = [record for record in records if record["phase"] == "start"]
+    terminals = [record for record in records if record["phase"] == "terminal"]
+    assert provider_calls == [1, 2]
+    assert delivered.delta == "ATTEMPT-2"
+    assert active is None
+    assert callback_marker is None
+    assert len(starts) == len(terminals) == 2
+    assert {record["attempt_digest"] for record in terminals} == {
+        record["attempt_digest"] for record in starts
+    }
+    assert all(
+        record["stage_latency"]["callbacks"] == {} for record in terminals
+    )
+
+
 def test_internal_provider_fallback_starts_a_distinct_physical_attempt(
     relay_turn, monkeypatch
 ):

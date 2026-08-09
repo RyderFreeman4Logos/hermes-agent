@@ -3852,11 +3852,9 @@ def interruptible_streaming_api_call(
                 # suppressed by the CLI's _stream_delta when the stream
                 # box is already closed (tool boundary flush).
                 elif agent.stream_delta_callback:
-                    try:
-                        agent.stream_delta_callback(delta.content)
-                        agent._record_streamed_assistant_text(delta.content)
-                    except Exception:
-                        pass
+                    agent._fire_stream_delta(
+                        delta.content, raw_display_only=True
+                    )
 
             # Accumulate tool call deltas — notify display on first name
             if delta and delta.tool_calls:

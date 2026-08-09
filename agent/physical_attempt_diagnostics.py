@@ -1,4 +1,11 @@
-"""Opt-in, content-free diagnostics for physical provider attempts."""
+"""Opt-in, content-free diagnostics for physical provider attempts.
+
+The v1 stream stages stop at Python's first wire event, callback execution, and
+the synchronous gateway ``transport.write`` handoff.  They do not yet model
+wire-event type/cadence/character counts, detailed terminal/backpressure/drop
+counters, delayed websocket flush/socket send or Tee legs, Node receive/parse/
+dispatch, bounded retention, or full failure-path privacy and overhead evidence.
+"""
 
 from __future__ import annotations
 
@@ -51,7 +58,10 @@ _ACTIVE_ATTEMPT: ContextVar[Attempt | None] = ContextVar(
 
 
 def activate_attempt(attempt: Attempt | None) -> None:
-    """Bind an enabled streamed attempt to the current callback context."""
+    """Bind a streamed attempt, or clear attribution when provenance is unknown."""
+    if attempt is None:
+        _ACTIVE_ATTEMPT.set(None)
+        return
     if not isinstance(attempt, Attempt) or not attempt.streamed or attempt.finished:
         return
     if _ACTIVE_ATTEMPT.get() is not attempt:

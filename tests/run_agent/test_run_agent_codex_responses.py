@@ -2314,3 +2314,40 @@ def test_consume_codex_stream_leaves_unindexed_reasoning_untouched():
     )
 
     assert "".join(reasoning_streamed) == "Need to inspect files."
+
+
+def test_run_codex_stream_starts_and_finishes_a_private_physical_attempt(monkeypatch):
+    from agent import attempt_digests
+
+    agent = _build_agent(monkeypatch)
+    calls = []
+
+    class Sink:
+        def finish(self, attempt, usage):
+            calls.append(("finish", attempt, usage))
+
+    def start(_agent, kwargs, **metadata):
+        calls.append(("start", kwargs.copy(), metadata))
+        return Sink(), "attempt"
+
+    monkeypatch.setattr(attempt_digests, "start_codex_attempt", start)
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            create=lambda **kwargs: _FakeCreateStream([
+                SimpleNamespace(type="response.completed", response=_codex_message_response("ok"))
+            ])
+        )
+    )
+    request = _codex_request_kwargs()
+    request["_hermes_physical_attempt_identity"] = {"wire_prefix": _sentinel_for_digest_test()}
+
+    response = agent._run_codex_stream(request)
+
+    assert response.status == "completed"
+    assert "_hermes_physical_attempt_identity" not in calls[0][1]
+    assert calls[0][2]["retry"] == 0
+    assert calls[1] == ("finish", "attempt", {"input_tokens": 5})
+
+
+def _sentinel_for_digest_test():
+    return "never-reaches-provider"

@@ -1388,6 +1388,14 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     max_stream_retries = 1
     # Accumulate streamed text so callers / compat shims can read it.
     agent._codex_streamed_text_parts: list = []
+    # This envelope is private to the local digest sink and must never reach
+    # Relay metadata or the provider SDK.
+    attempt_identity = api_kwargs.pop("_hermes_physical_attempt_identity", {})
+    attempt_role = (
+        "reviewer" if getattr(agent, "is_reviewer", False)
+        else "subagent" if getattr(agent, "is_subagent", False)
+        else "main"
+    )
 
     def _on_text_delta(text: str) -> None:
         agent._codex_streamed_text_parts.append(text)
@@ -1411,6 +1419,12 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         if agent._interrupt_requested:
             raise InterruptedError("Agent interrupted before Codex stream retry")
 
+        from agent.attempt_digests import response_usage, start_codex_attempt
+
+        attempt_sink, attempt_record = start_codex_attempt(
+            agent, api_kwargs, retry=attempt, role=attempt_role, identity=attempt_identity
+        )
+        final = None
         intercepted_events = []
         writer_token = {"value": None}
 
@@ -1477,6 +1491,8 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             _httpx.ConnectError,
             ConnectionError,
         ) as exc:
+            if attempt_sink is not None:
+                attempt_sink.finish(attempt_record, {})
             if attempt < max_stream_retries:
                 logger.debug(
                     "Codex Responses failure_class=transport_failure phase=connect "
@@ -1536,7 +1552,8 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 raise
             except RuntimeError:
                 if event_stream.final_response is not None:
-                    return event_stream.final_response
+                    final = event_stream.final_response
+                    return final
                 raise
 
             # A terminal response has already been assembled at this point
@@ -1570,6 +1587,8 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
 
             return final
         finally:
+            if attempt_sink is not None:
+                attempt_sink.finish(attempt_record, response_usage(final))
             close_fn = getattr(event_stream, "close", None)
             if callable(close_fn):
                 try:

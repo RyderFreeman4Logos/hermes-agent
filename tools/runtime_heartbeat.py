@@ -86,6 +86,7 @@ class _WarmReplayPlan:
 
 @dataclass(frozen=True)
 class _WarmDispatch:
+    agent: Any
     client: Any
     replay: _WarmReplayPlan
     mode: str
@@ -463,6 +464,9 @@ def dispatch_warm_snapshot_request(
     dispatch: _WarmDispatch, api_kwargs: Dict[str, Any]
 ) -> tuple[Any, bool]:
     """Issue one isolated replay through the captured normal wire contract."""
+    from agent.chat_completion_helpers import _fence_retained_codex_request_owner
+
+    _fence_retained_codex_request_owner(dispatch.agent)
     response = dispatch.replay.dispatch(dispatch.client, api_kwargs)
     if dispatch.mode == "bounded":
         return response, bool(dispatch.replay.validate_response(response))
@@ -641,6 +645,7 @@ def claim_warm_snapshot(agent) -> Optional[tuple[int, Dict[str, Any], Any]]:
     with lock:
         state["last_claim_reason"] = ""
     return epoch, api_kwargs, _WarmDispatch(
+        agent=agent,
         client=physical_client,
         replay=snapshot.replay,
         mode=mode,

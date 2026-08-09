@@ -663,10 +663,13 @@ def run_codex_app_server_turn(
     Called from run_conversation() when agent.api_mode == "codex_app_server".
     Returns the same dict shape as the chat_completions path.
     """
+    from agent import chat_completion_helpers
     from agent.transports.codex_app_server_session import (
         CodexAppServerSession,
         _ServerRequestRouting,
     )
+
+    chat_completion_helpers._fence_retained_codex_request_owner(agent)
 
     # Lazy session: one CodexAppServerSession per AIAgent instance.
     # Spawned on first turn, reused across turns, closed at AIAgent
@@ -1375,7 +1378,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     """
     import httpx as _httpx
 
-    from agent import physical_attempt_diagnostics, relay_llm
+    from agent import chat_completion_helpers, physical_attempt_diagnostics, relay_llm
 
     active_client = client or agent._ensure_primary_openai_client(reason="codex_stream_direct")
     raw_client = getattr(active_client, "_real_client", active_client)
@@ -1464,6 +1467,9 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             )
 
         def _open_codex_stream(next_api_kwargs: dict[str, Any]):
+            chat_completion_helpers._fence_retained_codex_request_owner(
+                agent, lifecycle=diagnostic_lifecycle
+            )
             stream_kwargs = dict(next_api_kwargs)
             stream_kwargs["stream"] = True
             diagnostic_attempt["value"] = (

@@ -464,9 +464,18 @@ def _reconcile_codex_request_owner_locked(agent) -> None:
     setattr(agent, "_codex_request_owner", None)
 
 
-def _fence_retained_codex_request_owner(agent) -> None:
-    """Block every provider route while a retained Codex worker is alive."""
+def _fence_retained_codex_request_owner(
+    agent, *, lifecycle: dict[str, Any] | None = None
+) -> None:
+    """Block dispatch unless it carries the retained worker's lifecycle."""
     with _CODEX_REQUEST_OWNER_LOCK:
+        owner = getattr(agent, "_codex_request_owner", None)
+        if (
+            lifecycle is not None
+            and isinstance(owner, dict)
+            and owner.get("lifecycle") is lifecycle
+        ):
+            return
         _reconcile_codex_request_owner_locked(agent)
 
 

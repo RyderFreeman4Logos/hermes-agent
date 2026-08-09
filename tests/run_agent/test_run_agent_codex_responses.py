@@ -403,10 +403,148 @@ def _build_xai_agent_with_slash_enum_tool(monkeypatch):
     return agent
 
 
+@pytest.mark.parametrize(
+    "entrypoint",
+    ["_run_codex_stream", "_run_codex_create_stream_fallback"],
+)
+def test_codex_stream_entrypoints_honor_retained_owner(monkeypatch, entrypoint):
+    from agent import chat_completion_helpers as h
+
+    agent = _build_agent(monkeypatch)
+    owner = h._reserve_codex_request_owner(
+        agent, {"attempt": None, "cancel_event": threading.Event()}
+    )
+    owner.update(thread=SimpleNamespace(is_alive=lambda: True), started=True)
+    create_calls = []
+
+    def create(**kwargs):
+        create_calls.append(kwargs)
+        return _FakeCreateStream(
+            [
+                SimpleNamespace(
+                    type="response.completed",
+                    response=_codex_ack_message_response("must not dispatch"),
+                )
+            ]
+        )
+
+    client = SimpleNamespace(responses=SimpleNamespace(create=create))
+    try:
+        with pytest.raises(TimeoutError) as excinfo:
+            getattr(agent, entrypoint)(_codex_request_kwargs(), client=client)
+        assert "prior Codex request still owns its physical worker" in str(excinfo.value)
+        assert getattr(
+            excinfo.value, "_hermes_pre_dispatch_retained_owner", False
+        ) is True
+        assert getattr(
+            excinfo.value, "_hermes_ambiguous_provider_acceptance", False
+        ) is True
+        assert create_calls == []
+        assert getattr(agent, "_codex_request_owner") is owner
+    finally:
+        h._release_codex_request_owner(agent, owner)
 
 
+def test_codex_app_server_route_honors_retained_owner(monkeypatch):
+    from agent import chat_completion_helpers as h
+
+    agent = _build_agent(monkeypatch)
+    owner = h._reserve_codex_request_owner(
+        agent, {"attempt": None, "cancel_event": threading.Event()}
+    )
+    owner.update(thread=SimpleNamespace(is_alive=lambda: True), started=True)
+    run_turn_calls = []
+
+    def run_turn(**kwargs):
+        run_turn_calls.append(kwargs)
+        raise AssertionError("app-server physically dispatched")
+
+    setattr(
+        agent,
+        "_codex_session",
+        SimpleNamespace(run_turn=run_turn, close=lambda: None),
+    )
+    setattr(agent, "api_mode", "codex_app_server")
+    try:
+        with pytest.raises(TimeoutError) as excinfo:
+            agent.run_conversation("must not dispatch")
+        assert getattr(
+            excinfo.value, "_hermes_pre_dispatch_retained_owner", False
+        ) is True
+        assert getattr(
+            excinfo.value, "_hermes_ambiguous_provider_acceptance", False
+        ) is True
+        assert run_turn_calls == []
+        assert getattr(agent, "_codex_request_owner") is owner
+    finally:
+        h._release_codex_request_owner(agent, owner)
 
 
+def test_heartbeat_warm_honors_retained_owner(monkeypatch):
+    from agent import chat_completion_helpers as h
+    from tools.runtime_heartbeat import (
+        begin_normal_warm_snapshot,
+        finish_normal_warm_snapshot,
+        runtime_heartbeat,
+        runtime_warm_capability,
+    )
+
+    agent = _build_agent(monkeypatch)
+    setattr(agent, "api_mode", "chat_completions")
+    physical_calls = []
+
+    def create(**kwargs):
+        physical_calls.append(kwargs)
+        return SimpleNamespace(choices=[SimpleNamespace()])
+
+    client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+    )
+    agent.client = client
+    agent._claim_request_openai_client_for_heartbeat = lambda expected: expected
+    agent._release_request_openai_client_from_heartbeat = lambda *_a, **_k: None
+    token = begin_normal_warm_snapshot(
+        agent,
+        {
+            "model": getattr(agent, "model"),
+            "messages": [{"role": "user", "content": "validated request"}],
+            "max_tokens": 32,
+        },
+        physical_client=client,
+    )
+    finish_normal_warm_snapshot(agent, token, succeeded=True)
+    assert runtime_warm_capability(agent) == (
+        "eligible",
+        "chat.completions.create",
+    )
+
+    heartbeat_event = {
+        "status": "ALIVE",
+        "session_key": "retained-owner-session",
+        "provider": getattr(agent, "provider"),
+        "cache_context": "retained-owner-cache",
+    }
+    monkeypatch.setattr(
+        runtime_heartbeat,
+        "is_event_current",
+        lambda candidate, _agent=None, **_kwargs: candidate is heartbeat_event,
+    )
+    owner = h._reserve_codex_request_owner(
+        agent, {"attempt": None, "cancel_event": threading.Event()}
+    )
+    owner.update(thread=SimpleNamespace(is_alive=lambda: True), started=True)
+    try:
+        result = agent.run_conversation(
+            "",
+            turn_origin="heartbeat_warm",
+            heartbeat_event=heartbeat_event,
+        )
+        assert result["heartbeat_warm_status"] == "degraded"
+        assert result["heartbeat_warm_reason"] == "provider_error:TimeoutError"
+        assert physical_calls == []
+        assert getattr(agent, "_codex_request_owner") is owner
+    finally:
+        h._release_codex_request_owner(agent, owner)
 
 
 def test_run_codex_stream_returns_collected_items_when_stream_ends_without_terminal(monkeypatch):

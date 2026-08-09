@@ -549,6 +549,8 @@ class ProcessRegistry:
         # gateway drain this after each agent turn to auto-trigger new turns.
         import queue as _queue_mod
         self.completion_queue: _queue_mod.Queue = _queue_mod.Queue()
+        # Terminal producer fallback retained until the delivery ledger owns it.
+        self._terminal_completion_spool: dict[tuple, dict] = {}
         # Rehydrate durable async and ordinary completions at registry startup.
         # Consumers still inject them as fresh turns through this existing rail.
         try:
@@ -2215,18 +2217,21 @@ class ProcessRegistry:
                     exc_info=True,
                 )
 
-        # The prior checkpoint is the restart fallback until the ordinary
-        # completion receipt exists. Retiring it first creates a crash window
-        # where neither source can reproduce the terminal event.
         if was_running:
-            if completion_receipt_persisted:
-                self._write_checkpoint()
-            else:
+            # Keep the exact terminal payload in the checkpoint until its
+            # durable receipt exists. A later unrelated checkpoint write must
+            # not erase it.
+            if event is not None and not completion_receipt_persisted:
+                identity = self._completion_identity(event)
+                if identity is not None:
+                    with self._lock:
+                        self._terminal_completion_spool[identity] = dict(event)
                 logger.warning(
-                    "Keeping prior process checkpoint for %s until completion "
+                    "Keeping terminal process checkpoint for %s until completion "
                     "delivery can be persisted",
                     session.id,
                 )
+            self._write_checkpoint()
 
         if event is not None:
             identity = self._completion_identity(event)
@@ -2272,6 +2277,21 @@ class ProcessRegistry:
         }
         _redact_process_result(event)
         return event
+
+    @staticmethod
+    def _checkpoint_completion_event(entry: dict) -> dict:
+        """Materialize an outcome-unknown completion from a dead checkpoint."""
+        return {
+            "type": "completion",
+            "session_id": entry.get("session_id", ""),
+            "session_key": entry.get("session_key", ""),
+            "command": entry.get("command", "unknown"),
+            "exit_code": None,
+            "completion_reason": "unknown",
+            "termination_source": "checkpoint_recovery",
+            "output": "",
+            "started_at": entry.get("started_at", time.time()),
+        }
 
     @staticmethod
     def _completion_identity(evt: dict) -> "tuple | None":
@@ -2421,11 +2441,21 @@ class ProcessRegistry:
             )
         return True
 
+    def _retire_terminal_completion_spool(self, evt: dict) -> None:
+        identity = self._completion_identity(evt)
+        if identity is None:
+            return
+        with self._lock:
+            spooled = self._terminal_completion_spool.pop(identity, None)
+        if spooled is not None:
+            self._write_checkpoint()
+
     def complete_completion_delivery(self, evt: dict) -> None:
         identity = self._completion_identity(evt)
         if identity is not None:
             with self._completion_disposition_lock:
                 self._set_completion_disposition(identity, "delivered")
+            self._retire_terminal_completion_spool(evt)
 
     def release_completion_delivery(self, evt: dict) -> None:
         identity = self._completion_identity(evt)
@@ -2584,6 +2614,33 @@ class ProcessRegistry:
                 text = completion_delivery_prompt(evt, text)
                 if text is not None:
                     results.append((evt, text))
+                elif evt.get("type") in {"completion", "async_delegation"}:
+                    if not self.claim_completion_delivery(evt):
+                        continue
+                    try:
+                        from tools.async_delegation import claim_event_delivery
+
+                        claim_id = claim_event_delivery(
+                            evt, "visibility-suppressed"
+                        )
+                    except Exception:
+                        self.release_completion_delivery(evt)
+                        requeue.append(evt)
+                        continue
+                    if claim_id is None:
+                        self.release_completion_delivery(evt)
+                        continue
+                    if not claim_id:
+                        self.complete_completion_delivery(evt)
+                        continue
+                    if not finish_completion_event_delivery(
+                        evt,
+                        claim_id,
+                        "visibility_suppressed",
+                        registry=self,
+                    ):
+                        # The finish helper requeued the failed transition.
+                        break
         for evt in requeue:
             self.completion_queue.put(evt)
         return results
@@ -3351,7 +3408,7 @@ class ProcessRegistry:
         self,
         extra_entries: Optional[List[Dict[str, Any]]] = None,
     ):
-        """Write running process metadata to checkpoint file atomically."""
+        """Write running processes and unhanded terminal events atomically."""
         try:
             with self._lock:
                 entries = []
@@ -3393,6 +3450,10 @@ class ProcessRegistry:
                             "delegated_child": s.delegated_child,
                             "watch_patterns": s.watch_patterns,
                         })
+                entries.extend(
+                    {"completion_event": dict(event)}
+                    for event in self._terminal_completion_spool.values()
+                )
                 if extra_entries:
                     tracked_ids = {item.get("session_id") for item in entries}
                     entries.extend(
@@ -3400,7 +3461,7 @@ class ProcessRegistry:
                         for item in extra_entries
                         if item.get("session_id") not in tracked_ids
                     )
-            
+
             # Atomic write to avoid corruption on crash
             from utils import atomic_json_write
             atomic_json_write(CHECKPOINT_PATH, entries)
@@ -3425,9 +3486,39 @@ class ProcessRegistry:
 
         recovered = 0
         unresolved_scope_entries: List[Dict[str, Any]] = []
+
+        def materialize_terminal_event(event: dict) -> None:
+            persisted = False
+            try:
+                from tools.async_delegation import persist_event_delivery
+
+                persisted = bool(persist_event_delivery(event))
+            except Exception:
+                logger.warning(
+                    "Failed to materialize checkpoint completion %s",
+                    event.get("session_id", "?"),
+                    exc_info=True,
+                )
+            identity = self._completion_identity(event)
+            if identity is not None:
+                with self._lock:
+                    if persisted:
+                        self._terminal_completion_spool.pop(identity, None)
+                    else:
+                        self._terminal_completion_spool[identity] = dict(event)
+            self.completion_queue.put(dict(event))
+
         for entry in entries:
+            terminal_event = entry.get("completion_event")
+            if isinstance(terminal_event, dict):
+                materialize_terminal_event(terminal_event)
+                continue
             pid = entry.get("pid")
             if not pid:
+                if entry.get("notify_on_complete"):
+                    materialize_terminal_event(
+                        self._checkpoint_completion_event(entry)
+                    )
                 continue
 
             pid_scope = entry.get("pid_scope", "host")
@@ -3441,6 +3532,10 @@ class ProcessRegistry:
                     pid,
                     pid_scope,
                 )
+                if entry.get("notify_on_complete"):
+                    materialize_terminal_event(
+                        self._checkpoint_completion_event(entry)
+                    )
                 continue
 
             # The PID must be alive AND still the same process we spawned. A
@@ -3467,6 +3562,11 @@ class ProcessRegistry:
                         pid,
                     )
                     unresolved_scope_entries.append(entry)
+                    continue
+                if entry.get("notify_on_complete"):
+                    materialize_terminal_event(
+                        self._checkpoint_completion_event(entry)
+                    )
                 continue
 
             session = ProcessSession(
@@ -3573,7 +3673,11 @@ def finish_completion_event_delivery(
     try:
         if outcome == "committed":
             terminal = complete_event_delivery(evt, claim_id)
-        elif outcome in {"missing_active_marker", "history_conflict"}:
+        elif outcome in {
+            "missing_active_marker",
+            "history_conflict",
+            "visibility_suppressed",
+        }:
             terminal = mark_completion_delivery_recovery(evt, claim_id, outcome)
     except Exception:
         logger.debug("Failed to commit completion delivery transition", exc_info=True)
@@ -3582,12 +3686,20 @@ def finish_completion_event_delivery(
         target.complete_completion_delivery(evt)
         return True
 
+    released = False
     try:
-        release_event_delivery(evt, claim_id)
+        released = release_event_delivery(evt, claim_id)
     except Exception:
         logger.debug("Failed to release durable completion delivery", exc_info=True)
+    if released:
+        target._retire_terminal_completion_spool(evt)
     target.release_completion_delivery(evt)
-    target.completion_queue.put(evt)
+    retry_event = dict(evt)
+    if released:
+        retry_event.pop("_completion_delivery_retained_claim_id", None)
+    elif claim_id:
+        retry_event["_completion_delivery_retained_claim_id"] = claim_id
+    target.completion_queue.put(retry_event)
     return False
 
 

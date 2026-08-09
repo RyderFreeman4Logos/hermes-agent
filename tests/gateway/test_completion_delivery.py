@@ -17,7 +17,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.config import Platform
-from gateway.run import GatewayRunner
+from gateway.run import GatewayRunner, _drain_gateway_watch_events
 from gateway.session import SessionSource
 from tools.process_registry import ProcessRegistry, ProcessSession
 
@@ -425,6 +425,202 @@ def _stop_after_sleeps(monkeypatch, runner, count):
     monkeypatch.setattr(asyncio, "sleep", _bounded_sleep)
 
 
+def _committing_gateway_runner(monkeypatch, tmp_path, db):
+    """Run accepted synthetic events through the real gateway history fence."""
+    from tests.gateway.test_first_turn_session_meta_rebaseline import (
+        SESSION_ID,
+        SESSION_KEY,
+        _bootstrap,
+    )
+
+    runner = _bootstrap(monkeypatch, tmp_path, db)
+    runner.session_store._entries = {}
+    setattr(runner, "_session_source_cache", {})
+    committed_prompts = []
+
+    async def run_agent(**kwargs):
+        prompt = kwargs["message"]
+        messages = [
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": "terminal"},
+        ]
+        db.append_message(SESSION_ID, "user", prompt)
+        db.append_message(SESSION_ID, "assistant", "terminal")
+        committed_prompts.append(prompt)
+        return {
+            "final_response": "terminal",
+            "messages": messages,
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+            "api_calls": 1,
+            "completed": True,
+            "completion_delivery_status": "committed",
+        }
+
+    runner._run_agent = AsyncMock(side_effect=run_agent)
+    adapter = SimpleNamespace(supports_async_delivery=True, send=AsyncMock())
+
+    async def handle_message(event):
+        await runner._handle_message_with_agent(event, event.source, SESSION_KEY, 1)
+        runner._running = False
+
+    adapter.handle_message = AsyncMock(side_effect=handle_message)
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._running = True
+    return runner, adapter, committed_prompts
+
+
+async def _run_gateway_completion_queue(monkeypatch, runner, registry):
+    """Drive both production gateway consumers that previously dropped retries."""
+    assert _drain_gateway_watch_events(registry.completion_queue) == []
+    assert not registry.completion_queue.empty()
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+    await runner._async_delegation_watcher(interval=0)
+
+
+def test_gateway_recovers_checkpointed_completion_through_history_commit(
+    monkeypatch, tmp_path, isolated_registry
+):
+    """A failed initial persist survives restart and reaches a terminal gateway turn."""
+    from hermes_state import SessionDB
+    from tests.gateway.test_first_turn_session_meta_rebaseline import SESSION_ID
+    from tools import async_delegation as ad
+    import tools.process_registry as registry_module
+
+    persist = ad.persist_event_delivery
+    attempts = 0
+
+    def fail_once(event):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("storage unavailable")
+        return persist(event)
+
+    monkeypatch.setattr(ad, "persist_event_delivery", fail_once)
+    process = ProcessSession(
+        id="proc-gateway-checkpoint",
+        command="true",
+        session_key="agent:main:telegram:dm:123",
+        started_at=5.7,
+        pid=999999999,
+        watcher_platform="telegram",
+        watcher_chat_id="123",
+        exited=False,
+        exit_code=1,
+        output_buffer="failed after writing useful output\n",
+        notify_on_complete=True,
+    )
+    isolated_registry._running[process.id] = process
+    assert isolated_registry._write_checkpoint()
+    process.exited = True
+    isolated_registry._move_to_finished(process)
+    assert isolated_registry.completion_queue.get_nowait()["session_id"] == process.id
+
+    restarted = ProcessRegistry()
+    assert restarted.recover_from_checkpoint() == 0
+    monkeypatch.setattr(registry_module, "process_registry", restarted)
+    restored = restarted.completion_queue.get_nowait()
+    assert restored["session_id"] == process.id
+    restarted.completion_queue.put(restored)
+
+    db = SessionDB(db_path=tmp_path / "sessions.db")
+    db.create_session(SESSION_ID, source="telegram")
+    runner, adapter, committed_prompts = _committing_gateway_runner(
+        monkeypatch, tmp_path, db
+    )
+    complete = ad.complete_event_delivery
+
+    def complete_after_history(event, claim_id):
+        assert committed_prompts
+        assert any(
+            row["content"] == committed_prompts[-1]
+            for row in db.get_messages_as_conversation(SESSION_ID)
+        )
+        return complete(event, claim_id)
+
+    monkeypatch.setattr(ad, "complete_event_delivery", complete_after_history)
+    try:
+        asyncio.run(_run_gateway_completion_queue(monkeypatch, runner, restarted))
+        adapter.handle_message.assert_awaited_once()
+        receipt = ad.get_durable_event_delivery(restored)
+        assert receipt is not None
+        assert receipt["delivery_state"] == "delivered"
+
+        from tools.process_registry import format_process_notification
+
+        replay_text = format_process_notification(restored)
+        assert replay_text
+        assert asyncio.run(
+            runner._deliver_completion_notification(replay_text, dict(restored))
+        ) is None
+        adapter.handle_message.assert_awaited_once()
+
+        after_restart = ProcessRegistry()
+        assert after_restart.recover_from_checkpoint() == 0
+        assert after_restart.completion_queue.empty()
+    finally:
+        db.close()
+
+
+def test_gateway_retries_retained_same_process_claim(
+    monkeypatch, tmp_path, isolated_registry
+):
+    """A double-write failure keeps its claim until the gateway retry terminalizes it."""
+    from hermes_state import SessionDB
+    from tests.gateway.test_first_turn_session_meta_rebaseline import SESSION_ID
+    from tools import async_delegation as ad
+    import tools.process_registry as registry_module
+
+    event = _completion_event(
+        started_at=5.8, session_id="proc-gateway-retained-claim"
+    )
+    event["exit_code"] = 1
+    assert ad.persist_event_delivery(event)
+    assert isolated_registry.claim_completion_delivery(event)
+    claim = ad.claim_event_delivery(event, "gateway-test")
+    assert claim
+    complete = ad.complete_event_delivery
+    release = ad.release_event_delivery
+    monkeypatch.setattr(
+        ad,
+        "complete_event_delivery",
+        lambda *_args: (_ for _ in ()).throw(OSError("complete unavailable")),
+    )
+    monkeypatch.setattr(
+        ad,
+        "release_event_delivery",
+        lambda *_args: (_ for _ in ()).throw(OSError("release unavailable")),
+    )
+
+    assert not registry_module.finish_completion_event_delivery(
+        event, claim, "committed", registry=isolated_registry
+    )
+    retry = isolated_registry.completion_queue.get_nowait()
+    assert retry["_completion_delivery_retained_claim_id"] == claim
+    isolated_registry.completion_queue.put(retry)
+    monkeypatch.setattr(ad, "complete_event_delivery", complete)
+    monkeypatch.setattr(ad, "release_event_delivery", release)
+
+    db = SessionDB(db_path=tmp_path / "sessions.db")
+    db.create_session(SESSION_ID, source="telegram")
+    runner, adapter, _committed = _committing_gateway_runner(
+        monkeypatch, tmp_path, db
+    )
+    try:
+        asyncio.run(
+            _run_gateway_completion_queue(monkeypatch, runner, isolated_registry)
+        )
+        adapter.handle_message.assert_awaited_once()
+        receipt = ad.get_durable_event_delivery(event)
+        assert receipt is not None
+        assert receipt["delivery_state"] == "delivered"
+        assert isolated_registry.completion_queue.empty()
+    finally:
+        db.close()
+
+
 def test_duplicate_async_queue_replay_injects_once(monkeypatch, isolated_registry):
     """Byte-identical queue replays produce one turn in one gateway lifecycle."""
     isolated = queue.Queue()
@@ -601,8 +797,10 @@ async def test_cancelled_gateway_completion_turn_releases_receipt(
     delivery_event = _completion_event(
         started_at=2.53, session_id="proc-cancelled-gateway"
     )
+    delivery_event["exit_code"] = 1
     delivery_event["session_key"] = SESSION_KEY
     assert ad.persist_event_delivery(delivery_event)
+    assert isolated_registry.claim_completion_delivery(delivery_event)
     claim = ad.claim_event_delivery(delivery_event, "gateway-test")
     assert claim
     event = _event()
@@ -623,9 +821,19 @@ async def test_cancelled_gateway_completion_turn_releases_receipt(
         receipt = ad.get_durable_event_delivery(delivery_event)
         assert receipt is not None
         assert receipt["delivery_state"] == "pending"
-        retry_claim = ad.claim_event_delivery(delivery_event, "gateway-retry")
-        assert retry_claim
-        assert ad.release_event_delivery(delivery_event, retry_claim)
+        assert not isolated_registry.completion_queue.empty()
+
+        retry_runner, adapter, _committed = _committing_gateway_runner(
+            monkeypatch, tmp_path, db
+        )
+        await _run_gateway_completion_queue(
+            monkeypatch, retry_runner, isolated_registry
+        )
+        adapter.handle_message.assert_awaited_once()
+        receipt = ad.get_durable_event_delivery(delivery_event)
+        assert receipt is not None
+        assert receipt["delivery_state"] == "delivered"
+        assert isolated_registry.completion_queue.empty()
     finally:
         db.close()
 

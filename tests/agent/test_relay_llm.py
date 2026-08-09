@@ -588,8 +588,17 @@ def test_stream_marks_dispatch_and_first_wire_event(
     assert records[-1]["stage_latency"]["callbacks"]["text"]["count"] == 1
 
 
-def test_transformed_second_attempt_is_not_attributed_to_first(
-    relay_turn, monkeypatch, tmp_path
+@pytest.mark.parametrize(
+    ("provider_deltas", "relay_delta"),
+    [
+        (("attempt-1", "attempt-2"), "ATTEMPT-2"),
+        (("identical", "identical"), "identical"),
+        (("attempt-1", "attempt-2"), "attempt-1"),
+    ],
+    ids=("unmatched-rewrite", "equal-payload", "transform-collision"),
+)
+def test_ambiguous_second_attempt_is_not_attributed_to_first(
+    relay_turn, monkeypatch, tmp_path, provider_deltas, relay_delta
 ):
     relay, _turn = relay_turn
     from agent import physical_attempt_diagnostics as diagnostics
@@ -605,7 +614,7 @@ def test_transformed_second_attempt_is_not_attributed_to_first(
 
     def provider_stream(_request):
         provider_calls.append(len(provider_calls) + 1)
-        return iter([{"delta": f"attempt-{provider_calls[-1]}"}])
+        return iter([{"delta": provider_deltas[provider_calls[-1] - 1]}])
 
     async def retry_then_rewrite(
         _name,
@@ -624,7 +633,7 @@ def test_transformed_second_attempt_is_not_attributed_to_first(
             second = callback(request)
             raw_second = await anext(second)
             observe_chunk(raw_second)
-            yield {"delta": raw_second["delta"].upper()}
+            yield {"delta": relay_delta}
             with pytest.raises(StopAsyncIteration):
                 await anext(second)
             finalizer()
@@ -658,7 +667,9 @@ def test_transformed_second_attempt_is_not_attributed_to_first(
     starts = [record for record in records if record["phase"] == "start"]
     terminals = [record for record in records if record["phase"] == "terminal"]
     assert provider_calls == [1, 2]
-    assert delivered.delta == "ATTEMPT-2"
+    assert (
+        delivered["delta"] if isinstance(delivered, dict) else delivered.delta
+    ) == relay_delta
     assert active is None
     assert callback_marker is None
     assert len(starts) == len(terminals) == 2

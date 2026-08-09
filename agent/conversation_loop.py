@@ -1794,7 +1794,11 @@ def run_conversation(
             should_review_memory=_should_review_memory,
         )
 
-    while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
+    while (
+        (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0)
+        or agent._budget_grace_call
+        or getattr(agent, "_codex_incomplete_retries", 0)
+    ):
         terminal_text_only = (
             getattr(agent, "_delegate_depth", 0) > 0
             and min(
@@ -1832,7 +1836,7 @@ def run_conversation(
         # this iteration regardless of outcome.
         if agent._budget_grace_call:
             agent._budget_grace_call = False
-        elif not agent.iteration_budget.consume():
+        elif not getattr(agent, "_codex_incomplete_retries", 0) and not agent.iteration_budget.consume():
             _turn_exit_reason = "budget_exhausted"
             if not agent.quiet_mode:
                 agent._safe_print(f"\n⚠️  Iteration budget exhausted ({agent.iteration_budget.used}/{agent.iteration_budget.max_total} iterations used)")
@@ -3980,6 +3984,23 @@ def run_conversation(
                     thinking_spinner = None
                 if agent.thinking_callback:
                     agent.thinking_callback("")
+
+                if getattr(api_error, "_hermes_ambiguous_provider_acceptance", False):
+                    ambiguous_error = (
+                        "Provider request outcome is unknown after acceptance; "
+                        "Hermes did not replay it to avoid duplicate billed work."
+                    )
+                    agent._emit_status(f"⚠️ {ambiguous_error}")
+                    agent._persist_session(messages, conversation_history)
+                    return {
+                        "final_response": ambiguous_error,
+                        "messages": messages,
+                        "api_calls": api_call_count,
+                        "completed": False,
+                        "partial": True,
+                        "error": ambiguous_error,
+                        "ambiguous_provider_attempt": True,
+                    }
 
                 # -----------------------------------------------------------
                 # UnicodeEncodeError recovery.  Two common causes:
@@ -6405,75 +6426,88 @@ def run_conversation(
                         messages.append(interim_msg)
                         agent._emit_interim_assistant_message(interim_msg)
 
-                if agent._codex_incomplete_retries <= _CODEX_INCOMPLETE_CONTINUATION_LIMIT:
-                    # When the interim message has nothing the Responses
-                    # input converter will replay (no visible content, no
-                    # encrypted reasoning items, no replayable message
-                    # items — plain-text reasoning only), a bare retry is
-                    # byte-identical to the request that just came back
-                    # incomplete and fails the same way every time
-                    # (observed with grok-4.20 on xai-oauth, whose
-                    # reasoning items lack encrypted_content).  Append a
-                    # user-role nudge so the retry actually differs and
-                    # explicitly asks for the final answer.
-                    interim_replayable = (
-                        interim_has_content
-                        or interim_has_codex_reasoning
-                        or interim_has_codex_message_items
-                    )
-                    if not interim_replayable:
-                        _last_msg = messages[-1] if messages else None
-                        _already_nudged = (
-                            isinstance(_last_msg, dict)
-                            and _last_msg.get("role") == "user"
-                            and _last_msg.get("content") == _CODEX_INCOMPLETE_NUDGE
-                        )
-                        # Alternation guard: the nudge is a user-role message,
-                        # so it may only follow an assistant message. When the
-                        # interim was too empty to append (no content AND no
-                        # reasoning), the last message is still the prior
-                        # user/tool turn — appending the nudge there would
-                        # create a user→user / tool→user sequence that strict
-                        # providers reject.
-                        _last_is_assistant = (
-                            isinstance(_last_msg, dict)
-                            and _last_msg.get("role") == "assistant"
-                        )
-                        if not _already_nudged and _last_is_assistant:
-                            messages.append({
-                                "role": "user",
-                                "content": _CODEX_INCOMPLETE_NUDGE,
-                            })
-                    if not agent.quiet_mode:
-                        agent._vprint(f"{agent.log_prefix}↻ Codex response incomplete; continuing turn ({agent._codex_incomplete_retries}/{_CODEX_INCOMPLETE_CONTINUATION_LIMIT})")
-                    # Surface the continuation on the live spinner/status line
-                    # (CLI/TUI/Desktop) and gateway heartbeat: each of these
-                    # retries can spend minutes waiting on the provider, and
-                    # without a distinct notice the user only sees a generic
-                    # thinking spinner ("infinite thinking", #64434).
-                    agent._emit_wait_notice(
-                        f"↻ model returned reasoning with no final answer — "
-                        f"asking it to continue "
-                        f"({agent._codex_incomplete_retries}/{_CODEX_INCOMPLETE_CONTINUATION_LIMIT})"
-                    )
-                    agent._session_messages = messages
-                    continue
-
-                continuation_attempts = agent._codex_incomplete_retries - 1
-                continuation_error = (
-                    f"Codex response remained incomplete after "
-                    f"{continuation_attempts} continuation attempts"
+                # The continuation count is reporting only: a completed provider
+                # response can require more episodes than the local tool budget.
+                # Preserve the same Responses replay tail and let explicit stop
+                # or a terminal provider error own the turn boundary.
+                # When the interim message has nothing the Responses
+                # input converter will replay (no visible content, no
+                # encrypted reasoning items, no replayable message
+                # items — plain-text reasoning only), a bare retry is
+                # byte-identical to the request that just came back
+                # incomplete and fails the same way every time
+                # (observed with grok-4.20 on xai-oauth, whose
+                # reasoning items lack encrypted_content).  Append a
+                # user-role nudge so the retry actually differs and
+                # explicitly asks for the final answer.
+                interim_replayable = (
+                    interim_has_content
+                    or interim_has_codex_reasoning
+                    or interim_has_codex_message_items
                 )
-                agent._codex_incomplete_retries = 0
-                agent._persist_session(messages, conversation_history)
-                return {
-                    "final_response": continuation_error,
-                    "messages": messages,
-                    "api_calls": api_call_count,
-                    "completed": False,
-                    "partial": True,
-                    "error": continuation_error,
-                }
+                if not interim_replayable:
+                    _last_msg = messages[-1] if messages else None
+                    _already_nudged = (
+                        isinstance(_last_msg, dict)
+                        and _last_msg.get("role") == "user"
+                        and _last_msg.get("content") == _CODEX_INCOMPLETE_NUDGE
+                    )
+                    # Alternation guard: the nudge is a user-role message,
+                    # so it may only follow an assistant message. When the
+                    # interim was too empty to append (no content AND no
+                    # reasoning), the last message is still the prior
+                    # user/tool turn — appending the nudge there would
+                    # create a user→user / tool→user sequence that strict
+                    # providers reject.
+                    _last_is_assistant = (
+                        isinstance(_last_msg, dict)
+                        and _last_msg.get("role") == "assistant"
+                    )
+                    if not _already_nudged and _last_is_assistant:
+                        messages.append({
+                            "role": "user",
+                            "content": _CODEX_INCOMPLETE_NUDGE,
+                        })
+                    _continuation_backoff = jittered_backoff(
+                        agent._codex_incomplete_retries,
+                        base_delay=1.0,
+                        max_delay=15.0,
+                    )
+                    if _continuation_backoff > 0:
+                        agent._emit_wait_notice(
+                            f"↻ no replayable continuation state; waiting "
+                            f"{_continuation_backoff:.1f}s before retrying"
+                        )
+                        _backoff_deadline = time.monotonic() + _continuation_backoff
+                        while time.monotonic() < _backoff_deadline:
+                            if agent._interrupt_requested:
+                                interrupted = True
+                                _turn_exit_reason = "interrupted_during_continuation_backoff"
+                                break
+                            time.sleep(min(0.2, _backoff_deadline - time.monotonic()))
+                        if interrupted:
+                            break
+                _continuation_label = (
+                    f"({agent._codex_incomplete_retries}/{_CODEX_INCOMPLETE_CONTINUATION_LIMIT})"
+                    if agent._codex_incomplete_retries <= _CODEX_INCOMPLETE_CONTINUATION_LIMIT
+                    else f"(continuation {agent._codex_incomplete_retries})"
+                )
+                if not agent.quiet_mode:
+                    agent._vprint(
+                        f"{agent.log_prefix}↻ Codex response incomplete; continuing turn "
+                        f"{_continuation_label}"
+                    )
+                # Surface the continuation on the live spinner/status line
+                # (CLI/TUI/Desktop) and gateway heartbeat: each of these
+                # retries can spend minutes waiting on the provider, and
+                # without a distinct notice the user only sees a generic
+                # thinking spinner ("infinite thinking", #64434).
+                agent._emit_wait_notice(
+                    f"↻ model returned reasoning with no final answer — "
+                    f"asking it to continue {_continuation_label}"
+                )
+                agent._session_messages = messages
+                continue
             elif hasattr(agent, "_codex_incomplete_retries"):
                 agent._codex_incomplete_retries = 0
             

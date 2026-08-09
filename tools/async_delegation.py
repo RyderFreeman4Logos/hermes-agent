@@ -674,6 +674,53 @@ def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
         from tools.runtime_heartbeat import runtime_heartbeat
 
         return "" if runtime_heartbeat.is_event_current(evt) else None
+    retained_claim = str(evt.get("_completion_delivery_retained_claim_id") or "")
+    if retained_claim:
+        now = time.time()
+        if evt.get("type") == "async_delegation":
+            delegation_id = str(evt.get("delegation_id") or "")
+            if not delegation_id:
+                return None
+            with _DB_LOCK, _transaction() as conn:
+                cur = conn.execute(
+                    """UPDATE async_delegations
+                       SET delivery_attempts=delivery_attempts+1, updated_at=?
+                       WHERE delegation_id=? AND delivery_state='effect_started'
+                         AND delivery_claim=? AND delivery_attempts<?""",
+                    (now, delegation_id, retained_claim, _MAX_DELIVERY_ATTEMPTS),
+                )
+                if cur.rowcount == 0:
+                    conn.execute(
+                        """UPDATE async_delegations SET delivery_state='dropped',
+                                  delivery_claim=NULL, delivery_claimed_at=NULL,
+                                  updated_at=?
+                           WHERE delegation_id=? AND delivery_state='effect_started'
+                             AND delivery_claim=? AND delivery_attempts>=?""",
+                        (now, delegation_id, retained_claim, _MAX_DELIVERY_ATTEMPTS),
+                    )
+            return retained_claim if cur.rowcount == 1 else None
+        delivery_id = _ordinary_completion_delivery_id(evt)
+        if delivery_id is None:
+            return None
+        with _DB_LOCK, _transaction() as conn:
+            cur = conn.execute(
+                """UPDATE ordinary_completion_deliveries
+                   SET delivery_attempts=delivery_attempts+1, updated_at=?
+                   WHERE delivery_id=? AND delivery_state='effect_started'
+                     AND delivery_claim=? AND delivery_attempts<?""",
+                (now, delivery_id, retained_claim, _MAX_DELIVERY_ATTEMPTS),
+            )
+            if cur.rowcount == 0:
+                conn.execute(
+                    """UPDATE ordinary_completion_deliveries
+                       SET delivery_state='dropped', delivery_claim=NULL,
+                           delivery_claimed_at=NULL, delivery_owner_pid=NULL,
+                           delivery_owner_started_at=NULL, updated_at=?
+                       WHERE delivery_id=? AND delivery_state='effect_started'
+                         AND delivery_claim=? AND delivery_attempts>=?""",
+                    (now, delivery_id, retained_claim, _MAX_DELIVERY_ATTEMPTS),
+                )
+        return retained_claim if cur.rowcount == 1 else None
     if evt.get("type") == "async_delegation":
         delegation_id = str(evt.get("delegation_id") or "")
         if not delegation_id:

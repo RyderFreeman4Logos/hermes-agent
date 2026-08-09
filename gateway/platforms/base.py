@@ -2704,6 +2704,25 @@ def merge_pending_message_event(
     """
     existing = pending_messages.get(session_key)
     if existing:
+        existing_metadata = getattr(existing, "metadata", None) or {}
+        incoming_metadata = getattr(event, "metadata", None) or {}
+        incoming_receipts = incoming_metadata.get("_completion_delivery_receipts")
+        incoming_receipt = incoming_metadata.get("_completion_delivery_receipt")
+        if isinstance(incoming_receipts, list) or isinstance(incoming_receipt, dict):
+            receipts = existing_metadata.get("_completion_delivery_receipts")
+            if not isinstance(receipts, list):
+                receipts = []
+                existing_metadata["_completion_delivery_receipts"] = receipts
+            existing_receipt = existing_metadata.pop(
+                "_completion_delivery_receipt", None
+            )
+            if isinstance(existing_receipt, dict):
+                receipts.append(existing_receipt)
+            if isinstance(incoming_receipts, list):
+                receipts.extend(r for r in incoming_receipts if isinstance(r, dict))
+            if isinstance(incoming_receipt, dict):
+                receipts.append(incoming_receipt)
+            existing.metadata = existing_metadata
         existing_is_photo = getattr(existing, "message_type", None) == MessageType.PHOTO
         incoming_is_photo = event.message_type == MessageType.PHOTO
         existing_has_media = bool(existing.media_urls)

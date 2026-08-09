@@ -5232,12 +5232,21 @@ def _owned_live_subagent_snapshot(
 
 
 def _current_model_control_owner(parent_agent: Any) -> Optional[Dict[str, Any]]:
+    import sys
+
     from gateway.session_context import get_session_env
 
     owner: Dict[str, Any] = {"owner_agent": parent_agent}
+    gateway_server = sys.modules.get("tui_gateway.server")
+    runtime_record = getattr(gateway_server, "_current_runtime_session_record", None)
+    # get_session_env falls back to os.environ; an inherited UI id alone is not
+    # gateway authority. Exact transport/generation checks apply only to a turn
+    # with an in-process gateway session record bound.
+    if runtime_record is None or runtime_record.get() is None:
+        return owner
     owner_session_id = get_session_env("HERMES_UI_SESSION_ID", "") or None
     if owner_session_id is None:
-        return owner
+        return None
     owner_transport, owner_session_record = _capture_gateway_steer_authority(
         owner_session_id
     )

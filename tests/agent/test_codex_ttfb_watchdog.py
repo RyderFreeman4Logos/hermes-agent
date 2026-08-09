@@ -2,11 +2,9 @@
 
 The chatgpt.com/backend-api/codex endpoint has an intermittent failure mode
 where it accepts the connection but never emits a single stream event. The
-watchdog in ``interruptible_api_call`` kills such a connection at a short TTFB
-cutoff (instead of waiting out the much longer wall-clock stale timeout) so the
-retry loop can reconnect promptly. Once any stream event arrives, the TTFB
-watchdog is satisfied and a separate idle watchdog handles streams that stop
-emitting SSE events.
+watchdog in ``interruptible_api_call`` aborts such a connection, marks
+acceptance ambiguous, and retains ownership of a resistant physical worker so
+no blind replay can start while it remains alive.
 
 The "bytes flowing" signal is ``agent._codex_stream_last_event_ts``, set on
 *any* event by ``codex_runtime.run_codex_stream`` — so reasoning-only or
@@ -147,6 +145,29 @@ def _prepare_clocked_call(agent, monkeypatch, clock, *, first_event=False):
     )
 
 
+def test_codex_owner_reservation_blocks_before_worker_start():
+    from agent import chat_completion_helpers as h
+
+    agent = SimpleNamespace()
+    first = {"attempt": None, "cancel_event": threading.Event()}
+    owner = h._reserve_codex_request_owner(agent, first)
+    owner["thread"] = SimpleNamespace(is_alive=lambda: False)
+    try:
+        with pytest.raises(TimeoutError) as excinfo:
+            h._reserve_codex_request_owner(
+                agent,
+                {"attempt": None, "cancel_event": threading.Event()},
+            )
+        assert getattr(
+            excinfo.value,
+            "_hermes_pre_dispatch_retained_owner",
+            False,
+        ) is True
+        assert getattr(agent, "_codex_request_owner") is owner
+    finally:
+        h._release_codex_request_owner(agent, owner)
+
+
 def test_ttfb_includes_silent_hang_hint_for_gpt_5_5(tmp_path, monkeypatch):
     """The no-first-byte watchdog should surface the same actionable hint as the
     stale-call timeout path when the model matches the silent-hang heuristic."""
@@ -248,10 +269,10 @@ def test_ttfb_does_not_kill_when_events_flow(tmp_path, monkeypatch):
     "stale_timeout",
     [float("inf"), float("-inf"), float("nan")],
 )
-def test_wait_notice_omits_reconnect_when_all_deadlines_are_non_finite(
+def test_wait_notice_omits_safety_timeout_when_all_deadlines_are_non_finite(
     stale_timeout,
 ):
-    """A disabled watchdog must not be advertised as a future reconnect."""
+    """A disabled watchdog must not advertise a future safety timeout."""
     from agent import chat_completion_helpers as h
 
     recovery = h._codex_wait_notice_recovery(
@@ -407,7 +428,22 @@ def test_codex_timeout_classes_use_fake_clock_and_retry_path(
     first_event,
 ):
     from agent import chat_completion_helpers as h
+    from agent import physical_attempt_diagnostics as diagnostics
     from agent.error_classifier import classify_api_error
+
+    lifecycle = []
+    monkeypatch.setattr(
+        diagnostics,
+        "record_ambiguity",
+        lambda attempt, **metadata: lifecycle.append(("ambiguity", attempt, metadata)),
+    )
+    monkeypatch.setattr(
+        diagnostics,
+        "record_reconciliation",
+        lambda attempt, **metadata: lifecycle.append(
+            ("reconciliation", attempt, metadata)
+        ),
+    )
 
     agent = _make_codex_agent(
         tmp_path,
@@ -418,6 +454,16 @@ def test_codex_timeout_classes_use_fake_clock_and_retry_path(
     monkeypatch.setattr(agent, "_compute_non_stream_stale_timeout", lambda *_a: 1200.0)
     clock = _FakeClock()
     call = _prepare_clocked_call(agent, monkeypatch, clock, first_event=first_event)
+    attempt = object()
+    fake_stream = agent._run_codex_stream
+
+    def linked_stream(api_kwargs, **kwargs):
+        lifecycle_state = api_kwargs.get(diagnostics._INTERNAL_LIFECYCLE_KEY)
+        if lifecycle_state is not None:
+            lifecycle_state["attempt"] = attempt
+        return fake_stream(api_kwargs, **kwargs)
+
+    monkeypatch.setattr(agent, "_run_codex_stream", linked_stream)
 
     def activity(now):
         if mode in {"keepalive", "semantic"}:
@@ -435,9 +481,45 @@ def test_codex_timeout_classes_use_fake_clock_and_retry_path(
         timeout_error = excinfo.value
         assert clock.now == expected_now
         assert f"timeout_class={timeout_class}" in str(timeout_error)
-        assert timeout_error._hermes_ambiguous_provider_acceptance is True
+        assert getattr(
+            timeout_error,
+            "_hermes_ambiguous_provider_acceptance",
+            False,
+        ) is True
         assert call.closes.count(close_reason) == 1
         assert classify_api_error(timeout_error).retryable is True
+        owner = getattr(agent, "_codex_request_owner")
+        assert owner["thread"].is_alive()
+        assert owner["lifecycle"]["cancel_event"].is_set()
+        with pytest.raises(TimeoutError) as blocked:
+            h.interruptible_api_call(
+                agent,
+                {"model": "gpt-5.5", "input": "must not dispatch"},
+            )
+        assert getattr(
+            blocked.value,
+            "_hermes_pre_dispatch_retained_owner",
+            False,
+        ) is True
+        assert len(workers) == 1
+        assert getattr(agent, "_codex_request_owner") is owner
+        assert lifecycle == [
+            (
+                "ambiguity",
+                attempt,
+                {"failure_class": timeout_class},
+            ),
+            (
+                "reconciliation",
+                attempt,
+                {"action": "retain"},
+            ),
+            (
+                "reconciliation",
+                attempt,
+                {"action": "wait"},
+            ),
+        ]
     finally:
         call.release.set()
         for worker in workers:

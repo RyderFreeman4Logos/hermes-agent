@@ -30,9 +30,21 @@ _KEY_FILE = "physical_attempt_digests.key"
 _RECORDS_FILE = "physical_attempt_digests.jsonl"
 _ROLES = {"main", "subagent", "reviewer", "fallback", "auxiliary", "unknown"}
 _OUTCOMES = {"completed", "incomplete", "failed", "error", "cancelled", "interrupted"}
+_PHASES = {"start", "progress", "ambiguity", "reconciliation", "terminal"}
+_PROGRESS = {"semantic"}
+_AMBIGUITY_CLASSES = {
+    "transport",
+    "missing_terminal",
+    "ttfb_timeout",
+    "sse_idle_timeout",
+    "no_progress_timeout",
+    "total_request_timeout",
+}
+_RECONCILIATION_ACTIONS = {"halt", "retain", "wait", "reaped", "resume"}
 _INTERNAL_SCOPE_KEY = "_hermes_physical_attempt_scope"
 _VISIBLE_CATEGORIES = {"text", "reasoning", "thinking", "tool", "terminal"}
 _TRANSPORT_KINDS = {"stdio", "websocket", "tee", "other"}
+_INTERNAL_LIFECYCLE_KEY = "_hermes_physical_attempt_lifecycle"
 
 
 @dataclass
@@ -40,6 +52,10 @@ class Attempt:
     digest: str
     streamed: bool = False
     finished: bool = False
+    progress_recorded: bool = False
+    ambiguity_recorded: bool = False
+    reconciliation_actions: set[str] = field(default_factory=set)
+    disposition: str | None = None
     started_ns: int | None = None
     dispatch_ns: int | None = None
     first_wire_ns: int | None = None
@@ -367,6 +383,8 @@ def finish_attempt(
             "attempt_digest": attempt.digest,
             "monotonic_ns": terminal_ns,
             "outcome": outcome if outcome in _OUTCOMES else "unknown",
+            "disposition": attempt.disposition
+            or (outcome if outcome in _OUTCOMES else "unknown"),
             "cache_state": cache_state,
             "input_tokens": canonical.input_tokens if usage else None,
             "output_tokens": canonical.output_tokens if usage else None,
@@ -380,6 +398,76 @@ def finish_attempt(
         _append(record)
     except Exception:
         return
+
+
+def _append_phase(record: dict[str, Any]) -> None:
+    try:
+        _append(record)
+    except Exception:
+        pass
+
+
+def record_progress(attempt: Attempt | None, *, progress: str) -> None:
+    """Record the first content-free semantic-progress phase for an attempt."""
+    if (
+        not isinstance(attempt, Attempt)
+        or attempt.finished
+        or attempt.progress_recorded
+    ):
+        return
+    attempt.progress_recorded = True
+    _append_phase(
+        {
+            "schema": _SCHEMA,
+            "phase": "progress",
+            "attempt_digest": attempt.digest,
+            "monotonic_ns": time.monotonic_ns(),
+            "progress": progress if progress in _PROGRESS else "semantic",
+        }
+    )
+
+
+def record_ambiguity(attempt: Attempt | None, *, failure_class: str) -> None:
+    """Record one acceptance-ambiguity phase without exception text."""
+    if (
+        not isinstance(attempt, Attempt)
+        or attempt.finished
+        or attempt.ambiguity_recorded
+    ):
+        return
+    attempt.ambiguity_recorded = True
+    attempt.disposition = "ambiguous_halt"
+    _append_phase(
+        {
+            "schema": _SCHEMA,
+            "phase": "ambiguity",
+            "attempt_digest": attempt.digest,
+            "monotonic_ns": time.monotonic_ns(),
+            "failure_class": failure_class
+            if failure_class in _AMBIGUITY_CLASSES
+            else "transport",
+            "acceptance": "unknown",
+        }
+    )
+
+
+def record_reconciliation(attempt: Attempt | None, *, action: str) -> None:
+    """Record each bounded reconciliation action once per attempt."""
+    if not isinstance(attempt, Attempt):
+        return
+    action_value = action if action in _RECONCILIATION_ACTIONS else "halt"
+    if action_value in attempt.reconciliation_actions:
+        return
+    attempt.reconciliation_actions.add(action_value)
+    _append_phase(
+        {
+            "schema": _SCHEMA,
+            "phase": "reconciliation",
+            "attempt_digest": attempt.digest,
+            "monotonic_ns": time.monotonic_ns(),
+            "action": action_value,
+        }
+    )
 
 
 def _request_identity(
@@ -506,6 +594,8 @@ def _digest_key() -> bytes:
 
 
 def _append(record: dict[str, Any]) -> None:
+    if record.get("phase") not in _PHASES:
+        return
     path = _ensure_root() / _RECORDS_FILE
     fd = _private_fd(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, create=True)
     try:

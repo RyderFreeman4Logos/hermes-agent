@@ -8108,6 +8108,7 @@ class AIAgent:
         moa_config: Optional[dict[str, Any]] = None,
         turn_origin: str = "user",
         heartbeat_event: Optional[Dict[str, Any]] = None,
+        turn_deadline: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         if turn_origin == "heartbeat_warm":
@@ -8246,6 +8247,7 @@ class AIAgent:
                     persist_user_display_metadata=persist_user_display_metadata,
                     moa_config=moa_config,
                     turn_origin=turn_origin,
+                    turn_deadline=turn_deadline,
                 )
             terminal = result if isinstance(result, dict) else {}
             terminal_messages = terminal.get("messages")

@@ -291,6 +291,7 @@ def finalize_turn(
     original_user_message,
     _should_review_memory,
     _turn_exit_reason,
+    logical_iteration_count=None,
     _pending_verification_response=None,
     _pending_verification_response_previewed=False,
 ):
@@ -302,8 +303,10 @@ def finalize_turn(
     from agent.conversation_loop import logger
 
 
+    if logical_iteration_count is None:
+        logical_iteration_count = api_call_count
     budget_exhausted = (
-        api_call_count >= agent.max_iterations
+        logical_iteration_count >= agent.max_iterations
         or agent.iteration_budget.remaining <= 0
     )
     budget_fallback_eligible = (
@@ -332,24 +335,24 @@ def finalize_turn(
         # response-loss blocker)
         if _pending_verification_response_previewed:
             agent._response_was_previewed = True
-        _turn_exit_reason = f"max_iterations_reached({api_call_count}/{agent.max_iterations})"
+        _turn_exit_reason = f"max_iterations_reached({logical_iteration_count}/{agent.max_iterations})"
         iteration_limit_fallback = True
         preserved_verification_fallback = True
     elif final_response is None and budget_fallback_eligible:
         # Budget exhausted — ask the model for a summary via one extra
         # API call with tools stripped.  _handle_max_iterations injects a
         # user message and makes a single toolless request.
-        _turn_exit_reason = f"max_iterations_reached({api_call_count}/{agent.max_iterations})"
+        _turn_exit_reason = f"max_iterations_reached({logical_iteration_count}/{agent.max_iterations})"
         agent._emit_status(
-            f"⚠️ Iteration budget exhausted ({api_call_count}/{agent.max_iterations}) "
+            f"⚠️ Iteration budget exhausted ({logical_iteration_count}/{agent.max_iterations}) "
             "— asking model to summarise"
         )
         if not agent.quiet_mode:
             agent._safe_print(
-                f"\n⚠️  Iteration budget exhausted ({api_call_count}/{agent.max_iterations}) "
+                f"\n⚠️  Iteration budget exhausted ({logical_iteration_count}/{agent.max_iterations}) "
                 "— requesting summary..."
             )
-        final_response = agent._handle_max_iterations(messages, api_call_count)
+        final_response = agent._handle_max_iterations(messages, logical_iteration_count)
         iteration_limit_fallback = True
 
     if iteration_limit_fallback:
@@ -373,7 +376,7 @@ def finalize_turn(
                         _kanban_task,
                         error=(
                             f"Iteration budget exhausted "
-                            f"({api_call_count}/{agent.max_iterations}) — "
+                            f"({logical_iteration_count}/{agent.max_iterations}) — "
                             "task could not complete within the allowed "
                             "iterations"
                         ),
@@ -381,13 +384,13 @@ def finalize_turn(
                         release_claim=True,
                         end_run=True,
                         event_payload_extra={
-                            "budget_used": api_call_count,
+                            "budget_used": logical_iteration_count,
                             "budget_max": agent.max_iterations,
                         },
                     )
                     logger.info(
                         "recorded budget-exhausted failure for task %s (%d/%d)",
-                        _kanban_task, api_call_count, agent.max_iterations,
+                        _kanban_task, logical_iteration_count, agent.max_iterations,
                     )
                 finally:
                     try:
@@ -407,7 +410,7 @@ def finalize_turn(
         final_response is not None
         and not failed
         and (
-            api_call_count < agent.max_iterations
+            logical_iteration_count < agent.max_iterations
             or normal_text_response
         )
     ) or (
@@ -746,11 +749,12 @@ def finalize_turn(
     _budget_max = agent.iteration_budget.max_total if agent.iteration_budget else 0
 
     _diag_msg = (
-        "Turn ended: reason=%s model=%s api_calls=%d/%d budget=%d/%d "
+        "Turn ended: reason=%s model=%s api_calls=%d logical_iterations=%d/%d budget=%d/%d "
         "tool_turns=%d last_msg_role=%s response_len=%d session=%s"
     )
     _diag_args = (
-        _turn_exit_reason, agent.model, api_call_count, agent.max_iterations,
+        _turn_exit_reason, agent.model, api_call_count,
+        logical_iteration_count, agent.max_iterations,
         _budget_used, _budget_max,
         _turn_tool_count, _last_msg_role, _resp_len,
         agent.session_id or "none",

@@ -1705,7 +1705,11 @@ def test_mid_turn_compaction_does_not_double_persist_in_place_rows(monkeypatch, 
     )
 
 
-def _codex_incomplete_with_reasoning(text: str, reasoning_id: str = "rs_default"):
+def _codex_incomplete_with_reasoning(
+    text: str,
+    reasoning_id: str = "rs_default",
+    encrypted_content: str | None = None,
+):
     """Incomplete response with a reasoning item whose id/encrypted_content
     can vary independently of the visible message text."""
     return SimpleNamespace(
@@ -1713,7 +1717,11 @@ def _codex_incomplete_with_reasoning(text: str, reasoning_id: str = "rs_default"
             SimpleNamespace(
                 type="reasoning",
                 id=reasoning_id,
-                encrypted_content=f"opaque_{reasoning_id}",
+                encrypted_content=(
+                    encrypted_content
+                    if encrypted_content is not None
+                    else f"opaque_{reasoning_id}"
+                ),
                 summary=[SimpleNamespace(text="thinking...")],
             ),
             SimpleNamespace(
@@ -1816,9 +1824,60 @@ def test_codex_incomplete_continues_past_local_count_until_late_completion(monke
     assert getattr(agent, "_codex_incomplete_retries") == 0
 
 
-def test_codex_ambiguous_post_accept_failure_is_not_replayed(monkeypatch):
-    """Without a provider resume handle, preserve ambiguity instead of rebilling."""
+def test_codex_late_tool_call_keeps_one_post_tool_model_call(monkeypatch):
+    """Continuation calls are physical calls, not local tool-loop iterations."""
     agent = _build_agent(monkeypatch)
+    responses = [
+        _codex_incomplete_with_reasoning(f"Partial {index}", f"rs_{index}")
+        for index in range(10)
+    ] + [
+        _codex_tool_call_response(),
+        _codex_message_response("Finished after the tool"),
+    ]
+    requests = []
+    tool_effects = []
+
+    def _fake_api_call(api_kwargs):
+        requests.append(api_kwargs)
+        return responses.pop(0)
+
+    def _fake_execute_tool_calls(assistant_message, messages, _task_id, *_args):
+        for call in assistant_message.tool_calls:
+            tool_effects.append(call.id)
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": '{"ok":true}',
+                }
+            )
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _fake_api_call)
+    monkeypatch.setattr(agent, "_execute_tool_calls", _fake_execute_tool_calls)
+
+    result = agent.run_conversation("continue, then run one tool")
+
+    assert len(requests) == 12
+    assert result["api_calls"] == 12
+    assert tool_effects == ["call_1"]
+    assert responses == []
+    assert result["completed"] is True
+    assert result["final_response"] == "Finished after the tool"
+
+
+def test_codex_ambiguous_post_accept_failure_is_not_replayed(monkeypatch, tmp_path):
+    """Ambiguity durably closes the turn before an unrelated next message."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from hermes_state import SessionDB
+
+    agent = _build_agent(monkeypatch)
+    monkeypatch.setattr(
+        agent,
+        "_persist_session",
+        run_agent.AIAgent._persist_session.__get__(agent, type(agent)),
+    )
+    agent._session_db = SessionDB()
+    agent._ensure_db_session()
     calls = []
     ambiguous = RuntimeError("stream ended after dispatch")
     ambiguous._hermes_ambiguous_provider_acceptance = True
@@ -1837,6 +1896,32 @@ def test_codex_ambiguous_post_accept_failure_is_not_replayed(monkeypatch):
     assert result["completed"] is False
     assert result["partial"] is True
     assert result["ambiguous_provider_attempt"] is True
+    assert result["messages"][-1]["role"] == "assistant"
+    assert result["messages"][-1]["finish_reason"] == "ambiguous_provider_attempt"
+    persisted = agent._session_db.get_messages(agent.session_id)
+    assert persisted[-1]["role"] == "assistant"
+    assert persisted[-1]["finish_reason"] == "ambiguous_provider_attempt"
+
+    next_requests = []
+
+    def _next_call(api_kwargs):
+        next_requests.append(api_kwargs)
+        return _codex_message_response("Answered the unrelated turn")
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _next_call)
+    second = agent.run_conversation(
+        "unrelated new question",
+        conversation_history=persisted,
+    )
+
+    assert second["completed"] is True
+    assert len(next_requests) == 1
+    user_items = [
+        item
+        for item in next_requests[0]["input"]
+        if isinstance(item, dict) and item.get("role") == "user"
+    ]
+    assert user_items[-1]["content"] == "unrelated new question"
 
 
 def test_codex_unreplayable_incomplete_backs_off_without_ending_turn(monkeypatch):
@@ -1864,6 +1949,67 @@ def test_codex_unreplayable_incomplete_backs_off_without_ending_turn(monkeypatch
     assert result["completed"] is True
     assert result["final_response"] == "Finished after backoff"
     assert sleeps == [0.2, 0.2]
+
+
+def test_codex_duplicate_replay_state_backs_off_and_interrupt_wins(monkeypatch):
+    """Byte-equivalent replay state cannot busy-dispatch another billed request."""
+    from agent import conversation_loop
+
+    agent = _build_agent(monkeypatch)
+    responses = [
+        _codex_incomplete_with_reasoning("Same state", "rs_first", "opaque_same"),
+        _codex_incomplete_with_reasoning("Same state", "rs_second", "opaque_same"),
+        _codex_message_response("Must not dispatch"),
+    ]
+    requests = []
+    backoffs = []
+
+    def _fake_api_call(api_kwargs):
+        requests.append(api_kwargs)
+        return responses.pop(0)
+
+    def _interrupting_backoff(attempt, **_kwargs):
+        backoffs.append(attempt)
+        agent._interrupt_requested = True
+        return 0.4
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _fake_api_call)
+    monkeypatch.setattr(conversation_loop, "jittered_backoff", _interrupting_backoff)
+
+    result = agent.run_conversation("do not busy replay")
+
+    assert len(requests) == 2
+    assert backoffs == [2]
+    assert result["completed"] is False
+    assert result["interrupted"] is True
+
+
+def test_codex_pre_dispatch_deadline_rejects_too_small_watchdog_budget(
+    monkeypatch,
+):
+    """A known outer deadline wins before a request can reach the provider."""
+    from agent import conversation_loop
+
+    agent = _build_agent(monkeypatch)
+    monkeypatch.setenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "5")
+    monkeypatch.setenv("HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS", "5")
+    monkeypatch.setattr(conversation_loop.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(
+        agent,
+        "_interruptible_api_call",
+        lambda _kwargs: pytest.fail("provider dispatch must not occur"),
+    )
+
+    result = agent.run_conversation(
+        "do not dispatch without watchdog headroom",
+        turn_deadline=107.0,
+    )
+
+    assert result["api_calls"] == 0
+    assert result["completed"] is False
+    assert result["failed"] is True
+    assert result.get("ambiguous_provider_attempt") is not True
+    assert result["messages"][-1]["role"] == "assistant"
 
 
 def test_codex_incomplete_counter_resets_after_completion_and_new_turn(monkeypatch):

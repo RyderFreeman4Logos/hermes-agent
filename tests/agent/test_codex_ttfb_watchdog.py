@@ -425,20 +425,60 @@ def test_codex_timeout_classes_use_fake_clock_and_retry_path(
         if mode == "semantic":
             setattr(agent, "_codex_stream_last_progress_ts", now)
 
+    real_thread = h.threading.Thread
     workers = _install_clocked_worker(
         monkeypatch, h, clock, call.ready, step=step, on_poll=activity
     )
     try:
         with pytest.raises(TimeoutError) as excinfo:
             h.interruptible_api_call(agent, {"model": "gpt-5.5", "input": "hi"})
+        timeout_error = excinfo.value
         assert clock.now == expected_now
-        assert f"timeout_class={timeout_class}" in str(excinfo.value)
+        assert f"timeout_class={timeout_class}" in str(timeout_error)
+        assert timeout_error._hermes_ambiguous_provider_acceptance is True
         assert call.closes.count(close_reason) == 1
-        assert classify_api_error(excinfo.value).retryable is True
+        assert classify_api_error(timeout_error).retryable is True
     finally:
         call.release.set()
         for worker in workers:
             worker.wait()
+
+    # Feed the exact helper-generated object through the conversation loop:
+    # ambiguity must terminate locally rather than replaying the billed request.
+    monkeypatch.setattr(h.threading, "Thread", real_thread)
+    from agent import conversation_loop
+    import run_agent
+
+    monkeypatch.setattr(run_agent, "get_tool_definitions", lambda **_kwargs: [])
+    monkeypatch.setattr(run_agent, "check_toolset_requirements", lambda: {})
+    monkeypatch.setattr(agent, "tools", [], raising=False)
+    monkeypatch.setattr(agent, "valid_tool_names", set(), raising=False)
+    monkeypatch.setattr(agent, "_cleanup_task_resources", lambda task_id: None)
+    monkeypatch.setattr(
+        agent,
+        "_persist_session",
+        lambda messages, conversation_history=None: None,
+    )
+    monkeypatch.setattr(
+        agent,
+        "_save_trajectory",
+        lambda messages, user_query, completed: None,
+    )
+    calls = []
+
+    def _raise_same_timeout(_kwargs):
+        calls.append(None)
+        raise timeout_error
+
+    monkeypatch.setattr(agent, "_disable_streaming", True, raising=False)
+    monkeypatch.setattr(agent, "_interruptible_api_call", _raise_same_timeout)
+    monkeypatch.setattr(conversation_loop, "jittered_backoff", lambda *_a, **_k: 0.0)
+    monkeypatch.setattr(conversation_loop.time, "sleep", lambda _seconds: None)
+    result = agent.run_conversation("one potentially billed action")
+
+    assert len(calls) == 1
+    assert result["ambiguous_provider_attempt"] is True
+    assert result["messages"][-1]["role"] == "assistant"
 
 
 def test_semantic_progress_survives_1200_and_1500_seconds(tmp_path, monkeypatch):

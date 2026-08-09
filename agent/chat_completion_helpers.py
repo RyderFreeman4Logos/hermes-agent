@@ -482,35 +482,43 @@ def _check_stale_giveup(agent) -> None:
         )
 
 
-def _reserve_codex_request_owner(agent, lifecycle: dict[str, Any]) -> dict[str, Any]:
-    """Reserve one physical Codex worker or reject a blind overlapping call."""
+def _reconcile_codex_request_owner_locked(agent) -> None:
     from agent import physical_attempt_diagnostics
 
+    previous = getattr(agent, "_codex_request_owner", None)
+    if not isinstance(previous, dict):
+        return
+    thread = previous.get("thread")
+    if thread is None or previous.get("started") is False or thread.is_alive():
+        previous_lifecycle = previous.get("lifecycle") or {}
+        physical_attempt_diagnostics.record_reconciliation(
+            previous_lifecycle.get("attempt"),
+            action="wait",
+        )
+        error = TimeoutError(
+            "A prior Codex request still owns its physical worker; "
+            "Hermes did not dispatch another request."
+        )
+        setattr(error, "_hermes_ambiguous_provider_acceptance", True)
+        setattr(error, "_hermes_pre_dispatch_retained_owner", True)
+        raise error
+    physical_attempt_diagnostics.record_reconciliation(
+        (previous.get("lifecycle") or {}).get("attempt"),
+        action="reaped",
+    )
+    setattr(agent, "_codex_request_owner", None)
+
+
+def _fence_retained_codex_request_owner(agent) -> None:
+    """Block every provider route while a retained Codex worker is alive."""
     with _CODEX_REQUEST_OWNER_LOCK:
-        previous = getattr(agent, "_codex_request_owner", None)
-        if isinstance(previous, dict):
-            thread = previous.get("thread")
-            if (
-                thread is None
-                or previous.get("started") is False
-                or thread.is_alive()
-            ):
-                previous_lifecycle = previous.get("lifecycle") or {}
-                physical_attempt_diagnostics.record_reconciliation(
-                    previous_lifecycle.get("attempt"),
-                    action="wait",
-                )
-                error = TimeoutError(
-                    "A prior Codex request still owns its physical worker; "
-                    "Hermes did not dispatch another request."
-                )
-                setattr(error, "_hermes_ambiguous_provider_acceptance", True)
-                setattr(error, "_hermes_pre_dispatch_retained_owner", True)
-                raise error
-            physical_attempt_diagnostics.record_reconciliation(
-                (previous.get("lifecycle") or {}).get("attempt"),
-                action="reaped",
-            )
+        _reconcile_codex_request_owner_locked(agent)
+
+
+def _reserve_codex_request_owner(agent, lifecycle: dict[str, Any]) -> dict[str, Any]:
+    """Reserve one physical Codex worker or reject a blind overlapping call."""
+    with _CODEX_REQUEST_OWNER_LOCK:
+        _reconcile_codex_request_owner_locked(agent)
         owner = {
             "thread": None,
             "started": False,
@@ -909,6 +917,7 @@ def direct_api_call(agent, api_kwargs: dict):
     ``TimeoutError`` so the outer retry loop reconnects with backoff /
     credential rotation / provider fallback.
     """
+    _fence_retained_codex_request_owner(agent)
     _check_stale_giveup(agent)
     agent._touch_activity("waiting for non-streaming API response")
     # Request-lifecycle state, every transition under ``request_client_lock``
@@ -1132,6 +1141,8 @@ def interruptible_api_call(agent, api_kwargs: dict):
     the main retry loop can try again with backoff / credential rotation /
     provider fallback.
     """
+    _fence_retained_codex_request_owner(agent)
+
     # Cron and other non-interactive, nested-pool contexts must not spawn the
     # interrupt worker — it wedges before the socket opens on the 2nd+ call
     # (#62151). Run inline instead. See should_use_direct_api_call.
@@ -2717,6 +2728,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     def _managed_summary_call(request, callback, *, retry_count: int):
         from agent import relay_llm
 
+        _fence_retained_codex_request_owner(agent)
         return relay_llm.execute_current(
             request,
             callback,
@@ -2858,7 +2870,9 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
         if agent.api_mode == "codex_responses":
             codex_kwargs = agent._build_api_kwargs(api_messages)
             codex_kwargs.pop("tools", None)
-            summary_response = agent._run_codex_stream(codex_kwargs)
+            summary_response = _managed_summary_call(
+                codex_kwargs, agent._run_codex_stream, retry_count=0
+            )
             _ct_sum = agent._get_transport()
             _cnr_sum = _ct_sum.normalize_response(summary_response)
             final_response = (_cnr_sum.content or "").strip()
@@ -2970,7 +2984,9 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             if agent.api_mode == "codex_responses":
                 codex_kwargs = agent._build_api_kwargs(api_messages)
                 codex_kwargs.pop("tools", None)
-                retry_response = agent._run_codex_stream(codex_kwargs)
+                retry_response = _managed_summary_call(
+                    codex_kwargs, agent._run_codex_stream, retry_count=1
+                )
                 _ct_retry = agent._get_transport()
                 _cnr_retry = _ct_retry.normalize_response(retry_response)
                 final_response = (_cnr_retry.content or "").strip()
@@ -3151,6 +3167,7 @@ def interruptible_streaming_api_call(
     """
     if agent._interrupt_requested:
         raise InterruptedError("Agent interrupted before streaming API call")
+    _fence_retained_codex_request_owner(agent)
 
     # Cron and other non-interactive, nested-pool contexts deadlock on the
     # spawned worker thread (#62151). They also have no stream consumer, so the

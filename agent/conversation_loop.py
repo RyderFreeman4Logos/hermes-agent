@@ -1785,6 +1785,7 @@ def run_conversation(
     agent._provider_response_records = []
     agent._provider_response_request_index = 0
     agent._cache_turn_origin = turn_origin
+    _terminal_text_only_continuation = False
 
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
     # turn to the codex app-server subprocess (terminal/file ops/patching
@@ -1808,7 +1809,7 @@ def run_conversation(
         or agent._budget_grace_call
         or getattr(agent, "_codex_incomplete_retries", 0)
     ):
-        terminal_text_only = (
+        terminal_text_only = _terminal_text_only_continuation or (
             getattr(agent, "_delegate_depth", 0) > 0
             and min(
                 agent.max_iterations - logical_iteration_count,
@@ -4047,6 +4048,15 @@ def run_conversation(
                     messages.append({"role": "assistant", "content": final_response})
                     _pre_dispatch_deadline_exhausted = True
                     break
+
+                if getattr(
+                    api_error,
+                    "_hermes_pre_dispatch_retained_owner",
+                    False,
+                ):
+                    api_call_count -= 1
+                    agent._api_call_count = api_call_count
+                    _refund_current_logical_iteration()
 
                 if getattr(api_error, "_hermes_ambiguous_provider_acceptance", False):
                     ambiguous_error = (
@@ -6404,11 +6414,23 @@ def run_conversation(
                     except Exception:
                         pass
             
-            if terminal_text_only and (
-                has_incomplete_scratchpad(assistant_message.content or "")
-                or not agent._strip_think_blocks(assistant_message.content or "").strip()
-                or assistant_message.tool_calls
-                or finish_reason in {"incomplete", "length", "tool_calls"}
+            codex_provider_incomplete = (
+                agent.api_mode == "codex_responses"
+                and finish_reason == "incomplete"
+            )
+            if terminal_text_only and codex_provider_incomplete:
+                _terminal_text_only_continuation = True
+            if (
+                terminal_text_only
+                and not codex_provider_incomplete
+                and (
+                    has_incomplete_scratchpad(assistant_message.content or "")
+                    or not agent._strip_think_blocks(
+                        assistant_message.content or ""
+                    ).strip()
+                    or assistant_message.tool_calls
+                    or finish_reason in {"incomplete", "length", "tool_calls"}
+                )
             ):
                 _turn_exit_reason = (
                     f"terminal_slot_exhausted({logical_iteration_count}/{agent.max_iterations})"

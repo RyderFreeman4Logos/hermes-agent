@@ -522,6 +522,7 @@ def test_run_codex_stream_wraps_the_final_physical_attempt(
 
     starts = []
     finishes = []
+    progress = []
     token = object()
 
     def start(request, **metadata):
@@ -533,6 +534,11 @@ def test_run_codex_stream_wraps_the_final_physical_attempt(
 
     monkeypatch.setattr(diagnostics, "start_responses_attempt", start)
     monkeypatch.setattr(diagnostics, "finish_responses_attempt", finish)
+    monkeypatch.setattr(
+        diagnostics,
+        "record_progress",
+        lambda attempt, **metadata: progress.append((attempt, metadata)),
+    )
 
     agent = _build_agent(monkeypatch)
     agent.platform = platform
@@ -549,6 +555,7 @@ def test_run_codex_stream_wraps_the_final_physical_attempt(
         assert diagnostics._INTERNAL_SCOPE_KEY not in physical
         return _FakeCreateStream(
             [
+                SimpleNamespace(type="response.output_text.delta", delta="done"),
                 SimpleNamespace(
                     type="response.completed",
                     response=SimpleNamespace(
@@ -574,6 +581,7 @@ def test_run_codex_stream_wraps_the_final_physical_attempt(
         "retry": 0,
         "continuation": 2,
     }
+    assert progress == [(token, {"progress": "semantic"})]
     assert finishes == [(token, {"usage": usage, "outcome": "completed"})]
 
 
@@ -847,6 +855,159 @@ def test_run_codex_stream_returns_terminal_response_when_post_terminal_drain_fai
     assert any(
         "finalization" in record.message for record in caplog.records
     )
+
+
+@pytest.mark.parametrize("transport_error_name", ["ReadError", "WriteError"])
+def test_run_codex_stream_marks_post_dispatch_transport_error_ambiguous(
+    monkeypatch,
+    transport_error_name,
+):
+    import httpx
+
+    from agent import physical_attempt_diagnostics as diagnostics
+
+    agent = _build_agent(monkeypatch)
+    request = httpx.Request(
+        "POST",
+        "https://chatgpt.com/backend-api/codex/responses",
+    )
+    transport_error = getattr(httpx, transport_error_name)(
+        "wire failed after response start",
+        request=request,
+    )
+    token = object()
+    phases = []
+    create_calls = []
+
+    class ReadDroppingStream:
+        def __iter__(self):
+            yield SimpleNamespace(type="response.created")
+            raise transport_error
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(
+        diagnostics,
+        "start_responses_attempt",
+        lambda *_args, **_kwargs: token,
+    )
+    monkeypatch.setattr(
+        diagnostics,
+        "record_ambiguity",
+        lambda attempt, **metadata: phases.append(("ambiguity", attempt, metadata)),
+    )
+    monkeypatch.setattr(
+        diagnostics,
+        "record_reconciliation",
+        lambda attempt, **metadata: phases.append(
+            ("reconciliation", attempt, metadata)
+        ),
+    )
+    monkeypatch.setattr(
+        diagnostics,
+        "finish_responses_attempt",
+        lambda attempt, **metadata: phases.append(("terminal", attempt, metadata)),
+    )
+
+    def create(**kwargs):
+        create_calls.append(kwargs)
+        return ReadDroppingStream()
+
+    raw_client = SimpleNamespace(responses=SimpleNamespace(create=create))
+
+    with pytest.raises(type(transport_error)) as excinfo:
+        agent._run_codex_stream(_codex_request_kwargs(), client=raw_client)
+
+    assert excinfo.value is transport_error
+    assert getattr(
+        transport_error,
+        "_hermes_ambiguous_provider_acceptance",
+        False,
+    ) is True
+    assert len(create_calls) == 1
+    assert phases == [
+        ("ambiguity", token, {"failure_class": "transport"}),
+        ("reconciliation", token, {"action": "halt"}),
+        ("terminal", token, {"usage": None, "outcome": "error"}),
+    ]
+
+
+def test_run_codex_stream_retries_preaccept_connect_error(monkeypatch):
+    import httpx
+
+    agent = _build_agent(monkeypatch)
+    request = httpx.Request(
+        "POST",
+        "https://chatgpt.com/backend-api/codex/responses",
+    )
+    connect_error = httpx.ConnectError("connect failed", request=request)
+    calls = []
+
+    def create(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise connect_error
+        return _FakeCreateStream(
+            [
+                SimpleNamespace(
+                    type="response.completed",
+                    response=SimpleNamespace(
+                        status="completed",
+                        output=[],
+                        usage=None,
+                    ),
+                )
+            ]
+        )
+
+    raw_client = SimpleNamespace(responses=SimpleNamespace(create=create))
+
+    response = agent._run_codex_stream(_codex_request_kwargs(), client=raw_client)
+
+    assert response is not None
+    assert response.status == "completed"
+    assert len(calls) == 2
+    assert getattr(
+        connect_error,
+        "_hermes_ambiguous_provider_acceptance",
+        False,
+    ) is False
+
+
+def test_cancelled_codex_lifecycle_fences_late_stream_callbacks(monkeypatch):
+    import threading
+
+    from agent import physical_attempt_diagnostics as diagnostics
+
+    agent = _build_agent(monkeypatch)
+    cancel_event = threading.Event()
+    deltas = []
+    monkeypatch.setattr(agent, "_fire_stream_delta", deltas.append)
+
+    class LateStream:
+        def __iter__(self):
+            yield SimpleNamespace(type="response.created")
+            cancel_event.set()
+            yield SimpleNamespace(type="response.output_text.delta", delta="late")
+
+        def close(self):
+            return None
+
+    raw_client = SimpleNamespace(
+        responses=SimpleNamespace(create=lambda **_kwargs: LateStream())
+    )
+    request = _codex_request_kwargs()
+    request[diagnostics._INTERNAL_LIFECYCLE_KEY] = {
+        "attempt": None,
+        "cancel_event": cancel_event,
+    }
+
+    with pytest.raises(InterruptedError, match="owner cancelled"):
+        agent._run_codex_stream(request, client=raw_client)
+
+    assert deltas == []
+    assert getattr(agent, "_codex_streamed_text_parts") == []
 
 
 def test_run_conversation_codex_plain_text(monkeypatch):
@@ -1741,6 +1902,31 @@ def _codex_unreplayable_reasoning_response(text: str):
     )
 
 
+def test_delegated_final_slot_keeps_codex_incomplete_continuation(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    setattr(agent, "_delegate_depth", 1)
+    setattr(agent, "max_iterations", 1)
+    responses = [
+        _codex_incomplete_with_reasoning("Still working", "rs_1"),
+        _codex_message_response("Late completion"),
+    ]
+    requests = []
+
+    def _fake_api_call(api_kwargs):
+        requests.append(api_kwargs)
+        return responses.pop(0)
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _fake_api_call)
+
+    result = agent.run_conversation("finish this delegated task")
+
+    assert len(requests) == 2
+    assert all("tools" not in request for request in requests)
+    assert result["api_calls"] == 2
+    assert result["completed"] is True
+    assert result["final_response"] == "Late completion"
+
+
 def test_codex_incomplete_budget_issues_three_continuations(monkeypatch):
     """Three declared continuations remain exactly three physical follow-ups."""
     agent = _build_agent(monkeypatch)
@@ -1998,6 +2184,25 @@ def test_codex_pre_dispatch_deadline_rejects_too_small_watchdog_budget(
     assert result["failed"] is True
     assert result.get("ambiguous_provider_attempt") is not True
     assert result["messages"][-1]["role"] == "assistant"
+
+
+def test_codex_retained_owner_rejection_refunds_non_dispatch(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    blocked = TimeoutError("prior physical request still owns its worker")
+    setattr(blocked, "_hermes_ambiguous_provider_acceptance", True)
+    setattr(blocked, "_hermes_pre_dispatch_retained_owner", True)
+
+    def reject(_kwargs):
+        raise blocked
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", reject)
+
+    result = agent.run_conversation("must not overlap the retained request")
+
+    assert result["api_calls"] == 0
+    assert result["completed"] is False
+    assert result["ambiguous_provider_attempt"] is True
+    assert getattr(agent, "iteration_budget").used == 0
 
 
 def test_codex_incomplete_counter_resets_after_completion_and_new_turn(monkeypatch):

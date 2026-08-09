@@ -1390,33 +1390,58 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     diagnostic_scope = relay_api_kwargs.pop(
         physical_attempt_diagnostics._INTERNAL_SCOPE_KEY, None
     )
+    diagnostic_lifecycle = relay_api_kwargs.pop(
+        physical_attempt_diagnostics._INTERNAL_LIFECYCLE_KEY,
+        None,
+    )
     # Accumulate streamed text so callers / compat shims can read it.
     agent._codex_streamed_text_parts: list = []
+    diagnostic_attempt = {"value": None, "finished": False}
+
+    def _lifecycle_cancelled() -> bool:
+        if not isinstance(diagnostic_lifecycle, dict):
+            return False
+        is_set = getattr(diagnostic_lifecycle.get("cancel_event"), "is_set", None)
+        return bool(callable(is_set) and is_set())
 
     def _on_text_delta(text: str) -> None:
+        if _lifecycle_cancelled():
+            return
         agent._codex_streamed_text_parts.append(text)
         agent._fire_stream_delta(text)
 
     def _on_reasoning_delta(text: str) -> None:
-        agent._fire_reasoning_delta(text)
+        if not _lifecycle_cancelled():
+            agent._fire_reasoning_delta(text)
 
     def _on_commentary_message(text: str) -> None:
-        agent._fire_streamed_codex_commentary(text)
+        if not _lifecycle_cancelled():
+            agent._fire_streamed_codex_commentary(text)
 
     def _on_event(event: Any) -> None:
+        if _lifecycle_cancelled():
+            return
         # TTFB watchdog and activity touch — runs once per SSE event.
         agent._codex_stream_last_event_ts = time.time()
         agent._touch_activity("receiving stream response")
 
     def _on_progress() -> None:
+        if _lifecycle_cancelled():
+            return
         agent._codex_stream_last_progress_ts = time.time()
+        physical_attempt_diagnostics.record_progress(
+            diagnostic_attempt["value"],
+            progress="semantic",
+        )
 
     for attempt in range(max_stream_retries + 1):
+        if _lifecycle_cancelled():
+            raise InterruptedError("Codex request owner cancelled before stream retry")
         if agent._interrupt_requested:
             raise InterruptedError("Agent interrupted before Codex stream retry")
 
         intercepted_events = []
-        writer_token = {"value": None}
+        writer_token: dict[str, int | None] = {"value": None}
         diagnostic_attempt = {"value": None, "finished": False}
 
         platform = str(getattr(agent, "platform", "") or "").lower()
@@ -1455,18 +1480,19 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     ),
                 )
             )
-            try:
-                return response_create(**stream_kwargs)
-            except BaseException:
-                _finish_diagnostic(None, "error")
-                raise
+            if isinstance(diagnostic_lifecycle, dict):
+                diagnostic_lifecycle["attempt"] = diagnostic_attempt["value"]
+            return response_create(**stream_kwargs)
 
         def _codex_stream_created(_raw_stream: Any) -> None:
             # Claim the delta sink for THIS physical attempt. A newer attempt
             # supersedes this token and fences late deltas out of the turn.
-            writer_token["value"] = claim_stream_writer(agent)
+            if not _lifecycle_cancelled():
+                writer_token["value"] = claim_stream_writer(agent)
 
         def _accept_codex_chunk(_chunk: Any) -> bool:
+            if _lifecycle_cancelled():
+                return False
             token = writer_token["value"]
             if token is None or stream_writer_is_current(agent, token):
                 return True
@@ -1513,35 +1539,48 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 },
                 defer_logical_completion=True,
             )
-        except (
-            _httpx.RemoteProtocolError,
-            _httpx.ReadTimeout,
-            _httpx.ConnectError,
-            ConnectionError,
-        ) as exc:
+        except (_httpx.TransportError, ConnectionError) as exc:
+            # ConnectError is the one HTTPX transport class that proves no
+            # connection was established, so provider acceptance is impossible.
+            if isinstance(exc, _httpx.ConnectError):
+                _finish_diagnostic(None, "error")
+                if attempt < max_stream_retries and not _lifecycle_cancelled():
+                    logger.debug(
+                        "Codex Responses connect failure before acceptance; retrying "
+                        "attempt=%s/%s. %s error=%s",
+                        attempt + 1,
+                        max_stream_retries + 1,
+                        agent._client_log_context(),
+                        exc,
+                    )
+                    continue
+                raise
+            physical_attempt_diagnostics.record_ambiguity(
+                diagnostic_attempt["value"],
+                failure_class="transport",
+            )
+            physical_attempt_diagnostics.record_reconciliation(
+                diagnostic_attempt["value"],
+                action="halt",
+            )
             _finish_diagnostic(None, "error")
-            if attempt < max_stream_retries and isinstance(exc, _httpx.ConnectError):
-                logger.debug(
-                    "Codex Responses connect failure before acceptance; retrying "
-                    "attempt=%s/%s. %s error=%s",
-                    attempt + 1,
-                    max_stream_retries + 1,
-                    agent._client_log_context(),
-                    exc,
-                )
-                continue
             setattr(exc, "_hermes_ambiguous_provider_acceptance", True)
             logger.warning(
                 "Codex Responses transport failure may follow provider acceptance; "
-                "not replaying a fresh request. phase=connect attempt=%s/%s "
+                "not replaying a fresh request. phase=dispatch attempt=%s/%s "
                 "error_type=%s. %s",
-                attempt + 1, max_stream_retries + 1, type(exc).__name__,
+                attempt + 1,
+                max_stream_retries + 1,
+                type(exc).__name__,
                 agent._client_log_context(),
             )
             raise
+        except BaseException:
+            _finish_diagnostic(None, "error")
+            raise
 
         def _interrupt_or_superseded() -> bool:
-            return bool(agent._interrupt_requested)
+            return bool(agent._interrupt_requested or _lifecycle_cancelled())
 
         try:
             try:
@@ -1563,27 +1602,66 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     on_progress=_on_progress,
                     interrupt_check=_interrupt_or_superseded,
                 )
-            except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
+            except (_httpx.TransportError, ConnectionError) as exc:
+                if isinstance(exc, _httpx.ConnectError) and writer_token["value"] is None:
+                    _finish_diagnostic(None, "error")
+                    if attempt < max_stream_retries and not _lifecycle_cancelled():
+                        logger.debug(
+                            "Codex Responses connect failure before acceptance; retrying "
+                            "attempt=%s/%s. %s error=%s",
+                            attempt + 1,
+                            max_stream_retries + 1,
+                            agent._client_log_context(),
+                            exc,
+                        )
+                        continue
+                    raise
+                physical_attempt_diagnostics.record_ambiguity(
+                    diagnostic_attempt["value"],
+                    failure_class="transport",
+                )
+                physical_attempt_diagnostics.record_reconciliation(
+                    diagnostic_attempt["value"],
+                    action="halt",
+                )
                 _finish_diagnostic(None, "error")
                 setattr(exc, "_hermes_ambiguous_provider_acceptance", True)
                 logger.warning(
                     "Codex Responses stream transport failed after dispatch; "
                     "not replaying a fresh request. attempt=%s/%s "
-                    "error_type=%s. %s",
-                    attempt + 1, max_stream_retries + 1,
-                    type(exc).__name__, agent._client_log_context(), exc,
+                    "error_type=%s. %s error=%s",
+                    attempt + 1,
+                    max_stream_retries + 1,
+                    type(exc).__name__,
+                    agent._client_log_context(),
+                    exc,
                 )
                 raise
             except RuntimeError as exc:
+                if _lifecycle_cancelled():
+                    raise InterruptedError(
+                        "Codex request owner cancelled during stream"
+                    ) from exc
                 if event_stream.final_response is not None:
                     _finish_diagnostic(
                         getattr(event_stream.final_response, "usage", None),
                         str(getattr(event_stream.final_response, "status", None) or "completed"),
                     )
                     return event_stream.final_response
+                physical_attempt_diagnostics.record_ambiguity(
+                    diagnostic_attempt["value"],
+                    failure_class="missing_terminal",
+                )
+                physical_attempt_diagnostics.record_reconciliation(
+                    diagnostic_attempt["value"],
+                    action="halt",
+                )
                 setattr(exc, "_hermes_ambiguous_provider_acceptance", True)
                 _finish_diagnostic(None, "error")
                 raise
+
+            if _lifecycle_cancelled():
+                raise InterruptedError("Codex request owner cancelled during stream")
 
             # A terminal response has already been assembled at this point
             # (``final`` is built), so a transport error while draining the
@@ -1591,11 +1669,11 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             # finalizer — must NOT discard it or trigger a new physical
             # request. Record it as a non-fatal finalization warning and
             # still return the already-completed, already-billed response.
-            if not agent._interrupt_requested:
+            if not agent._interrupt_requested and not _lifecycle_cancelled():
                 try:
                     for _ignored in event_stream:
                         pass
-                except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
+                except (_httpx.TransportError, ConnectionError) as exc:
                     logger.warning(
                         "Codex Responses failure_class=transport_failure "
                         "phase=finalization: transport finalization failed "
@@ -1641,7 +1719,10 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                         )
             if not diagnostic_attempt["finished"]:
                 _finish_diagnostic(
-                    None, "interrupted" if agent._interrupt_requested else "error"
+                    None,
+                    "interrupted"
+                    if agent._interrupt_requested or _lifecycle_cancelled()
+                    else "error",
                 )
 
 

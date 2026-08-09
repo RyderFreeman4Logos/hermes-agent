@@ -6259,7 +6259,21 @@ def _attach_tui_cache_callback(agent, sid: str):
         if cache_info.get("note"):
             text += f" · {cache_info['note']}"
         kind = "error" if cache_info["level"] == "error" else "cache_hit"
-        _emit("status.update", sid, {"kind": kind, "text": text})
+        payload = {"kind": kind, "text": text}
+        if (
+            getattr(agent, "_tui_first_provider_response_record_enabled", False)
+            and not getattr(agent, "_tui_first_provider_response_recorded", False)
+        ):
+            agent._tui_first_provider_response_recorded = True
+            identity = f"{sid}:{getattr(agent, 'session_id', '')}".encode()
+            payload["first_provider_response"] = {
+                "turn_origin": str(getattr(agent, "_tui_turn_origin", "user")),
+                "request_index": 1,
+                "timestamp": time.time(),
+                "owner": "tui_gateway",
+                "session": hashlib.sha256(identity).hexdigest(),
+            }
+        _emit("status.update", sid, payload)
 
     agent._tui_cache_callback = emit_cache_state
     return agent
@@ -9803,6 +9817,7 @@ def _dispatch_completion_batch(
                 text,
                 display_kind="async_delegation_complete",
                 display_metadata=_async_delegation_display_metadata(evt),
+                turn_origin="subagent-result",
                 completion_delivery_callback=lambda outcome: [
                     _finish_async_completion_claim(item["evt"], claim, outcome)
                     for item, claim in async_claims
@@ -9810,7 +9825,9 @@ def _dispatch_completion_batch(
                 **kwargs,
             )
         else:
-            _run_prompt_submit(rid, sid, session, prompt, **kwargs)
+            _run_prompt_submit(
+                rid, sid, session, prompt, turn_origin="background-completion", **kwargs
+            )
         for item, claim in claimed:
             if item["evt"].get("type") != "async_delegation":
                 complete_event_delivery(item["evt"], claim)
@@ -10379,6 +10396,9 @@ def _handle_heartbeat_event(sid: str, session: dict, evt: dict) -> None:
 
     def _warm() -> None:
         try:
+            agent._tui_turn_origin = "heartbeat_warm"
+            agent._tui_first_provider_response_record_enabled = True
+            agent._tui_first_provider_response_recorded = False
             agent.run_conversation(
                 "",
                 turn_origin="heartbeat_warm",
@@ -10735,6 +10755,11 @@ def _run_prompt_submit(
         ):
             _start_inflight_turn(session, text)
         agent = session["agent"]
+        agent._tui_turn_origin = turn_origin or (
+            "background-completion" if completion_delivery else "user"
+        )
+        agent._tui_first_provider_response_record_enabled = True
+        agent._tui_first_provider_response_recorded = False
         if not heartbeat_turn and hasattr(agent, "clear_interrupt"):
             try:
                 agent.clear_interrupt()

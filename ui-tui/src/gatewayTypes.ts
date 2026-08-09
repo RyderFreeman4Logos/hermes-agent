@@ -610,7 +610,21 @@ export type GatewayEvent =
   | { payload?: { text?: string }; session_id?: string; type: 'thinking.delta' }
   | { payload?: { kind?: string }; session_id?: string; type: 'reaction' }
   | { payload?: undefined; session_id?: string; type: 'message.start' }
-  | { payload?: { kind?: string; text?: string }; session_id?: string; type: 'status.update' }
+  | {
+      payload?: {
+        first_provider_response?: {
+          owner: 'tui_gateway'
+          request_index: 1
+          session: string
+          timestamp: number
+          turn_origin: 'user' | 'background-completion' | 'subagent-result' | 'heartbeat_warm'
+        }
+        kind?: string
+        text?: string
+      }
+      session_id?: string
+      type: 'status.update'
+    }
   | {
       payload?: {
         id?: string

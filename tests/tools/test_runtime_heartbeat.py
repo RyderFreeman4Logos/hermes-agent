@@ -208,6 +208,142 @@ def test_ordinary_idle_coordinator_arms_nothing():
     assert FakeTimer.created == []
 
 
+def test_successful_idle_session_arms_fires_and_cancels_without_process(
+    monkeypatch, caplog
+):
+    from tools.runtime_heartbeat import RuntimeHeartbeat
+
+    class ImmediateThread:
+        def __init__(self, target, **_kwargs):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    class Owner:
+        provider = "openai"
+        requested_provider = "openai"
+        base_url = "https://api.openai.invalid/v1"
+        model = "model"
+        api_mode = "chat_completions"
+        platform = "tui"
+        session_id = "idle-owner"
+        _turn_received_provider_response = False
+
+        def __init__(self):
+            self.calls = []
+
+        def run_conversation(self, message, **kwargs):
+            self.calls.append((message, kwargs))
+            return {
+                "heartbeat_warm_status": "warmed",
+                "heartbeat_warm_reason": "physical_success",
+            }
+
+    monkeypatch.setattr("tools.runtime_heartbeat._runtime_config", _runtime)
+    monkeypatch.setattr(
+        "tools.runtime_heartbeat.runtime_warm_capability",
+        lambda _owner: ("eligible", "test"),
+    )
+    monkeypatch.setattr("tools.runtime_heartbeat.threading.Thread", ImmediateThread)
+    FakeTimer.created = []
+    events = queue.Queue()
+    manager = RuntimeHeartbeat(event_queue=events, timer_factory=FakeTimer)
+    owner = Owner()
+    result = {
+        "completed": True,
+        "failed": False,
+        "interrupted": False,
+        "api_calls": 1,
+    }
+
+    assert manager.arm_session_after_turn(
+        owner, result, caller_id="idle-owner"
+    ) is True
+    [snapshot] = manager.active_snapshots()
+    assert snapshot["kind"] == "session"
+    assert snapshot["interval_s"] == 23
+
+    with caplog.at_level("INFO", logger="tools.runtime_heartbeat"):
+        FakeTimer.created[0].callback()
+    event = events.get_nowait()
+    assert event["target_kind"] == "session"
+    assert event["status"] == "ALIVE"
+    assert event["heartbeat_warm_owned"] is True
+    assert owner.calls == [
+        ("", {"turn_origin": "heartbeat_warm", "heartbeat_event": event})
+    ]
+    assert any("phase=due" in record.message for record in caplog.records)
+
+    assert manager.cancel_session(owner) is True
+    assert FakeTimer.created[-1].cancelled is True
+    assert manager.outstanding_for_caller("idle-owner") == []
+    assert manager.arm_session_after_turn(
+        owner, {**result, "completed": False}, caller_id="idle-owner"
+    ) is False
+    owner.platform = "subagent"
+    assert manager.arm_session_after_turn(
+        owner, result, caller_id="idle-owner"
+    ) is False
+
+
+def test_turn_compress_and_model_switch_manage_session_warm(monkeypatch):
+    from run_agent import AIAgent
+    from tools.runtime_heartbeat import runtime_heartbeat
+
+    calls = []
+    result = {"final_response": "done", "completed": True, "interrupted": False}
+    agent = AIAgent.__new__(AIAgent)
+    vars(agent).update(
+        session_id="idle-owner",
+        platform="cli",
+        _parent_session_id=None,
+        _session_db=None,
+        _conversation_root_id=lambda: "idle-owner",
+        _turn_received_provider_response=False,
+    )
+
+    def fake_turn(owner, *_args, **_kwargs):
+        assert calls == [("cancel", owner)]
+        owner._turn_received_provider_response = True
+        return result
+
+    monkeypatch.setattr("agent.conversation_loop.run_conversation", fake_turn)
+    monkeypatch.setattr(
+        runtime_heartbeat,
+        "cancel_session",
+        lambda owner: calls.append(("cancel", owner)),
+    )
+    monkeypatch.setattr(
+        runtime_heartbeat,
+        "arm_session_after_turn",
+        lambda owner, turn_result: calls.append(("arm", owner, turn_result)),
+    )
+    monkeypatch.setattr(
+        "agent.conversation_compression.compress_context",
+        lambda _owner, messages, system_message, **_kwargs: (
+            messages,
+            system_message,
+        ),
+    )
+    monkeypatch.setattr(
+        "agent.agent_runtime_helpers.switch_model",
+        lambda *_args, **_kwargs: "switched",
+    )
+
+    assert AIAgent.run_conversation(agent, "hello") is result
+    assert AIAgent._compress_context(
+        agent, [], "system", commit_fence=object()
+    ) == ([], "system")
+    assert AIAgent.switch_model(agent, "new-model", "openai") == "switched"
+    assert calls == [
+        ("cancel", agent),
+        ("arm", agent, result),
+        ("cancel", agent),
+        ("cancel", agent),
+    ]
+
+
 def test_per_target_owner_isolation_and_cancel():
     from tools.runtime_heartbeat import RuntimeHeartbeat
 

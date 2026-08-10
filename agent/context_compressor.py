@@ -347,7 +347,11 @@ def _prune_stale_reasoning_replay(messages: List[Dict[str, Any]]) -> int:
     last_user_idx = -1
     for i in range(len(messages) - 1, -1, -1):
         msg = messages[i]
-        if isinstance(msg, dict) and msg.get("role") == "user":
+        if (
+            isinstance(msg, dict)
+            and msg.get("role") == "user"
+            and not ContextCompressor._is_synthetic_compression_user_turn(msg)
+        ):
             last_user_idx = i
             break
     if last_user_idx < 0:
@@ -941,13 +945,13 @@ _REPLAY_BUDGET_KEYS = (
 # retained assistant turn (Codex Responses items ride the wire each request;
 # message items are required for prefix-cache continuity).  The remaining
 # generic thinking-text keys (``reasoning`` / ``reasoning_content``) are
-# replayed for at most the NEWEST assistant turn on non-Codex transports —
-# Anthropic strips all-but-newest at convert time, Bedrock Converse never
-# replays thinking at all, and strict chat-completions providers either
-# reject the field or receive a one-space echo pad (#73624).  Charging them
-# on every message spent 19-24% of the tail budget on bytes that provably
-# never reach the wire, so the tail cut landed early and each compaction
-# discarded more real transcript than configured.
+# replayed for at most the NEWEST assistant turn unless the provider's echo
+# policy requires historical reasoning_content. Anthropic strips all-but-newest
+# for ordinary endpoints, Bedrock Converse never replays thinking, and strict
+# chat-completions providers reject the field (#73624). Charging stripped
+# fields on every message spent 19-24% of the tail budget on bytes that never
+# reach the wire, so the tail cut landed early and each compaction discarded
+# more real transcript than configured.
 _ALWAYS_REPLAYED_BUDGET_KEYS = (
     "codex_reasoning_items",
     "codex_message_items",
@@ -3007,6 +3011,21 @@ class ContextCompressor(ContextEngine):
     # Tool output pruning (cheap pre-pass, no LLM call)
     # ------------------------------------------------------------------
 
+    def _replays_stale_thinking(self) -> bool:
+        """Whether the active wire policy echoes historical reasoning text."""
+        if getattr(self, "api_mode", "") not in (
+            "chat_completions",
+            "anthropic_messages",
+        ):
+            return False
+        from agent.message_sanitization import needs_reasoning_echo
+
+        return needs_reasoning_echo(
+            getattr(self, "provider", ""),
+            getattr(self, "model", ""),
+            getattr(self, "base_url", ""),
+        )
+
     def _prune_old_tool_results(
         self, messages: List[Dict[str, Any]], protect_tail_count: int,
         protect_tail_tokens: int | None = None,
@@ -3061,6 +3080,8 @@ class ContextCompressor(ContextEngine):
                         call_id_to_tool[cid] = (name, args_str)
 
         # Determine the prune boundary
+        _newest_asst_idx = -1
+        _replays_stale_thinking = False
         if protect_tail_tokens is not None and protect_tail_tokens > 0:
             # Token-budget approach: walk backward accumulating tokens.
             # Cap the message-count floor the same way tail-cut does so a
@@ -3073,14 +3094,17 @@ class ContextCompressor(ContextEngine):
                 len(result),
                 _MAX_TAIL_MESSAGE_FLOOR,
             )
-            # Same newest-turn-only thinking charge as the tail-cut walk
-            # (#73624) — this boundary decides which tool results stay
-            # prunable, and overcharging stale thinking shrinks that window.
+            # Match the outgoing provider policy: require-side echo transports
+            # replay historical thinking; other transports replay only newest.
             _newest_asst_idx = _last_assistant_index(result)
+            _replays_stale_thinking = self._replays_stale_thinking()
             for i in range(len(result) - 1, -1, -1):
                 msg = result[i]
                 msg_tokens = _estimate_msg_budget_tokens(
-                    msg, charge_stale_thinking=(i == _newest_asst_idx)
+                    msg,
+                    charge_stale_thinking=(
+                        _replays_stale_thinking or i == _newest_asst_idx
+                    ),
                 )
                 if accumulated + msg_tokens > protect_tail_tokens and (len(result) - i) >= min_protect:
                     boundary = i
@@ -3239,7 +3263,12 @@ class ContextCompressor(ContextEngine):
             def _protected_region_tokens() -> int:
                 start = max(0, prune_boundary)
                 return sum(
-                    _estimate_msg_budget_tokens(result[i])
+                    _estimate_msg_budget_tokens(
+                        result[i],
+                        charge_stale_thinking=(
+                            _replays_stale_thinking or i == _newest_asst_idx
+                        ),
+                    )
                     for i in range(start, len(result))
                 )
 
@@ -4564,9 +4593,12 @@ This compaction should PRIORITISE preserving all information related to the focu
         if cls._is_context_summary_content(content):
             return True
         text = _content_text_for_contains(content).strip()
+        from agent.conversation_loop import _CODEX_INCOMPLETE_NUDGE
+
         return text in {
             COMPRESSION_CONTINUATION_USER_CONTENT,
             _LEGACY_COMPRESSION_CONTINUATION_USER_CONTENT,
+            _CODEX_INCOMPLETE_NUDGE,
         } or text.startswith(
             TODO_INJECTION_HEADER + "\n"
         )
@@ -5458,16 +5490,18 @@ This compaction should PRIORITISE preserving all information related to the focu
         accumulated = 0
         cut_idx = n  # start from beyond the end
 
-        # Newest assistant turn: the only message whose generic thinking
-        # fields any transport still replays (#73624) — every older turn's
-        # reasoning/reasoning_content is stripped or padded at send time,
-        # so charging it here spends tail budget on bytes that never ship.
+        # Require-side echo transports replay historical thinking; other
+        # transports strip/pad it and replay only the newest assistant turn.
         _newest_asst_idx = _last_assistant_index(messages)
+        _replays_stale_thinking = self._replays_stale_thinking()
 
         for i in range(n - 1, head_end - 1, -1):
             msg = messages[i]
             msg_tokens = _estimate_msg_budget_tokens(
-                msg, charge_stale_thinking=(i == _newest_asst_idx)
+                msg,
+                charge_stale_thinking=(
+                    _replays_stale_thinking or i == _newest_asst_idx
+                ),
             )
             # Stop once we exceed the soft ceiling (unless we haven't hit min_tail yet)
             if accumulated + msg_tokens > soft_ceiling and (n - i) >= min_tail:
@@ -5495,7 +5529,10 @@ This compaction should PRIORITISE preserving all information related to the focu
             for j in range(n - 1, head_end - 1, -1):
                 raw_msg = messages[j]
                 raw_tok = _estimate_msg_budget_tokens(
-                    raw_msg, charge_stale_thinking=(j == _newest_asst_idx)
+                    raw_msg,
+                    charge_stale_thinking=(
+                        _replays_stale_thinking or j == _newest_asst_idx
+                    ),
                 )
                 if raw_accumulated + raw_tok > raw_budget and (n - j) >= min_tail:
                     cut_idx = j

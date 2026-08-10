@@ -2,10 +2,11 @@
 
 Generic thinking fields (``reasoning`` / ``reasoning_content`` + the
 ``reasoning_details`` text charge) are replayed for at most the NEWEST
-assistant turn on every transport — Anthropic strips all-but-newest at
-convert time, Bedrock never replays thinking, strict chat-completions
-providers reject or one-space-pad the field. Charging them on every message
-spent 19-24% of the tail budget on bytes that never reach the wire.
+assistant turn unless a require-side provider echoes historical reasoning.
+Anthropic strips all-but-newest for ordinary endpoints, Bedrock never replays
+thinking, and strict chat-completions providers reject the field. Charging
+stripped fields on every message spent 19-24% of the tail budget on bytes that
+never reach the wire.
 
 Codex sidecar fields (``codex_reasoning_items`` / ``codex_message_items``)
 ARE wire-replayed on every retained turn and stay charged unconditionally
@@ -108,8 +109,8 @@ class TestLastAssistantIndex:
 
 
 class TestTailCutBehavior:
-    """The tail cut must protect MORE real transcript when stale turns carry
-    heavy thinking — the #73624 symptom was the cut landing early."""
+    """Newest-only transports must protect more real transcript when stale
+    turns carry heavy thinking — #73624's symptom was the cut landing early."""
 
     def _compressor(self):
         from agent.context_compressor import ContextCompressor
@@ -156,3 +157,120 @@ class TestTailCutBehavior:
         # index = more messages in the tail), and strictly more here because
         # the stale thinking dominates each message's old-cost.
         assert cut < old_cut
+
+    def test_require_side_reasoning_echo_charges_stale_turns(self):
+        from agent.context_compressor import ContextCompressor
+        from agent.message_sanitization import (
+            apply_reasoning_content_policy,
+            needs_reasoning_echo,
+        )
+        from agent.transports.chat_completions import ChatCompletionsTransport
+
+        messages: list[dict] = [{"role": "system", "content": "sys"}]
+        for i in range(30):
+            messages.extend([
+                {"role": "user", "content": f"question {i}"},
+                {
+                    "role": "assistant",
+                    "content": f"answer {i}",
+                    "reasoning_content": "r" * 6_000,
+                },
+            ])
+
+        provider = "deepseek"
+        model = "deepseek-v4-pro"
+        base_url = "https://api.deepseek.com/v1"
+        require_echo = needs_reasoning_echo(provider, model, base_url)
+        api_message = {
+            "role": "assistant",
+            "content": messages[2]["content"],
+        }
+        apply_reasoning_content_policy(messages[2], api_message, require_echo)
+        wire = ChatCompletionsTransport().convert_messages(
+            [api_message], model=model
+        )
+        assert len(wire[0]["reasoning_content"]) == 6_000
+
+        strict = ContextCompressor(
+            model="mistral-small",
+            provider="mistral",
+            api_mode="chat_completions",
+            quiet_mode=True,
+            config_context_length=200_000,
+        )
+        require = ContextCompressor(
+            model=model,
+            provider=provider,
+            base_url=base_url,
+            api_mode="chat_completions",
+            quiet_mode=True,
+            config_context_length=200_000,
+        )
+        budget = 1_500
+
+        strict_cut = strict._find_tail_cut_by_tokens(
+            messages, 1, token_budget=budget
+        )
+        require_cut = require._find_tail_cut_by_tokens(
+            messages, 1, token_budget=budget
+        )
+        assert require_cut > strict_cut
+
+
+class TestProtectedPressureConsistency:
+    def test_stale_thinking_alone_does_not_demote_tool_results(self):
+        from agent.context_compressor import ContextCompressor
+
+        def history(stale_thinking: bool) -> list[dict]:
+            messages: list[dict] = [{"role": "user", "content": "start"}]
+            for i in range(8):
+                assistant = {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": f"call_{i}",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": f'{{"path":"f{i}"}}',
+                        },
+                    }],
+                }
+                if stale_thinking:
+                    assistant["reasoning_content"] = "r" * 6_000
+                messages.extend([
+                    assistant,
+                    {
+                        "role": "tool",
+                        "tool_call_id": f"call_{i}",
+                        "content": f"UNIQUE-{i}-" + chr(65 + i) * 1_000,
+                    },
+                ])
+            messages.extend([
+                {"role": "assistant", "content": "done"},
+                {"role": "user", "content": "continue"},
+            ])
+            return messages
+
+        compressor = ContextCompressor(
+            model="mistral-small",
+            provider="mistral",
+            api_mode="chat_completions",
+            quiet_mode=True,
+            config_context_length=128_000,
+        )
+        results = []
+        for stale_thinking in (False, True):
+            pruned, count = compressor._prune_old_tool_results(
+                history(stale_thinking),
+                protect_tail_count=20,
+                protect_tail_tokens=3_000,
+            )
+            full_results = sum(
+                len(message.get("content", "")) > 400
+                for message in pruned
+                if message.get("role") == "tool"
+            )
+            results.append((count, full_results))
+
+        assert results == [(0, 8), (0, 8)]

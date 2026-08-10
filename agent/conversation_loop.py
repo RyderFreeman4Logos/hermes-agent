@@ -1996,6 +1996,7 @@ def run_conversation(
     pending_moa_prepared_request = None
     ambiguous_continuation_attempted = False
     ambiguous_continuation_prompt: Optional[str] = None
+    ambiguous_origin_error = None
 
     def _terminal_ambiguous_provider_outcome(api_error=None):
         ambiguous_error = (
@@ -2004,13 +2005,14 @@ def run_conversation(
         )
         failure_class = None
         timeout_class = None
-        if api_error is not None:
-            failure_class = getattr(api_error, "failure_class", None) or getattr(
-                api_error, "timeout_class", None
+        source = api_error if api_error is not None else ambiguous_origin_error
+        if source is not None:
+            failure_class = getattr(source, "failure_class", None) or getattr(
+                source, "timeout_class", None
             )
-            timeout_class = getattr(api_error, "timeout_class", None)
+            timeout_class = getattr(source, "timeout_class", None)
             if not failure_class:
-                err_text = str(api_error)
+                err_text = str(source)
                 if "timeout_class=" in err_text:
                     # e.g. "timeout_class=ttfb_timeout; ..."
                     try:
@@ -4523,6 +4525,7 @@ def run_conversation(
                         and agent.provider != "moa"
                     ):
                         ambiguous_continuation_attempted = True
+                        ambiguous_origin_error = api_error
                         ambiguous_continuation_prompt = (
                             "[System: A previous provider request may have been accepted "
                             "but its outcome is unknown. This is one fresh continuation, "
@@ -4536,7 +4539,9 @@ def run_conversation(
                     return _terminal_ambiguous_provider_outcome(api_error)
 
                 if ambiguous_continuation_attempted:
-                    return _terminal_ambiguous_provider_outcome(api_error)
+                    return _terminal_ambiguous_provider_outcome(
+                        api_error if api_error is not None else ambiguous_origin_error
+                    )
 
                 # -----------------------------------------------------------
                 # UnicodeEncodeError recovery.  Two common causes:

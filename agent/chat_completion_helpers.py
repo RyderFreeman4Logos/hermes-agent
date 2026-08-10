@@ -1407,6 +1407,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
         # call on this agent can't be misread as first-byte for this one.
         agent._codex_stream_last_event_ts = None
         agent._codex_stream_last_progress_ts = None
+        agent._codex_stream_partial_tool_call = False
 
     _call_start = time.time()
     agent._touch_activity("waiting for non-streaming API response")
@@ -1440,6 +1441,14 @@ def interruptible_api_call(agent, api_kwargs: dict):
             setattr(error, "_hermes_ambiguous_provider_acceptance", True)
             setattr(error, "timeout_class", timeout_class)
             setattr(error, "failure_class", timeout_class)
+            # Outer watchdog paths do not raise the stream worker's transport
+            # exception. Copy cross-thread partial-tool state so recovery does
+            # not cross an unsafe tool-call boundary (#90 review F-001).
+            setattr(
+                error,
+                "_hermes_ambiguous_partial_tool_call",
+                bool(getattr(agent, "_codex_stream_partial_tool_call", False)),
+            )
             result["error"] = error
             attempt = (codex_lifecycle or {}).get("attempt")
             physical_attempt_diagnostics.record_ambiguity(

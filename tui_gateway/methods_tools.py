@@ -1068,7 +1068,14 @@ def _(rid, params: dict) -> dict:
                 {
                     "type": "exec",
                     "output": "\n".join(
-                        filter(None, [summary["headline"], summary["token_line"], summary.get("note")])
+                        filter(
+                            None,
+                            [
+                                summary["headline"],
+                                summary["token_line"],
+                                summary.get("note"),
+                            ],
+                        )
                     ),
                 },
             )
@@ -1081,6 +1088,7 @@ def _(rid, params: dict) -> dict:
             from agent.manual_compression_feedback import (
                 describe_compression_lock_skip,
             )
+
             return _ok(
                 rid,
                 {"type": "exec", "output": describe_compression_lock_skip(e.holder)},
@@ -1091,6 +1099,8 @@ def _(rid, params: dict) -> dict:
                 committed=False,
             )
             return _err(rid, 5009, f"compress failed: {exc}")
+        finally:
+            _finish_manual_compression_fence(session)
 
     return _err(rid, 4018, f"not a quick/plugin/bundle/skill command: {name}")
 

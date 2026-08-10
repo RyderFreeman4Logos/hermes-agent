@@ -23,6 +23,7 @@ Defense against context-window overflow operates at three levels:
 """
 
 import hashlib
+import json
 import logging
 import os
 import re
@@ -43,6 +44,15 @@ HEREDOC_MARKER = "HERMES_PERSIST_EOF"
 _BUDGET_TOOL_NAME = "__budget_enforcement__"
 _UNSAFE_RESULT_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
 _MAX_RESULT_FILENAME_STEM = 120
+_INSERTION_COMPACT_THRESHOLD_CHARS = 32_000
+_HIGH_VOLUME_TOOL_NAMES = frozenset({
+    "execute_code",
+    "process",
+    "search_files",
+    "terminal",
+    "web_extract",
+    "web_search",
+})
 
 
 def _resolve_storage_dir(env) -> str:
@@ -141,6 +151,18 @@ def _build_persisted_message(
     return msg
 
 
+def _needs_insertion_compaction(tool_name: str, content: str) -> bool:
+    if tool_name in _HIGH_VOLUME_TOOL_NAMES:
+        return True
+    stripped = content.lstrip()
+    if not stripped.startswith(("{", "[")):
+        return False
+    try:
+        return isinstance(json.loads(stripped), (dict, list))
+    except (TypeError, ValueError):
+        return False
+
+
 def maybe_persist_tool_result(
     content: str,
     tool_name: str,
@@ -166,10 +188,24 @@ def maybe_persist_tool_result(
     Returns:
         Original content if small, or <persisted-output> replacement.
     """
-    effective_threshold = threshold if threshold is not None else config.resolve_threshold(tool_name)
+    configured_threshold = (
+        threshold if threshold is not None else config.resolve_threshold(tool_name)
+    )
 
-    if effective_threshold == float("inf"):
+    if configured_threshold == float("inf"):
         return content
+
+    insertion_limited = (
+        threshold is None
+        and env is not None
+        and _INSERTION_COMPACT_THRESHOLD_CHARS < len(content) <= configured_threshold
+        and _needs_insertion_compaction(tool_name, content)
+    )
+    effective_threshold = (
+        _INSERTION_COMPACT_THRESHOLD_CHARS
+        if insertion_limited
+        else configured_threshold
+    )
 
     if len(content) <= effective_threshold:
         return content
@@ -188,6 +224,13 @@ def maybe_persist_tool_result(
                 return _build_persisted_message(preview, has_more, len(content), remote_path)
         except Exception as exc:
             logger.warning("Sandbox write failed for %s: %s", tool_use_id, exc)
+
+    if insertion_limited:
+        logger.warning(
+            "Keeping recoverable %s result inline after sandbox write failed",
+            tool_name,
+        )
+        return content
 
     logger.info(
         "Inline-truncating large tool result: %s (%d chars, no sandbox write)",

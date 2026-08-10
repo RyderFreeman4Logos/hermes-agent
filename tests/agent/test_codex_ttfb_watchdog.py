@@ -621,8 +621,16 @@ def test_codex_timeout_classes_use_fake_clock_and_retry_path(
     monkeypatch.setattr(conversation_loop.time, "sleep", lambda _seconds: None)
     result = agent.run_conversation("one potentially billed action")
 
-    assert len(calls) == 1
+    # After #90, one fresh checkpoint continuation is allowed before the
+    # ambiguous path terminates. The second raise is that continuation, not
+    # a transport replay of the original accepted request.
+    assert len(calls) == 2
     assert result["ambiguous_provider_attempt"] is True
+    assert result.get("turn_exit_reason") == "ambiguous_provider_attempt"
+    assert (
+        result.get("failure_class") == timeout_class
+        or result.get("timeout_class") == timeout_class
+    )
     assert result["messages"][-1]["role"] == "assistant"
 
 
@@ -714,3 +722,63 @@ def test_codex_parser_counts_only_semantic_sse_progress():
 
     assert response.status == "completed"
     assert len(progress) == 4
+
+
+def test_large_request_ttfb_scale_is_not_capped_by_implicit_default(monkeypatch, caplog):
+    """#92 / upstream #69228: implicit max must not undo adaptive scale-up."""
+    from agent import chat_completion_helpers as h
+
+    monkeypatch.delenv("HERMES_CODEX_TTFB_MAX_SECONDS", raising=False)
+    monkeypatch.delenv("HERMES_CODEX_TTFB_STRICT", raising=False)
+    monkeypatch.setenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "120")
+    monkeypatch.setattr(
+        h, "estimate_request_context_tokens", lambda _payload: 150_000
+    )
+    agent = SimpleNamespace(
+        api_mode="codex_responses",
+        provider="openai-codex",
+        base_url="https://chatgpt.com/backend-api/codex",
+    )
+    with caplog.at_level("INFO"):
+        (
+            _enabled,
+            _openai,
+            est,
+            ttfb_enabled,
+            ttfb_timeout,
+            _idle_enabled,
+            idle_timeout,
+        ) = h._resolve_codex_stream_watchdogs(agent, {"input": "x" * 100})
+
+    assert est == 150_000
+    assert ttfb_enabled is True
+    assert ttfb_timeout == 180.0
+    assert idle_timeout == 180.0
+    assert not any("Capping openai-codex no-byte TTFB" in r.message for r in caplog.records)
+
+
+def test_explicit_ttfb_max_still_caps_adaptive_scale(monkeypatch):
+    from agent import chat_completion_helpers as h
+
+    monkeypatch.setenv("HERMES_CODEX_TTFB_MAX_SECONDS", "150")
+    monkeypatch.delenv("HERMES_CODEX_TTFB_STRICT", raising=False)
+    monkeypatch.setenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "120")
+    monkeypatch.setattr(
+        h, "estimate_request_context_tokens", lambda _payload: 150_000
+    )
+    agent = SimpleNamespace(
+        api_mode="codex_responses",
+        provider="openai-codex",
+        base_url="https://chatgpt.com/backend-api/codex",
+    )
+    (
+        _enabled,
+        _openai,
+        _est,
+        ttfb_enabled,
+        ttfb_timeout,
+        _idle_enabled,
+        _idle_timeout,
+    ) = h._resolve_codex_stream_watchdogs(agent, {"input": "x"}, log_adjustments=False)
+    assert ttfb_enabled is True
+    assert ttfb_timeout == 150.0

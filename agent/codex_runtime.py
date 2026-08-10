@@ -1588,6 +1588,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             )
             _finish_diagnostic(None, "error")
             setattr(exc, "_hermes_ambiguous_provider_acceptance", True)
+            setattr(exc, "failure_class", "transport")
             setattr(
                 exc,
                 "_hermes_ambiguous_partial_tool_call",
@@ -1654,6 +1655,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 )
                 _finish_diagnostic(None, "error")
                 setattr(exc, "_hermes_ambiguous_provider_acceptance", True)
+                setattr(exc, "failure_class", "transport")
                 setattr(
                     exc,
                     "_hermes_ambiguous_partial_tool_call",
@@ -1690,6 +1692,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     action="halt",
                 )
                 setattr(exc, "_hermes_ambiguous_provider_acceptance", True)
+                setattr(exc, "failure_class", "missing_terminal")
                 setattr(
                     exc,
                     "_hermes_ambiguous_partial_tool_call",

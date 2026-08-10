@@ -894,6 +894,52 @@ def test_owner_observed_success_skips_gateway_turn(monkeypatch, isolated_registr
     assert restarted_queue.empty()
 
 
+def test_gateway_watcher_silences_delegated_success_and_commits_lifecycle(
+    monkeypatch, isolated_registry
+):
+    """The live watcher must retain the canonical delegated-child marker."""
+    import tools.process_registry as registry_module
+    from tools import async_delegation as ad
+
+    process = ProcessSession(
+        id="proc-gateway-delegated-success",
+        command="true",
+        task_id="task",
+        session_key="agent:main:telegram:dm:123",
+        started_at=6.0,
+        output_buffer="done\n",
+        exited=True,
+        exit_code=0,
+        completion_reason="exited",
+        notify_on_complete=True,
+        delegated_child=True,
+    )
+    isolated_registry._finished[process.id] = process
+    monkeypatch.setattr(registry_module, "process_registry", isolated_registry)
+
+    async def _instant_sleep(*_args, **_kwargs):
+        pass
+
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+
+    asyncio.run(runner._run_process_watcher({
+        "session_id": process.id,
+        "check_interval": 0,
+        "session_key": process.session_key,
+        "platform": "telegram",
+        "chat_type": "dm",
+        "chat_id": "123",
+        "notify_on_complete": True,
+    }))
+
+    adapter.handle_message.assert_not_awaited()
+    receipt = ad.get_durable_event_delivery(isolated_registry._completion_event(process))
+    assert receipt is not None
+    assert receipt["delivery_state"] == "delivered"
+
+
 def test_failed_process_injection_releases_lifecycle_claim(monkeypatch):
     adapter = SimpleNamespace(handle_message=AsyncMock())
     runner = _runner(adapter)

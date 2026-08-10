@@ -1904,16 +1904,13 @@ class ProcessRegistry:
         return ("completion", session_id, started_at, session_key)
 
     @staticmethod
-    def _is_observed_completion_noop(evt: dict) -> bool:
-        """Only a fully-known normal success may reuse an inline receipt."""
+    def _is_normal_completion_success(evt: dict) -> bool:
+        """Return True only for the canonical, fully-known normal outcome."""
         return (
             type(evt.get("exit_code")) is int
             and evt["exit_code"] == 0
-            and str(evt.get("completion_reason") or "").lower() == "exited"
+            and evt.get("completion_reason") == "exited"
             and not evt.get("termination_source")
-            and isinstance(evt.get("command"), str)
-            and bool(evt["command"])
-            and isinstance(evt.get("output"), str)
             and not any(
                 evt.get(key)
                 for key in (
@@ -1921,6 +1918,16 @@ class ProcessRegistry:
                     "warning", "safety_alert", "timed_out", "cancelled",
                 )
             )
+        )
+
+    @staticmethod
+    def _is_observed_completion_noop(evt: dict) -> bool:
+        """Only a fully-known normal success may reuse an inline receipt."""
+        return (
+            ProcessRegistry._is_normal_completion_success(evt)
+            and isinstance(evt.get("command"), str)
+            and bool(evt["command"])
+            and isinstance(evt.get("output"), str)
         )
 
     def _set_completion_disposition(self, identity: tuple, state: str) -> None:
@@ -3619,7 +3626,10 @@ def completion_delivery_prompt(evt: dict, payload: str) -> "str | None":
     """Return a model-only completion prompt, or None for an explicit no-op."""
     if evt.get("type", "completion") != "completion":
         return payload
-    if evt.get("delegated_child") is True and evt.get("exit_code") == 0:
+    if (
+        evt.get("delegated_child") is True
+        and ProcessRegistry._is_normal_completion_success(evt)
+    ):
         return None
     if type(evt.get("exit_code")) is not int:
         return payload

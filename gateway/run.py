@@ -22986,10 +22986,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _out = f"[… output truncated — showing last {len(_tail)} chars]\n{_tail}"
                     else:
                         _out = _raw
-                    completion_evt = {
-                        "type": "completion",
-                        "session_id": session_id,
-                        "session_key": session_key,
+                    completion_evt = _pr_check._completion_event(session)
+                    completion_evt.update({
                         "platform": platform_name,
                         "chat_type": watcher.get("chat_type", ""),
                         "chat_id": chat_id,
@@ -22997,13 +22995,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "user_id": user_id,
                         "user_name": user_name,
                         "message_id": message_id,
-                        "started_at": getattr(session, "started_at", None),
                         "command": _command,
-                        "exit_code": session.exit_code,
-                        "completion_reason": getattr(session, "completion_reason", "exited"),
-                        "termination_source": getattr(session, "termination_source", ""),
                         "output": _out,
-                    }
+                    })
                     synth_text = format_process_notification(completion_evt)
                     if not synth_text:
                         break

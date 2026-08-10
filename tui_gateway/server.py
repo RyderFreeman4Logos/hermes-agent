@@ -5062,9 +5062,37 @@ def _apply_pending_model_switch(sid: str, session: dict) -> None:
 class CompressionLockHeld(Exception):
     """Raised by _compress_session_history when compression skipped due
     to a concurrent lock on the session's compression_locks row."""
+
     def __init__(self, holder: str | None = None):
         self.holder = holder
         super().__init__(f"Compression lock held: {holder or 'unknown'}")
+
+
+def _begin_manual_compression_fence(session: dict) -> None:
+    """Make manual compression own the session while completions stay queued."""
+    with session["history_lock"]:
+        if session.get("running"):
+            raise RuntimeError(
+                "session busy — /interrupt the current turn before /compress"
+            )
+        session["_manual_compression_fence"] = threading.Event()
+        session["_manual_compression_fence_owner"] = threading.get_ident()
+        session["running"] = True
+
+
+def _finish_manual_compression_fence(session: dict) -> None:
+    """Release queued completions at the manual-compression terminal edge."""
+    with session["history_lock"]:
+        fence = session.get("_manual_compression_fence")
+        if (
+            fence is None
+            or session.get("_manual_compression_fence_owner") != threading.get_ident()
+        ):
+            return
+        session["running"] = False
+        session.pop("_manual_compression_fence", None)
+        session.pop("_manual_compression_fence_owner", None)
+    fence.set()
 
 
 def _compress_session_history(
@@ -5087,6 +5115,10 @@ def _compress_session_history(
     per-route) is what fixes #35533: previously "/compress here 3" reached
     this helper unparsed and ran a FULL compress focused on the literal
     text "here 3".
+
+    The helper raises the session's manual-compression fence. Each route must
+    release it with :func:`_finish_manual_compression_fence` only after its
+    terminal publication and UI cleanup have completed.
     """
     from agent.conversation_compression import (
         finalize_context_engine_compression_notification,
@@ -5098,6 +5130,7 @@ def _compress_session_history(
         split_history_for_partial_compress,
     )
 
+    _begin_manual_compression_fence(session)
     agent = session["agent"]
     # Snapshot history under the lock so the LLM-bound compression call
     # below does NOT hold history_lock for the duration of the request —
@@ -10020,6 +10053,8 @@ def _try_steer_busy_completion(
 ) -> bool | None:
     """Attempt busy-steer delivery. True=handled, False=no steer, None=idle."""
     with session["history_lock"]:
+        if session.get("_manual_compression_fence") is not None:
+            return False
         if not session.get("running"):
             return None
         agent = session.get("agent")
@@ -10512,6 +10547,12 @@ def _notification_poller_loop(
     _last_kanban_poll = 0.0
     _last_loop_poll = 0.0
     while not stop_event.is_set() and not session.get("_finalized"):
+        if not _notification_poller_is_current(session, stop_event):
+            break
+        compression_fence = session.get("_manual_compression_fence")
+        if compression_fence is not None:
+            compression_fence.wait(_NOTIFICATION_QUEUE_WAIT_SECONDS)
+            continue
         _now = time.monotonic()
         # ── /loop wakeup driver ──────────────────────────────────────
         # Fire a due /loop tick for THIS session while it's idle. Same
@@ -10622,12 +10663,24 @@ def _notification_poller_loop(
                     except Exception:
                         logger.debug(
                             "Could not record delivery attempt for delegation %s",
-                            _did, exc_info=True,
+                            _did,
+                            exc_info=True,
                         )
             continue
 
         if not process_registry.completion_event_should_deliver(evt):
             continue
+
+        # The poller may already be blocked in Queue.get() when manual
+        # compression raises its fence. Hold this owned item in place so it
+        # cannot steer the compression turn or lose FIFO order by requeueing.
+        while (
+            compression_fence := session.get("_manual_compression_fence")
+        ) is not None:
+            if not _notification_poller_is_current(session, stop_event):
+                process_registry.completion_queue.put(evt)
+                return
+            compression_fence.wait(_NOTIFICATION_QUEUE_WAIT_SECONDS)
 
         if evt.get("type") == "heartbeat":
             _handle_heartbeat_event(sid, session, evt)
@@ -14725,6 +14778,9 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
                 committed=False,
             )
         return f"live session sync failed: {e}"
+    finally:
+        if name == "compress":
+            _finish_manual_compression_fence(session)
     return ""
 
 

@@ -6,7 +6,6 @@ not delivery; fallback is one bounded idle turn with per-event claims.
 
 from __future__ import annotations
 
-import queue as queue_mod
 import threading
 import time
 from types import SimpleNamespace
@@ -15,6 +14,12 @@ import pytest
 
 from tools.process_registry import ProcessRegistry
 from tui_gateway import server
+
+_REAL_NOTIFICATION_EVENT_BELONGS_ELSEWHERE = (
+    server._notification_event_belongs_elsewhere
+)
+_REAL_NOTIFICATION_EVENT_REQUIRES_OWNER = server._notification_event_requires_owner
+_REAL_SESSION_OWNS_NOTIFICATION_EVENT = server._session_owns_notification_event
 
 
 def _completion_event(session_id: str, *, session_key: str = "session-key", exit_code: int = 0, output: str = "ok", **extra):
@@ -93,7 +98,6 @@ def isolated_registry(monkeypatch, tmp_path):
     from tools import async_delegation as ad
 
     monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
-    monkeypatch.setattr(ad, "restore_undelivered_completions", lambda _queue: 0)
     registry = ProcessRegistry()
     monkeypatch.setattr(
         "tools.process_registry.process_registry",
@@ -407,7 +411,29 @@ def test_busy_pending_steer_does_not_block_later_queue_events(isolated_registry,
     assert {p["evt"]["session_id"] for p in pending} == {"proc_first", "proc_second"}
 
 
-@pytest.mark.parametrize("outcome", ["success", "failure", "cancel", "noop"])
+def test_manual_compression_fence_release_is_generation_owned():
+    """A stale finalizer cannot release a successor compression generation."""
+    session = _session()
+
+    first = server._begin_manual_compression_fence(session)
+    assert first is not None
+    server._finish_manual_compression_fence(session, first)
+
+    second = server._begin_manual_compression_fence(session)
+    assert second is not first
+    server._finish_manual_compression_fence(session, first)
+
+    assert session.get("_manual_compression_fence") is second
+    assert session["running"] is True
+
+    server._finish_manual_compression_fence(session, second)
+    assert "_manual_compression_fence" not in session
+    assert session["running"] is False
+
+
+@pytest.mark.parametrize(
+    "outcome", ["success", "failure", "cancel", "noop", "lock_skip"]
+)
 def test_manual_compress_holds_completions_until_terminal_boundary(
     isolated_registry, monkeypatch, outcome
 ):
@@ -424,14 +450,19 @@ def test_manual_compress_holds_completions_until_terminal_boundary(
     event_dequeued = threading.Event()
     deliveries: list[tuple[str, dict]] = []
 
-    class _ObservedQueue(queue_mod.Queue):
-        def get(self, *args, **kwargs):
-            poller_waiting.set()
-            item = super().get(*args, **kwargs)
-            event_dequeued.set()
-            return item
+    get_completion_for_owner = isolated_registry.get_completion_for_owner
 
-    isolated_registry.completion_queue = _ObservedQueue()
+    def observed_get_completion_for_owner(*args, **kwargs):
+        poller_waiting.set()
+        item = get_completion_for_owner(*args, **kwargs)
+        event_dequeued.set()
+        return item
+
+    monkeypatch.setattr(
+        isolated_registry,
+        "get_completion_for_owner",
+        observed_get_completion_for_owner,
+    )
 
     class _Agent:
         session_id = "session-key"
@@ -457,14 +488,20 @@ def test_manual_compress_holds_completions_until_terminal_boundary(
                     "commit_status": "aborted",
                     "failure_class": "commit_fence_cancelled",
                 }
-                return list(messages)
+                return list(messages), ""
+            if outcome == "lock_skip":
+                self._compression_skipped_due_to_lock = "other-generation"
+                return list(messages), ""
             self.context_compressor._last_compression_telemetry = {
                 "commit_status": "committed"
             }
-            return [
-                {"role": "system", "content": "system"},
-                {"role": "assistant", "content": "compressed"},
-            ]
+            return (
+                [
+                    {"role": "system", "content": "system"},
+                    {"role": "assistant", "content": "compressed"},
+                ],
+                "",
+            )
 
         def steer(self, _text):
             pytest.fail("a completion must not steer the manual compression turn")
@@ -503,6 +540,10 @@ def test_manual_compress_holds_completions_until_terminal_boundary(
     monkeypatch.setattr(server, "_session_info", lambda *_a, **_k: {})
     monkeypatch.setattr(server, "_get_usage", lambda _agent: {})
     monkeypatch.setattr(server, "_emit", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_tts_stream_stop", lambda: None)
+    monkeypatch.setattr(
+        "agent.interrupt_compat.request_hard_interrupt", lambda _agent: None
+    )
     monkeypatch.setattr(
         "agent.model_metadata.estimate_request_tokens_rough", lambda *_a, **_k: 100
     )
@@ -570,6 +611,19 @@ def test_manual_compress_holds_completions_until_terminal_boundary(
         assert poller_waiting.wait(2)
         command_thread.start()
         assert compression_entered.wait(2), command_result
+        first_fence = session.get("_manual_compression_fence")
+        assert first_fence is not None
+        if outcome == "failure":
+            interrupt = server._methods["session.interrupt"](
+                "stop", {"session_id": "sid"}
+            )
+            assert "error" not in interrupt
+            assert session["running"] is True
+            successor = server._methods["session.compress"](
+                "second", {"session_id": "sid"}
+            )
+            assert successor.get("error", {}).get("code") == 4009
+            assert session.get("_manual_compression_fence") is first_fence
         isolated_registry.completion_queue.put(process_event)
         isolated_registry.completion_queue.put(delegation_event)
 
@@ -598,9 +652,180 @@ def test_manual_compress_holds_completions_until_terminal_boundary(
         assert session["running"] is False
         assert "_manual_compression_fence" not in session
         assert "_manual_compression_fence_owner" not in session
+        process_receipt = ad.get_durable_event_delivery(process_event)
+        delegation_receipt = ad.get_durable_delegation(
+            delegation_event["delegation_id"]
+        )
+        assert process_receipt is not None
+        assert delegation_receipt is not None
+        assert process_receipt["delivery_state"] == "delivered"
+        assert delegation_receipt["delivery_state"] == "delivered"
+        restarted = ProcessRegistry()
+        assert restarted.completion_queue.empty()
     finally:
         release_compression.set()
         release_terminal.set()
         stop_poller.set()
         command_thread.join(2)
         poller_thread.join(2)
+
+
+def test_foreign_poller_preserves_owner_fifo_and_unrelated_progress(
+    isolated_registry, monkeypatch
+):
+    """A foreign poller cannot rotate an owner's durable completion FIFO."""
+    from tools import async_delegation as ad
+
+    registry = isolated_registry
+    a_waiting = threading.Event()
+    a_holds_first = threading.Event()
+
+    get_completion_for_owner = registry.get_completion_for_owner
+
+    def observed_get_completion_for_owner(*args, **kwargs):
+        if threading.current_thread().name == "poller-A":
+            a_waiting.set()
+        item = get_completion_for_owner(*args, **kwargs)
+        if (
+            threading.current_thread().name == "poller-A"
+            and item.get("session_id") == "proc-a-1"
+        ):
+            a_holds_first.set()
+        return item
+
+    monkeypatch.setattr(
+        registry,
+        "get_completion_for_owner",
+        observed_get_completion_for_owner,
+    )
+    monkeypatch.setattr(
+        server,
+        "_notification_event_belongs_elsewhere",
+        _REAL_NOTIFICATION_EVENT_BELONGS_ELSEWHERE,
+    )
+    monkeypatch.setattr(
+        server,
+        "_notification_event_requires_owner",
+        _REAL_NOTIFICATION_EVENT_REQUIRES_OWNER,
+    )
+    monkeypatch.setattr(
+        server,
+        "_session_owns_notification_event",
+        _REAL_SESSION_OWNS_NOTIFICATION_EVENT,
+    )
+    monkeypatch.setattr(server, "_emit", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_NOTIFICATION_QUEUE_WAIT_SECONDS", 0.01)
+    monkeypatch.setattr(server, "_NOTIFICATION_REQUEUE_BACKOFF_SECONDS", 0.01)
+    monkeypatch.setattr(server, "_COMPLETION_BACKLOG_COALESCE_WINDOW_SECONDS", 0.0)
+
+    delivered: dict[str, list[str]] = {"A": [], "B": []}
+    b_delivered = threading.Event()
+    a_all_delivered = threading.Event()
+
+    def run_completion(_rid, sid, session, text, **kwargs):
+        delivered[sid].append(text)
+        callback = kwargs.get("completion_delivery_callback")
+        if callback is not None:
+            callback("committed")
+        with session["history_lock"]:
+            session["running"] = False
+        if sid == "B":
+            b_delivered.set()
+        elif len(delivered["A"]) == 3:
+            a_all_delivered.set()
+
+    monkeypatch.setattr(server, "_run_prompt_submit", run_completion)
+
+    session_a = _session(session_key="conversation-A")
+    session_b = _session(session_key="conversation-B")
+    monkeypatch.setitem(server._sessions, "A", session_a)
+    monkeypatch.setitem(server._sessions, "B", session_b)
+
+    a_events = [
+        _completion_event(
+            f"proc-a-{position}",
+            session_key="conversation-A",
+            output=f"owner-{position}",
+            origin_ui_session_id="A",
+            started_at=float(position),
+        )
+        for position in (1, 2, 3)
+    ]
+    b_event = _completion_event(
+        "proc-b",
+        session_key="conversation-B",
+        output="foreign-progress",
+        origin_ui_session_id="B",
+        started_at=10.0,
+    )
+    for event in (*a_events, b_event):
+        assert ad.persist_event_delivery(event)
+
+    stop_a = threading.Event()
+    stop_b = threading.Event()
+    stop_a_restarted = threading.Event()
+    poller_a = threading.Thread(
+        name="poller-A",
+        target=server._notification_poller_loop,
+        args=(stop_a, "A", session_a),
+        daemon=True,
+    )
+    poller_b = threading.Thread(
+        name="poller-B",
+        target=server._notification_poller_loop,
+        args=(stop_b, "B", session_b),
+        daemon=True,
+    )
+    poller_a_restarted = threading.Thread(
+        name="poller-A-restarted",
+        target=server._notification_poller_loop,
+        args=(stop_a_restarted, "A", session_a),
+        daemon=True,
+    )
+    fence = None
+    try:
+        poller_a.start()
+        assert a_waiting.wait(2)
+        fence = server._begin_manual_compression_fence(session_a)
+        registry.completion_queue.put(a_events[0])
+        assert a_holds_first.wait(2)
+
+        registry.completion_queue.put(a_events[1])
+        registry.completion_queue.put(b_event)
+        registry.completion_queue.put(a_events[2])
+        poller_b.start()
+        assert b_delivered.wait(3)
+        assert delivered["A"] == []
+
+        stop_b.set()
+        poller_b.join(2)
+        assert not poller_b.is_alive()
+        stop_a.set()
+        poller_a.join(2)
+        assert not poller_a.is_alive()
+
+        poller_a_restarted.start()
+        server._finish_manual_compression_fence(session_a, fence)
+        assert a_all_delivered.wait(3)
+        assert len(delivered["A"]) == 3
+        assert len(delivered["B"]) == 1
+        owner_text = "\n".join(delivered["A"])
+        assert all(owner_text.count(f"owner-{position}") == 1 for position in (1, 2, 3))
+        positions = [owner_text.index(f"owner-{position}") for position in (1, 2, 3)]
+        assert positions == sorted(positions)
+
+        for event in (*a_events, b_event):
+            receipt = ad.get_durable_event_delivery(event)
+            assert receipt is not None
+            assert receipt["delivery_state"] == "delivered"
+        restarted = ProcessRegistry()
+        assert restarted.completion_queue.empty()
+    finally:
+        stop_a.set()
+        stop_b.set()
+        stop_a_restarted.set()
+        if fence is not None:
+            server._finish_manual_compression_fence(session_a, fence)
+        poller_a.join(2)
+        poller_b.join(2)
+        poller_a_restarted.join(2)

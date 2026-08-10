@@ -65,9 +65,11 @@ class TestBudgetExcludesReasoningDetailsEnvelope:
                 {"type": "thinking", "thinking": prose, "signature": "s" * 5_000},
             ],
         }
-        once = _estimate_msg_budget_tokens(
-            {"role": "assistant", "content": "hi", "reasoning_content": prose}
-        )
+        once = _estimate_msg_budget_tokens({
+            "role": "assistant",
+            "content": "hi",
+            "reasoning_content": prose,
+        })
         both = _estimate_msg_budget_tokens(msg)
         assert both - once < 100, (
             f"thinking prose charged twice (delta {both - once} tokens)"

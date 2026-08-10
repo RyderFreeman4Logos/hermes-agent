@@ -1784,20 +1784,35 @@ def test_delegated_child_failure_still_reaches_parent_delivery():
 
 
 @pytest.mark.parametrize(
-    "overrides",
+    ("overrides", "removed", "suppressed"),
     [
-        {"completion_reason": "killed"},
-        {"exit_code": False, "completion_reason": "exited"},
-        {"completion_reason": "failed_start"},
-        {"completion_reason": "lost"},
-        {"completion_reason": "cancelled"},
-        {"completion_reason": "exited", "cancelled": True},
+        ({"completion_reason": "exited"}, (), True),
+        ({"completion_reason": "killed"}, (), False),
+        ({"exit_code": False, "completion_reason": "exited"}, (), False),
+        ({"completion_reason": "failed_start"}, (), False),
+        ({"completion_reason": "lost"}, (), False),
+        ({"completion_reason": "cancelled"}, (), False),
+        ({"completion_reason": "exited", "cancelled": True}, (), False),
+        ({"completion_reason": "exited"}, ("type",), False),
+        ({"completion_reason": "exited"}, ("command",), False),
+        ({"completion_reason": "exited"}, ("output",), False),
+        ({"completion_reason": "exited", "command": None}, (), False),
+        ({"completion_reason": "exited", "command": 1}, (), False),
+        ({"completion_reason": "exited", "output": None}, (), False),
+        ({"completion_reason": "exited", "output": 1}, (), False),
+        ({"completion_reason": "exited", "failed": True}, (), False),
+        ({"completion_reason": "exited", "lost": True}, (), False),
+        ({"completion_reason": "exited", "canceled": True}, (), False),
     ],
 )
-def test_delegated_child_non_normal_completion_fails_open(overrides):
-    assert completion_delivery_prompt(
-        _completion_event(delegated_child=True, **overrides), "payload"
-    ) is not None
+def test_delegated_child_suppression_requires_closed_completion_envelope(
+    overrides, removed, suppressed
+):
+    event = _completion_event(delegated_child=True, **overrides)
+    for key in removed:
+        del event[key]
+
+    assert (completion_delivery_prompt(event, "payload") is None) is suppressed
 
 
 def test_completion_visibility_explicit_false_skips_delivery(monkeypatch):

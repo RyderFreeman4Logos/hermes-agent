@@ -1786,40 +1786,45 @@ def test_delegated_child_failure_still_reaches_parent_delivery():
     ) is not None
 
 
+_CLOSED_COMPLETION_ENVELOPE_CASES = [
+    ({"completion_reason": "exited"}, (), True),
+    ({"completion_reason": "killed"}, (), False),
+    ({"exit_code": False, "completion_reason": "exited"}, (), False),
+    ({"completion_reason": "failed_start"}, (), False),
+    ({"completion_reason": "lost"}, (), False),
+    ({"completion_reason": "cancelled"}, (), False),
+    ({"completion_reason": "exited", "cancelled": True}, (), False),
+    ({"completion_reason": "exited"}, ("type",), False),
+    ({"completion_reason": "exited"}, ("command",), False),
+    ({"completion_reason": "exited"}, ("output",), False),
+    ({"completion_reason": "exited", "command": None}, (), False),
+    ({"completion_reason": "exited", "command": 1}, (), False),
+    ({"completion_reason": "exited", "output": None}, (), False),
+    ({"completion_reason": "exited", "output": 1}, (), False),
+    ({"completion_reason": "exited", "failed": True}, (), False),
+    ({"completion_reason": "exited", "lost": True}, (), False),
+    ({"completion_reason": "exited", "canceled": True}, (), False),
+    ({}, ("termination_source",), False),
+    ({"termination_source": None}, (), False),
+    ({"termination_source": False}, (), False),
+    ({"termination_source": 0}, (), False),
+    ({}, ("session_id",), False),
+    ({"session_id": ""}, (), False),
+    ({"session_id": 1}, (), False),
+    ({}, ("session_key",), False),
+    ({"session_key": 1}, (), False),
+    ({}, ("started_at",), False),
+    ({"started_at": True}, (), False),
+    ({"started_at": 0}, (), False),
+    ({"started_at": float("nan")}, (), False),
+    ({"started_at": float("inf")}, (), False),
+    ({"started_at": float("-inf")}, (), False),
+]
+
+
 @pytest.mark.parametrize(
     ("overrides", "removed", "suppressed"),
-    [
-        ({"completion_reason": "exited"}, (), True),
-        ({"completion_reason": "exited", "session_key": ""}, (), True),
-        ({"completion_reason": "killed"}, (), False),
-        ({"exit_code": False, "completion_reason": "exited"}, (), False),
-        ({"completion_reason": "failed_start"}, (), False),
-        ({"completion_reason": "lost"}, (), False),
-        ({"completion_reason": "cancelled"}, (), False),
-        ({"completion_reason": "exited", "cancelled": True}, (), False),
-        ({"completion_reason": "exited"}, ("type",), False),
-        ({"completion_reason": "exited"}, ("command",), False),
-        ({"completion_reason": "exited"}, ("output",), False),
-        ({"completion_reason": "exited", "command": None}, (), False),
-        ({"completion_reason": "exited", "command": 1}, (), False),
-        ({"completion_reason": "exited", "output": None}, (), False),
-        ({"completion_reason": "exited", "output": 1}, (), False),
-        ({"completion_reason": "exited", "failed": True}, (), False),
-        ({"completion_reason": "exited", "lost": True}, (), False),
-        ({"completion_reason": "exited", "canceled": True}, (), False),
-        ({}, ("termination_source",), False),
-        ({"termination_source": None}, (), False),
-        ({"termination_source": False}, (), False),
-        ({"termination_source": 0}, (), False),
-        ({}, ("session_id",), False),
-        ({"session_id": ""}, (), False),
-        ({"session_id": 1}, (), False),
-        ({}, ("session_key",), False),
-        ({"session_key": 1}, (), False),
-        ({}, ("started_at",), False),
-        ({"started_at": True}, (), False),
-        ({"started_at": 0}, (), False),
-    ],
+    _CLOSED_COMPLETION_ENVELOPE_CASES,
 )
 def test_delegated_child_suppression_requires_closed_completion_envelope(
     overrides, removed, suppressed
@@ -1829,6 +1834,28 @@ def test_delegated_child_suppression_requires_closed_completion_envelope(
         del event[key]
 
     assert (completion_delivery_prompt(event, "payload") is None) is suppressed
+
+
+def test_delegated_child_empty_session_key_is_silenced():
+    assert completion_delivery_prompt(
+        _completion_event(delegated_child=True, session_key=""), "payload"
+    ) is None
+
+
+def test_delegated_child_positive_subunit_started_at_is_silenced():
+    assert completion_delivery_prompt(
+        _completion_event(delegated_child=True, started_at=0.5), "payload"
+    ) is None
+
+
+def test_closed_completion_envelope_has_one_canonical_suppressing_row():
+    suppressing_rows = [
+        (overrides, removed)
+        for overrides, removed, suppressed in _CLOSED_COMPLETION_ENVELOPE_CASES
+        if suppressed
+    ]
+
+    assert suppressing_rows == [({"completion_reason": "exited"}, ())]
 
 
 def test_completion_visibility_explicit_false_skips_delivery(monkeypatch):

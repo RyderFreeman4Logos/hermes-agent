@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import sqlite3
 import threading
 import time
@@ -606,6 +607,7 @@ def _ordinary_completion_delivery_id(evt: Dict[str, Any]) -> Optional[str]:
         or not isinstance(session_key, str)
         or isinstance(started_at, bool)
         or not isinstance(started_at, (int, float))
+        or (isinstance(started_at, float) and not math.isfinite(started_at))
         or started_at <= 0
     ):
         return None
@@ -614,6 +616,15 @@ def _ordinary_completion_delivery_id(evt: Dict[str, Any]) -> Optional[str]:
         ensure_ascii=False,
         separators=(",", ":"),
     )
+
+
+def _durable_event_payload(evt: Dict[str, Any]) -> Dict[str, Any]:
+    """Strip process-local delivery state before persistence or replay."""
+    return {
+        key: value
+        for key, value in evt.items()
+        if not key.startswith("_completion_delivery_")
+    }
 
 
 def persist_event_delivery(evt: Dict[str, Any]) -> bool:
@@ -627,7 +638,7 @@ def persist_event_delivery(evt: Dict[str, Any]) -> bool:
             """INSERT OR IGNORE INTO ordinary_completion_deliveries
                (delivery_id, event_json, delivery_state, updated_at)
                VALUES (?, ?, 'pending', ?)""",
-            (delivery_id, json.dumps(evt, sort_keys=True), now),
+            (delivery_id, json.dumps(_durable_event_payload(evt), sort_keys=True), now),
         )
     return True
 
@@ -638,7 +649,9 @@ def record_completion_delivery_recovery(
     """Persist a missing in-memory suffix/marker disposition before clearing it."""
     if not session_id or not reason or not isinstance(event, dict):
         return False
-    payload = json.dumps(event, sort_keys=True, separators=(",", ":"))
+    payload = json.dumps(
+        _durable_event_payload(event), sort_keys=True, separators=(",", ":")
+    )
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
             """INSERT OR IGNORE INTO completion_delivery_recoveries
@@ -744,7 +757,7 @@ def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
             """INSERT OR IGNORE INTO ordinary_completion_deliveries
                (delivery_id, event_json, delivery_state, updated_at)
                VALUES (?, ?, 'pending', ?)""",
-            (delivery_id, json.dumps(evt, sort_keys=True), now),
+            (delivery_id, json.dumps(_durable_event_payload(evt), sort_keys=True), now),
         )
         cur = conn.execute(
             """UPDATE ordinary_completion_deliveries

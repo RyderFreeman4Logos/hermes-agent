@@ -4,7 +4,15 @@ Handler bodies are byte-identical to their pre-split server.py form; they
 are rebound onto server.py's globals at install time — see method_ctx.py.
 """
 
+from typing import TYPE_CHECKING
+
 from .method_ctx import HandlerRegistry
+
+if TYPE_CHECKING:
+    from .server import (
+        _begin_manual_compression_fence,
+        _finish_manual_compression_fence,
+    )
 
 _registry = HandlerRegistry()
 method = _registry.method
@@ -953,10 +961,11 @@ def _(rid, params: dict) -> dict:
     if name in {"compress", "compact"}:
         if not session:
             return _err(rid, 4001, "no active session to compress")
+        busy_response = _err(
+            rid, 4009, "session busy — /interrupt the current turn before /compress"
+        )
         if session.get("running"):
-            return _err(
-                rid, 4009, "session busy — /interrupt the current turn before /compress"
-            )
+            return busy_response
         from agent.conversation_compression import (
             finalize_context_engine_compression_notification,
         )
@@ -984,6 +993,10 @@ def _(rid, params: dict) -> dict:
                 rid,
                 {"type": "exec", "output": str(ack.get("output") or "")},
             )
+        try:
+            manual_compression_fence = _begin_manual_compression_fence(session)
+        except RuntimeError:
+            return busy_response
         try:
             from agent.manual_compression_feedback import (
                 compression_attempt_committed,
@@ -1096,7 +1109,7 @@ def _(rid, params: dict) -> dict:
             )
             return _err(rid, 5009, f"compress failed: {exc}")
         finally:
-            _finish_manual_compression_fence(session)
+            _finish_manual_compression_fence(session, manual_compression_fence)
 
     return _err(rid, 4018, f"not a quick/plugin/bundle/skill command: {name}")
 

@@ -33,6 +33,22 @@ def _completion_event(session_id: str, *, session_key: str = "session-key", exit
     return event
 
 
+def _delegation_event(delegation_id: str, *, summary: str) -> dict:
+    return {
+        "type": "async_delegation",
+        "delegation_id": delegation_id,
+        "session_key": "session-key",
+        "origin_ui_session_id": "sid",
+        "goal": "delegated task",
+        "status": "completed",
+        "summary": summary,
+        "api_calls": 1,
+        "duration_seconds": 1.0,
+        "dispatched_at": 2.0,
+        "completed_at": 3.0,
+    }
+
+
 def _session(**extra):
     base = {
         "agent": SimpleNamespace(),
@@ -73,7 +89,11 @@ class _StopAfter:
 
 
 @pytest.fixture
-def isolated_registry(monkeypatch):
+def isolated_registry(monkeypatch, tmp_path):
+    from tools import async_delegation as ad
+
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    monkeypatch.setattr(ad, "restore_undelivered_completions", lambda _queue: 0)
     registry = ProcessRegistry()
     monkeypatch.setattr(
         "tools.process_registry.process_registry",
@@ -84,16 +104,22 @@ def isolated_registry(monkeypatch):
 
     monkeypatch.setattr(prm, "process_registry", registry)
     monkeypatch.setattr(server, "_collect_kanban_notifications", lambda _s: [])
-    monkeypatch.setattr(server, "_notification_event_belongs_elsewhere", lambda *_a, **_k: False)
+    monkeypatch.setattr(
+        server, "_notification_event_belongs_elsewhere", lambda *_a, **_k: False
+    )
     monkeypatch.setattr(server, "_notification_event_requires_owner", lambda _e: True)
-    monkeypatch.setattr(server, "_session_owns_notification_event", lambda *_a, **_k: True)
+    monkeypatch.setattr(
+        server, "_session_owns_notification_event", lambda *_a, **_k: True
+    )
     monkeypatch.setattr(server, "_sync_runtime_heartbeat_status", lambda *a, **k: None)
     monkeypatch.setattr(server, "_NOTIFICATION_REQUEUE_BACKOFF_SECONDS", 0.0)
     monkeypatch.setattr(server, "_COMPLETION_BACKLOG_COALESCE_WINDOW_SECONDS", 0.02)
     return registry
 
 
-def test_busy_tool_chain_steers_once_and_skips_idle_duplicate(isolated_registry, monkeypatch):
+def test_busy_tool_chain_steers_once_and_skips_idle_duplicate(
+    isolated_registry, monkeypatch
+):
     """Several completions during one long tool chain apply exactly once."""
     registry = isolated_registry
     steered: list[str] = []
@@ -379,3 +405,202 @@ def test_busy_pending_steer_does_not_block_later_queue_events(isolated_registry,
     assert registry.completion_queue.empty()
     pending = sess.get("_completion_steer_pending") or []
     assert {p["evt"]["session_id"] for p in pending} == {"proc_first", "proc_second"}
+
+
+@pytest.mark.parametrize("outcome", ["success", "failure", "cancel", "noop"])
+def test_manual_compress_holds_completions_until_terminal_boundary(
+    isolated_registry, monkeypatch, outcome
+):
+    """Manual compression owns the turn until every terminal path completes."""
+    from agent import conversation_compression
+    from tools import async_delegation as ad
+
+    compression_entered = threading.Event()
+    release_compression = threading.Event()
+    terminal_entered = threading.Event()
+    release_terminal = threading.Event()
+    delivered = threading.Event()
+    poller_waiting = threading.Event()
+    event_dequeued = threading.Event()
+    deliveries: list[tuple[str, dict]] = []
+
+    class _ObservedQueue(queue_mod.Queue):
+        def get(self, *args, **kwargs):
+            poller_waiting.set()
+            item = super().get(*args, **kwargs)
+            event_dequeued.set()
+            return item
+
+    isolated_registry.completion_queue = _ObservedQueue()
+
+    class _Agent:
+        session_id = "session-key"
+        api_mode = "codex_responses"
+        tools: list = []
+        _cached_system_prompt = ""
+        _awaiting_cache_creation_usage = False
+        _awaiting_cache_creation_base_input = 0
+
+        def __init__(self):
+            self.context_compressor = SimpleNamespace(
+                _last_compression_telemetry=None,
+                precomputed_token_count=None,
+            )
+
+        def _compress_context(self, messages, _system_prompt="", **_kwargs):
+            compression_entered.set()
+            assert release_compression.wait(5), "compression release timed out"
+            if outcome == "failure":
+                raise RuntimeError("forced compression failure")
+            if outcome == "cancel":
+                self.context_compressor._last_compression_telemetry = {
+                    "commit_status": "aborted",
+                    "failure_class": "commit_fence_cancelled",
+                }
+                return list(messages)
+            self.context_compressor._last_compression_telemetry = {
+                "commit_status": "committed"
+            }
+            return [
+                {"role": "system", "content": "system"},
+                {"role": "assistant", "content": "compressed"},
+            ]
+
+        def steer(self, _text):
+            pytest.fail("a completion must not steer the manual compression turn")
+
+    agent = _Agent()
+    history = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "one"},
+        {"role": "assistant", "content": "two"},
+    ]
+    if outcome != "noop":
+        history.extend([
+            {"role": "user", "content": "three"},
+            {"role": "assistant", "content": "four"},
+        ])
+    session = _session(agent=agent, history=history)
+    monkeypatch.setitem(server._sessions, "sid", session)
+
+    if outcome == "noop":
+        record_noop = conversation_compression.record_compression_noop
+
+        def held_noop(*args, **kwargs):
+            compression_entered.set()
+            assert release_compression.wait(5), "no-op release timed out"
+            return record_noop(*args, **kwargs)
+
+        monkeypatch.setattr(
+            conversation_compression, "record_compression_noop", held_noop
+        )
+
+    monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: False)
+    monkeypatch.setattr(
+        server, "_sync_session_key_after_compress", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(server, "_restart_slash_worker", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_session_info", lambda *_a, **_k: {})
+    monkeypatch.setattr(server, "_get_usage", lambda _agent: {})
+    monkeypatch.setattr(server, "_emit", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        "agent.model_metadata.estimate_request_tokens_rough", lambda *_a, **_k: 100
+    )
+    monkeypatch.setattr(
+        "agent.model_metadata.get_model_context_length", lambda *_a, **_k: 10_000
+    )
+
+    def status_update(_sid, kind, _text=None):
+        if kind == "ready":
+            terminal_entered.set()
+            assert release_terminal.wait(5), "terminal release timed out"
+
+    monkeypatch.setattr(server, "_status_update", status_update)
+
+    def run_completion(_rid, _sid, sess, text, **kwargs):
+        deliveries.append((text, kwargs))
+        callback = kwargs.get("completion_delivery_callback")
+        if callback is not None:
+            callback("committed")
+        with sess["history_lock"]:
+            sess["running"] = False
+        delivered.set()
+
+    monkeypatch.setattr(server, "_run_prompt_submit", run_completion)
+    monkeypatch.setattr(server, "_NOTIFICATION_QUEUE_WAIT_SECONDS", 0.01)
+
+    process_event = _completion_event(
+        f"proc-manual-compress-{outcome}", output="process-done"
+    )
+    delegation_event = _delegation_event(
+        f"deleg-manual-compress-{outcome}", summary="subagent-done"
+    )
+    assert ad.persist_event_delivery(process_event)
+    ad._persist_dispatch({
+        "delegation_id": delegation_event["delegation_id"],
+        "session_key": "session-key",
+        "origin_ui_session_id": "sid",
+        "parent_session_id": "session-key",
+        "dispatched_at": 2.0,
+    })
+    ad._persist_completion(
+        delegation_event, {"status": "completed", "summary": "subagent-done"}
+    )
+
+    command_result: dict = {}
+
+    def run_compress():
+        try:
+            command_result["response"] = server._methods["session.compress"](
+                "rid", {"session_id": "sid"}
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            command_result["exception"] = exc
+
+    stop_poller = threading.Event()
+    command_thread = threading.Thread(target=run_compress, daemon=True)
+    poller_thread = threading.Thread(
+        target=server._notification_poller_loop,
+        args=(stop_poller, "sid", session),
+        daemon=True,
+    )
+
+    try:
+        poller_thread.start()
+        assert poller_waiting.wait(2)
+        command_thread.start()
+        assert compression_entered.wait(2), command_result
+        isolated_registry.completion_queue.put(process_event)
+        isolated_registry.completion_queue.put(delegation_event)
+
+        assert event_dequeued.wait(2)
+        assert deliveries == []
+        assert command_thread.is_alive()
+
+        release_compression.set()
+        assert terminal_entered.wait(2)
+        with session["history_lock"]:
+            assert session.get("_manual_compression_fence") is not None
+        assert deliveries == []
+
+        release_terminal.set()
+        command_thread.join(2)
+        assert not command_thread.is_alive()
+        assert "exception" not in command_result
+        assert delivered.wait(2)
+
+        assert len(deliveries) == 1
+        text, _kwargs = deliveries[0]
+        assert text.count("process-done") == 1
+        assert text.count("subagent-done") == 1
+        assert text.index("process-done") < text.index("subagent-done")
+        assert isolated_registry.completion_queue.empty()
+        assert session["running"] is False
+        assert "_manual_compression_fence" not in session
+        assert "_manual_compression_fence_owner" not in session
+    finally:
+        release_compression.set()
+        release_terminal.set()
+        stop_poller.set()
+        command_thread.join(2)
+        poller_thread.join(2)

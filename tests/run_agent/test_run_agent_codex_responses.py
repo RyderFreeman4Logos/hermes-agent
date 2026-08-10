@@ -2329,7 +2329,7 @@ def test_ambiguous_checkpoint_preserves_tool_result_without_duplicate_effect(mon
 
 @pytest.mark.parametrize(
     ("unsafe_partial_tool", "expected_calls"),
-    [(False, 2), (True, 1)],
+    [(False, 4), (True, 1)],
     ids=["second-ambiguity", "partial-tool-boundary"],
 )
 def test_ambiguous_checkpoint_is_bounded_and_rejects_partial_tool_boundary(
@@ -2341,16 +2341,14 @@ def test_ambiguous_checkpoint_is_bounded_and_rejects_partial_tool_boundary(
     first._hermes_ambiguous_provider_acceptance = True
     if unsafe_partial_tool:
         first._hermes_ambiguous_partial_tool_call = True
-    second = RuntimeError("second ambiguous dispatch")
-    second._hermes_ambiguous_provider_acceptance = True
+    subsequent = RuntimeError("subsequent ambiguous dispatch")
+    subsequent._hermes_ambiguous_provider_acceptance = True
 
     def _fake_api_call(api_kwargs):
         requests.append(api_kwargs)
         if len(requests) == 1:
             raise first
-        if len(requests) == 2:
-            raise second
-        return _codex_message_response("must not dispatch")
+        raise subsequent
 
     monkeypatch.setattr(agent, "_interruptible_api_call", _fake_api_call)
 
@@ -2363,6 +2361,47 @@ def test_ambiguous_checkpoint_is_bounded_and_rejects_partial_tool_boundary(
     assert result["ambiguous_provider_attempt"] is True
     assert result["turn_exit_reason"] == "ambiguous_provider_attempt"
     assert result["messages"][-1]["finish_reason"] == "ambiguous_provider_attempt"
+    assert len({repr(request["input"]) for request in requests}) == expected_calls
+
+
+def test_ambiguous_checkpoint_continuations_back_off(monkeypatch):
+    """Each fresh checkpoint waits before its next physical dispatch."""
+    from agent import conversation_loop
+
+    agent = _build_agent(monkeypatch)
+    requests = []
+    backoffs = []
+    now = [0.0]
+    ambiguous = RuntimeError("ambiguous dispatch")
+    ambiguous._hermes_ambiguous_provider_acceptance = True
+
+    def _fake_api_call(api_kwargs):
+        requests.append(api_kwargs)
+        if len(requests) < 3:
+            raise ambiguous
+        return _codex_message_response("Finished after checkpoint backoff")
+
+    def _backoff(attempt, **kwargs):
+        backoffs.append((attempt, kwargs["base_delay"], kwargs["max_delay"]))
+        return 0.4
+
+    sleeps = []
+    clock = types.SimpleNamespace(
+        time=lambda: now[0],
+        monotonic=lambda: now[0],
+        sleep=lambda delay: (sleeps.append(delay), now.__setitem__(0, now[0] + delay)),
+    )
+    monkeypatch.setattr(agent, "_interruptible_api_call", _fake_api_call)
+    monkeypatch.setattr(conversation_loop, "jittered_backoff", _backoff)
+    monkeypatch.setattr(conversation_loop, "time", clock)
+
+    result = agent.run_conversation("back off between ambiguous checkpoints")
+
+    assert result["completed"] is True
+    assert result["final_response"] == "Finished after checkpoint backoff"
+    assert len(requests) == 3
+    assert backoffs == [(1, 1.0, 15.0), (2, 1.0, 15.0)]
+    assert sleeps == pytest.approx([0.2, 0.2, 0.2, 0.2])
 
 
 def test_ambiguous_checkpoint_empty_response_does_not_replay_original(monkeypatch):

@@ -1907,15 +1907,19 @@ class ProcessRegistry:
     def _is_normal_completion_success(evt: dict) -> bool:
         """Return True only for the canonical, fully-known normal outcome."""
         return (
-            type(evt.get("exit_code")) is int
+            evt.get("type") == "completion"
+            and type(evt.get("exit_code")) is int
             and evt["exit_code"] == 0
             and evt.get("completion_reason") == "exited"
+            and isinstance(evt.get("command"), str)
+            and isinstance(evt.get("output"), str)
             and not evt.get("termination_source")
             and not any(
                 evt.get(key)
                 for key in (
                     "error", "stderr", "error_message", "exception",
                     "warning", "safety_alert", "timed_out", "cancelled",
+                    "canceled", "failed", "lost",
                 )
             )
         )

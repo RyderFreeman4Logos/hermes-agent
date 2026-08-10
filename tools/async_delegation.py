@@ -38,7 +38,6 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import sqlite3
 import threading
 import time
@@ -465,6 +464,41 @@ def restore_undelivered_completions(target_queue) -> int:
                    WHERE delivery_id=? AND delivery_state='effect_started'""",
                 (now, delivery_id),
             )
+        pending_rows = conn.execute(
+            """SELECT delivery_id, event_json
+               FROM ordinary_completion_deliveries
+               WHERE delivery_state='pending'"""
+        ).fetchall()
+        for delivery_id, payload in pending_rows:
+            evt = _load_durable_event_payload(payload)
+            if not isinstance(evt, dict):
+                continue
+            normalized_id = _ordinary_completion_delivery_id(evt)
+            normalized_payload = json.dumps(_durable_event_payload(evt), sort_keys=True)
+            if normalized_id is not None and normalized_id != delivery_id:
+                target_exists = conn.execute(
+                    "SELECT 1 FROM ordinary_completion_deliveries WHERE delivery_id=?",
+                    (normalized_id,),
+                ).fetchone()
+                if target_exists:
+                    conn.execute(
+                        """DELETE FROM ordinary_completion_deliveries
+                           WHERE delivery_id=? AND delivery_state='pending'""",
+                        (delivery_id,),
+                    )
+                else:
+                    conn.execute(
+                        """UPDATE ordinary_completion_deliveries
+                           SET delivery_id=?, event_json=? WHERE delivery_id=?
+                             AND delivery_state='pending'""",
+                        (normalized_id, normalized_payload, delivery_id),
+                    )
+            else:
+                conn.execute(
+                    """UPDATE ordinary_completion_deliveries SET event_json=?
+                       WHERE delivery_id=? AND delivery_state='pending'""",
+                    (normalized_payload, delivery_id),
+                )
         ordinary_rows = conn.execute(
             """SELECT delivery_id, event_json, delivery_attempts
                FROM ordinary_completion_deliveries
@@ -521,26 +555,13 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
 
 
 def _ordinary_completion_delivery_id(evt: Dict[str, Any]) -> Optional[str]:
-    """Return the stable ordinary-process completion identity."""
-    session_id = evt.get("session_id")
-    session_key = evt.get("session_key", "")
-    started_at = evt.get("started_at")
-    if (
-        evt.get("type", "completion") != "completion"
-        or not isinstance(session_id, str)
-        or not session_id
-        or not isinstance(session_key, str)
-        or isinstance(started_at, bool)
-        or not isinstance(started_at, (int, float))
-        or (isinstance(started_at, float) and not math.isfinite(started_at))
-        or started_at <= 0
-    ):
+    """Return canonical tuple authority or a sanitized envelope fingerprint."""
+    from tools.process_registry import ProcessRegistry
+
+    identity = ProcessRegistry._completion_durable_identity(evt)
+    if identity is None:
         return None
-    return json.dumps(
-        ["completion", session_id, started_at, session_key],
-        ensure_ascii=False,
-        separators=(",", ":"),
-    )
+    return json.dumps(identity, ensure_ascii=False, separators=(",", ":"))
 
 
 def _durable_event_payload(evt: Dict[str, Any]) -> Dict[str, Any]:

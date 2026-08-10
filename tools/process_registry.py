@@ -30,6 +30,7 @@ Usage:
 """
 
 import codecs
+import hashlib
 import json
 import logging
 import math
@@ -75,6 +76,7 @@ FINISHED_TTL_SECONDS = 1800     # Keep finished processes for 30 minutes
 MAX_PROCESSES = 64              # Max concurrent tracked processes (LRU pruning)
 MAX_ACTIVE_PROCESS_AGE = 86400  # 24h default — see session_reset.bg_process_max_age_hours (#29177)
 COMPLETION_DISPOSITION_RETENTION = 2048
+_COMPLETION_DELIVERY_PRIVATE_PREFIX = "_completion_delivery_"
 
 # Watch pattern rate limiting — PER SESSION.
 # Hard rule: at most ONE watch-match notification every WATCH_MIN_INTERVAL_SECONDS.
@@ -109,6 +111,102 @@ def format_uptime_short(seconds: int) -> str:
 
 class _CompletionDeliveryToken(str):
     """Process-local authority whose type cannot survive JSON persistence."""
+
+
+class _CompletionDeliveryBinding(str):
+    """Exact private subtype binding a local token to its producer event."""
+
+
+def _completion_durable_payload(evt: dict) -> dict:
+    """Return the public ordinary-completion projection used for persistence."""
+    return {
+        key: value
+        for key, value in evt.items()
+        if not key.startswith(_COMPLETION_DELIVERY_PRIVATE_PREFIX)
+    }
+
+
+def _completion_event_fingerprint(evt: dict) -> Optional[str]:
+    """Return a replay-stable identity for one sanitized malformed envelope."""
+    if (
+        evt.get("type", "completion") != "completion"
+        or _completion_core_identity(evt) is None
+    ):
+        return None
+    payload = _completion_durable_payload(evt)
+    payload.pop("restored", None)
+    try:
+        encoded = json.dumps(
+            payload,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        return None
+    return f"completion-event-v1:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def _completion_core_identity(evt: dict) -> "tuple | None":
+    """Return the stable producer tuple without granting public authority."""
+    session_id = evt.get("session_id")
+    session_key = evt.get("session_key", "")
+    started_at = evt.get("started_at")
+    if (
+        evt.get("type", "completion") != "completion"
+        or not isinstance(session_id, str)
+        or not session_id
+        or not isinstance(session_key, str)
+        or isinstance(started_at, bool)
+        or not isinstance(started_at, (int, float))
+        or (isinstance(started_at, float) and not math.isfinite(started_at))
+        or started_at <= 0
+    ):
+        return None
+    return ("completion", session_id, started_at, session_key)
+
+
+def _bound_completion_delivery_metadata(evt: dict) -> "tuple | None":
+    """Decode exact local authority bound to its producer and original envelope."""
+    token = evt.get("_completion_delivery_token")
+    binding = evt.get("_completion_delivery_binding")
+    if (
+        type(token) is not _CompletionDeliveryToken
+        or type(binding) is not _CompletionDeliveryBinding
+        or not token
+        or not binding
+    ):
+        return None
+    try:
+        metadata = json.loads(str(binding))
+    except (TypeError, ValueError):
+        return None
+    if (
+        not isinstance(metadata, list)
+        or len(metadata) != 3
+        or not isinstance(metadata[1], str)
+        or token.rpartition("|")[2] != metadata[1]
+    ):
+        return None
+    return token, metadata[0], metadata[2]
+
+
+def _bound_completion_delivery_token(evt: dict) -> Optional[_CompletionDeliveryToken]:
+    """Return an exact local token only when its producer binding still matches."""
+    metadata = _bound_completion_delivery_metadata(evt)
+    return metadata[0] if metadata is not None else None
+
+
+def _bound_completion_event_fingerprint(evt: dict) -> Optional[str]:
+    """Return the original envelope fingerprint from valid local authority."""
+    if _completion_core_identity(evt) is None:
+        return None
+    metadata = _bound_completion_delivery_metadata(evt)
+    fingerprint = metadata[2] if metadata is not None else None
+    if isinstance(fingerprint, str) and fingerprint.startswith("completion-event-v1:"):
+        return fingerprint
+    return None
 
 
 @dataclass
@@ -1824,7 +1922,7 @@ class ProcessRegistry:
         # Keep the exact terminal payload in the checkpoint until its durable
         # receipt exists. A later unrelated checkpoint write must not erase it.
         if event is not None and not completion_receipt_persisted:
-            identity = self._completion_identity(event)
+            identity = self._completion_durable_identity(event)
             if identity is not None:
                 with self._lock:
                     self._terminal_completion_spool[identity] = {
@@ -1845,6 +1943,22 @@ class ProcessRegistry:
                 with self._completion_disposition_lock:
                     state = self._completion_dispositions.get(identity)
                     if state in {"queued", "observed_queued", "inflight", "delivered"}:
+                        try:
+                            from tools.async_delegation import (
+                                claim_event_delivery,
+                                mark_completion_delivery_recovery,
+                            )
+
+                            claim = claim_event_delivery(event, "process-duplicate")
+                            if claim:
+                                mark_completion_delivery_recovery(
+                                    event, claim, "producer_duplicate"
+                                )
+                        except Exception:
+                            logger.debug(
+                                "Failed to settle duplicate completion receipt",
+                                exc_info=True,
+                            )
                         return
                     self._set_completion_disposition(
                         identity, "observed_queued" if state == "observed" else "queued"
@@ -1882,7 +1996,21 @@ class ProcessRegistry:
             "delegated_child": session.delegated_child,
         }
         if session.notify_on_complete:
-            event["_completion_delivery_token"] = session._completion_delivery_token
+            core = _completion_core_identity(event)
+            producer = hashlib.sha256(
+                str(session._completion_delivery_token).encode("utf-8")
+            ).hexdigest()
+            binding = _CompletionDeliveryBinding(
+                json.dumps(
+                    [core, producer, _completion_event_fingerprint(event)],
+                    allow_nan=False,
+                    separators=(",", ":"),
+                )
+            )
+            event["_completion_delivery_binding"] = binding
+            event["_completion_delivery_token"] = _CompletionDeliveryToken(
+                f"{session._completion_delivery_token}|{producer}"
+            )
         return event
 
     @staticmethod
@@ -1902,56 +2030,61 @@ class ProcessRegistry:
 
     @staticmethod
     def _completion_identity(evt: dict) -> "tuple | None":
-        """Return a stable ordinary-completion identity, or None to fail open."""
-        session_id = evt.get("session_id")
-        session_key = evt.get("session_key", "")
-        started_at = evt.get("started_at")
+        """Return tuple authority only for a fully canonical success envelope."""
+        identity = _completion_core_identity(evt)
         if (
-            evt.get("type", "completion") != "completion"
-            or not isinstance(session_id, str)
-            or not session_id
-            or not isinstance(session_key, str)
-            or isinstance(started_at, bool)
-            or not isinstance(started_at, (int, float))
-            or (isinstance(started_at, float) and not math.isfinite(started_at))
-            or started_at <= 0
+            identity is None
+            or evt.get("type") != "completion"
+            or "session_key" not in evt
+            or evt.get("termination_source") != ""
+            or type(evt.get("exit_code")) is not int
+            or evt["exit_code"] != 0
+            or evt.get("completion_reason") != "exited"
+            or not isinstance(evt.get("command"), str)
+            or not isinstance(evt.get("output"), str)
+            or any(
+                evt.get(key)
+                for key in (
+                    "error",
+                    "stderr",
+                    "error_message",
+                    "exception",
+                    "warning",
+                    "safety_alert",
+                    "timed_out",
+                    "cancelled",
+                    "canceled",
+                    "failed",
+                    "lost",
+                )
+            )
         ):
             return None
-        return ("completion", session_id, started_at, session_key)
+        return identity
 
     @staticmethod
-    def _completion_claim_identity(evt: dict) -> "tuple | None":
-        """Return a durable identity or a producer-local arbitration token."""
+    def _completion_durable_identity(evt: dict) -> "tuple | None":
+        """Return canonical, bound-producer, or sanitized-envelope authority."""
         identity = ProcessRegistry._completion_identity(evt)
         if identity is not None:
             return identity
-        token = evt.get("_completion_delivery_token")
-        if type(token) is _CompletionDeliveryToken and token:
-            return ("completion-local", token)
-        return None
+        fingerprint = _bound_completion_event_fingerprint(
+            evt
+        ) or _completion_event_fingerprint(evt)
+        return ("completion-event", fingerprint) if fingerprint is not None else None
+
+    @staticmethod
+    def _completion_claim_identity(evt: dict) -> "tuple | None":
+        """Return a producer-local token/event binding or durable authority."""
+        metadata = _bound_completion_delivery_metadata(evt)
+        if metadata is not None:
+            return ("completion-local", metadata[0], metadata[2])
+        return ProcessRegistry._completion_durable_identity(evt)
 
     @staticmethod
     def _is_normal_completion_success(evt: dict) -> bool:
         """Return True only for the canonical, fully-known normal outcome."""
-        return (
-            evt.get("type") == "completion"
-            and ProcessRegistry._completion_identity(evt) is not None
-            and "session_key" in evt
-            and evt.get("termination_source") == ""
-            and type(evt.get("exit_code")) is int
-            and evt["exit_code"] == 0
-            and evt.get("completion_reason") == "exited"
-            and isinstance(evt.get("command"), str)
-            and isinstance(evt.get("output"), str)
-            and not any(
-                evt.get(key)
-                for key in (
-                    "error", "stderr", "error_message", "exception",
-                    "warning", "safety_alert", "timed_out", "cancelled",
-                    "canceled", "failed", "lost",
-                )
-            )
-        )
+        return ProcessRegistry._completion_identity(evt) is not None
 
     @staticmethod
     def _is_observed_completion_noop(evt: dict) -> bool:
@@ -1995,9 +2128,13 @@ class ProcessRegistry:
         ):
             return False
         event = self._completion_event(session)
-        identity = self._completion_identity(event)
+        identity = self._completion_claim_identity(event)
         if identity is None:
             return False
+        identities = {identity}
+        stable_identity = self._completion_identity(event)
+        if stable_identity is not None:
+            identities.add(stable_identity)
 
         if self._is_observed_completion_noop(event):
             claim = None
@@ -2031,7 +2168,8 @@ class ProcessRegistry:
             if not committed:
                 return False
             with self._completion_disposition_lock:
-                self._set_completion_disposition(identity, "delivered")
+                for candidate in identities:
+                    self._set_completion_disposition(candidate, "delivered")
             return True
 
         with self._completion_disposition_lock:
@@ -2074,7 +2212,7 @@ class ProcessRegistry:
         return True
 
     def _retire_terminal_completion_spool(self, evt: dict) -> None:
-        identity = self._completion_identity(evt)
+        identity = self._completion_durable_identity(evt)
         if identity is None:
             return
         with self._lock:
@@ -3211,7 +3349,7 @@ class ProcessRegistry:
                     event.get("session_id", "?"),
                     exc_info=True,
                 )
-            identity = self._completion_identity(event)
+            identity = self._completion_durable_identity(event)
             if identity is not None:
                 with self._lock:
                     if persisted:
@@ -3389,27 +3527,59 @@ def finish_completion_event_delivery(
     """Resolve one completion claim only through its durable terminal fence."""
     from tools.async_delegation import (
         complete_event_delivery,
+        get_durable_event_delivery,
         mark_completion_delivery_recovery,
         release_event_delivery,
     )
 
     target = registry or process_registry
     terminal = False
-    try:
-        if outcome == "committed":
+    if outcome == "committed":
+        try:
             terminal = complete_event_delivery(evt, claim_id)
-        elif outcome in {
-            "missing_active_marker",
-            "history_conflict",
-            "visibility_suppressed",
-        }:
-            terminal = mark_completion_delivery_recovery(evt, claim_id, outcome)
-    except Exception:
-        logger.debug("Failed to commit completion delivery transition", exc_info=True)
+        except Exception:
+            logger.debug("Failed to acknowledge committed completion", exc_info=True)
+        if not terminal:
+            try:
+                terminal = mark_completion_delivery_recovery(
+                    evt, claim_id, "committed_ack_failed"
+                )
+            except Exception:
+                logger.debug(
+                    "Failed to record committed completion ACK recovery",
+                    exc_info=True,
+                )
+        if not terminal:
+            try:
+                receipt = get_durable_event_delivery(evt) or {}
+                state = str(receipt.get("delivery_state") or "")
+                terminal = state in {"delivered", "dropped"} or state.startswith(
+                    "recovery_"
+                )
+            except Exception:
+                logger.debug("Failed to reconcile committed completion", exc_info=True)
+    else:
+        try:
+            if outcome in {
+                "missing_active_marker",
+                "history_conflict",
+                "visibility_suppressed",
+            }:
+                terminal = mark_completion_delivery_recovery(evt, claim_id, outcome)
+        except Exception:
+            logger.debug(
+                "Failed to commit completion delivery transition", exc_info=True
+            )
 
     if terminal:
         target.complete_completion_delivery(evt)
         return True
+    if outcome == "committed":
+        logger.error(
+            "Committed completion ACK remains unresolved; retaining its claim "
+            "without requeueing the provider effect"
+        )
+        return False
 
     released = False
     try:

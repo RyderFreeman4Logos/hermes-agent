@@ -1554,6 +1554,7 @@ def _record_runtime_provider_activity(
                 else canonical_runtime_cache_context_identity(agent)
             ),
             activity_at=activity_at,
+            owner=agent,
         )
     except Exception:
         logger.debug("Could not reset exact heartbeat cache lease", exc_info=True)
@@ -2559,19 +2560,20 @@ def run_conversation(
         )
 
         if ambiguous_checkpoint_continuation:
-            # This recovery checkpoint exists only on the fresh wire request.
-            # Keeping it out of ``messages`` preserves the durable transcript
-            # and every completed tool result exactly as they were.
-            api_messages.extend([
+            # Wire-only recovery instruction. Do not invent a user turn
+            # (AGENTS.md: no synthetic user mid-loop). Append an assistant
+            # checkpoint so the next model request is distinct and tools stay
+            # constrained by the same durable transcript.
+            api_messages.append(
                 {
                     "role": "assistant",
-                    "content": "[Recovery checkpoint: prior provider outcome unknown.]",
-                },
-                {
-                    "role": "user",
-                    "content": ambiguous_continuation_prompt,
-                },
-            ])
+                    "content": (
+                        "[Recovery checkpoint: prior provider outcome unknown. "
+                        f"{ambiguous_continuation_prompt}]"
+                    ),
+                    "finish_reason": "ambiguous_recovery_checkpoint",
+                }
+            )
 
         # Safety net: strip orphaned tool results / add stubs for missing
         # results before sending to the API.  Runs unconditionally — not
@@ -8068,6 +8070,15 @@ def run_conversation(
                         and agent._thinking_prefill_retries >= 2
                     )
                     if _truly_empty and (not _has_structured or _prefill_exhausted) and agent._empty_content_retries < 3:
+                        if ambiguous_continuation_attempted:
+                            # The one allowed checkpoint already returned no
+                            # usable content. Do not fall into the generic
+                            # empty-response retry — that would reconstruct the
+                            # original durable request and replay the ambiguous
+                            # physical attempt.
+                            return _terminal_ambiguous_provider_outcome(
+                                ambiguous_origin_error
+                            )
                         agent._empty_content_retries += 1
                         wait_time = jittered_backoff(
                             agent._empty_content_retries,

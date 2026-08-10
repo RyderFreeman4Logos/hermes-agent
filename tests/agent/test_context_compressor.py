@@ -12,6 +12,7 @@ from agent.context_compressor import (
     COMPRESSED_SUMMARY_METADATA_KEY,
     _summarize_tool_result,
     _is_summary_access_or_quota_error,
+    _estimate_msg_budget_tokens,
 )
 from hermes_state import SessionDB
 
@@ -265,6 +266,32 @@ class TestCompress:
 
 
 class TestTailBudgetCodexReplayFields:
+    @pytest.mark.parametrize(
+        ("message", "wire_content"),
+        [
+            (
+                {"role": "user", "content": "short", "api_content": "wire" * 2_000},
+                "wire" * 2_000,
+            ),
+            (
+                {"role": "assistant", "content": "same", "api_content": "same"},
+                "same",
+            ),
+            ({"role": "user", "content": "plain"}, "plain"),
+            (
+                {"role": "tool", "content": "tool body", "api_content": "ignored" * 2_000},
+                "tool body",
+            ),
+            (
+                {"role": "user", "content": "plain", "api_content": ["ignored"]},
+                "plain",
+            ),
+        ],
+    )
+    def test_tail_budget_counts_wire_content_once(self, message, wire_content):
+        expected = {"role": message["role"], "content": wire_content}
+        assert _estimate_msg_budget_tokens(message) == _estimate_msg_budget_tokens(expected)
+
     def test_tail_cut_counts_codex_replay_and_reasoning_fields(self):
         """Tail protection must budget hidden replay fields sent back to providers.
 

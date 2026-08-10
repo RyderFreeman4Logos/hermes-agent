@@ -1777,6 +1777,47 @@ def run_conversation(
     # retain that ephemeral output and rebase it onto the compacted transcript
     # on the next loop iteration. This prevents a second advisor fan-out.
     pending_moa_prepared_request = None
+    ambiguous_continuation_attempted = False
+    ambiguous_continuation_prompt: Optional[str] = None
+
+    def _terminal_ambiguous_provider_outcome():
+        ambiguous_error = (
+            "Provider request outcome is unknown after acceptance; "
+            "Hermes did not replay it to avoid duplicate billed work."
+        )
+        ambiguous_message = {
+            "role": "assistant",
+            "content": ambiguous_error,
+            "finish_reason": "ambiguous_provider_attempt",
+        }
+        if messages and messages[-1].get("role") == "assistant":
+            prior_content = str(messages[-1].get("content") or "").strip()
+            for replay_key in (
+                "reasoning",
+                "reasoning_content",
+                "reasoning_details",
+                "codex_reasoning_items",
+                "codex_message_items",
+                "tool_calls",
+            ):
+                messages[-1].pop(replay_key, None)
+            messages[-1].update(ambiguous_message)
+            if prior_content:
+                messages[-1]["content"] = f"{prior_content}\n\n{ambiguous_error}"
+        else:
+            messages.append(ambiguous_message)
+        agent._emit_status(f"⚠️ {ambiguous_error}")
+        agent._persist_session(messages, conversation_history)
+        return {
+            "final_response": ambiguous_error,
+            "messages": messages,
+            "api_calls": api_call_count,
+            "completed": False,
+            "partial": True,
+            "error": ambiguous_error,
+            "ambiguous_provider_attempt": True,
+            "turn_exit_reason": "ambiguous_provider_attempt",
+        }
 
     # Per-turn tally of consecutive successful credential-pool token refreshes,
     # keyed by (provider, pool-entry-id). A persistent upstream 401 lets
@@ -1823,13 +1864,19 @@ def run_conversation(
         )
         or agent._budget_grace_call
         or getattr(agent, "_codex_incomplete_retries", 0)
+        or ambiguous_continuation_prompt is not None
     ):
-        terminal_text_only = _terminal_text_only_continuation or (
-            getattr(agent, "_delegate_depth", 0) > 0
-            and min(
-                agent.max_iterations - logical_iteration_count,
-                agent.iteration_budget.remaining,
-            ) == 1
+        ambiguous_checkpoint_continuation = ambiguous_continuation_prompt is not None
+        terminal_text_only = not ambiguous_checkpoint_continuation and (
+            _terminal_text_only_continuation
+            or (
+                getattr(agent, "_delegate_depth", 0) > 0
+                and min(
+                    agent.max_iterations - logical_iteration_count,
+                    agent.iteration_budget.remaining,
+                )
+                == 1
+            )
         )
         _redirect_text = agent._drain_pending_redirect()
         if _redirect_text:
@@ -1866,7 +1913,7 @@ def run_conversation(
             agent._budget_grace_call = False
             logical_iteration_count += 1
             logical_slot_consumed = True
-        elif not codex_continuation:
+        elif not codex_continuation and not ambiguous_checkpoint_continuation:
             if not agent.iteration_budget.consume():
                 _turn_exit_reason = "budget_exhausted"
                 api_call_count -= 1
@@ -2231,6 +2278,21 @@ def run_conversation(
             _sel_incoming,
             logger=request_logger,
         )
+
+        if ambiguous_checkpoint_continuation:
+            # This recovery checkpoint exists only on the fresh wire request.
+            # Keeping it out of ``messages`` preserves the durable transcript
+            # and every completed tool result exactly as they were.
+            api_messages.extend([
+                {
+                    "role": "assistant",
+                    "content": "[Recovery checkpoint: prior provider outcome unknown.]",
+                },
+                {
+                    "role": "user",
+                    "content": ambiguous_continuation_prompt,
+                },
+            ])
 
         # Safety net: strip orphaned tool results / add stubs for missing
         # results before sending to the API.  Runs unconditionally — not
@@ -2854,7 +2916,12 @@ def run_conversation(
                         raise
 
                 def _perform_api_call(next_api_kwargs):
+                    nonlocal ambiguous_continuation_prompt
                     _mark_provider_dispatch(None)
+                    # The continuation is now part of this fresh request. Clear
+                    # its loop sentinel before dispatch so it cannot spin if a
+                    # transport path does not expose a dispatch callback.
+                    ambiguous_continuation_prompt = None
                     if terminal_text_only:
                         next_api_kwargs = dict(next_api_kwargs)
                         relay_llm.disable_tools(next_api_kwargs)
@@ -3080,6 +3147,16 @@ def run_conversation(
                 )
 
                 if response_invalid:
+                    if ambiguous_checkpoint_continuation:
+                        continuation_error = RuntimeError(
+                            "Fresh continuation response is invalid"
+                        )
+                        setattr(
+                            continuation_error,
+                            "_hermes_ambiguous_provider_acceptance",
+                            True,
+                        )
+                        raise continuation_error
                     agent._invoke_api_request_error_hook(
                         task_id=effective_task_id,
                         turn_id=turn_id,
@@ -4016,6 +4093,8 @@ def run_conversation(
                     thinking_spinner = None
                 if agent.thinking_callback:
                     agent.thinking_callback("")
+                if ambiguous_checkpoint_continuation:
+                    return _terminal_ambiguous_provider_outcome()
                 if agent._has_pending_redirect():
                     # redirect() deliberately used the interrupt machinery to
                     # cancel only this provider request. Keep its correction
@@ -4057,6 +4136,8 @@ def run_conversation(
                     api_call_count -= 1
                     agent._api_call_count = api_call_count
                     _refund_current_logical_iteration()
+                    if ambiguous_continuation_attempted:
+                        return _terminal_ambiguous_provider_outcome()
                     final_response = str(api_error)
                     failed = True
                     _turn_exit_reason = "pre_dispatch_turn_deadline"
@@ -4074,44 +4155,32 @@ def run_conversation(
                     _refund_current_logical_iteration()
 
                 if getattr(api_error, "_hermes_ambiguous_provider_acceptance", False):
-                    ambiguous_error = (
-                        "Provider request outcome is unknown after acceptance; "
-                        "Hermes did not replay it to avoid duplicate billed work."
-                    )
-                    ambiguous_message = {
-                        "role": "assistant",
-                        "content": ambiguous_error,
-                        "finish_reason": "ambiguous_provider_attempt",
-                    }
-                    if messages and messages[-1].get("role") == "assistant":
-                        prior_content = str(messages[-1].get("content") or "").strip()
-                        for replay_key in (
-                            "reasoning",
-                            "reasoning_content",
-                            "reasoning_details",
-                            "codex_reasoning_items",
-                            "codex_message_items",
-                            "tool_calls",
-                        ):
-                            messages[-1].pop(replay_key, None)
-                        messages[-1].update(ambiguous_message)
-                        if prior_content:
-                            messages[-1]["content"] = (
-                                f"{prior_content}\n\n{ambiguous_error}"
-                            )
-                    else:
-                        messages.append(ambiguous_message)
-                    agent._emit_status(f"⚠️ {ambiguous_error}")
-                    agent._persist_session(messages, conversation_history)
-                    return {
-                        "final_response": ambiguous_error,
-                        "messages": messages,
-                        "api_calls": api_call_count,
-                        "completed": False,
-                        "partial": True,
-                        "error": ambiguous_error,
-                        "ambiguous_provider_attempt": True,
-                    }
+                    if (
+                        not ambiguous_continuation_attempted
+                        and not getattr(
+                            api_error,
+                            "_hermes_ambiguous_partial_tool_call",
+                            False,
+                        )
+                        and not agent._interrupt_requested
+                        and not moa_config
+                        and agent.provider != "moa"
+                    ):
+                        ambiguous_continuation_attempted = True
+                        ambiguous_continuation_prompt = (
+                            "[System: A previous provider request may have been accepted "
+                            "but its outcome is unknown. This is one fresh continuation, "
+                            "not a replay. Do not repeat completed work or actions; verify "
+                            "uncertain external effects before any side effect.]"
+                        )
+                        agent._emit_status(
+                            "⚠️ Provider outcome unknown; requesting one fresh continuation."
+                        )
+                        break
+                    return _terminal_ambiguous_provider_outcome()
+
+                if ambiguous_continuation_attempted:
+                    return _terminal_ambiguous_provider_outcome()
 
                 # -----------------------------------------------------------
                 # UnicodeEncodeError recovery.  Two common causes:
@@ -6254,6 +6323,9 @@ def run_conversation(
         
         if _pre_dispatch_deadline_exhausted:
             break
+
+        if ambiguous_continuation_prompt is not None:
+            continue
 
         if _retry.restart_with_redirected_messages:
             # The cancelled request produced no valid assistant item. Reuse the

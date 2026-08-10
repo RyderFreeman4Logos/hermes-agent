@@ -4027,10 +4027,8 @@ def _compress_context_impl(
         }:
             _refresh_delegate_model_pool_schema_after_compression(agent)
         if host_publish is not None:
-            # The TUI's durable model-switch marker targets this session. Release
-            # the compression lease before publishing that post-boundary write,
-            # while still switching before this call returns to the request loop.
-            _release_lock()
+            # Keep the compression lease through the host's required durable
+            # publication; its transcript append is holder-qualified.
             host_publish()
             finalize_context_engine_compression_notification(
                 agent,

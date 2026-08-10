@@ -276,7 +276,9 @@ class TestCompressionBoundaryHook:
             assert get_model_switch_after_compression(agent) is None
             assert getattr(agent, "_pending_context_engine_compression_notification") is None
 
-    def test_auto_threshold_switches_the_first_provider_request(self, monkeypatch):
+    def test_auto_threshold_serializes_switch_publication_before_first_request(
+        self, monkeypatch
+    ):
         from hermes_state import SessionDB
         from tui_gateway import server
 
@@ -290,19 +292,26 @@ class TestCompressionBoundaryHook:
             compressor.protect_first_n = 0
             compressor.protect_last_n = 0
             compressor.compression_count = 0
+            compress_next = [True]
             monkeypatch.setattr(
                 compressor,
                 "should_compress",
-                lambda _tokens: compressor.compression_count == 0,
+                lambda _tokens: compress_next[0],
             )
 
             def compress(_messages, **_kwargs):
-                compressor.compression_count = 1
+                compressor.compression_count += 1
+                compress_next[0] = False
                 compressor._last_compression_made_progress = True
                 compressor._last_summary_fallback_used = False
                 compressor._last_feasibility_skip = False
                 compressor._last_compress_aborted = False
-                return [{"role": "user", "content": "compressed trigger"}]
+                return [
+                    {
+                        "role": "user",
+                        "content": f"compressed trigger {compressor.compression_count}",
+                    }
+                ]
 
             monkeypatch.setattr(compressor, "compress", compress)
 
@@ -354,16 +363,100 @@ class TestCompressionBoundaryHook:
             )
             monkeypatch.setattr(server, "_restart_slash_worker", lambda *_args: None)
 
+            publication_entered = threading.Event()
+            contender_attempted = threading.Event()
+            marker_finished = threading.Event()
+            contender_done = threading.Event()
+            contender_acquired = []
+            contender_errors = []
+            holder_during_publication = []
+            marker_lock_holders = []
+            pending_during_publication = []
+            contender_holder = f"test-contender:pid={os.getpid()}"
+            original_sync = server._sync_session_key_after_compress
+            original_append_message = db.append_message
+
+            def sync_with_barrier(*args, **kwargs):
+                original_sync(*args, **kwargs)
+                if publication_entered.is_set():
+                    return
+                holder_during_publication.append(
+                    db.get_compression_lock_holder(agent.session_id)
+                )
+                pending_during_publication.append(
+                    get_model_switch_after_compression(agent) is pending
+                )
+                publication_entered.set()
+                if not contender_attempted.wait(timeout=10):
+                    raise RuntimeError("contender did not attempt lease acquisition")
+
+            def append_message(*args, **kwargs):
+                if kwargs.get("display_kind") != "model_switch":
+                    return original_append_message(*args, **kwargs)
+                marker_lock_holders.append(kwargs.get("compression_lock_holder"))
+                try:
+                    return original_append_message(*args, **kwargs)
+                finally:
+                    marker_finished.set()
+
+            def contend() -> None:
+                acquired = False
+                try:
+                    if not publication_entered.wait(timeout=10):
+                        contender_errors.append("host publication did not start")
+                        return
+                    acquired = db.try_acquire_compression_lock(
+                        agent.session_id,
+                        contender_holder,
+                        ttl_seconds=60,
+                    )
+                    contender_acquired.append(acquired)
+                    contender_attempted.set()
+                    if acquired and not marker_finished.wait(timeout=10):
+                        contender_errors.append("model marker was not attempted")
+                except BaseException as exc:
+                    contender_errors.append(repr(exc))
+                finally:
+                    contender_attempted.set()
+                    if acquired:
+                        db.release_compression_lock(agent.session_id, contender_holder)
+                    contender_done.set()
+
+            monkeypatch.setattr(
+                server, "_sync_session_key_after_compress", sync_with_barrier
+            )
+            monkeypatch.setattr(db, "append_message", append_message)
+            contender_thread = threading.Thread(
+                target=contend,
+                name="deferred-switch-lease-contender",
+            )
+            contender_thread.start()
+
             try:
                 server._run_prompt_submit("request", sid, session, "trigger")
-                run_thread = session.get("_run_thread")
-                assert isinstance(run_thread, threading.Thread)
-                run_thread.join(timeout=15)
+                first_run = session.get("_run_thread")
+                assert isinstance(first_run, threading.Thread)
+                first_run.join(timeout=15)
 
-                assert not run_thread.is_alive()
+                assert not first_run.is_alive()
+                assert contender_done.wait(timeout=10)
+                contender_thread.join(timeout=1)
+                assert not contender_thread.is_alive()
+                assert contender_errors == []
+                assert pending_during_publication == [True]
+                assert holder_during_publication[0]
+                assert contender_acquired == [False]
+                assert marker_lock_holders == [holder_during_publication[0]]
                 assert requests == ["next-model"]
                 assert agent._create_openai_client.call_count == 1
                 assert get_model_switch_after_compression(agent) is None
+                assert agent._model_switch_after_compression_state["state"] == "applied"
+                durable = db.get_session(agent.session_id)
+                assert durable is not None
+                assert durable["model"] == "next-model"
+                assert "pending_model_switch_after_compression" not in (
+                    durable["model_config"] or ""
+                )
                 assert (
                     sum(
                         message.get("display_kind") == "model_switch"
@@ -371,7 +464,30 @@ class TestCompressionBoundaryHook:
                     )
                     == 1
                 )
+
+                compress_next[0] = True
+                session["running"] = True
+                server._run_prompt_submit("request-2", sid, session, "followup")
+                second_run = session.get("_run_thread")
+                assert isinstance(second_run, threading.Thread)
+                assert second_run is not first_run
+                second_run.join(timeout=15)
+
+                assert not second_run.is_alive()
+                assert compressor.compression_count == 2
+                assert requests == ["next-model", "next-model"]
+                assert agent.model == "next-model"
+                assert agent._create_openai_client.call_count == 1
+                assert get_model_switch_after_compression(agent) is None
+                assert db.get_session(agent.session_id)["model"] == "next-model"
+                assert db.get_compression_lock_holder(agent.session_id) is None
             finally:
+                publication_entered.set()
+                contender_attempted.set()
+                marker_finished.set()
+                contender_thread.join(timeout=1)
+                if db.get_compression_lock_holder(agent.session_id) == contender_holder:
+                    db.release_compression_lock(agent.session_id, contender_holder)
                 server._sessions.pop(sid, None)
 
     def test_manual_compression_switches_the_first_followup_request_once(
@@ -807,7 +923,6 @@ class TestCompressionBoundaryHook:
             agent.switch_model.assert_not_called()
             assert get_model_switch_after_compression(agent) is pending
             compressor.on_session_start.assert_not_called()
-
 
     def test_no_progress_does_not_notify(self):
         from hermes_state import SessionDB

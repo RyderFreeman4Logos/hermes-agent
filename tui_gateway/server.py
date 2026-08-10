@@ -4059,6 +4059,9 @@ def _append_model_switch_marker(
 
     try:
         agent = session.get("agent")
+        compression_lock_holder = getattr(
+            agent, "_active_compression_lock_holder", None
+        )
         db = getattr(agent, "_session_db", None) if agent is not None else None
         if db is not None:
             db.append_message(
@@ -4066,6 +4069,7 @@ def _append_model_switch_marker(
                 role="user",
                 content=marker,
                 display_kind="model_switch",
+                compression_lock_holder=compression_lock_holder,
             )
             return
 
@@ -4080,6 +4084,7 @@ def _append_model_switch_marker(
                 role="user",
                 content=marker,
                 display_kind="model_switch",
+                compression_lock_holder=compression_lock_holder,
             )
     except Exception:
         logger.debug("failed to persist model switch marker", exc_info=True)

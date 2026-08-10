@@ -1554,7 +1554,6 @@ def _record_runtime_provider_activity(
                 else canonical_runtime_cache_context_identity(agent)
             ),
             activity_at=activity_at,
-            owner=agent,
         )
     except Exception:
         logger.debug("Could not reset exact heartbeat cache lease", exc_info=True)

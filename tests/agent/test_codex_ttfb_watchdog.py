@@ -724,6 +724,77 @@ def test_codex_parser_counts_only_semantic_sse_progress():
     assert len(progress) == 4
 
 
+def test_outer_watchdog_timeout_copies_partial_tool_flag(tmp_path, monkeypatch):
+    """Watchdog settle must terminate recovery when stream saw a tool-call event."""
+    from agent import chat_completion_helpers as h
+
+    agent = _make_codex_agent(tmp_path, monkeypatch)
+    clock = _FakeClock()
+    call = _prepare_clocked_call(agent, monkeypatch, clock, first_event=False)
+
+    def mark_partial(now):
+        # Simulate a function_call event observed by the stream worker, then
+        # silence that triggers the outer TTFB watchdog.
+        agent._codex_stream_partial_tool_call = True
+        if now >= 121.0:
+            call.complete["value"] = False
+
+    workers = _install_clocked_worker(
+        monkeypatch, h, clock, call.ready, step=121.0, on_poll=mark_partial
+    )
+    try:
+        with pytest.raises(TimeoutError) as excinfo:
+            h.interruptible_api_call(agent, {"model": "gpt-5.5", "input": "hi"})
+        timeout_error = excinfo.value
+        assert getattr(timeout_error, "_hermes_ambiguous_provider_acceptance", False)
+        assert getattr(timeout_error, "_hermes_ambiguous_partial_tool_call", False)
+        assert getattr(timeout_error, "timeout_class", None) == "ttfb_timeout"
+    finally:
+        call.release.set()
+        for worker in workers:
+            worker.wait()
+
+
+def test_partial_tool_watchdog_timeout_does_not_continue(monkeypatch, tmp_path):
+    """Conversation loop must not continue after partial-tool ambiguity."""
+    from agent import conversation_loop
+    import run_agent
+
+    agent = _make_codex_agent(tmp_path, monkeypatch)
+    monkeypatch.setattr(run_agent, "get_tool_definitions", lambda **_kwargs: [])
+    monkeypatch.setattr(run_agent, "check_toolset_requirements", lambda: {})
+    monkeypatch.setattr(agent, "tools", [], raising=False)
+    monkeypatch.setattr(agent, "valid_tool_names", set(), raising=False)
+    monkeypatch.setattr(agent, "_cleanup_task_resources", lambda task_id: None)
+    monkeypatch.setattr(
+        agent, "_persist_session", lambda messages, conversation_history=None: None
+    )
+    monkeypatch.setattr(
+        agent, "_save_trajectory", lambda messages, user_query, completed: None
+    )
+    monkeypatch.setattr(conversation_loop, "jittered_backoff", lambda *_a, **_k: 0.0)
+    monkeypatch.setattr(conversation_loop.time, "sleep", lambda _seconds: None)
+
+    calls = []
+    timeout_error = TimeoutError("timeout_class=ttfb_timeout; partial tool boundary")
+    timeout_error._hermes_ambiguous_provider_acceptance = True
+    timeout_error._hermes_ambiguous_partial_tool_call = True
+    timeout_error.timeout_class = "ttfb_timeout"
+    timeout_error.failure_class = "ttfb_timeout"
+
+    def _raise_timeout(_kwargs):
+        calls.append(None)
+        raise timeout_error
+
+    monkeypatch.setattr(agent, "_disable_streaming", True, raising=False)
+    monkeypatch.setattr(agent, "_interruptible_api_call", _raise_timeout)
+    result = agent.run_conversation("must not continue after partial tool")
+    assert len(calls) == 1
+    assert result["ambiguous_provider_attempt"] is True
+    assert result.get("turn_exit_reason") == "ambiguous_provider_attempt"
+    assert result.get("failure_class") == "ttfb_timeout"
+
+
 def test_large_request_ttfb_scale_is_not_capped_by_implicit_default(monkeypatch, caplog):
     """#92 / upstream #69228: implicit max must not undo adaptive scale-up."""
     from agent import chat_completion_helpers as h

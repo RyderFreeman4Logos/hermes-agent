@@ -1401,6 +1401,11 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     agent._codex_streamed_text_parts: list = []
     diagnostic_attempt = {"value": None, "finished": False}
     partial_tool_call = {"seen": False}
+    # Cross-thread safety for outer watchdog paths: stream worker may see a
+    # partial function/tool-call event, then die under TTFB/SSE/progress/total
+    # timeout without raising the transport exception that currently copies
+    # the local flag. Outer settle must still treat that boundary as unsafe.
+    agent._codex_stream_partial_tool_call = False
 
     def _lifecycle_cancelled() -> bool:
         if not isinstance(diagnostic_lifecycle, dict):
@@ -1428,6 +1433,8 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         event_type = str(_event_field(event, "type", ""))
         item_type = str(_item_field(_event_field(event, "item"), "type", ""))
         partial_tool_call["seen"] |= "_call" in event_type or "_call" in item_type
+        if partial_tool_call["seen"]:
+            agent._codex_stream_partial_tool_call = True
         # TTFB watchdog and activity touch — runs once per SSE event.
         physical_attempt_diagnostics.mark_wire_event(diagnostic_attempt["value"])
         agent._codex_stream_last_event_ts = time.time()
@@ -1450,6 +1457,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
 
         intercepted_events = []
         partial_tool_call["seen"] = False
+        agent._codex_stream_partial_tool_call = False
         writer_token: dict[str, int | None] = {"value": None}
         diagnostic_attempt = {"value": None, "finished": False}
 
@@ -1524,12 +1532,15 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             )
 
         def _stream_has_partial_tool_call() -> bool:
-            if partial_tool_call["seen"]:
+            if partial_tool_call["seen"] or getattr(
+                agent, "_codex_stream_partial_tool_call", False
+            ):
                 return True
             for event in intercepted_events:
                 event_type = str(_event_field(event, "type", ""))
                 item_type = str(_item_field(_event_field(event, "item"), "type", ""))
                 if "_call" in event_type or "_call" in item_type:
+                    agent._codex_stream_partial_tool_call = True
                     return True
             return False
 

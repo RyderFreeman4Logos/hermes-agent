@@ -1526,6 +1526,10 @@ def _build_snapshot_entry(
 # Skills index
 # =========================================================================
 
+# Cache-key-safe marker used when every category should render names-only.
+ALL_SKILL_CATEGORIES = frozenset({"*"})
+
+
 def _parse_skill_file(skill_file: Path) -> tuple[bool, dict, str]:
     """Read a SKILL.md once and return platform compatibility, frontmatter, and description.
 
@@ -1813,17 +1817,21 @@ def build_skills_system_prompt(
     # what the index stops showing them. Match on the top-level category
     # segment so nested categories ("social-media/twitter") are demoted with
     # their parent.
-    demoted = frozenset(
-        cat for cat in skills_by_category
-        if cat.split("/", 1)[0] in (compact_categories or frozenset())
-    )
+    requested_demotions = compact_categories or frozenset()
+    if ALL_SKILL_CATEGORIES.issubset(requested_demotions):
+        demoted = frozenset(skills_by_category)
+    else:
+        demoted = frozenset(
+            cat for cat in skills_by_category
+            if cat.split("/", 1)[0] in requested_demotions
+        )
 
     hidden_note = ""
     if demoted:
         hidden_note = (
-            "\n(Categories marked [names only] are outside the current coding "
-            "context, so their descriptions are omitted — the skills work "
-            "normally and load with skill_view(name) as usual.)"
+            "\n(Categories marked [names only] omit descriptions to reduce the "
+            "fixed prompt size. Every skill name remains available: use "
+            "skill_view(name) for full instructions or skills_list for metadata.)"
         )
 
     if not skills_by_category:

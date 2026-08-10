@@ -4234,8 +4234,19 @@ def run_conversation(
                         "cache_telemetry_present": canonical_usage.cache_telemetry_present,
                         "reasoning_tokens": canonical_usage.reasoning_tokens,
                     }
+                    display_usage_dict = {
+                        "prompt_tokens": aggregator_usage.prompt_tokens,
+                        "completion_tokens": aggregator_usage.output_tokens,
+                        "total_tokens": aggregator_usage.total_tokens,
+                        "input_tokens": aggregator_usage.input_tokens,
+                        "output_tokens": aggregator_usage.output_tokens,
+                        "cache_read_tokens": aggregator_usage.cache_read_tokens,
+                        "cache_write_tokens": aggregator_usage.cache_write_tokens,
+                        "cache_telemetry_present": aggregator_usage.cache_telemetry_present,
+                        "reasoning_tokens": aggregator_usage.reasoning_tokens,
+                    }
                     post_compression_cache = _ingest_successful_provider_usage(
-                        agent, usage_dict, first_call=api_call_count == 1
+                        agent, display_usage_dict, first_call=api_call_count == 1
                     )
                     agent.context_compressor.update_from_response(usage_dict)
                 elif getattr(

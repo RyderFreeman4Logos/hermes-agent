@@ -5375,7 +5375,7 @@ def _cache_level(pct: int) -> str:
     return "error" if pct < CACHE_HIT_ERROR_THRESHOLD else "info"
 
 
-def _cache_info_from_usage(usage: Any) -> dict[str, int | str] | None:
+def _cache_info_from_usage(usage: Any) -> dict[str, int | str | None] | None:
     if not isinstance(usage, dict):
         return None
 
@@ -5405,10 +5405,10 @@ def _cache_info_from_usage(usage: Any) -> dict[str, int | str] | None:
     write_tokens = tokens(*write_keys)
     prompt_tokens = tokens("prompt_tokens")
     if telemetry_present is False:
-        cache_info: dict[str, int | str] = {
+        cache_info: dict[str, int | str | None] = {
             "read_tokens": 0,
             "prompt_tokens": prompt_tokens,
-            "pct": 0,
+            "pct": None,
             "state": "unavailable",
             "level": "info",
         }
@@ -5429,7 +5429,7 @@ def _cache_info_from_usage(usage: Any) -> dict[str, int | str] | None:
         if telemetry_present is True
         else "unknown"
     )
-    cache_info: dict[str, int | str] = {
+    cache_info: dict[str, int | str | None] = {
         "read_tokens": read_tokens,
         "prompt_tokens": prompt_tokens,
         "pct": pct,

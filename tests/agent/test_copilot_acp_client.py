@@ -515,3 +515,27 @@ def test_heartbeat_warm_blocks_acp_client_io_before_cancel(tmp_path):
     )
     assert process.stdin.payloads[-1]["method"] == "session/cancel"
     assert process.prompt_finished_cancelled is True
+
+
+def test_copilot_acp_omits_unreported_cache_details_through_first_response(monkeypatch, tmp_path):
+    from agent.conversation_loop import _ingest_successful_provider_usage
+    from agent.usage_pricing import normalize_usage
+
+    client = _make_home_client(tmp_path)
+    monkeypatch.setattr(client, "_run_prompt", lambda *_args, **_kwargs: ("ok", ""))
+    completion = client._create_chat_completion(model="copilot-acp", messages=[])
+    normalized = normalize_usage(completion.usage, provider="copilot", api_mode="chat_completions")
+    agent = type("Agent", (), {"_first_turn_usage": None, "_last_turn_usage": None})()
+    _ingest_successful_provider_usage(
+        agent,
+        {
+            "prompt_tokens": normalized.prompt_tokens,
+            "cache_read_tokens": normalized.cache_read_tokens,
+            "cache_write_tokens": normalized.cache_write_tokens,
+            "cache_telemetry_present": normalized.cache_telemetry_present,
+        },
+        first_call=True,
+    )
+
+    assert normalized.cache_telemetry_present is False
+    assert agent._first_provider_response["state"] == "no_field"

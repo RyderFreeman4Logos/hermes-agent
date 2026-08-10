@@ -2427,7 +2427,34 @@ def test_first_api_call_reports_cache_hit_to_tui_callback(
 def test_moa_cache_display_uses_aggregator_usage_while_accounting_keeps_advisors():
     from agent.usage_pricing import CanonicalUsage
 
+    class _CapturingEngine(ContextEngine):
+        last_prompt_tokens = 0
+
+        def __init__(self):
+            self.updated = []
+            self.completed = []
+
+        @property
+        def name(self):
+            return "capturing"
+
+        def update_from_response(self, usage):
+            self.updated.append(dict(usage))
+
+        def should_compress(self, prompt_tokens=None):
+            return False
+
+        def compress(
+            self, messages, current_tokens=None, focus_topic=None, force=False, memory_context=""
+        ):
+            return messages
+
+        def on_turn_complete(self, messages, usage=None, **_kwargs):
+            self.completed.append(usage)
+
     agent = _make_agent(max_iterations=10)
+    engine = _CapturingEngine()
+    setattr(agent, "context_compressor", engine)
     response = _mock_response(content="Done.", finish_reason="stop")
     response.usage = SimpleNamespace(
         prompt_tokens=1_000,
@@ -2450,6 +2477,20 @@ def test_moa_cache_display_uses_aggregator_usage_while_accounting_keeps_advisors
     assert cache_events[0][0:4] == ("hit", 95, 950, 1_000)
     assert agent.session_input_tokens == 9_050
     assert agent.session_cache_read_tokens == 950
+    expected_usage = {
+        "prompt_tokens": 10_000,
+        "completion_tokens": 10,
+        "total_tokens": 10_010,
+        "input_tokens": 9_050,
+        "output_tokens": 10,
+        "cache_read_tokens": 950,
+        "cache_write_tokens": 0,
+        "cache_telemetry_present": True,
+        "reasoning_tokens": 0,
+    }
+    assert getattr(agent, "_last_turn_usage") == expected_usage
+    assert engine.updated == [expected_usage]
+    assert engine.completed == [expected_usage]
 
 
 def test_post_compression_cache_attribution_survives_retry_then_clears():

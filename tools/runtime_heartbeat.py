@@ -987,6 +987,83 @@ class RuntimeHeartbeat:
 
         return process_registry.completion_queue
 
+    @staticmethod
+    def _session_target_id(owner: Any) -> str:
+        return f"conversation:{id(owner):x}"
+
+    def cancel_session(self, owner: Any) -> bool:
+        """Cancel this agent's idle-conversation warm without touching processes."""
+        if owner is None:
+            return False
+        target_id = self._session_target_id(owner)
+        with self._lock:
+            target = self._targets.get(target_id)
+            if (
+                target is None
+                or target.kind != "session"
+                or target.owner_id != id(owner)
+            ):
+                return False
+        return self.cancel(target_id)
+
+    def arm_session_after_turn(
+        self,
+        owner: Any,
+        result: Any,
+        *,
+        caller_id: Optional[str] = None,
+    ) -> bool:
+        """Keep a successful main conversation warm while it is idle."""
+        if (
+            owner is None
+            or getattr(owner, "platform", "") == "subagent"
+            or not isinstance(result, dict)
+            or result.get("completed") is False
+            or result.get("failed") is True
+            or result.get("interrupted") is True
+            or not (
+                getattr(owner, "_turn_received_provider_response", False)
+                or result.get("api_calls")
+            )
+        ):
+            return False
+
+        if not caller_id:
+            try:
+                from tools.approval import get_current_session_key
+
+                caller_id = get_current_session_key(default="")
+            except Exception:
+                caller_id = ""
+        caller_id = str(caller_id or getattr(owner, "session_id", "") or "")
+        if not caller_id:
+            return False
+
+        provider = canonical_runtime_provider_identity(owner)
+        interval = resolve_heartbeat_interval(_runtime_config(), provider)
+        if interval is None or runtime_warm_capability(owner)[0] != "eligible":
+            return False
+        cache_context = canonical_runtime_cache_context_identity(owner)
+        target_id = self._session_target_id(owner)
+        owner_ref = _weak_owner(owner)
+        if owner_ref is None:
+            return False
+
+        return self.arm(
+            target_id,
+            caller_id=caller_id,
+            kind="session",
+            interval=interval,
+            inspect=lambda: {
+                "alive": owner_ref() is not None,
+                "progress": True,
+                "evidence": "conversation idle",
+            },
+            provider=provider,
+            cache_context=cache_context,
+            owner=owner,
+        )
+
     def arm(
         self,
         target_id: str,

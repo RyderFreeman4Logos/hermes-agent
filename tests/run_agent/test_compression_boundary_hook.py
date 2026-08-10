@@ -13,7 +13,9 @@ this from a real user-initiated /new.
 
 import os
 import tempfile
+import threading
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -32,6 +34,19 @@ from hermes_state_common import AuthorityWriteIndeterminateError
 def _public_shape(messages):
     fields = ("role", "content", "tool_calls", "tool_call_id", "name")
     return [{key: row[key] for key in fields if key in row} for row in messages]
+
+
+def _final_response(model):
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(content="done", tool_calls=None),
+                finish_reason="stop",
+            )
+        ],
+        model=model,
+        usage=None,
+    )
 
 
 class TestCompressionBoundaryHook:
@@ -260,6 +275,177 @@ class TestCompressionBoundaryHook:
             assert agent.model == "new-model"
             assert get_model_switch_after_compression(agent) is None
             assert getattr(agent, "_pending_context_engine_compression_notification") is None
+
+    def test_auto_threshold_switches_the_first_provider_request(self, monkeypatch):
+        from hermes_state import SessionDB
+        from tui_gateway import server
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+            agent = self._make_agent(db)
+            agent.compression_in_place = True
+            compressor = agent.context_compressor
+            compressor.context_length = 64_000
+            compressor.threshold_tokens = 1
+            compressor.protect_first_n = 0
+            compressor.protect_last_n = 0
+            compressor.compression_count = 0
+            monkeypatch.setattr(
+                compressor,
+                "should_compress",
+                lambda _tokens: compressor.compression_count == 0,
+            )
+
+            def compress(_messages, **_kwargs):
+                compressor.compression_count = 1
+                compressor._last_compression_made_progress = True
+                compressor._last_summary_fallback_used = False
+                compressor._last_feasibility_skip = False
+                compressor._last_compress_aborted = False
+                return [{"role": "user", "content": "compressed trigger"}]
+
+            monkeypatch.setattr(compressor, "compress", compress)
+
+            requests = []
+            old_client = MagicMock()
+            target_client = MagicMock()
+
+            def create(**kwargs):
+                requests.append(kwargs["model"])
+                return _final_response(kwargs["model"])
+
+            target_client.chat.completions.create.side_effect = create
+            old_client.chat.completions.create.side_effect = create
+            agent.client = old_client
+            agent._create_openai_client = MagicMock(return_value=target_client)
+            pending = ModelSwitchResult(
+                success=True,
+                new_model="next-model",
+                target_provider="openrouter",
+                api_key="next-key",
+                base_url=agent.base_url,
+                api_mode="chat_completions",
+                context_length=128_000,
+            )
+            session = {
+                "agent": agent,
+                "session_key": agent.session_id,
+                "history": [],
+                "history_lock": threading.Lock(),
+                "history_version": 0,
+                "running": True,
+                "attached_images": [],
+                "image_counter": 0,
+                "cols": 80,
+                "slash_worker": None,
+                "show_reasoning": False,
+                "tool_progress_mode": "all",
+                "after_compression_model_switch": pending,
+            }
+            sid = "auto-threshold"
+            server._sessions[sid] = session
+            server._attach_model_switch_after_compression(sid, session, agent)
+            monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+            monkeypatch.setattr(server, "make_stream_renderer", lambda _cols: None)
+            monkeypatch.setattr(server, "render_message", lambda *_args: None)
+            monkeypatch.setattr(server, "_get_db", lambda: None)
+            monkeypatch.setattr(
+                server, "_sync_agent_model_with_config", lambda *_args: None
+            )
+            monkeypatch.setattr(server, "_restart_slash_worker", lambda *_args: None)
+
+            try:
+                server._run_prompt_submit("request", sid, session, "trigger")
+                run_thread = session.get("_run_thread")
+                assert isinstance(run_thread, threading.Thread)
+                run_thread.join(timeout=15)
+
+                assert not run_thread.is_alive()
+                assert requests == ["next-model"]
+                assert agent._create_openai_client.call_count == 1
+                assert get_model_switch_after_compression(agent) is None
+                assert (
+                    sum(
+                        message.get("display_kind") == "model_switch"
+                        for message in session["history"]
+                    )
+                    == 1
+                )
+            finally:
+                server._sessions.pop(sid, None)
+
+    def test_manual_compression_switches_the_first_followup_request_once(
+        self, monkeypatch
+    ):
+        from hermes_state import SessionDB
+        from tui_gateway import server
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+            agent = self._make_agent(db)
+            compressor = agent.context_compressor
+
+            def compress(_messages, **_kwargs):
+                compressor.compression_count += 1
+                compressor._last_compression_made_progress = True
+                compressor._last_summary_fallback_used = False
+                compressor._last_feasibility_skip = False
+                compressor._last_compress_aborted = False
+                return [{"role": "user", "content": "compressed history"}]
+
+            monkeypatch.setattr(compressor, "compress", compress)
+
+            requests = []
+            target_client = MagicMock()
+            target_client.chat.completions.create.side_effect = lambda **kwargs: (
+                requests.append(kwargs["model"]) or _final_response(kwargs["model"])
+            )
+            agent._create_openai_client = MagicMock(return_value=target_client)
+            pending = ModelSwitchResult(
+                success=True,
+                new_model="next-model",
+                target_provider="openrouter",
+                api_key="next-key",
+                base_url=agent.base_url,
+                api_mode="chat_completions",
+                context_length=128_000,
+            )
+            session = {
+                "agent": agent,
+                "session_key": agent.session_id,
+                "history": [
+                    {"role": "user", "content": f"message {index}"}
+                    for index in range(6)
+                ],
+                "history_lock": threading.Lock(),
+                "history_version": 0,
+                "running": False,
+                "slash_worker": None,
+                "after_compression_model_switch": pending,
+            }
+            sid = "manual-compression"
+            server._sessions[sid] = session
+            server._attach_model_switch_after_compression(sid, session, agent)
+            monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+            monkeypatch.setattr(server, "_restart_slash_worker", lambda *_args: None)
+
+            try:
+                response = server._methods["session.compress"](
+                    "request", {"session_id": sid}
+                )
+                assert "error" not in response
+
+                agent.compression_enabled = False
+                result = agent.run_conversation(
+                    "followup", conversation_history=session["history"]
+                )
+
+                assert result["completed"] is True
+                assert requests == ["next-model"]
+                assert agent._create_openai_client.call_count == 1
+                assert get_model_switch_after_compression(agent) is None
+            finally:
+                server._sessions.pop(sid, None)
 
     def test_deferred_notification_still_publishes_target_route_atomically(self):
         import json
@@ -590,6 +776,38 @@ class TestCompressionBoundaryHook:
             compressor.on_session_start.assert_not_called()
             assert get_model_switch_after_compression(agent) is pending
 
+    def test_cancelled_compression_keeps_deferred_switch(self):
+        from agent.auxiliary_client import AuxiliaryExplicitCancellation
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+            agent = self._make_agent(db)
+            compressor = MagicMock()
+            compressor.compress.side_effect = AuxiliaryExplicitCancellation()
+            agent.context_compressor = compressor
+            pending = ModelSwitchResult(
+                success=True,
+                new_model="later-model",
+                target_provider="later-provider",
+                context_length=128_000,
+            )
+            schedule_model_switch_after_compression(agent, pending)
+            agent.switch_model = MagicMock()
+            messages = [{"role": "user", "content": "request"}]
+
+            returned, _ = agent._compress_context(
+                messages,
+                "sys",
+                approx_tokens=100,
+            )
+
+            assert [message.get("role") for message in returned] == ["user"]
+            assert [message.get("content") for message in returned] == ["request"]
+            agent.switch_model.assert_not_called()
+            assert get_model_switch_after_compression(agent) is pending
+            compressor.on_session_start.assert_not_called()
+
 
     def test_no_progress_does_not_notify(self):
         from hermes_state import SessionDB
@@ -601,6 +819,14 @@ class TestCompressionBoundaryHook:
             compressor.compress.side_effect = lambda messages, **_kwargs: messages
             compressor._last_compress_aborted = False
             agent.context_compressor = compressor
+            pending = ModelSwitchResult(
+                success=True,
+                new_model="later-model",
+                target_provider="later-provider",
+                context_length=128_000,
+            )
+            schedule_model_switch_after_compression(agent, pending)
+            agent.switch_model = MagicMock()
             messages = [{"role": "user", "content": "request"}]
 
             returned, _ = agent._compress_context(
@@ -615,6 +841,8 @@ class TestCompressionBoundaryHook:
             assert [m.get("content") for m in returned] == [
                 m.get("content") for m in messages
             ]
+            agent.switch_model.assert_not_called()
+            assert get_model_switch_after_compression(agent) is pending
             compressor.on_session_start.assert_not_called()
 
 

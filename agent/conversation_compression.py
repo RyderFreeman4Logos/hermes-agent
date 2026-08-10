@@ -2370,6 +2370,7 @@ def _compress_context_impl(
             "_defer_host_compression_publication", False
         )
     )
+    host_publish = None
     if not defer_context_engine_notification:
         defer_context_engine_notification = host_deferred_publication
     _compressor_attempt_snapshot = _snapshot_compressor_attempt_state(
@@ -3810,16 +3811,8 @@ def _compress_context_impl(
                 host_publish = getattr(
                     agent, "_compression_host_publication_callback", None
                 )
-                if callable(host_publish):
-                    host_publish()
-                    finalize_context_engine_compression_notification(
-                        agent,
-                        committed=True,
-                    )
-                    new_system_prompt = (
-                        getattr(agent, "_cached_system_prompt", None)
-                        or new_system_prompt
-                    )
+                if not callable(host_publish):
+                    host_publish = None
             elif not defer_context_engine_notification:
                 finalize_context_engine_compression_notification(
                     agent,
@@ -3968,6 +3961,19 @@ def _compress_context_impl(
             "not_applicable", "in_place_committed", "rotated_committed",
         }:
             _refresh_delegate_model_pool_schema_after_compression(agent)
+        if host_publish is not None:
+            # The TUI's durable model-switch marker targets this session. Release
+            # the compression lease before publishing that post-boundary write,
+            # while still switching before this call returns to the request loop.
+            _release_lock()
+            host_publish()
+            finalize_context_engine_compression_notification(
+                agent,
+                committed=True,
+            )
+            new_system_prompt = (
+                getattr(agent, "_cached_system_prompt", None) or new_system_prompt
+            )
         return compressed, new_system_prompt
     finally:
         # Release the lock on the OLD session_id only AFTER rotation completed

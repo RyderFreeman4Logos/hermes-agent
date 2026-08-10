@@ -922,6 +922,15 @@ agent:
   #   - "For UI work, don't run tsc/lint until I approve the look."
   #   - "Clean the diff before you commit and push."
 
+  # Skills catalog detail in the fixed system-prompt prefix:
+  #   full       - keep every skill description (default)
+  #   compact    - show non-coding categories as names-only lines
+  #   names-only - show every category as names-only lines
+  # Every skill name remains visible and skill_view/skills_list still recover
+  # its full metadata and instructions. Changes take effect next session;
+  # changing this mid-session would invalidate the provider's prefix cache.
+  skills_catalog_mode: full
+
   # When verify-on-stop finds edited code without fresh verification evidence,
   # append guidance for creative UI work (avoid broad tsc/lint/test before visual
   # approval) and clean-diff expectations. Set false to keep that nudge terse.

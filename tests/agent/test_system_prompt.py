@@ -339,3 +339,56 @@ class TestSkillsInVolatileBand:
         full = _build(build_system_prompt)
         assert full.index(_CONTEXT) < full.index(_SKILLS)
         assert full.index(_SKILLS) < full.index("Conversation started:")
+
+
+class TestSkillsCatalogMode:
+    def test_default_mode_is_full_and_config_key_is_registered(self):
+        from hermes_cli.config import DEFAULT_CONFIG, _validate_config_key
+
+        assert DEFAULT_CONFIG["agent"]["skills_catalog_mode"] == "full"
+        assert _validate_config_key("agent.skills_catalog_mode") == (True, None)
+
+    def test_mode_is_resolved_once_per_agent(self):
+        from agent.system_prompt import _session_skills_catalog_mode
+
+        agent = _make_agent()
+        with patch(
+            "hermes_cli.config.load_config_readonly",
+            side_effect=[
+                {"agent": {"skills_catalog_mode": "compact"}},
+                {"agent": {"skills_catalog_mode": "full"}},
+            ],
+        ) as load_config:
+            assert _session_skills_catalog_mode(agent) == "compact"
+            assert _session_skills_catalog_mode(agent) == "compact"
+
+        load_config.assert_called_once_with()
+
+    def test_modes_compose_with_existing_coding_demotions(self):
+        from agent.coding_context import _NON_CODING_SKILL_CATEGORIES
+        from agent.prompt_builder import ALL_SKILL_CATEGORIES
+
+        def rendered_categories(mode):
+            agent = _make_agent(
+                valid_tool_names=["skills_list"],
+                _skills_catalog_mode=mode,
+            )
+            with (
+                patch("run_agent.get_toolset_for_tool", return_value=None),
+                patch(
+                    "agent.coding_context.coding_compact_skill_categories",
+                    return_value=frozenset({"focus-only"}),
+                ),
+                patch(
+                    "run_agent.build_skills_system_prompt",
+                    return_value=_SKILLS,
+                ) as build_skills,
+            ):
+                _prompt_parts(agent)
+            return build_skills.call_args.kwargs["compact_categories"]
+
+        assert rendered_categories("full") == frozenset({"focus-only"})
+        assert rendered_categories("compact") == frozenset(
+            {"focus-only", *_NON_CODING_SKILL_CATEGORIES}
+        )
+        assert rendered_categories("names-only") == ALL_SKILL_CATEGORIES

@@ -2162,6 +2162,7 @@ class TestSanitizerStripsOrphanedToolCalls:
                 ],
             },
             {"role": "tool", "tool_call_id": "tc_valid", "content": "file content"},
+            {"role": "assistant", "content": "done"},
         ]
 
         sanitized = compressor._sanitize_tool_pairs(msgs)
@@ -2221,6 +2222,53 @@ class TestSanitizerStripsOrphanedToolCalls:
         asst = next(m for m in sanitized if m.get("role") == "assistant")
         assert not asst.get("tool_calls")
         # No stub tool messages (which would have call_id != id mismatch)
+
+    @pytest.mark.parametrize("completed_ids", [(), ("call_1",)])
+    def test_compress_preserves_inflight_tool_chain(self, compressor, completed_ids):
+        """Compression must not orphan results that arrive after it returns."""
+        call_ids = ("call_1", "call_2")
+        messages = [
+            {"role": "user" if i % 2 == 0 else "assistant", "content": f"old {i}"}
+            for i in range(8)
+        ] + [
+            {"role": "user", "content": "run the batch"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": call_id, "function": {"name": "work", "arguments": "{}"}}
+                    for call_id in call_ids
+                ],
+            },
+            *[
+                {"role": "tool", "tool_call_id": call_id, "content": "done"}
+                for call_id in completed_ids
+            ],
+        ]
+
+        with patch.object(compressor, "_generate_summary", return_value="summary"):
+            compressed = compressor.compress(messages, current_tokens=90_000, force=True)
+
+        assert compressor.compression_count == 1
+        assert [
+            tc["id"]
+            for message in compressed
+            for tc in (message.get("tool_calls") or [])
+        ] == list(call_ids)
+
+        compressed.extend(
+            {"role": "tool", "tool_call_id": call_id, "content": "done"}
+            for call_id in call_ids
+            if call_id not in completed_ids
+        )
+        from agent.agent_runtime_helpers import repair_message_sequence
+
+        assert repair_message_sequence(None, compressed) == 0
+        assert [
+            message["tool_call_id"]
+            for message in compressed
+            if message.get("role") == "tool"
+        ] == list(call_ids)
 
 
 class TestCooldownReentryAbort:

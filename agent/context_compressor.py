@@ -5012,8 +5012,15 @@ This compaction should PRIORITISE preserving all information related to the focu
         #    when call_id != id (Codex Responses API format), re-exposing orphans.
         missing_results = surviving_call_ids - result_call_ids
         if missing_results:
+            # Results are appended after execution. The trailing assistant,
+            # possibly behind partial batch results, is presumed still in flight;
+            # sanitize_api_messages stubs a genuinely unanswered call pre-API.
+            trailing_inflight = next(
+                (msg for msg in reversed(messages) if msg.get("role") != "tool"),
+                None,
+            )
             for msg in messages:
-                if msg.get("role") != "assistant":
+                if msg.get("role") != "assistant" or msg is trailing_inflight:
                     continue
                 tcs = msg.get("tool_calls")
                 if not tcs:

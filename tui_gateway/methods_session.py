@@ -2719,17 +2719,23 @@ def _(rid, params: dict) -> dict:
         from agent.manual_compression_feedback import (
             describe_compression_lock_skip,
         )
-        return _ok(rid, {
-            "compressed": False,
-            "lock_held": True,
-            "message": describe_compression_lock_skip(e.holder),
-        })
+
+        return _ok(
+            rid,
+            {
+                "compressed": False,
+                "lock_held": True,
+                "message": describe_compression_lock_skip(e.holder),
+            },
+        )
     except Exception as e:
         finalize_context_engine_compression_notification(
             session["agent"],
             committed=False,
         )
         return _err(rid, 5005, str(e))
+    finally:
+        _finish_manual_compression_fence(session)
 
 
 @method("session.save")

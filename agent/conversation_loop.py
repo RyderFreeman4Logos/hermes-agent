@@ -827,6 +827,7 @@ _CODEX_INCOMPLETE_NUDGE = (
 )
 # The retry counter includes the initial incomplete response, not just follow-ups.
 _CODEX_INCOMPLETE_CONTINUATION_LIMIT = 3
+_AMBIGUOUS_CHECKPOINT_CONTINUATION_LIMIT = 3
 
 
 # Shared recovery hint appended to every content-policy refusal message. Both
@@ -1778,7 +1779,7 @@ def run_conversation(
     # retain that ephemeral output and rebase it onto the compacted transcript
     # on the next loop iteration. This prevents a second advisor fan-out.
     pending_moa_prepared_request = None
-    ambiguous_continuation_attempted = False
+    ambiguous_continuation_count = 0
     ambiguous_continuation_prompt: Optional[str] = None
     ambiguous_origin_error = None
 
@@ -3175,15 +3176,7 @@ def run_conversation(
 
                 if response_invalid:
                     if ambiguous_checkpoint_continuation:
-                        continuation_error = RuntimeError(
-                            "Fresh continuation response is invalid"
-                        )
-                        setattr(
-                            continuation_error,
-                            "_hermes_ambiguous_provider_acceptance",
-                            True,
-                        )
-                        raise continuation_error
+                        return _terminal_ambiguous_provider_outcome()
                     agent._invoke_api_request_error_hook(
                         task_id=effective_task_id,
                         turn_id=turn_id,
@@ -4121,7 +4114,9 @@ def run_conversation(
                 if agent.thinking_callback:
                     agent.thinking_callback("")
                 if ambiguous_checkpoint_continuation:
-                    return _terminal_ambiguous_provider_outcome()
+                    interrupted = True
+                    _turn_exit_reason = "interrupted_during_ambiguous_checkpoint_continuation"
+                    break
                 if agent._has_pending_redirect():
                     # redirect() deliberately used the interrupt machinery to
                     # cancel only this provider request. Keep its correction
@@ -4163,7 +4158,7 @@ def run_conversation(
                     api_call_count -= 1
                     agent._api_call_count = api_call_count
                     _refund_current_logical_iteration()
-                    if ambiguous_continuation_attempted:
+                    if ambiguous_continuation_count:
                         return _terminal_ambiguous_provider_outcome()
                     final_response = str(api_error)
                     failed = True
@@ -4183,7 +4178,8 @@ def run_conversation(
 
                 if getattr(api_error, "_hermes_ambiguous_provider_acceptance", False):
                     if (
-                        not ambiguous_continuation_attempted
+                        ambiguous_continuation_count
+                        < _AMBIGUOUS_CHECKPOINT_CONTINUATION_LIMIT
                         and not getattr(
                             api_error,
                             "_hermes_ambiguous_partial_tool_call",
@@ -4193,21 +4189,46 @@ def run_conversation(
                         and not moa_config
                         and agent.provider != "moa"
                     ):
-                        ambiguous_continuation_attempted = True
+                        ambiguous_continuation_count += 1
                         ambiguous_origin_error = api_error
                         ambiguous_continuation_prompt = (
                             "[System: A previous provider request may have been accepted "
                             "but its outcome is unknown. This is one fresh continuation, "
                             "not a replay. Do not repeat completed work or actions; verify "
-                            "uncertain external effects before any side effect.]"
+                            "uncertain external effects before any side effect. "
+                            f"Checkpoint attempt {ambiguous_continuation_count}/"
+                            f"{_AMBIGUOUS_CHECKPOINT_CONTINUATION_LIMIT}.]"
                         )
                         agent._emit_status(
-                            "⚠️ Provider outcome unknown; requesting one fresh continuation."
+                            "⚠️ Provider outcome unknown; requesting fresh continuation "
+                            f"{ambiguous_continuation_count}/"
+                            f"{_AMBIGUOUS_CHECKPOINT_CONTINUATION_LIMIT}."
                         )
+                        _continuation_backoff = jittered_backoff(
+                            ambiguous_continuation_count,
+                            base_delay=1.0,
+                            max_delay=15.0,
+                        )
+                        if _continuation_backoff > 0:
+                            agent._emit_wait_notice(
+                                "↻ Provider outcome unknown; waiting "
+                                f"{_continuation_backoff:.1f}s before fresh continuation "
+                                f"{ambiguous_continuation_count}/"
+                                f"{_AMBIGUOUS_CHECKPOINT_CONTINUATION_LIMIT}"
+                            )
+                            _backoff_deadline = time.monotonic() + _continuation_backoff
+                            while time.monotonic() < _backoff_deadline:
+                                if agent._interrupt_requested:
+                                    interrupted = True
+                                    _turn_exit_reason = "interrupted_during_ambiguous_continuation_backoff"
+                                    break
+                                time.sleep(min(0.2, _backoff_deadline - time.monotonic()))
+                            if interrupted:
+                                break
                         break
                     return _terminal_ambiguous_provider_outcome(api_error)
 
-                if ambiguous_continuation_attempted:
+                if ambiguous_continuation_count:
                     return _terminal_ambiguous_provider_outcome(
                         api_error if api_error is not None else ambiguous_origin_error
                     )
@@ -6354,7 +6375,7 @@ def run_conversation(
         if _pre_dispatch_deadline_exhausted:
             break
 
-        if ambiguous_continuation_prompt is not None:
+        if ambiguous_continuation_prompt is not None and not interrupted:
             continue
 
         if _retry.restart_with_redirected_messages:
@@ -7676,8 +7697,8 @@ def run_conversation(
                         and agent._thinking_prefill_retries >= 2
                     )
                     if _truly_empty and (not _has_structured or _prefill_exhausted) and agent._empty_content_retries < 3:
-                        if ambiguous_continuation_attempted:
-                            # The one allowed checkpoint already returned no
+                        if ambiguous_continuation_count:
+                            # A checkpoint already returned no
                             # usable content. Do not fall into the generic
                             # empty-response retry — that would reconstruct the
                             # original durable request and replay the ambiguous

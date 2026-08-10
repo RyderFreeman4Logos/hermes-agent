@@ -18660,6 +18660,25 @@ def test_tui_cache_callback_uses_95_percent_error_boundary(pct, kind):
     ]
 
 
+def test_tui_cache_callback_does_not_round_a_positive_subpercent_hit_to_zero():
+    class _Agent:
+        pass
+
+    emitted: list[tuple[str, str, dict]] = []
+    with patch.object(
+        server,
+        "_emit",
+        lambda event_type, sid, payload: emitted.append((event_type, sid, payload)),
+    ):
+        agent = _Agent()
+        server._attach_tui_cache_callback(agent, "cache-sid")
+        agent._tui_cache_callback("hit", 0, 1, 2_000)
+
+    assert emitted == [
+        ("status.update", "cache-sid", {"kind": "error", "text": "cache <1%"})
+    ]
+
+
 def test_tui_cache_callback_labels_post_compression_usage():
     class _Agent:
         _first_turn_usage = {

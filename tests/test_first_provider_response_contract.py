@@ -58,6 +58,7 @@ def test_first_provider_response_record_is_content_free_and_secondary_is_retaine
     assert agent._provider_response_records[1]["timestamp"] >= first["timestamp"]
     assert agent._first_provider_response is first
     assert len(emitted) == 2
+    assert emitted[0][0:2] == ("no_field", None)
 
 
 def test_provider_response_distinguishes_reported_miss_from_unknown():
@@ -128,7 +129,7 @@ def test_tui_cache_callback_persists_session_record_without_content(monkeypatch)
             server, "_emit", lambda event, event_sid, payload: emitted.append((event, event_sid, payload))
         )
         server._attach_tui_cache_callback(agent, sid)
-        agent._tui_cache_callback("no_field", 0, 0, 2_000, record)
+        agent._tui_cache_callback("no_field", None, 0, 2_000, record)
     finally:
         server._sessions.pop(sid, None)
 
@@ -139,6 +140,7 @@ def test_tui_cache_callback_persists_session_record_without_content(monkeypatch)
     assert len(wire_record["session"]) == 64
     assert "owner_session_id" not in wire_record
     assert "content" not in repr(record)
+    assert emitted[0][2]["text"] == "cache no telemetry"
 
 
 @pytest.mark.parametrize(

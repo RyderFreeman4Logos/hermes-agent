@@ -94,7 +94,7 @@ def test_terminal_claim_cancels_heartbeat_before_completion_publication(
     ]
 
 
-def test_completion_ledger_rejects_contradictory_terminal_republication(registry):
+def test_completion_ledger_distinguishes_contradictory_terminal_republication(registry):
     session = _make_session(sid="proc-once", exited=True, exit_code=1)
     session.notify_on_complete = True
     session.session_key = "owner"
@@ -106,8 +106,10 @@ def test_completion_ledger_rejects_contradictory_terminal_republication(registry
     session.exit_code = 0
     registry._running[session.id] = session
     registry._move_to_finished(session)
+    second = registry.completion_queue.get_nowait()
 
     assert first["exit_code"] == 1
+    assert second["exit_code"] == 0
     assert registry.completion_queue.empty()
 
 

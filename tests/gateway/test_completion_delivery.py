@@ -6,6 +6,7 @@ turn and transcript publication finish.
 """
 
 import asyncio
+import copy
 import json
 import queue
 import threading
@@ -81,8 +82,30 @@ def _completion_event(*, started_at, session_id="proc_reused"):
         "command": "echo done",
         "exit_code": 0,
         "completion_reason": "exited",
+        "termination_source": "",
         "output": "done\n",
     }
+
+
+def _canonical_delegated_completion():
+    return {
+        **_completion_event(started_at=42.25, session_id="proc-collision"),
+        "termination_source": "",
+        "delegated_child": True,
+    }
+
+
+def _malformed_collision_copy(event):
+    malformed = json.loads(json.dumps(event))
+    malformed.pop("termination_source")
+    malformed.update(
+        command="distinct-malformed-command",
+        output="distinct malformed output",
+        error="distinct malformed error",
+        _completion_delivery_token="serialized-token-canary",
+        _completion_delivery_claim_id="serialized-claim-canary",
+    )
+    return malformed
 
 
 def _runtime_heartbeat_event(**overrides):
@@ -564,12 +587,10 @@ def test_gateway_recovers_checkpointed_completion_through_history_commit(
         db.close()
 
 
-def test_gateway_retries_retained_same_process_claim(
-    monkeypatch, tmp_path, isolated_registry
+def test_gateway_committed_effect_ack_failure_never_requeues(
+    monkeypatch, isolated_registry
 ):
-    """A double-write failure keeps its claim until the gateway retry terminalizes it."""
-    from hermes_state import SessionDB
-    from tests.gateway.test_first_turn_session_meta_rebaseline import SESSION_ID
+    """A committed effect records ACK recovery instead of retrying its provider."""
     from tools import async_delegation as ad
     import tools.process_registry as registry_module
 
@@ -581,44 +602,25 @@ def test_gateway_retries_retained_same_process_claim(
     assert isolated_registry.claim_completion_delivery(event)
     claim = ad.claim_event_delivery(event, "gateway-test")
     assert claim
-    complete = ad.complete_event_delivery
-    release = ad.release_event_delivery
+    release = MagicMock(side_effect=AssertionError("committed effect was released"))
     monkeypatch.setattr(
         ad,
         "complete_event_delivery",
         lambda *_args: (_ for _ in ()).throw(OSError("complete unavailable")),
     )
-    monkeypatch.setattr(
-        ad,
-        "release_event_delivery",
-        lambda *_args: (_ for _ in ()).throw(OSError("release unavailable")),
-    )
-
-    assert not registry_module.finish_completion_event_delivery(
-        event, claim, "committed", registry=isolated_registry
-    )
-    retry = isolated_registry.completion_queue.get_nowait()
-    assert retry["_completion_delivery_retained_claim_id"] == claim
-    isolated_registry.completion_queue.put(retry)
-    monkeypatch.setattr(ad, "complete_event_delivery", complete)
     monkeypatch.setattr(ad, "release_event_delivery", release)
 
-    db = SessionDB(db_path=tmp_path / "sessions.db")
-    db.create_session(SESSION_ID, source="telegram")
-    runner, adapter, _committed = _committing_gateway_runner(
-        monkeypatch, tmp_path, db
+    assert registry_module.finish_completion_event_delivery(
+        event, claim, "committed", registry=isolated_registry
     )
-    try:
-        asyncio.run(
-            _run_gateway_completion_queue(monkeypatch, runner, isolated_registry)
-        )
-        adapter.handle_message.assert_awaited_once()
-        receipt = ad.get_durable_event_delivery(event)
-        assert receipt is not None
-        assert receipt["delivery_state"] == "delivered"
-        assert isolated_registry.completion_queue.empty()
-    finally:
-        db.close()
+    release.assert_not_called()
+    assert isolated_registry.completion_queue.empty()
+    receipt = ad.get_durable_event_delivery(event)
+    assert receipt is not None
+    assert receipt["delivery_state"] == "recovery_committed_ack_failed"
+
+    restarted = ProcessRegistry()
+    assert restarted.completion_queue.empty()
 
 
 def test_duplicate_async_queue_replay_injects_once(monkeypatch, isolated_registry):
@@ -730,6 +732,232 @@ def test_gateway_push_keeps_claim_until_turn_commit(isolated_registry):
     assert receipt is not None
     assert receipt["delivery_state"] == "delivered"
     assert not isolated_registry.completion_event_should_deliver(event)
+
+
+def test_genuine_local_token_transplant_keeps_distinct_malformed_event_visible(
+    monkeypatch, isolated_registry
+):
+    """A token minted for producer A cannot claim producer B."""
+    import tools.process_registry as registry_module
+
+    effects = []
+
+    async def inject(_text, event):
+        effects.append(event["command"])
+        return True
+
+    runner = _runner(SimpleNamespace(handle_message=AsyncMock()))
+    monkeypatch.setattr(runner, "_inject_watch_notification", inject)
+
+    def malformed(name, started_at):
+        event = isolated_registry._completion_event(
+            ProcessSession(
+                id=f"proc-{name}",
+                command=f"{name}-command",
+                session_key="agent:main:telegram:dm:123",
+                started_at=started_at,
+                output_buffer=f"{name}-output",
+                exited=True,
+                exit_code=1,
+                completion_reason="exited",
+                notify_on_complete=True,
+            )
+        )
+        event.pop("session_id")
+        event["error"] = f"{name}-error"
+        return event
+
+    first = malformed("first", 10.0)
+    second = malformed("second", 20.0)
+    first_token = first["_completion_delivery_token"]
+    assert first_token != second["_completion_delivery_token"]
+    second["_completion_delivery_token"] = first_token
+
+    assert (
+        asyncio.run(runner._deliver_completion_notification("visible", first)) is True
+    )
+    for duplicate in (dict(first), copy.copy(first), copy.deepcopy(first)):
+        assert (
+            asyncio.run(runner._deliver_completion_notification("visible", duplicate))
+            is None
+        )
+
+    assert (
+        asyncio.run(runner._deliver_completion_notification("visible", second)) is True
+    )
+    assert effects == ["first-command", "second-command"]
+    assert registry_module.completion_delivery_prompt(second, "visible") is not None
+
+
+def test_checkpoint_malformed_tuple_collision_delivers_once_and_stays_settled(
+    monkeypatch, tmp_path, isolated_registry
+):
+    """A sanitized checkpoint event cannot inherit canonical success authority."""
+    from tools import async_delegation as ad
+    import tools.process_registry as registry_module
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"auxiliary": {"completion_visibility": {"enabled": False}}},
+    )
+    effects = []
+
+    async def inject(_text, event):
+        effects.append(event["command"])
+        return True
+
+    runner = _runner(SimpleNamespace(handle_message=AsyncMock()))
+    monkeypatch.setattr(runner, "_inject_watch_notification", inject)
+    canonical = _canonical_delegated_completion()
+    assert (
+        asyncio.run(runner._deliver_completion_notification("canonical", canonical))
+        is None
+    )
+    canonical_receipt = ad.get_durable_event_delivery(canonical)
+    assert canonical_receipt and canonical_receipt["delivery_state"] == "delivered"
+
+    malformed = _malformed_collision_copy(canonical)
+    registry_module.CHECKPOINT_PATH.write_text(
+        json.dumps([{"completion_event": malformed}]), encoding="utf-8"
+    )
+    restarted = ProcessRegistry()
+    assert restarted.recover_from_checkpoint() == 0
+    restored = restarted.completion_queue.get_nowait()
+    assert not any(key.startswith("_completion_delivery_") for key in restored)
+    assert registry_module.completion_delivery_prompt(restored, "visible") is not None
+    monkeypatch.setattr(registry_module, "process_registry", restarted)
+
+    assert (
+        asyncio.run(runner._deliver_completion_notification("visible", restored))
+        is True
+    )
+    assert effects == ["distinct-malformed-command"]
+    malformed_receipt = ad.get_durable_event_delivery(restored)
+    assert malformed_receipt and malformed_receipt["delivery_state"] == "delivered"
+    assert malformed_receipt["delivery_id"] != canonical_receipt["delivery_id"]
+    assert (
+        asyncio.run(runner._deliver_completion_notification("visible", dict(restored)))
+        is None
+    )
+    assert effects == ["distinct-malformed-command"]
+
+    restored_after_restart = queue.Queue()
+    assert ad.restore_undelivered_completions(restored_after_restart) == 0
+    assert restored_after_restart.empty()
+
+
+def test_sqlite_malformed_tuple_collision_delivers_once_and_stays_settled(
+    monkeypatch, isolated_registry
+):
+    """Legacy tuple-keyed malformed SQLite traffic migrates before arbitration."""
+    from tools import async_delegation as ad
+    import tools.process_registry as registry_module
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"auxiliary": {"completion_visibility": {"enabled": False}}},
+    )
+    canonical = _canonical_delegated_completion()
+    malformed = _malformed_collision_copy(canonical)
+    legacy_id = ad._ordinary_completion_delivery_id(canonical)
+    assert legacy_id
+    with ad._connect() as conn:
+        conn.execute(
+            """INSERT INTO ordinary_completion_deliveries
+               (delivery_id, event_json, delivery_state, updated_at)
+               VALUES (?, ?, 'pending', ?)""",
+            (legacy_id, json.dumps(malformed), 1.0),
+        )
+
+    restarted = ProcessRegistry()
+    restored = restarted.completion_queue.get_nowait()
+    assert not any(key.startswith("_completion_delivery_") for key in restored)
+    assert registry_module.completion_delivery_prompt(restored, "visible") is not None
+    monkeypatch.setattr(registry_module, "process_registry", restarted)
+    effects = []
+
+    async def inject(_text, event):
+        effects.append(event["command"])
+        return True
+
+    runner = _runner(SimpleNamespace(handle_message=AsyncMock()))
+    monkeypatch.setattr(runner, "_inject_watch_notification", inject)
+    assert (
+        asyncio.run(runner._deliver_completion_notification("canonical", canonical))
+        is None
+    )
+    canonical_receipt = ad.get_durable_event_delivery(canonical)
+    assert canonical_receipt and canonical_receipt["delivery_state"] == "delivered"
+
+    assert (
+        asyncio.run(runner._deliver_completion_notification("visible", restored))
+        is True
+    )
+    assert effects == ["distinct-malformed-command"]
+    malformed_receipt = ad.get_durable_event_delivery(restored)
+    assert malformed_receipt and malformed_receipt["delivery_state"] == "delivered"
+    assert malformed_receipt["delivery_id"] != canonical_receipt["delivery_id"]
+    assert (
+        asyncio.run(runner._deliver_completion_notification("visible", dict(restored)))
+        is None
+    )
+    assert effects == ["distinct-malformed-command"]
+
+    restored_after_restart = queue.Queue()
+    assert ad.restore_undelivered_completions(restored_after_restart) == 0
+    assert restored_after_restart.empty()
+
+
+def test_committed_gateway_effect_ack_failure_reconciles_without_provider_replay(
+    monkeypatch, isolated_registry
+):
+    """A committed parent effect retries only its ACK, never the provider event."""
+    from tools import async_delegation as ad
+    import tools.process_registry as registry_module
+
+    adapter = SimpleNamespace(handle_message=AsyncMock(), supports_push=True)
+    runner = _runner(adapter)
+    event = _completion_event(started_at=43.0, session_id="proc-committed-ack-failure")
+    event["exit_code"] = 1
+
+    assert (
+        asyncio.run(runner._deliver_completion_notification("visible", event)) is True
+    )
+    adapter.handle_message.assert_awaited_once()
+    delivered = adapter.handle_message.await_args.args[0]
+    receipt = ad.get_durable_event_delivery(event)
+    assert receipt and receipt["delivery_state"] == "effect_started"
+
+    complete_calls = 0
+
+    def fail_complete_once(*_args):
+        nonlocal complete_calls
+        complete_calls += 1
+        raise OSError("intentional committed ACK failure")
+
+    release = MagicMock(side_effect=AssertionError("committed effect was released"))
+    monkeypatch.setattr(ad, "complete_event_delivery", fail_complete_once)
+    monkeypatch.setattr(ad, "release_event_delivery", release)
+    asyncio.run(runner._finish_completion_delivery_receipt(delivered, "committed"))
+
+    assert complete_calls == 1
+    release.assert_not_called()
+    assert isolated_registry.completion_queue.empty()
+    receipt = ad.get_durable_event_delivery(event)
+    assert receipt and receipt["delivery_state"] == "recovery_committed_ack_failed"
+
+    restarted = ProcessRegistry()
+    monkeypatch.setattr(registry_module, "process_registry", restarted)
+    restart_adapter = SimpleNamespace(handle_message=AsyncMock(), supports_push=True)
+    restart_runner = _runner(restart_adapter)
+    assert (
+        asyncio.run(
+            restart_runner._deliver_completion_notification("visible", dict(event))
+        )
+        is None
+    )
+    restart_adapter.handle_message.assert_not_awaited()
+    assert restarted.completion_queue.empty()
 
 
 def test_busy_gateway_merge_finalizes_every_completion_receipt(

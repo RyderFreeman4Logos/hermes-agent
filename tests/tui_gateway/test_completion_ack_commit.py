@@ -7,6 +7,7 @@ import queue
 import threading
 import time
 import types
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -327,8 +328,8 @@ def test_failed_ordinary_recovery_transition_leaves_claim_for_retry(
     assert receipt["delivery_state"] == "pending"
 
 
-def test_visibility_noop_requires_durable_ack(monkeypatch, tmp_path):
-    """A suppressed completion is retryable when its durable ACK fails."""
+def test_visibility_noop_ack_failure_records_terminal_recovery(monkeypatch, tmp_path):
+    """A suppressed completion records recovery when its direct ACK fails."""
     from tools import async_delegation as ad
     import tools.process_registry as registry_module
 
@@ -353,11 +354,11 @@ def test_visibility_noop_requires_durable_ack(monkeypatch, tmp_path):
         consumer="tui-test",
     )
 
-    assert registry.completion_event_should_deliver(event)
-    assert registry.completion_queue.get_nowait() == event
+    assert not registry.completion_event_should_deliver(event)
+    assert registry.completion_queue.empty()
     receipt = ad.get_durable_event_delivery(event)
     assert receipt is not None
-    assert receipt["delivery_state"] == "pending"
+    assert receipt["delivery_state"] == "recovery_committed_ack_failed"
 
 
 def test_tui_post_turn_visibility_suppression_is_durable(
@@ -642,8 +643,10 @@ def test_process_completion_persist_failure_recovers_after_restart(
     assert receipt["delivery_state"] == "pending"
 
 
-def test_failed_complete_and_release_reuses_live_claim(monkeypatch, tmp_path):
-    """A transient double-write failure keeps authority for same-process retry."""
+def test_failed_complete_records_recovery_without_releasing_committed_effect(
+    monkeypatch, tmp_path
+):
+    """A committed effect never reuses its provider claim after ACK failure."""
     from tools import async_delegation as ad
     import tools.process_registry as registry_module
 
@@ -659,38 +662,23 @@ def test_failed_complete_and_release_reuses_live_claim(monkeypatch, tmp_path):
     assert registry.claim_completion_delivery(event)
     claim = ad.claim_event_delivery(event, "tui-test")
     assert claim
-    complete = ad.complete_event_delivery
-    release = ad.release_event_delivery
+    release = MagicMock(side_effect=AssertionError("committed effect was released"))
     monkeypatch.setattr(
         ad,
         "complete_event_delivery",
         lambda *_args: (_ for _ in ()).throw(OSError("complete unavailable")),
     )
-    monkeypatch.setattr(
-        ad,
-        "release_event_delivery",
-        lambda *_args: (_ for _ in ()).throw(OSError("release unavailable")),
-    )
+    monkeypatch.setattr(ad, "release_event_delivery", release)
 
-    assert not registry_module.finish_completion_event_delivery(
+    assert registry_module.finish_completion_event_delivery(
         event, claim, "committed", registry=registry
     )
+    release.assert_not_called()
+    assert registry.completion_queue.empty()
     receipt = ad.get_durable_event_delivery(event)
     assert receipt is not None
-    assert receipt["delivery_state"] == "effect_started"
-    retry = registry.completion_queue.get_nowait()
-    assert retry["_completion_delivery_retained_claim_id"] == claim
-
-    monkeypatch.setattr(ad, "complete_event_delivery", complete)
-    monkeypatch.setattr(ad, "release_event_delivery", release)
-    assert registry.claim_completion_delivery(retry)
-    assert ad.claim_event_delivery(retry, "tui-retry") == claim
-    assert registry_module.finish_completion_event_delivery(
-        retry, claim, "committed", registry=registry
-    )
-    receipt = ad.get_durable_event_delivery(event)
-    assert receipt is not None
-    assert receipt["delivery_state"] == "delivered"
+    assert receipt["delivery_state"] == "recovery_committed_ack_failed"
+    assert registry_module.ProcessRegistry().completion_queue.empty()
 
     bounded_event = {
         **event,

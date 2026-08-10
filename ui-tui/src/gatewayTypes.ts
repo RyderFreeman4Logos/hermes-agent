@@ -755,7 +755,7 @@ export type GatewayEvent =
           attribution?: 'post_compression'
           level: 'error' | 'info'
           note?: string
-          pct: number
+          pct: number | null
           prompt_tokens: number
           read_tokens: number
           state: 'cold_write' | 'hit' | 'miss' | 'unavailable' | 'unknown'

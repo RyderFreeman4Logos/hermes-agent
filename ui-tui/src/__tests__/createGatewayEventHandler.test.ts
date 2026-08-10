@@ -2180,7 +2180,7 @@ describe('createGatewayEventHandler', () => {
 
     onEvent({
       payload: {
-        cache_info: { level: 'info', pct: 0, prompt_tokens: 2_000, read_tokens: 0, state: 'unavailable' },
+        cache_info: { level: 'info', pct: null, prompt_tokens: 2_000, read_tokens: 0, state: 'unavailable' },
         text: 'final answer'
       },
       type: 'message.complete'
@@ -2189,6 +2189,24 @@ describe('createGatewayEventHandler', () => {
     expect(appended).toEqual([
       { role: 'assistant', text: 'final answer' },
       { kind: 'event', role: 'system', text: 'cache unavailable' }
+    ])
+  })
+
+  it('renders a positive sub-percent cache hit without rounding it to zero', () => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+    onEvent({
+      payload: {
+        cache_info: { level: 'error', pct: 0, prompt_tokens: 2_000, read_tokens: 1, state: 'hit' },
+        text: 'final answer'
+      },
+      type: 'message.complete'
+    } as any)
+
+    expect(appended).toEqual([
+      { role: 'assistant', text: 'final answer' },
+      { kind: 'event', role: 'system', text: 'cache <1%', tone: 'error' }
     ])
   })
 })

@@ -601,7 +601,6 @@ def _empty_response(model: str) -> SimpleNamespace:
         prompt_tokens=0,
         completion_tokens=0,
         total_tokens=0,
-        prompt_tokens_details=SimpleNamespace(cached_tokens=0),
     )
     return SimpleNamespace(
         id=f"chatcmpl-{uuid.uuid4().hex[:12]}",
@@ -658,10 +657,11 @@ def translate_gemini_response(resp: Dict[str, Any], model: str) -> SimpleNamespa
         prompt_tokens=int(usage_meta.get("promptTokenCount") or 0),
         completion_tokens=int(usage_meta.get("candidatesTokenCount") or 0),
         total_tokens=int(usage_meta.get("totalTokenCount") or 0),
-        prompt_tokens_details=SimpleNamespace(
-            cached_tokens=int(usage_meta.get("cachedContentTokenCount") or 0),
-        ),
     )
+    if "cachedContentTokenCount" in usage_meta:
+        usage.prompt_tokens_details = SimpleNamespace(
+            cached_tokens=int(usage_meta.get("cachedContentTokenCount") or 0),
+        )
     reasoning = "".join(reasoning_pieces) or None
     message = SimpleNamespace(
         role="assistant",
@@ -831,10 +831,11 @@ def translate_stream_event(event: Dict[str, Any], model: str, tool_call_indices:
                 prompt_tokens=int(usage_meta.get("promptTokenCount") or 0),
                 completion_tokens=int(usage_meta.get("candidatesTokenCount") or 0),
                 total_tokens=int(usage_meta.get("totalTokenCount") or 0),
-                prompt_tokens_details=SimpleNamespace(
-                    cached_tokens=int(usage_meta.get("cachedContentTokenCount") or 0),
-                ),
             )
+            if "cachedContentTokenCount" in usage_meta:
+                finish_chunk.usage.prompt_tokens_details = SimpleNamespace(
+                    cached_tokens=int(usage_meta.get("cachedContentTokenCount") or 0),
+                )
         chunks.append(finish_chunk)
     return chunks
 

@@ -163,6 +163,58 @@ def test_translate_native_response_surfaces_reasoning_and_tool_calls():
     assert json.loads(choice.message.tool_calls[0].function.arguments) == {"q": "hermes"}
 
 
+def test_native_empty_response_omits_unreported_cache_details():
+    from agent.gemini_native_adapter import _empty_response
+    from agent.usage_pricing import normalize_usage
+
+    normalized = normalize_usage(
+        _empty_response("gemini-2.5-flash").usage,
+        provider="gemini",
+        api_mode="chat_completions",
+    )
+
+    assert normalized.cache_telemetry_present is False
+
+
+@pytest.mark.parametrize("cached_tokens", [None, 0])
+def test_native_usage_preserves_cache_field_presence_through_first_response(cached_tokens):
+    from agent.conversation_loop import _ingest_successful_provider_usage
+    from agent.gemini_native_adapter import translate_gemini_response
+    from agent.usage_pricing import normalize_usage
+
+    usage_metadata = {
+        "promptTokenCount": 2_000,
+        "candidatesTokenCount": 10,
+        "totalTokenCount": 2_010,
+    }
+    if cached_tokens is not None:
+        usage_metadata["cachedContentTokenCount"] = cached_tokens
+    response = translate_gemini_response(
+        {
+            "candidates": [{"content": {"parts": [{"text": "ok"}]}}],
+            "usageMetadata": usage_metadata,
+        },
+        model="gemini-2.5-flash",
+    )
+    normalized = normalize_usage(response.usage, provider="gemini", api_mode="chat_completions")
+    agent = SimpleNamespace(_first_turn_usage=None, _last_turn_usage=None)
+    _ingest_successful_provider_usage(
+        agent,
+        {
+            "prompt_tokens": normalized.prompt_tokens,
+            "cache_read_tokens": normalized.cache_read_tokens,
+            "cache_write_tokens": normalized.cache_write_tokens,
+            "cache_telemetry_present": normalized.cache_telemetry_present,
+        },
+        first_call=True,
+    )
+
+    assert normalized.cache_telemetry_present is (cached_tokens is not None)
+    assert agent._first_provider_response["state"] == (
+        "miss" if cached_tokens is not None else "no_field"
+    )
+
+
 def test_native_client_uses_x_goog_api_key_and_native_models_endpoint(monkeypatch):
     from agent.gemini_native_adapter import GeminiNativeClient
 

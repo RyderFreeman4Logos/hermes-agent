@@ -18767,7 +18767,7 @@ def test_cache_info_distinguishes_unavailable_from_reported_zero():
     ) == {
         "read_tokens": 0,
         "prompt_tokens": 2_000,
-        "pct": 0,
+        "pct": None,
         "state": "unavailable",
         "level": "info",
     }
@@ -18780,6 +18780,37 @@ def test_cache_info_distinguishes_unavailable_from_reported_zero():
         "state": "miss",
         "level": "error",
     }
+
+
+@pytest.mark.parametrize(
+    ("usage", "expected"),
+    [
+        (
+            {"cache_telemetry_present": False, "prompt_tokens": 2_000},
+            (None, "unavailable", "info"),
+        ),
+        (
+            {"cache_telemetry_present": True, "cache_read_tokens": 0, "prompt_tokens": 2_000},
+            (0, "miss", "error"),
+        ),
+        (
+            {"cache_telemetry_present": True, "cache_read_tokens": 1, "prompt_tokens": 2_000},
+            (0, "hit", "error"),
+        ),
+        (
+            {"cache_telemetry_present": True, "cache_read_tokens": 1_880, "prompt_tokens": 2_000},
+            (94, "hit", "error"),
+        ),
+        (
+            {"cache_telemetry_present": True, "cache_read_tokens": 1_900, "prompt_tokens": 2_000},
+            (95, "hit", "info"),
+        ),
+    ],
+)
+def test_cache_info_final_wire_keeps_telemetry_provenance(usage, expected):
+    cache_info = server._cache_info_from_usage(usage)
+
+    assert (cache_info["pct"], cache_info["state"], cache_info["level"]) == expected
 
 
 def test_cache_info_keeps_post_compression_low_hit_neutral():
@@ -18877,3 +18908,83 @@ def test_prompt_submit_message_complete_prefers_first_call_cache_usage(monkeypat
         payload for event, _sid, payload in emitted if event == "message.complete"
     ]
     assert complete[-1]["cache_info"]["pct"] == 87
+
+
+@pytest.mark.parametrize(
+    ("usage", "status_text", "final_pct", "state"),
+    [
+        ({"cache_telemetry_present": False, "prompt_tokens": 2_000}, "cache no telemetry", None, "unavailable"),
+        (
+            {"cache_telemetry_present": True, "cache_read_tokens": 0, "cache_write_tokens": 0, "prompt_tokens": 2_000},
+            "cache MISS",
+            0,
+            "miss",
+        ),
+        ({"cache_telemetry_present": True, "cache_read_tokens": 1, "prompt_tokens": 2_000}, "cache <1%", 0, "hit"),
+    ],
+)
+def test_prompt_submit_walks_provider_cache_usage_to_status_and_completion(
+    monkeypatch, usage, status_text, final_pct, state
+):
+    from agent.conversation_loop import _ingest_successful_provider_usage
+
+    emitted: list[tuple[str, str, dict]] = []
+
+    class _Agent:
+        _first_turn_usage = None
+        _last_turn_usage = None
+        _cache_turn_origin = "user"
+        session_id = "provider-session"
+
+        def run_conversation(self, *_args, **_kwargs):
+            _ingest_successful_provider_usage(self, usage, first_call=True)
+            return {
+                "final_response": "reply",
+                "messages": [{"role": "assistant", "content": "reply"}],
+            }
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    sid = "cache-walk-sid"
+    agent = _Agent()
+    server._sessions[sid] = _session(agent=agent)
+    try:
+        server._attach_tui_cache_callback(agent, sid)
+        monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+        monkeypatch.setattr(server, "_get_usage", lambda _agent: {})
+        monkeypatch.setattr(server, "render_message", lambda _text, _cols: "")
+        monkeypatch.setattr(
+            server,
+            "_emit",
+            lambda event_type, event_sid, payload=None: emitted.append(
+                (event_type, event_sid, payload)
+            ),
+        )
+
+        server.handle_request(
+            {
+                "id": "cache-walk",
+                "method": "prompt.submit",
+                "params": {"session_id": sid, "text": "hi"},
+            }
+        )
+    finally:
+        session = server._sessions.pop(sid, None)
+
+    status = [payload for event, _sid, payload in emitted if event == "status.update"]
+    complete = [payload for event, _sid, payload in emitted if event == "message.complete"]
+    assert status[-1]["text"] == status_text
+    assert status[-1]["cache_record"]["state"] == ("no_field" if state == "unavailable" else state)
+    assert "content" not in repr(session["first_provider_response"])
+    assert complete[-1]["cache_info"] == {
+        "read_tokens": usage.get("cache_read_tokens", 0),
+        "prompt_tokens": 2_000,
+        "pct": final_pct,
+        "state": state,
+        "level": "error" if state != "unavailable" else "info",
+    }

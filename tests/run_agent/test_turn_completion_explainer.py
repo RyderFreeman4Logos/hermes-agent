@@ -2249,8 +2249,8 @@ def test_first_api_call_reports_cache_hit_to_tui_callback(
     )
     agent.client.chat.completions.create.side_effect = [response]
     cache_events = []
-    agent._tui_cache_callback = lambda state, pct, read, prompt: cache_events.append(
-        (state, pct, read, prompt)
+    agent._tui_cache_callback = lambda state, pct, read, prompt, record: cache_events.append(
+        (state, pct, read, prompt, record)
     )
 
     with (
@@ -2262,7 +2262,8 @@ def test_first_api_call_reports_cache_hit_to_tui_callback(
         result = agent.run_conversation("do something")
 
     assert result["final_response"] == "Done."
-    assert cache_events == [("hit", expected_pct, cached_tokens, 2_000)]
+    assert cache_events[0][:4] == ("hit", expected_pct, cached_tokens, 2_000)
+    assert cache_events[0][4]["state"] == "hit"
     assert "cache_attribution" not in agent._first_turn_usage
     cache_lines = [
         call.args[0] for call in vprint.call_args_list if "💾 Cache:" in call.args[0]
@@ -2271,6 +2272,34 @@ def test_first_api_call_reports_cache_hit_to_tui_callback(
     red_pct = f"\033[31m{expected_pct}%\033[0m"
     assert (red_pct in cache_lines[0]) is should_be_red
     assert "post-compression cold prefix" not in cache_lines[0]
+
+
+def test_moa_cache_display_uses_aggregator_usage_while_accounting_keeps_advisors():
+    from agent.usage_pricing import CanonicalUsage
+
+    agent = _make_agent(max_iterations=10)
+    response = _mock_response(content="Done.", finish_reason="stop")
+    response.usage = SimpleNamespace(
+        prompt_tokens=1_000,
+        completion_tokens=10,
+        total_tokens=1_010,
+        prompt_tokens_details=SimpleNamespace(cached_tokens=950),
+    )
+    agent.client.chat.completions.create.side_effect = [response]
+    agent.client.consume_reference_usage = lambda: (CanonicalUsage(input_tokens=9_000), None)
+    cache_events = []
+    agent._tui_cache_callback = lambda *args: cache_events.append(args)
+
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        agent.run_conversation("do something")
+
+    assert cache_events[0][0:4] == ("hit", 95, 950, 1_000)
+    assert agent.session_input_tokens == 9_050
+    assert agent.session_cache_read_tokens == 950
 
 
 def test_post_compression_cache_attribution_survives_retry_then_clears():

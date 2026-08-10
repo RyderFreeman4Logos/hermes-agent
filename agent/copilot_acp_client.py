@@ -544,7 +544,6 @@ class CopilotACPClient:
             prompt_tokens=0,
             completion_tokens=0,
             total_tokens=0,
-            prompt_tokens_details=SimpleNamespace(cached_tokens=0),
         )
         assistant_message = SimpleNamespace(
             content=cleaned_text,

@@ -37,7 +37,7 @@ type CacheInfo = {
   attribution?: 'post_compression'
   level: 'error' | 'info'
   note?: string
-  pct: number
+  pct: number | null
   prompt_tokens: number
   read_tokens: number
   state: 'cold_write' | 'hit' | 'miss' | 'unavailable' | 'unknown'
@@ -50,7 +50,11 @@ const cacheFootnote = (cacheInfo?: CacheInfo): Msg | null => {
 
   const cacheText =
     cacheInfo.state === 'hit'
-      ? `cache ${Math.max(0, Math.round(cacheInfo.pct))}%`
+      ? cacheInfo.read_tokens > 0 &&
+          cacheInfo.prompt_tokens > 0 &&
+          cacheInfo.read_tokens * 100 < cacheInfo.prompt_tokens
+        ? 'cache <1%'
+        : `cache ${Math.max(0, Math.round(cacheInfo.pct ?? 0))}%`
       : cacheInfo.state === 'cold_write'
         ? 'cache cold-write'
         : `cache ${cacheInfo.state}`
@@ -59,7 +63,7 @@ const cacheFootnote = (cacheInfo?: CacheInfo): Msg | null => {
     cacheInfo.attribution === 'post_compression'
       ? ` · ${
           cacheInfo.note ??
-          (cacheInfo.state === 'hit' && cacheInfo.pct >= 95
+          (cacheInfo.state === 'hit' && (cacheInfo.pct ?? 0) >= 95
             ? 'post-compression cache warm'
             : 'post-compression warmup (expected)')
         }`

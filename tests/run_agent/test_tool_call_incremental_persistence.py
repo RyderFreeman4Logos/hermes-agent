@@ -33,6 +33,7 @@ import pytest
 from agent.tool_dispatch_helpers import make_tool_result_message
 from agent.agent_runtime_helpers import sanitize_api_messages
 from agent.tool_executor import execute_tool_calls_segmented
+from agent.turn_context import substitute_api_content
 from hermes_state import SessionDB
 from run_agent import AIAgent
 from tools.tool_result_storage import PERSISTED_OUTPUT_TAG
@@ -301,16 +302,20 @@ def test_execute_tool_calls_sequential_flushes_each_tool_result_before_next_disp
 
 
 @pytest.mark.parametrize("executor_mode", ["sequential", "concurrent"])
-def test_large_result_is_bounded_before_append_but_callback_keeps_raw(
+def test_combined_result_and_hints_are_bounded_before_append_with_raw_recovery(
     tmp_path, executor_mode
 ):
     agent = _make_agent()
-    tool_call = _mock_tool_call(call_id=f"large-{executor_mode}")
+    tool_call = _mock_tool_call(name="terminal", call_id=f"large-{executor_mode}")
     assistant_message = SimpleNamespace(content="", tool_calls=[tool_call])
     messages: list = []
-    raw = '{"success":true,"data":"' + "x" * 40_000 + '"}'
+    raw = "x" * 32_000
+    hints = "\n\n[Subdirectory context discovered: nested/AGENTS.md]\n" + "h" * 15_000
     callback = MagicMock()
     setattr(agent, "tool_complete_callback", callback)
+    hint_tracker = MagicMock()
+    hint_tracker.check_tool_call.return_value = hints
+    setattr(agent, "_subdirectory_hints", hint_tracker)
     env = MagicMock()
     env.get_temp_dir.return_value = str(tmp_path)
     env.execute.return_value = {"output": "", "returncode": 0}
@@ -320,15 +325,27 @@ def test_large_result_is_bounded_before_append_but_callback_keeps_raw(
         else patch.object(agent, "_invoke_tool", return_value=raw)
     )
 
-    with dispatch_patch, patch(
-        "agent.tool_executor.get_active_env", return_value=env
+    with (
+        dispatch_patch,
+        patch("agent.tool_executor.get_active_env", return_value=env),
     ):
         execute = getattr(agent, f"_execute_tool_calls_{executor_mode}")
         execute(assistant_message, messages, "task-1")
 
-    assert PERSISTED_OUTPUT_TAG in messages[-1]["content"]
+    history_content = messages[-1]["content"]
+    assert len(raw + hints) > 32_000
+    assert len(history_content) <= 32_000
+    assert PERSISTED_OUTPUT_TAG in history_content
+    assert "Full output saved to:" in history_content
+    assert history_content.endswith(hints)
     assert env.execute.call_args.kwargs["stdin_data"] == raw
     assert callback.call_args.args[3] == raw
+
+    wire_message = dict(messages[-1], api_content="ignored-sidecar" * 4_000)
+    substitute_api_content(wire_message)
+    assert "api_content" not in wire_message
+    assert wire_message["content"] == history_content
+    assert len(wire_message["content"]) <= 32_000
 
 
 def test_sequential_keyboard_interrupt_emits_results_for_all_calls():

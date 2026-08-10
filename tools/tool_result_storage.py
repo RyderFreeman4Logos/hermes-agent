@@ -170,6 +170,7 @@ def maybe_persist_tool_result(
     env=None,
     config: BudgetConfig = DEFAULT_BUDGET,
     threshold: int | float | None = None,
+    history_suffix: str = "",
 ) -> str:
     """Layer 2: persist oversized result into the sandbox, return preview + path.
 
@@ -184,31 +185,41 @@ def maybe_persist_tool_result(
         env: The active BaseEnvironment instance, or None.
         config: BudgetConfig controlling thresholds and preview size.
         threshold: Explicit override; takes precedence over config resolution.
+        history_suffix: Text appended after persistence; its size is reserved
+            before deciding whether the raw result fits in history.
 
     Returns:
-        Original content if small, or <persisted-output> replacement.
+        Original content plus history suffix if small, or a
+        <persisted-output> replacement plus that suffix.
     """
     configured_threshold = (
         threshold if threshold is not None else config.resolve_threshold(tool_name)
     )
 
     if configured_threshold == float("inf"):
-        return content
+        return content + history_suffix
 
-    insertion_limited = (
+    history_threshold = configured_threshold
+    if (
         threshold is None
         and env is not None
-        and _INSERTION_COMPACT_THRESHOLD_CHARS < len(content) <= configured_threshold
         and _needs_insertion_compaction(tool_name, content)
-    )
+    ):
+        history_threshold = min(
+            history_threshold,
+            _INSERTION_COMPACT_THRESHOLD_CHARS,
+        )
     effective_threshold = (
-        _INSERTION_COMPACT_THRESHOLD_CHARS
-        if insertion_limited
-        else configured_threshold
+        max(0, history_threshold - len(history_suffix))
+        if env is not None
+        else history_threshold
+    )
+    history_limited = (
+        len(content) <= configured_threshold and len(content) > effective_threshold
     )
 
     if len(content) <= effective_threshold:
-        return content
+        return content + history_suffix
 
     storage_dir = _resolve_storage_dir(env)
     remote_path = f"{storage_dir}/{_safe_result_filename(tool_use_id)}"
@@ -221,16 +232,24 @@ def maybe_persist_tool_result(
                     "Persisted large tool result: %s (%s, %d chars -> %s)",
                     tool_name, tool_use_id, len(content), remote_path,
                 )
-                return _build_persisted_message(preview, has_more, len(content), remote_path)
+                return (
+                    _build_persisted_message(
+                        preview,
+                        has_more,
+                        len(content),
+                        remote_path,
+                    )
+                    + history_suffix
+                )
         except Exception as exc:
             logger.warning("Sandbox write failed for %s: %s", tool_use_id, exc)
 
-    if insertion_limited:
+    if history_limited:
         logger.warning(
             "Keeping recoverable %s result inline after sandbox write failed",
             tool_name,
         )
-        return content
+        return content + history_suffix
 
     logger.info(
         "Inline-truncating large tool result: %s (%d chars, no sandbox write)",
@@ -239,7 +258,7 @@ def maybe_persist_tool_result(
     return (
         f"{preview}\n\n"
         f"[Truncated: tool response was {len(content):,} chars. "
-        f"Full output could not be saved to sandbox.]"
+        f"Full output could not be saved to sandbox.]" + history_suffix
     )
 
 

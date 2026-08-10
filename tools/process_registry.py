@@ -1908,12 +1908,14 @@ class ProcessRegistry:
         """Return True only for the canonical, fully-known normal outcome."""
         return (
             evt.get("type") == "completion"
+            and ProcessRegistry._completion_identity(evt) is not None
+            and "session_key" in evt
+            and evt.get("termination_source") == ""
             and type(evt.get("exit_code")) is int
             and evt["exit_code"] == 0
             and evt.get("completion_reason") == "exited"
             and isinstance(evt.get("command"), str)
             and isinstance(evt.get("output"), str)
-            and not evt.get("termination_source")
             and not any(
                 evt.get(key)
                 for key in (

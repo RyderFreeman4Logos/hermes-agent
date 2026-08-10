@@ -13,6 +13,8 @@ ARE wire-replayed on every retained turn and stay charged unconditionally
 (#55572) — including native compaction checkpoints (#81747).
 """
 
+import pytest
+
 from agent.context_compressor import (
     _ALWAYS_REPLAYED_BUDGET_KEYS,
     _NEWEST_TURN_ONLY_BUDGET_KEYS,
@@ -37,6 +39,40 @@ def _assistant(thinking=False, codex=False):
 
 
 class TestChargeStaleThinking:
+    @pytest.mark.parametrize(
+        ("api_mode", "provider", "model", "base_url"),
+        [
+            ("chat_completions", "kimi-coding", "k3", "https://api.kimi.com/coding/v1"),
+            ("chat_completions", "mistral", "mistral-small", "https://api.mistral.ai/v1"),
+            ("anthropic_messages", "anthropic", "claude-opus-5", "https://api.anthropic.com"),
+            ("bedrock_converse", "bedrock", "claude-opus-5", ""),
+            ("codex_responses", "openai-codex", "gpt-5.6", "https://chatgpt.com/backend-api/codex"),
+        ],
+    )
+    def test_reasoning_alias_pair_is_charged_once_across_transport_policies(
+        self, api_mode, provider, model, base_url
+    ):
+        from agent.context_compressor import ContextCompressor
+
+        compressor = ContextCompressor(
+            model=model,
+            provider=provider,
+            base_url=base_url,
+            api_mode=api_mode,
+            quiet_mode=True,
+            config_context_length=200_000,
+        )
+        long = "r" * 8_000
+        single = {"role": "assistant", "content": "done", "reasoning_content": long}
+        duplicate = dict(single, reasoning="short" * 400)
+
+        # Exercise both the transport's stale-turn policy and the universally
+        # charged newest-assistant policy.
+        for charge in {compressor._replays_stale_thinking(), True}:
+            assert _estimate_msg_budget_tokens(
+                duplicate, charge_stale_thinking=charge
+            ) == _estimate_msg_budget_tokens(single, charge_stale_thinking=charge)
+
     def test_stale_turn_thinking_not_charged(self):
         msg = _assistant(thinking=True)
         full = _estimate_msg_budget_tokens(msg, charge_stale_thinking=True)

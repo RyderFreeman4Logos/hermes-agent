@@ -3189,6 +3189,19 @@ def _count_image_tokens(msg: Dict[str, Any], cost_per_image: int) -> int:
     return count * cost_per_image
 
 
+_REASONING_REPLAY_ALIASES = ("reasoning", "reasoning_content")
+
+
+def _reasoning_alias_for_estimation(msg: Dict[str, Any]) -> tuple[bool, Any]:
+    """Return the larger persisted reasoning alias when both are present."""
+    if not all(key in msg for key in _REASONING_REPLAY_ALIASES):
+        return False, None
+    return True, max(
+        (msg[key] for key in _REASONING_REPLAY_ALIASES),
+        key=lambda value: len(str(value)),
+    )
+
+
 def _wire_message_shadow(msg: Dict[str, Any]) -> Dict[str, Any]:
     """Shadow of a message holding only what the provider actually receives.
 
@@ -3210,21 +3223,22 @@ def _wire_message_shadow(msg: Dict[str, Any]) -> Dict[str, Any]:
       separately at a flat rate by ``_count_image_tokens``, and counting their
       raw chars here would massively overestimate usage.
     """
-    sidecar = msg.get("api_content")
-    sidecar_wins = (
-        isinstance(sidecar, str)
-        and bool(sidecar)
-        and msg.get("role") in ("user", "assistant")
-    )
+    from agent.turn_context import api_content_for_wire
+
+    sidecar = api_content_for_wire(msg)
+    sidecar_wins = sidecar is not None
+    has_reasoning_aliases, reasoning_replay = _reasoning_alias_for_estimation(msg)
     shadow: Dict[str, Any] = {}
     for k, v in msg.items():
         if k in ("_anthropic_content_blocks", "reasoning_details"):
+            continue
+        if has_reasoning_aliases and k in _REASONING_REPLAY_ALIASES:
             continue
         if k == "api_content":
             # Always popped before the request is built; only counted when it
             # actually replaces ``content``.
             if sidecar_wins:
-                shadow["content"] = v
+                shadow["content"] = sidecar
             continue
         if k == "content":
             if sidecar_wins:
@@ -3248,6 +3262,8 @@ def _wire_message_shadow(msg: Dict[str, Any]) -> Dict[str, Any]:
                 shadow[k] = v
         else:
             shadow[k] = v
+    if has_reasoning_aliases:
+        shadow["reasoning_content"] = reasoning_replay
     return shadow
 
 

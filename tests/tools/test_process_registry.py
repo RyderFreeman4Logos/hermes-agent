@@ -1773,13 +1773,30 @@ def _visibility_config():
 
 def test_delegated_child_success_is_silenced_before_parent_delivery():
     assert completion_delivery_prompt(
-        _completion_event(delegated_child=True), "payload"
+        _completion_event(delegated_child=True, completion_reason="exited"), "payload"
     ) is None
 
 
 def test_delegated_child_failure_still_reaches_parent_delivery():
     assert completion_delivery_prompt(
         _completion_event(delegated_child=True, exit_code=1), "payload"
+    ) is not None
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"completion_reason": "killed"},
+        {"exit_code": False, "completion_reason": "exited"},
+        {"completion_reason": "failed_start"},
+        {"completion_reason": "lost"},
+        {"completion_reason": "cancelled"},
+        {"completion_reason": "exited", "cancelled": True},
+    ],
+)
+def test_delegated_child_non_normal_completion_fails_open(overrides):
+    assert completion_delivery_prompt(
+        _completion_event(delegated_child=True, **overrides), "payload"
     ) is not None
 
 

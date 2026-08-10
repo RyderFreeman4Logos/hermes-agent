@@ -779,6 +779,77 @@ def test_provider_activity_resets_only_the_exact_agent_owner(monkeypatch):
     assert second.cancelled is False
 
 
+def test_recent_matching_provider_activity_postpones_cross_owner_due_without_warm(
+    monkeypatch,
+):
+    from agent.conversation_loop import _record_runtime_provider_activity
+    from tools.runtime_heartbeat import (
+        RuntimeHeartbeat,
+        canonical_runtime_cache_context_identity,
+        canonical_runtime_provider_identity,
+    )
+
+    class ImmediateThread:
+        def __init__(self, target, **_kwargs):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    class Owner:
+        provider = "openai"
+        requested_provider = "openai"
+        base_url = "https://api.openai.invalid/v1"
+        model = "model"
+        api_mode = "chat_completions"
+
+        def __init__(self):
+            self.calls = []
+
+        def run_conversation(self, message, **kwargs):
+            self.calls.append((message, kwargs))
+            return {
+                "heartbeat_warm_status": "warmed",
+                "heartbeat_warm_reason": "physical_success",
+            }
+
+    monkeypatch.setattr("tools.runtime_heartbeat.threading.Thread", ImmediateThread)
+    FakeTimer.created = []
+    clock = SimpleNamespace(now=100.0)
+    monkeypatch.setattr("tools.runtime_heartbeat.time.monotonic", lambda: clock.now)
+    events = queue.Queue()
+    manager = RuntimeHeartbeat(event_queue=events, timer_factory=FakeTimer)
+    activity_owner, target_owner = Owner(), Owner()
+    assert manager.arm(
+        "target",
+        caller_id="visible-root-session",
+        kind="delegation",
+        interval=1700,
+        inspect=lambda: {"alive": True, "progress": True},
+        provider=canonical_runtime_provider_identity(target_owner),
+        cache_context=canonical_runtime_cache_context_identity(target_owner),
+        owner=target_owner,
+    )
+    old_timer = FakeTimer.created[0]
+    old_generation = manager._targets["target"].generation
+
+    monkeypatch.setattr("tools.runtime_heartbeat.runtime_heartbeat", manager)
+    clock.now = 200.0
+    _record_runtime_provider_activity(
+        activity_owner,
+        clock.now,
+        caller_id="visible-root-session",
+    )
+
+    target = manager._targets["target"]
+    assert old_timer.cancelled is True
+    assert target.generation > old_generation
+    assert target.deadline == 1900.0
+    old_timer.callback()
+    assert target_owner.calls == []
+    assert events.empty()
+
+
 def test_successful_owned_warm_outcome_survives_its_lease_rearm(monkeypatch):
     from tools.runtime_heartbeat import RuntimeHeartbeat
 

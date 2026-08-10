@@ -1945,6 +1945,7 @@ def test_successful_provider_dispatches_reset_exact_heartbeat_group(heartbeat_ev
                 provider="openrouter",
                 cache_context="test-cache-context",
                 activity_at=123.0,
+                owner=agent,
             )
 
             reset_deadline.reset_mock()
@@ -1954,6 +1955,7 @@ def test_successful_provider_dispatches_reset_exact_heartbeat_group(heartbeat_ev
                 provider=canonical_runtime_provider_identity(agent),
                 cache_context=canonical_runtime_cache_context_identity(agent),
                 activity_at=123.0,
+                owner=agent,
             )
     finally:
         reset_current_session_key(token)

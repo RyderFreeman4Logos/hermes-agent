@@ -429,7 +429,7 @@ def restore_undelivered_completions(target_queue) -> int:
                     _delegation_id, _MAX_DELIVERY_ATTEMPTS,
                 )
                 continue
-            evt = json.loads(payload)
+            evt = _load_durable_event_payload(payload)
             if isinstance(evt, dict):
                 evt["restored"] = True
             target_queue.put(evt)
@@ -479,7 +479,7 @@ def restore_undelivered_completions(target_queue) -> int:
                     (now, delivery_id),
                 )
                 continue
-            evt = json.loads(payload)
+            evt = _load_durable_event_payload(payload)
             if isinstance(evt, dict):
                 evt["restored"] = True
                 target_queue.put(evt)
@@ -552,6 +552,12 @@ def _durable_event_payload(evt: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _load_durable_event_payload(payload: str) -> Any:
+    """Decode persisted event data without restoring process-local authority."""
+    event = json.loads(payload)
+    return _durable_event_payload(event) if isinstance(event, dict) else event
+
+
 def persist_event_delivery(evt: Dict[str, Any]) -> bool:
     """Create the durable ordinary-completion receipt before queue delivery."""
     delivery_id = _ordinary_completion_delivery_id(evt)
@@ -598,7 +604,7 @@ def get_completion_delivery_recoveries(session_id: str) -> List[Dict[str, Any]]:
         ).fetchall()
     return [
         {
-            "event": json.loads(row[0]),
+            "event": _load_durable_event_payload(row[0]),
             "reason": row[1],
             "recovered_at": row[2],
         }
@@ -891,7 +897,7 @@ def get_durable_event_delivery(evt: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "delivery_attempts": row[1],
         "delivered_at": row[2],
         "delivery_claim": row[3],
-        "event": json.loads(row[4]),
+        "event": _load_durable_event_payload(row[4]),
     }
 
 

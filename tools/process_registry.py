@@ -107,6 +107,10 @@ def format_uptime_short(seconds: int) -> str:
     return f"{hours}h {mins}m"
 
 
+class _CompletionDeliveryToken(str):
+    """Process-local authority whose type cannot survive JSON persistence."""
+
+
 @dataclass
 class ProcessSession:
     """A tracked background process with output buffering."""
@@ -173,8 +177,8 @@ class ProcessSession:
     _completion_supervisor_started: bool = field(default=False, repr=False)
     _subreaper_managed: bool = field(default=False, repr=False)
     _termination_in_progress: bool = field(default=False, repr=False)
-    _completion_delivery_token: str = field(
-        default_factory=lambda: uuid.uuid4().hex, repr=False
+    _completion_delivery_token: _CompletionDeliveryToken = field(
+        default_factory=lambda: _CompletionDeliveryToken(uuid.uuid4().hex), repr=False
     )
 
 
@@ -1826,7 +1830,7 @@ class ProcessRegistry:
                     self._terminal_completion_spool[identity] = {
                         key: value
                         for key, value in event.items()
-                        if key != "_completion_delivery_token"
+                        if not key.startswith("_completion_delivery_")
                     }
             logger.warning(
                 "Keeping terminal process checkpoint for %s until completion "
@@ -1922,7 +1926,7 @@ class ProcessRegistry:
         if identity is not None:
             return identity
         token = evt.get("_completion_delivery_token")
-        if isinstance(token, str) and token:
+        if type(token) is _CompletionDeliveryToken and token:
             return ("completion-local", token)
         return None
 
@@ -3191,6 +3195,11 @@ class ProcessRegistry:
         recovered = 0
 
         def materialize_terminal_event(event: dict) -> None:
+            event = {
+                key: value
+                for key, value in event.items()
+                if not key.startswith("_completion_delivery_")
+            }
             persisted = False
             try:
                 from tools.async_delegation import persist_event_delivery

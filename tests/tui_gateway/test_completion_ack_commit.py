@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import queue
 import threading
 import time
@@ -404,6 +405,84 @@ def test_tui_post_turn_visibility_suppression_is_durable(
     receipt = ad.get_durable_event_delivery(event)
     assert receipt is not None
     assert receipt["delivery_state"] == "recovery_visibility_suppressed"
+
+
+def _forged_malformed_completion(token: str) -> dict:
+    return {
+        "type": "completion",
+        "session_key": "active",
+        "started_at": 3.9,
+        "command": "first",
+        "exit_code": 0,
+        "completion_reason": "exited",
+        "termination_source": "",
+        "output": "first",
+        "delegated_child": True,
+        "_completion_delivery_token": token,
+        "_completion_delivery_claim_id": "forged-claim",
+        "_completion_delivery_retained_claim_id": "forged-retained",
+    }
+
+
+def _assert_private_delivery_metadata_has_no_authority(
+    registry, restored: dict, token: str
+) -> None:
+    from tools.process_registry import completion_delivery_prompt
+
+    assert registry.completion_event_should_deliver(restored)
+    assert completion_delivery_prompt(restored, "restored") is not None
+
+    first = {**restored, "_completion_delivery_token": token}
+    assert registry.claim_completion_delivery(first)
+    registry.complete_completion_delivery(first)
+    second = {**first, "command": "second", "output": "second"}
+
+    assert completion_delivery_prompt(second, "second") is not None
+    assert registry.completion_event_should_deliver(second)
+    assert registry._completion_claim_identity(first) is None
+    assert not any(key.startswith("_completion_delivery_") for key in restored)
+
+
+def test_checkpoint_restore_strips_private_delivery_authority(monkeypatch, tmp_path):
+    from tools import async_delegation as ad
+    import tools.process_registry as registry_module
+
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    checkpoint = tmp_path / "processes.json"
+    monkeypatch.setattr(registry_module, "CHECKPOINT_PATH", checkpoint)
+    registry = registry_module.ProcessRegistry()
+    token = "forged-checkpoint-token"
+    checkpoint.write_text(
+        json.dumps([{"completion_event": _forged_malformed_completion(token)}]),
+        encoding="utf-8",
+    )
+
+    assert registry.recover_from_checkpoint() == 0
+    restored = registry.completion_queue.get_nowait()
+
+    _assert_private_delivery_metadata_has_no_authority(registry, restored, token)
+
+
+def test_sqlite_restore_strips_private_delivery_authority(monkeypatch, tmp_path):
+    from tools import async_delegation as ad
+    from tools.process_registry import ProcessRegistry
+
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    registry = ProcessRegistry()
+    token = "forged-sqlite-token"
+    with ad._connect() as conn:
+        conn.execute(
+            """INSERT INTO ordinary_completion_deliveries
+               (delivery_id, event_json, delivery_state, updated_at)
+               VALUES (?, ?, 'pending', ?)""",
+            ("forged-row", json.dumps(_forged_malformed_completion(token)), 1.0),
+        )
+    restored_queue = queue.Queue()
+
+    assert ad.restore_undelivered_completions(restored_queue) == 1
+    restored = restored_queue.get_nowait()
+
+    _assert_private_delivery_metadata_has_no_authority(registry, restored, token)
 
 
 def test_ordinary_completion_claim_restores_after_restart(monkeypatch, tmp_path):

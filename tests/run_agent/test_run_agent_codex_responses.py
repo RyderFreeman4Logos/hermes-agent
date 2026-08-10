@@ -2365,6 +2365,33 @@ def test_ambiguous_checkpoint_is_bounded_and_rejects_partial_tool_boundary(
     assert result["messages"][-1]["finish_reason"] == "ambiguous_provider_attempt"
 
 
+def test_ambiguous_checkpoint_empty_response_does_not_replay_original(monkeypatch):
+    """Empty checkpoint content must terminate; never reconstruct original request."""
+    agent = _build_agent(monkeypatch)
+    requests = []
+    ambiguous = RuntimeError("stream ended after dispatch")
+    ambiguous._hermes_ambiguous_provider_acceptance = True
+    ambiguous.failure_class = "transport"
+
+    def _fake_api_call(api_kwargs):
+        requests.append(api_kwargs)
+        if len(requests) == 1:
+            raise ambiguous
+        # Valid Codex message item with empty content — previously fell into
+        # generic empty-response retry and rebuilt the original durable request.
+        return _codex_message_response("")
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _fake_api_call)
+    result = agent.run_conversation("empty checkpoint must not replay")
+    assert len(requests) == 2
+    assert result["api_calls"] == 2
+    assert result["completed"] is False
+    assert result["ambiguous_provider_attempt"] is True
+    assert result["turn_exit_reason"] == "ambiguous_provider_attempt"
+    assert requests[0]["input"] != requests[1]["input"]
+    assert "one fresh continuation, not a replay" in repr(requests[1]["input"])
+
+
 def test_codex_unreplayable_incomplete_backs_off_without_ending_turn(monkeypatch):
     """No replay state waits before the next billed continuation, not a busy loop."""
     from agent import conversation_loop

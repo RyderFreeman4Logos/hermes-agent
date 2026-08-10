@@ -779,7 +779,7 @@ def test_provider_activity_resets_only_the_exact_agent_owner(monkeypatch):
     assert second.cancelled is False
 
 
-def test_recent_matching_provider_activity_postpones_cross_owner_due_without_warm(
+def test_recent_matching_provider_activity_postpones_same_owner_due_without_warm(
     monkeypatch,
 ):
     from agent.conversation_loop import _record_runtime_provider_activity
@@ -819,34 +819,51 @@ def test_recent_matching_provider_activity_postpones_cross_owner_due_without_war
     monkeypatch.setattr("tools.runtime_heartbeat.time.monotonic", lambda: clock.now)
     events = queue.Queue()
     manager = RuntimeHeartbeat(event_queue=events, timer_factory=FakeTimer)
-    activity_owner, target_owner = Owner(), Owner()
+    owner = Owner()
+    sibling = Owner()
     assert manager.arm(
-        "target",
+        "target-owner",
         caller_id="visible-root-session",
         kind="delegation",
         interval=1700,
         inspect=lambda: {"alive": True, "progress": True},
-        provider=canonical_runtime_provider_identity(target_owner),
-        cache_context=canonical_runtime_cache_context_identity(target_owner),
-        owner=target_owner,
+        provider=canonical_runtime_provider_identity(owner),
+        cache_context=canonical_runtime_cache_context_identity(owner),
+        owner=owner,
     )
-    old_timer = FakeTimer.created[0]
-    old_generation = manager._targets["target"].generation
+    assert manager.arm(
+        "target-sibling",
+        caller_id="visible-root-session",
+        kind="delegation",
+        interval=1700,
+        inspect=lambda: {"alive": True, "progress": True},
+        provider=canonical_runtime_provider_identity(sibling),
+        cache_context=canonical_runtime_cache_context_identity(sibling),
+        owner=sibling,
+    )
+    owner_timer = FakeTimer.created[0]
+    sibling_timer = FakeTimer.created[1]
+    owner_generation = manager._targets["target-owner"].generation
+    sibling_generation = manager._targets["target-sibling"].generation
 
     monkeypatch.setattr("tools.runtime_heartbeat.runtime_heartbeat", manager)
     clock.now = 200.0
     _record_runtime_provider_activity(
-        activity_owner,
+        owner,
         clock.now,
         caller_id="visible-root-session",
     )
 
-    target = manager._targets["target"]
-    assert old_timer.cancelled is True
-    assert target.generation > old_generation
-    assert target.deadline == 1900.0
-    old_timer.callback()
-    assert target_owner.calls == []
+    owner_target = manager._targets["target-owner"]
+    sibling_target = manager._targets["target-sibling"]
+    assert owner_timer.cancelled is True
+    assert sibling_timer.cancelled is False
+    assert owner_target.generation > owner_generation
+    assert sibling_target.generation == sibling_generation
+    assert owner_target.deadline == 1900.0
+    owner_timer.callback()
+    assert owner.calls == []
+    assert sibling.calls == []
     assert events.empty()
 
 

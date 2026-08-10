@@ -29,6 +29,7 @@ from agent.usage_pricing import (
     POST_COMPRESSION_CACHE_NOTE,
     POST_COMPRESSION_CACHE_WARM_NOTE,
     cache_hit_percent,
+    format_cache_hit_percent,
 )
 from hermes_constants import (
     DEFAULT_INDICATOR_STYLE,
@@ -6289,7 +6290,7 @@ def _attach_tui_cache_callback(agent, sid: str):
     agent._tui_cache_owner_session = sid
 
     def emit_cache_state(
-        state: str, pct: int, read: int, prompt: int, record: dict | None = None
+        state: str, pct: int | None, read: int, prompt: int, record: dict | None = None
     ) -> None:
         session = _sessions.get(sid)
         publish_record = (
@@ -6310,17 +6311,17 @@ def _attach_tui_cache_callback(agent, sid: str):
             "prompt_tokens": prompt,
             "pct": pct,
             "state": state,
-            "level": _cache_level(pct),
+            "level": _cache_level(pct) if pct is not None else "info",
         }
         if isinstance(record, dict):
             state = str(record.get("state", state))
-            pct = int(record.get("pct", 0))
         else:
             state = str(cache_info["state"])
-            pct = int(cache_info["pct"])
         text = (
-            f"cache {pct}%"
+            f"cache {format_cache_hit_percent(read, prompt)}"
             if state == "hit"
+            else "cache no telemetry"
+            if state == "no_field"
             else "cache unavailable"
             if state == "unavailable"
             else f"cache {state.upper()}"

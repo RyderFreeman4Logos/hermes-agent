@@ -104,6 +104,7 @@ from agent.usage_pricing import (
     POST_COMPRESSION_CACHE_WARM_NOTE,
     cache_hit_percent,
     estimate_usage_cost,
+    format_cache_hit_percent,
     normalize_usage,
 )
 from hermes_constants import PARTIAL_STREAM_STUB_ID
@@ -249,7 +250,7 @@ def _ingest_successful_provider_usage(agent, usage: dict, *, first_call: bool) -
     cache_callback = getattr(agent, "_tui_cache_callback", None)
     if callable(cache_callback):
         try:
-            cache_callback(cache_state, cache_pct or 0, cache_read, prompt_tokens, record)
+            cache_callback(cache_state, cache_pct, cache_read, prompt_tokens, record)
         except Exception:
             logger.debug("TUI provider-response cache callback failed", exc_info=True)
     return post_compression
@@ -4396,7 +4397,7 @@ def run_conversation(
                     prompt = usage_dict["prompt_tokens"]
                     if (cached or written) and not agent.quiet_mode:
                         hit_pct = cache_hit_percent(cached, prompt)
-                        hit_text = f"{hit_pct}%"
+                        hit_text = format_cache_hit_percent(cached, prompt)
                         if (
                             hit_pct < CACHE_HIT_ERROR_THRESHOLD
                             and not post_compression_cache

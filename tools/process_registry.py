@@ -139,6 +139,7 @@ class ProcessSession:
     watcher_message_id: str = ""                # Triggering message id — reply anchor for topic routing
     watcher_interval: int = 0                   # 0 = no watcher configured
     notify_on_complete: bool = False             # Queue agent notification on exit
+    delegated_child: bool = False                # Spawned by a delegate_task child
     heartbeat_provider: str = ""                 # Canonical provider for recovery preflight
     # Watch patterns — trigger agent notification when output matches any pattern
     watch_patterns: List[str] = field(default_factory=list)
@@ -1866,6 +1867,7 @@ class ProcessRegistry:
             # Stable across checkpoint recovery and independent of which
             # watcher notices the process exit first.
             "started_at": session.started_at,
+            "delegated_child": session.delegated_child,
         }
 
     @staticmethod
@@ -3119,6 +3121,7 @@ class ProcessRegistry:
                             "watcher_message_id": s.watcher_message_id,
                             "watcher_interval": s.watcher_interval,
                             "notify_on_complete": s.notify_on_complete,
+                            "delegated_child": s.delegated_child,
                             "heartbeat_provider": s.heartbeat_provider,
                             "watch_patterns": s.watch_patterns,
                         })
@@ -3243,6 +3246,7 @@ class ProcessRegistry:
                 watcher_message_id=entry.get("watcher_message_id", ""),
                 watcher_interval=entry.get("watcher_interval", 0),
                 notify_on_complete=entry.get("notify_on_complete", False),
+                delegated_child=entry.get("delegated_child", False),
                 heartbeat_provider=entry.get("heartbeat_provider", ""),
                 watch_patterns=entry.get("watch_patterns", []),
             )
@@ -3615,6 +3619,8 @@ def completion_delivery_prompt(evt: dict, payload: str) -> "str | None":
     """Return a model-only completion prompt, or None for an explicit no-op."""
     if evt.get("type", "completion") != "completion":
         return payload
+    if evt.get("delegated_child") is True and evt.get("exit_code") == 0:
+        return None
     if type(evt.get("exit_code")) is not int:
         return payload
     if not _completion_visibility_should_deliver(evt):

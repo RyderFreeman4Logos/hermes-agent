@@ -1780,11 +1780,29 @@ def run_conversation(
     ambiguous_continuation_attempted = False
     ambiguous_continuation_prompt: Optional[str] = None
 
-    def _terminal_ambiguous_provider_outcome():
+    def _terminal_ambiguous_provider_outcome(api_error=None):
         ambiguous_error = (
             "Provider request outcome is unknown after acceptance; "
             "Hermes did not replay it to avoid duplicate billed work."
         )
+        failure_class = None
+        timeout_class = None
+        if api_error is not None:
+            failure_class = getattr(api_error, "failure_class", None) or getattr(
+                api_error, "timeout_class", None
+            )
+            timeout_class = getattr(api_error, "timeout_class", None)
+            if not failure_class:
+                err_text = str(api_error)
+                if "timeout_class=" in err_text:
+                    # e.g. "timeout_class=ttfb_timeout; ..."
+                    try:
+                        timeout_class = err_text.split("timeout_class=", 1)[1].split(
+                            ";", 1
+                        )[0].strip()
+                        failure_class = timeout_class
+                    except Exception:
+                        failure_class = None
         ambiguous_message = {
             "role": "assistant",
             "content": ambiguous_error,
@@ -1808,7 +1826,7 @@ def run_conversation(
             messages.append(ambiguous_message)
         agent._emit_status(f"⚠️ {ambiguous_error}")
         agent._persist_session(messages, conversation_history)
-        return {
+        outcome = {
             "final_response": ambiguous_error,
             "messages": messages,
             "api_calls": api_call_count,
@@ -1818,6 +1836,11 @@ def run_conversation(
             "ambiguous_provider_attempt": True,
             "turn_exit_reason": "ambiguous_provider_attempt",
         }
+        if failure_class:
+            outcome["failure_class"] = failure_class
+        if timeout_class:
+            outcome["timeout_class"] = timeout_class
+        return outcome
 
     # Per-turn tally of consecutive successful credential-pool token refreshes,
     # keyed by (provider, pool-entry-id). A persistent upstream 401 lets
@@ -4177,10 +4200,10 @@ def run_conversation(
                             "⚠️ Provider outcome unknown; requesting one fresh continuation."
                         )
                         break
-                    return _terminal_ambiguous_provider_outcome()
+                    return _terminal_ambiguous_provider_outcome(api_error)
 
                 if ambiguous_continuation_attempted:
-                    return _terminal_ambiguous_provider_outcome()
+                    return _terminal_ambiguous_provider_outcome(api_error)
 
                 # -----------------------------------------------------------
                 # UnicodeEncodeError recovery.  Two common causes:

@@ -274,7 +274,9 @@ def _resolve_codex_stream_watchdogs(
                     disable_above,
                 )
             ttfb_timeout = idle_default
-        ttfb_cap = _env_float("HERMES_CODEX_TTFB_MAX_SECONDS", 120.0)
+        # Implicit default must not cancel adaptive scale-up. Only an explicit
+        # positive HERMES_CODEX_TTFB_MAX_SECONDS caps the timeout (#92 / upstream #69228).
+        ttfb_cap = _env_float("HERMES_CODEX_TTFB_MAX_SECONDS", 0.0)
         if ttfb_cap > 0 and ttfb_timeout > ttfb_cap:
             if log_adjustments:
                 logger.info(
@@ -1246,6 +1248,8 @@ def interruptible_api_call(agent, api_kwargs: dict):
             if result["response"] is not None or result["error"] is not None:
                 return
             setattr(error, "_hermes_ambiguous_provider_acceptance", True)
+            setattr(error, "timeout_class", timeout_class)
+            setattr(error, "failure_class", timeout_class)
             result["error"] = error
             attempt = (codex_lifecycle or {}).get("attempt")
             physical_attempt_diagnostics.record_ambiguity(

@@ -1078,6 +1078,49 @@ class TestDelegateObservability(unittest.TestCase):
             self.assertEqual(entry["turn_exit_reason"], "terminal_slot_exhausted(2/2)")
             self.assertEqual(entry["exit_reason"], "terminal_slot_exhausted(2/2)")
 
+    def test_ambiguous_provider_attempt_does_not_become_max_iterations(self):
+        """#92: provider ambiguity must not be labeled as budget exhaustion."""
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.model = "test-model"
+            mock_child.session_prompt_tokens = 0
+            mock_child.session_completion_tokens = 0
+            mock_child.run_conversation.return_value = {
+                "final_response": (
+                    "Provider request outcome is unknown after acceptance; "
+                    "Hermes did not replay it to avoid duplicate billed work."
+                ),
+                "completed": False,
+                "interrupted": False,
+                "api_calls": 3,
+                "messages": [],
+                "partial": True,
+                "error": (
+                    "Provider request outcome is unknown after acceptance; "
+                    "Hermes did not replay it to avoid duplicate billed work."
+                ),
+                "ambiguous_provider_attempt": True,
+                "turn_exit_reason": "ambiguous_provider_attempt",
+                "failure_class": "ttfb_timeout",
+                "timeout_class": "ttfb_timeout",
+            }
+            MockAgent.return_value = mock_child
+
+            result = json.loads(
+                delegate_task(goal="Test ambiguous child", parent_agent=parent)
+            )
+            entry = result["results"][0]
+            self.assertEqual(entry["status"], "failed")
+            self.assertEqual(entry["exit_reason"], "ambiguous_provider_attempt")
+            self.assertNotEqual(entry["exit_reason"], "max_iterations")
+            self.assertEqual(entry["turn_exit_reason"], "ambiguous_provider_attempt")
+            self.assertTrue(entry["ambiguous_provider_attempt"])
+            self.assertEqual(entry["failure_class"], "ttfb_timeout")
+            self.assertEqual(entry["timeout_class"], "ttfb_timeout")
+            self.assertEqual(entry["api_calls"], 3)
+
 
 class TestSubagentCostRollup(unittest.TestCase):
     """Port of Kilo-Org/kilocode#9448 — parent's session_estimated_cost_usd

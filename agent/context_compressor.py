@@ -357,17 +357,14 @@ def _prune_stale_reasoning_replay(messages: List[Dict[str, Any]]) -> int:
       context carriers, not per-turn reasoning.  They must survive on every
       retained message, so pruning filters items instead of popping the key.
     """
+    from agent.conversation_compression import _is_real_user_message
+
     # Find the last real user message — everything after it is the active
     # turn.  Synthetic continuation rows and tool results never mark a turn
     # boundary.
     last_user_idx = -1
     for i in range(len(messages) - 1, -1, -1):
-        msg = messages[i]
-        if (
-            isinstance(msg, dict)
-            and msg.get("role") == "user"
-            and not ContextCompressor._is_synthetic_compression_user_turn(msg)
-        ):
+        if _is_real_user_message(messages[i]):
             last_user_idx = i
             break
     if last_user_idx < 0:

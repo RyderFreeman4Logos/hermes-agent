@@ -2021,6 +2021,7 @@ _SYNTHETIC_USER_PREFIXES = (
     "[System: Your previous response was truncated",
     "[System: The previous response was cut off",
     "[System: Your previous tool call",
+    "[System: Continue now. Execute the required tool calls and only ",
     "[Your active task list was preserved across context compression]",
     "[IMPORTANT: Background process ",
 )

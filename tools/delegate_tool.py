@@ -2879,13 +2879,22 @@ def _run_single_child(
                         # Fallback for messages without tool_call_id
                         tool_trace[-1].update(result_meta)
 
-        # Determine exit reason
+        # Determine exit reason. Never invent max_iterations when the child
+        # failed for provider ambiguity or another structured non-budget cause.
         if turn_exit_reason:
             exit_reason = turn_exit_reason
         elif interrupted:
             exit_reason = "interrupted"
         elif completed:
             exit_reason = "completed"
+        elif result.get("ambiguous_provider_attempt"):
+            exit_reason = "ambiguous_provider_attempt"
+        elif result.get("failure_class"):
+            exit_reason = str(result.get("failure_class"))
+        elif result.get("timeout_class"):
+            exit_reason = str(result.get("timeout_class"))
+        elif result.get("error") and not completed:
+            exit_reason = "error"
         else:
             exit_reason = "max_iterations"
 
@@ -2931,6 +2940,12 @@ def _run_single_child(
                 else 0.0
             ),
         }
+        if result.get("ambiguous_provider_attempt"):
+            entry["ambiguous_provider_attempt"] = True
+        if result.get("failure_class"):
+            entry["failure_class"] = result.get("failure_class")
+        if result.get("timeout_class"):
+            entry["timeout_class"] = result.get("timeout_class")
         if status == "failed":
             entry["error"] = result.get("error", "Subagent did not produce a response.")
 

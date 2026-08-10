@@ -18923,8 +18923,12 @@ def test_prompt_submit_message_complete_prefers_first_call_cache_usage(monkeypat
         ({"cache_telemetry_present": True, "cache_read_tokens": 1, "prompt_tokens": 2_000}, "cache <1%", 0, "hit"),
     ],
 )
-def test_prompt_submit_walks_provider_cache_usage_to_status_and_completion(
-    monkeypatch, usage, status_text, final_pct, state
+@pytest.mark.parametrize(
+    ("event_type", "origin"),
+    [("completion", "background_completion"), ("async_delegation", "subagent_result")],
+)
+def test_completion_wake_walks_provider_cache_usage_to_status_and_completion(
+    monkeypatch, usage, status_text, final_pct, state, event_type, origin
 ):
     from agent.conversation_loop import _ingest_successful_provider_usage
 
@@ -18936,11 +18940,13 @@ def test_prompt_submit_walks_provider_cache_usage_to_status_and_completion(
         _cache_turn_origin = "user"
         session_id = "provider-session"
 
-        def run_conversation(self, *_args, **_kwargs):
+        def run_conversation(self, *_args, turn_origin=None, **_kwargs):
+            self._cache_turn_origin = turn_origin
             _ingest_successful_provider_usage(self, usage, first_call=True)
             return {
                 "final_response": "reply",
                 "messages": [{"role": "assistant", "content": "reply"}],
+                "completion_delivery_status": "committed",
             }
 
     class _ImmediateThread:
@@ -18958,6 +18964,7 @@ def test_prompt_submit_walks_provider_cache_usage_to_status_and_completion(
         monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
         monkeypatch.setattr(server, "_get_usage", lambda _agent: {})
         monkeypatch.setattr(server, "render_message", lambda _text, _cols: "")
+        monkeypatch.setattr(server, "_finish_completion_claim", lambda *_args: True)
         monkeypatch.setattr(
             server,
             "_emit",
@@ -18965,13 +18972,19 @@ def test_prompt_submit_walks_provider_cache_usage_to_status_and_completion(
                 (event_type, event_sid, payload)
             ),
         )
+        callback_args = []
+        callback = getattr(agent, "_tui_cache_callback")
 
-        server.handle_request(
-            {
-                "id": "cache-walk",
-                "method": "prompt.submit",
-                "params": {"session_id": sid, "text": "hi"},
-            }
+        def capture_callback(state, pct, read, prompt, record):
+            callback_args.append((state, pct, read, prompt, record))
+            callback(state, pct, read, prompt, record)
+
+        setattr(agent, "_tui_cache_callback", capture_callback)
+        server._dispatch_completion_batch(
+            sid,
+            server._sessions[sid],
+            [{"evt": {"type": event_type}, "claim": "claim", "text": "wake"}],
+            consumer="test",
         )
     finally:
         session = server._sessions.pop(sid, None)
@@ -18981,6 +18994,14 @@ def test_prompt_submit_walks_provider_cache_usage_to_status_and_completion(
     assert status[-1]["text"] == status_text
     assert status[-1]["cache_record"]["state"] == ("no_field" if state == "unavailable" else state)
     assert "content" not in repr(session["first_provider_response"])
+    assert agent._cache_turn_origin == origin
+    assert len(callback_args) == 1
+    assert callback_args[0][:4] == (
+        "no_field" if state == "unavailable" else state,
+        None if state == "miss" else final_pct,
+        usage.get("cache_read_tokens", 0),
+        2_000,
+    )
     assert complete[-1]["cache_info"] == {
         "read_tokens": usage.get("cache_read_tokens", 0),
         "prompt_tokens": 2_000,

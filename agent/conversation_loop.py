@@ -112,9 +112,11 @@ from utils import base_url_host_matches, env_var_enabled
 logger = logging.getLogger(__name__)
 
 
-def _ingest_successful_provider_usage(agent, usage: dict, *, first_call: bool) -> bool:
-    """Store usage and emit content-free cache records for this provider response."""
-    agent._last_turn_usage = dict(usage)
+def _ingest_successful_provider_usage(
+    agent, usage: dict, *, first_call: bool, accounting_usage: dict | None = None
+) -> bool:
+    """Store accounting usage and emit display cache records for one provider response."""
+    agent._last_turn_usage = dict(accounting_usage if accounting_usage is not None else usage)
     post_compression = bool(
         getattr(agent, "_awaiting_cache_usage_after_compression", False)
     )
@@ -3913,7 +3915,10 @@ def run_conversation(
                         "reasoning_tokens": aggregator_usage.reasoning_tokens,
                     }
                     post_compression_cache = _ingest_successful_provider_usage(
-                        agent, display_usage_dict, first_call=api_call_count == 1
+                        agent,
+                        display_usage_dict,
+                        first_call=api_call_count == 1,
+                        accounting_usage=usage_dict,
                     )
                     agent.context_compressor.update_from_response(usage_dict)
                 elif getattr(

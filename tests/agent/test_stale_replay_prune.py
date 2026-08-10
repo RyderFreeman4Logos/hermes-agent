@@ -7,6 +7,8 @@ compaction checkpoints (type="compaction") are exempt because they carry
 already-pruned history, not per-turn reasoning.
 """
 
+import pytest
+
 from agent.context_compressor import (
     _STALE_REPLAY_PRUNE_KEYS,
     _prune_stale_reasoning_replay,
@@ -65,9 +67,51 @@ def test_multi_message_active_turn_chain_is_never_pruned():
         assert messages[idx].get("codex_reasoning_items"), f"active-chain msg {idx} lost its items"
 
 
-def test_compress_keeps_active_chain_before_incomplete_nudge():
-    from agent.context_compressor import ContextCompressor
+@pytest.mark.parametrize(
+    ("continuation_kind", "synthetic_flag", "keeps_active_reasoning"),
+    [
+        pytest.param("codex-incomplete", None, True, id="codex-incomplete"),
+        pytest.param("compression-continuation", None, True, id="compression-continuation"),
+        pytest.param("empty-recovery", "_empty_recovery_synthetic", True, id="empty-recovery"),
+        pytest.param("dropped-toolcall", "_dropped_toolcall_nudge", True, id="dropped-toolcall"),
+        pytest.param("verification-stop", "_verification_stop_synthetic", True, id="verification-stop"),
+        pytest.param("pre-verify", "_pre_verify_synthetic", True, id="pre-verify"),
+        pytest.param("intent-ack", None, True, id="intent-ack"),
+        pytest.param("new-human-turn", None, False, id="new-human-turn"),
+    ],
+)
+def test_compress_uses_real_user_boundary_for_synthetic_continuations(
+    continuation_kind, synthetic_flag, keeps_active_reasoning
+):
+    from agent.context_compressor import (
+        COMPRESSION_CONTINUATION_USER_CONTENT,
+        ContextCompressor,
+    )
     from agent.conversation_loop import _CODEX_INCOMPLETE_NUDGE
+
+    continuation_content = {
+        "codex-incomplete": _CODEX_INCOMPLETE_NUDGE,
+        "compression-continuation": COMPRESSION_CONTINUATION_USER_CONTENT,
+        "empty-recovery": (
+            "You just executed tool calls but returned an empty response. Please "
+            "process the tool results above and continue with the task."
+        ),
+        "dropped-toolcall": (
+            "Your previous turn indicated a tool call but none was included. Do "
+            "not narrate a plan or restate intent — issue the actual tool call now "
+            "to continue the task."
+        ),
+        "verification-stop": "[System: Run the required verification before finishing.]",
+        "pre-verify": "[System: Run the configured pre-verify hook before finishing.]",
+        "intent-ack": (
+            "[System: Continue now. Execute the required tool calls and only send "
+            "your final answer after completing the task.]"
+        ),
+        "new-human-turn": "Please start a genuinely new user task now.",
+    }[continuation_kind]
+    continuation: dict = {"role": "user", "content": continuation_content}
+    if synthetic_flag:
+        continuation[synthetic_flag] = True
 
     messages: list[dict] = [{"role": "system", "content": "sys"}]
     for i in range(11):
@@ -98,7 +142,7 @@ def test_compress_keeps_active_chain_before_incomplete_nudge():
             "reasoning": "still thinking",
             "codex_reasoning_items": [_reasoning("incomplete")],
         },
-        {"role": "user", "content": _CODEX_INCOMPLETE_NUDGE},
+        continuation,
     ])
     compressor = ContextCompressor(
         model="gpt-test",
@@ -122,8 +166,11 @@ def test_compress_keeps_active_chain_before_incomplete_nudge():
         )
     )
 
-    assert active["codex_reasoning_items"] == [_reasoning("active")]
-    assert any(msg.get("content") == _CODEX_INCOMPLETE_NUDGE for msg in compressed)
+    if keeps_active_reasoning:
+        assert active["codex_reasoning_items"] == [_reasoning("active")]
+    else:
+        assert "codex_reasoning_items" not in active
+    assert any(msg.get("content") == continuation_content for msg in compressed)
 
 
 def test_native_compaction_checkpoints_survive_pruning():

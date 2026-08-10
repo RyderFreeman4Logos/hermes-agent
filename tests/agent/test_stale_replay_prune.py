@@ -65,6 +65,67 @@ def test_multi_message_active_turn_chain_is_never_pruned():
         assert messages[idx].get("codex_reasoning_items"), f"active-chain msg {idx} lost its items"
 
 
+def test_compress_keeps_active_chain_before_incomplete_nudge():
+    from agent.context_compressor import ContextCompressor
+    from agent.conversation_loop import _CODEX_INCOMPLETE_NUDGE
+
+    messages: list[dict] = [{"role": "system", "content": "sys"}]
+    for i in range(11):
+        messages.extend([
+            {"role": "user", "content": f"old {i} " + "u" * 500},
+            {
+                "role": "assistant",
+                "content": f"answer {i} " + "a" * 500,
+                "codex_reasoning_items": [_reasoning(f"old{i}")],
+            },
+        ])
+    messages.extend([
+        {"role": "user", "content": "active task"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "active_call",
+                "type": "function",
+                "function": {"name": "terminal", "arguments": "{}"},
+            }],
+            "codex_reasoning_items": [_reasoning("active")],
+        },
+        {"role": "tool", "tool_call_id": "active_call", "content": "tool result"},
+        {
+            "role": "assistant",
+            "content": "",
+            "reasoning": "still thinking",
+            "codex_reasoning_items": [_reasoning("incomplete")],
+        },
+        {"role": "user", "content": _CODEX_INCOMPLETE_NUDGE},
+    ])
+    compressor = ContextCompressor(
+        model="gpt-test",
+        provider="openai-codex",
+        api_mode="codex_responses",
+        quiet_mode=True,
+        config_context_length=100_000,
+        protect_first_n=3,
+        protect_last_n=8,
+    )
+    compressor.tail_token_budget = 500
+    compressor._generate_summary = lambda *args, **kwargs: "summary"
+
+    compressed = compressor.compress(messages, current_tokens=90_000, force=True)
+    active = next(
+        msg
+        for msg in compressed
+        if any(
+            call.get("id") == "active_call"
+            for call in msg.get("tool_calls", [])
+        )
+    )
+
+    assert active["codex_reasoning_items"] == [_reasoning("active")]
+    assert any(msg.get("content") == _CODEX_INCOMPLETE_NUDGE for msg in compressed)
+
+
 def test_native_compaction_checkpoints_survive_pruning():
     """type="compaction" items are cumulative context carriers — they must
     survive on stale messages even when reasoning items are stripped."""

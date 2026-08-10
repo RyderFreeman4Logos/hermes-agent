@@ -894,6 +894,12 @@ class AIAgent:
 
     def switch_model(self, new_model, new_provider, api_key='', base_url='', api_mode=''):
         """Forwarder — see ``agent.agent_runtime_helpers.switch_model``."""
+        try:
+            from tools.runtime_heartbeat import runtime_heartbeat
+
+            runtime_heartbeat.cancel_session(self)
+        except Exception:
+            logger.debug("session heartbeat model-switch cancel failed", exc_info=True)
         from agent.agent_runtime_helpers import switch_model
         return switch_model(self, new_model, new_provider, api_key, base_url, api_mode)
 
@@ -7502,6 +7508,12 @@ class AIAgent:
         auto-compress abort.  Auto-compress callers use the default
         ``force=False``.
         """
+        try:
+            from tools.runtime_heartbeat import runtime_heartbeat
+
+            runtime_heartbeat.cancel_session(self)
+        except Exception:
+            logger.debug("session heartbeat compression cancel failed", exc_info=True)
         from agent.conversation_compression import (
             CompressionCommitFence,
             compress_context,
@@ -7986,6 +7998,12 @@ class AIAgent:
                 moa_config=moa_config,
                 heartbeat_event=heartbeat_event,
             )
+        try:
+            from tools.runtime_heartbeat import runtime_heartbeat
+
+            runtime_heartbeat.cancel_session(self)
+        except Exception:
+            logger.debug("session heartbeat cancel failed", exc_info=True)
         if getattr(self, "_completion_delivery_commit_failed", False):
             from agent.message_sanitization import (
                 durable_messages_before_pending_completion,
@@ -8202,6 +8220,12 @@ class AIAgent:
             if task_started:
                 task_finished = True
                 finish_task_run(**task_context, result=result)
+            try:
+                from tools.runtime_heartbeat import runtime_heartbeat
+
+                runtime_heartbeat.arm_session_after_turn(self, result)
+            except Exception:
+                logger.debug("session heartbeat arm failed", exc_info=True)
             return result
         except BaseException as exc:
             if isinstance(exc, (KeyboardInterrupt, InterruptedError)) or (

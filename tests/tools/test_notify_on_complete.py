@@ -147,6 +147,17 @@ class TestCheckpointNotify:
             assert data[0]["notify_on_complete"] is True
 
 
+    def test_checkpoint_includes_delegated_child(self, registry, tmp_path):
+        with patch("tools.process_registry.CHECKPOINT_PATH", tmp_path / "procs.json"):
+            session = _make_session(notify_on_complete=True)
+            session.delegated_child = True
+            registry._running[session.id] = session
+            registry._write_checkpoint()
+
+            data = json.loads((tmp_path / "procs.json").read_text())
+            assert data[0]["delegated_child"] is True
+
+
     def test_recover_without_process_identity_is_refused(self, registry, tmp_path):
         """Old checkpoint entries cannot safely prove PID ownership."""
         checkpoint = tmp_path / "procs.json"

@@ -1771,6 +1771,18 @@ def _visibility_config():
     return {"auxiliary": {"completion_visibility": {"enabled": True}}}
 
 
+def test_delegated_child_success_is_silenced_before_parent_delivery():
+    assert completion_delivery_prompt(
+        _completion_event(delegated_child=True), "payload"
+    ) is None
+
+
+def test_delegated_child_failure_still_reaches_parent_delivery():
+    assert completion_delivery_prompt(
+        _completion_event(delegated_child=True, exit_code=1), "payload"
+    ) is not None
+
+
 def test_completion_visibility_explicit_false_skips_delivery(monkeypatch):
     from types import SimpleNamespace
 

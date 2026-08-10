@@ -3314,6 +3314,12 @@ def terminal_tool(
                     "notify_on_complete": bool(notify_on_complete),
                     "watch_patterns": list(watch_patterns or []),
                 }
+                if notification_requested:
+                    from agent.delegation_context import is_delegated_child_context
+
+                    notification_metadata["delegated_child"] = (
+                        is_delegated_child_context()
+                    )
 
                 if notify_on_complete or watch_patterns:
                     from gateway.session_context import (

@@ -940,6 +940,73 @@ def test_gateway_watcher_silences_delegated_success_and_commits_lifecycle(
     assert receipt["delivery_state"] == "delivered"
 
 
+@pytest.mark.parametrize("missing_key", ["termination_source", "session_id"])
+def test_gateway_watcher_delivers_incomplete_delegated_completion_and_preserves_recovery(
+    monkeypatch, isolated_registry, missing_key
+):
+    """The real watcher must fail open when its canonical envelope is incomplete."""
+    import tools.process_registry as registry_module
+    from tools import async_delegation as ad
+
+    process = ProcessSession(
+        id=f"proc-gateway-incomplete-{missing_key}",
+        command="true",
+        task_id="task",
+        session_key="agent:main:telegram:dm:123",
+        started_at=6.1,
+        output_buffer="done\n",
+        exited=True,
+        exit_code=0,
+        completion_reason="exited",
+        notify_on_complete=True,
+        delegated_child=True,
+    )
+    isolated_registry._finished[process.id] = process
+    canonical_event = isolated_registry._completion_event
+
+    def incomplete_event(session):
+        event = canonical_event(session)
+        event.pop(missing_key)
+        return event
+
+    monkeypatch.setattr(isolated_registry, "_completion_event", incomplete_event)
+    monkeypatch.setattr(registry_module, "process_registry", isolated_registry)
+
+    async def _instant_sleep(*_args, **_kwargs):
+        pass
+
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+
+    asyncio.run(runner._run_process_watcher({
+        "session_id": process.id,
+        "check_interval": 0,
+        "session_key": process.session_key,
+        "platform": "telegram",
+        "chat_type": "dm",
+        "chat_id": "123",
+        "notify_on_complete": True,
+    }))
+
+    adapter.handle_message.assert_awaited_once()
+    event = incomplete_event(process)
+    receipt = ad.get_durable_event_delivery(event)
+    if missing_key == "termination_source":
+        assert receipt is not None
+        assert receipt["delivery_state"] == "effect_started"
+        delivered_event = adapter.handle_message.await_args.args[0]
+        asyncio.run(runner._finish_completion_delivery_receipt(
+            delivered_event, "committed"
+        ))
+        receipt = ad.get_durable_event_delivery(event)
+        assert receipt is not None
+        assert receipt["delivery_state"] == "delivered"
+    else:
+        assert receipt is None
+    assert isolated_registry.completion_queue.empty()
+
+
 def test_failed_process_injection_releases_lifecycle_claim(monkeypatch):
     adapter = SimpleNamespace(handle_message=AsyncMock())
     runner = _runner(adapter)

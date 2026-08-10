@@ -1759,8 +1759,11 @@ def _completion_event(**overrides):
         "type": "completion",
         "session_id": "proc_visibility",
         "session_key": "session-a",
+        "started_at": 1.0,
         "command": "safe-test-command",
         "exit_code": 0,
+        "completion_reason": "exited",
+        "termination_source": "",
         "output": "done",
     }
     event.update(overrides)
@@ -1787,6 +1790,7 @@ def test_delegated_child_failure_still_reaches_parent_delivery():
     ("overrides", "removed", "suppressed"),
     [
         ({"completion_reason": "exited"}, (), True),
+        ({"completion_reason": "exited", "session_key": ""}, (), True),
         ({"completion_reason": "killed"}, (), False),
         ({"exit_code": False, "completion_reason": "exited"}, (), False),
         ({"completion_reason": "failed_start"}, (), False),
@@ -1803,6 +1807,18 @@ def test_delegated_child_failure_still_reaches_parent_delivery():
         ({"completion_reason": "exited", "failed": True}, (), False),
         ({"completion_reason": "exited", "lost": True}, (), False),
         ({"completion_reason": "exited", "canceled": True}, (), False),
+        ({}, ("termination_source",), False),
+        ({"termination_source": None}, (), False),
+        ({"termination_source": False}, (), False),
+        ({"termination_source": 0}, (), False),
+        ({}, ("session_id",), False),
+        ({"session_id": ""}, (), False),
+        ({"session_id": 1}, (), False),
+        ({}, ("session_key",), False),
+        ({"session_key": 1}, (), False),
+        ({}, ("started_at",), False),
+        ({"started_at": True}, (), False),
+        ({"started_at": 0}, (), False),
     ],
 )
 def test_delegated_child_suppression_requires_closed_completion_envelope(

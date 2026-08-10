@@ -1007,6 +1007,114 @@ def test_gateway_watcher_delivers_incomplete_delegated_completion_and_preserves_
     assert isolated_registry.completion_queue.empty()
 
 
+def _run_malformed_producer_through_both_gateway_watchers(
+    monkeypatch, isolated_registry, mutate_event
+):
+    """Return one producer event after both competing consumers settle it."""
+    import tools.process_registry as registry_module
+
+    process = ProcessSession(
+        id="proc-gateway-malformed-producer",
+        command="true",
+        task_id="task",
+        session_key="agent:main:telegram:dm:123",
+        started_at=6.2,
+        output_buffer="done\n",
+        exited=True,
+        exit_code=0,
+        completion_reason="exited",
+        notify_on_complete=True,
+        delegated_child=True,
+    )
+    canonical_event = isolated_registry._completion_event
+
+    def malformed_event(session):
+        event = canonical_event(session)
+        mutate_event(event)
+        return event
+
+    monkeypatch.setattr(isolated_registry, "_completion_event", malformed_event)
+    monkeypatch.setattr(registry_module, "process_registry", isolated_registry)
+    isolated_registry._running[process.id] = process
+    isolated_registry._move_to_finished(process)
+    queued_event = isolated_registry.completion_queue.get_nowait()
+    isolated_registry.completion_queue.put(queued_event)
+
+    async def _instant_sleep(*_args, **_kwargs):
+        pass
+
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    asyncio.run(runner._run_process_watcher({
+        "session_id": process.id,
+        "check_interval": 0,
+        "session_key": process.session_key,
+        "platform": "telegram",
+        "chat_type": "dm",
+        "chat_id": "123",
+        "notify_on_complete": True,
+    }))
+    if adapter.handle_message.await_count:
+        asyncio.run(runner._finish_completion_delivery_receipt(
+            adapter.handle_message.await_args.args[0], "committed"
+        ))
+
+    asyncio.run(_run_gateway_completion_queue(
+        monkeypatch, runner, isolated_registry
+    ))
+    return queued_event, adapter
+
+
+@pytest.mark.parametrize(
+    "started_at",
+    [float("nan"), float("inf"), float("-inf")],
+    ids=["nan", "positive-infinity", "negative-infinity"],
+)
+def test_nonfinite_completion_fails_open_once_without_durable_identity(
+    monkeypatch, isolated_registry, started_at
+):
+    from tools import async_delegation as ad
+
+    event, adapter = _run_malformed_producer_through_both_gateway_watchers(
+        monkeypatch,
+        isolated_registry,
+        lambda candidate: candidate.__setitem__("started_at", started_at),
+    )
+
+    adapter.handle_message.assert_awaited_once()
+    assert ad.get_durable_event_delivery(event) is None
+    assert not isolated_registry.completion_event_should_deliver(event)
+    assert isolated_registry.completion_queue.empty()
+    restarted = ProcessRegistry()
+    assert restarted.recover_from_checkpoint() == 0
+    assert restarted.completion_queue.empty()
+
+
+def test_missing_session_completion_fails_open_once_without_durable_identity(
+    monkeypatch, isolated_registry
+):
+    from tools import async_delegation as ad
+
+    event, adapter = _run_malformed_producer_through_both_gateway_watchers(
+        monkeypatch,
+        isolated_registry,
+        lambda candidate: candidate.pop("session_id"),
+    )
+
+    adapter.handle_message.assert_awaited_once()
+    assert ad.get_durable_event_delivery(event) is None
+    assert not isolated_registry.completion_event_should_deliver(event)
+    assert isolated_registry.completion_queue.empty()
+    token = event["_completion_delivery_token"]
+    delivered_event = adapter.handle_message.await_args.args[0]
+    assert token not in delivered_event.text
+    assert token not in str(delivered_event.metadata)
+    restarted = ProcessRegistry()
+    assert restarted.recover_from_checkpoint() == 0
+    assert restarted.completion_queue.empty()
+
+
 def test_failed_process_injection_releases_lifecycle_claim(monkeypatch):
     adapter = SimpleNamespace(handle_message=AsyncMock())
     runner = _runner(adapter)

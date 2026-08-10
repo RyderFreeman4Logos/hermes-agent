@@ -22426,6 +22426,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         key: value
                         for key, value in evt.items()
                         if not key.startswith("_completion_delivery_")
+                        or key == "_completion_delivery_token"
                     },
                     "claim_id": delivery_claim_id,
                 }

@@ -437,6 +437,37 @@ def test_ordinary_completion_claim_restores_after_restart(monkeypatch, tmp_path)
     assert receipt["delivery_claim"] is None
 
 
+@pytest.mark.parametrize(
+    "started_at",
+    [float("nan"), float("inf"), float("-inf")],
+    ids=["nan", "positive-infinity", "negative-infinity"],
+)
+def test_ordinary_completion_identity_rejects_nonfinite_started_at(started_at):
+    from tools import async_delegation as ad
+
+    event = {
+        "type": "completion",
+        "session_id": "proc-nonfinite",
+        "session_key": "active",
+        "started_at": started_at,
+    }
+
+    assert ad._ordinary_completion_delivery_id(event) is None
+
+
+def test_ordinary_completion_identity_preserves_large_integer_started_at():
+    from tools import async_delegation as ad
+
+    event = {
+        "type": "completion",
+        "session_id": "proc-large-integer",
+        "session_key": "active",
+        "started_at": 10**1000,
+    }
+
+    assert ad._ordinary_completion_delivery_id(event) is not None
+
+
 def test_process_completion_is_durable_before_checkpoint_and_queue(
     monkeypatch, tmp_path
 ):
@@ -472,9 +503,11 @@ def test_process_completion_is_durable_before_checkpoint_and_queue(
 
     assert order == ["persist", "checkpoint"]
     event = registry.completion_queue.get_nowait()
+    assert event["_completion_delivery_token"]
     receipt = ad.get_durable_event_delivery(event)
     assert receipt is not None
     assert receipt["delivery_state"] == "pending"
+    assert "_completion_delivery_token" not in receipt["event"]
 
 
 def test_process_completion_persist_failure_recovers_after_restart(
@@ -522,6 +555,7 @@ def test_process_completion_persist_failure_recovers_after_restart(
     assert restarted.recover_from_checkpoint() == 0
     restored = restarted.completion_queue.get_nowait()
     assert restored["session_id"] == process.id
+    assert "_completion_delivery_token" not in restored
     assert restarted.completion_queue.empty()
     receipt = ad.get_durable_event_delivery(restored)
     assert receipt is not None

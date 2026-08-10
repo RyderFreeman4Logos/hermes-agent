@@ -32,6 +32,7 @@ Usage:
 import codecs
 import json
 import logging
+import math
 import os
 import platform
 import shlex
@@ -172,6 +173,9 @@ class ProcessSession:
     _completion_supervisor_started: bool = field(default=False, repr=False)
     _subreaper_managed: bool = field(default=False, repr=False)
     _termination_in_progress: bool = field(default=False, repr=False)
+    _completion_delivery_token: str = field(
+        default_factory=lambda: uuid.uuid4().hex, repr=False
+    )
 
 
 def arm_process_heartbeat(
@@ -1819,7 +1823,11 @@ class ProcessRegistry:
             identity = self._completion_identity(event)
             if identity is not None:
                 with self._lock:
-                    self._terminal_completion_spool[identity] = dict(event)
+                    self._terminal_completion_spool[identity] = {
+                        key: value
+                        for key, value in event.items()
+                        if key != "_completion_delivery_token"
+                    }
             logger.warning(
                 "Keeping terminal process checkpoint for %s until completion "
                 "delivery can be persisted",
@@ -1828,7 +1836,7 @@ class ProcessRegistry:
         self._write_checkpoint()
 
         if event is not None:
-            identity = self._completion_identity(event)
+            identity = self._completion_claim_identity(event)
             if identity is not None:
                 with self._completion_disposition_lock:
                     state = self._completion_dispositions.get(identity)
@@ -1855,7 +1863,7 @@ class ProcessRegistry:
             if session.output_buffer
             else ""
         )
-        return {
+        event = {
             "type": "completion",
             "session_id": session.id,
             "session_key": session.session_key,
@@ -1869,6 +1877,9 @@ class ProcessRegistry:
             "started_at": session.started_at,
             "delegated_child": session.delegated_child,
         }
+        if session.notify_on_complete:
+            event["_completion_delivery_token"] = session._completion_delivery_token
+        return event
 
     @staticmethod
     def _checkpoint_completion_event(entry: dict) -> dict:
@@ -1898,10 +1909,22 @@ class ProcessRegistry:
             or not isinstance(session_key, str)
             or isinstance(started_at, bool)
             or not isinstance(started_at, (int, float))
+            or (isinstance(started_at, float) and not math.isfinite(started_at))
             or started_at <= 0
         ):
             return None
         return ("completion", session_id, started_at, session_key)
+
+    @staticmethod
+    def _completion_claim_identity(evt: dict) -> "tuple | None":
+        """Return a durable identity or a producer-local arbitration token."""
+        identity = ProcessRegistry._completion_identity(evt)
+        if identity is not None:
+            return identity
+        token = evt.get("_completion_delivery_token")
+        if isinstance(token, str) and token:
+            return ("completion-local", token)
+        return None
 
     @staticmethod
     def _is_normal_completion_success(evt: dict) -> bool:
@@ -2017,7 +2040,7 @@ class ProcessRegistry:
 
     def completion_event_should_deliver(self, evt: dict) -> bool:
         """Fail open except for an observed no-op or claimed/delivered identity."""
-        identity = self._completion_identity(evt)
+        identity = self._completion_claim_identity(evt)
         if identity is None:
             return True
         with self._completion_disposition_lock:
@@ -2031,7 +2054,7 @@ class ProcessRegistry:
 
     def claim_completion_delivery(self, evt: dict) -> bool:
         """Atomically claim an ordinary completion; unknown identities fail open."""
-        identity = self._completion_identity(evt)
+        identity = self._completion_claim_identity(evt)
         if identity is None:
             return True
         with self._completion_disposition_lock:
@@ -2056,14 +2079,14 @@ class ProcessRegistry:
             self._write_checkpoint()
 
     def complete_completion_delivery(self, evt: dict) -> None:
-        identity = self._completion_identity(evt)
+        identity = self._completion_claim_identity(evt)
         if identity is not None:
             with self._completion_disposition_lock:
                 self._set_completion_disposition(identity, "delivered")
             self._retire_terminal_completion_spool(evt)
 
     def release_completion_delivery(self, evt: dict) -> None:
-        identity = self._completion_identity(evt)
+        identity = self._completion_claim_identity(evt)
         if identity is not None:
             with self._completion_disposition_lock:
                 state = self._completion_dispositions.get(identity)

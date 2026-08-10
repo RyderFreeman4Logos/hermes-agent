@@ -1400,6 +1400,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     # Accumulate streamed text so callers / compat shims can read it.
     agent._codex_streamed_text_parts: list = []
     diagnostic_attempt = {"value": None, "finished": False}
+    partial_tool_call = {"seen": False}
 
     def _lifecycle_cancelled() -> bool:
         if not isinstance(diagnostic_lifecycle, dict):
@@ -1424,6 +1425,9 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     def _on_event(event: Any) -> None:
         if _lifecycle_cancelled():
             return
+        event_type = str(_event_field(event, "type", ""))
+        item_type = str(_item_field(_event_field(event, "item"), "type", ""))
+        partial_tool_call["seen"] |= "_call" in event_type or "_call" in item_type
         # TTFB watchdog and activity touch — runs once per SSE event.
         physical_attempt_diagnostics.mark_wire_event(diagnostic_attempt["value"])
         agent._codex_stream_last_event_ts = time.time()
@@ -1445,6 +1449,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             raise InterruptedError("Agent interrupted before Codex stream retry")
 
         intercepted_events = []
+        partial_tool_call["seen"] = False
         writer_token: dict[str, int | None] = {"value": None}
         diagnostic_attempt = {"value": None, "finished": False}
 
@@ -1518,6 +1523,16 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 model=api_kwargs.get("model"),
             )
 
+        def _stream_has_partial_tool_call() -> bool:
+            if partial_tool_call["seen"]:
+                return True
+            for event in intercepted_events:
+                event_type = str(_event_field(event, "type", ""))
+                item_type = str(_item_field(_event_field(event, "item"), "type", ""))
+                if "_call" in event_type or "_call" in item_type:
+                    return True
+            return False
+
         try:
             event_stream = relay_llm.stream(
                 dict(relay_api_kwargs),
@@ -1573,6 +1588,11 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             )
             _finish_diagnostic(None, "error")
             setattr(exc, "_hermes_ambiguous_provider_acceptance", True)
+            setattr(
+                exc,
+                "_hermes_ambiguous_partial_tool_call",
+                _stream_has_partial_tool_call(),
+            )
             logger.warning(
                 "Codex Responses transport failure may follow provider acceptance; "
                 "not replaying a fresh request. phase=dispatch attempt=%s/%s "
@@ -1634,6 +1654,11 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 )
                 _finish_diagnostic(None, "error")
                 setattr(exc, "_hermes_ambiguous_provider_acceptance", True)
+                setattr(
+                    exc,
+                    "_hermes_ambiguous_partial_tool_call",
+                    _stream_has_partial_tool_call(),
+                )
                 logger.warning(
                     "Codex Responses stream transport failed after dispatch; "
                     "not replaying a fresh request. attempt=%s/%s "
@@ -1665,6 +1690,11 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     action="halt",
                 )
                 setattr(exc, "_hermes_ambiguous_provider_acceptance", True)
+                setattr(
+                    exc,
+                    "_hermes_ambiguous_partial_tool_call",
+                    _stream_has_partial_tool_call(),
+                )
                 _finish_diagnostic(None, "error")
                 raise
 

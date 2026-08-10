@@ -1042,9 +1042,11 @@ def test_run_codex_stream_returns_terminal_response_when_post_terminal_drain_fai
 
 
 @pytest.mark.parametrize("transport_error_name", ["ReadError", "WriteError"])
+@pytest.mark.parametrize("partial_tool_event", [False, True], ids=["no-tool", "partial-tool"])
 def test_run_codex_stream_marks_post_dispatch_transport_error_ambiguous(
     monkeypatch,
     transport_error_name,
+    partial_tool_event,
 ):
     import httpx
 
@@ -1065,7 +1067,14 @@ def test_run_codex_stream_marks_post_dispatch_transport_error_ambiguous(
 
     class ReadDroppingStream:
         def __iter__(self):
-            yield SimpleNamespace(type="response.created")
+            yield (
+                SimpleNamespace(
+                    type="response.output_item.added",
+                    item=SimpleNamespace(type="function_call"),
+                )
+                if partial_tool_event
+                else SimpleNamespace(type="response.created")
+            )
             raise transport_error
 
         def close(self):
@@ -1109,6 +1118,11 @@ def test_run_codex_stream_marks_post_dispatch_transport_error_ambiguous(
         "_hermes_ambiguous_provider_acceptance",
         False,
     ) is True
+    assert getattr(
+        transport_error,
+        "_hermes_ambiguous_partial_tool_call",
+        False,
+    ) is partial_tool_event
     assert len(create_calls) == 1
     assert phases == [
         ("ambiguity", token, {"failure_class": "transport"}),
@@ -2223,12 +2237,17 @@ def test_codex_late_tool_call_keeps_one_post_tool_model_call(monkeypatch):
     assert result["final_response"] == "Finished after the tool"
 
 
-def test_codex_ambiguous_post_accept_failure_is_not_replayed(monkeypatch, tmp_path):
-    """Ambiguity durably closes the turn before an unrelated next message."""
+@pytest.mark.parametrize("delegated", [False, True], ids=["main", "delegated"])
+def test_codex_ambiguous_post_accept_uses_one_checkpoint_continuation(
+    monkeypatch, tmp_path, delegated
+):
+    """A fresh marked continuation advances the same durable turn exactly once."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     from hermes_state import SessionDB
 
     agent = _build_agent(monkeypatch)
+    agent.is_subagent = delegated
+    agent._delegate_depth = int(delegated)
     monkeypatch.setattr(
         agent,
         "_persist_session",
@@ -2236,50 +2255,114 @@ def test_codex_ambiguous_post_accept_failure_is_not_replayed(monkeypatch, tmp_pa
     )
     agent._session_db = SessionDB()
     agent._ensure_db_session()
-    calls = []
+    requests = []
     ambiguous = RuntimeError("stream ended after dispatch")
     ambiguous._hermes_ambiguous_provider_acceptance = True
 
-    def _fake_api_call(_kwargs):
-        calls.append(None)
-        if len(calls) == 1:
+    def _fake_api_call(api_kwargs):
+        requests.append(api_kwargs)
+        if len(requests) == 1:
             raise ambiguous
-        return _codex_message_response("This must not be requested")
+        return _codex_message_response("Recovered without replay")
 
     monkeypatch.setattr(agent, "_interruptible_api_call", _fake_api_call)
 
     result = agent.run_conversation("do not replay an ambiguous request")
 
-    assert len(calls) == 1
+    assert len(requests) == 2
+    assert result["api_calls"] == 2
+    assert result["completed"] is True
+    assert result["final_response"] == "Recovered without replay"
+    assert requests[0]["input"] != requests[1]["input"]
+    recovery_wire = repr(requests[1]["input"])
+    assert "one fresh continuation, not a replay" in recovery_wire
+    assert "Do not repeat completed work or actions" in recovery_wire
+    assert "verify uncertain external effects before any side effect" in recovery_wire
+    persisted = agent._session_db.get_messages(agent.session_id)
+    assert persisted[-1]["content"] == "Recovered without replay"
+    assert "fresh continuation" not in repr(persisted)
+
+
+def test_ambiguous_checkpoint_preserves_tool_result_without_duplicate_effect(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    requests = []
+    tool_effects = []
+    ambiguous = RuntimeError("stream ended after dispatch")
+    ambiguous._hermes_ambiguous_provider_acceptance = True
+
+    def _fake_api_call(api_kwargs):
+        requests.append(api_kwargs)
+        if len(requests) == 1:
+            return _codex_tool_call_response()
+        if len(requests) == 2:
+            raise ambiguous
+        return _codex_message_response("Finished from checkpoint")
+
+    def _fake_execute_tool_calls(assistant_message, messages, _task_id, *_args):
+        for call in assistant_message.tool_calls:
+            tool_effects.append(call.id)
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "content": '{"ok":true,"effect":"once"}',
+                }
+            )
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _fake_api_call)
+    monkeypatch.setattr(agent, "_execute_tool_calls", _fake_execute_tool_calls)
+
+    result = agent.run_conversation("run one tool, then finish")
+
+    assert len(requests) == 3
+    assert result["api_calls"] == 3
+    assert result["completed"] is True
+    assert tool_effects == ["call_1"]
+    recovery_wire = repr(requests[2]["input"])
+    assert "effect" in recovery_wire and "once" in recovery_wire
+    assert "Do not repeat completed work or actions" in recovery_wire
+    assert [message["role"] for message in result["messages"]][-2:] == [
+        "tool",
+        "assistant",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("unsafe_partial_tool", "expected_calls"),
+    [(False, 2), (True, 1)],
+    ids=["second-ambiguity", "partial-tool-boundary"],
+)
+def test_ambiguous_checkpoint_is_bounded_and_rejects_partial_tool_boundary(
+    monkeypatch, unsafe_partial_tool, expected_calls
+):
+    agent = _build_agent(monkeypatch)
+    requests = []
+    first = RuntimeError("first ambiguous dispatch")
+    first._hermes_ambiguous_provider_acceptance = True
+    if unsafe_partial_tool:
+        first._hermes_ambiguous_partial_tool_call = True
+    second = RuntimeError("second ambiguous dispatch")
+    second._hermes_ambiguous_provider_acceptance = True
+
+    def _fake_api_call(api_kwargs):
+        requests.append(api_kwargs)
+        if len(requests) == 1:
+            raise first
+        if len(requests) == 2:
+            raise second
+        return _codex_message_response("must not dispatch")
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _fake_api_call)
+
+    result = agent.run_conversation("stop recovery at the safety boundary")
+
+    assert len(requests) == expected_calls
+    assert result["api_calls"] == expected_calls
     assert result["completed"] is False
     assert result["partial"] is True
     assert result["ambiguous_provider_attempt"] is True
-    assert result["messages"][-1]["role"] == "assistant"
+    assert result["turn_exit_reason"] == "ambiguous_provider_attempt"
     assert result["messages"][-1]["finish_reason"] == "ambiguous_provider_attempt"
-    persisted = agent._session_db.get_messages(agent.session_id)
-    assert persisted[-1]["role"] == "assistant"
-    assert persisted[-1]["finish_reason"] == "ambiguous_provider_attempt"
-
-    next_requests = []
-
-    def _next_call(api_kwargs):
-        next_requests.append(api_kwargs)
-        return _codex_message_response("Answered the unrelated turn")
-
-    monkeypatch.setattr(agent, "_interruptible_api_call", _next_call)
-    second = agent.run_conversation(
-        "unrelated new question",
-        conversation_history=persisted,
-    )
-
-    assert second["completed"] is True
-    assert len(next_requests) == 1
-    user_items = [
-        item
-        for item in next_requests[0]["input"]
-        if isinstance(item, dict) and item.get("role") == "user"
-    ]
-    assert user_items[-1]["content"] == "unrelated new question"
 
 
 def test_codex_unreplayable_incomplete_backs_off_without_ending_turn(monkeypatch):

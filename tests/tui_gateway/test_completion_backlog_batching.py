@@ -406,6 +406,46 @@ def test_idle_batch_provider_failure_restores_one_ordered_retry_unit(
     ]
 
 
+def test_idle_batch_retries_transient_requeue_exception_without_drop(
+    isolated_registry, monkeypatch
+):
+    from tools import async_delegation as ad
+
+    registry = isolated_registry
+    event = _completion_event("proc-requeue-outage", started_at=4.0)
+    assert ad.persist_event_delivery(event)
+    registry.completion_queue.put(event)
+    selected = registry.completion_queue.get_nowait()
+    original_requeue = registry.requeue_completions_front
+    requeue_calls = 0
+
+    def fail_once(events):
+        nonlocal requeue_calls
+        requeue_calls += 1
+        if requeue_calls == 1:
+            raise OSError("requeue unavailable")
+        return original_requeue(events)
+
+    monkeypatch.setattr(registry, "requeue_completions_front", fail_once)
+
+    def submit(_rid, _sid, session, _text, **kwargs):
+        kwargs["completion_delivery_callback"]("provider_failed")
+        session["running"] = False
+
+    monkeypatch.setattr(server, "_run_prompt_submit", submit)
+    server._dispatch_completion_batch(
+        "sid",
+        _session(running=True),
+        [{"evt": selected, "model_text": "completion", "text": "completion"}],
+        consumer="tui-test",
+    )
+
+    assert requeue_calls == 2
+    remaining = registry.completion_queue.get_nowait()
+    assert remaining["session_id"] == event["session_id"]
+    assert registry.completion_queue.empty()
+
+
 def test_shutdown_formatter_error_restores_batch_before_concurrent_tail(
     isolated_registry, monkeypatch
 ):

@@ -528,8 +528,10 @@ def test_process_completion_persist_failure_recovers_after_restart(
     assert receipt["delivery_state"] == "pending"
 
 
-def test_failed_complete_and_release_reuses_live_claim(monkeypatch, tmp_path):
-    """A transient double-write failure keeps authority for same-process retry."""
+def test_committed_effect_complete_exception_never_requeues_provider(
+    monkeypatch, tmp_path
+):
+    """A visible effect becomes ACK-only even when durable completion fails."""
     from tools import async_delegation as ad
     import tools.process_registry as registry_module
 
@@ -538,62 +540,38 @@ def test_failed_complete_and_release_reuses_live_claim(monkeypatch, tmp_path):
     monkeypatch.setattr(registry_module, "process_registry", registry)
     event = {
         "type": "completion",
-        "session_id": "proc-live-claim-retry",
+        "session_id": "proc-committed-ack-only",
         "session_key": "active",
         "started_at": 5.6,
     }
     assert registry.claim_completion_delivery(event)
     claim = ad.claim_event_delivery(event, "tui-test")
     assert claim
-    complete = ad.complete_event_delivery
-    release = ad.release_event_delivery
     monkeypatch.setattr(
         ad,
         "complete_event_delivery",
         lambda *_args: (_ for _ in ()).throw(OSError("complete unavailable")),
     )
-    monkeypatch.setattr(
-        ad,
-        "release_event_delivery",
-        lambda *_args: (_ for _ in ()).throw(OSError("release unavailable")),
-    )
+    release = ad.release_event_delivery
+    releases = []
 
-    assert not registry_module.finish_completion_event_delivery(
+    def record_release(*args):
+        releases.append(args)
+        return release(*args)
+
+    monkeypatch.setattr(ad, "release_event_delivery", record_release)
+
+    assert registry_module.finish_completion_event_delivery(
         event, claim, "committed", registry=registry
     )
     receipt = ad.get_durable_event_delivery(event)
     assert receipt is not None
-    assert receipt["delivery_state"] == "effect_started"
-    retry = registry.completion_queue.get_nowait()
-    assert retry["_completion_delivery_retained_claim_id"] == claim
-
-    monkeypatch.setattr(ad, "complete_event_delivery", complete)
-    monkeypatch.setattr(ad, "release_event_delivery", release)
-    assert registry.claim_completion_delivery(retry)
-    assert ad.claim_event_delivery(retry, "tui-retry") == claim
-    assert registry_module.finish_completion_event_delivery(
-        retry, claim, "committed", registry=registry
-    )
-    receipt = ad.get_durable_event_delivery(event)
-    assert receipt is not None
-    assert receipt["delivery_state"] == "delivered"
-
-    bounded_event = {
-        **event,
-        "session_id": "proc-live-claim-bounded",
-        "started_at": 5.61,
-    }
-    bounded_claim = ad.claim_event_delivery(bounded_event, "tui-test")
-    assert bounded_claim
-    bounded_event["_completion_delivery_retained_claim_id"] = bounded_claim
-    for _ in range(ad._MAX_DELIVERY_ATTEMPTS):
-        if ad.claim_event_delivery(bounded_event, "tui-retry") is None:
-            break
-    else:
-        pytest.fail("retained claim did not converge to a terminal disposition")
-    receipt = ad.get_durable_event_delivery(bounded_event)
-    assert receipt is not None
-    assert receipt["delivery_state"] == "dropped"
+    assert receipt["delivery_state"] == "recovery_committed_ack"
+    assert releases == []
+    assert registry.completion_queue.empty()
+    restored = queue.Queue()
+    assert ad.restore_undelivered_completions(restored) == 0
+    assert restored.empty()
 
 
 @pytest.mark.parametrize("surface", ["busy", "idle"])

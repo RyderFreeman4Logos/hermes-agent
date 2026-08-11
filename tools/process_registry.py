@@ -516,6 +516,31 @@ def arm_process_heartbeat(
     return interval
 
 
+_COMPLETION_QUEUE_OVERFLOW = "_hermes_completion_overflow"
+
+
+def _completion_queue_items(completion_queue) -> "list[dict]":
+    """Return the logical FIFO while the caller holds ``queue.mutex``."""
+    return [
+        *completion_queue.queue,
+        *getattr(completion_queue, _COMPLETION_QUEUE_OVERFLOW, ()),
+    ]
+
+
+def _replace_completion_queue_items(completion_queue, events: "list[dict]") -> None:
+    """Keep a bounded Queue native-sized while retaining its ordered overflow."""
+    physical_limit = (
+        completion_queue.maxsize if completion_queue.maxsize > 0 else len(events)
+    )
+    completion_queue.queue.clear()
+    completion_queue.queue.extend(events[:physical_limit])
+    overflow = events[physical_limit:]
+    if overflow:
+        setattr(completion_queue, _COMPLETION_QUEUE_OVERFLOW, overflow)
+    elif hasattr(completion_queue, _COMPLETION_QUEUE_OVERFLOW):
+        delattr(completion_queue, _COMPLETION_QUEUE_OVERFLOW)
+
+
 def drain_matching_queue_events(completion_queue, predicate) -> "list[dict]":
     """Remove matching events from one stable snapshot without rotating others.
 
@@ -524,11 +549,11 @@ def drain_matching_queue_events(completion_queue, predicate) -> "list[dict]":
     the snapshot's original owner boundaries.
     """
     with completion_queue.mutex:
-        snapshot = tuple(completion_queue.queue)
+        snapshot = tuple(_completion_queue_items(completion_queue))
 
     selected = tuple(bool(predicate(event)) for event in snapshot)
     with completion_queue.not_empty:
-        current = list(completion_queue.queue)
+        current = _completion_queue_items(completion_queue)
         if len(current) < len(snapshot) or any(
             event is not snapshot[index]
             for index, event in enumerate(current[: len(snapshot)])
@@ -543,8 +568,7 @@ def drain_matching_queue_events(completion_queue, predicate) -> "list[dict]":
             event for event, should_drain in zip(snapshot, selected) if not should_drain
         ]
         retained.extend(current[len(snapshot) :])
-        completion_queue.queue.clear()
-        completion_queue.queue.extend(retained)
+        _replace_completion_queue_items(completion_queue, retained)
         completion_queue.not_full.notify_all()
         return drained
 
@@ -2542,14 +2566,18 @@ class ProcessRegistry:
 
         while True:
             with completion_queue.mutex:
-                snapshot = tuple(completion_queue.queue)
+                snapshot = tuple(_completion_queue_items(completion_queue))
 
             candidate = next((evt for evt in snapshot if owns_event(evt)), None)
             if candidate is not None:
                 with completion_queue.not_empty:
-                    for index, current in enumerate(completion_queue.queue):
+                    current_events = _completion_queue_items(completion_queue)
+                    for index, current in enumerate(current_events):
                         if current is candidate:
-                            del completion_queue.queue[index]
+                            del current_events[index]
+                            _replace_completion_queue_items(
+                                completion_queue, current_events
+                            )
                             completion_queue.not_full.notify()
                             return candidate
                 continue
@@ -2562,7 +2590,7 @@ class ProcessRegistry:
                 remaining = None
 
             with completion_queue.not_empty:
-                current = tuple(completion_queue.queue)
+                current = tuple(_completion_queue_items(completion_queue))
                 if len(current) != len(snapshot) or any(
                     left is not right for left, right in zip(current, snapshot)
                 ):
@@ -2575,16 +2603,20 @@ class ProcessRegistry:
 
     def requeue_completions_front(self, events: "list[Dict[str, Any]]") -> None:
         """Atomically restore detached work ahead of a concurrent producer tail."""
+        self._requeue_completions_front(events)
+
+    def _requeue_completions_front(self, events: "list[Dict[str, Any]]") -> None:
+        """Atomically restore detached work ahead of a concurrent producer tail."""
         if not events:
             return
         completion_queue = self.completion_queue
-        # Detached events already count in unfinished_tasks. A producer may
-        # consume their freed capacity before rollback, so waiting for maxsize
-        # here can deadlock the sole consumer. Restore without a second put;
-        # normal get() calls wake blocked producers as the queue drops below its
-        # bound again.
+        # A producer may consume detached slots before rollback. Keep the native
+        # Queue bounded and retain the ordered tail alongside it; every selective
+        # completion consumer reads the combined logical FIFO.
         with completion_queue.not_empty:
-            completion_queue.queue.extendleft(reversed(events))
+            restored = list(events)
+            restored.extend(_completion_queue_items(completion_queue))
+            _replace_completion_queue_items(completion_queue, restored)
             completion_queue.not_empty.notify_all()
 
     def drain_notifications(
@@ -2681,7 +2713,7 @@ class ProcessRegistry:
                 # unit, ahead of anything produced after snapshot selection.
                 restore = [result_evt for result_evt, _text in results]
                 restore.extend(pending[event_index:])
-                self.requeue_completions_front(restore)
+                restore_completion_event_retries(restore, registry=self)
                 logger.warning(
                     "Notification formatting failed; restored selected batch",
                     exc_info=True,
@@ -2720,7 +2752,7 @@ class ProcessRegistry:
             ):
                 requeue.extend(pending[event_index + 1 :])
                 break
-        self.requeue_completions_front(requeue)
+        restore_completion_event_retries(requeue, registry=self)
         return results
 
     def get(self, session_id: str) -> Optional[ProcessSession]:
@@ -3714,6 +3746,48 @@ class ProcessRegistry:
         return recovered
 
 
+def restore_completion_event_retries(
+    events: "list[dict]", *, registry: Optional[ProcessRegistry] = None
+) -> bool:
+    """Bound a transient requeue outage without dropping the detached unit."""
+    if not events:
+        return True
+    target = registry or process_registry
+    for _attempt in range(2):
+        try:
+            target.requeue_completions_front(events)
+            return True
+        except Exception:
+            logger.debug("Completion retry restoration failed", exc_info=True)
+    try:
+        # Keep the unit live even when a wrapper around the public method is down.
+        target._requeue_completions_front(events)
+        return True
+    except Exception:
+        logger.exception("Completion retry restoration failed permanently")
+        return False
+
+
+def reconcile_committed_completion_event_delivery(
+    evt: dict,
+    claim_id: str,
+    *,
+    registry: Optional[ProcessRegistry] = None,
+) -> bool:
+    """Retain a visible effect as ACK-only when its durable ACK needs repair."""
+    from tools.async_delegation import mark_completion_delivery_recovery
+
+    target = registry or process_registry
+    for _attempt in range(2):
+        try:
+            if mark_completion_delivery_recovery(evt, claim_id, "committed_ack"):
+                break
+        except Exception:
+            logger.debug("Failed to reconcile committed completion ACK", exc_info=True)
+    target.complete_completion_delivery(evt)
+    return True
+
+
 def completion_result_delivery_outcome(result: dict) -> str:
     """Classify an agent result without treating failed no-op drops as committed."""
     suffix_status = str(result.get("completion_delivery_status") or "none")
@@ -3754,7 +3828,7 @@ def claim_completion_event_delivery(
             if attempt == 0:
                 continue
             if retry_queue is None:
-                target.requeue_completion_front(evt)
+                restore_completion_event_retries([evt], registry=target)
             else:
                 retry_queue.append(evt)
             return None
@@ -3762,7 +3836,7 @@ def claim_completion_event_delivery(
             target.release_completion_delivery(evt)
             if claim_failed:
                 if retry_queue is None:
-                    target.requeue_completion_front(evt)
+                    restore_completion_event_retries([evt], registry=target)
                 else:
                     retry_queue.append(evt)
             return None
@@ -3786,11 +3860,23 @@ def finish_completion_event_delivery(
     )
 
     target = registry or process_registry
+    if outcome in {"committed", "visibility_noop"}:
+        try:
+            if complete_event_delivery(evt, claim_id):
+                target.complete_completion_delivery(evt)
+                return True
+        except Exception:
+            logger.debug(
+                "Failed to commit completion delivery transition", exc_info=True
+            )
+        if outcome == "committed":
+            return reconcile_committed_completion_event_delivery(
+                evt, claim_id, registry=target
+            )
+
     terminal = False
     try:
-        if outcome == "committed":
-            terminal = complete_event_delivery(evt, claim_id)
-        elif outcome in {
+        if outcome in {
             "missing_active_marker",
             "history_conflict",
             "visibility_suppressed",
@@ -3817,7 +3903,7 @@ def finish_completion_event_delivery(
     elif claim_id:
         retry_event["_completion_delivery_retained_claim_id"] = claim_id
     if retry_queue is None:
-        target.requeue_completion_front(retry_event)
+        restore_completion_event_retries([retry_event], registry=target)
     else:
         retry_queue.append(retry_event)
     return False

@@ -1997,6 +1997,78 @@ def test_batch_front_restore_keeps_native_bound_across_retry_cycles(registry, ma
         assert completion_queue.unfinished_tasks == maxsize + cycle + 1
 
 
+def test_bounded_duplicate_skip_consumes_reserved_slot(registry):
+    completion_queue = queue.Queue(maxsize=1)
+    registry.completion_queue = completion_queue
+    event = _completion_event(
+        session_id="already-delivered", session_key="owner", started_at=1.0
+    )
+    registry.complete_completion_delivery(event)
+    completion_queue.put(event)
+
+    assert (
+        registry.drain_notifications(
+            session_key="owner", owns_event=lambda _event: True
+        )
+        == []
+    )
+    completion_queue.put_nowait(
+        _completion_event(session_id="replacement", session_key="owner")
+    )
+    assert completion_queue.qsize() == 1
+
+
+def test_bounded_selectors_reserve_snapshot_exclusively(registry):
+    completion_queue = queue.Queue(maxsize=1)
+    registry.completion_queue = completion_queue
+    event = _completion_event(session_id="one-snapshot")
+    completion_queue.put(event)
+    predicate_barrier = threading.Barrier(2, timeout=2)
+    results = []
+    errors = []
+    result_lock = threading.Lock()
+
+    def select():
+        try:
+            selected = registry.drain_matching_completions(
+                lambda _event: (predicate_barrier.wait() is not None) or True
+            )
+            with result_lock:
+                results.append(selected)
+        except Exception as exc:
+            with result_lock:
+                errors.append(exc)
+
+    threads = [threading.Thread(target=select, daemon=True) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(3)
+
+    assert not errors
+    assert not any(thread.is_alive() for thread in threads)
+    assert sum(len(selected) for selected in results) == 1
+    assert [item is event for selected in results for item in selected] == [True]
+
+
+def test_bounded_restore_replaces_reserved_slot_with_retry_copy(registry):
+    completion_queue = queue.Queue(maxsize=1)
+    registry.completion_queue = completion_queue
+    event = _completion_event(
+        session_id="copy-retry", session_key="owner", started_at=1.0
+    )
+    completion_queue.put(event)
+    assert registry.drain_matching_completions(lambda _event: True) == [event]
+
+    retry = dict(event)
+    retry["_completion_delivery_retained_claim_id"] = "claim-copy-retry"
+    registry.requeue_completions_front([retry])
+
+    assert completion_queue.qsize() == 1
+    assert completion_queue.full()
+    assert registry.drain_matching_completions(lambda _event: True) == [retry]
+
+
 def test_drain_notifications_filters_async_delegation_by_session_key():
     """Async-delegation events should only be consumed by the matching session's drain.
 

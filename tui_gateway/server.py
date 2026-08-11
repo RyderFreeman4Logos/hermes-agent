@@ -9925,8 +9925,10 @@ def _collect_idle_completion_batch(
             continue
         requires_owner = _notification_event_requires_owner(evt)
         if requires_owner and not _session_owns_notification_event(sid, session, evt):
+            process_registry.consume_completion_event(evt)
             continue
         if not process_registry.completion_event_should_deliver(evt):
+            process_registry.consume_completion_event(evt)
             continue
         if evt.get("type") == "heartbeat":
             _restore_completion_events(process_registry, [evt])
@@ -9934,6 +9936,7 @@ def _collect_idle_completion_batch(
         try:
             text = format_process_notification(evt)
             if not text:
+                process_registry.consume_completion_event(evt)
                 continue
             model_text = completion_delivery_prompt(evt, text)
         except Exception:
@@ -10270,9 +10273,11 @@ def _notification_poller_loop(
                             _did,
                             exc_info=True,
                         )
+            process_registry.consume_completion_event(evt)
             continue
 
         if not process_registry.completion_event_should_deliver(evt):
+            process_registry.consume_completion_event(evt)
             continue
 
         # The poller may already be blocked in Queue.get() when manual
@@ -10287,12 +10292,16 @@ def _notification_poller_loop(
             compression_fence.wait(_NOTIFICATION_QUEUE_WAIT_SECONDS)
 
         if evt.get("type") == "heartbeat":
-            _handle_heartbeat_event(sid, session, evt)
+            try:
+                _handle_heartbeat_event(sid, session, evt)
+            finally:
+                process_registry.consume_completion_event(evt)
             continue
 
         try:
             text = format_process_notification(evt)
             if not text:
+                process_registry.consume_completion_event(evt)
                 continue
             model_text = completion_delivery_prompt(evt, text)
         except Exception as exc:
@@ -10398,15 +10407,21 @@ def _notification_poller_loop(
                     str(evt.get("origin_ui_session_id") or ""),
                     str(evt.get("session_key") or ""),
                 )
+                process_registry.consume_completion_event(evt)
             continue
         if not process_registry.completion_event_should_deliver(evt):
+            process_registry.consume_completion_event(evt)
             continue
         if evt.get("type") == "heartbeat":
-            _handle_heartbeat_event(sid, session, evt)
+            try:
+                _handle_heartbeat_event(sid, session, evt)
+            finally:
+                process_registry.consume_completion_event(evt)
             continue
         try:
             text = format_process_notification(evt)
             if not text:
+                process_registry.consume_completion_event(evt)
                 continue
             model_text = completion_delivery_prompt(evt, text)
         except Exception as exc:

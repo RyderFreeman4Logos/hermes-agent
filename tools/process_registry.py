@@ -54,6 +54,14 @@ from typing import Any, Dict, List, Optional
 from hermes_cli.config import get_hermes_home
 
 from agent.redact import redact_sensitive_text
+from tools.completion_identity import (
+    canonical_completion_fingerprint as _canonical_completion_fingerprint,
+    completion_authority_fingerprint as _completion_authority_fingerprint,
+    completion_core_identity as _completion_core_identity,
+    completion_durable_payload as _completion_durable_payload,
+    completion_event_fingerprint as _completion_event_fingerprint,
+    completion_identity as _public_completion_identity,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +87,6 @@ FINISHED_TTL_SECONDS = 1800     # Keep finished processes for 30 minutes
 MAX_PROCESSES = 64              # Max concurrent tracked processes (LRU pruning)
 MAX_ACTIVE_PROCESS_AGE = 86400  # 24h default — see session_reset.bg_process_max_age_hours (#29177)
 COMPLETION_DISPOSITION_RETENTION = 2048
-_COMPLETION_DELIVERY_PRIVATE_PREFIX = "_completion_delivery_"
 
 # Watch pattern rate limiting — PER SESSION.
 # Hard rule: at most ONE watch-match notification every WATCH_MIN_INTERVAL_SECONDS.
@@ -390,106 +397,6 @@ class _CompletionDeliveryToken(str):
 
 class _CompletionDeliveryBinding(str):
     """Exact private subtype binding a local token to its producer event."""
-
-
-def _completion_durable_payload(evt: dict) -> dict:
-    """Return the public ordinary-completion projection used for persistence."""
-    return {
-        key: value
-        for key, value in evt.items()
-        if not key.startswith(_COMPLETION_DELIVERY_PRIVATE_PREFIX)
-    }
-
-
-def _completion_authority_fingerprint(
-    evt: dict, *, allow_nonfinite: bool = False
-) -> Optional[str]:
-    """Hash the current terminal envelope without transport-only routing fields."""
-    if evt.get("type", "completion") != "completion":
-        return None
-    payload = _completion_durable_payload(evt)
-    for key in (
-        "restored",
-        "platform",
-        "chat_type",
-        "chat_id",
-        "thread_id",
-        "user_id",
-        "user_name",
-        "message_id",
-        "completion_ack_recorded_at",
-    ):
-        payload.pop(key, None)
-    try:
-        encoded = json.dumps(
-            payload,
-            allow_nan=allow_nonfinite,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-    except (TypeError, ValueError):
-        return None
-    return f"completion-event-v1:{hashlib.sha256(encoded).hexdigest()}"
-
-
-def _canonical_completion_fingerprint(evt: dict) -> str:
-    """Hash the fixed public fields that distinguish canonical terminal envelopes."""
-    encoded = json.dumps(
-        (
-            evt["command"],
-            evt["output"],
-            evt["exit_code"],
-            evt["completion_reason"],
-            evt["termination_source"],
-            bool(evt.get("delegated_child", False)),
-        ),
-        ensure_ascii=False,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return f"completion-canonical-v1:{hashlib.sha256(encoded).hexdigest()}"
-
-
-def _completion_event_fingerprint(evt: dict) -> Optional[str]:
-    """Return a replay-stable identity for one sanitized malformed envelope."""
-    if (
-        evt.get("type", "completion") != "completion"
-        or _completion_core_identity(evt) is None
-    ):
-        return None
-    payload = _completion_durable_payload(evt)
-    payload.pop("restored", None)
-    payload.pop("completion_ack_recorded_at", None)
-    try:
-        encoded = json.dumps(
-            payload,
-            allow_nan=False,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-    except (TypeError, ValueError):
-        return None
-    return f"completion-event-v1:{hashlib.sha256(encoded).hexdigest()}"
-
-
-def _completion_core_identity(evt: dict) -> "tuple | None":
-    """Return the stable producer tuple without granting public authority."""
-    session_id = evt.get("session_id")
-    session_key = evt.get("session_key", "")
-    started_at = evt.get("started_at")
-    if (
-        evt.get("type", "completion") != "completion"
-        or not isinstance(session_id, str)
-        or not session_id
-        or not isinstance(session_key, str)
-        or isinstance(started_at, bool)
-        or not isinstance(started_at, (int, float))
-        or (isinstance(started_at, float) and not math.isfinite(started_at))
-        or started_at <= 0
-    ):
-        return None
-    return ("completion", session_id, started_at, session_key)
 
 
 def _bound_completion_delivery_metadata(evt: dict) -> "tuple | None":
@@ -2550,36 +2457,7 @@ class ProcessRegistry:
     @staticmethod
     def _completion_identity(evt: dict) -> "tuple | None":
         """Return tuple authority only for a fully canonical success envelope."""
-        identity = _completion_core_identity(evt)
-        if (
-            identity is None
-            or evt.get("type") != "completion"
-            or "session_key" not in evt
-            or evt.get("termination_source") != ""
-            or type(evt.get("exit_code")) is not int
-            or evt["exit_code"] != 0
-            or evt.get("completion_reason") != "exited"
-            or not isinstance(evt.get("command"), str)
-            or not isinstance(evt.get("output"), str)
-            or any(
-                evt.get(key)
-                for key in (
-                    "error",
-                    "stderr",
-                    "error_message",
-                    "exception",
-                    "warning",
-                    "safety_alert",
-                    "timed_out",
-                    "cancelled",
-                    "canceled",
-                    "failed",
-                    "lost",
-                )
-            )
-        ):
-            return None
-        return identity
+        return _public_completion_identity(evt)
 
     @staticmethod
     def _completion_durable_identity(evt: dict) -> "tuple | None":

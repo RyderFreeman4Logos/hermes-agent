@@ -854,6 +854,7 @@ def test_live_async_claim_is_not_stolen_by_sibling_registry(monkeypatch, tmp_pat
     import tools.process_registry as registry_module
 
     monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    now = time.time()
     event = {
         "type": "async_delegation",
         "delegation_id": "deleg-live-owner",
@@ -864,8 +865,8 @@ def test_live_async_claim_is_not_stolen_by_sibling_registry(monkeypatch, tmp_pat
         "goal": "live owner",
         "status": "completed",
         "summary": "done",
-        "dispatched_at": 5.67,
-        "completed_at": 5.68,
+        "dispatched_at": now,
+        "completed_at": now,
     }
     ad._persist_dispatch(event)
     ad._persist_completion(event, {"status": "completed", "summary": "done"})

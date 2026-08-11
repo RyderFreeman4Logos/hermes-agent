@@ -1333,9 +1333,9 @@ def _ordinary_completion_delivery_id(evt: Dict[str, Any]) -> Optional[str]:
     """Return canonical tuple authority or a sanitized envelope fingerprint."""
     if evt.get("type", "completion") != "completion":
         return None
-    from tools.process_registry import ProcessRegistry
+    from tools.completion_identity import completion_durable_identity
 
-    identity = ProcessRegistry._completion_durable_identity(evt)
+    identity = completion_durable_identity(evt)
     if identity is None:
         return None
     return json.dumps(identity, ensure_ascii=False, separators=(",", ":"))

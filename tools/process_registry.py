@@ -251,6 +251,46 @@ def _completion_queue_reservations(completion_queue) -> "dict[int, dict]":
     return reservations
 
 
+def _completion_reservation_identity(event: dict) -> "tuple | None":
+    """Return the durable identity used to match a copied reserved event."""
+    event_type = event.get("type", "completion")
+    if event_type == "async_delegation":
+        delegation_id = event.get("delegation_id")
+        if isinstance(delegation_id, str) and delegation_id:
+            return (event_type, delegation_id)
+        return None
+    session_id = event.get("session_id")
+    session_key = event.get("session_key", "")
+    started_at = event.get("started_at")
+    if (
+        event_type != "completion"
+        or not isinstance(session_id, str)
+        or not session_id
+        or not isinstance(session_key, str)
+        or isinstance(started_at, bool)
+        or not isinstance(started_at, (int, float))
+        or started_at <= 0
+    ):
+        return None
+    return (event_type, session_id, started_at, session_key)
+
+
+def _find_completion_queue_reservation(reservations, event: dict):
+    exact = reservations.get(id(event))
+    if exact is event:
+        return id(event), event
+    identity = _completion_reservation_identity(event)
+    if identity is None:
+        return None
+    # ponytail: linear scan; add an identity index only if queue limits grow.
+    matches = [
+        (key, reserved)
+        for key, reserved in reservations.items()
+        if _completion_reservation_identity(reserved) == identity
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
 def _replace_completion_queue_items(completion_queue, events: "list[dict]") -> None:
     """Replace the native FIFO without bypassing ``Queue.maxsize``."""
     if completion_queue.maxsize > 0 and len(events) > completion_queue.maxsize:
@@ -274,17 +314,36 @@ def _restore_completion_queue_items(completion_queue, events: "list[dict]") -> N
     with completion_queue.not_empty:
         current = _completion_queue_items(completion_queue)
         current_by_id = {id(event): event for event in current}
+        current_index_by_id = {id(event): index for index, event in enumerate(current)}
         reservations = _completion_queue_reservations(completion_queue)
         detached = []
+        replaced = False
         for event in events:
             key = id(event)
             if current_by_id.get(key) is event:
                 reservations.pop(key, None)
-            else:
+                continue
+            reservation = _find_completion_queue_reservation(reservations, event)
+            if reservation is None:
                 detached.append(event)
+                continue
+            reserved_key, reserved_event = reservation
+            index = current_index_by_id.get(reserved_key)
+            if index is None or current[index] is not reserved_event:
+                detached.append(event)
+                continue
+            current[index] = event
+            current_by_id.pop(reserved_key, None)
+            current_by_id[key] = event
+            current_index_by_id.pop(reserved_key, None)
+            current_index_by_id[key] = index
+            reservations.pop(reserved_key, None)
+            replaced = True
         _set_completion_queue_reservations(completion_queue, reservations)
         if detached:
             _replace_completion_queue_items(completion_queue, [*detached, *current])
+        elif replaced:
+            _replace_completion_queue_items(completion_queue, current)
         completion_queue.not_empty.notify_all()
 
 
@@ -294,11 +353,12 @@ def _complete_completion_queue_reservation(completion_queue, event: dict) -> boo
         return False
     with completion_queue.not_full:
         reservations = _completion_queue_reservations(completion_queue)
-        key = id(event)
-        if reservations.get(key) is not event:
+        reservation = _find_completion_queue_reservation(reservations, event)
+        if reservation is None:
             return False
+        key, reserved_event = reservation
         for index, current in enumerate(completion_queue.queue):
-            if current is event:
+            if current is reserved_event:
                 del completion_queue.queue[index]
                 reservations.pop(key, None)
                 _set_completion_queue_reservations(completion_queue, reservations)
@@ -328,13 +388,17 @@ def drain_matching_queue_events(completion_queue, predicate) -> "list[dict]":
             for index, event in enumerate(current[: len(snapshot)])
         ):
             return []
+        reservations = _completion_queue_reservations(completion_queue)
+        selected = tuple(
+            should_drain and reservations.get(id(event)) is not event
+            for event, should_drain in zip(snapshot, selected)
+        )
         drained = [
             event for event, should_drain in zip(snapshot, selected) if should_drain
         ]
         if not drained:
             return []
         if completion_queue.maxsize > 0:
-            reservations = _completion_queue_reservations(completion_queue)
             reservations.update((id(event), event) for event in drained)
             setattr(
                 completion_queue,
@@ -2012,20 +2076,8 @@ class ProcessRegistry:
     @staticmethod
     def _completion_identity(evt: dict) -> "tuple | None":
         """Return a stable ordinary-completion identity, or None to fail open."""
-        session_id = evt.get("session_id")
-        session_key = evt.get("session_key", "")
-        started_at = evt.get("started_at")
-        if (
-            evt.get("type", "completion") != "completion"
-            or not isinstance(session_id, str)
-            or not session_id
-            or not isinstance(session_key, str)
-            or isinstance(started_at, bool)
-            or not isinstance(started_at, (int, float))
-            or started_at <= 0
-        ):
-            return None
-        return ("completion", session_id, started_at, session_key)
+        identity = _completion_reservation_identity(evt)
+        return identity if identity and identity[0] == "completion" else None
 
     @staticmethod
     def _is_observed_completion_noop(evt: dict) -> bool:
@@ -2173,6 +2225,10 @@ class ProcessRegistry:
             with self._completion_disposition_lock:
                 self._set_completion_disposition(identity, "delivered")
             self._retire_terminal_completion_spool(evt)
+
+    def consume_completion_event(self, evt: dict) -> None:
+        """Terminally remove a selected event without changing its delivery ledger."""
+        _complete_completion_queue_reservation(self.completion_queue, evt)
 
     def release_completion_delivery(self, evt: dict) -> None:
         identity = self._completion_identity(evt)
@@ -2392,6 +2448,7 @@ class ProcessRegistry:
                 # session owns (or legacy ownerless ordinary events). Routing must
                 # happen first so a foreign session cannot drop the owner's event.
                 if evt.get("type") == "completion" and self._drain_should_skip(evt):
+                    self.consume_completion_event(evt)
                     continue
 
                 text = (
@@ -2415,13 +2472,16 @@ class ProcessRegistry:
                 )
                 raise
             if not formatted:
+                self.consume_completion_event(evt)
                 continue
             if text is not None:
                 results.append((evt, text))
                 continue
             if evt.get("type") not in {"completion", "async_delegation"}:
+                self.consume_completion_event(evt)
                 continue
             if not self.claim_completion_delivery(evt):
+                self.consume_completion_event(evt)
                 continue
             try:
                 from tools.async_delegation import claim_event_delivery
@@ -2434,6 +2494,7 @@ class ProcessRegistry:
                 break
             if claim_id is None:
                 self.release_completion_delivery(evt)
+                self.consume_completion_event(evt)
                 continue
             if not claim_id:
                 self.complete_completion_delivery(evt)
@@ -3588,9 +3649,12 @@ def claim_completion_event_delivery(
     from tools.async_delegation import claim_event_delivery
 
     target = registry or process_registry
+    consume_selected = getattr(target, "consume_completion_event", None)
     claim_failed = False
     for attempt in range(2):
         if not target.claim_completion_delivery(evt):
+            if consume_selected is not None:
+                consume_selected(evt)
             return None
         try:
             claim_id = claim_event_delivery(evt, consumer)
@@ -3612,6 +3676,9 @@ def claim_completion_event_delivery(
                     restore_completion_event_retries([evt], registry=target)
                 else:
                     retry_queue.append(evt)
+            else:
+                if consume_selected is not None:
+                    consume_selected(evt)
             return None
         return claim_id
     return None

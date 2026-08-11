@@ -412,7 +412,7 @@ def test_soft_ceiling_retries_past_standalone_handoff():
         summarized.extend(turns)
         return ContextCompressor._with_summary_prefix("fresh summary")
 
-    def _budget_tokens(message):
+    def _budget_tokens(message, **_kwargs):
         return 80 if ContextCompressor._is_context_summary_message(message) else 8
 
     with (

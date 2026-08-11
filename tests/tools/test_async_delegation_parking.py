@@ -803,3 +803,78 @@ def test_ordinary_committed_effect_age_prune_retains_no_replay_identity(delegati
     assert ad.persist_event_delivery(event)
     assert ad.claim_event_delivery(event, "stale-publication") is None
     assert ad.get_durable_event_delivery(event) is None
+
+
+def test_tuple_era_retirement_preserves_only_payload_specific_identity(delegation_db):
+    ad = delegation_db
+    first = {
+        **_ordinary_event("legacy-retirement", 45.0),
+        "command": "printf first",
+        "exit_code": 0,
+        "output": "first\n",
+    }
+    second = {**first, "command": "printf second", "output": "second\n"}
+    first_id = ad._ordinary_completion_delivery_id(first)
+    second_id = ad._ordinary_completion_delivery_id(second)
+    legacy_id = ad._ordinary_completion_legacy_delivery_id(first)
+    assert first_id and second_id and legacy_id
+    assert first_id != second_id
+    assert legacy_id == ad._ordinary_completion_legacy_delivery_id(second)
+
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute(
+            """INSERT INTO ordinary_completion_deliveries
+               (delivery_id, event_json, delivery_state, updated_at,
+                delivery_tombstoned_at)
+               VALUES (?, ?, 'delivered', 1, ?)""",
+            (
+                legacy_id,
+                json.dumps(first, sort_keys=True),
+                time.time() - ad._DURABLE_RETENTION_SECONDS - 1,
+            ),
+        )
+    ad._prune_durable_records()
+
+    with ad._DB_LOCK, ad._transaction() as conn:
+        retired = conn.execute(
+            """SELECT delivery_id FROM completion_delivery_retirements
+               WHERE delivery_kind='ordinary_completion_deliveries'"""
+        ).fetchall()
+    assert retired == [(first_id,)]
+    assert ad.persist_event_delivery(first)
+    assert ad.claim_event_delivery(first, "stale-first") is None
+    assert ad.persist_event_delivery(second)
+    assert ad.claim_event_delivery(second, "distinct-second")
+
+
+def test_retired_payload_under_wrong_row_key_is_parked_before_cleanup(delegation_db):
+    ad = delegation_db
+    event = _ordinary_event("retired-wrong-row", 46.0)
+    delivery_id = ad._ordinary_completion_delivery_id(event)
+    assert delivery_id
+    assert ad.persist_event_delivery(event)
+    claim = ad.claim_event_delivery(event, "first-effect")
+    assert claim and ad.complete_event_delivery(event, claim)
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute(
+            """UPDATE ordinary_completion_deliveries
+               SET delivery_tombstoned_at=? WHERE delivery_id=?""",
+            (time.time() - ad._DURABLE_RETENTION_SECONDS - 1, delivery_id),
+        )
+    ad._prune_durable_records()
+
+    wrong_row = "forged-row-key-that-is-neither-current-nor-legacy"
+    _insert_ordinary(ad, wrong_row, json.dumps(event, sort_keys=True), 2.0)
+    restored = _Queue()
+    assert ad.restore_undelivered_completions(restored) == 0
+
+    with ad._DB_LOCK, ad._transaction() as conn:
+        row = conn.execute(
+            """SELECT delivery_state, event_json
+               FROM ordinary_completion_deliveries WHERE delivery_id=?""",
+            (wrong_row,),
+        ).fetchone()
+    assert row is not None
+    assert row[0] == "parked_corrupt"
+    assert "does not match" in row[1]
+    assert restored.items == []

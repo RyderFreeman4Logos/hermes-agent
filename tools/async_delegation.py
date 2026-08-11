@@ -402,13 +402,33 @@ def _prune_durable_records() -> None:
             )
             # ponytail: compact IDs persist; reclaim only after producer
             # epochs/watermarks prove stale publications are impossible.
-            conn.execute(
-                f"""INSERT OR IGNORE INTO completion_delivery_retirements
-                    (delivery_kind, delivery_id, retired_at)
-                    SELECT ?, {id_column}, delivery_tombstoned_at FROM {table}
-                     WHERE delivery_tombstoned_at < ?""",
-                (table, cutoff),
-            )
+            if table == "ordinary_completion_deliveries":
+                rows = conn.execute(
+                    """SELECT delivery_id, event_json, delivery_tombstoned_at
+                       FROM ordinary_completion_deliveries
+                       WHERE delivery_tombstoned_at < ?""",
+                    (cutoff,),
+                ).fetchall()
+                conn.executemany(
+                    """INSERT OR IGNORE INTO completion_delivery_retirements
+                       (delivery_kind, delivery_id, retired_at)
+                       VALUES ('ordinary_completion_deliveries', ?, ?)""",
+                    (
+                        (
+                            _ordinary_retirement_delivery_id(delivery_id, payload),
+                            retired_at,
+                        )
+                        for delivery_id, payload, retired_at in rows
+                    ),
+                )
+            else:
+                conn.execute(
+                    f"""INSERT OR IGNORE INTO completion_delivery_retirements
+                        (delivery_kind, delivery_id, retired_at)
+                        SELECT ?, {id_column}, delivery_tombstoned_at FROM {table}
+                         WHERE delivery_tombstoned_at < ?""",
+                    (table, cutoff),
+                )
             conn.execute(
                 f"DELETE FROM {table} WHERE delivery_tombstoned_at < ?",
                 (cutoff,),
@@ -697,7 +717,7 @@ def _reconcile_committed_ack_events(conn, events, now: float) -> int:
         delivery_id = _ordinary_completion_delivery_id(event)
         if delivery_id is None:
             continue
-        if _ordinary_delivery_retired(conn, event, delivery_id):
+        if _ordinary_delivery_retired(conn, delivery_id):
             reconciled += 1
             continue
         payload = json.dumps(_durable_event_payload(event), sort_keys=True)
@@ -981,8 +1001,11 @@ def restore_undelivered_completions(target_queue) -> int:
             if event is None:
                 continue
             normalized_id = _ordinary_completion_delivery_id(event)
-            if normalized_id is not None and _ordinary_delivery_retired(
-                conn, event, normalized_id
+            legacy_id = _ordinary_completion_legacy_delivery_id(event)
+            if (
+                normalized_id is not None
+                and delivery_id in {normalized_id, legacy_id}
+                and _ordinary_delivery_retired(conn, normalized_id)
             ):
                 conn.execute(
                     """DELETE FROM ordinary_completion_deliveries
@@ -995,7 +1018,7 @@ def restore_undelivered_completions(target_queue) -> int:
             )
             if normalized_id != delivery_id:
                 target = (normalized_id, normalized_payload)
-                if delivery_id == _ordinary_completion_legacy_delivery_id(event):
+                if delivery_id == legacy_id:
                     legacy_migrations[delivery_id] = target
                 else:
                     mismatches[delivery_id] = target
@@ -1220,17 +1243,24 @@ def _ordinary_completion_legacy_delivery_id(evt: Dict[str, Any]) -> Optional[str
     return json.dumps(identity, ensure_ascii=False, separators=(",", ":"))
 
 
-def _ordinary_delivery_retired(
-    conn: sqlite3.Connection, evt: Dict[str, Any], delivery_id: str
-) -> bool:
-    if _delivery_retired(conn, "ordinary_completion_deliveries", delivery_id):
-        return True
-    legacy_id = _ordinary_completion_legacy_delivery_id(evt)
-    return bool(
-        legacy_id
-        and legacy_id != delivery_id
-        and _delivery_retired(conn, "ordinary_completion_deliveries", legacy_id)
-    )
+def _ordinary_retirement_delivery_id(stored_id: str, payload: str) -> str:
+    """Narrow a tuple-era row to the canonical identity retained in its payload."""
+    try:
+        event = _load_durable_event_payload(payload)
+    except (TypeError, ValueError):
+        return stored_id
+    if not isinstance(event, dict):
+        return stored_id
+    canonical_id = _ordinary_completion_delivery_id(event)
+    if canonical_id is None or stored_id != _ordinary_completion_legacy_delivery_id(
+        event
+    ):
+        return stored_id
+    return canonical_id
+
+
+def _ordinary_delivery_retired(conn: sqlite3.Connection, delivery_id: str) -> bool:
+    return _delivery_retired(conn, "ordinary_completion_deliveries", delivery_id)
 
 
 def _durable_event_payload(evt: Dict[str, Any]) -> Dict[str, Any]:
@@ -1312,7 +1342,7 @@ def persist_event_delivery(evt: Dict[str, Any]) -> bool:
     now = time.time()
     payload = json.dumps(_durable_event_payload(evt), sort_keys=True)
     with _DB_LOCK, _transaction() as conn:
-        if _ordinary_delivery_retired(conn, evt, delivery_id):
+        if _ordinary_delivery_retired(conn, delivery_id):
             return True
         _migrate_ordinary_completion_legacy_row(conn, evt, delivery_id, payload, now)
         conn.execute(
@@ -1444,7 +1474,7 @@ def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
         if delivery_id is None:
             return None
         with _DB_LOCK, _transaction() as conn:
-            if _ordinary_delivery_retired(conn, evt, delivery_id):
+            if _ordinary_delivery_retired(conn, delivery_id):
                 return None
             payload = json.dumps(_durable_event_payload(evt), sort_keys=True)
             _migrate_ordinary_completion_legacy_row(
@@ -1482,7 +1512,7 @@ def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
     now = time.time()
     payload = json.dumps(_durable_event_payload(evt), sort_keys=True)
     with _DB_LOCK, _transaction() as conn:
-        if _ordinary_delivery_retired(conn, evt, delivery_id):
+        if _ordinary_delivery_retired(conn, delivery_id):
             return None
         _migrate_ordinary_completion_legacy_row(conn, evt, delivery_id, payload, now)
         conn.execute(

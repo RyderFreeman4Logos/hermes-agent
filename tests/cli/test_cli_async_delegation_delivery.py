@@ -142,6 +142,73 @@ def test_cli_transient_claim_failure_keeps_visible_and_physical_fifo(
         producer.join(2)
 
 
+def test_cli_transient_front_restore_failure_retains_selected_unit(
+    monkeypatch, tmp_path
+):
+    from tools import async_delegation as ad
+    import tools.process_registry as registry_module
+
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    registry = registry_module.ProcessRegistry()
+    monkeypatch.setattr(registry_module, "process_registry", registry)
+    cli = HermesCLI.__new__(HermesCLI)
+    cli._completion_delivery_inflight = False
+    cli._pending_input = queue.Queue()
+    cli.session_id = "visible-session"
+    cli._session_db = None
+    cli._owns_process_notification = lambda event: True
+    events = [
+        {
+            "type": "completion",
+            "session_id": f"proc-cli-restore-{seq}",
+            "session_key": "visible-session",
+            "started_at": float(seq),
+            "command": "true",
+            "exit_code": 0,
+            "completion_reason": "exited",
+            "termination_source": "",
+            "output": "done",
+        }
+        for seq in (1, 2)
+    ]
+    for event in events:
+        assert ad.persist_event_delivery(event)
+        registry.completion_queue.put(event)
+
+    claim_calls = 0
+    real_claim = ad.claim_event_delivery
+
+    def fail_first_claim(event, consumer):
+        nonlocal claim_calls
+        if event is events[0] and claim_calls < 2:
+            claim_calls += 1
+            raise OSError("claim storage unavailable")
+        return real_claim(event, consumer)
+
+    monkeypatch.setattr(ad, "claim_event_delivery", fail_first_claim)
+    requeue_calls = 0
+    real_requeue = registry.requeue_completions_front
+
+    def fail_first_requeue(items):
+        nonlocal requeue_calls
+        requeue_calls += 1
+        if requeue_calls == 1:
+            raise OSError("front restore unavailable once")
+        return real_requeue(items)
+
+    monkeypatch.setattr(registry, "requeue_completions_front", fail_first_requeue)
+
+    cli._drain_process_notifications("cli-idle")
+
+    assert claim_calls == 2
+    assert requeue_calls == 2
+    with registry.completion_queue.mutex:
+        live = list(registry.completion_queue.queue)
+    assert live == events
+    assert all(actual is wanted for actual, wanted in zip(live, events))
+    assert cli._pending_input.empty()
+
+
 @pytest.mark.parametrize("storage_failure", ["claim", "release"])
 def test_cli_storage_failure_retries_once_in_same_process(
     monkeypatch, tmp_path, storage_failure

@@ -585,11 +585,23 @@ def test_gateway_retry_restores_selected_tail_before_concurrent_put(
     producer.start()
     runner = _runner(SimpleNamespace())
     runner._deliver_completion_notification = AsyncMock(return_value=False)
+    original_requeue = isolated_registry.requeue_completions_front
+    requeue_calls = 0
+
+    def fail_once(events):
+        nonlocal requeue_calls
+        requeue_calls += 1
+        if requeue_calls == 1:
+            raise OSError("front restore unavailable once")
+        return original_requeue(events)
+
+    monkeypatch.setattr(isolated_registry, "requeue_completions_front", fail_once)
     _stop_after_sleeps(monkeypatch, runner, count=2)
     try:
         asyncio.run(runner._async_delegation_watcher(interval=0))
         producer.join(2)
         assert not producer.is_alive()
+        assert requeue_calls == 2
         with completion_queue.mutex:
             remaining = list(completion_queue.queue)
         expected = [first, second, concurrent]
@@ -850,6 +862,47 @@ def test_gateway_committed_effect_ack_failure_never_requeues(
 
     restarted = ProcessRegistry()
     assert restarted.completion_queue.empty()
+
+
+def test_raw_api_async_ack_failure_uses_shared_committed_recovery(
+    monkeypatch, isolated_registry
+):
+    from tools import async_delegation as ad
+
+    event = _async_event("deleg-raw-api-ack")
+    event.update({
+        "session_key": "raw-api-session",
+        "origin_session_id": "raw-api-session",
+        "origin_ui_session_id": "",
+        "parent_session_id": "",
+    })
+    ad._persist_dispatch(event)
+    ad._persist_completion(event, {"status": "completed", "summary": "Found it"})
+
+    adapter = MagicMock(supports_async_delivery=False)
+    runner = _runner(adapter)
+    runner.adapters = {Platform.API_SERVER: adapter}
+    visible_effects = []
+
+    async def visible_self_post(
+        _adapter, *, text, session_id="", source=None, completion_delivery=False
+    ):
+        visible_effects.append((text, session_id, completion_delivery))
+
+    monkeypatch.setattr("gateway.wake.adapter_supports_push", lambda _adapter: False)
+    monkeypatch.setattr("gateway.wake.deliver_wake", visible_self_post)
+    monkeypatch.setattr(ad, "complete_completion_delivery", lambda *_args: False)
+
+    assert (
+        asyncio.run(runner._deliver_completion_notification("VISIBLE", event)) is True
+    )
+    assert visible_effects == [("VISIBLE", "raw-api-session", True)]
+    durable = ad.get_durable_delegation(event["delegation_id"])
+    assert durable is not None
+    assert durable["delivery_state"] == "recovery_committed_ack_failed"
+    restored = queue.Queue()
+    assert ad.restore_undelivered_completions(restored) == 0
+    assert restored.empty()
 
 
 def test_duplicate_async_queue_replay_injects_once(monkeypatch, isolated_registry):

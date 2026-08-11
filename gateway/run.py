@@ -23685,6 +23685,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         from tools.process_registry import (
             drain_matching_queue_events,
             process_registry as _pr,
+            restore_completion_event_retries,
         )
 
         def owner_key(evt: dict) -> tuple:
@@ -23723,7 +23724,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         if owner_key(events[later_index]) == owner:
                             restore.append(events[later_index])
                             restored_indexes.add(later_index)
-                    _pr.requeue_completions_front(restore)
+                    restore_completion_event_retries(restore, registry=_pr)
 
                 for event_index, evt in enumerate(events):
                     if event_index in restored_indexes:

@@ -609,8 +609,8 @@ class AIAgent:
             logger.debug("SessionDB unavailable for recall", exc_info=True)
             return None
 
-    def _ensure_db_session(self) -> None:
-        """Create session DB row on first use. Disables _session_db on failure."""
+    def _ensure_db_session(self, *, patience_s: Optional[float] = None) -> None:
+        """Create the session row on first use within an optional write budget."""
         if getattr(self, "_persist_disabled", False):
             return
         if self._session_db_created or not self._session_db:
@@ -647,6 +647,7 @@ class AIAgent:
                 parent_session_id=self._parent_session_id,
                 cwd=_launch_cwd_for_session(source),
                 profile_name=_profile_for_session,
+                **({"patience_s": patience_s} if patience_s is not None else {}),
             )
             self._session_db_created = True
         except Exception as e:
@@ -2019,15 +2020,35 @@ class AIAgent:
         conversation_history: Optional[List[Dict]] = None,
         *,
         display_metadata_cas: Optional[Dict[str, Any]] = None,
+        patience_s: Optional[float] = None,
     ):
-        """Serialize direct and turn-boundary session flushes per agent."""
+        """Serialize session flushes, optionally under one wall-clock budget."""
         persist_lock = getattr(self, "_session_persist_lock", None)
         if persist_lock is None:
             return self._flush_messages_to_session_db_unlocked(
                 messages,
                 conversation_history,
                 display_metadata_cas=display_metadata_cas,
+                patience_s=patience_s,
             )
+        if patience_s is not None:
+            deadline = time.monotonic() + max(0.0, patience_s)
+            if not persist_lock.acquire(
+                timeout=max(0.0, deadline - time.monotonic())
+            ):
+                self._last_session_db_flush_error = TimeoutError(
+                    "session persistence lock remained busy"
+                )
+                return False
+            try:
+                return self._flush_messages_to_session_db_unlocked(
+                    messages,
+                    conversation_history,
+                    display_metadata_cas=display_metadata_cas,
+                    patience_s=max(0.0, deadline - time.monotonic()),
+                )
+            finally:
+                persist_lock.release()
         with persist_lock:
             return self._flush_messages_to_session_db_unlocked(
                 messages,
@@ -2042,6 +2063,7 @@ class AIAgent:
         *,
         _adoption_budget: int = 1,
         display_metadata_cas: Optional[Dict[str, Any]] = None,
+        patience_s: Optional[float] = None,
     ):
         """Persist any un-flushed messages to the SQLite session store.
 
@@ -2078,15 +2100,32 @@ class AIAgent:
         )
 
         compression_wait_logged = False
+        write_deadline = (
+            time.monotonic() + max(0.0, patience_s)
+            if patience_s is not None
+            else None
+        )
+
+        def _remaining_write_patience() -> float:
+            if write_deadline is not None:
+                return max(0.0, write_deadline - time.monotonic())
+            try:
+                return max(
+                    0.0,
+                    float(
+                        getattr(
+                            self._session_db,
+                            "_TRANSCRIPT_WRITE_PATIENCE_S",
+                            60.0,
+                        )
+                    ),
+                )
+            except (TypeError, ValueError):
+                return 60.0
 
         def _append_messages_batch(rows):
             nonlocal compression_wait_logged
-            try:
-                wait_seconds = float(
-                    getattr(self._session_db, "_TRANSCRIPT_WRITE_PATIENCE_S", 60.0)
-                )
-            except (TypeError, ValueError):
-                wait_seconds = 60.0
+            wait_seconds = _remaining_write_patience()
             deadline = time.monotonic() + max(0.0, wait_seconds)
             waiting = False
             while True:
@@ -2110,6 +2149,7 @@ class AIAgent:
                         )
                         or 300.0,
                         display_metadata_cas=display_metadata_cas,
+                        patience_s=wait_seconds,
                     )
                     return True
                 except CompressionSessionBusyError:
@@ -2159,7 +2199,12 @@ class AIAgent:
         try:
             # Retry row creation if the earlier attempt failed transiently.
             if not self._session_db_created:
-                self._ensure_db_session()
+                if patience_s is None:
+                    self._ensure_db_session()
+                else:
+                    self._ensure_db_session(
+                        patience_s=_remaining_write_patience()
+                    )
             # Positional flushing used to slice at
             # max(len(conversation_history), _last_flushed_db_idx). That
             # assumes the live `messages` list is the original history plus a

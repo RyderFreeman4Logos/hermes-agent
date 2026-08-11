@@ -242,6 +242,19 @@ class TestRunConversationCodexPath:
         from tools.process_registry import completion_delivery_prompt, format_process_notification
 
         monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config_readonly",
+            lambda: {
+                "session": {
+                    "completion_delivery_commit": {
+                        "max_attempts": 1,
+                        "initial_backoff_s": 0,
+                        "max_backoff_s": 0,
+                        "patience_s": 0,
+                    }
+                }
+            },
+        )
         db = SessionDB(db_path=tmp_path / "state.db")
         session_id = "codex-completion-pending"
         db.create_session(session_id, source="tui", model="test-model")

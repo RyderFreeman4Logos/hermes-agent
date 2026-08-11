@@ -803,7 +803,10 @@ def run_codex_app_server_turn(
     if turn.projected_messages:
         messages.extend(turn.projected_messages)
 
-    from agent.turn_finalizer import finalize_completion_delivery_suffix
+    from agent.turn_finalizer import (
+        completion_delivery_commit_error_message,
+        finalize_completion_delivery_suffix,
+    )
 
     _completion_delivery_status = finalize_completion_delivery_suffix(
         agent,
@@ -970,7 +973,7 @@ def run_codex_app_server_turn(
         "error": (
             turn.error
             or (
-                "completion delivery could not be committed to SessionDB"
+                completion_delivery_commit_error_message(agent)
                 if _completion_delivery_commit_failed
                 else None
             )

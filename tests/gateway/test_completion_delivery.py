@@ -557,6 +557,126 @@ def test_gateway_completion_drain_preserves_watch_fifo_during_concurrent_put(
         producer.join(2)
 
 
+def test_gateway_retry_restores_selected_tail_before_concurrent_put(
+    monkeypatch, isolated_registry
+):
+    producer_start = threading.Event()
+    producer_done = threading.Event()
+    completion_queue = _InterleavingDrainQueue(producer_start, producer_done)
+    first = _DrainSignalEvent(
+        completion_queue,
+        **_completion_event(started_at=1.0, session_id="proc-fifo-1"),
+    )
+    second = _DrainSignalEvent(
+        completion_queue,
+        **_completion_event(started_at=2.0, session_id="proc-fifo-2"),
+    )
+    concurrent = _completion_event(started_at=3.0, session_id="proc-fifo-3")
+    completion_queue.put(first)
+    completion_queue.put(second)
+    isolated_registry.completion_queue = completion_queue
+
+    def produce():
+        assert producer_start.wait(2), "watcher did not reach producer boundary"
+        completion_queue.put(concurrent)
+        producer_done.set()
+
+    producer = threading.Thread(target=produce, daemon=True)
+    producer.start()
+    runner = _runner(SimpleNamespace())
+    runner._deliver_completion_notification = AsyncMock(return_value=False)
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+    try:
+        asyncio.run(runner._async_delegation_watcher(interval=0))
+        producer.join(2)
+        assert not producer.is_alive()
+        with completion_queue.mutex:
+            remaining = list(completion_queue.queue)
+        expected = [first, second, concurrent]
+        assert remaining == expected
+        assert all(actual is wanted for actual, wanted in zip(remaining, expected))
+    finally:
+        producer_start.set()
+        producer.join(2)
+
+
+def test_gateway_failed_owner_does_not_block_other_owner_progress(
+    monkeypatch, isolated_registry
+):
+    producer_start = threading.Event()
+    producer_done = threading.Event()
+    completion_queue = _InterleavingDrainQueue(producer_start, producer_done)
+
+    def routed(seq, owner):
+        routed_event = _DrainSignalEvent(
+            completion_queue,
+            **_completion_event(
+                started_at=float(seq), session_id=f"proc-{owner}-{seq}"
+            ),
+        )
+        routed_event["session_key"] = owner
+        routed_event["owner"] = owner
+        routed_event["seq"] = seq
+        return routed_event
+
+    first = routed(1, "A")
+    foreign_b = routed(1, "B")
+    second = routed(2, "A")
+    foreign_c = routed(1, "C")
+    concurrent = _completion_event(started_at=3.0, session_id="proc-A-3")
+    concurrent["session_key"] = "A"
+    concurrent["owner"] = "A"
+    concurrent["seq"] = 3
+    for event in (first, foreign_b, second, foreign_c):
+        completion_queue.put(event)
+    isolated_registry.completion_queue = completion_queue
+
+    def produce():
+        assert producer_start.wait(2), "watcher did not reach producer boundary"
+        completion_queue.put(concurrent)
+        producer_done.set()
+
+    producer = threading.Thread(target=produce, daemon=True)
+    producer.start()
+    observed = []
+    runner = _runner(SimpleNamespace())
+
+    async def deliver(_text, event, **_kwargs):
+        observed.append((event["owner"], event["seq"]))
+        return event is not first
+
+    runner._deliver_completion_notification = AsyncMock(side_effect=deliver)
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+    try:
+        asyncio.run(runner._async_delegation_watcher(interval=0))
+        producer.join(2)
+        assert not producer.is_alive()
+        assert observed == [("A", 1), ("B", 1), ("C", 1)]
+        with completion_queue.mutex:
+            remaining = list(completion_queue.queue)
+        assert remaining == [first, second, concurrent]
+    finally:
+        producer_start.set()
+        producer.join(2)
+
+
+def test_gateway_ordinary_watcher_failure_has_one_retry(monkeypatch, isolated_registry):
+    event = _completion_event(started_at=4.0, session_id="proc-single-retry")
+    event["exit_code"] = 1
+    isolated_registry.completion_queue.put(event)
+    runner = _runner(SimpleNamespace())
+    runner._inject_watch_notification = AsyncMock(return_value=False)
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    with isolated_registry.completion_queue.mutex:
+        retries = list(isolated_registry.completion_queue.queue)
+    assert len(retries) == 1
+    assert retries[0]["session_id"] == event["session_id"]
+    assert retries[0]["started_at"] == event["started_at"]
+
+
 def _committing_gateway_runner(monkeypatch, tmp_path, db):
     """Run accepted synthetic events through the real gateway history fence."""
     from tests.gateway.test_first_turn_session_meta_rebaseline import (
@@ -1625,33 +1745,38 @@ def test_gateway_storage_failure_retries_once_in_same_process(
         with pytest.raises(RuntimeError, match="prompt failed"):
             asyncio.run(runner._deliver_completion_notification("payload", event))
     else:
-        expected = False if failure_stage == "inject_release" else None
+        expected = True if failure_stage == "claim" else False
         assert (
             asyncio.run(runner._deliver_completion_notification("payload", event))
             is expected
         )
 
-    assert effects == []
-    assert isolated_registry.completion_event_should_deliver(event)
-    retry = isolated_registry.completion_queue.get_nowait()
-    assert isolated_registry.completion_queue.empty()
-    receipt = ad.get_durable_event_delivery(event)
-    assert receipt is not None
-    assert receipt["delivery_state"] == (
-        "pending" if failure_stage == "claim" else "effect_started"
-    )
-    if failure_stage.endswith("release"):
+    if failure_stage == "claim":
+        assert effects == [event["session_id"]]
+        assert isolated_registry.completion_queue.empty()
+        receipt = ad.get_durable_event_delivery(event)
+        assert receipt is not None
+        assert receipt["delivery_state"] == "delivered"
+    else:
+        assert effects == []
+        assert isolated_registry.completion_event_should_deliver(event)
+        retry = isolated_registry.completion_queue.get_nowait()
+        assert isolated_registry.completion_queue.empty()
+        receipt = ad.get_durable_event_delivery(event)
+        assert receipt is not None
+        assert receipt["delivery_state"] == "effect_started"
         assert retry["_completion_delivery_retained_claim_id"] == receipt["delivery_claim"]
 
-    assert asyncio.run(
-        runner._deliver_completion_notification("payload", retry)
-    ) is True
-    assert effects == [event["session_id"]]
-    receipt = ad.get_durable_event_delivery(event)
-    assert receipt is not None
-    assert receipt["delivery_state"] == "delivered"
-    assert isolated_registry.completion_queue.empty()
-    assert not isolated_registry.completion_event_should_deliver(event)
+        assert (
+            asyncio.run(runner._deliver_completion_notification("payload", retry))
+            is True
+        )
+        assert effects == [event["session_id"]]
+        receipt = ad.get_durable_event_delivery(event)
+        assert receipt is not None
+        assert receipt["delivery_state"] == "delivered"
+        assert isolated_registry.completion_queue.empty()
+        assert not isolated_registry.completion_event_should_deliver(event)
 
     assert asyncio.run(
         runner._deliver_completion_notification("payload", dict(event))

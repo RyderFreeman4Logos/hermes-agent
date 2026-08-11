@@ -1002,31 +1002,40 @@ def test_tui_storage_failure_retries_once_in_same_process(
     else:
         server._dispatch_completion_batch("sid", session, [item], consumer="tui-test")
 
-    assert effects == []
-    assert registry.completion_event_should_deliver(event)
-    retry = registry.completion_queue.get_nowait()
-    assert registry.completion_queue.empty()
-    receipt = ad.get_durable_event_delivery(event)
-    assert receipt is not None
-    assert receipt["delivery_state"] == (
-        "pending" if storage_failure == "claim" else "effect_started"
-    )
-    if storage_failure == "release":
+    if storage_failure == "claim":
+        assert effects == ["completion"]
+        assert registry.completion_queue.empty()
+        if surface == "busy":
+            pending = session["_completion_steer_pending"][-1]
+            assert server._finish_completion_claim(
+                pending["evt"], pending["claim"], "committed"
+            )
+    else:
+        assert effects == []
+        assert registry.completion_event_should_deliver(event)
+        retry = registry.completion_queue.get_nowait()
+        assert registry.completion_queue.empty()
+        receipt = ad.get_durable_event_delivery(event)
+        assert receipt is not None
+        assert receipt["delivery_state"] == "effect_started"
         assert retry["_completion_delivery_retained_claim_id"] == receipt["delivery_claim"]
 
-    session["running"] = True
-    if surface == "busy":
-        assert server._try_steer_busy_completion(
-            session, retry, "completion", "completion"
-        ) is True
-        pending = session["_completion_steer_pending"][-1]
-        assert server._finish_completion_claim(
-            pending["evt"], pending["claim"], "committed"
-        )
-    else:
-        server._dispatch_completion_batch(
-            "sid", session, [{**item, "evt": retry}], consumer="tui-test"
-        )
+        session["running"] = True
+        if surface == "busy":
+            assert (
+                server._try_steer_busy_completion(
+                    session, retry, "completion", "completion"
+                )
+                is True
+            )
+            pending = session["_completion_steer_pending"][-1]
+            assert server._finish_completion_claim(
+                pending["evt"], pending["claim"], "committed"
+            )
+        else:
+            server._dispatch_completion_batch(
+                "sid", session, [{**item, "evt": retry}], consumer="tui-test"
+            )
 
     assert effects == ["completion"]
     receipt = ad.get_durable_event_delivery(event)

@@ -11080,12 +11080,28 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         )
         from tools.runtime_heartbeat import runtime_heartbeat
 
+        if getattr(self, "_completion_delivery_inflight", False):
+            return
+        with self._pending_input.mutex:
+            if any(
+                isinstance(item, _CompletionDeliveryMessage)
+                for item in self._pending_input.queue
+            ):
+                return
         session_key = getattr(self, "session_id", "") or ""
-        for event, synthetic_message in process_registry.drain_notifications(
+        drained = process_registry.drain_notifications(
             session_key=session_key,
             owns_event=self._owns_process_notification,
-        ):
-            claim = claim_completion_event_delivery(event, consumer)
+        )
+        for event_index, (event, synthetic_message) in enumerate(drained):
+            retry_events: list[dict] = []
+            claim = claim_completion_event_delivery(
+                event, consumer, retry_queue=retry_events
+            )
+            if retry_events:
+                retry_events.extend(evt for evt, _text in drained[event_index + 1 :])
+                process_registry.requeue_completions_front(retry_events)
+                break
             if claim is None:
                 continue
             if event.get("type") == "heartbeat":
@@ -11142,7 +11158,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             else:
                 queued_message = synthetic_message
             self._pending_input.put(queued_message)
-            if not isinstance(queued_message, _CompletionDeliveryMessage):
+            if isinstance(queued_message, _CompletionDeliveryMessage):
+                untouched = [evt for evt, _text in drained[event_index + 1 :]]
+                if untouched:
+                    process_registry.requeue_completions_front(untouched)
+                break
+            else:
                 complete_event_delivery(event, claim)
 
     def _drain_interrupt_queue_to_pending_input(self) -> None:
@@ -14195,10 +14216,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     ) -> Optional[str]:
         """Run one CLI turn and release any unresolved completion claim."""
         completion_resolved = False
+        if completion_delivery:
+            self._completion_delivery_inflight = True
 
         def _finish_completion(outcome: str) -> None:
             nonlocal completion_resolved
-            if completion_resolved or not completion_event or not completion_claim:
+            if completion_resolved or not completion_event or not completion_delivery:
                 return
             completion_resolved = True
             from tools.process_registry import finish_completion_event_delivery
@@ -14221,6 +14244,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             )
         finally:
             _finish_completion("provider_failed")
+            if completion_delivery:
+                self._completion_delivery_inflight = False
 
     def _chat(
         self,

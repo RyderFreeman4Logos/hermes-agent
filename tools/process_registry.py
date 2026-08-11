@@ -2779,15 +2779,21 @@ class ProcessRegistry:
 
     def requeue_completion_front(self, evt: Dict[str, Any]) -> None:
         """Return a held completion to its original FIFO boundary."""
+        self.requeue_completions_front([evt])
+
+    def requeue_completions_front(self, events: "list[Dict[str, Any]]") -> None:
+        """Atomically restore detached work ahead of a concurrent producer tail."""
+        if not events:
+            return
         completion_queue = self.completion_queue
-        with completion_queue.not_full:
-            while (
-                completion_queue.maxsize > 0
-                and len(completion_queue.queue) >= completion_queue.maxsize
-            ):
-                completion_queue.not_full.wait()
-            completion_queue.queue.appendleft(evt)
-            completion_queue.not_empty.notify()
+        # Detached events already count in unfinished_tasks. A producer may
+        # consume their freed capacity before rollback, so waiting for maxsize
+        # here can deadlock the sole consumer. Restore without a second put;
+        # normal get() calls wake blocked producers as the queue drops below its
+        # bound again.
+        with completion_queue.not_empty:
+            completion_queue.queue.extendleft(reversed(events))
+            completion_queue.not_empty.notify_all()
 
     def drain_notifications(
         self,
@@ -2861,52 +2867,68 @@ class ProcessRegistry:
             return []
 
         for event_index, evt in enumerate(pending):
-            # Local consumed/observed state may suppress only events this
-            # session owns (or legacy ownerless ordinary events). Routing must
-            # happen first so a foreign session cannot drop the owner's event.
-            if evt.get("type") == "completion" and self._drain_should_skip(evt):
+            formatted = False
+            try:
+                # Local consumed/observed state may suppress only events this
+                # session owns (or legacy ownerless ordinary events). Routing must
+                # happen first so a foreign session cannot drop the owner's event.
+                if evt.get("type") == "completion" and self._drain_should_skip(evt):
+                    continue
+
+                text = (
+                    format_runtime_heartbeat(evt)
+                    if evt.get("type") == "heartbeat"
+                    else format_process_notification(evt)
+                )
+                if text:
+                    formatted = True
+                    text = completion_delivery_prompt(evt, text)
+            except Exception:
+                # Earlier formatted results have not escaped this call yet.
+                # Restore them with the failing item and untouched suffix as one
+                # unit, ahead of anything produced after snapshot selection.
+                restore = [result_evt for result_evt, _text in results]
+                restore.extend(pending[event_index:])
+                self.requeue_completions_front(restore)
+                logger.warning(
+                    "Notification formatting failed; restored selected batch",
+                    exc_info=True,
+                )
+                raise
+            if not formatted:
                 continue
+            if text is not None:
+                results.append((evt, text))
+                continue
+            if evt.get("type") not in {"completion", "async_delegation"}:
+                continue
+            if not self.claim_completion_delivery(evt):
+                continue
+            try:
+                from tools.async_delegation import claim_event_delivery
 
-            text = (
-                format_runtime_heartbeat(evt)
-                if evt.get("type") == "heartbeat"
-                else format_process_notification(evt)
-            )
-            if text:
-                text = completion_delivery_prompt(evt, text)
-                if text is not None:
-                    results.append((evt, text))
-                elif evt.get("type") in {"completion", "async_delegation"}:
-                    if not self.claim_completion_delivery(evt):
-                        continue
-                    try:
-                        from tools.async_delegation import claim_event_delivery
-
-                        claim_id = claim_event_delivery(
-                            evt, "visibility-suppressed"
-                        )
-                    except Exception:
-                        self.release_completion_delivery(evt)
-                        requeue.append(evt)
-                        requeue.extend(pending[event_index + 1 :])
-                        break
-                    if claim_id is None:
-                        self.release_completion_delivery(evt)
-                        continue
-                    if not claim_id:
-                        self.complete_completion_delivery(evt)
-                        continue
-                    if not finish_completion_event_delivery(
-                        evt,
-                        claim_id,
-                        "visibility_suppressed",
-                        registry=self,
-                        retry_queue=requeue,
-                    ):
-                        requeue.extend(pending[event_index + 1 :])
-                        break
-        for evt in reversed(requeue):
-            self.requeue_completion_front(evt)
+                claim_id = claim_event_delivery(evt, "visibility-suppressed")
+            except Exception:
+                self.release_completion_delivery(evt)
+                requeue.append(evt)
+                requeue.extend(pending[event_index + 1 :])
+                break
+            if claim_id is None:
+                self.release_completion_delivery(evt)
+                continue
+            if not claim_id:
+                self.complete_completion_delivery(evt)
+                continue
+            if not finish_completion_event_delivery(
+                evt,
+                claim_id,
+                "visibility_suppressed",
+                registry=self,
+                retry_queue=requeue,
+            ):
+                requeue.extend(pending[event_index + 1 :])
+                break
+        self.requeue_completions_front(requeue)
         return results
 
     def get(self, session_id: str) -> Optional[ProcessSession]:
@@ -4141,23 +4163,39 @@ def claim_completion_event_delivery(
     consumer: str,
     *,
     registry: Optional[ProcessRegistry] = None,
+    retry_queue: Optional[list[dict]] = None,
 ) -> Optional[str]:
     """Claim local and durable ownership without stranding a dequeued event."""
     from tools.async_delegation import claim_event_delivery
 
     target = registry or process_registry
-    if not target.claim_completion_delivery(evt):
-        return None
-    try:
-        claim_id = claim_event_delivery(evt, consumer)
-    except Exception:
-        logger.debug("Failed to claim durable completion delivery", exc_info=True)
-        target.release_completion_delivery(evt)
-        target.completion_queue.put(evt)
-        return None
-    if claim_id is None:
-        target.release_completion_delivery(evt)
-    return claim_id
+    claim_failed = False
+    for attempt in range(2):
+        if not target.claim_completion_delivery(evt):
+            return None
+        try:
+            claim_id = claim_event_delivery(evt, consumer)
+        except Exception:
+            logger.debug("Failed to claim durable completion delivery", exc_info=True)
+            target.release_completion_delivery(evt)
+            claim_failed = True
+            if attempt == 0:
+                continue
+            if retry_queue is None:
+                target.requeue_completion_front(evt)
+            else:
+                retry_queue.append(evt)
+            return None
+        if claim_id is None:
+            target.release_completion_delivery(evt)
+            if claim_failed:
+                if retry_queue is None:
+                    target.requeue_completion_front(evt)
+                else:
+                    retry_queue.append(evt)
+            return None
+        return claim_id
+    return None
 
 
 def finish_completion_event_delivery(
@@ -4251,7 +4289,7 @@ def finish_completion_event_delivery(
     elif claim_id:
         retry_event["_completion_delivery_retained_claim_id"] = claim_id
     if retry_queue is None:
-        target.completion_queue.put(retry_event)
+        target.requeue_completion_front(retry_event)
     else:
         retry_queue.append(retry_event)
     return False

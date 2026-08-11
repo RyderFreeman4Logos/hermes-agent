@@ -9546,6 +9546,13 @@ def _mark_steered_completions_applied(session: dict, applied_text: str) -> list[
     return marked
 
 
+def _restore_completion_events(process_registry, events: list[dict]) -> bool:
+    """Retry one transient queue outage, then use the registry's safe fallback."""
+    from tools.process_registry import restore_completion_event_retries
+
+    return restore_completion_event_retries(events, registry=process_registry)
+
+
 def _finish_steered_completion_claims(session: dict, outcome: str) -> list[dict]:
     """Resolve applied busy steers at the same terminal fence as idle delivery."""
     with session["history_lock"]:
@@ -9565,7 +9572,7 @@ def _finish_steered_completion_claims(session: dict, outcome: str) -> list[dict]
     if retry_events:
         from tools.process_registry import process_registry
 
-        process_registry.requeue_completions_front(retry_events)
+        _restore_completion_events(process_registry, retry_events)
     return terminal
 
 
@@ -9727,13 +9734,35 @@ def _dispatch_completion_batch(
             return []
         settled = True
         retry_events: list[dict] = []
-        terminal = [
-            _finish_completion_claim(
-                item["evt"], claim, outcome, retry_queue=retry_events
-            )
-            for item, claim in claimed
-        ]
-        process_registry.requeue_completions_front(retry_events)
+        terminal = []
+        for item, claim in claimed:
+            try:
+                terminal.append(
+                    _finish_completion_claim(
+                        item["evt"], claim, outcome, retry_queue=retry_events
+                    )
+                )
+            except Exception:
+                logger.warning(
+                    "Completion settlement failed; retaining its delivery fence",
+                    exc_info=True,
+                )
+                if outcome == "committed":
+                    from tools.process_registry import (
+                        reconcile_committed_completion_event_delivery,
+                    )
+
+                    terminal.append(
+                        reconcile_committed_completion_event_delivery(
+                            item["evt"], claim, registry=process_registry
+                        )
+                    )
+                else:
+                    retry_event = dict(item["evt"])
+                    retry_event["_completion_delivery_retained_claim_id"] = claim
+                    retry_events.append(retry_event)
+                    terminal.append(False)
+        _restore_completion_events(process_registry, retry_events)
         return terminal
 
     try:
@@ -9758,7 +9787,7 @@ def _dispatch_completion_batch(
                                 "provider_failed",
                                 retry_queue=retry_events,
                             )
-                    process_registry.requeue_completions_front(retry_events)
+                    _restore_completion_events(process_registry, retry_events)
                     break
                 if claim is None:
                     continue
@@ -9771,7 +9800,7 @@ def _dispatch_completion_batch(
             [item for item, _claim in claimed]
         )
         if not prompt:
-            finish_claims("committed")
+            finish_claims("visibility_noop")
             with session["history_lock"]:
                 session["running"] = False
             return
@@ -9852,11 +9881,11 @@ def _finish_suppressed_completion(
         terminal = _finish_completion_claim(
             evt,
             claim,
-            "committed",
+            "visibility_noop",
             retry_queue=retries,
         )
     if retry_queue is None and len(retries) > retry_start:
-        process_registry.requeue_completions_front(retries[retry_start:])
+        _restore_completion_events(process_registry, retries[retry_start:])
     return terminal
 
 
@@ -9891,7 +9920,7 @@ def _collect_idle_completion_batch(
         except Exception:
             break
         if _notification_event_belongs_elsewhere(sid, session, evt):
-            process_registry.requeue_completion_front(evt)
+            _restore_completion_events(process_registry, [evt])
             time.sleep(_NOTIFICATION_REQUEUE_BACKOFF_SECONDS)
             continue
         requires_owner = _notification_event_requires_owner(evt)
@@ -9900,7 +9929,7 @@ def _collect_idle_completion_batch(
         if not process_registry.completion_event_should_deliver(evt):
             continue
         if evt.get("type") == "heartbeat":
-            process_registry.requeue_completion_front(evt)
+            _restore_completion_events(process_registry, [evt])
             break
         try:
             text = format_process_notification(evt)
@@ -9908,8 +9937,8 @@ def _collect_idle_completion_batch(
                 continue
             model_text = completion_delivery_prompt(evt, text)
         except Exception:
-            process_registry.requeue_completions_front(
-                [item["evt"] for item in batch_items] + [evt]
+            _restore_completion_events(
+                process_registry, [item["evt"] for item in batch_items] + [evt]
             )
             raise
         if model_text is None:
@@ -10197,7 +10226,7 @@ def _notification_poller_loop(
         # session's poller happened to wake first (Ben's "reported in a
         # different session" bug). Leave foreign events for their owner.
         if _notification_event_belongs_elsewhere(sid, session, evt):
-            process_registry.requeue_completion_front(evt)
+            _restore_completion_events(process_registry, [evt])
             time.sleep(_NOTIFICATION_REQUEUE_BACKOFF_SECONDS)
             continue
 
@@ -10253,7 +10282,7 @@ def _notification_poller_loop(
             compression_fence := session.get("_manual_compression_fence")
         ) is not None:
             if not _notification_poller_is_current(session, stop_event):
-                process_registry.requeue_completion_front(evt)
+                _restore_completion_events(process_registry, [evt])
                 return
             compression_fence.wait(_NOTIFICATION_QUEUE_WAIT_SECONDS)
 
@@ -10267,7 +10296,7 @@ def _notification_poller_loop(
                 continue
             model_text = completion_delivery_prompt(evt, text)
         except Exception as exc:
-            process_registry.requeue_completion_front(evt)
+            _restore_completion_events(process_registry, [evt])
             logger.warning(
                 "Completion notification formatting failed: %s", exc, exc_info=True
             )
@@ -10295,14 +10324,14 @@ def _notification_poller_loop(
             continue
         if steer_result is False:
             # Busy but not steer-capable: legacy requeue until idle.
-            process_registry.requeue_completion_front(evt)
+            _restore_completion_events(process_registry, [evt])
             time.sleep(_NOTIFICATION_REQUEUE_BACKOFF_SECONDS)
             continue
 
         # Idle path: coalesce a bounded per-session backlog into ONE turn.
         with session["history_lock"]:
             if session.get("running"):
-                process_registry.requeue_completion_front(evt)
+                _restore_completion_events(process_registry, [evt])
                 time.sleep(_NOTIFICATION_REQUEUE_BACKOFF_SECONDS)
                 continue
             session["running"] = True
@@ -10324,9 +10353,9 @@ def _notification_poller_loop(
                 session["running"] = False
             continue
         if overflow:
-            process_registry.requeue_completions_front([
-                overflow_item["evt"] for overflow_item in overflow
-            ])
+            _restore_completion_events(
+                process_registry, [overflow_item["evt"] for overflow_item in overflow]
+            )
         _dispatch_completion_batch(sid, session, batch_items, consumer="tui-poller")
 
     # Drain only this session's bounded queue snapshot after stop. Foreign
@@ -10384,9 +10413,10 @@ def _notification_poller_loop(
             restore_ids = {id(event) for event in deferred}
             restore_ids.update(id(item["evt"]) for item in shutdown_batch)
             restore_ids.update(id(event) for event in shutdown_events[event_index:])
-            process_registry.requeue_completions_front([
-                event for event in shutdown_events if id(event) in restore_ids
-            ])
+            _restore_completion_events(
+                process_registry,
+                [event for event in shutdown_events if id(event) in restore_ids],
+            )
             logger.warning(
                 "Completion shutdown formatting failed: %s", exc, exc_info=True
             )
@@ -10400,7 +10430,7 @@ def _notification_poller_loop(
                 retry_queue=retry_events,
             ):
                 retry_events.extend(shutdown_events[event_index + 1 :])
-                process_registry.requeue_completions_front(retry_events)
+                _restore_completion_events(process_registry, retry_events)
                 break
             continue
 
@@ -10414,7 +10444,7 @@ def _notification_poller_loop(
                 retry_events = [item["evt"] for item in shutdown_batch]
                 retry_events.extend(shutdown_events[event_index:])
                 shutdown_batch.clear()
-                process_registry.requeue_completions_front(retry_events)
+                _restore_completion_events(process_registry, retry_events)
                 break
         shutdown_batch.append({"evt": evt, "model_text": model_text, "text": text})
 
@@ -10422,15 +10452,15 @@ def _notification_poller_loop(
         dispatch_items: list[dict] = []
         with session["history_lock"]:
             if session.get("running"):
-                process_registry.requeue_completions_front([
-                    item["evt"] for item in shutdown_batch
-                ])
+                _restore_completion_events(
+                    process_registry, [item["evt"] for item in shutdown_batch]
+                )
             else:
                 session["running"] = True
                 batch_items, overflow = _bound_completion_batch(shutdown_batch)
-                process_registry.requeue_completions_front([
-                    item["evt"] for item in overflow
-                ])
+                _restore_completion_events(
+                    process_registry, [item["evt"] for item in overflow]
+                )
                 if batch_items:
                     dispatch_items = batch_items
                 else:
@@ -10442,7 +10472,7 @@ def _notification_poller_loop(
 
     # Ownership can change after the snapshot predicate. Fail closed and put
     # those rare records ahead of any newer producer tail in original order.
-    process_registry.requeue_completions_front(deferred)
+    _restore_completion_events(process_registry, deferred)
 
 
 def _handle_heartbeat_event(sid: str, session: dict, evt: dict) -> None:
@@ -11715,7 +11745,7 @@ def _run_prompt_submit(
                             else:
                                 # Keep claimed steers pending for a later idle poller.
                                 session.setdefault("_completion_steer_pending", []).append(item)
-                        process_registry.requeue_completions_front(retry_events)
+                        _restore_completion_events(process_registry, retry_events)
                         batch_items = []
                     else:
                         session["running"] = True
@@ -11728,7 +11758,7 @@ def _run_prompt_submit(
                         else:
                             with session["history_lock"]:
                                 session.setdefault("_completion_steer_pending", []).append(item)
-                    process_registry.requeue_completions_front(retry_events)
+                    _restore_completion_events(process_registry, retry_events)
                     _dispatch_completion_batch(
                         sid, session, bounded, consumer="tui-post-turn"
                     )

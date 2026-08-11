@@ -793,12 +793,8 @@ def test_gateway_recovers_checkpointed_completion_through_history_commit(
         db.close()
 
 
-def test_gateway_retries_retained_same_process_claim(
-    monkeypatch, tmp_path, isolated_registry
-):
-    """A double-write failure keeps its claim until the gateway retry terminalizes it."""
-    from hermes_state import SessionDB
-    from tests.gateway.test_first_turn_session_meta_rebaseline import SESSION_ID
+def test_gateway_retries_retained_same_process_claim(monkeypatch, isolated_registry):
+    """A committed effect becomes ACK-only when both durable writes fail."""
     from tools import async_delegation as ad
     import tools.process_registry as registry_module
 
@@ -810,8 +806,6 @@ def test_gateway_retries_retained_same_process_claim(
     assert isolated_registry.claim_completion_delivery(event)
     claim = ad.claim_event_delivery(event, "gateway-test")
     assert claim
-    complete = ad.complete_event_delivery
-    release = ad.release_event_delivery
     monkeypatch.setattr(
         ad,
         "complete_event_delivery",
@@ -823,31 +817,13 @@ def test_gateway_retries_retained_same_process_claim(
         lambda *_args: (_ for _ in ()).throw(OSError("release unavailable")),
     )
 
-    assert not registry_module.finish_completion_event_delivery(
+    assert registry_module.finish_completion_event_delivery(
         event, claim, "committed", registry=isolated_registry
     )
-    retry = isolated_registry.completion_queue.get_nowait()
-    assert retry["_completion_delivery_retained_claim_id"] == claim
-    isolated_registry.completion_queue.put(retry)
-    monkeypatch.setattr(ad, "complete_event_delivery", complete)
-    monkeypatch.setattr(ad, "release_event_delivery", release)
-
-    db = SessionDB(db_path=tmp_path / "sessions.db")
-    db.create_session(SESSION_ID, source="telegram")
-    runner, adapter, _committed = _committing_gateway_runner(
-        monkeypatch, tmp_path, db
-    )
-    try:
-        asyncio.run(
-            _run_gateway_completion_queue(monkeypatch, runner, isolated_registry)
-        )
-        adapter.handle_message.assert_awaited_once()
-        receipt = ad.get_durable_event_delivery(event)
-        assert receipt is not None
-        assert receipt["delivery_state"] == "delivered"
-        assert isolated_registry.completion_queue.empty()
-    finally:
-        db.close()
+    receipt = ad.get_durable_event_delivery(event)
+    assert receipt is not None
+    assert receipt["delivery_state"] == "recovery_committed_ack"
+    assert isolated_registry.completion_queue.empty()
 
 
 def test_duplicate_async_queue_replay_injects_once(monkeypatch, isolated_registry):
@@ -959,6 +935,52 @@ def test_gateway_push_keeps_claim_until_turn_commit(isolated_registry):
     assert receipt is not None
     assert receipt["delivery_state"] == "delivered"
     assert not isolated_registry.completion_event_should_deliver(event)
+
+
+@pytest.mark.parametrize("failure_index", [0, 1])
+def test_gateway_receipt_consumer_isolates_settlement_exception(
+    monkeypatch, isolated_registry, failure_index
+):
+    from tools import async_delegation as ad
+    import tools.process_registry as registry_module
+
+    events = [
+        _completion_event(
+            started_at=2.61 + index / 100,
+            session_id=f"proc-receipt-isolation-{index}",
+        )
+        for index in range(3)
+    ]
+    receipts = []
+    for event in events:
+        assert ad.persist_event_delivery(event)
+        assert isolated_registry.claim_completion_delivery(event)
+        claim = ad.claim_event_delivery(event, "gateway-receipt-test")
+        assert claim
+        receipts.append({"event": event, "claim_id": claim})
+    message = MagicMock(metadata={"_completion_delivery_receipts": receipts})
+    attempted = []
+    finish = registry_module.finish_completion_event_delivery
+
+    def fail_one(event, claim_id, outcome, **kwargs):
+        attempted.append(event)
+        if event is events[failure_index]:
+            raise OSError("receipt settlement unavailable")
+        return finish(event, claim_id, outcome, **kwargs)
+
+    monkeypatch.setattr(registry_module, "finish_completion_event_delivery", fail_one)
+    runner = _runner(SimpleNamespace())
+
+    asyncio.run(runner._finish_completion_delivery_receipt(message, "committed"))
+
+    assert attempted == events
+    assert message.metadata == {}
+    for index, event in enumerate(events):
+        receipt = ad.get_durable_event_delivery(event)
+        assert receipt is not None
+        expected = "recovery_committed_ack" if index == failure_index else "delivered"
+        assert receipt["delivery_state"] == expected
+    assert isolated_registry.completion_queue.empty()
 
 
 def test_busy_gateway_merge_finalizes_every_completion_receipt(

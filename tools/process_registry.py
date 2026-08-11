@@ -2427,7 +2427,9 @@ class ProcessRegistry:
             if identity is not None:
                 with self._completion_disposition_lock:
                     state = self._completion_dispositions.get(identity)
-                    if state in {"queued", "observed_queued", "inflight", "delivered"}:
+                    if state in {"queued", "observed_queued"}:
+                        return
+                    if state in {"inflight", "observed_inflight", "delivered"}:
                         try:
                             from tools.async_delegation import (
                                 claim_event_delivery,

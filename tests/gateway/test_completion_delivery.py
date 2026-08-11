@@ -1810,3 +1810,80 @@ def test_gateway_presentation_projection_shares_producer_delivery_identity(
     receipt = ad.get_durable_event_delivery(queued_event)
     assert receipt is not None
     assert receipt["delivery_state"] == "delivered"
+
+
+def test_released_projection_retry_survives_delayed_producer(
+    monkeypatch, isolated_registry
+):
+    from tools import async_delegation as ad
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"auxiliary": {"completion_visibility": {"enabled": False}}},
+    )
+    process = ProcessSession(
+        id="proc-projection-retry-race",
+        command="printf long-output",
+        task_id="task",
+        session_key="agent:main:telegram:dm:123",
+        started_at=73.0,
+        output_buffer="prefix\n" + ("x" * 2400),
+        exited=True,
+        exit_code=0,
+        completion_reason="exited",
+        termination_source="",
+        notify_on_complete=True,
+        delegated_child=False,
+    )
+    isolated_registry._running[process.id] = process
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    runner._load_background_notifications_mode = lambda: "off"
+
+    async def instant_sleep(_delay):
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", instant_sleep)
+    asyncio.run(
+        runner._run_process_watcher({
+            "session_id": process.id,
+            "check_interval": 0,
+            "session_key": process.session_key,
+            "platform": "telegram",
+            "chat_type": "dm",
+            "chat_id": "123",
+            "notify_on_complete": True,
+        })
+    )
+    first_delivery = adapter.handle_message.await_args.args[0]
+    first_event = first_delivery.metadata["_completion_delivery_receipt"]["event"]
+    canonical_event = isolated_registry._completion_event(process)
+    assert ad._ordinary_completion_delivery_id(
+        first_event
+    ) == ad._ordinary_completion_delivery_id(canonical_event)
+
+    asyncio.run(
+        runner._finish_completion_delivery_receipt(first_delivery, "provider_failed")
+    )
+    receipt = ad.get_durable_event_delivery(canonical_event)
+    assert receipt is not None
+    assert receipt["delivery_state"] == "pending"
+    assert isolated_registry.completion_queue.qsize() == 1
+
+    isolated_registry._move_to_finished(process)
+    sleep_calls = 0
+
+    async def bounded_sleep(_delay):
+        nonlocal sleep_calls
+        sleep_calls += 1
+        if sleep_calls >= 2:
+            runner._running = False
+
+    monkeypatch.setattr(asyncio, "sleep", bounded_sleep)
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    assert adapter.handle_message.await_count == 2
+    receipt = ad.get_durable_event_delivery(canonical_event)
+    assert receipt is not None
+    assert receipt["delivery_state"] == "effect_started"
+    assert isolated_registry.completion_queue.empty()

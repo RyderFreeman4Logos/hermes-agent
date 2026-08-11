@@ -621,10 +621,10 @@ def test_codex_timeout_classes_use_fake_clock_and_retry_path(
     monkeypatch.setattr(conversation_loop.time, "sleep", lambda _seconds: None)
     result = agent.run_conversation("one potentially billed action")
 
-    # After #90, one fresh checkpoint continuation is allowed before the
-    # ambiguous path terminates. The second raise is that continuation, not
-    # a transport replay of the original accepted request.
-    assert len(calls) == 2
+    # The original ambiguous attempt plus up to three fresh checkpoint
+    # continuations are allowed. These are new reconciliation requests, not
+    # transport replays of the originally accepted request.
+    assert len(calls) == 4
     assert result["ambiguous_provider_attempt"] is True
     assert result.get("turn_exit_reason") == "ambiguous_provider_attempt"
     assert (

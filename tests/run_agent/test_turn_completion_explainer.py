@@ -1478,11 +1478,17 @@ def test_codex_responses_normal_dispatch_publishes_only_after_validation(
         response = agent._interruptible_api_call(request)
 
     assert response is normal_response
-    run_codex.assert_called_once_with(
-        request,
-        client=wire_client,
-        on_first_delta=None,
-    )
+    run_codex.assert_called_once()
+    dispatched_request = run_codex.call_args.args[0]
+    lifecycle_key = "_hermes_physical_attempt_lifecycle"
+    assert lifecycle_key in dispatched_request
+    assert {
+        key: value for key, value in dispatched_request.items() if key != lifecycle_key
+    } == request
+    assert run_codex.call_args.kwargs == {
+        "client": wire_client,
+        "on_first_delta": None,
+    }
     before_validation = agent.run_conversation(
         "",
         turn_origin="heartbeat_warm",
@@ -2393,7 +2399,7 @@ def test_first_api_call_reports_cache_hit_to_tui_callback(
     )
     agent.client.chat.completions.create.side_effect = [response]
     cache_events = []
-    agent._tui_cache_callback = lambda state, pct, read, prompt: cache_events.append(
+    agent._tui_cache_callback = lambda state, pct, read, prompt, _record: cache_events.append(
         (state, pct, read, prompt)
     )
 

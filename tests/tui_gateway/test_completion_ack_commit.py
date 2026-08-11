@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 import types
 
 import pytest
@@ -188,12 +189,13 @@ def test_startup_restore_makes_effect_started_completion_retryable(
     monkeypatch.setattr(ad, "_db_path", lambda: db_path)
     db = SessionDB(db_path)
     db.create_session(session_id="active", source="tui", model="test")
+    fresh_time = time.time()
     event = {
         "type": "async_delegation",
         "delegation_id": "deleg-pre-ack-crash",
         "session_key": "active",
-        "dispatched_at": 1.0,
-        "completed_at": 2.0,
+        "dispatched_at": fresh_time,
+        "completed_at": fresh_time,
         "summary": "done",
     }
     try:
@@ -202,7 +204,7 @@ def test_startup_restore_makes_effect_started_completion_retryable(
             "session_key": "active",
             "origin_ui_session_id": "sid",
             "parent_session_id": "active",
-            "dispatched_at": 1.0,
+            "dispatched_at": fresh_time,
         })
         ad._persist_completion(event, {"status": "completed", "summary": "done"})
         assert ad.claim_completion_delivery(event["delegation_id"], "crashed-claim")

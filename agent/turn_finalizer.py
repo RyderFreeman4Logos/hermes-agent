@@ -45,6 +45,9 @@ from agent.retry_utils import jittered_backoff
 
 
 _COMPLETION_COMMIT_DEFAULTS = (32, 0.05, 5.0, 120.0)
+_COMPLETION_COMMIT_MAX_ATTEMPTS = 1_000
+_COMPLETION_COMMIT_MAX_BACKOFF_S = 60.0
+_COMPLETION_COMMIT_MAX_PATIENCE_S = 3_600.0
 
 
 def _get_completion_delivery_commit_config() -> tuple[int, float, float, float]:
@@ -61,11 +64,16 @@ def _get_completion_delivery_commit_config() -> tuple[int, float, float, float]:
         )
         if not all(math.isfinite(value) for value in values):
             raise ValueError("retry durations must be finite")
+        # ponytail: one-hour ceiling; raise it only if real SessionDB recovery
+        # needs a longer foreground turn budget.
         return (
-            max(1, int(retry.get("max_attempts", 32))),
-            max(0.0, values[0]),
-            max(0.0, values[1]),
-            max(0.0, values[2]),
+            min(
+                max(1, int(retry.get("max_attempts", 32))),
+                _COMPLETION_COMMIT_MAX_ATTEMPTS,
+            ),
+            min(max(0.0, values[0]), _COMPLETION_COMMIT_MAX_BACKOFF_S),
+            min(max(0.0, values[1]), _COMPLETION_COMMIT_MAX_BACKOFF_S),
+            min(max(0.0, values[2]), _COMPLETION_COMMIT_MAX_PATIENCE_S),
         )
     except Exception:
         return _COMPLETION_COMMIT_DEFAULTS
@@ -178,10 +186,12 @@ def _flush_completion_delivery_with_retry(agent, staged, metadata_cas) -> bool:
         attempts += 1
         error = None
         try:
+            remaining_patience = max(0.0, patience - (time.monotonic() - started))
             committed = (
                 agent._flush_messages_to_session_db(
                     staged,
                     display_metadata_cas=metadata_cas,
+                    patience_s=remaining_patience,
                 )
                 is True
             )
@@ -198,29 +208,35 @@ def _flush_completion_delivery_with_retry(agent, staged, metadata_cas) -> bool:
             _completion_delivery_commit_failure_kind(error)
         )
 
-        # Re-read after the failed flush: an operator may tune the policy while
-        # a long SessionDB attempt is blocked, without restarting the process.
-        max_attempts, initial, maximum, patience = (
-            _get_completion_delivery_commit_config()
-        )
-        elapsed = time.monotonic() - started
-        if attempts >= max_attempts or elapsed >= patience:
-            return False
-        remaining = patience - elapsed
-        delay = 0.0
-        if initial > 0 and maximum > 0:
-            delay = min(
-                jittered_backoff(
-                    attempts,
-                    base_delay=initial,
-                    max_delay=maximum,
-                    jitter_ratio=0.5,
-                ),
-                maximum,
-                remaining,
+        try:
+            # Re-read after the failed flush: an operator may tune the policy while
+            # a long SessionDB attempt is blocked, without restarting the process.
+            max_attempts, initial, maximum, patience = (
+                _get_completion_delivery_commit_config()
             )
-        if delay > 0:
-            time.sleep(delay)
+            elapsed = time.monotonic() - started
+            if attempts >= max_attempts or elapsed >= patience:
+                return False
+            remaining = patience - elapsed
+            delay = 0.0
+            if initial > 0 and maximum > 0:
+                delay = min(
+                    jittered_backoff(
+                        attempts,
+                        base_delay=initial,
+                        max_delay=maximum,
+                        jitter_ratio=0.5,
+                    ),
+                    maximum,
+                    remaining,
+                )
+            if delay > 0:
+                time.sleep(delay)
+        except Exception as exc:
+            agent._completion_delivery_commit_failure = (
+                _completion_delivery_commit_failure_kind(exc)
+            )
+            return False
 
 
 def _is_pure_tool_call_tail(msg: dict) -> bool:
@@ -393,16 +409,19 @@ def finalize_completion_delivery_suffix(
     )
     committed = not db_bound
     if db_bound:
-        committed = _flush_completion_delivery_with_retry(agent, staged, metadata_cas)
-    if not committed:
-        if commit_tool_intent:
-            agent._persist_user_message_idx = previous_persist_idx
-            agent._persist_user_message_override = previous_persist_override
+        # Install recovery authority before entering any fallible retry/timing
+        # code. An unexpected exception can never leave a visible effect free
+        # to start a new provider turn without its exact canonical suffix.
         agent._pending_completion_delivery_suffix = copy.deepcopy(staged[start:])
         agent._pending_completion_delivery_display_metadata_cas = copy.deepcopy(
             metadata_cas
         )
         agent._completion_delivery_commit_failed = True
+        committed = _flush_completion_delivery_with_retry(agent, staged, metadata_cas)
+    if not committed:
+        if commit_tool_intent:
+            agent._persist_user_message_idx = previous_persist_idx
+            agent._persist_user_message_override = previous_persist_override
         agent._db_flush_scan_prefix = None
         return "pending"
 

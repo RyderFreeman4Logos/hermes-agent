@@ -448,6 +448,115 @@ def _stop_after_sleeps(monkeypatch, runner, count):
     monkeypatch.setattr(asyncio, "sleep", _bounded_sleep)
 
 
+class _InterleavingDrainQueue(queue.Queue):
+    def __init__(self, producer_start, producer_done):
+        super().__init__()
+        self.producer_start = producer_start
+        self.producer_done = producer_done
+        self.legacy_gets = 0
+        self.triggered = False
+
+    def get_nowait(self):
+        self.legacy_gets += 1
+        return super().get_nowait()
+
+    def release_during_selective_drain(self):
+        if not self.legacy_gets and not self.triggered:
+            self.triggered = True
+            self.producer_start.set()
+            assert self.producer_done.wait(2), "producer did not finish"
+
+    def empty(self):
+        with self.mutex:
+            observed_empty = not self._qsize()
+        if observed_empty and self.legacy_gets and not self.triggered:
+            self.triggered = True
+            self.producer_start.set()
+            assert self.producer_done.wait(2), "producer did not finish"
+            return True
+        return observed_empty
+
+
+class _DrainSignalEvent(dict):
+    def __init__(self, completion_queue, **values):
+        super().__init__(values)
+        self.completion_queue = completion_queue
+
+    def get(self, key, default=None):
+        if key == "type":
+            self.completion_queue.release_during_selective_drain()
+        return super().get(key, default)
+
+
+def test_gateway_watch_drain_preserves_foreign_fifo_during_concurrent_put():
+    producer_start = threading.Event()
+    producer_done = threading.Event()
+    completion_queue = _InterleavingDrainQueue(producer_start, producer_done)
+    first = _DrainSignalEvent(completion_queue, type="completion", seq=1)
+    watch = _DrainSignalEvent(completion_queue, type="watch_match", seq="watch")
+    second = _DrainSignalEvent(completion_queue, type="completion", seq=2)
+    third = _DrainSignalEvent(completion_queue, type="completion", seq=3)
+    for event in (first, watch, second):
+        completion_queue.put(event)
+
+    def produce():
+        assert producer_start.wait(2), "watch drain did not reach producer boundary"
+        completion_queue.put(third)
+        producer_done.set()
+
+    producer = threading.Thread(target=produce, daemon=True)
+    producer.start()
+    try:
+        assert _drain_gateway_watch_events(completion_queue) == [watch]
+        producer.join(2)
+        assert not producer.is_alive()
+        with completion_queue.mutex:
+            remaining = list(completion_queue.queue)
+        assert [event["seq"] for event in remaining] == [1, 2, 3]
+    finally:
+        producer_start.set()
+        producer.join(2)
+
+
+def test_gateway_completion_drain_preserves_watch_fifo_during_concurrent_put(
+    monkeypatch, isolated_registry
+):
+    producer_start = threading.Event()
+    producer_done = threading.Event()
+    completion_queue = _InterleavingDrainQueue(producer_start, producer_done)
+    first = _DrainSignalEvent(completion_queue, type="watch_match", seq=1)
+    heartbeat = _DrainSignalEvent(completion_queue, type="heartbeat", seq="heartbeat")
+    second = _DrainSignalEvent(completion_queue, type="watch_match", seq=2)
+    third = _DrainSignalEvent(completion_queue, type="watch_match", seq=3)
+    for event in (first, heartbeat, second):
+        completion_queue.put(event)
+    isolated_registry.completion_queue = completion_queue
+
+    def produce():
+        assert producer_start.wait(2), (
+            "completion drain did not reach producer boundary"
+        )
+        completion_queue.put(third)
+        producer_done.set()
+
+    producer = threading.Thread(target=produce, daemon=True)
+    producer.start()
+    runner = _runner(SimpleNamespace())
+    runner._handle_heartbeat_event = AsyncMock()
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+    try:
+        asyncio.run(runner._async_delegation_watcher(interval=0))
+        producer.join(2)
+        assert not producer.is_alive()
+        runner._handle_heartbeat_event.assert_awaited_once_with(heartbeat)
+        with completion_queue.mutex:
+            remaining = list(completion_queue.queue)
+        assert [event["seq"] for event in remaining] == [1, 2, 3]
+    finally:
+        producer_start.set()
+        producer.join(2)
+
+
 def _committing_gateway_runner(monkeypatch, tmp_path, db):
     """Run accepted synthetic events through the real gateway history fence."""
     from tests.gateway.test_first_turn_session_meta_rebaseline import (

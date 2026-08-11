@@ -3516,30 +3516,21 @@ def _format_gateway_process_notification(evt: dict) -> "str | None":
 
 
 def _drain_gateway_watch_events(completion_queue) -> "list[dict]":
-    """Drain gateway-owned watch events without spinning on requeued events.
+    """Drain gateway-owned watch events without rotating foreign events.
 
     Watch events are handled by the post-turn gateway drain. Completion and
     heartbeat events are owned by ``_async_delegation_watcher`` (with ordinary
     live-process delivery arbitrated against ``_run_process_watcher``).
-    Requeueing those events inside ``while not queue.empty()`` would make the
-    loop non-terminating, so detach the current batch first, then requeue any
-    events this drain does not own after the queue is empty.
     """
-    watch_events: list[dict] = []
-    requeue: list[dict] = []
-    while not completion_queue.empty():
-        try:
-            evt = completion_queue.get_nowait()
-        except Exception:
-            break
-        evt_type = evt.get("type", "completion")
-        if evt_type in {"watch_match", "watch_disabled"}:
-            watch_events.append(evt)
-        elif evt_type in {"completion", "async_delegation", "heartbeat"}:
-            requeue.append(evt)
-    for evt in requeue:
-        completion_queue.put(evt)
-    return watch_events
+    from tools.process_registry import drain_matching_queue_events
+
+    return drain_matching_queue_events(
+        completion_queue,
+        lambda evt: (
+            evt.get("type", "completion")
+            not in {"completion", "async_delegation", "heartbeat"}
+        ),
+    )
 
 
 # Module-level weak reference to the active GatewayRunner instance.
@@ -23636,19 +23627,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         live ordinary events against ``_run_process_watcher``.
         """
         await asyncio.sleep(3)  # let platforms finish connecting
-        from tools.process_registry import process_registry as _pr
+        from tools.process_registry import (
+            drain_matching_queue_events,
+            process_registry as _pr,
+        )
+
         while self._running:
             try:
-                # Detach the current queue batch so requeued watch events do not
-                # make this pass spin forever.
-                requeue = []
+                # Select this watcher's bounded snapshot without moving watch
+                # events behind a producer that appends concurrently.
                 completion_events = []
                 heartbeat_events = []
-                while not _pr.completion_queue.empty():
-                    try:
-                        evt = _pr.completion_queue.get_nowait()
-                    except Exception:
-                        break
+                events = drain_matching_queue_events(
+                    _pr.completion_queue,
+                    lambda evt: (
+                        evt.get("type", "completion")
+                        in {"completion", "async_delegation", "heartbeat"}
+                    ),
+                )
+                for evt in events:
                     if evt.get("type", "completion") in {
                         "completion",
                         "async_delegation",
@@ -23656,10 +23653,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         completion_events.append(evt)
                     elif evt.get("type") == "heartbeat":
                         heartbeat_events.append(evt)
-                    else:
-                        requeue.append(evt)
-                for evt in requeue:
-                    _pr.completion_queue.put(evt)
                 for evt in completion_events:
                     synth_text = _format_gateway_process_notification(evt)
                     if not synth_text:

@@ -2,6 +2,7 @@
 
 import json
 import os
+import queue
 import shlex
 import signal
 import subprocess
@@ -1992,19 +1993,92 @@ def test_completion_visibility_missing_fields_fails_open(monkeypatch):
     assert completion_delivery_prompt(_completion_event(output=None), "payload") is not None
 
 
-def test_drain_notifications_completion_callback_exception_fails_closed(registry):
-    event = {
-        "type": "completion",
-        "session_id": "proc_callback_error",
-        "session_key": "session-a",
-        "command": "safe-test-command",
-        "exit_code": 0,
-        "output": "done",
-    }
-    registry.completion_queue.put(event)
+def test_drain_notifications_preserves_foreign_fifo_during_concurrent_put(registry):
+    producer_start = threading.Event()
+    producer_done = threading.Event()
 
-    def broken(_event):
-        raise RuntimeError("ownership check exploded")
+    class InterleavingQueue(queue.Queue):
+        def __init__(self):
+            super().__init__()
+            self.legacy_gets = 0
+            self.triggered = False
+
+        def get_nowait(self):
+            self.legacy_gets += 1
+            return super().get_nowait()
+
+        def release_during_selective_drain(self):
+            if not self.legacy_gets and not self.triggered:
+                self.triggered = True
+                producer_start.set()
+                assert producer_done.wait(2), "producer did not finish"
+
+        def empty(self):
+            with self.mutex:
+                observed_empty = not self._qsize()
+            if observed_empty and self.legacy_gets and not self.triggered:
+                self.triggered = True
+                producer_start.set()
+                assert producer_done.wait(2), "producer did not finish"
+                return True
+            return observed_empty
+
+    events = [
+        _completion_event(session_id="a-1", session_key="A"),
+        _completion_event(session_id="b-1", session_key="B"),
+        _completion_event(session_id="c-1", session_key="C"),
+        _completion_event(session_id="a-2", session_key="A"),
+        _completion_event(session_id="a-3", session_key="A"),
+    ]
+    interleaving_queue = InterleavingQueue()
+    registry.completion_queue = interleaving_queue
+    for event in events[:4]:
+        interleaving_queue.put(event)
+
+    def produce():
+        assert producer_start.wait(2), "drain did not reach producer boundary"
+        interleaving_queue.put(events[4])
+        producer_done.set()
+
+    producer = threading.Thread(target=produce, daemon=True)
+    producer.start()
+    try:
+        drained = registry.drain_notifications(
+            session_key="B",
+            owns_event=lambda event: (
+                interleaving_queue.release_during_selective_drain()
+                or event.get("session_key") == "B"
+            ),
+        )
+        producer.join(2)
+        assert not producer.is_alive()
+        assert [event["session_id"] for event, _text in drained] == ["b-1"]
+        with interleaving_queue.mutex:
+            remaining = list(interleaving_queue.queue)
+        assert [event["session_id"] for event in remaining] == [
+            "a-1",
+            "c-1",
+            "a-2",
+            "a-3",
+        ]
+    finally:
+        producer_start.set()
+        producer.join(2)
+
+
+def test_drain_notifications_completion_callback_exception_fails_closed(registry):
+    events = [
+        _completion_event(session_id="proc_before_error"),
+        _completion_event(session_id="proc_callback_error"),
+        _completion_event(session_id="proc_after_error"),
+    ]
+    for event in events:
+        registry.completion_queue.put(event)
+
+    def broken(event):
+        if event is events[1]:
+            raise RuntimeError("ownership check exploded")
+        return event is events[0]
 
     results = registry.drain_notifications(
         session_key="session-a",
@@ -2012,8 +2086,41 @@ def test_drain_notifications_completion_callback_exception_fails_closed(registry
     )
 
     assert results == []
-    assert registry.completion_queue.get_nowait() == event
-    assert registry.completion_queue.empty()
+    with registry.completion_queue.mutex:
+        assert list(registry.completion_queue.queue) == events
+
+
+def test_drain_notifications_finish_failure_requeues_remaining_batch_in_order(
+    registry, monkeypatch
+):
+    from tools import async_delegation as ad
+    import tools.process_registry as registry_module
+
+    events = [
+        _completion_event(session_id=f"proc_retry_{position}") for position in (1, 2, 3)
+    ]
+    for event in events:
+        registry.completion_queue.put(event)
+
+    monkeypatch.setattr(
+        registry_module, "completion_delivery_prompt", lambda _event, _text: None
+    )
+    monkeypatch.setattr(
+        ad,
+        "claim_event_delivery",
+        lambda event, _consumer: f"claim-{event['session_id']}",
+    )
+    monkeypatch.setattr(ad, "mark_completion_delivery_recovery", lambda *_args: False)
+    monkeypatch.setattr(ad, "release_event_delivery", lambda *_args: True)
+
+    assert registry.drain_notifications() == []
+    with registry.completion_queue.mutex:
+        retries = list(registry.completion_queue.queue)
+    assert [event["session_id"] for event in retries] == [
+        "proc_retry_1",
+        "proc_retry_2",
+        "proc_retry_3",
+    ]
 
 
 def test_drain_notifications_filters_async_delegation_by_session_key():

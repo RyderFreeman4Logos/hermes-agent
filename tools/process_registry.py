@@ -522,6 +522,39 @@ def arm_process_heartbeat(
     return interval
 
 
+def drain_matching_queue_events(completion_queue, predicate) -> "list[dict]":
+    """Remove matching events from one stable snapshot without rotating others.
+
+    Predicates run outside the queue mutex. A predicate failure therefore leaves
+    the queue untouched, while producers may append a tail without invalidating
+    the snapshot's original owner boundaries.
+    """
+    with completion_queue.mutex:
+        snapshot = tuple(completion_queue.queue)
+
+    selected = tuple(bool(predicate(event)) for event in snapshot)
+    with completion_queue.not_empty:
+        current = list(completion_queue.queue)
+        if len(current) < len(snapshot) or any(
+            event is not snapshot[index]
+            for index, event in enumerate(current[: len(snapshot)])
+        ):
+            return []
+        drained = [
+            event for event, should_drain in zip(snapshot, selected) if should_drain
+        ]
+        if not drained:
+            return []
+        retained = [
+            event for event, should_drain in zip(snapshot, selected) if not should_drain
+        ]
+        retained.extend(current[len(snapshot) :])
+        completion_queue.queue.clear()
+        completion_queue.queue.extend(retained)
+        completion_queue.not_full.notify_all()
+        return drained
+
+
 class ProcessRegistry:
     """
     In-memory registry of running and finished background processes.
@@ -2696,6 +2729,10 @@ class ProcessRegistry:
         """
         return not self.completion_event_should_deliver(evt)
 
+    def drain_matching_completions(self, predicate) -> "list[dict]":
+        """Atomically drain a bounded snapshot selected by ``predicate``."""
+        return drain_matching_queue_events(self.completion_queue, predicate)
+
     def get_completion_for_owner(self, owns_event, *, timeout: float | None = None):
         """Remove the first matching completion without disturbing foreign FIFO.
 
@@ -2776,12 +2813,12 @@ class ProcessRegistry:
 
         - ``owns_event(evt) -> bool``: positive-proof ownership callback.
           When provided, a routed event is consumed ONLY if the callback
-          returns True; everything else is re-queued for its owner.
+          returns True; everything else remains queued for its owner.
           The TUI passes its compression-chain-aware ownership check here so
           a post-compression session still claims its own pre-compression
           dispatches.
         - ``session_key``: plain key equality (CLI and other single-session
-          callers). Non-matching addressed events are re-queued.
+          callers). Non-matching addressed events remain queued.
 
         With neither set, all events are consumed (legacy single-session
         behavior, backward compatible). Ownerless ordinary notifications also
@@ -2792,14 +2829,10 @@ class ProcessRegistry:
         results: "list[tuple[dict, str]]" = []
         requeue: "list[dict]" = []
         preserved_types = set(preserve_event_types or ())
-        while not self.completion_queue.empty():
-            try:
-                evt = self.completion_queue.get_nowait()
-            except Exception:
-                break
+
+        def should_drain(evt: dict) -> bool:
             if evt.get("type") in preserved_types:
-                requeue.append(evt)
-                continue
+                return False
             # Positive-proof ownership beats bare key equality. Delegation
             # payloads always require proof; ordinary events require it once
             # they carry routing metadata. Ownerless ordinary events preserve
@@ -2811,23 +2844,23 @@ class ProcessRegistry:
                 evt_session_key or evt_origin_sid
             )
             if owns_event is not None and requires_positive_proof:
-                try:
-                    owned = bool(owns_event(evt))
-                except Exception:
-                    owned = False  # fail closed — never leak on a broken check
-                if not owned:
-                    requeue.append(evt)
-                    continue
+                return bool(owns_event(evt))
             elif session_key and requires_positive_proof:
-                if evt_session_key != session_key:
-                    requeue.append(evt)
-                    continue
+                return evt_session_key == session_key
             elif is_async_delegation and evt.get("restored"):
                 # Durable restore can enqueue previous-process payloads into a
                 # fresh registry. An unfiltered legacy drain cannot prove
                 # ownership, so leave those events queued for the owner.
-                requeue.append(evt)
-                continue
+                return False
+            return True
+
+        try:
+            pending = self.drain_matching_completions(should_drain)
+        except Exception:
+            logger.debug("Notification ownership check failed", exc_info=True)
+            return []
+
+        for event_index, evt in enumerate(pending):
             # Local consumed/observed state may suppress only events this
             # session owns (or legacy ownerless ordinary events). Routing must
             # happen first so a foreign session cannot drop the owner's event.
@@ -2855,7 +2888,8 @@ class ProcessRegistry:
                     except Exception:
                         self.release_completion_delivery(evt)
                         requeue.append(evt)
-                        continue
+                        requeue.extend(pending[event_index + 1 :])
+                        break
                     if claim_id is None:
                         self.release_completion_delivery(evt)
                         continue
@@ -2867,11 +2901,12 @@ class ProcessRegistry:
                         claim_id,
                         "visibility_suppressed",
                         registry=self,
+                        retry_queue=requeue,
                     ):
-                        # The finish helper requeued the failed transition.
+                        requeue.extend(pending[event_index + 1 :])
                         break
-        for evt in requeue:
-            self.completion_queue.put(evt)
+        for evt in reversed(requeue):
+            self.requeue_completion_front(evt)
         return results
 
     def get(self, session_id: str) -> Optional[ProcessSession]:
@@ -4131,6 +4166,7 @@ def finish_completion_event_delivery(
     outcome: str,
     *,
     registry: Optional[ProcessRegistry] = None,
+    retry_queue: Optional[list[dict]] = None,
 ) -> bool:
     """Resolve one completion claim only through its durable terminal fence."""
     from tools.async_delegation import (
@@ -4214,7 +4250,10 @@ def finish_completion_event_delivery(
         retry_event.pop("_completion_delivery_retained_claim_id", None)
     elif claim_id:
         retry_event["_completion_delivery_retained_claim_id"] = claim_id
-    target.completion_queue.put(retry_event)
+    if retry_queue is None:
+        target.completion_queue.put(retry_event)
+    else:
+        retry_queue.append(retry_event)
     return False
 
 

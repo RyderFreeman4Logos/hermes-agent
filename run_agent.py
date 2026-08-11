@@ -2072,6 +2072,7 @@ class AIAgent:
         edits a persisted message's content/role in place expecting a re-write
         (in-place compaction resets the seed and re-diffs by identity).
         """
+        self._last_session_db_flush_error = None
         # Persistence-isolated agents (e.g. the background skill/memory review
         # fork) must NEVER write into the canonical session store. The fork
         # shares the parent's session_id for prompt-cache warmth, so any write
@@ -2134,6 +2135,9 @@ class AIAgent:
                         compression_wait_logged = True
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
+                        self._last_session_db_flush_error = RuntimeError(
+                            "session persistence timed out waiting for compression"
+                        )
                         logger.warning(
                             "Session persistence timed out waiting for compression: %s",
                             parent_session_id,
@@ -2389,6 +2393,7 @@ class AIAgent:
             # Force a full re-scan on the next flush: an exception mid-loop
             # leaves messages with mixed dispositions.
             self._db_flush_scan_prefix = None
+            self._last_session_db_flush_error = e
             logger.warning("Session DB append_message failed: %s", e)
             return False
 
@@ -8008,7 +8013,10 @@ class AIAgent:
             from agent.message_sanitization import (
                 durable_messages_before_pending_completion,
             )
-            from agent.turn_finalizer import retry_pending_completion_delivery_commit
+            from agent.turn_finalizer import (
+                completion_delivery_commit_error_message,
+                retry_pending_completion_delivery_commit,
+            )
 
             _pending_messages = getattr(self, "_session_messages", None) or []
             _pending_status = retry_pending_completion_delivery_commit(
@@ -8031,9 +8039,8 @@ class AIAgent:
                     "failed": True,
                     "partial": True,
                     "interrupted": False,
-                    "error": (
-                        "A prior completion delivery could not be committed to "
-                        "SessionDB; retry after storage recovers"
+                    "error": completion_delivery_commit_error_message(
+                        self, prior=True
                     ),
                     "completion_delivery_status": "pending",
                     "agent_persisted": True,

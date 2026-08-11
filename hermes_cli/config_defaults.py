@@ -20,6 +20,17 @@ DEFAULT_CONFIG = {
         "wal_autocheckpoint": None,
         "journal_size_limit": None,
     },
+    # Completion delivery must become durable before a new turn starts. These
+    # values are re-read at each retry decision, so config.yaml edits apply
+    # without restarting a long-lived agent.
+    "session": {
+        "completion_delivery_commit": {
+            "max_attempts": 32,
+            "initial_backoff_s": 0.05,
+            "max_backoff_s": 5.0,
+            "patience_s": 120.0,
+        },
+    },
     # Global active chat session cap across CLI, TUI/dashboard, and messaging.
     # None/0 = unbounded.
     "max_concurrent_sessions": None,

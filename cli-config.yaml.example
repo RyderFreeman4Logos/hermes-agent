@@ -18,6 +18,16 @@ database:
   # wal_autocheckpoint: 1000     # pages between automatic checkpoints
   # journal_size_limit: 67108864 # cap the WAL/journal file size in bytes
 
+# Completion-delivery SessionDB commits are retried before Hermes accepts a new
+# user turn. Long-lived agents re-read these values between attempts, so edits
+# to config.yaml apply without a restart.
+session:
+  completion_delivery_commit:
+    max_attempts: 32
+    initial_backoff_s: 0.05
+    max_backoff_s: 5.0
+    patience_s: 120
+
 # =============================================================================
 # Model Configuration
 # =============================================================================

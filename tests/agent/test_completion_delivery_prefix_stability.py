@@ -7,8 +7,12 @@ fake chat-completions client.  No provider request leaves the process.
 from __future__ import annotations
 
 import copy
+import errno
 import json
+import sqlite3
+import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -76,6 +80,25 @@ def _completion_texts() -> tuple[str, str]:
     wire = completion_delivery_prompt(event, canonical)
     assert wire is not None and wire != canonical
     return canonical, wire
+
+
+def _completion_commit_config(
+    *,
+    max_attempts: int,
+    initial_backoff_s: float,
+    max_backoff_s: float,
+    patience_s: float,
+) -> dict:
+    return {
+        "session": {
+            "completion_delivery_commit": {
+                "max_attempts": max_attempts,
+                "initial_backoff_s": initial_backoff_s,
+                "max_backoff_s": max_backoff_s,
+                "patience_s": patience_s,
+            }
+        }
+    }
 
 
 def _stage_completion(agent: AIAgent, wire: str) -> None:
@@ -383,6 +406,15 @@ def test_effect_started_completion_survives_repeated_prune_and_final_cas(
         "hermes_cli.plugins.invoke_hook",
         lambda hook, **_kw: (
             [{"context": injected_context}] if hook == "pre_llm_call" else []
+        ),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: _completion_commit_config(
+            max_attempts=2,
+            initial_backoff_s=0,
+            max_backoff_s=0,
+            patience_s=10,
         ),
     )
     db = SessionDB(db_path=tmp_path / "state.db")
@@ -1392,7 +1424,7 @@ def test_completion_commit_retries_before_publishing_live_state(tmp_path, monkey
     def flaky_append(*args, **kwargs):
         nonlocal attempts
         attempts += 1
-        if attempts == 1:
+        if attempts <= 3:
             raise RuntimeError("transient sqlite failure")
         return original_append(*args, **kwargs)
 
@@ -1402,7 +1434,7 @@ def test_completion_commit_retries_before_publishing_live_state(tmp_path, monkey
         result = agent.run_conversation(wire, conversation_history=before)
         resumed = db.get_messages_as_conversation(session_id)
 
-        assert attempts == 2
+        assert attempts == 4
         assert result["completed"] is True
         assert not result.get("cleanup_errors")
         assert _public_shape(result["messages"]) == _public_shape(resumed)
@@ -1417,6 +1449,241 @@ def test_completion_commit_retries_before_publishing_live_state(tmp_path, monkey
             row for row in snapshot_rows if row.get("content") == canonical
         )
         assert snapshot_event["api_content"] == wire
+    finally:
+        db.close()
+
+
+def test_completion_commit_retry_defaults_favor_recovery():
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+    retry = DEFAULT_CONFIG["session"]["completion_delivery_commit"]
+
+    assert retry["max_attempts"] == 32
+    assert retry["initial_backoff_s"] == 0.05
+    assert retry["max_backoff_s"] == 5.0
+    assert retry["patience_s"] == 120.0
+
+
+def test_pending_commit_hot_reloads_budget_and_exponential_backoff(monkeypatch):
+    from agent.turn_finalizer import retry_pending_completion_delivery_commit
+
+    retained = [
+        {"role": "user", "content": "canonical completion"},
+        {"role": "assistant", "content": "visible effect already completed"},
+    ]
+    messages = [
+        {
+            "role": "user",
+            "content": "provider-only completion prompt",
+            "_completion_delivery_synthetic": True,
+        }
+    ]
+    flushed: list[list[dict]] = []
+
+    def flush(staged, **_kwargs):
+        flushed.append(copy.deepcopy(staged))
+        return len(flushed) >= 3
+
+    agent = SimpleNamespace(
+        _pending_completion_delivery_suffix=copy.deepcopy(retained),
+        _pending_completion_delivery_display_metadata_cas=None,
+        _completion_delivery_commit_failed=True,
+        _flush_messages_to_session_db=flush,
+        _save_session_log=lambda _messages: None,
+    )
+
+    def load_config():
+        if len(flushed) < 2:
+            return _completion_commit_config(
+                max_attempts=2,
+                initial_backoff_s=0.05,
+                max_backoff_s=0.1,
+                patience_s=10,
+            )
+        return _completion_commit_config(
+            max_attempts=3,
+            initial_backoff_s=0.05,
+            max_backoff_s=1,
+            patience_s=10,
+        )
+
+    sleeps: list[float] = []
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", load_config)
+    monkeypatch.setattr(time, "sleep", sleeps.append)
+
+    assert retry_pending_completion_delivery_commit(agent, messages) == "committed"
+    assert len(flushed) == 3
+    assert all(rows == retained for rows in flushed)
+    assert len(sleeps) == 2
+    assert 0.05 <= sleeps[0] <= 0.075
+    assert 0.1 <= sleeps[1] <= 0.15
+    assert messages == retained
+    assert agent._completion_delivery_commit_failed is False
+
+
+def test_pending_commit_hot_reloads_config_between_calls(monkeypatch):
+    from agent.turn_finalizer import retry_pending_completion_delivery_commit
+
+    retained = [{"role": "user", "content": "canonical completion"}]
+    messages = [
+        {
+            "role": "user",
+            "content": "provider-only completion prompt",
+            "_completion_delivery_synthetic": True,
+        }
+    ]
+    attempts = 0
+
+    def flush(_staged, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        return attempts >= 3
+
+    agent = SimpleNamespace(
+        _pending_completion_delivery_suffix=copy.deepcopy(retained),
+        _pending_completion_delivery_display_metadata_cas=None,
+        _completion_delivery_commit_failed=True,
+        _flush_messages_to_session_db=flush,
+        _save_session_log=lambda _messages: None,
+    )
+    config = _completion_commit_config(
+        max_attempts=1,
+        initial_backoff_s=0,
+        max_backoff_s=0,
+        patience_s=10,
+    )
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: config)
+
+    assert retry_pending_completion_delivery_commit(agent, messages) == "pending"
+    config = _completion_commit_config(
+        max_attempts=2,
+        initial_backoff_s=0,
+        max_backoff_s=0,
+        patience_s=10,
+    )
+    assert retry_pending_completion_delivery_commit(agent, messages) == "committed"
+    assert attempts == 3
+
+
+def test_pending_commit_patience_caps_high_attempt_budget(monkeypatch):
+    from agent import turn_finalizer
+
+    retained = [{"role": "user", "content": "canonical completion"}]
+    messages = [
+        {
+            "role": "user",
+            "content": "provider-only completion prompt",
+            "_completion_delivery_synthetic": True,
+        }
+    ]
+    attempts = 0
+    now = 0.0
+
+    def flush(_staged, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        return False
+
+    def sleep(delay):
+        nonlocal now
+        now += delay
+
+    agent = SimpleNamespace(
+        _pending_completion_delivery_suffix=copy.deepcopy(retained),
+        _pending_completion_delivery_display_metadata_cas=None,
+        _completion_delivery_commit_failed=True,
+        _flush_messages_to_session_db=flush,
+        _save_session_log=lambda _messages: None,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: _completion_commit_config(
+            max_attempts=32,
+            initial_backoff_s=0.05,
+            max_backoff_s=0.05,
+            patience_s=0.06,
+        ),
+    )
+    monkeypatch.setattr(
+        turn_finalizer,
+        "time",
+        SimpleNamespace(monotonic=lambda: now, sleep=sleep),
+    )
+
+    assert (
+        turn_finalizer.retry_pending_completion_delivery_commit(agent, messages)
+        == "pending"
+    )
+    assert attempts == 2
+    assert now == pytest.approx(0.06)
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_error"),
+    [
+        (sqlite3.OperationalError("database is locked"), "locked or busy"),
+        (OSError(errno.ENOSPC, "No space left on device"), "no space left"),
+        (PermissionError(errno.EACCES, "Permission denied"), "permission"),
+        (
+            RuntimeError("display metadata compare-and-set matched no active message"),
+            "compare-and-set conflict",
+        ),
+    ],
+)
+def test_pending_commit_error_classification_aborts_before_provider(
+    tmp_path, monkeypatch, failure, expected_error
+):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: _completion_commit_config(
+            max_attempts=1,
+            initial_backoff_s=0,
+            max_backoff_s=0,
+            patience_s=10,
+        ),
+    )
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = f"completion-error-{type(failure).__name__}"
+    db.create_session(session_id, source="tui", model="test-model")
+    db.append_messages_batch(
+        session_id,
+        [
+            {"role": "user", "content": "before"},
+            {"role": "assistant", "content": "working"},
+        ],
+    )
+    before = db.get_messages_as_conversation(session_id)
+    agent = _make_agent(tmp_path, db, session_id)
+    live_event = {
+        "role": "user",
+        "content": "provider-only completion prompt",
+        "_completion_delivery_synthetic": True,
+    }
+    retained = [
+        {"role": "user", "content": "canonical completion"},
+        {"role": "assistant", "content": "effect already visible"},
+    ]
+    agent._session_messages = [*before, live_event]
+    setattr(agent, "_pending_completion_delivery_suffix", retained)
+    setattr(agent, "_pending_completion_delivery_display_metadata_cas", None)
+    setattr(agent, "_completion_delivery_commit_failed", True)
+    requests = _capture_client(
+        agent, [_mock_response(content="must not run", finish_reason="stop")]
+    )
+    monkeypatch.setattr(
+        db,
+        "append_messages_batch",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(failure),
+    )
+
+    try:
+        result = agent.run_conversation("new user turn", conversation_history=before)
+
+        assert result["completion_delivery_status"] == "pending"
+        assert result["api_calls"] == 0
+        assert expected_error in result["error"].lower()
+        assert requests == []
+        assert getattr(agent, "_pending_completion_delivery_suffix") == retained
     finally:
         db.close()
 
@@ -1482,15 +1749,21 @@ def test_missing_retry_state_does_not_poison_cached_agent(
         db.close()
 
 
+@pytest.mark.parametrize(
+    ("missing", "expected_error"),
+    [
+        ("suffix", "pending completion suffix is missing"),
+        ("marker", "active completion marker is missing"),
+    ],
+)
 def test_missing_retry_state_waits_for_durable_recovery_write(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, missing, expected_error
 ):
     """A failed missing-state disposition keeps the retained retry latch."""
-    from agent.turn_finalizer import retry_pending_completion_delivery_commit
     from tools import async_delegation as ad
 
     db = SessionDB(db_path=tmp_path / "state.db")
-    session_id = "completion-missing-write-failed"
+    session_id = f"completion-missing-write-failed-{missing}"
     db.create_session(session_id, source="tui", model="test-model")
     agent = _make_agent(tmp_path, db, session_id)
     pending_event = {
@@ -1498,15 +1771,24 @@ def test_missing_retry_state_waits_for_durable_recovery_write(
         "content": "lost completion",
         "_completion_delivery_synthetic": True,
     }
-    agent._session_messages = []
-    setattr(agent, "_pending_completion_delivery_suffix", [pending_event])
+    agent._session_messages = [pending_event] if missing == "suffix" else []
+    retained = None if missing == "suffix" else [pending_event]
+    setattr(agent, "_pending_completion_delivery_suffix", retained)
     setattr(agent, "_completion_delivery_commit_failed", True)
     monkeypatch.setattr(ad, "record_completion_delivery_recovery", lambda *_a: False)
+    requests = _capture_client(
+        agent, [_mock_response(content="must not run", finish_reason="stop")]
+    )
 
     try:
-        assert retry_pending_completion_delivery_commit(agent, []) == "pending"
+        result = agent.run_conversation("new user turn", conversation_history=[])
+
+        assert result["completion_delivery_status"] == "pending"
+        assert expected_error in result["error"].lower()
+        assert "process restart is not required" in result["error"].lower()
+        assert requests == []
         assert getattr(agent, "_completion_delivery_commit_failed") is True
-        assert getattr(agent, "_pending_completion_delivery_suffix") == [pending_event]
+        assert getattr(agent, "_pending_completion_delivery_suffix") == retained
     finally:
         db.close()
 
@@ -1514,6 +1796,15 @@ def test_missing_retry_state_waits_for_durable_recovery_write(
 def test_failed_tool_intent_commit_never_executes_or_replays_tool(tmp_path, monkeypatch):
     """A completion tool call must be canonical before its side effect runs."""
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: _completion_commit_config(
+            max_attempts=2,
+            initial_backoff_s=0,
+            max_backoff_s=0,
+            patience_s=10,
+        ),
+    )
     db = SessionDB(db_path=tmp_path / "state.db")
     session_id = "completion-tool-intent-failure"
     db.create_session(session_id, source="tui", model="test-model")
@@ -1565,6 +1856,15 @@ def test_persistent_completion_commit_failure_keeps_restart_on_old_prefix(
 ):
     """A loud pending result is safer than publishing DB-divergent history."""
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: _completion_commit_config(
+            max_attempts=2,
+            initial_backoff_s=0,
+            max_backoff_s=0,
+            patience_s=10,
+        ),
+    )
     db = SessionDB(db_path=tmp_path / "state.db")
     session_id = "completion-persistent-commit-failure"
     db.create_session(session_id, source="tui", model="test-model")

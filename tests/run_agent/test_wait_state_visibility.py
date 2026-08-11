@@ -103,7 +103,7 @@ def test_nonstream_wait_loop_emits_explained_notice(tmp_path, monkeypatch):
     # TTFB kill at 1s ends the call quickly; the wait notice fires on the
     # 100-poll cadence, so to observe it within the 1s window we shrink the
     # cadence by patching threading.Thread.join used in the poll loop is
-    # overkill — instead just verify the TTFB reconnect notice, which flows
+    # overkill — instead just verify the TTFB stop notice, which flows
     # through the same _emit_wait_notice path.
     monkeypatch.setenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "1")
 
@@ -113,6 +113,6 @@ def test_nonstream_wait_loop_emits_explained_notice(tmp_path, monkeypatch):
     finally:
         stop["flag"] = True
 
-    reconnect_notices = [s for s in seen if "reconnecting" in s]
-    assert reconnect_notices, f"expected a reconnect wait-notice, saw: {seen}"
-    assert "no response from provider" in reconnect_notices[0]
+    stop_notices = [s for s in seen if "stopping without replay" in s]
+    assert stop_notices, f"expected a no-replay wait-notice, saw: {seen}"
+    assert "no response from provider" in stop_notices[0]

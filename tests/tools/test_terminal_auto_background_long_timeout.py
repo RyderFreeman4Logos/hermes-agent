@@ -100,10 +100,10 @@ def _run(
         patch("tools.terminal_tool._last_activity", {"default": 0}),
         patch("tools.terminal_tool._create_environment", create_environment),
         patch("tools.process_registry.process_registry", registry),
-        patch("tools.approval.get_current_session_key", return_value=""),
+        patch("tools.approval.get_current_session_key", return_value="owner-test"),
         patch("gateway.session_context.async_delivery_supported", async_probe),
         patch("gateway.session_context.get_session_env", return_value=""),
-        patch("tools.runtime_heartbeat.preflight_current_heartbeat", return_value=None),
+        patch("tools.runtime_heartbeat.preflight_current_heartbeat", return_value=1700),
         patch("tools.runtime_heartbeat.runtime_heartbeat.arm"),
     ):
         result = json.loads(terminal_tool(command=command, **kwargs))
@@ -154,7 +154,9 @@ def terminal_runtime(monkeypatch):
         "_create_environment",
         lambda **_kwargs: pytest.fail("cached local environment should be reused"),
     )
-    monkeypatch.setattr("tools.approval.get_current_session_key", lambda default="": "")
+    monkeypatch.setattr(
+        "tools.approval.get_current_session_key", lambda default="": "owner-test"
+    )
     monkeypatch.setattr(
         "gateway.session_context.async_delivery_supported", lambda: True
     )
@@ -162,11 +164,11 @@ def terminal_runtime(monkeypatch):
         "gateway.session_context.get_session_env", lambda *_args, **_kwargs: ""
     )
     monkeypatch.setattr(
-        "tools.runtime_heartbeat.preflight_current_heartbeat", lambda: None
+        "tools.runtime_heartbeat.preflight_current_heartbeat", lambda: 1700
     )
     monkeypatch.setattr(
         "tools.runtime_heartbeat.runtime_heartbeat.arm",
-        lambda *_args, **_kwargs: False,
+        lambda *_args, **_kwargs: True,
     )
     return terminal_tool, registry
 
@@ -318,6 +320,7 @@ def test_promoted_execution_deadline_kills_process_tree_once(
         assert session._completion_event.wait(5)
         assert _wait_until(lambda: not _pid_is_running(child_pid))
         assert registry.poll(session_id)["status"] == "exited"
+        assert _wait_until(lambda: not registry.completion_queue.empty())
 
         events = []
         while not registry.completion_queue.empty():
@@ -351,6 +354,7 @@ def test_completion_before_spawn_returns_keeps_background_notification(
     assert result["exit_code"] == 0
     assert result["session_id"]
     assert result["notify_on_complete"] is True
+    assert _wait_until(lambda: not registry.completion_queue.empty())
     events = []
     while not registry.completion_queue.empty():
         events.append(registry.completion_queue.get_nowait())

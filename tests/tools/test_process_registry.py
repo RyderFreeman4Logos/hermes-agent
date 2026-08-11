@@ -1287,6 +1287,7 @@ class TestCheckpoint:
             "kind": "process",
             "started_at": snapshots[0]["started_at"],
             "interval_s": 1700,
+            "last_success_at": None,
         }]
         assert providers == ["openai-codex"]
 

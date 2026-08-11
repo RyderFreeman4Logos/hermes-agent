@@ -401,6 +401,37 @@ def _completion_durable_payload(evt: dict) -> dict:
     }
 
 
+def _completion_authority_fingerprint(
+    evt: dict, *, allow_nonfinite: bool = False
+) -> Optional[str]:
+    """Hash the current terminal envelope without transport-only routing fields."""
+    if evt.get("type", "completion") != "completion":
+        return None
+    payload = _completion_durable_payload(evt)
+    for key in (
+        "restored",
+        "platform",
+        "chat_type",
+        "chat_id",
+        "thread_id",
+        "user_id",
+        "user_name",
+        "message_id",
+    ):
+        payload.pop(key, None)
+    try:
+        encoded = json.dumps(
+            payload,
+            allow_nan=allow_nonfinite,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        return None
+    return f"completion-event-v1:{hashlib.sha256(encoded).hexdigest()}"
+
+
 def _completion_event_fingerprint(evt: dict) -> Optional[str]:
     """Return a replay-stable identity for one sanitized malformed envelope."""
     if (
@@ -475,10 +506,18 @@ def _bound_completion_delivery_token(evt: dict) -> Optional[_CompletionDeliveryT
 
 def _bound_completion_event_fingerprint(evt: dict) -> Optional[str]:
     """Return the original envelope fingerprint from valid local authority."""
-    if _completion_core_identity(evt) is None:
-        return None
     metadata = _bound_completion_delivery_metadata(evt)
+    current_core = _completion_core_identity(evt)
+    current_fingerprint = _completion_authority_fingerprint(evt)
     fingerprint = metadata[2] if metadata is not None else None
+    if (
+        current_core is None
+        or current_fingerprint is None
+        or metadata is None
+        or metadata[1] != list(current_core)
+        or fingerprint != current_fingerprint
+    ):
+        return None
     if isinstance(fingerprint, str) and fingerprint.startswith("completion-event-v1:"):
         return fingerprint
     return None
@@ -625,6 +664,8 @@ class ProcessRegistry:
         "cannot set terminal process group",
         "tcsetattr: Inappropriate ioctl for device",
     )
+    _SPOOL_PENDING = "pending"
+    _SPOOL_COMMITTED_ACK = "committed_ack"
 
     def __init__(self):
         self._running: Dict[str, ProcessSession] = {}
@@ -642,13 +683,30 @@ class ProcessRegistry:
         self.completion_queue: _queue_mod.Queue = _queue_mod.Queue()
         # Terminal producer fallback retained until the delivery ledger owns it.
         self._terminal_completion_spool: dict[tuple, dict] = {}
+        committed_ack_events = self._checkpoint_completion_ack_events()
+        for event in committed_ack_events:
+            self._spool_terminal_completion(
+                event, disposition=self._SPOOL_COMMITTED_ACK
+            )
         # Rehydrate durable async and ordinary completions at registry startup.
         # Consumers still inject them as fresh turns through this existing rail.
         try:
+            if committed_ack_events:
+                from tools import async_delegation
+
+                reconcile_acks = getattr(
+                    async_delegation, "reconcile_committed_completion_acks"
+                )
+                reconcile_acks(committed_ack_events)
             from tools.async_delegation import restore_undelivered_completions
             restore_undelivered_completions(self.completion_queue)
         except Exception as exc:
             logger.warning("Could not restore durable completions: %s", exc)
+        else:
+            for event in committed_ack_events:
+                self._discard_terminal_completion_spool(
+                    event, disposition=self._SPOOL_COMMITTED_ACK
+                )
 
         # Legacy session-id views used by raw notification paths and callers of
         # is_completion_consumed(). Model-turn delivery uses the stable ledger
@@ -2292,14 +2350,7 @@ class ProcessRegistry:
         # Keep the exact terminal payload in the checkpoint until its durable
         # receipt exists. A later unrelated checkpoint write must not erase it.
         if event is not None and not completion_receipt_persisted:
-            identity = self._completion_durable_identity(event)
-            if identity is not None:
-                with self._lock:
-                    self._terminal_completion_spool[identity] = {
-                        key: value
-                        for key, value in event.items()
-                        if not key.startswith("_completion_delivery_")
-                    }
+            self._spool_terminal_completion(event)
             logger.warning(
                 "Keeping terminal process checkpoint for %s until completion "
                 "delivery can be persisted",
@@ -2372,7 +2423,7 @@ class ProcessRegistry:
             ).hexdigest()
             binding = _CompletionDeliveryBinding(
                 json.dumps(
-                    [core, producer, _completion_event_fingerprint(event)],
+                    [core, producer, _completion_authority_fingerprint(event)],
                     allow_nan=False,
                     separators=(",", ":"),
                 )
@@ -2438,17 +2489,20 @@ class ProcessRegistry:
         identity = ProcessRegistry._completion_identity(evt)
         if identity is not None:
             return identity
-        fingerprint = _bound_completion_event_fingerprint(
-            evt
-        ) or _completion_event_fingerprint(evt)
+        fingerprint = _bound_completion_event_fingerprint(evt)
+        if fingerprint is None and _completion_core_identity(evt) is not None:
+            fingerprint = _completion_authority_fingerprint(evt)
         return ("completion-event", fingerprint) if fingerprint is not None else None
 
     @staticmethod
     def _completion_claim_identity(evt: dict) -> "tuple | None":
         """Return a producer-local token/event binding or durable authority."""
         metadata = _bound_completion_delivery_metadata(evt)
-        if metadata is not None:
-            return ("completion-local", metadata[0], metadata[2])
+        current_fingerprint = _completion_authority_fingerprint(
+            evt, allow_nonfinite=True
+        )
+        if metadata is not None and current_fingerprint is not None:
+            return ("completion-local", metadata[0], current_fingerprint)
         return ProcessRegistry._completion_durable_identity(evt)
 
     @staticmethod
@@ -2581,21 +2635,69 @@ class ProcessRegistry:
             )
         return True
 
-    def _retire_terminal_completion_spool(self, evt: dict) -> None:
+    def _terminal_completion_spool_key(
+        self, evt: dict, disposition: str
+    ) -> "tuple | None":
         identity = self._completion_durable_identity(evt)
         if identity is None:
-            return
+            return None
+        return disposition, identity
+
+    def _spool_terminal_completion(
+        self, evt: dict, *, disposition: str = _SPOOL_PENDING
+    ) -> bool:
+        if disposition not in {self._SPOOL_PENDING, self._SPOOL_COMMITTED_ACK}:
+            raise ValueError(f"unknown terminal completion disposition: {disposition}")
+        key = self._terminal_completion_spool_key(evt, disposition)
+        if key is None:
+            return False
         with self._lock:
-            spooled = self._terminal_completion_spool.pop(identity, None)
-        if spooled is not None:
+            self._terminal_completion_spool[key] = _completion_durable_payload(evt)
+        return True
+
+    def _discard_terminal_completion_spool(
+        self, evt: dict, *, disposition: str
+    ) -> bool:
+        key = self._terminal_completion_spool_key(evt, disposition)
+        if key is None:
+            return False
+        with self._lock:
+            return self._terminal_completion_spool.pop(key, None) is not None
+
+    def _checkpoint_completion_ack_events(self) -> list[dict]:
+        if not CHECKPOINT_PATH.exists():
+            return []
+        try:
+            entries = json.loads(CHECKPOINT_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+        if not isinstance(entries, list):
+            return []
+        return [
+            _completion_durable_payload(entry["completion_ack"])
+            for entry in entries
+            if isinstance(entry, dict) and isinstance(entry.get("completion_ack"), dict)
+        ]
+
+    def _retire_terminal_completion_spool(self, evt: dict) -> None:
+        retired = False
+        for disposition in (self._SPOOL_PENDING, self._SPOOL_COMMITTED_ACK):
+            retired = (
+                self._discard_terminal_completion_spool(evt, disposition=disposition)
+                or retired
+            )
+        if retired:
             self._write_checkpoint()
 
-    def complete_completion_delivery(self, evt: dict) -> None:
+    def _settle_completion_delivery_claim(self, evt: dict) -> None:
         identity = self._completion_claim_identity(evt)
         if identity is not None:
             with self._completion_disposition_lock:
                 self._set_completion_disposition(identity, "delivered")
-            self._retire_terminal_completion_spool(evt)
+
+    def complete_completion_delivery(self, evt: dict) -> None:
+        self._settle_completion_delivery_claim(evt)
+        self._retire_terminal_completion_spool(evt)
 
     def release_completion_delivery(self, evt: dict) -> None:
         identity = self._completion_claim_identity(evt)
@@ -3729,8 +3831,14 @@ class ProcessRegistry:
                             "watch_patterns": s.watch_patterns,
                         })
                 entries.extend(
-                    {"completion_event": dict(event)}
-                    for event in self._terminal_completion_spool.values()
+                    {
+                        (
+                            "completion_ack"
+                            if key[0] == self._SPOOL_COMMITTED_ACK
+                            else "completion_event"
+                        ): dict(event)
+                    }
+                    for key, event in self._terminal_completion_spool.items()
                 )
                 if extra_entries:
                     tracked_ids = {item.get("session_id") for item in entries}
@@ -3781,16 +3889,41 @@ class ProcessRegistry:
                     event.get("session_id", "?"),
                     exc_info=True,
                 )
-            identity = self._completion_durable_identity(event)
-            if identity is not None:
-                with self._lock:
-                    if persisted:
-                        self._terminal_completion_spool.pop(identity, None)
-                    else:
-                        self._terminal_completion_spool[identity] = dict(event)
+            if persisted:
+                self._discard_terminal_completion_spool(
+                    event, disposition=self._SPOOL_PENDING
+                )
+            else:
+                self._spool_terminal_completion(event)
             self.completion_queue.put(dict(event))
 
+        committed_ack_events = [
+            _completion_durable_payload(entry["completion_ack"])
+            for entry in entries
+            if isinstance(entry, dict) and isinstance(entry.get("completion_ack"), dict)
+        ]
+        if committed_ack_events:
+            try:
+                from tools import async_delegation
+
+                reconcile_acks = getattr(
+                    async_delegation, "reconcile_committed_completion_acks"
+                )
+                reconcile_acks(committed_ack_events)
+            except Exception:
+                logger.warning(
+                    "Failed to reconcile checkpointed committed completion ACKs",
+                    exc_info=True,
+                )
+            else:
+                for event in committed_ack_events:
+                    self._discard_terminal_completion_spool(
+                        event, disposition=self._SPOOL_COMMITTED_ACK
+                    )
+
         for entry in entries:
+            if isinstance(entry.get("completion_ack"), dict):
+                continue
             terminal_event = entry.get("completion_event")
             if isinstance(terminal_event, dict):
                 materialize_terminal_event(terminal_event)
@@ -3976,7 +4109,14 @@ def finish_completion_event_delivery(
 
     target = registry or process_registry
     terminal = False
+    committed_ack_spooled = False
+    committed_ack_checkpointed = False
     if outcome == "committed":
+        committed_ack_spooled = target._spool_terminal_completion(
+            evt, disposition=target._SPOOL_COMMITTED_ACK
+        )
+        if committed_ack_spooled:
+            committed_ack_checkpointed = target._write_checkpoint()
         try:
             terminal = complete_event_delivery(evt, claim_id)
         except Exception:
@@ -4017,11 +4157,15 @@ def finish_completion_event_delivery(
         target.complete_completion_delivery(evt)
         return True
     if outcome == "committed":
-        logger.error(
-            "Committed completion ACK remains unresolved; retaining its claim "
-            "without requeueing the provider effect"
+        target._settle_completion_delivery_claim(evt)
+        if committed_ack_spooled and not committed_ack_checkpointed:
+            committed_ack_checkpointed = target._write_checkpoint()
+        log = logger.warning if committed_ack_checkpointed else logger.error
+        log(
+            "Committed completion ACK remains unresolved; retaining an ACK-only "
+            "checkpoint without requeueing the provider effect"
         )
-        return False
+        return committed_ack_checkpointed
 
     released = False
     try:

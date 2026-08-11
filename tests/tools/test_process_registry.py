@@ -113,6 +113,41 @@ def test_completion_ledger_distinguishes_contradictory_terminal_republication(re
     assert registry.completion_queue.empty()
 
 
+def test_private_completion_pair_cannot_alias_a_distinct_current_event(registry):
+    first_session = _make_session(
+        sid="proc-binding-first", command="first", exited=True, exit_code=0
+    )
+    second_session = _make_session(
+        sid="proc-binding-second", command="second", exited=True, exit_code=1
+    )
+    for session in (first_session, second_session):
+        session.notify_on_complete = True
+        session.session_key = "owner"
+
+    first = registry._completion_event(first_session)
+    second = registry._completion_event(second_session)
+    second["_completion_delivery_token"] = first["_completion_delivery_token"]
+    second["_completion_delivery_binding"] = first["_completion_delivery_binding"]
+
+    assert registry._completion_claim_identity(
+        first
+    ) != registry._completion_claim_identity(second)
+    assert registry._completion_durable_identity(
+        first
+    ) != registry._completion_durable_identity(second)
+    assert registry._spool_terminal_completion(first)
+    assert str(first["_completion_delivery_token"]) not in repr(
+        registry._terminal_completion_spool
+    )
+    assert all(
+        not key.startswith("_completion_delivery_")
+        for event in registry._terminal_completion_spool.values()
+        for key in event
+    )
+    assert registry.claim_completion_delivery(first)
+    assert registry.claim_completion_delivery(second)
+
+
 def test_remote_threshold_refreshes_status_before_promotion(registry, monkeypatch):
     class FinishedEnv:
         def execute(self, command, **_kwargs):

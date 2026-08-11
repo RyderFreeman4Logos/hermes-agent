@@ -930,13 +930,18 @@ def test_committed_gateway_effect_ack_failure_reconciles_without_provider_replay
 
     complete_calls = 0
 
-    def fail_complete_once(*_args):
+    def fail_complete(*_args):
         nonlocal complete_calls
         complete_calls += 1
         raise OSError("intentional committed ACK failure")
 
+    real_complete = ad.complete_event_delivery
+    real_mark_recovery = ad.mark_completion_delivery_recovery
     release = MagicMock(side_effect=AssertionError("committed effect was released"))
-    monkeypatch.setattr(ad, "complete_event_delivery", fail_complete_once)
+    monkeypatch.setattr(ad, "complete_event_delivery", fail_complete)
+    monkeypatch.setattr(
+        ad, "mark_completion_delivery_recovery", MagicMock(return_value=False)
+    )
     monkeypatch.setattr(ad, "release_event_delivery", release)
     asyncio.run(runner._finish_completion_delivery_receipt(delivered, "committed"))
 
@@ -944,8 +949,15 @@ def test_committed_gateway_effect_ack_failure_reconciles_without_provider_replay
     release.assert_not_called()
     assert isolated_registry.completion_queue.empty()
     receipt = ad.get_durable_event_delivery(event)
-    assert receipt and receipt["delivery_state"] == "recovery_committed_ack_failed"
+    assert receipt and receipt["delivery_state"] == "effect_started"
+    checkpoint_entries = json.loads(
+        registry_module.CHECKPOINT_PATH.read_text(encoding="utf-8")
+    )
+    assert checkpoint_entries[0]["completion_ack"]["session_id"] == event["session_id"]
 
+    monkeypatch.setattr(ad, "complete_event_delivery", real_complete)
+    monkeypatch.setattr(ad, "mark_completion_delivery_recovery", real_mark_recovery)
+    monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: False)
     restarted = ProcessRegistry()
     monkeypatch.setattr(registry_module, "process_registry", restarted)
     restart_adapter = SimpleNamespace(handle_message=AsyncMock(), supports_push=True)
@@ -958,6 +970,8 @@ def test_committed_gateway_effect_ack_failure_reconciles_without_provider_replay
     )
     restart_adapter.handle_message.assert_not_awaited()
     assert restarted.completion_queue.empty()
+    receipt = ad.get_durable_event_delivery(event)
+    assert receipt and receipt["delivery_state"] == "recovery_committed_ack_failed"
 
 
 def test_busy_gateway_merge_finalizes_every_completion_receipt(

@@ -15,6 +15,7 @@ import pytest
 
 from gateway.config import GatewayConfig, Platform
 from gateway.run import GatewayRunner, _parse_session_key
+from tools.process_registry import ProcessRegistry, ProcessSession
 
 
 # ---------------------------------------------------------------------------
@@ -23,6 +24,8 @@ from gateway.run import GatewayRunner, _parse_session_key
 
 class _FakeRegistry:
     """Return pre-canned sessions, then None once exhausted."""
+
+    _completion_event = staticmethod(ProcessRegistry._completion_event)
 
     def __init__(self, sessions, consumed=False):
         self._sessions = list(sessions)
@@ -114,9 +117,17 @@ async def test_consumed_completion_skips_raw_notification(monkeypatch, tmp_path)
     background_process_notifications: all)."""
     import tools.process_registry as pr_module
 
-    sessions = [SimpleNamespace(
-        output_buffer="done\n", exited=True, exit_code=0, command="sleep 1; echo done",
-    )]
+    sessions = [
+        ProcessSession(
+            id="proc_test",
+            command="sleep 1; echo done",
+            session_key="agent:main:telegram:dm:123",
+            output_buffer="done\n",
+            exited=True,
+            exit_code=0,
+            notify_on_complete=True,
+        )
+    ]
     monkeypatch.setattr(
         pr_module, "process_registry", _FakeRegistry(sessions, consumed=True)
     )
@@ -147,9 +158,16 @@ async def test_consumed_completion_skips_raw_notification_without_agent_notify(
     completion message in every mode."""
     import tools.process_registry as pr_module
 
-    sessions = [SimpleNamespace(
-        output_buffer="done\n", exited=True, exit_code=0, command="echo done",
-    )]
+    sessions = [
+        ProcessSession(
+            id="proc_test",
+            command="echo done",
+            session_key="agent:main:telegram:dm:123",
+            output_buffer="done\n",
+            exited=True,
+            exit_code=0,
+        )
+    ]
     monkeypatch.setattr(
         pr_module, "process_registry", _FakeRegistry(sessions, consumed=True)
     )

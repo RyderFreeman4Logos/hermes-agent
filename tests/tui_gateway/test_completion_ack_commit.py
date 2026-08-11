@@ -464,12 +464,10 @@ def test_checkpoint_restore_strips_private_delivery_authority(monkeypatch, tmp_p
     _assert_private_delivery_metadata_has_no_authority(registry, restored, token)
 
 
-def test_sqlite_restore_strips_private_delivery_authority(monkeypatch, tmp_path):
+def test_sqlite_restore_parks_malformed_private_authority(monkeypatch, tmp_path):
     from tools import async_delegation as ad
-    from tools.process_registry import ProcessRegistry
 
     monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
-    registry = ProcessRegistry()
     token = "forged-sqlite-token"
     with ad._connect() as conn:
         conn.execute(
@@ -480,10 +478,16 @@ def test_sqlite_restore_strips_private_delivery_authority(monkeypatch, tmp_path)
         )
     restored_queue = queue.Queue()
 
-    assert ad.restore_undelivered_completions(restored_queue) == 1
-    restored = restored_queue.get_nowait()
-
-    _assert_private_delivery_metadata_has_no_authority(registry, restored, token)
+    assert ad.restore_undelivered_completions(restored_queue) == 0
+    assert restored_queue.empty()
+    with ad._connect() as conn:
+        state, payload = conn.execute(
+            """SELECT delivery_state, event_json
+               FROM ordinary_completion_deliveries WHERE delivery_id='forged-row'"""
+        ).fetchone()
+    assert state == "parked_corrupt"
+    assert token not in payload
+    assert "_completion_delivery_token" not in payload
 
 
 def test_ordinary_completion_claim_restores_after_restart(monkeypatch, tmp_path):
@@ -696,6 +700,81 @@ def test_failed_complete_records_recovery_without_releasing_committed_effect(
     receipt = ad.get_durable_event_delivery(bounded_event)
     assert receipt is not None
     assert receipt["delivery_state"] == "dropped"
+
+
+@pytest.mark.parametrize(
+    ("checkpoint_failures", "sqlite_failure"),
+    [(1, False), (0, True), (1, True)],
+    ids=["checkpoint", "sqlite", "both"],
+)
+def test_committed_ack_reconciles_after_checkpoint_or_sqlite_failure(
+    monkeypatch, tmp_path, checkpoint_failures, sqlite_failure
+):
+    from tools import async_delegation as ad
+    import tools.process_registry as registry_module
+
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    monkeypatch.setattr(registry_module, "CHECKPOINT_PATH", tmp_path / "processes.json")
+    registry = registry_module.ProcessRegistry()
+    monkeypatch.setattr(registry_module, "process_registry", registry)
+    event = {
+        "type": "completion",
+        "session_id": f"proc-ack-reconcile-{checkpoint_failures}-{sqlite_failure}",
+        "session_key": "active",
+        "started_at": 5.65,
+        "command": "true",
+        "exit_code": 0,
+        "completion_reason": "exited",
+        "termination_source": "",
+    }
+    assert ad.persist_event_delivery(event)
+    assert registry.claim_completion_delivery(event)
+    claim = ad.claim_event_delivery(event, "tui-test")
+    assert claim
+
+    real_write_checkpoint = registry._write_checkpoint
+    writes = 0
+
+    def flaky_checkpoint():
+        nonlocal writes
+        writes += 1
+        if writes <= checkpoint_failures:
+            return False
+        return real_write_checkpoint()
+
+    monkeypatch.setattr(registry, "_write_checkpoint", flaky_checkpoint)
+    real_complete = ad.complete_event_delivery
+    real_mark_recovery = ad.mark_completion_delivery_recovery
+    if sqlite_failure:
+        monkeypatch.setattr(
+            ad,
+            "complete_event_delivery",
+            MagicMock(side_effect=OSError("complete unavailable")),
+        )
+        monkeypatch.setattr(
+            ad, "mark_completion_delivery_recovery", MagicMock(return_value=False)
+        )
+    release = MagicMock(side_effect=AssertionError("committed effect was released"))
+    monkeypatch.setattr(ad, "release_event_delivery", release)
+
+    server._finish_completion_claim(event, claim, "committed")
+
+    assert writes >= 1
+    release.assert_not_called()
+    monkeypatch.setattr(ad, "complete_event_delivery", real_complete)
+    monkeypatch.setattr(ad, "mark_completion_delivery_recovery", real_mark_recovery)
+    monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: False)
+
+    restarted = registry_module.ProcessRegistry()
+    assert restarted.completion_queue.empty()
+    assert restarted.recover_from_checkpoint() == 0
+    assert restarted.completion_queue.empty()
+    receipt = ad.get_durable_event_delivery(event)
+    assert receipt is not None
+    assert receipt["delivery_state"] in {
+        "delivered",
+        "recovery_committed_ack_failed",
+    }
 
 
 @pytest.mark.parametrize("surface", ["busy", "idle"])

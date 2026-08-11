@@ -142,6 +142,7 @@ def _completion_authority_fingerprint(
         "user_id",
         "user_name",
         "message_id",
+        "completion_ack_recorded_at",
     ):
         payload.pop(key, None)
     try:
@@ -157,6 +158,23 @@ def _completion_authority_fingerprint(
     return f"completion-event-v1:{hashlib.sha256(encoded).hexdigest()}"
 
 
+def _canonical_completion_fingerprint(evt: dict) -> str:
+    """Hash the fixed public fields that distinguish canonical terminal envelopes."""
+    encoded = json.dumps(
+        (
+            evt["command"],
+            evt["output"],
+            evt["exit_code"],
+            evt["completion_reason"],
+            evt["termination_source"],
+            bool(evt.get("delegated_child", False)),
+        ),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return f"completion-canonical-v1:{hashlib.sha256(encoded).hexdigest()}"
+
+
 def _completion_event_fingerprint(evt: dict) -> Optional[str]:
     """Return a replay-stable identity for one sanitized malformed envelope."""
     if (
@@ -166,6 +184,7 @@ def _completion_event_fingerprint(evt: dict) -> Optional[str]:
         return None
     payload = _completion_durable_payload(evt)
     payload.pop("restored", None)
+    payload.pop("completion_ack_recorded_at", None)
     try:
         encoded = json.dumps(
             payload,
@@ -416,10 +435,12 @@ class ProcessRegistry:
             )
         # Rehydrate durable async and ordinary completions at registry startup.
         # Consumers still inject them as fresh turns through this existing rail.
+        ack_retention_seconds = float("inf")
         try:
             if committed_ack_events:
                 from tools import async_delegation
 
+                ack_retention_seconds = async_delegation._DURABLE_RETENTION_SECONDS
                 reconcile_acks = getattr(
                     async_delegation, "reconcile_committed_completion_acks"
                 )
@@ -429,10 +450,17 @@ class ProcessRegistry:
         except Exception as exc:
             logger.warning("Could not restore durable completions: %s", exc)
         else:
+            ack_cutoff = time.time() - ack_retention_seconds
             for event in committed_ack_events:
-                self._discard_terminal_completion_spool(
-                    event, disposition=self._SPOOL_COMMITTED_ACK
+                recorded_at = event.get("completion_ack_recorded_at")
+                retire = event.get("type") != "async_delegation" or (
+                    isinstance(recorded_at, (int, float))
+                    and recorded_at < ack_cutoff
                 )
+                if retire:
+                    self._discard_terminal_completion_spool(
+                        event, disposition=self._SPOOL_COMMITTED_ACK
+                    )
                 key = self._checkpoint_entry_key({"completion_ack": event})
                 if key is not None:
                     self._checkpoint_owned_keys.add(key)
@@ -2128,7 +2156,7 @@ class ProcessRegistry:
             return None
         identity = ProcessRegistry._completion_identity(evt)
         if identity is not None:
-            return identity
+            return (*identity, _canonical_completion_fingerprint(evt))
         fingerprint = _bound_completion_event_fingerprint(evt)
         if fingerprint is None and _completion_core_identity(evt) is not None:
             fingerprint = _completion_authority_fingerprint(evt)
@@ -2196,9 +2224,9 @@ class ProcessRegistry:
         if identity is None:
             return False
         identities = {identity}
-        stable_identity = self._completion_identity(event)
-        if stable_identity is not None:
-            identities.add(stable_identity)
+        durable_identity = self._completion_durable_identity(event)
+        if durable_identity is not None:
+            identities.add(durable_identity)
 
         if self._is_observed_completion_noop(event):
             claim = None
@@ -2335,8 +2363,20 @@ class ProcessRegistry:
         key = self._terminal_completion_spool_key(evt, disposition)
         if key is None:
             return False
+        payload = _completion_durable_payload(evt)
+        if disposition == self._SPOOL_COMMITTED_ACK:
+            recorded_at = payload.get("completion_ack_recorded_at")
+            if (
+                isinstance(recorded_at, bool)
+                or not isinstance(recorded_at, (int, float))
+                or not math.isfinite(recorded_at)
+                or recorded_at <= 0
+            ):
+                recorded_at = time.time()
+            payload["completion_ack_recorded_at"] = recorded_at
+            evt["completion_ack_recorded_at"] = recorded_at
         with self._lock:
-            self._terminal_completion_spool[key] = _completion_durable_payload(evt)
+            self._terminal_completion_spool[key] = payload
         return True
 
     def _discard_terminal_completion_spool(
@@ -3568,9 +3608,14 @@ class ProcessRegistry:
                 )
             else:
                 for event in committed_ack_events:
-                    self._discard_terminal_completion_spool(
-                        event, disposition=self._SPOOL_COMMITTED_ACK
-                    )
+                    if event.get("type") == "async_delegation":
+                        self._spool_terminal_completion(
+                            event, disposition=self._SPOOL_COMMITTED_ACK
+                        )
+                    else:
+                        self._discard_terminal_completion_spool(
+                            event, disposition=self._SPOOL_COMMITTED_ACK
+                        )
 
         for entry in entries:
             if isinstance(entry.get("completion_ack"), dict):
@@ -3787,6 +3832,7 @@ def finish_completion_event_delivery(
                 "missing_active_marker",
                 "history_conflict",
                 "visibility_suppressed",
+                "target_gone",
             }:
                 terminal = mark_completion_delivery_recovery(evt, claim_id, outcome)
         except Exception:

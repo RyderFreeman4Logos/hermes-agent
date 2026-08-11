@@ -526,3 +526,220 @@ def test_malformed_abandoned_task_is_parked_without_blocking_neighbor(delegation
         ).fetchone()
     assert state == "parked_corrupt"
     assert json.loads(payload)["corrupt_delivery_row"] == "deleg-bad-task"
+
+
+@pytest.mark.parametrize(
+    ("field", "forged"),
+    [
+        ("session_key", "foreign-session"),
+        ("origin_ui_session_id", "foreign-tab"),
+        ("origin_session_id", "foreign-origin"),
+        ("parent_session_id", "foreign-parent"),
+    ],
+)
+def test_restored_async_routing_is_bound_to_dispatch_row(
+    delegation_db, field, forged
+):
+    ad = delegation_db
+    event = {
+        "type": "async_delegation",
+        "delegation_id": f"deleg-forged-{field}",
+        "session_key": "owner-session",
+        "origin_ui_session_id": "owner-tab",
+        "origin_session_id": "owner-origin",
+        "parent_session_id": "owner-parent",
+        "status": "completed",
+        "summary": "PRIVATE RESULT",
+    }
+    ad._persist_dispatch({**event, "dispatched_at": 1.0})
+    ad._persist_completion(event, {"status": "completed", "summary": event["summary"]})
+    event[field] = forged
+    with ad._connect() as conn:
+        conn.execute(
+            "UPDATE async_delegations SET event_json=? WHERE delegation_id=?",
+            (json.dumps(event), event["delegation_id"]),
+        )
+
+    restored = _Queue()
+    assert ad.restore_undelivered_completions(restored) == 0
+    assert restored.items == []
+    assert _delivery_row(ad, event["delegation_id"])[0] == "parked_corrupt"
+
+
+def test_restored_async_routing_missing_payload_fields_rebuilt_from_row(delegation_db):
+    ad = delegation_db
+    routing = {
+        "session_key": "owner-session",
+        "origin_ui_session_id": "owner-tab",
+        "origin_session_id": "owner-origin",
+        "parent_session_id": "owner-parent",
+    }
+    event = {
+        "type": "async_delegation",
+        "delegation_id": "deleg-routing-rebuild",
+        **routing,
+        "status": "completed",
+        "summary": "done",
+    }
+    ad._persist_dispatch({**event, "dispatched_at": 1.0})
+    ad._persist_completion(event, {"status": "completed", "summary": "done"})
+    with ad._connect() as conn:
+        stored = json.loads(conn.execute(
+            "SELECT event_json FROM async_delegations WHERE delegation_id=?",
+            (event["delegation_id"],),
+        ).fetchone()[0])
+        for field in routing:
+            stored.pop(field, None)
+        conn.execute(
+            "UPDATE async_delegations SET event_json=? WHERE delegation_id=?",
+            (json.dumps(stored), event["delegation_id"]),
+        )
+
+    restored = _Queue()
+    assert ad.restore_undelivered_completions(restored) == 1
+    assert {field: restored.items[0][field] for field in routing} == routing
+
+
+def test_distinct_canonical_successes_have_distinct_public_durable_ids(delegation_db):
+    ad = delegation_db
+    from tools.process_registry import ProcessRegistry, ProcessSession
+
+    registry = ProcessRegistry()
+    events = [
+        registry._completion_event(
+            ProcessSession(
+                id="proc-canonical-alias",
+                command=command,
+                session_key="owner",
+                started_at=42.0,
+                output_buffer=output,
+                exited=True,
+                exit_code=0,
+                completion_reason="exited",
+                notify_on_complete=True,
+            )
+        )
+        for command, output in (
+            ("first command", "FIRST PRIVATE RESULT"),
+            ("different command", "PRIVATE SECOND"),
+        )
+    ]
+
+    first_id, second_id = map(ad._ordinary_completion_delivery_id, events)
+    assert first_id and second_id and first_id != second_id
+    assert "PRIVATE SECOND" not in second_id
+    assert all(ad.persist_event_delivery(event) for event in events)
+
+
+@pytest.mark.parametrize("probe", ["missing-owner-start", "unreadable-current-start"])
+def test_unverifiable_effect_owner_moves_to_no_replay_recovery(
+    delegation_db, monkeypatch, probe
+):
+    ad = delegation_db
+    import queue
+
+    event = _ordinary_event(f"owner-{probe}", 43.0)
+    assert ad.persist_event_delivery(event)
+    claim = ad.claim_event_delivery(event, "owner-test")
+    assert claim
+    with ad._connect() as conn:
+        if probe == "missing-owner-start":
+            conn.execute(
+                "UPDATE ordinary_completion_deliveries "
+                "SET delivery_owner_started_at=NULL WHERE delivery_id=?",
+                (ad._ordinary_completion_delivery_id(event),),
+            )
+    monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: True)
+    if probe == "unreadable-current-start":
+        monkeypatch.setattr(
+            "gateway.status.get_process_start_time", lambda _pid: None
+        )
+
+    restored = queue.Queue()
+    assert ad.restore_undelivered_completions(restored) == 0
+    assert restored.empty()
+    assert ad.get_durable_event_delivery(event)["delivery_state"].startswith("recovery_")
+
+
+def test_checkpoint_ack_tombstone_survives_result_cap_and_stale_publication(
+    delegation_db, monkeypatch, tmp_path
+):
+    ad = delegation_db
+    import queue
+    import tools.process_registry as registry_module
+
+    monkeypatch.setattr(registry_module, "CHECKPOINT_PATH", tmp_path / "processes.json")
+    event = {
+        "type": "async_delegation",
+        "delegation_id": "deleg-prune-tombstone",
+        "session_key": "owner",
+        "origin_ui_session_id": "tab",
+        "origin_session_id": "origin",
+        "parent_session_id": "parent",
+        "status": "completed",
+        "summary": "done",
+    }
+    ad._persist_dispatch({**event, "dispatched_at": 1.0})
+    ad._persist_completion(event, {"status": "completed", "summary": "done"})
+    claim = ad.claim_completion_delivery(event["delegation_id"], "crashed-ack")
+    assert claim
+    registry = registry_module.ProcessRegistry()
+    assert registry._spool_terminal_completion(
+        event, disposition=registry._SPOOL_COMMITTED_ACK
+    )
+    assert registry._write_checkpoint()
+
+    restarted = registry_module.ProcessRegistry()
+    assert restarted.completion_queue.empty()
+    for index in range(ad._MAX_RETAINED_COMPLETED + 1):
+        filler = {
+            "delegation_id": f"filler-{index}",
+            "session_key": "owner",
+            "dispatched_at": 2.0 + index,
+        }
+        ad._persist_dispatch(filler)
+        ad._persist_completion(
+            {"type": "async_delegation", **filler, "status": "completed"},
+            {"status": "completed", "summary": "filler"},
+        )
+        filler_claim = ad.claim_completion_delivery(
+            filler["delegation_id"], f"filler-claim-{index}"
+        )
+        assert filler_claim
+        assert ad.complete_completion_delivery(
+            filler["delegation_id"], f"filler-claim-{index}"
+        )
+
+    ad._persist_dispatch({**event, "dispatched_at": 1.0})
+    ad._persist_completion(event, {"status": "completed", "summary": "done"})
+    restored = queue.Queue()
+    assert ad.restore_undelivered_completions(restored) == 0
+    assert restored.empty()
+    assert ad.get_durable_delegation(event["delegation_id"])["delivery_state"] != "pending"
+
+
+def test_zero_row_checkpoint_ack_creates_no_replay_tombstone(
+    delegation_db, monkeypatch, tmp_path
+):
+    ad = delegation_db
+    import tools.process_registry as registry_module
+
+    monkeypatch.setattr(registry_module, "CHECKPOINT_PATH", tmp_path / "processes.json")
+    event = {
+        "type": "async_delegation",
+        "delegation_id": "deleg-missing-at-reconcile",
+        "session_key": "owner",
+        "status": "completed",
+        "summary": "done",
+    }
+    writer = registry_module.ProcessRegistry()
+    assert writer._spool_terminal_completion(
+        event, disposition=writer._SPOOL_COMMITTED_ACK
+    )
+    assert writer._write_checkpoint()
+
+    restarted = registry_module.ProcessRegistry()
+    assert restarted.completion_queue.empty()
+    durable = ad.get_durable_delegation(event["delegation_id"])
+    assert durable is not None
+    assert durable["delivery_state"].startswith("recovery_")

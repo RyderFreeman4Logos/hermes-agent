@@ -859,7 +859,7 @@ def test_sqlite_malformed_tuple_collision_delivers_once_and_stays_settled(
     )
     canonical = _canonical_delegated_completion()
     malformed = _malformed_collision_copy(canonical)
-    legacy_id = ad._ordinary_completion_delivery_id(canonical)
+    legacy_id = ad._ordinary_completion_legacy_delivery_id(canonical)
     assert legacy_id
     with ad._connect() as conn:
         conn.execute(
@@ -1371,6 +1371,68 @@ def test_failed_process_injection_releases_lifecycle_claim(monkeypatch):
         runner._deliver_completion_notification("payload", event)
     ) is True
     assert injected.await_count == 2
+
+
+def test_gateway_async_effect_uses_shared_ack_recovery(
+    monkeypatch, isolated_registry
+):
+    from tools import async_delegation as ad
+
+    event = _async_event("deleg-gateway-shared-settlement")
+    ad._persist_dispatch(event)
+    ad._persist_completion(event, {"status": "completed", "summary": "Found it"})
+    runner = _runner(SimpleNamespace(handle_message=AsyncMock(), supports_push=False))
+    monkeypatch.setattr(runner, "_inject_watch_notification", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        ad,
+        "complete_completion_delivery",
+        MagicMock(side_effect=OSError("intentional direct ACK failure")),
+    )
+
+    assert asyncio.run(
+        runner._deliver_completion_notification("payload", event)
+    ) is True
+    durable = ad.get_durable_delegation(event["delegation_id"])
+    assert durable is not None
+    assert durable["delivery_state"] == "recovery_committed_ack_failed"
+    assert isolated_registry.completion_queue.empty()
+
+
+@pytest.mark.parametrize("event_type", ["completion", "async_delegation"])
+def test_gateway_api_self_post_uses_completion_fence(
+    monkeypatch, event_type
+):
+    from tools import async_delegation as ad
+
+    adapter = SimpleNamespace(handle_message=AsyncMock(), supports_async_delivery=False)
+    runner = _runner(adapter)
+    runner.adapters = {Platform.API_SERVER: adapter}  # type: ignore[assignment]
+    if event_type == "async_delegation":
+        event = _async_event("deleg-api-self-post")
+        event.update(session_key="raw-api-session", origin_session_id="raw-api-session")
+        ad._persist_dispatch(event)
+        ad._persist_completion(event, {"status": "completed", "summary": "Found it"})
+    else:
+        event = _completion_event(started_at=4.25, session_id="proc-api-self-post")
+        event.update(session_key="raw-api-session", origin_session_id="raw-api-session")
+        for field in ("platform", "chat_type", "chat_id"):
+            event.pop(field, None)
+        assert ad.persist_event_delivery(event)
+    self_post = AsyncMock()
+    monkeypatch.setattr("gateway.wake.deliver_wake", self_post)
+
+    assert asyncio.run(
+        runner._deliver_completion_notification("payload", event)
+    ) is True
+    call = self_post.await_args
+    assert call is not None
+    assert call.kwargs["completion_delivery"] is True
+    if event_type == "async_delegation":
+        durable = ad.get_durable_delegation(event["delegation_id"])
+    else:
+        durable = ad.get_durable_event_delivery(event)
+    assert durable is not None
+    assert durable["delivery_state"] == "delivered"
 
 
 def test_failed_completion_prompt_releases_lifecycle_claim_for_retry(monkeypatch):

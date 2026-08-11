@@ -22354,7 +22354,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             adapter,
                             text=synth_text,
                             session_id=raw_sid,
-                            completion_delivery=evt.get("type") == "completion",
+                            completion_delivery=evt.get("type") in {
+                                "completion",
+                                "async_delegation",
+                            },
                         )
                         return True
                     except Exception as e:
@@ -22402,7 +22405,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter,
                     text=synth_text,
                     session_id=raw_sid,
-                    completion_delivery=evt.get("type") == "completion",
+                    completion_delivery=evt.get("type") in {
+                        "completion",
+                        "async_delegation",
+                    },
                 )
                 return True
             except Exception as e:
@@ -22444,7 +22450,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message_id=str(evt.get("message_id") or "").strip() or None,
                 metadata={
                     **metadata,
-                    "_completion_delivery_synthetic": evt.get("type") == "completion",
+                    "_completion_delivery_synthetic": evt.get("type")
+                    in {"completion", "async_delegation"},
                 },
             )
             logger.info(
@@ -22591,167 +22598,63 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             claim_completion_event_delivery,
             completion_delivery_prompt,
             finish_completion_event_delivery,
-            process_registry,
         )
 
-        process_claimed = False
-        ordinary_claim_id = ""
-        if evt.get("type", "completion") == "completion":
-            ordinary_claim = claim_completion_event_delivery(evt, "gateway")
-            if ordinary_claim is None:
-                return None
-            process_claimed = True
-            ordinary_claim_id = ordinary_claim or "gateway-local"
-
+        claim = claim_completion_event_delivery(evt, "gateway")
+        if claim is None:
+            return None
+        claim_id = claim or "gateway-local"
+        settled = False
         try:
             model_text = await asyncio.to_thread(
                 completion_delivery_prompt, evt, synth_text
             )
-        except BaseException:
-            if process_claimed:
-                finish_completion_event_delivery(
-                    evt, ordinary_claim_id, "provider_failed"
-                )
-            raise
-        if model_text is None:
-            if process_claimed:
-                finish_completion_event_delivery(
-                    evt, ordinary_claim_id, "committed"
-                )
-            return None
-        synth_text = model_text
-        identity = None if process_claimed else self._completion_delivery_identity(evt)
-        durable_claim_id = ""
-        durable_delegation_id = ""
-        if evt.get("type") == "async_delegation":
-            durable_delegation_id = str(evt.get("delegation_id") or "")
-            if durable_delegation_id:
-                try:
-                    from tools.async_delegation import claim_completion_delivery
+            if model_text is None:
+                settled = True
+                finish_completion_event_delivery(evt, claim_id, "committed")
+                return None
+            synth_text = model_text
 
-                    durable_claim_id = f"gateway:{id(self)}:{__import__('uuid').uuid4().hex}"
-                    if not claim_completion_delivery(
-                        durable_delegation_id, durable_claim_id,
-                    ):
+            if evt.get("type") == "async_delegation":
+                GatewayRunner._enrich_async_delegation_routing(self, evt)
+                parent_session_id = str(evt.get("parent_session_id") or "").strip()
+                if parent_session_id:
+                    verdict = await self._classify_completion_target(parent_session_id)
+                    if verdict == "terminal":
+                        logger.warning(
+                            "Async delegation %s targets permanently-gone session %s; "
+                            "retaining terminal recovery without provider replay.",
+                            evt.get("delegation_id") or "<legacy>",
+                            parent_session_id,
+                        )
+                        settled = True
+                        finish_completion_event_delivery(evt, claim_id, "target_gone")
                         return None
-                except Exception as exc:
-                    logger.warning(
-                        "Could not claim durable async completion %s: %s",
-                        durable_delegation_id, exc,
-                    )
-                    return False
-            parent_session_id = str(evt.get("parent_session_id") or "").strip()
-            if parent_session_id:
-                # Pre-flight (#65838-class): adapter acceptance is NOT proof of
-                # delivery — the inner #55578 resolver can still fail closed
-                # inside the message pipeline AFTER the adapter accepted, which
-                # would falsely acknowledge the durable row as delivered.
-                # Verify the target here, before acceptance, and give drops an
-                # honest durable disposition.
-                verdict = await self._classify_completion_target(parent_session_id)
-                if verdict == "terminal":
-                    logger.warning(
-                        "Async delegation %s targets permanently-gone session %s; "
-                        "terminally dropping delivery (result remains in the "
-                        "delegation records).",
-                        durable_delegation_id or "<legacy>", parent_session_id,
-                    )
-                    if durable_claim_id:
-                        try:
-                            from tools.async_delegation import drop_completion_delivery
+                    if verdict == "retry":
+                        settled = True
+                        finish_completion_event_delivery(
+                            evt, claim_id, "provider_failed"
+                        )
+                        return False
 
-                            drop_completion_delivery(
-                                durable_delegation_id, durable_claim_id,
-                            )
-                        except Exception:
-                            logger.debug(
-                                "Could not drop durable completion claim",
-                                exc_info=True,
-                            )
-                    return None
-                if verdict == "retry":
-                    if durable_claim_id:
-                        try:
-                            from tools.async_delegation import release_completion_delivery
-
-                            release_completion_delivery(
-                                durable_delegation_id, durable_claim_id,
-                            )
-                        except Exception:
-                            logger.debug(
-                                "Could not release durable completion claim",
-                                exc_info=True,
-                            )
-                    return False
-        if identity is not None:
-            with self._completion_delivery_lock:
-                if (
-                    identity in self._completion_deliveries_inflight
-                    or identity in self._completion_deliveries_delivered
-                ):
-                    return None
-                self._completion_deliveries_inflight.add(identity)
-
-        delivery_claim_id = ordinary_claim_id or durable_claim_id
-        if delivery_claim_id:
-            evt["_completion_delivery_claim_id"] = delivery_claim_id
-        accepted = False
-        try:
+            evt["_completion_delivery_claim_id"] = claim_id
             injection_result = await self._inject_watch_notification(synth_text, evt)
             if injection_result is not True:
+                settled = True
+                outcome = (
+                    "target_gone" if injection_result is None else "provider_failed"
+                )
+                finish_completion_event_delivery(evt, claim_id, outcome)
                 return injection_result
             if evt.pop("_completion_delivery_deferred", False):
-                accepted = True
+                settled = True
                 return True
-            accepted = True
 
-            if identity is not None:
-                with self._completion_delivery_lock:
-                    self._completion_deliveries_inflight.discard(identity)
-                    self._completion_deliveries_delivered[identity] = None
-                    while (
-                        len(self._completion_deliveries_delivered)
-                        > self._completion_delivery_retention
-                    ):
-                        self._completion_deliveries_delivered.popitem(last=False)
-            if process_claimed:
-                finish_completion_event_delivery(
-                    evt, ordinary_claim_id, "committed"
-                )
-
-            # If the durable async-delegation producer branch is present, its
-            # SQLite row remains the authoritative replay state. Acknowledge it
-            # after adapter acceptance; this gateway keeps no parallel ledger.
-            if durable_claim_id:
-                try:
-                    from tools.async_delegation import complete_completion_delivery
-
-                    complete_completion_delivery(
-                        durable_delegation_id, durable_claim_id,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "Could not acknowledge durable async completion %s: %s",
-                        durable_delegation_id, exc,
-                    )
-            return True
+            settled = True
+            return finish_completion_event_delivery(evt, claim_id, "committed")
         finally:
-            if identity is not None and not accepted:
-                with self._completion_delivery_lock:
-                    self._completion_deliveries_inflight.discard(identity)
-            if process_claimed and not accepted:
-                finish_completion_event_delivery(
-                    evt, ordinary_claim_id, "provider_failed"
-                )
-            if durable_claim_id and not accepted:
-                try:
-                    from tools.async_delegation import release_completion_delivery
-
-                    release_completion_delivery(
-                        durable_delegation_id, durable_claim_id,
-                    )
-                except Exception:
-                    logger.debug("Could not release durable completion claim", exc_info=True)
+            if not settled:
+                finish_completion_event_delivery(evt, claim_id, "provider_failed")
 
     def _enrich_async_delegation_routing(self, evt: dict) -> None:
         """Fill platform/chat_id/thread_id/chat_type on an async-delegation event.
@@ -22760,11 +22663,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         daemon worker has no access to the per-message routing metadata the
         terminal background watcher captures at spawn time). Parse the
         session_key into the routing fields ``_build_process_event_source``
-        expects. Best-effort: a CLI-origin event (empty session_key) is left
-        as-is and simply won't route on the gateway.
+        expects. Any persisted transport projection is discarded first; the
+        durable ``session_key``/``origin_session_id`` row is the sole route
+        authority. A CLI-origin event (empty session_key) remains unrouted.
         """
-        if evt.get("platform"):
-            return  # already enriched
+        for key in (
+            "platform",
+            "chat_type",
+            "chat_id",
+            "thread_id",
+            "user_id",
+            "user_name",
+            "message_id",
+        ):
+            evt.pop(key, None)
         parsed = _parse_session_key(evt.get("session_key", "") or "")
         if not parsed:
             return
@@ -22894,17 +22806,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 for evt in requeue:
                     _pr.completion_queue.put(evt)
                 for evt in completion_events:
-                    if evt.get("type") == "async_delegation":
-                        self._enrich_async_delegation_routing(evt)
                     synth_text = _format_gateway_process_notification(evt)
                     if not synth_text:
                         continue
                     try:
-                        delivered = await self._deliver_completion_notification(synth_text, evt)
-                        if delivered is False:
-                            _pr.completion_queue.put(evt)
+                        await self._deliver_completion_notification(synth_text, evt)
                     except Exception as e:
-                        _pr.completion_queue.put(evt)
                         logger.error("Completion injection error: %s", e)
                 for evt in heartbeat_events:
                     try:
@@ -23008,13 +22915,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     synth_text = format_process_notification(completion_evt)
                     if not synth_text:
                         break
-                    delivered = await self._deliver_completion_notification(
+                    await self._deliver_completion_notification(
                         synth_text, completion_evt,
                     )
-                    if delivered is False:
-                        # The process remains terminal; retry after failed
-                        # adapter injection instead of suppressing the result.
-                        continue
+                    # The shared settlement helper owns retries and requeueing.
                     break
 
                 # --- Normal text-only notification ---

@@ -1200,51 +1200,49 @@ def test_drain_notifications_formatter_error_restores_selected_batch_before_tail
 def test_batch_front_restore_keeps_native_bound_across_retry_cycles(registry, maxsize):
     completion_queue = queue.Queue(maxsize=maxsize)
     registry.completion_queue = completion_queue
-    original = [{"owner": "A", "seq": seq} for seq in range(1, maxsize + 1)]
-    for event in original:
+    expected = [{"owner": "A", "seq": seq} for seq in range(1, maxsize + 1)]
+    for event in expected:
         completion_queue.put(event)
-    expected = list(original)
 
     for cycle in range(3):
         detached = registry.drain_matching_completions(lambda _event: True)
         assert detached == expected
-        produced = [
-            {"owner": f"P{cycle}", "seq": len(expected) + offset}
-            for offset in range(1, maxsize + 1)
-        ]
+        assert all(actual is wanted for actual, wanted in zip(detached, expected))
+        produced = {"owner": f"P{cycle}", "seq": maxsize + cycle + 1}
+        producer_entered = threading.Event()
         producer_done = threading.Event()
 
-        def produce(items=produced):
-            for event in items:
-                completion_queue.put(event)
+        def produce(event=produced):
+            producer_entered.set()
+            completion_queue.put(event)
             producer_done.set()
 
         producer = threading.Thread(target=produce, daemon=True)
         producer.start()
-        assert producer_done.wait(1), "drain did not wake the bounded producer"
+        assert producer_entered.wait(1), "producer did not reach bounded put"
+        with completion_queue.mutex:
+            native = list(completion_queue.queue)
+            assert native == expected
+            assert all(actual is wanted for actual, wanted in zip(native, expected))
+            assert not producer_done.is_set()
+
+        registry.requeue_completions_front(detached)
+        assert completion_queue.qsize() == maxsize
+        assert completion_queue.full()
+        assert not completion_queue.empty()
+        assert not producer_done.is_set()
+
+        popped = completion_queue.get_nowait()
+        assert popped is expected[0]
+        assert producer_done.wait(1), "terminal dequeue did not wake bounded producer"
         producer.join(1)
-
-        restored = threading.Event()
-
-        def restore():
-            registry.requeue_completions_front(detached)
-            restored.set()
-
-        restorer = threading.Thread(target=restore, daemon=True)
-        restorer.start()
-        assert restored.wait(1), "retry restore deadlocked behind its producer"
-        restorer.join(1)
-        expected.extend(produced)
-        assert completion_queue.qsize() <= maxsize
-        assert completion_queue.unfinished_tasks == len(expected)
-
-    foreign = registry.drain_matching_completions(
-        lambda event: event.get("owner", "").startswith("P")
-    )
-    assert foreign == expected[maxsize:]
-    remaining = registry.drain_matching_completions(lambda _event: True)
-    assert remaining == original
-    assert all(actual is wanted for actual, wanted in zip(remaining, original))
+        assert not producer.is_alive()
+        expected = [*expected[1:], produced]
+        with completion_queue.mutex:
+            native = list(completion_queue.queue)
+        assert native == expected
+        assert completion_queue.qsize() == maxsize
+        assert completion_queue.unfinished_tasks == maxsize + cycle + 1
 
 
 def test_drain_notifications_filters_async_delegation_by_session_key():

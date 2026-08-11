@@ -339,3 +339,190 @@ def test_repeated_ownership_drops_eventually_reach_the_parking_threshold(
 
     assert queue.items == []
     assert _delivery_row(ad, "d-unowned")[0] == "parked"
+
+
+def _ordinary_event(name: str, started_at: float) -> dict:
+    return {
+        "type": "completion",
+        "session_id": f"proc-{name}",
+        "session_key": "owner",
+        "started_at": started_at,
+        "command": f"command-{name}",
+        "exit_code": 1,
+        "completion_reason": "exited",
+        "termination_source": "",
+        "output": name,
+    }
+
+
+def test_wrong_ordinary_row_identity_is_parked_without_rekeying(delegation_db):
+    ad = delegation_db
+    event = _ordinary_event("wrong-row", 11.0)
+    normalized_id = ad._ordinary_completion_delivery_id(event)
+    assert normalized_id
+    _insert_ordinary(ad, "wrong-row-id", json.dumps(event), 1.0)
+
+    queue = _Queue()
+    assert ad.restore_undelivered_completions(queue) == 0
+
+    assert queue.items == []
+    assert _ordinary_state(ad, "wrong-row-id") == "parked_corrupt"
+    with ad._DB_LOCK, ad._transaction() as conn:
+        assert (
+            conn.execute(
+                "SELECT 1 FROM ordinary_completion_deliveries WHERE delivery_id=?",
+                (normalized_id,),
+            ).fetchone()
+            is None
+        )
+
+
+def test_swapped_ordinary_identities_preserve_two_once_only_effects(delegation_db):
+    ad = delegation_db
+    events = [
+        _ordinary_event("swapped-a", 12.0),
+        _ordinary_event("swapped-b", 13.0),
+    ]
+    ids = [ad._ordinary_completion_delivery_id(event) for event in events]
+    assert all(ids) and ids[0] != ids[1]
+    _insert_ordinary(ad, ids[0], json.dumps(events[1]), 1.0)
+    _insert_ordinary(ad, ids[1], json.dumps(events[0]), 2.0)
+
+    queue = _Queue()
+    assert ad.restore_undelivered_completions(queue) == 2
+    effects = []
+    for event in queue.items:
+        claim = ad.claim_event_delivery(event, "swapped-test")
+        assert claim
+        effects.append(event["session_id"])
+        assert ad.complete_event_delivery(event, claim)
+
+    assert sorted(effects) == sorted(event["session_id"] for event in events)
+    restarted = _Queue()
+    assert ad.restore_undelivered_completions(restarted) == 0
+    assert restarted.items == []
+
+
+def test_wrong_type_scalar_fields_park_only_their_rows(delegation_db):
+    ad = delegation_db
+    async_events = [
+        {
+            "type": "async_delegation",
+            "delegation_id": f"deleg-bad-{name}",
+            "session_key": "owner",
+            "status": "completed",
+            "summary": name,
+        }
+        for name in ("attempts", "owner-pid", "owner-start")
+    ]
+    ordinary_events = [
+        _ordinary_event("bad-attempts", 13.5),
+        _ordinary_event("bad-owner-pid", 14.0),
+        _ordinary_event("bad-owner-start", 15.0),
+    ]
+    ordinary_ids = [
+        ad._ordinary_completion_delivery_id(event) for event in ordinary_events
+    ]
+    valid = _ordinary_event("valid-scalar-neighbor", 16.0)
+    valid_id = ad._ordinary_completion_delivery_id(valid)
+    assert all(ordinary_ids) and valid_id
+    with ad._connect() as conn:
+        for event, attempts, owner_pid, owner_started_at in (
+            (async_events[0], "not-an-integer", None, None),
+            (async_events[1], 0, "not-a-pid", 1),
+            (async_events[2], 0, 999999999, "not-a-start-time"),
+        ):
+            conn.execute(
+                """INSERT INTO async_delegations
+                   (delegation_id, origin_session, origin_ui_session_id, state,
+                    dispatched_at, completed_at, updated_at, event_json,
+                    delivery_state, delivery_attempts, delivery_claim,
+                    owner_pid, owner_started_at)
+                   VALUES (?, 'owner', '', 'completed', 1, 2, 2, ?, ?, ?,
+                           'claim', ?, ?)""",
+                (
+                    event["delegation_id"],
+                    json.dumps(event),
+                    "pending" if owner_pid is None else "effect_started",
+                    attempts,
+                    owner_pid,
+                    owner_started_at,
+                ),
+            )
+        conn.execute(
+            """INSERT INTO ordinary_completion_deliveries
+               (delivery_id, event_json, delivery_state, updated_at,
+                delivery_attempts)
+               VALUES (?, ?, 'pending', 2, ?)""",
+            (ordinary_ids[0], json.dumps(ordinary_events[0]), "not-an-integer"),
+        )
+        for event, delivery_id, owner_pid, owner_started_at in (
+            (ordinary_events[1], ordinary_ids[1], "not-a-pid", 1),
+            (ordinary_events[2], ordinary_ids[2], 999999999, "not-a-start-time"),
+        ):
+            conn.execute(
+                """INSERT INTO ordinary_completion_deliveries
+                   (delivery_id, event_json, delivery_state, updated_at,
+                    delivery_claim, delivery_owner_pid,
+                    delivery_owner_started_at)
+                   VALUES (?, ?, 'effect_started', 2, 'claim', ?, ?)""",
+                (delivery_id, json.dumps(event), owner_pid, owner_started_at),
+            )
+        conn.execute(
+            """INSERT INTO ordinary_completion_deliveries
+               (delivery_id, event_json, delivery_state, updated_at)
+               VALUES (?, ?, 'pending', 3)""",
+            (valid_id, json.dumps(valid)),
+        )
+
+    queue = _Queue()
+    assert ad.restore_undelivered_completions(queue) == 1
+    assert [event["session_id"] for event in queue.items] == [valid["session_id"]]
+    with ad._connect() as conn:
+        assert {
+            row[0]: row[1]
+            for row in conn.execute(
+                "SELECT delegation_id, delivery_state FROM async_delegations"
+            )
+        } == {event["delegation_id"]: "parked_corrupt" for event in async_events}
+        assert {
+            row[0]: row[1]
+            for row in conn.execute(
+                "SELECT delivery_id, delivery_state "
+                "FROM ordinary_completion_deliveries WHERE delivery_id != ?",
+                (valid_id,),
+            )
+        } == {delivery_id: "parked_corrupt" for delivery_id in ordinary_ids}
+
+
+def test_malformed_abandoned_task_is_parked_without_blocking_neighbor(delegation_db):
+    ad = delegation_db
+    valid = _ordinary_event("valid-task-neighbor", 17.0)
+    valid_id = ad._ordinary_completion_delivery_id(valid)
+    assert valid_id
+    with ad._connect() as conn:
+        conn.execute(
+            """INSERT INTO async_delegations
+               (delegation_id, origin_session, origin_ui_session_id, state,
+                dispatched_at, updated_at, task_json, delivery_state,
+                owner_pid)
+               VALUES ('deleg-bad-task', 'owner', '', 'running', 1, 1,
+                       '{not-json', 'pending', 999999999)"""
+        )
+        conn.execute(
+            """INSERT INTO ordinary_completion_deliveries
+               (delivery_id, event_json, delivery_state, updated_at)
+               VALUES (?, ?, 'pending', 2)""",
+            (valid_id, json.dumps(valid)),
+        )
+
+    queue = _Queue()
+    assert ad.restore_undelivered_completions(queue) == 1
+    assert [event["session_id"] for event in queue.items] == [valid["session_id"]]
+    with ad._connect() as conn:
+        state, payload = conn.execute(
+            "SELECT delivery_state, event_json FROM async_delegations "
+            "WHERE delegation_id='deleg-bad-task'"
+        ).fetchone()
+    assert state == "parked_corrupt"
+    assert json.loads(payload)["corrupt_delivery_row"] == "deleg-bad-task"

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import multiprocessing
+from pathlib import Path
 import queue
 import threading
 import types
@@ -33,6 +35,23 @@ class _HeldThread(_InlineThread):
     def run(self):
         if self._target:
             self._target()
+
+
+def _checkpoint_ack_writer(checkpoint, db_path, event, ready, write_now):
+    """Write one ACK from a separately constructed registry after a barrier."""
+    from tools import async_delegation as ad
+    import tools.process_registry as registry_module
+
+    ad._db_path = lambda: Path(db_path)
+    registry_module.CHECKPOINT_PATH = Path(checkpoint)
+    registry = registry_module.ProcessRegistry()
+    if not registry._spool_terminal_completion(
+        event, disposition=registry._SPOOL_COMMITTED_ACK
+    ):
+        raise RuntimeError("could not spool checkpoint ACK")
+    ready.set()
+    if not write_now.wait(10) or not registry._write_checkpoint():
+        raise RuntimeError("could not write checkpoint ACK")
 
 
 @pytest.fixture()
@@ -489,8 +508,10 @@ def test_sqlite_restore_parks_malformed_private_authority(monkeypatch, tmp_path)
     assert "_completion_delivery_token" not in payload
 
 
-def test_ordinary_completion_claim_restores_after_restart(monkeypatch, tmp_path):
-    """A restart requeues an unfinished ordinary completion from state.db."""
+def test_ordinary_completion_owner_loss_is_parked_after_effect_start(
+    monkeypatch, tmp_path
+):
+    """An owner-lost effect boundary is retained without guessing or replay."""
     import queue
 
     from tools import async_delegation as ad
@@ -512,12 +533,11 @@ def test_ordinary_completion_claim_restores_after_restart(monkeypatch, tmp_path)
     assert restarted_queue.empty()
     monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: False)
 
-    assert ad.restore_undelivered_completions(restarted_queue) == 1
-    restored = restarted_queue.get_nowait()
-    assert {key: restored[key] for key in event} == event
+    assert ad.restore_undelivered_completions(restarted_queue) == 0
+    assert restarted_queue.empty()
     receipt = ad.get_durable_event_delivery(event)
     assert receipt is not None
-    assert receipt["delivery_state"] == "pending"
+    assert receipt["delivery_state"] == "recovery_effect_started_owner_lost"
     assert receipt["delivery_claim"] is None
 
 
@@ -774,6 +794,137 @@ def test_committed_ack_reconciles_after_checkpoint_or_sqlite_failure(
         "delivered",
         "recovery_committed_ack_failed",
     }
+
+
+def test_persistent_ack_failures_leave_dead_claim_parked_without_replay(
+    monkeypatch, tmp_path
+):
+    from tools import async_delegation as ad
+    import tools.process_registry as registry_module
+
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    monkeypatch.setattr(registry_module, "CHECKPOINT_PATH", tmp_path / "processes.json")
+    registry = registry_module.ProcessRegistry()
+    event = {
+        "type": "completion",
+        "session_id": "proc-all-ack-writes-failed",
+        "session_key": "active",
+        "started_at": 5.66,
+        "command": "false",
+        "exit_code": 1,
+        "completion_reason": "exited",
+        "termination_source": "",
+        "output": "visible failure",
+    }
+    assert ad.persist_event_delivery(event)
+    claim = registry_module.claim_completion_event_delivery(
+        event, "tui-test", registry=registry
+    )
+    assert claim
+    monkeypatch.setattr(registry, "_write_checkpoint", lambda: False)
+    monkeypatch.setattr(
+        ad,
+        "complete_event_delivery",
+        MagicMock(side_effect=OSError("direct ACK unavailable")),
+    )
+    monkeypatch.setattr(
+        ad,
+        "mark_completion_delivery_recovery",
+        MagicMock(side_effect=OSError("recovery ACK unavailable")),
+    )
+    release = MagicMock(side_effect=AssertionError("committed effect was released"))
+    monkeypatch.setattr(ad, "release_event_delivery", release)
+
+    assert not registry_module.finish_completion_event_delivery(
+        event, claim, "committed", registry=registry
+    )
+    release.assert_not_called()
+    monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: False)
+
+    restarted = registry_module.ProcessRegistry()
+    assert restarted.completion_queue.empty()
+    receipt = ad.get_durable_event_delivery(event)
+    assert receipt is not None
+    assert receipt["delivery_state"] == "recovery_effect_started_owner_lost"
+
+
+def test_live_async_claim_is_not_stolen_by_sibling_registry(monkeypatch, tmp_path):
+    from tools import async_delegation as ad
+    import tools.process_registry as registry_module
+
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    event = {
+        "type": "async_delegation",
+        "delegation_id": "deleg-live-owner",
+        "session_key": "active",
+        "origin_ui_session_id": "sid",
+        "origin_session_id": "active",
+        "parent_session_id": "active",
+        "goal": "live owner",
+        "status": "completed",
+        "summary": "done",
+        "dispatched_at": 5.67,
+        "completed_at": 5.68,
+    }
+    ad._persist_dispatch(event)
+    ad._persist_completion(event, {"status": "completed", "summary": "done"})
+    owner = registry_module.ProcessRegistry()
+    claim = registry_module.claim_completion_event_delivery(
+        event, "live-owner", registry=owner
+    )
+    assert claim
+
+    sibling = registry_module.ProcessRegistry()
+
+    assert sibling.completion_queue.empty()
+    durable = ad.get_durable_delegation(event["delegation_id"])
+    assert durable is not None
+    assert durable["delivery_state"] == "effect_started"
+
+
+def test_checkpoint_ack_merge_survives_two_process_writers(tmp_path):
+    if "fork" not in multiprocessing.get_all_start_methods():
+        pytest.skip("requires fork to construct both registries before either write")
+    context = multiprocessing.get_context("fork")
+
+    checkpoint = tmp_path / "processes.json"
+    db_path = tmp_path / "state.db"
+    events = [
+        {
+            "type": "completion",
+            "session_id": f"proc-checkpoint-writer-{index}",
+            "session_key": "active",
+            "started_at": 20.0 + index,
+            "command": "false",
+            "exit_code": 1,
+            "completion_reason": "exited",
+            "termination_source": "",
+            "output": f"writer-{index}",
+        }
+        for index in (1, 2)
+    ]
+    ready = [context.Event(), context.Event()]
+    write_now = [context.Event(), context.Event()]
+    workers = [
+        context.Process(
+            target=_checkpoint_ack_writer,
+            args=(checkpoint, db_path, event, ready[index], write_now[index]),
+        )
+        for index, event in enumerate(events)
+    ]
+    for worker in workers:
+        worker.start()
+    assert all(barrier.wait(10) for barrier in ready)
+
+    for index, worker in enumerate(workers):
+        write_now[index].set()
+        worker.join(15)
+        assert worker.exitcode == 0
+
+    entries = json.loads(checkpoint.read_text(encoding="utf-8"))
+    assert sorted(entry["completion_ack"]["session_id"] for entry in entries) == sorted(
+        event["session_id"] for event in events
+    )
 
 
 @pytest.mark.parametrize("surface", ["busy", "idle"])
@@ -1050,10 +1201,10 @@ def test_ack_after_suffix_commit_survives_repeated_wakeups(
         db.close()
 
 
-def test_startup_restore_makes_effect_started_completion_retryable(
+def test_startup_restore_parks_owner_lost_effect_started_completion(
     tmp_path, monkeypatch
 ):
-    """A crash before suffix/CAS acknowledgement restores the durable claim."""
+    """An ambiguous crash after effect start must not rerun the provider."""
     from tools import async_delegation as ad
 
     db_path = tmp_path / "state.db"
@@ -1083,16 +1234,13 @@ def test_startup_restore_makes_effect_started_completion_retryable(
         assert durable["delivery_state"] == "effect_started"
 
         restored_events = queue.Queue()
-        assert ad.restore_undelivered_completions(restored_events) == 1
-        assert restored_events.get_nowait()["restored"] is True
+        monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: False)
+        assert ad.restore_undelivered_completions(restored_events) == 0
+        assert restored_events.empty()
         durable = ad.get_durable_delegation(event["delegation_id"])
         assert durable is not None
-        assert durable["delivery_state"] == "pending"
-        assert ad.claim_completion_delivery(event["delegation_id"], "retry-claim")
-        assert ad.complete_completion_delivery(event["delegation_id"], "retry-claim")
-        durable = ad.get_durable_delegation(event["delegation_id"])
-        assert durable is not None
-        assert durable["delivery_state"] == "delivered"
+        assert durable["delivery_state"] == "recovery_effect_started_owner_lost"
+        assert not ad.claim_completion_delivery(event["delegation_id"], "retry-claim")
     finally:
         db.close()
 

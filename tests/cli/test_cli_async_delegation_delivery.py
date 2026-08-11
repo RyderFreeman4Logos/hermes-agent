@@ -181,17 +181,22 @@ def test_cli_committed_ack_dual_failure_restarts_without_provider_replay(
     registry = registry_module.ProcessRegistry()
     monkeypatch.setattr(registry_module, "process_registry", registry)
     event = {
-        "type": "completion",
-        "session_id": "proc-cli-committed-ack-failure",
+        "type": "async_delegation",
+        "delegation_id": "deleg-cli-committed-ack-failure",
         "session_key": "visible-session",
-        "started_at": 8.5,
-        "command": "true",
-        "exit_code": 1,
-        "completion_reason": "exited",
-        "termination_source": "",
-        "output": "failed visibly",
+        "origin_ui_session_id": "cli",
+        "origin_session_id": "visible-session",
+        "parent_session_id": "visible-session",
+        "goal": "finish in the background",
+        "status": "completed",
+        "summary": "finished visibly",
+        "dispatched_at": 8.5,
+        "completed_at": 9.5,
     }
-    assert ad.persist_event_delivery(event)
+    ad._persist_dispatch(event)
+    ad._persist_completion(
+        event, {"status": "completed", "summary": "finished visibly"}
+    )
     assert registry.claim_completion_delivery(event)
     claim = ad.claim_event_delivery(event, "cli-idle")
     assert claim
@@ -231,19 +236,22 @@ def test_cli_committed_ack_dual_failure_restarts_without_provider_replay(
     )
     assert effects == ["completion payload"]
     release.assert_not_called()
-    receipt = ad.get_durable_event_delivery(event)
+    receipt = ad.get_durable_delegation(event["delegation_id"])
     assert receipt and receipt["delivery_state"] == "effect_started"
     checkpoint_entries = json.loads(
         registry_module.CHECKPOINT_PATH.read_text(encoding="utf-8")
     )
-    assert checkpoint_entries[0]["completion_ack"]["session_id"] == event["session_id"]
+    assert (
+        checkpoint_entries[0]["completion_ack"]["delegation_id"]
+        == event["delegation_id"]
+    )
 
     monkeypatch.setattr(ad, "complete_event_delivery", real_complete)
     monkeypatch.setattr(ad, "mark_completion_delivery_recovery", real_mark_recovery)
     monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: False)
     restarted = registry_module.ProcessRegistry()
     assert restarted.completion_queue.empty()
-    receipt = ad.get_durable_event_delivery(event)
+    receipt = ad.get_durable_delegation(event["delegation_id"])
     assert receipt and receipt["delivery_state"] == "recovery_committed_ack_failed"
     assert effects == ["completion payload"]
 

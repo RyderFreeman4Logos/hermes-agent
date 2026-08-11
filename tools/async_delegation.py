@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import threading
 import time
@@ -98,6 +99,54 @@ _MAX_DURABLE_PENDING = 1000
 # instead of replaying on every restart forever.
 _MAX_DELIVERY_ATTEMPTS = 8
 _DB_LOCK = threading.Lock()
+
+
+def _current_process_identity() -> tuple[int, Optional[int]]:
+    pid = os.getpid()
+    try:
+        from gateway.status import get_process_start_time
+
+        return pid, get_process_start_time(pid)
+    except Exception:
+        return pid, None
+
+
+def _delivery_owner_live(
+    owner_pid,
+    owner_started_at,
+    pid_exists,
+    get_process_start_time,
+) -> bool:
+    """Validate a durable PID incarnation; uncertainty stays fail-closed."""
+    if owner_pid is None:
+        return False
+    if type(owner_pid) is not int or owner_pid <= 0:
+        raise ValueError("owner_pid must be a positive integer or null")
+    if owner_started_at is not None and (
+        type(owner_started_at) is not int or owner_started_at <= 0
+    ):
+        raise ValueError("owner_started_at must be a positive integer or null")
+    if pid_exists is None:
+        return True
+    try:
+        if not pid_exists(owner_pid):
+            return False
+    except Exception:
+        return True
+    if owner_started_at is None or get_process_start_time is None:
+        return True
+    try:
+        current_started_at = get_process_start_time(owner_pid)
+    except Exception:
+        return True
+    return current_started_at is None or current_started_at == owner_started_at
+
+
+def _delivery_attempt_count(value) -> int:
+    if type(value) is not int or value < 0:
+        raise ValueError("delivery_attempts must be a non-negative integer")
+    return value
+
 
 # ---------------------------------------------------------------------------
 # Stale-delegation detection (progress-based, on by default)
@@ -345,14 +394,62 @@ def recover_abandoned_delegations() -> int:
         for row in rows:
             (delegation_id, session_key, origin_ui, parent_id, dispatched_at,
              pid, started, task_json, origin_session_id) = row
-            live = False
-            if pid:
-                live = _pid_exists(int(pid))
-                if live and started is not None:
-                    live = get_process_start_time(int(pid)) == int(started)
+            try:
+                live = _delivery_owner_live(
+                    pid, started, _pid_exists, get_process_start_time
+                )
+            except (TypeError, ValueError) as exc:
+                diagnostic = f"{type(exc).__name__}: {exc}"
+                parked_payload = _corrupt_completion_payload(
+                    expected_type="async_delegation",
+                    row_id=str(delegation_id),
+                    diagnostic=diagnostic,
+                )
+                conn.execute(
+                    """UPDATE async_delegations
+                       SET state='unknown', completed_at=?, updated_at=?,
+                           event_json=?, delivery_state='parked_corrupt',
+                           delivery_claim=NULL, delivery_claimed_at=NULL,
+                           owner_pid=NULL, owner_started_at=NULL
+                       WHERE delegation_id=? AND state IN ('running','finalizing')""",
+                    (now, now, parked_payload, delegation_id),
+                )
+                logger.warning(
+                    "Parking corrupt abandoned async row %s: %s",
+                    delegation_id,
+                    diagnostic,
+                )
+                continue
             if live:
                 continue
-            task = json.loads(task_json or "{}")
+            try:
+                task = json.loads(task_json or "{}")
+                if not isinstance(task, dict):
+                    raise ValueError(
+                        f"task_json must decode to an object, got {type(task).__name__}"
+                    )
+            except (TypeError, ValueError) as exc:
+                diagnostic = f"{type(exc).__name__}: {exc}"
+                parked_payload = _corrupt_completion_payload(
+                    expected_type="async_delegation",
+                    row_id=str(delegation_id),
+                    diagnostic=diagnostic,
+                )
+                conn.execute(
+                    """UPDATE async_delegations
+                       SET state='unknown', completed_at=?, updated_at=?,
+                           event_json=?, delivery_state='parked_corrupt',
+                           delivery_claim=NULL, delivery_claimed_at=NULL,
+                           owner_pid=NULL, owner_started_at=NULL
+                       WHERE delegation_id=? AND state IN ('running','finalizing')""",
+                    (now, now, parked_payload, delegation_id),
+                )
+                logger.warning(
+                    "Parking corrupt abandoned async row %s: %s",
+                    delegation_id,
+                    diagnostic,
+                )
+                continue
             event = {
                 "type": "async_delegation", "delegation_id": delegation_id,
                 "session_key": session_key, "origin_ui_session_id": origin_ui,
@@ -424,7 +521,8 @@ def _reconcile_committed_ack_events(conn, events, now: float) -> int:
             cur = conn.execute(
                 """UPDATE async_delegations
                    SET delivery_state='recovery_committed_ack_failed',
-                       delivery_claim=NULL, delivery_claimed_at=NULL, updated_at=?
+                       delivery_claim=NULL, delivery_claimed_at=NULL,
+                       owner_pid=NULL, owner_started_at=NULL, updated_at=?
                    WHERE delegation_id=?
                      AND delivery_state IN ('pending', 'effect_started')""",
                 (now, delegation_id),
@@ -474,32 +572,98 @@ def restore_undelivered_completions(target_queue) -> int:
     results seconds after boot (#64484).
     """
     recover_abandoned_delegations()
+    pid_exists: Optional[Callable[[int], bool]] = None
+    process_start_time: Optional[Callable[[int], Optional[int]]] = None
+    try:
+        from gateway.status import (
+            _pid_exists as pid_exists,
+            get_process_start_time as process_start_time,
+        )
+    except Exception:
+        pass
     restored_events = []
     with _DB_LOCK, _transaction() as conn:
         now = time.time()
-        conn.execute(
-            """UPDATE async_delegations SET delivery_state='pending',
-                      delivery_claim=NULL, delivery_claimed_at=NULL, updated_at=?
+        claimed_async_rows = conn.execute(
+            """SELECT delegation_id, event_json, owner_pid, owner_started_at
+               FROM async_delegations
                WHERE state != 'running' AND delivery_state='effect_started'
-                 AND event_json IS NOT NULL""",
-            (now,),
-        )
+                 AND event_json IS NOT NULL"""
+        ).fetchall()
+        for delegation_id, payload, owner_pid, owner_started_at in claimed_async_rows:
+            try:
+                live = _delivery_owner_live(
+                    owner_pid,
+                    owner_started_at,
+                    pid_exists,
+                    process_start_time,
+                )
+            except (TypeError, ValueError) as exc:
+                diagnostic = f"{type(exc).__name__}: {exc}"
+                parked_payload = _corrupt_completion_payload(
+                    expected_type="async_delegation",
+                    row_id=delegation_id,
+                    diagnostic=diagnostic,
+                )
+                conn.execute(
+                    """UPDATE async_delegations
+                       SET event_json=?, delivery_state='parked_corrupt',
+                           delivery_claim=NULL, delivery_claimed_at=NULL,
+                           owner_pid=NULL, owner_started_at=NULL, updated_at=?
+                       WHERE delegation_id=? AND delivery_state='effect_started'""",
+                    (parked_payload, now, delegation_id),
+                )
+                logger.warning(
+                    "Parking corrupt async completion row %s: %s",
+                    delegation_id,
+                    diagnostic,
+                )
+                continue
+            if live:
+                continue
+            conn.execute(
+                """UPDATE async_delegations
+                   SET delivery_state='recovery_effect_started_owner_lost',
+                       delivery_claim=NULL, delivery_claimed_at=NULL,
+                       owner_pid=NULL, owner_started_at=NULL, updated_at=?
+                   WHERE delegation_id=? AND delivery_state='effect_started'""",
+                (now, delegation_id),
+            )
+            logger.warning(
+                "Async completion %s lost its delivery owner after effect start; "
+                "retaining recovery state without provider replay.",
+                delegation_id,
+            )
+
         rows = conn.execute(
             """SELECT delegation_id, event_json, delivery_attempts FROM async_delegations
                WHERE state != 'running' AND delivery_state='pending' AND event_json IS NOT NULL
                ORDER BY completed_at, delegation_id"""
         ).fetchall()
         for delegation_id, payload, attempts in rows:
-            # Park a completion that has exhausted its delivery budget. Its
-            # origin session is permanently gone (dead owner pid), so every boot
-            # it re-enqueues here, fails the fail-closed ownership gate, is
-            # dropped un-acked, and cycles again — re-logging the "Dropping
-            # unowned" WARNING forever. release_completion_delivery() only caps
-            # rows a consumer managed to CLAIM; an unownable row is dropped
-            # before the claim, so this is the only place it can be retired.
-            # 'parked' (not 'delivered'): nothing was ever handed to a consumer,
-            # so claiming delivery would be dishonest. The row stays queryable.
-            if int(attempts or 0) >= _MAX_DELIVERY_ATTEMPTS:
+            try:
+                attempt_count = _delivery_attempt_count(attempts)
+            except (TypeError, ValueError) as exc:
+                diagnostic = f"{type(exc).__name__}: {exc}"
+                parked_payload = _corrupt_completion_payload(
+                    expected_type="async_delegation",
+                    row_id=delegation_id,
+                    diagnostic=diagnostic,
+                )
+                conn.execute(
+                    """UPDATE async_delegations
+                       SET event_json=?, delivery_state='parked_corrupt', updated_at=?
+                       WHERE delegation_id=? AND delivery_state='pending'""",
+                    (parked_payload, now, delegation_id),
+                )
+                logger.warning(
+                    "Parking corrupt async completion row %s: %s",
+                    delegation_id,
+                    diagnostic,
+                )
+                continue
+            # 'parked' (not 'delivered'): nothing was handed to a consumer.
+            if attempt_count >= _MAX_DELIVERY_ATTEMPTS:
                 conn.execute(
                     """UPDATE async_delegations SET delivery_state='parked', updated_at=?
                        WHERE delegation_id=?""",
@@ -538,41 +702,65 @@ def restore_undelivered_completions(target_queue) -> int:
                 continue
             event["restored"] = True
             restored_events.append(event)
-
-        try:
-            from gateway.status import _pid_exists, get_process_start_time
-        except Exception:
-            _pid_exists = get_process_start_time = None
         claimed_rows = conn.execute(
-            """SELECT delivery_id, delivery_owner_pid,
+            """SELECT delivery_id, event_json, delivery_owner_pid,
                       delivery_owner_started_at
                FROM ordinary_completion_deliveries
                WHERE delivery_state='effect_started'"""
         ).fetchall()
-        for delivery_id, owner_pid, owner_started_at in claimed_rows:
-            live = bool(owner_pid) if _pid_exists is None else (
-                bool(owner_pid) and _pid_exists(int(owner_pid))
-            )
-            if live and owner_started_at is not None and get_process_start_time:
-                live = (
-                    get_process_start_time(int(owner_pid))
-                    == int(owner_started_at)
+        for delivery_id, _payload, owner_pid, owner_started_at in claimed_rows:
+            try:
+                live = _delivery_owner_live(
+                    owner_pid,
+                    owner_started_at,
+                    pid_exists,
+                    process_start_time,
                 )
+            except (TypeError, ValueError) as exc:
+                diagnostic = f"{type(exc).__name__}: {exc}"
+                parked_payload = _corrupt_completion_payload(
+                    expected_type="completion",
+                    row_id=delivery_id,
+                    diagnostic=diagnostic,
+                )
+                conn.execute(
+                    """UPDATE ordinary_completion_deliveries
+                       SET event_json=?, delivery_state='parked_corrupt',
+                           delivery_claim=NULL, delivery_claimed_at=NULL,
+                           delivery_owner_pid=NULL,
+                           delivery_owner_started_at=NULL, updated_at=?
+                       WHERE delivery_id=? AND delivery_state='effect_started'""",
+                    (parked_payload, now, delivery_id),
+                )
+                logger.warning(
+                    "Parking corrupt ordinary completion row %s: %s",
+                    delivery_id,
+                    diagnostic,
+                )
+                continue
             if live:
                 continue
             conn.execute(
                 """UPDATE ordinary_completion_deliveries
-                   SET delivery_state='pending', delivery_claim=NULL,
-                       delivery_claimed_at=NULL, delivery_owner_pid=NULL,
+                   SET delivery_state='recovery_effect_started_owner_lost',
+                       delivery_claim=NULL, delivery_claimed_at=NULL,
+                       delivery_owner_pid=NULL,
                        delivery_owner_started_at=NULL, updated_at=?
                    WHERE delivery_id=? AND delivery_state='effect_started'""",
                 (now, delivery_id),
             )
+            logger.warning(
+                "Ordinary completion %s lost its delivery owner after effect start; "
+                "retaining recovery state without provider replay.",
+                delivery_id,
+            )
         pending_rows = conn.execute(
             """SELECT delivery_id, event_json
                FROM ordinary_completion_deliveries
-               WHERE delivery_state='pending'"""
+               WHERE delivery_state='pending' ORDER BY updated_at, delivery_id"""
         ).fetchall()
+        legacy_migrations = {}
+        mismatches = {}
         for delivery_id, payload in pending_rows:
             event, diagnostic = _decode_restored_completion(
                 payload, expected_type="completion", row_id=delivery_id
@@ -602,36 +790,125 @@ def restore_undelivered_completions(target_queue) -> int:
                 _durable_event_payload(event), sort_keys=True
             )
             if normalized_id != delivery_id:
-                target_exists = conn.execute(
-                    "SELECT 1 FROM ordinary_completion_deliveries WHERE delivery_id=?",
-                    (normalized_id,),
-                ).fetchone()
-                if target_exists:
-                    conn.execute(
-                        """DELETE FROM ordinary_completion_deliveries
-                           WHERE delivery_id=? AND delivery_state='pending'""",
-                        (delivery_id,),
-                    )
+                target = (normalized_id, normalized_payload)
+                if delivery_id == _ordinary_completion_legacy_delivery_id(event):
+                    legacy_migrations[delivery_id] = target
                 else:
-                    conn.execute(
-                        """UPDATE ordinary_completion_deliveries
-                           SET delivery_id=?, event_json=? WHERE delivery_id=?
-                             AND delivery_state='pending'""",
-                        (normalized_id, normalized_payload, delivery_id),
-                    )
+                    mismatches[delivery_id] = target
             else:
                 conn.execute(
                     """UPDATE ordinary_completion_deliveries SET event_json=?
                        WHERE delivery_id=? AND delivery_state='pending'""",
                     (normalized_payload, delivery_id),
                 )
+
+        for delivery_id, (
+            normalized_id,
+            normalized_payload,
+        ) in legacy_migrations.items():
+            target_exists = conn.execute(
+                "SELECT 1 FROM ordinary_completion_deliveries WHERE delivery_id=?",
+                (normalized_id,),
+            ).fetchone()
+            if target_exists:
+                conn.execute(
+                    """UPDATE ordinary_completion_deliveries
+                       SET event_json=?, delivery_state='parked_corrupt', updated_at=?
+                       WHERE delivery_id=? AND delivery_state='pending'""",
+                    (
+                        _corrupt_completion_payload(
+                            expected_type="completion",
+                            row_id=delivery_id,
+                            diagnostic="duplicate legacy ordinary completion identity",
+                        ),
+                        now,
+                        delivery_id,
+                    ),
+                )
+            else:
+                conn.execute(
+                    """UPDATE ordinary_completion_deliveries
+                       SET delivery_id=?, event_json=? WHERE delivery_id=?
+                         AND delivery_state='pending'""",
+                    (normalized_id, normalized_payload, delivery_id),
+                )
+
+        cycle_rows = set()
+        visited_rows = set()
+        for start in mismatches:
+            if start in visited_rows:
+                continue
+            path = []
+            positions = {}
+            current = start
+            while current in mismatches and current not in positions:
+                if current in visited_rows:
+                    break
+                positions[current] = len(path)
+                path.append(current)
+                current = mismatches[current][0]
+            if current in positions:
+                cycle_rows.update(path[positions[current] :])
+            visited_rows.update(path)
+
+        for delivery_id, (normalized_id, normalized_payload) in mismatches.items():
+            if delivery_id in cycle_rows:
+                conn.execute(
+                    """UPDATE ordinary_completion_deliveries SET event_json=?
+                       WHERE delivery_id=? AND delivery_state='pending'""",
+                    (normalized_payload, normalized_id),
+                )
+                continue
+            diagnostic = "ordinary completion identity does not match its durable row"
+            parked_payload = _corrupt_completion_payload(
+                expected_type="completion",
+                row_id=delivery_id,
+                diagnostic=diagnostic,
+            )
+            conn.execute(
+                """UPDATE ordinary_completion_deliveries
+                   SET event_json=?, delivery_state='parked_corrupt', updated_at=?
+                   WHERE delivery_id=? AND delivery_state='pending'""",
+                (parked_payload, now, delivery_id),
+            )
+            logger.warning(
+                "Parking corrupt ordinary completion row %s: %s",
+                delivery_id,
+                diagnostic,
+            )
+        if cycle_rows:
+            logger.warning(
+                "Repaired a closed ordinary completion identity cycle across %d rows",
+                len(cycle_rows),
+            )
         ordinary_rows = conn.execute(
             """SELECT delivery_id, event_json, delivery_attempts
                FROM ordinary_completion_deliveries
                WHERE delivery_state='pending' ORDER BY updated_at, delivery_id"""
         ).fetchall()
         for delivery_id, payload, attempts in ordinary_rows:
-            if int(attempts or 0) >= _MAX_DELIVERY_ATTEMPTS:
+            try:
+                attempt_count = _delivery_attempt_count(attempts)
+            except (TypeError, ValueError) as exc:
+                diagnostic = f"{type(exc).__name__}: {exc}"
+                parked_payload = _corrupt_completion_payload(
+                    expected_type="completion",
+                    row_id=delivery_id,
+                    diagnostic=diagnostic,
+                )
+                conn.execute(
+                    """UPDATE ordinary_completion_deliveries
+                       SET event_json=?, delivery_state='parked_corrupt', updated_at=?
+                       WHERE delivery_id=? AND delivery_state='pending'""",
+                    (parked_payload, now, delivery_id),
+                )
+                logger.warning(
+                    "Parking corrupt ordinary completion row %s: %s",
+                    delivery_id,
+                    diagnostic,
+                )
+                continue
+            if attempt_count >= _MAX_DELIVERY_ATTEMPTS:
                 conn.execute(
                     """UPDATE ordinary_completion_deliveries
                        SET delivery_state='dropped', updated_at=?
@@ -684,6 +961,7 @@ def mark_completion_delivered(delegation_id: str) -> bool:
 def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     """Claim one pending completion across competing consumers/processes."""
     now = time.time()
+    owner_pid, owner_started_at = _current_process_identity()
     with _DB_LOCK, _transaction() as conn:
         row = conn.execute(
             "SELECT delivery_state FROM async_delegations WHERE delegation_id=?",
@@ -694,21 +972,45 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
         cur = conn.execute(
             """UPDATE async_delegations SET delivery_state='effect_started',
                       delivery_claim=?, delivery_claimed_at=?,
+                      owner_pid=?, owner_started_at=?,
                       delivery_attempts=delivery_attempts+1, updated_at=?
                WHERE delegation_id=? AND delivery_state='pending'
                  AND (delivery_claim IS NULL OR delivery_claimed_at < ?)""",
-            (claim_id, now, now, delegation_id, now - 300),
+            (
+                claim_id,
+                now,
+                owner_pid,
+                owner_started_at,
+                now,
+                delegation_id,
+                now - 300,
+            ),
         )
         return cur.rowcount == 1
 
 
 def _ordinary_completion_delivery_id(evt: Dict[str, Any]) -> Optional[str]:
     """Return canonical tuple authority or a sanitized envelope fingerprint."""
+    if evt.get("type", "completion") != "completion":
+        return None
     from tools.process_registry import ProcessRegistry
 
     identity = ProcessRegistry._completion_durable_identity(evt)
     if identity is None:
         return None
+    return json.dumps(identity, ensure_ascii=False, separators=(",", ":"))
+
+
+def _ordinary_completion_legacy_delivery_id(evt: Dict[str, Any]) -> Optional[str]:
+    """Return the former tuple key only when the current envelope owns its core."""
+    if _ordinary_completion_delivery_id(evt) is None:
+        return None
+    identity = (
+        "completion",
+        evt["session_id"],
+        evt["started_at"],
+        evt.get("session_key", ""),
+    )
     return json.dumps(identity, ensure_ascii=False, separators=(",", ":"))
 
 
@@ -843,15 +1145,9 @@ def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
     delivery_id = _ordinary_completion_delivery_id(evt)
     if delivery_id is None:
         return ""
-    claim_id = f"{consumer}:{__import__('os').getpid()}:{uuid.uuid4().hex}"
+    owner_pid, owner_started_at = _current_process_identity()
+    claim_id = f"{consumer}:{owner_pid}:{uuid.uuid4().hex}"
     now = time.time()
-    owner_pid = __import__("os").getpid()
-    try:
-        from gateway.status import get_process_start_time
-
-        owner_started_at = get_process_start_time(owner_pid)
-    except Exception:
-        owner_started_at = None
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
             """INSERT OR IGNORE INTO ordinary_completion_deliveries
@@ -892,7 +1188,8 @@ def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     with _DB_LOCK, _transaction() as conn:
         capped = conn.execute(
             """UPDATE async_delegations SET delivery_state='dropped',
-                      delivery_claim=NULL, delivery_claimed_at=NULL, updated_at=?
+                      delivery_claim=NULL, delivery_claimed_at=NULL,
+                      owner_pid=NULL, owner_started_at=NULL, updated_at=?
                WHERE delegation_id=? AND delivery_state='effect_started'
                  AND delivery_claim=? AND delivery_attempts>=?""",
             (now, delegation_id, claim_id, _MAX_DELIVERY_ATTEMPTS),
@@ -906,7 +1203,8 @@ def release_completion_delivery(delegation_id: str, claim_id: str) -> bool:
             return True
         cur = conn.execute(
             """UPDATE async_delegations SET delivery_state='pending', delivery_claim=NULL,
-                      delivery_claimed_at=NULL, updated_at=?
+                      delivery_claimed_at=NULL, owner_pid=NULL,
+                      owner_started_at=NULL, updated_at=?
                WHERE delegation_id=? AND delivery_state='effect_started'
                  AND delivery_claim=?""",
             (now, delegation_id, claim_id),
@@ -927,8 +1225,8 @@ def drop_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     with _DB_LOCK, _transaction() as conn:
         cur = conn.execute(
             """UPDATE async_delegations SET delivery_state='dropped',
-                      updated_at=?, delivery_claim=NULL,
-                      delivery_claimed_at=NULL
+                      updated_at=?, delivery_claim=NULL, delivery_claimed_at=NULL,
+                      owner_pid=NULL, owner_started_at=NULL
                WHERE delegation_id=? AND delivery_state='effect_started'
                  AND delivery_claim=?""",
             (now, delegation_id, claim_id),
@@ -950,7 +1248,8 @@ def mark_completion_delivery_recovery(
         with _DB_LOCK, _transaction() as conn:
             cur = conn.execute(
                 """UPDATE async_delegations SET delivery_state=?, delivery_claim=NULL,
-                          delivery_claimed_at=NULL, updated_at=?
+                          delivery_claimed_at=NULL, owner_pid=NULL,
+                          owner_started_at=NULL, updated_at=?
                    WHERE delegation_id=? AND delivery_state='effect_started'
                      AND delivery_claim=?""",
                 (f"recovery_{reason}", now, delegation_id, claim_id),
@@ -979,7 +1278,8 @@ def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
         cur = conn.execute(
             """UPDATE async_delegations SET delivery_state='delivered',
                       delivered_at=?, updated_at=?, delivery_claim=NULL,
-                      delivery_claimed_at=NULL
+                      delivery_claimed_at=NULL, owner_pid=NULL,
+                      owner_started_at=NULL
                WHERE delegation_id=? AND delivery_state='effect_started'
                  AND delivery_claim=?""",
             (now, now, delegation_id, claim_id),

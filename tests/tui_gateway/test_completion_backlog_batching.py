@@ -559,6 +559,7 @@ def test_failure_visible_success_can_silent_complete(isolated_registry, monkeypa
 
 def test_heartbeat_path_unaffected_by_completion_batching(isolated_registry, monkeypatch):
     registry = isolated_registry
+    registry.completion_queue = queue.Queue(maxsize=2)
     heartbeats: list = []
     delivered: list = []
     monkeypatch.setattr(
@@ -566,11 +567,12 @@ def test_heartbeat_path_unaffected_by_completion_batching(isolated_registry, mon
         "_handle_heartbeat_event",
         lambda sid, session, evt: heartbeats.append(evt),
     )
-    monkeypatch.setattr(
-        server,
-        "_run_prompt_submit",
-        lambda *a, **k: delivered.append(a),
-    )
+
+    def submit(*args, **kwargs):
+        delivered.append(args)
+        kwargs["completion_delivery_callback"]("committed")
+
+    monkeypatch.setattr(server, "_run_prompt_submit", submit)
     monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
 
     hb = {
@@ -588,6 +590,7 @@ def test_heartbeat_path_unaffected_by_completion_batching(isolated_registry, mon
     assert len(heartbeats) == 1
     assert heartbeats[0]["type"] == "heartbeat"
     assert len(delivered) == 1
+    assert registry.completion_queue.empty()
 
 
 def test_busy_pending_steer_does_not_block_later_queue_events(isolated_registry, monkeypatch):

@@ -168,8 +168,10 @@ def completion_delivery_commit_error_message(agent, *, prior: bool = False) -> s
     )
 
 
-def _flush_completion_delivery_with_retry(agent, staged, metadata_cas) -> bool:
-    """Retry one immutable suffix under the hot-read count/time budget."""
+def _flush_completion_delivery_with_retry(
+    agent, staged, metadata_cas, pending
+) -> bool:
+    """Settle one pending suffix once under the hot-read count/time budget."""
     attempts = 0
     started = time.monotonic()
     while True:
@@ -183,19 +185,40 @@ def _flush_completion_delivery_with_retry(agent, staged, metadata_cas) -> bool:
 
         attempts += 1
         error = None
+        persist_lock = getattr(agent, "_session_persist_lock", None)
+        persist_lock_acquired = persist_lock is None
         try:
             remaining_patience = max(0.0, patience - (time.monotonic() - started))
+            if persist_lock is not None:
+                persist_lock_acquired = persist_lock.acquire(
+                    timeout=remaining_patience
+                )
+            if not persist_lock_acquired:
+                raise TimeoutError("session persistence lock remained busy")
+            # Another finalizer may have published this exact generation while
+            # this caller waited. Re-check under the same lock as the append.
+            if getattr(agent, "_pending_completion_delivery_suffix", None) is not pending:
+                return True
             committed = (
                 agent._flush_messages_to_session_db(
                     staged,
                     display_metadata_cas=metadata_cas,
-                    patience_s=remaining_patience,
+                    patience_s=max(
+                        0.0, patience - (time.monotonic() - started)
+                    ),
                 )
                 is True
             )
+            if committed:
+                agent._pending_completion_delivery_suffix = None
+                agent._pending_completion_delivery_display_metadata_cas = None
+                agent._completion_delivery_commit_failed = False
         except Exception as exc:
             committed = False
             error = exc
+        finally:
+            if persist_lock is not None and persist_lock_acquired:
+                persist_lock.release()
         if committed:
             agent._completion_delivery_commit_failure = None
             return True
@@ -410,12 +433,15 @@ def finalize_completion_delivery_suffix(
         # Install recovery authority before entering any fallible retry/timing
         # code. An unexpected exception can never leave a visible effect free
         # to start a new provider turn without its exact canonical suffix.
-        agent._pending_completion_delivery_suffix = copy.deepcopy(staged[start:])
+        pending = copy.deepcopy(staged[start:])
+        agent._pending_completion_delivery_suffix = pending
         agent._pending_completion_delivery_display_metadata_cas = copy.deepcopy(
             metadata_cas
         )
         agent._completion_delivery_commit_failed = True
-        committed = _flush_completion_delivery_with_retry(agent, staged, metadata_cas)
+        committed = _flush_completion_delivery_with_retry(
+            agent, staged, metadata_cas, pending
+        )
     if not committed:
         if commit_tool_intent:
             agent._persist_user_message_idx = previous_persist_idx
@@ -426,9 +452,10 @@ def finalize_completion_delivery_suffix(
     if commit_tool_intent:
         staged[start]["_completion_delivery_active"] = True
     messages[:] = staged
-    agent._pending_completion_delivery_suffix = None
-    agent._pending_completion_delivery_display_metadata_cas = None
-    agent._completion_delivery_commit_failed = False
+    if not db_bound:
+        agent._pending_completion_delivery_suffix = None
+        agent._pending_completion_delivery_display_metadata_cas = None
+        agent._completion_delivery_commit_failed = False
     agent._completion_delivery_commit_failure = None
     # Keep the canonical override after response repair so later incremental
     # suffix flushes cannot restore the API-only instruction.
@@ -489,13 +516,12 @@ def retry_pending_completion_delivery_commit(agent, messages) -> str:
     metadata_cas = copy.deepcopy(getattr(
         agent, "_pending_completion_delivery_display_metadata_cas", None
     ))
-    committed = _flush_completion_delivery_with_retry(agent, staged, metadata_cas)
+    committed = _flush_completion_delivery_with_retry(
+        agent, staged, metadata_cas, pending
+    )
     if not committed:
         return "pending"
     messages[:] = staged
-    agent._pending_completion_delivery_suffix = None
-    agent._pending_completion_delivery_display_metadata_cas = None
-    agent._completion_delivery_commit_failed = False
     agent._completion_delivery_commit_failure = None
     try:
         agent._save_session_log(messages)

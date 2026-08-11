@@ -10,6 +10,7 @@ import copy
 import errno
 import json
 import sqlite3
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -1453,6 +1454,126 @@ def test_completion_commit_retries_before_publishing_live_state(tmp_path, monkey
         db.close()
 
 
+def test_concurrent_pending_retry_publishes_completion_suffix_once(
+    tmp_path, monkeypatch
+):
+    from agent import turn_finalizer
+    from agent.turn_finalizer import (
+        finalize_completion_delivery_suffix,
+        retry_pending_completion_delivery_commit,
+    )
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: _completion_commit_config(
+            max_attempts=1,
+            initial_backoff_s=0,
+            max_backoff_s=0,
+            patience_s=2,
+        ),
+    )
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "completion-concurrent-settlement"
+    db.create_session(session_id, source="tui", model="test-model")
+    agent = _make_agent(tmp_path, db, session_id)
+    messages: list[dict] = [
+        {"role": "user", "content": "original request"},
+        {"role": "assistant", "content": "background task started"},
+    ]
+    assert agent._flush_messages_to_session_db(messages) is True
+    canonical, wire = _completion_texts()
+    messages.extend(
+        [
+            {
+                "role": "user",
+                "content": wire,
+                "_completion_delivery_synthetic": True,
+            },
+            {"role": "assistant", "content": "visible answer"},
+        ]
+    )
+    agent._session_messages = messages
+
+    first_append_committed = threading.Event()
+    release_first_append = threading.Event()
+    retry_staged = threading.Event()
+    original_append = db.append_messages_batch
+    append_calls = 0
+    counter_lock = threading.Lock()
+
+    def gated_append(*args, **kwargs):
+        nonlocal append_calls
+        with counter_lock:
+            append_calls += 1
+            call_number = append_calls
+        result = original_append(*args, **kwargs)
+        if call_number == 1:
+            first_append_committed.set()
+            assert release_first_append.wait(5)
+        return result
+
+    monkeypatch.setattr(db, "append_messages_batch", gated_append)
+    outcomes: dict[str, str] = {}
+    errors: list[BaseException] = []
+
+    def run_first() -> None:
+        try:
+            outcomes["first"] = finalize_completion_delivery_suffix(
+                agent,
+                messages,
+                final_response="visible answer",
+                failed=False,
+                interrupted=False,
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    def run_retry() -> None:
+        try:
+            outcomes["retry"] = retry_pending_completion_delivery_commit(
+                agent, messages
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    first = threading.Thread(target=run_first)
+    retry = threading.Thread(target=run_retry)
+    try:
+        first.start()
+        assert first_append_committed.wait(5)
+        pending = getattr(agent, "_pending_completion_delivery_suffix")
+
+        def observed_deepcopy(value):
+            if value is pending:
+                retry_staged.set()
+            return copy.deepcopy(value)
+
+        monkeypatch.setattr(
+            turn_finalizer,
+            "copy",
+            SimpleNamespace(deepcopy=observed_deepcopy),
+        )
+        retry.start()
+        assert retry_staged.wait(5)
+        release_first_append.set()
+        first.join(5)
+        retry.join(5)
+        assert not first.is_alive()
+        assert not retry.is_alive()
+        assert errors == []
+
+        resumed = db.get_messages_as_conversation(session_id)
+        assert outcomes == {"first": "committed", "retry": "committed"}
+        assert append_calls == 1
+        assert sum(row.get("content") == canonical for row in resumed) == 1
+        assert sum(row.get("content") == "visible answer" for row in resumed) == 1
+    finally:
+        release_first_append.set()
+        first.join(5)
+        retry.join(5)
+        db.close()
+
+
 def test_completion_commit_retry_defaults_favor_recovery():
     from hermes_cli.config_defaults import DEFAULT_CONFIG
 
@@ -1748,6 +1869,117 @@ def test_pending_commit_patience_bounds_real_sessiondb_lock(tmp_path, monkeypatc
     assert elapsed < 0.25
     assert getattr(agent, "_completion_delivery_commit_failure") == "lock_busy"
     assert getattr(agent, "_pending_completion_delivery_suffix") == retained
+
+
+def test_pending_commit_patience_bounds_same_sessiondb_writer_lock(
+    tmp_path, monkeypatch
+):
+    from agent.turn_finalizer import retry_pending_completion_delivery_commit
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: _completion_commit_config(
+            max_attempts=1,
+            initial_backoff_s=0,
+            max_backoff_s=0,
+            patience_s=0.01,
+        ),
+    )
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "completion-writer-lock-patience"
+    db.create_session(session_id, source="tui", model="test-model")
+    db.append_messages_batch(
+        session_id,
+        [
+            {"role": "user", "content": "before"},
+            {"role": "assistant", "content": "working"},
+        ],
+    )
+    before = db.get_messages_as_conversation(session_id)
+    agent = _make_agent(tmp_path, db, session_id)
+    canonical, wire = _completion_texts()
+    retained = [
+        {
+            "role": "user",
+            "content": canonical,
+            "api_content": wire,
+            "display_kind": "hidden",
+            "display_metadata": {"completion_delivery_status": "complete"},
+        },
+        {"role": "assistant", "content": "effect already visible"},
+    ]
+    messages = [
+        *before,
+        {
+            "role": "user",
+            "content": wire,
+            "_completion_delivery_synthetic": True,
+        },
+    ]
+    agent._session_messages = messages
+    setattr(agent, "_pending_completion_delivery_suffix", copy.deepcopy(retained))
+    setattr(agent, "_pending_completion_delivery_display_metadata_cas", None)
+    setattr(agent, "_completion_delivery_commit_failed", True)
+
+    writer_entered = threading.Event()
+    release_writer = threading.Event()
+    retry_done = threading.Event()
+    owner_errors: list[BaseException] = []
+    retry_errors: list[BaseException] = []
+    outcome: dict[str, object] = {}
+
+    def hold_writer_transaction(_conn) -> None:
+        writer_entered.set()
+        if not release_writer.wait(5):
+            raise TimeoutError("test writer was not released")
+
+    def run_owner() -> None:
+        try:
+            db._execute_write(hold_writer_transaction, patience_s=1)
+        except BaseException as exc:
+            owner_errors.append(exc)
+
+    def run_retry() -> None:
+        started = time.monotonic()
+        try:
+            outcome["status"] = retry_pending_completion_delivery_commit(
+                agent, messages
+            )
+        except BaseException as exc:
+            retry_errors.append(exc)
+        finally:
+            outcome["elapsed_s"] = time.monotonic() - started
+            retry_done.set()
+
+    owner = threading.Thread(target=run_owner)
+    retry = threading.Thread(target=run_retry)
+    finished_within_bound = False
+    try:
+        owner.start()
+        assert writer_entered.wait(5)
+        retry.start()
+        finished_within_bound = retry_done.wait(0.5)
+    finally:
+        release_writer.set()
+        owner.join(5)
+        retry.join(5)
+
+    try:
+        assert not owner.is_alive()
+        assert not retry.is_alive()
+        assert owner_errors == []
+        assert retry_errors == []
+        assert finished_within_bound, outcome
+        assert outcome["status"] == "pending"
+        elapsed_s = outcome["elapsed_s"]
+        assert isinstance(elapsed_s, float)
+        assert elapsed_s < 0.5
+        assert getattr(agent, "_completion_delivery_commit_failure") == "lock_busy"
+        assert getattr(agent, "_pending_completion_delivery_suffix") == retained
+        resumed = db.get_messages_as_conversation(session_id)
+        assert sum(row.get("content") == canonical for row in resumed) == 0
+    finally:
+        db.close()
 
 
 @pytest.mark.parametrize(

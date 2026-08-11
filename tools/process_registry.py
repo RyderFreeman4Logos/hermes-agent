@@ -683,6 +683,8 @@ class ProcessRegistry:
         self.completion_queue: _queue_mod.Queue = _queue_mod.Queue()
         # Terminal producer fallback retained until the delivery ledger owns it.
         self._terminal_completion_spool: dict[tuple, dict] = {}
+        self._checkpoint_write_lock = threading.Lock()
+        self._checkpoint_owned_keys: set[tuple] = set()
         committed_ack_events = self._checkpoint_completion_ack_events()
         for event in committed_ack_events:
             self._spool_terminal_completion(
@@ -707,6 +709,9 @@ class ProcessRegistry:
                 self._discard_terminal_completion_spool(
                     event, disposition=self._SPOOL_COMMITTED_ACK
                 )
+                key = self._checkpoint_entry_key({"completion_ack": event})
+                if key is not None:
+                    self._checkpoint_owned_keys.add(key)
 
         # Legacy session-id views used by raw notification paths and callers of
         # is_completion_consumed(). Model-turn delivery uses the stable ledger
@@ -2486,6 +2491,11 @@ class ProcessRegistry:
     @staticmethod
     def _completion_durable_identity(evt: dict) -> "tuple | None":
         """Return canonical, bound-producer, or sanitized-envelope authority."""
+        if evt.get("type") == "async_delegation":
+            delegation_id = evt.get("delegation_id")
+            if isinstance(delegation_id, str) and delegation_id:
+                return "async-delegation", delegation_id
+            return None
         identity = ProcessRegistry._completion_identity(evt)
         if identity is not None:
             return identity
@@ -2643,6 +2653,50 @@ class ProcessRegistry:
             return None
         return disposition, identity
 
+    @classmethod
+    def _checkpoint_entry_key(cls, entry: dict) -> "tuple | None":
+        if not isinstance(entry, dict):
+            return None
+        for field in ("completion_ack", "completion_event"):
+            event = entry.get(field)
+            if isinstance(event, dict):
+                identity = cls._completion_durable_identity(event)
+                if identity is not None:
+                    return field, identity
+        session_id = entry.get("session_id")
+        if isinstance(session_id, str) and session_id:
+            return "process", session_id
+        try:
+            payload = json.dumps(
+                entry,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        except (TypeError, ValueError):
+            return None
+        return "checkpoint-entry", hashlib.sha256(payload).hexdigest()
+
+    @staticmethod
+    def _checkpoint_public_entry(entry: dict) -> dict:
+        public = dict(entry)
+        for field in ("completion_ack", "completion_event"):
+            event = public.get(field)
+            if isinstance(event, dict):
+                public[field] = _completion_durable_payload(event)
+        return public
+
+    @classmethod
+    def _read_checkpoint_entries(cls) -> list[dict]:
+        if not CHECKPOINT_PATH.exists():
+            return []
+        entries = json.loads(CHECKPOINT_PATH.read_text(encoding="utf-8"))
+        if not isinstance(entries, list) or not all(
+            isinstance(entry, dict) for entry in entries
+        ):
+            raise ValueError("process checkpoint must contain a list of objects")
+        return [cls._checkpoint_public_entry(entry) for entry in entries]
+
     def _spool_terminal_completion(
         self, evt: dict, *, disposition: str = _SPOOL_PENDING
     ) -> bool:
@@ -2665,13 +2719,9 @@ class ProcessRegistry:
             return self._terminal_completion_spool.pop(key, None) is not None
 
     def _checkpoint_completion_ack_events(self) -> list[dict]:
-        if not CHECKPOINT_PATH.exists():
-            return []
         try:
-            entries = json.loads(CHECKPOINT_PATH.read_text(encoding="utf-8"))
+            entries = self._read_checkpoint_entries()
         except Exception:
-            return []
-        if not isinstance(entries, list):
             return []
         return [
             _completion_durable_payload(entry["completion_ack"])
@@ -3788,69 +3838,96 @@ class ProcessRegistry:
         self,
         extra_entries: Optional[List[Dict[str, Any]]] = None,
     ):
-        """Write running processes, terminal events, and recovery entries atomically."""
+        """Merge checkpoint records under process-safe and advisory locks."""
         try:
-            with self._lock:
-                entries = []
-                for s in self._running.values():
-                    if not s.exited:
-                        # Lazily backfill the kernel start time for host PIDs so
-                        # recovery after restart can detect PID recycling even
-                        # for sessions spawned before this field existed.
-                        if s.host_start_time is None and s.pid_scope == "host" and s.pid:
-                            s.host_start_time = self._safe_host_start_time(s.pid)
-                        entries.append({
-                            "session_id": s.id,
-                            # Redact inline credentials before persisting to
-                            # disk — the checkpoint file lives under
-                            # ~/.hermes/processes.json with the raw command
-                            # (issue #77484). Recovery only uses command for
-                            # display/logging (the process is already running;
-                            # adoption re-validates the PID, never re-runs the
-                            # command), so masking is lossless.
-                            "command": redact_sensitive_text(s.command, code_file=True),
-                            "pid": s.pid,
-                            "pid_scope": s.pid_scope,
-                            "host_start_time": s.host_start_time,
-                            "systemd_unit": s.systemd_unit,
-                            "cwd": s.cwd,
-                            "started_at": s.started_at,
-                            "execution_deadline": s.execution_deadline,
-                            "task_id": s.task_id,
-                            "session_key": s.session_key,
-                            "watcher_platform": s.watcher_platform,
-                            "watcher_chat_id": s.watcher_chat_id,
-                            "watcher_user_id": s.watcher_user_id,
-                            "watcher_user_name": s.watcher_user_name,
-                            "watcher_thread_id": s.watcher_thread_id,
-                            "watcher_message_id": s.watcher_message_id,
-                            "watcher_interval": s.watcher_interval,
-                            "notify_on_complete": s.notify_on_complete,
-                            "delegated_child": s.delegated_child,
-                            "heartbeat_provider": s.heartbeat_provider,
-                            "watch_patterns": s.watch_patterns,
-                        })
-                entries.extend(
-                    {
-                        (
-                            "completion_ack"
-                            if key[0] == self._SPOOL_COMMITTED_ACK
-                            else "completion_event"
-                        ): dict(event)
-                    }
-                    for key, event in self._terminal_completion_spool.items()
-                )
-                if extra_entries:
-                    tracked_ids = {item.get("session_id") for item in entries}
+            with self._checkpoint_write_lock:
+                with self._lock:
+                    entries = []
+                    for s in self._running.values():
+                        if not s.exited:
+                            # Lazily backfill the kernel start time for host PIDs so
+                            # recovery after restart can detect PID recycling even
+                            # for sessions spawned before this field existed.
+                            if (
+                                s.host_start_time is None
+                                and s.pid_scope == "host"
+                                and s.pid
+                            ):
+                                s.host_start_time = self._safe_host_start_time(s.pid)
+                            entries.append({
+                                "session_id": s.id,
+                                "command": redact_sensitive_text(
+                                    s.command, code_file=True
+                                ),
+                                "pid": s.pid,
+                                "pid_scope": s.pid_scope,
+                                "host_start_time": s.host_start_time,
+                                "systemd_unit": s.systemd_unit,
+                                "cwd": s.cwd,
+                                "started_at": s.started_at,
+                                "execution_deadline": s.execution_deadline,
+                                "task_id": s.task_id,
+                                "session_key": s.session_key,
+                                "watcher_platform": s.watcher_platform,
+                                "watcher_chat_id": s.watcher_chat_id,
+                                "watcher_user_id": s.watcher_user_id,
+                                "watcher_user_name": s.watcher_user_name,
+                                "watcher_thread_id": s.watcher_thread_id,
+                                "watcher_message_id": s.watcher_message_id,
+                                "watcher_interval": s.watcher_interval,
+                                "notify_on_complete": s.notify_on_complete,
+                                "delegated_child": s.delegated_child,
+                                "heartbeat_provider": s.heartbeat_provider,
+                                "watch_patterns": s.watch_patterns,
+                            })
                     entries.extend(
-                        item
-                        for item in extra_entries
-                        if item.get("session_id") not in tracked_ids
+                        {
+                            (
+                                "completion_ack"
+                                if key[0] == self._SPOOL_COMMITTED_ACK
+                                else "completion_event"
+                            ): dict(event)
+                        }
+                        for key, event in self._terminal_completion_spool.items()
                     )
-            # Atomic write to avoid corruption on crash
-            from utils import atomic_json_write
-            atomic_json_write(CHECKPOINT_PATH, entries)
-            return True
+                    if extra_entries:
+                        tracked_ids = {item.get("session_id") for item in entries}
+                        entries.extend(
+                            item
+                            for item in extra_entries
+                            if item.get("session_id") not in tracked_ids
+                        )
+
+                local_entries = {}
+                for entry in entries:
+                    public = self._checkpoint_public_entry(entry)
+                    key = self._checkpoint_entry_key(public)
+                    if key is None:
+                        raise ValueError("checkpoint entry has no durable identity")
+                    local_entries[key] = public
+
+                from hermes_state import _session_db_advisory_write_lock
+                from utils import atomic_json_write
+
+                patience_s = 10.0
+                with _session_db_advisory_write_lock(
+                    CHECKPOINT_PATH,
+                    deadline=time.monotonic() + patience_s,
+                    patience_s=patience_s,
+                    allow_unsupported=False,
+                ):
+                    merged_entries = {}
+                    for entry in self._read_checkpoint_entries():
+                        key = self._checkpoint_entry_key(entry)
+                        if key is None:
+                            raise ValueError("checkpoint entry has no durable identity")
+                        if key not in self._checkpoint_owned_keys:
+                            merged_entries[key] = entry
+                    merged_entries.update(local_entries)
+                    atomic_json_write(CHECKPOINT_PATH, list(merged_entries.values()))
+                self._checkpoint_owned_keys = set(local_entries)
+                return True
+
         except Exception as e:
             logger.debug("Failed to write checkpoint file: %s", e, exc_info=True)
             return False
@@ -3861,13 +3938,16 @@ class ProcessRegistry:
 
         Returns the number of processes recovered as detached.
         """
-        if not CHECKPOINT_PATH.exists():
-            return 0
-
         try:
-            entries = json.loads(CHECKPOINT_PATH.read_text(encoding="utf-8"))
+            entries = self._read_checkpoint_entries()
         except Exception:
             return 0
+        with self._checkpoint_write_lock:
+            self._checkpoint_owned_keys.update(
+                key
+                for entry in entries
+                if (key := self._checkpoint_entry_key(entry)) is not None
+            )
 
         recovered = 0
         unresolved_scope_entries: List[Dict[str, Any]] = []

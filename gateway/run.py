@@ -24486,7 +24486,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             adapter,
                             text=synth_text,
                             session_id=raw_sid,
-                            completion_delivery=evt.get("type") == "completion",
+                            completion_delivery=evt.get("type")
+                            in {"completion", "async_delegation"},
                         )
                         return True
                     except Exception as e:
@@ -24558,7 +24559,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter,
                     text=synth_text,
                     session_id=raw_sid,
-                    completion_delivery=evt.get("type") == "completion",
+                    completion_delivery=evt.get("type")
+                    in {"completion", "async_delegation"},
                 )
                 return True
             except Exception as e:
@@ -24948,6 +24950,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return True
             accepted = True
 
+            terminal = True
+            if process_claimed:
+                terminal = finish_completion_event_delivery(
+                    evt,
+                    ordinary_claim_id,
+                    "committed",
+                    retry_queue=retry_queue,
+                )
+            elif durable_claim_id:
+                terminal = finish_completion_event_delivery(
+                    evt,
+                    durable_claim_id,
+                    "committed",
+                    retry_queue=retry_queue,
+                )
+            if not terminal:
+                return None
             if identity is not None:
                 with self._completion_delivery_lock:
                     self._completion_deliveries_inflight.discard(identity)
@@ -24957,29 +24976,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         > self._completion_delivery_retention
                     ):
                         self._completion_deliveries_delivered.popitem(last=False)
-            if process_claimed:
-                finish_completion_event_delivery(
-                    evt,
-                    ordinary_claim_id,
-                    "committed",
-                    retry_queue=retry_queue,
-                )
-
-            # If the durable async-delegation producer branch is present, its
-            # SQLite row remains the authoritative replay state. Acknowledge it
-            # after adapter acceptance; this gateway keeps no parallel ledger.
-            if durable_claim_id:
-                try:
-                    from tools.async_delegation import complete_completion_delivery
-
-                    complete_completion_delivery(
-                        durable_delegation_id, durable_claim_id,
-                    )
-                except Exception as exc:
-                    logger.warning(
-                        "Could not acknowledge durable async completion %s: %s",
-                        durable_delegation_id, exc,
-                    )
             return True
         finally:
             if identity is not None and not accepted:
@@ -25367,6 +25363,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         from tools.process_registry import (
             drain_matching_queue_events,
             process_registry as _pr,
+            restore_completion_event_retries,
         )
 
         def owner_key(evt: dict) -> tuple:
@@ -25405,7 +25402,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         if owner_key(events[later_index]) == owner:
                             restore.append(events[later_index])
                             restored_indexes.add(later_index)
-                    _pr.requeue_completions_front(restore)
+                    restore_completion_event_retries(restore, registry=_pr)
 
                 for event_index, evt in enumerate(events):
                     if event_index in restored_indexes:

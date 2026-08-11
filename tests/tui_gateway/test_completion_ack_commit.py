@@ -405,8 +405,10 @@ def test_tui_post_turn_visibility_suppression_is_durable(
     assert receipt["delivery_state"] == "recovery_visibility_suppressed"
 
 
-def test_ordinary_completion_claim_restores_after_restart(monkeypatch, tmp_path):
-    """A restart requeues an unfinished ordinary completion from state.db."""
+def test_ordinary_completion_claim_parks_after_dead_owner_restart(
+    monkeypatch, tmp_path
+):
+    """A dead effect owner is parked instead of replaying an ambiguous effect."""
     import queue
 
     from tools import async_delegation as ad
@@ -428,12 +430,11 @@ def test_ordinary_completion_claim_restores_after_restart(monkeypatch, tmp_path)
     assert restarted_queue.empty()
     monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: False)
 
-    assert ad.restore_undelivered_completions(restarted_queue) == 1
-    restored = restarted_queue.get_nowait()
-    assert {key: restored[key] for key in event} == event
+    assert ad.restore_undelivered_completions(restarted_queue) == 0
+    assert restarted_queue.empty()
     receipt = ad.get_durable_event_delivery(event)
     assert receipt is not None
-    assert receipt["delivery_state"] == "pending"
+    assert receipt["delivery_state"] == "recovery_effect_started"
     assert receipt["delivery_claim"] is None
 
 
@@ -572,6 +573,73 @@ def test_committed_effect_complete_exception_never_requeues_provider(
     restored = queue.Queue()
     assert ad.restore_undelivered_completions(restored) == 0
     assert restored.empty()
+
+
+@pytest.mark.parametrize("event_type", ["completion", "async_delegation"])
+def test_dual_committed_ack_failure_is_nonterminal_and_never_replays(
+    monkeypatch, tmp_path, event_type
+):
+    from tools import async_delegation as ad
+    import tools.process_registry as registry_module
+
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    registry = registry_module.ProcessRegistry()
+    if event_type == "async_delegation":
+        event = {
+            "type": event_type,
+            "delegation_id": "deleg-dual-ack",
+            "session_key": "active",
+            "origin_ui_session_id": "active",
+            "parent_session_id": "parent",
+            "dispatched_at": 5.61,
+            "completed_at": 5.62,
+            "status": "completed",
+            "summary": "done",
+        }
+        ad._persist_dispatch(event)
+        ad._persist_completion(event, {"status": "completed", "summary": "done"})
+    else:
+        event = {
+            "type": event_type,
+            "session_id": "proc-dual-ack",
+            "session_key": "active",
+            "started_at": 5.61,
+            "command": "true",
+            "exit_code": 0,
+            "completion_reason": "exited",
+            "termination_source": "",
+            "output": "done",
+        }
+        assert ad.persist_event_delivery(event)
+
+    assert registry.claim_completion_delivery(event)
+    claim = ad.claim_event_delivery(event, "tui-test")
+    assert claim
+    monkeypatch.setattr(ad, "complete_event_delivery", lambda *_args: False)
+    monkeypatch.setattr(ad, "mark_completion_delivery_recovery", lambda *_args: False)
+
+    assert not registry_module.finish_completion_event_delivery(
+        event, claim, "committed", registry=registry
+    )
+    before = (
+        ad.get_durable_delegation("deleg-dual-ack")
+        if event_type == "async_delegation"
+        else ad.get_durable_event_delivery(event)
+    )
+    assert before is not None
+    assert before["delivery_state"] == "effect_started"
+
+    monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: False)
+    restored = queue.Queue()
+    assert ad.restore_undelivered_completions(restored) == 0
+    assert restored.empty()
+    after = (
+        ad.get_durable_delegation("deleg-dual-ack")
+        if event_type == "async_delegation"
+        else ad.get_durable_event_delivery(event)
+    )
+    assert after is not None
+    assert after["delivery_state"] == "recovery_effect_started"
 
 
 @pytest.mark.parametrize("surface", ["busy", "idle"])
@@ -857,10 +925,8 @@ def test_ack_after_suffix_commit_survives_repeated_wakeups(
         db.close()
 
 
-def test_startup_restore_makes_effect_started_completion_retryable(
-    tmp_path, monkeypatch
-):
-    """A crash before suffix/CAS acknowledgement restores the durable claim."""
+def test_startup_restore_parks_effect_started_completion(tmp_path, monkeypatch):
+    """An ambiguous effect boundary is parked instead of replaying provider work."""
     from tools import async_delegation as ad
 
     db_path = tmp_path / "state.db"
@@ -890,16 +956,12 @@ def test_startup_restore_makes_effect_started_completion_retryable(
         assert durable["delivery_state"] == "effect_started"
 
         restored_events = queue.Queue()
-        assert ad.restore_undelivered_completions(restored_events) == 1
-        assert restored_events.get_nowait()["restored"] is True
+        assert ad.restore_undelivered_completions(restored_events) == 0
+        assert restored_events.empty()
         durable = ad.get_durable_delegation(event["delegation_id"])
         assert durable is not None
-        assert durable["delivery_state"] == "pending"
-        assert ad.claim_completion_delivery(event["delegation_id"], "retry-claim")
-        assert ad.complete_completion_delivery(event["delegation_id"], "retry-claim")
-        durable = ad.get_durable_delegation(event["delegation_id"])
-        assert durable is not None
-        assert durable["delivery_state"] == "delivered"
+        assert durable["delivery_state"] == "recovery_effect_started"
+        assert not ad.claim_completion_delivery(event["delegation_id"], "retry-claim")
     finally:
         db.close()
 

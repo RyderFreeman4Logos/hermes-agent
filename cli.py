@@ -12075,6 +12075,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         from tools.process_registry import (
             claim_completion_event_delivery,
             process_registry,
+            restore_completion_event_retries,
         )
         from tools.async_delegation import (
             complete_event_delivery,
@@ -12101,7 +12102,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             )
             if retry_events:
                 retry_events.extend(evt for evt, _text in drained[event_index + 1 :])
-                process_registry.requeue_completions_front(retry_events)
+                restore_completion_event_retries(
+                    retry_events, registry=process_registry
+                )
                 break
             if claim is None:
                 continue
@@ -12162,7 +12165,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             if isinstance(queued_message, _CompletionDeliveryMessage):
                 untouched = [evt for evt, _text in drained[event_index + 1 :]]
                 if untouched:
-                    process_registry.requeue_completions_front(untouched)
+                    restore_completion_event_retries(
+                        untouched, registry=process_registry
+                    )
                 break
             else:
                 complete_event_delivery(event, claim)

@@ -27,6 +27,8 @@ from tools.process_registry import ProcessRegistry, ProcessSession
 class _FakeRegistry:
     """Return pre-canned sessions, then None once exhausted."""
 
+    _completion_event = staticmethod(ProcessRegistry._completion_event)
+
     def __init__(self, sessions):
         self._sessions = list(sessions)
         self._completion_consumed: set = set()
@@ -138,9 +140,15 @@ async def test_notify_on_complete_uses_session_store_origin_for_group_topic(monk
     from gateway.session import SessionSource
 
     sessions = [
-        SimpleNamespace(
-            output_buffer="done\n", exited=True, exit_code=0, command="echo test"
-        ),
+        ProcessSession(
+            id="proc_test_internal",
+            command="echo test",
+            session_key="agent:main:telegram:group:-100:42",
+            output_buffer="done\n",
+            exited=True,
+            exit_code=0,
+            notify_on_complete=True,
+        )
     ]
     monkeypatch.setattr(pr_module, "process_registry", _FakeRegistry(sessions))
 

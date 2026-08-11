@@ -378,6 +378,89 @@ def recover_abandoned_delegations() -> int:
     return recovered
 
 
+def _decode_restored_completion(
+    payload: str, *, expected_type: str, row_id: str
+) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
+    try:
+        event = _load_durable_event_payload(payload)
+    except (TypeError, ValueError) as exc:
+        return None, type(exc).__name__
+    if not isinstance(event, dict):
+        return None, f"expected object, got {type(event).__name__}"
+    if event.get("type") != expected_type:
+        return event, f"unexpected event type ({type(event.get('type')).__name__})"
+    if expected_type == "async_delegation":
+        if event.get("delegation_id") != row_id:
+            return event, "delegation identity does not match its durable row"
+    elif _ordinary_completion_delivery_id(event) is None:
+        return event, "ordinary completion identity is invalid"
+    return event, None
+
+
+def _corrupt_completion_payload(
+    *, expected_type: str, row_id: str, diagnostic: str
+) -> str:
+    return json.dumps(
+        {
+            "type": expected_type,
+            "corrupt_delivery_row": row_id,
+            "corrupt_delivery_diagnostic": diagnostic,
+        },
+        sort_keys=True,
+    )
+
+
+def _reconcile_committed_ack_events(conn, events, now: float) -> int:
+    """Settle checkpointed parent effects before abandoned claims can replay."""
+    reconciled = 0
+    for raw_event in events or ():
+        if not isinstance(raw_event, dict):
+            continue
+        event = _durable_event_payload(raw_event)
+        if event.get("type") == "async_delegation":
+            delegation_id = event.get("delegation_id")
+            if not isinstance(delegation_id, str) or not delegation_id:
+                continue
+            cur = conn.execute(
+                """UPDATE async_delegations
+                   SET delivery_state='recovery_committed_ack_failed',
+                       delivery_claim=NULL, delivery_claimed_at=NULL, updated_at=?
+                   WHERE delegation_id=?
+                     AND delivery_state IN ('pending', 'effect_started')""",
+                (now, delegation_id),
+            )
+            reconciled += cur.rowcount
+            continue
+        delivery_id = _ordinary_completion_delivery_id(event)
+        if delivery_id is None:
+            continue
+        payload = json.dumps(_durable_event_payload(event), sort_keys=True)
+        conn.execute(
+            """INSERT OR IGNORE INTO ordinary_completion_deliveries
+               (delivery_id, event_json, delivery_state, updated_at)
+               VALUES (?, ?, 'recovery_committed_ack_failed', ?)""",
+            (delivery_id, payload, now),
+        )
+        cur = conn.execute(
+            """UPDATE ordinary_completion_deliveries
+               SET delivery_state='recovery_committed_ack_failed',
+                   delivery_claim=NULL, delivery_claimed_at=NULL,
+                   delivery_owner_pid=NULL, delivery_owner_started_at=NULL,
+                   updated_at=?
+               WHERE delivery_id=?
+                 AND delivery_state IN ('pending', 'effect_started')""",
+            (now, delivery_id),
+        )
+        reconciled += cur.rowcount
+    return reconciled
+
+
+def reconcile_committed_completion_acks(events) -> int:
+    """Reconcile durable ACK-only facts without re-running provider effects."""
+    with _DB_LOCK, _transaction() as conn:
+        return _reconcile_committed_ack_events(conn, events, time.time())
+
+
 def restore_undelivered_completions(target_queue) -> int:
     """Enqueue durable retryable completions as fresh turns after process start.
 
@@ -391,21 +474,22 @@ def restore_undelivered_completions(target_queue) -> int:
     results seconds after boot (#64484).
     """
     recover_abandoned_delegations()
-    restored = 0
+    restored_events = []
     with _DB_LOCK, _transaction() as conn:
+        now = time.time()
         conn.execute(
             """UPDATE async_delegations SET delivery_state='pending',
                       delivery_claim=NULL, delivery_claimed_at=NULL, updated_at=?
                WHERE state != 'running' AND delivery_state='effect_started'
                  AND event_json IS NOT NULL""",
-            (time.time(),),
+            (now,),
         )
         rows = conn.execute(
             """SELECT delegation_id, event_json, delivery_attempts FROM async_delegations
                WHERE state != 'running' AND delivery_state='pending' AND event_json IS NOT NULL
                ORDER BY completed_at, delegation_id"""
         ).fetchall()
-        for _delegation_id, payload, _attempts in rows:
+        for delegation_id, payload, attempts in rows:
             # Park a completion that has exhausted its delivery budget. Its
             # origin session is permanently gone (dead owner pid), so every boot
             # it re-enqueues here, fails the fail-closed ownership gate, is
@@ -415,26 +499,46 @@ def restore_undelivered_completions(target_queue) -> int:
             # before the claim, so this is the only place it can be retired.
             # 'parked' (not 'delivered'): nothing was ever handed to a consumer,
             # so claiming delivery would be dishonest. The row stays queryable.
-            if int(_attempts or 0) >= _MAX_DELIVERY_ATTEMPTS:
+            if int(attempts or 0) >= _MAX_DELIVERY_ATTEMPTS:
                 conn.execute(
                     """UPDATE async_delegations SET delivery_state='parked', updated_at=?
                        WHERE delegation_id=?""",
-                    (time.time(), _delegation_id),
+                    (now, delegation_id),
                 )
                 logger.warning(
                     "Async delegation %s exhausted its %d delivery attempts "
                     "without a session that could own it; parking it instead of "
                     "replaying on every restart (result remains queryable).",
-                    _delegation_id, _MAX_DELIVERY_ATTEMPTS,
+                    delegation_id,
+                    _MAX_DELIVERY_ATTEMPTS,
                 )
                 continue
-            evt = _load_durable_event_payload(payload)
-            if isinstance(evt, dict):
-                evt["restored"] = True
-            target_queue.put(evt)
-            restored += 1
+            event, diagnostic = _decode_restored_completion(
+                payload, expected_type="async_delegation", row_id=delegation_id
+            )
+            if diagnostic is not None:
+                parked_payload = _corrupt_completion_payload(
+                    expected_type="async_delegation",
+                    row_id=delegation_id,
+                    diagnostic=diagnostic,
+                )
+                conn.execute(
+                    """UPDATE async_delegations
+                       SET event_json=?, delivery_state='parked_corrupt', updated_at=?
+                       WHERE delegation_id=? AND delivery_state='pending'""",
+                    (parked_payload, now, delegation_id),
+                )
+                logger.warning(
+                    "Parking corrupt async completion row %s: %s",
+                    delegation_id,
+                    diagnostic,
+                )
+                continue
+            if event is None:
+                continue
+            event["restored"] = True
+            restored_events.append(event)
 
-        now = time.time()
         try:
             from gateway.status import _pid_exists, get_process_start_time
         except Exception:
@@ -470,12 +574,34 @@ def restore_undelivered_completions(target_queue) -> int:
                WHERE delivery_state='pending'"""
         ).fetchall()
         for delivery_id, payload in pending_rows:
-            evt = _load_durable_event_payload(payload)
-            if not isinstance(evt, dict):
+            event, diagnostic = _decode_restored_completion(
+                payload, expected_type="completion", row_id=delivery_id
+            )
+            if diagnostic is not None:
+                parked_payload = _corrupt_completion_payload(
+                    expected_type="completion",
+                    row_id=delivery_id,
+                    diagnostic=diagnostic,
+                )
+                conn.execute(
+                    """UPDATE ordinary_completion_deliveries
+                       SET event_json=?, delivery_state='parked_corrupt', updated_at=?
+                       WHERE delivery_id=? AND delivery_state='pending'""",
+                    (parked_payload, now, delivery_id),
+                )
+                logger.warning(
+                    "Parking corrupt ordinary completion row %s: %s",
+                    delivery_id,
+                    diagnostic,
+                )
                 continue
-            normalized_id = _ordinary_completion_delivery_id(evt)
-            normalized_payload = json.dumps(_durable_event_payload(evt), sort_keys=True)
-            if normalized_id is not None and normalized_id != delivery_id:
+            if event is None:
+                continue
+            normalized_id = _ordinary_completion_delivery_id(event)
+            normalized_payload = json.dumps(
+                _durable_event_payload(event), sort_keys=True
+            )
+            if normalized_id != delivery_id:
                 target_exists = conn.execute(
                     "SELECT 1 FROM ordinary_completion_deliveries WHERE delivery_id=?",
                     (normalized_id,),
@@ -513,12 +639,34 @@ def restore_undelivered_completions(target_queue) -> int:
                     (now, delivery_id),
                 )
                 continue
-            evt = _load_durable_event_payload(payload)
-            if isinstance(evt, dict):
-                evt["restored"] = True
-                target_queue.put(evt)
-                restored += 1
-    return restored
+            event, diagnostic = _decode_restored_completion(
+                payload, expected_type="completion", row_id=delivery_id
+            )
+            if diagnostic is not None:
+                parked_payload = _corrupt_completion_payload(
+                    expected_type="completion",
+                    row_id=delivery_id,
+                    diagnostic=diagnostic,
+                )
+                conn.execute(
+                    """UPDATE ordinary_completion_deliveries
+                       SET event_json=?, delivery_state='parked_corrupt', updated_at=?
+                       WHERE delivery_id=? AND delivery_state='pending'""",
+                    (parked_payload, now, delivery_id),
+                )
+                logger.warning(
+                    "Parking corrupt ordinary completion row %s: %s",
+                    delivery_id,
+                    diagnostic,
+                )
+                continue
+            if event is None:
+                continue
+            event["restored"] = True
+            restored_events.append(event)
+    for event in restored_events:
+        target_queue.put(event)
+    return len(restored_events)
 
 
 def mark_completion_delivered(delegation_id: str) -> bool:

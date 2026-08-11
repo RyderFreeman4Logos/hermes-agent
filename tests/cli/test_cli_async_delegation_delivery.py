@@ -1,5 +1,6 @@
 """Regression coverage for CLI async-delegation completion ownership."""
 
+import json
 import queue
 import types
 
@@ -165,6 +166,86 @@ def test_cli_storage_failure_retries_once_in_same_process(
     cli._drain_process_notifications("cli-idle")
     assert cli._pending_input.empty()
     assert len(effects) == 1
+
+
+def test_cli_committed_ack_dual_failure_restarts_without_provider_replay(
+    monkeypatch, tmp_path
+):
+    from unittest.mock import MagicMock
+
+    from tools import async_delegation as ad
+    import tools.process_registry as registry_module
+
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    monkeypatch.setattr(registry_module, "CHECKPOINT_PATH", tmp_path / "processes.json")
+    registry = registry_module.ProcessRegistry()
+    monkeypatch.setattr(registry_module, "process_registry", registry)
+    event = {
+        "type": "completion",
+        "session_id": "proc-cli-committed-ack-failure",
+        "session_key": "visible-session",
+        "started_at": 8.5,
+        "command": "true",
+        "exit_code": 1,
+        "completion_reason": "exited",
+        "termination_source": "",
+        "output": "failed visibly",
+    }
+    assert ad.persist_event_delivery(event)
+    assert registry.claim_completion_delivery(event)
+    claim = ad.claim_event_delivery(event, "cli-idle")
+    assert claim
+
+    cli = HermesCLI.__new__(HermesCLI)
+    cli.session_id = "visible-session"
+    cli._session_db = None
+    effects = []
+
+    def committed(message, **kwargs):
+        effects.append(message)
+        kwargs["completion_delivery_callback"]("committed")
+        return "done"
+
+    monkeypatch.setattr(cli, "_chat", committed)
+    real_complete = ad.complete_event_delivery
+    real_mark_recovery = ad.mark_completion_delivery_recovery
+    release = MagicMock(side_effect=AssertionError("committed effect was released"))
+    monkeypatch.setattr(
+        ad,
+        "complete_event_delivery",
+        MagicMock(side_effect=OSError("complete unavailable")),
+    )
+    monkeypatch.setattr(
+        ad, "mark_completion_delivery_recovery", MagicMock(return_value=False)
+    )
+    monkeypatch.setattr(ad, "release_event_delivery", release)
+
+    assert (
+        cli.chat(
+            "completion payload",
+            completion_delivery=True,
+            completion_event=event,
+            completion_claim=claim,
+        )
+        == "done"
+    )
+    assert effects == ["completion payload"]
+    release.assert_not_called()
+    receipt = ad.get_durable_event_delivery(event)
+    assert receipt and receipt["delivery_state"] == "effect_started"
+    checkpoint_entries = json.loads(
+        registry_module.CHECKPOINT_PATH.read_text(encoding="utf-8")
+    )
+    assert checkpoint_entries[0]["completion_ack"]["session_id"] == event["session_id"]
+
+    monkeypatch.setattr(ad, "complete_event_delivery", real_complete)
+    monkeypatch.setattr(ad, "mark_completion_delivery_recovery", real_mark_recovery)
+    monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: False)
+    restarted = registry_module.ProcessRegistry()
+    assert restarted.completion_queue.empty()
+    receipt = ad.get_durable_event_delivery(event)
+    assert receipt and receipt["delivery_state"] == "recovery_committed_ack_failed"
+    assert effects == ["completion payload"]
 
 
 def test_cli_completion_ownership_rejects_foreign_session():

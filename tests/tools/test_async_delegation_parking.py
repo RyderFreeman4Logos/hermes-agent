@@ -15,6 +15,7 @@ again, and the cycle repeats for the life of the install — re-logging a WARNIN
 each time.
 """
 
+from contextlib import contextmanager
 import json
 import time
 
@@ -31,7 +32,9 @@ def delegation_db(tmp_path, monkeypatch):
     return ad
 
 
-def _insert_pending(ad, delegation_id: str, *, attempts: int) -> None:
+def _insert_pending(
+    ad, delegation_id: str, *, attempts: int, event_json: str | None = None
+) -> None:
     """Insert a durable completion in the pending, undelivered state."""
     now = time.time()
     event = {
@@ -52,8 +55,15 @@ def _insert_pending(ad, delegation_id: str, *, attempts: int) -> None:
                 dispatched_at, completed_at, updated_at, event_json,
                 delivery_state, delivery_attempts)
                VALUES (?, ?, '', 'success', ?, ?, ?, ?, 'pending', ?)""",
-            (delegation_id, "telegram:dead-session", now, now, now,
-             json.dumps(event), attempts),
+            (
+                delegation_id,
+                "telegram:dead-session",
+                now,
+                now,
+                now,
+                event_json if event_json is not None else json.dumps(event),
+                attempts,
+            ),
         )
 
 
@@ -64,6 +74,34 @@ def _delivery_row(ad, delegation_id: str):
             "WHERE delegation_id=?",
             (delegation_id,),
         ).fetchone()
+
+
+def _insert_ordinary(ad, delivery_id: str, event_json: str, updated_at: float) -> None:
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute(
+            """INSERT INTO ordinary_completion_deliveries
+               (delivery_id, event_json, delivery_state, updated_at)
+               VALUES (?, ?, 'pending', ?)""",
+            (delivery_id, event_json, updated_at),
+        )
+
+
+def _ordinary_state(ad, delivery_id: str) -> str:
+    with ad._DB_LOCK, ad._transaction() as conn:
+        return conn.execute(
+            "SELECT delivery_state FROM ordinary_completion_deliveries "
+            "WHERE delivery_id=?",
+            (delivery_id,),
+        ).fetchone()[0]
+
+
+def _stored_event_json(ad, table: str, id_column: str, row_id: str) -> str:
+    assert table in {"async_delegations", "ordinary_completion_deliveries"}
+    assert id_column in {"delegation_id", "delivery_id"}
+    with ad._DB_LOCK, ad._transaction() as conn:
+        return conn.execute(
+            f"SELECT event_json FROM {table} WHERE {id_column}=?", (row_id,)
+        ).fetchone()[0]
 
 
 class _Queue:
@@ -162,6 +200,111 @@ def test_mixed_batch_parks_only_the_exhausted_row(delegation_db):
     assert [item["delegation_id"] for item in queue.items] == ["d-healthy"]
     assert _delivery_row(ad, "d-exhausted")[0] == "parked"
     assert _delivery_row(ad, "d-healthy")[0] == "pending"
+
+
+@pytest.mark.parametrize(
+    "bad_event_json",
+    [
+        '{"_completion_delivery_token":"private-async-token"',
+        "[]",
+        json.dumps({"type": "completion"}),
+    ],
+    ids=["malformed-json", "wrong-shape", "wrong-type"],
+)
+def test_corrupt_async_row_is_parked_without_blocking_valid_sibling(
+    delegation_db, bad_event_json, caplog
+):
+    ad = delegation_db
+    _insert_pending(ad, "d-corrupt", attempts=0, event_json=bad_event_json)
+    _insert_pending(ad, "d-valid", attempts=0)
+
+    queue = _Queue()
+    assert ad.restore_undelivered_completions(queue) == 1
+    assert [item["delegation_id"] for item in queue.items] == ["d-valid"]
+    assert _delivery_row(ad, "d-corrupt")[0] == "parked_corrupt"
+    parked_payload = _stored_event_json(
+        ad, "async_delegations", "delegation_id", "d-corrupt"
+    )
+    assert json.loads(parked_payload)["corrupt_delivery_row"] == "d-corrupt"
+    assert "_completion_delivery_" not in parked_payload
+
+    caplog.clear()
+    ad.restore_undelivered_completions(_Queue())
+    assert not [
+        record
+        for record in caplog.records
+        if "corrupt async completion row d-corrupt" in record.getMessage()
+    ]
+
+
+@pytest.mark.parametrize(
+    "bad_event_json",
+    [
+        '{"_completion_delivery_binding":"private-ordinary-binding"',
+        "[]",
+        json.dumps({"type": "async_delegation"}),
+    ],
+    ids=["malformed-json", "wrong-shape", "wrong-type"],
+)
+def test_corrupt_ordinary_row_is_local_and_enqueue_follows_commit(
+    delegation_db, monkeypatch, bad_event_json
+):
+    ad = delegation_db
+    corrupt_id = "ordinary-corrupt"
+    events = [
+        {
+            "type": "completion",
+            "session_id": f"proc-valid-{index}",
+            "session_key": "owner",
+            "started_at": float(index),
+            "command": f"command-{index}",
+            "exit_code": 0,
+            "completion_reason": "exited",
+            "termination_source": "",
+        }
+        for index in (1, 2)
+    ]
+    _insert_ordinary(ad, corrupt_id, bad_event_json, 0.0)
+    for event in events:
+        delivery_id = ad._ordinary_completion_delivery_id(event)
+        assert delivery_id is not None
+        _insert_ordinary(ad, delivery_id, json.dumps(event), event["started_at"])
+
+    real_transaction = ad._transaction
+    transaction_active = False
+
+    @contextmanager
+    def tracked_transaction():
+        nonlocal transaction_active
+        with real_transaction() as conn:
+            transaction_active = True
+            try:
+                yield conn
+            finally:
+                transaction_active = False
+
+    monkeypatch.setattr(ad, "_transaction", tracked_transaction)
+
+    class CommitAwareQueue(_Queue):
+        def put(self, item):
+            assert not transaction_active, "event escaped before SQLite commit"
+            super().put(item)
+
+    queue = CommitAwareQueue()
+    assert ad.restore_undelivered_completions(queue) == 2
+    assert [item["session_id"] for item in queue.items] == [
+        "proc-valid-1",
+        "proc-valid-2",
+    ]
+    assert _ordinary_state(ad, corrupt_id) == "parked_corrupt"
+    parked_payload = _stored_event_json(
+        ad,
+        "ordinary_completion_deliveries",
+        "delivery_id",
+        corrupt_id,
+    )
+    assert json.loads(parked_payload)["corrupt_delivery_row"] == corrupt_id
+    assert "_completion_delivery_" not in parked_payload
 
 
 def test_ownership_drop_advances_the_delivery_attempt_counter(delegation_db):

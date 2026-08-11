@@ -9564,8 +9564,18 @@ def _finish_steered_completion_claims(session: dict, outcome: str) -> list[dict]
         session["_completion_steer_pending"] = [
             item for item in pending if item.get("state") != "applied"
         ]
+    retry_events: list[dict] = []
     for item in terminal:
-        _finish_completion_claim(item["evt"], item.get("claim") or "", outcome)
+        _finish_completion_claim(
+            item["evt"],
+            item.get("claim") or "",
+            outcome,
+            retry_queue=retry_events,
+        )
+    if retry_events:
+        from tools.process_registry import process_registry
+
+        process_registry.requeue_completions_front(retry_events)
     return terminal
 
 
@@ -9713,19 +9723,53 @@ def _dispatch_completion_batch(
     """Claim and submit one idle turn for a bounded completion batch."""
     from tools.process_registry import (
         claim_completion_event_delivery,
-        finish_completion_event_delivery,
+        process_registry,
     )
 
     if not items:
         return
     claimed: list[tuple[dict, str]] = []
+    settled = False
+
+    def finish_claims(outcome: str) -> list[bool]:
+        nonlocal settled
+        if settled:
+            return []
+        settled = True
+        retry_events: list[dict] = []
+        terminal = [
+            _finish_completion_claim(
+                item["evt"], claim, outcome, retry_queue=retry_events
+            )
+            for item, claim in claimed
+        ]
+        process_registry.requeue_completions_front(retry_events)
+        return terminal
+
     try:
-        for item in items:
+        for item_index, item in enumerate(items):
             evt = item["evt"]
             # Busy-steer may already hold inflight claim/claim-id.
             claim = item.get("claim")
             if claim is None:
-                claim = claim_completion_event_delivery(evt, consumer)
+                retry_events: list[dict] = []
+                claim = claim_completion_event_delivery(
+                    evt, consumer, retry_queue=retry_events
+                )
+                if retry_events:
+                    for untouched in items[item_index + 1 :]:
+                        untouched_claim = untouched.get("claim")
+                        if untouched_claim is None:
+                            retry_events.append(untouched["evt"])
+                        else:
+                            _finish_completion_claim(
+                                untouched["evt"],
+                                untouched_claim,
+                                "provider_failed",
+                                retry_queue=retry_events,
+                            )
+                    process_registry.requeue_completions_front(retry_events)
+                    break
                 if claim is None:
                     continue
             claimed.append((item, claim))
@@ -9737,8 +9781,7 @@ def _dispatch_completion_batch(
             [item for item, _claim in claimed]
         )
         if not prompt:
-            for item, claim in claimed:
-                _finish_completion_claim(item["evt"], claim, "committed")
+            finish_claims("committed")
             with session["history_lock"]:
                 session["running"] = False
             return
@@ -9747,10 +9790,7 @@ def _dispatch_completion_batch(
         kwargs: dict[str, Any] = {}
         if is_completion:
             kwargs["completion_delivery"] = True
-        kwargs["completion_delivery_callback"] = lambda outcome: [
-            _finish_completion_claim(item["evt"], claim, outcome)
-            for item, claim in claimed
-        ]
+        kwargs["completion_delivery_callback"] = finish_claims
         async_claims = [
             (item, claim)
             for item, claim in claimed
@@ -9774,10 +9814,7 @@ def _dispatch_completion_batch(
                 rid, sid, session, prompt, turn_origin="background_completion", **kwargs
             )
     except Exception as exc:
-        for item, claim in claimed:
-            finish_completion_event_delivery(
-                item["evt"], claim, "provider_failed"
-            )
+        finish_claims("provider_failed")
         print(
             f"[tui_gateway] completion batch dispatch failed: "
             f"{type(exc).__name__}: {exc}",
@@ -9787,23 +9824,50 @@ def _dispatch_completion_batch(
             session["running"] = False
 
 
-def _finish_completion_claim(evt: dict, claim_id: str, outcome: str) -> bool:
+def _finish_completion_claim(
+    evt: dict,
+    claim_id: str,
+    outcome: str,
+    *,
+    retry_queue: list[dict] | None = None,
+) -> bool:
     """Resolve any completion only after its provider and publication fence."""
     from tools.process_registry import finish_completion_event_delivery
 
-    return finish_completion_event_delivery(evt, claim_id, outcome)
+    return finish_completion_event_delivery(
+        evt, claim_id, outcome, retry_queue=retry_queue
+    )
 
 
-def _finish_suppressed_completion(evt: dict, process_registry, consumer: str) -> bool:
+def _finish_suppressed_completion(
+    evt: dict,
+    process_registry,
+    consumer: str,
+    retry_queue: Optional[list[dict]] = None,
+) -> bool:
     """Durably ACK an explicit visibility no-op without opening a model turn."""
     from tools.process_registry import claim_completion_event_delivery
 
+    retries = retry_queue if retry_queue is not None else []
+    retry_start = len(retries)
     claim = claim_completion_event_delivery(
-        evt, consumer, registry=process_registry
+        evt,
+        consumer,
+        registry=process_registry,
+        retry_queue=retries,
     )
     if claim is None:
-        return False
-    return _finish_completion_claim(evt, claim, "committed")
+        terminal = len(retries) == retry_start
+    else:
+        terminal = _finish_completion_claim(
+            evt,
+            claim,
+            "committed",
+            retry_queue=retries,
+        )
+    if retry_queue is None and len(retries) > retry_start:
+        process_registry.requeue_completions_front(retries[retry_start:])
+    return terminal
 
 
 def _collect_idle_completion_batch(
@@ -9848,12 +9912,21 @@ def _collect_idle_completion_batch(
         if evt.get("type") == "heartbeat":
             process_registry.requeue_completion_front(evt)
             break
-        text = format_process_notification(evt)
-        if not text:
-            continue
-        model_text = completion_delivery_prompt(evt, text)
+        try:
+            text = format_process_notification(evt)
+            if not text:
+                continue
+            model_text = completion_delivery_prompt(evt, text)
+        except Exception:
+            process_registry.requeue_completions_front(
+                [item["evt"] for item in batch_items] + [evt]
+            )
+            raise
         if model_text is None:
-            _finish_suppressed_completion(evt, process_registry, "tui-visibility")
+            if not _finish_suppressed_completion(
+                evt, process_registry, "tui-visibility"
+            ):
+                break
             continue
         dedup = _notification_event_dedup_key(evt)
         if dedup not in emitted:
@@ -10198,12 +10271,23 @@ def _notification_poller_loop(
             _handle_heartbeat_event(sid, session, evt)
             continue
 
-        text = format_process_notification(evt)
-        if not text:
+        try:
+            text = format_process_notification(evt)
+            if not text:
+                continue
+            model_text = completion_delivery_prompt(evt, text)
+        except Exception as exc:
+            process_registry.requeue_completion_front(evt)
+            logger.warning(
+                "Completion notification formatting failed: %s", exc, exc_info=True
+            )
+            time.sleep(_NOTIFICATION_REQUEUE_BACKOFF_SECONDS)
             continue
-        model_text = completion_delivery_prompt(evt, text)
         if model_text is None:
-            _finish_suppressed_completion(evt, process_registry, "tui-visibility")
+            if not _finish_suppressed_completion(
+                evt, process_registry, "tui-visibility"
+            ):
+                time.sleep(_NOTIFICATION_REQUEUE_BACKOFF_SECONDS)
             continue
 
         # Only emit the same notification identity to TUI once — re-queued
@@ -10221,31 +10305,39 @@ def _notification_poller_loop(
             continue
         if steer_result is False:
             # Busy but not steer-capable: legacy requeue until idle.
-            process_registry.completion_queue.put(evt)
+            process_registry.requeue_completion_front(evt)
             time.sleep(_NOTIFICATION_REQUEUE_BACKOFF_SECONDS)
             continue
 
         # Idle path: coalesce a bounded per-session backlog into ONE turn.
         with session["history_lock"]:
             if session.get("running"):
-                process_registry.completion_queue.put(evt)
+                process_registry.requeue_completion_front(evt)
                 time.sleep(_NOTIFICATION_REQUEUE_BACKOFF_SECONDS)
                 continue
             session["running"] = True
 
         first_item = {"evt": evt, "model_text": model_text, "text": text}
-        batch_items, overflow = _collect_idle_completion_batch(
-            first_item,
-            process_registry,
-            sid,
-            session,
-            emitted=_emitted,
-        )
-        for overflow_item in overflow:
-            process_registry.completion_queue.put(overflow_item["evt"])
-        _dispatch_completion_batch(
-            sid, session, batch_items, consumer="tui-poller"
-        )
+        try:
+            batch_items, overflow = _collect_idle_completion_batch(
+                first_item,
+                process_registry,
+                sid,
+                session,
+                emitted=_emitted,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Completion backlog formatting failed: %s", exc, exc_info=True
+            )
+            with session["history_lock"]:
+                session["running"] = False
+            continue
+        if overflow:
+            process_registry.requeue_completions_front([
+                overflow_item["evt"] for overflow_item in overflow
+            ])
+        _dispatch_completion_batch(sid, session, batch_items, consumer="tui-poller")
 
     # Drain only this session's bounded queue snapshot after stop. Foreign
     # events never leave the queue, so a concurrent producer cannot append a
@@ -10293,12 +10385,33 @@ def _notification_poller_loop(
         if evt.get("type") == "heartbeat":
             _handle_heartbeat_event(sid, session, evt)
             continue
-        text = format_process_notification(evt)
-        if not text:
-            continue
-        model_text = completion_delivery_prompt(evt, text)
+        try:
+            text = format_process_notification(evt)
+            if not text:
+                continue
+            model_text = completion_delivery_prompt(evt, text)
+        except Exception as exc:
+            restore_ids = {id(event) for event in deferred}
+            restore_ids.update(id(item["evt"]) for item in shutdown_batch)
+            restore_ids.update(id(event) for event in shutdown_events[event_index:])
+            process_registry.requeue_completions_front([
+                event for event in shutdown_events if id(event) in restore_ids
+            ])
+            logger.warning(
+                "Completion shutdown formatting failed: %s", exc, exc_info=True
+            )
+            return
         if model_text is None:
-            _finish_suppressed_completion(evt, process_registry, "tui-visibility")
+            retry_events: list[dict] = []
+            if not _finish_suppressed_completion(
+                evt,
+                process_registry,
+                "tui-visibility",
+                retry_queue=retry_events,
+            ):
+                retry_events.extend(shutdown_events[event_index + 1 :])
+                process_registry.requeue_completions_front(retry_events)
+                break
             continue
 
         _dedup_key = _notification_event_dedup_key(evt)
@@ -10311,8 +10424,7 @@ def _notification_poller_loop(
                 retry_events = [item["evt"] for item in shutdown_batch]
                 retry_events.extend(shutdown_events[event_index:])
                 shutdown_batch.clear()
-                for retry_event in reversed(retry_events):
-                    process_registry.requeue_completion_front(retry_event)
+                process_registry.requeue_completions_front(retry_events)
                 break
         shutdown_batch.append({"evt": evt, "model_text": model_text, "text": text})
 
@@ -10320,13 +10432,15 @@ def _notification_poller_loop(
         dispatch_items: list[dict] = []
         with session["history_lock"]:
             if session.get("running"):
-                for item in reversed(shutdown_batch):
-                    process_registry.requeue_completion_front(item["evt"])
+                process_registry.requeue_completions_front([
+                    item["evt"] for item in shutdown_batch
+                ])
             else:
                 session["running"] = True
                 batch_items, overflow = _bound_completion_batch(shutdown_batch)
-                for item in reversed(overflow):
-                    process_registry.requeue_completion_front(item["evt"])
+                process_registry.requeue_completions_front([
+                    item["evt"] for item in overflow
+                ])
                 if batch_items:
                     dispatch_items = batch_items
                 else:
@@ -10338,8 +10452,7 @@ def _notification_poller_loop(
 
     # Ownership can change after the snapshot predicate. Fail closed and put
     # those rare records ahead of any newer producer tail in original order.
-    for evt in reversed(deferred):
-        process_registry.requeue_completion_front(evt)
+    process_registry.requeue_completions_front(deferred)
 
 
 def _handle_heartbeat_event(sid: str, session: dict, evt: dict) -> None:
@@ -11604,24 +11717,28 @@ def _run_prompt_submit(
             else:
                 with session["history_lock"]:
                     if session.get("running"):
+                        retry_events: list[dict] = []
                         for item in batch_items:
                             # Only requeue raw queue events (not already-claimed steers).
                             if item.get("claim") is None:
-                                process_registry.completion_queue.put(item["evt"])
+                                retry_events.append(item["evt"])
                             else:
                                 # Keep claimed steers pending for a later idle poller.
                                 session.setdefault("_completion_steer_pending", []).append(item)
+                        process_registry.requeue_completions_front(retry_events)
                         batch_items = []
                     else:
                         session["running"] = True
                 if batch_items:
                     bounded, overflow = _bound_completion_batch(batch_items)
+                    retry_events = []
                     for item in overflow:
                         if item.get("claim") is None:
-                            process_registry.completion_queue.put(item["evt"])
+                            retry_events.append(item["evt"])
                         else:
                             with session["history_lock"]:
                                 session.setdefault("_completion_steer_pending", []).append(item)
+                    process_registry.requeue_completions_front(retry_events)
                     _dispatch_completion_batch(
                         sid, session, bounded, consumer="tui-post-turn"
                     )

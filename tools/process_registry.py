@@ -234,12 +234,44 @@ def _bound_completion_delivery_metadata(evt: dict) -> "tuple | None":
         return None
     if (
         not isinstance(metadata, list)
-        or len(metadata) != 3
+        or len(metadata) not in {3, 5}
         or not isinstance(metadata[1], str)
         or token.rpartition("|")[2] != metadata[1]
     ):
         return None
-    return token, metadata[0], metadata[2]
+    if len(metadata) == 3:
+        metadata.extend((None, None))
+    elif (
+        not isinstance(metadata[2], str)
+        or not metadata[2].startswith("completion-event-v1:")
+        or not isinstance(metadata[3], str)
+        or not metadata[3].startswith("completion-event-v1:")
+        or not isinstance(metadata[4], list)
+    ):
+        return None
+    return token, metadata[0], metadata[2], metadata[3], metadata[4]
+
+
+def _bound_completion_projection(evt: dict) -> "tuple | None":
+    """Recover producer identity only from a binding valid for this projection."""
+    metadata = _bound_completion_delivery_metadata(evt)
+    current_core = _completion_core_identity(evt)
+    current_fingerprint = _completion_authority_fingerprint(evt)
+    if (
+        metadata is None
+        or current_core is None
+        or metadata[1] != list(current_core)
+        or metadata[3] != current_fingerprint
+        or not metadata[4]
+        or any(
+            isinstance(value, bool)
+            or not isinstance(value, (str, int, float))
+            or (isinstance(value, float) and not math.isfinite(value))
+            for value in metadata[4]
+        )
+    ):
+        return None
+    return metadata[0], metadata[2], tuple(metadata[4])
 
 
 def _bound_completion_delivery_token(evt: dict) -> Optional[_CompletionDeliveryToken]:
@@ -454,8 +486,7 @@ class ProcessRegistry:
             for event in committed_ack_events:
                 recorded_at = event.get("completion_ack_recorded_at")
                 retire = event.get("type") != "async_delegation" or (
-                    isinstance(recorded_at, (int, float))
-                    and recorded_at < ack_cutoff
+                    isinstance(recorded_at, (int, float)) and recorded_at < ack_cutoff
                 )
                 if retire:
                     self._discard_terminal_completion_spool(
@@ -2098,6 +2129,38 @@ class ProcessRegistry:
         return event
 
     @staticmethod
+    def _completion_presentation_event(evt: dict, updates: dict) -> dict:
+        """Apply display-only fields without replacing producer delivery identity."""
+        projected = dict(evt)
+        projected.update(updates)
+        metadata = _bound_completion_delivery_metadata(evt)
+        original_fingerprint = _bound_completion_event_fingerprint(evt)
+        durable_identity = ProcessRegistry._completion_durable_identity(evt)
+        projected_fingerprint = _completion_authority_fingerprint(projected)
+        if (
+            metadata is None
+            or original_fingerprint is None
+            or durable_identity is None
+            or projected_fingerprint is None
+        ):
+            return projected
+        producer = str(metadata[0]).rpartition("|")[2]
+        projected["_completion_delivery_binding"] = _CompletionDeliveryBinding(
+            json.dumps(
+                [
+                    metadata[1],
+                    producer,
+                    original_fingerprint,
+                    projected_fingerprint,
+                    list(durable_identity),
+                ],
+                allow_nan=False,
+                separators=(",", ":"),
+            )
+        )
+        return projected
+
+    @staticmethod
     def _checkpoint_completion_event(entry: dict) -> dict:
         """Materialize an outcome-unknown completion from a dead checkpoint."""
         return {
@@ -2154,6 +2217,9 @@ class ProcessRegistry:
             if isinstance(delegation_id, str) and delegation_id:
                 return "async-delegation", delegation_id
             return None
+        projection = _bound_completion_projection(evt)
+        if projection is not None:
+            return projection[2]
         identity = ProcessRegistry._completion_identity(evt)
         if identity is not None:
             return (*identity, _canonical_completion_fingerprint(evt))
@@ -2165,6 +2231,9 @@ class ProcessRegistry:
     @staticmethod
     def _completion_claim_identity(evt: dict) -> "tuple | None":
         """Return a producer-local token/event binding or durable authority."""
+        projection = _bound_completion_projection(evt)
+        if projection is not None:
+            return "completion-local", projection[0], projection[1]
         metadata = _bound_completion_delivery_metadata(evt)
         current_fingerprint = _completion_authority_fingerprint(
             evt, allow_nonfinite=True

@@ -1373,25 +1373,25 @@ def test_failed_process_injection_releases_lifecycle_claim(monkeypatch):
     assert injected.await_count == 2
 
 
-def test_gateway_async_effect_uses_shared_ack_recovery(
-    monkeypatch, isolated_registry
-):
+def test_gateway_async_effect_uses_shared_ack_recovery(monkeypatch, isolated_registry):
     from tools import async_delegation as ad
 
     event = _async_event("deleg-gateway-shared-settlement")
     ad._persist_dispatch(event)
     ad._persist_completion(event, {"status": "completed", "summary": "Found it"})
     runner = _runner(SimpleNamespace(handle_message=AsyncMock(), supports_push=False))
-    monkeypatch.setattr(runner, "_inject_watch_notification", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        runner, "_inject_watch_notification", AsyncMock(return_value=True)
+    )
     monkeypatch.setattr(
         ad,
         "complete_completion_delivery",
         MagicMock(side_effect=OSError("intentional direct ACK failure")),
     )
 
-    assert asyncio.run(
-        runner._deliver_completion_notification("payload", event)
-    ) is True
+    assert (
+        asyncio.run(runner._deliver_completion_notification("payload", event)) is True
+    )
     durable = ad.get_durable_delegation(event["delegation_id"])
     assert durable is not None
     assert durable["delivery_state"] == "recovery_committed_ack_failed"
@@ -1399,9 +1399,7 @@ def test_gateway_async_effect_uses_shared_ack_recovery(
 
 
 @pytest.mark.parametrize("event_type", ["completion", "async_delegation"])
-def test_gateway_api_self_post_uses_completion_fence(
-    monkeypatch, event_type
-):
+def test_gateway_api_self_post_uses_completion_fence(monkeypatch, event_type):
     from tools import async_delegation as ad
 
     adapter = SimpleNamespace(handle_message=AsyncMock(), supports_async_delivery=False)
@@ -1421,9 +1419,9 @@ def test_gateway_api_self_post_uses_completion_fence(
     self_post = AsyncMock()
     monkeypatch.setattr("gateway.wake.deliver_wake", self_post)
 
-    assert asyncio.run(
-        runner._deliver_completion_notification("payload", event)
-    ) is True
+    assert (
+        asyncio.run(runner._deliver_completion_notification("payload", event)) is True
+    )
     call = self_post.await_args
     assert call is not None
     assert call.kwargs["completion_delivery"] is True
@@ -1750,3 +1748,65 @@ def test_autonomous_completion_redacts_real_command_and_output_secrets(monkeypat
     delivered = adapter.handle_message.await_args.args[0]
     assert secret not in delivered.text
     assert "HOME=/home/user" in delivered.text
+
+
+def test_gateway_presentation_projection_shares_producer_delivery_identity(
+    monkeypatch, isolated_registry
+):
+    from tools import async_delegation as ad
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"auxiliary": {"completion_visibility": {"enabled": False}}},
+    )
+    process = ProcessSession(
+        id="proc-honest-long-output",
+        command="printf long-output",
+        task_id="task",
+        session_key="agent:main:telegram:dm:123",
+        started_at=72.0,
+        output_buffer="prefix\n" + ("x" * 2400),
+        exited=True,
+        exit_code=0,
+        completion_reason="exited",
+        termination_source="",
+        notify_on_complete=True,
+        delegated_child=False,
+    )
+    isolated_registry._running[process.id] = process
+    isolated_registry._move_to_finished(process)
+    queued_event = isolated_registry.completion_queue.get_nowait()
+    isolated_registry.completion_queue.put(queued_event)
+    queued_delivery_id = ad._ordinary_completion_delivery_id(queued_event)
+    assert queued_delivery_id
+
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+    runner._load_background_notifications_mode = lambda: "off"
+
+    async def instant_sleep(_delay):
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", instant_sleep)
+    asyncio.run(
+        runner._run_process_watcher({
+            "session_id": process.id,
+            "check_interval": 0,
+            "session_key": process.session_key,
+            "platform": "telegram",
+            "chat_type": "dm",
+            "chat_id": "123",
+            "notify_on_complete": True,
+        })
+    )
+    delivered = adapter.handle_message.await_args.args[0]
+    receipt_event = delivered.metadata["_completion_delivery_receipt"]["event"]
+    assert ad._ordinary_completion_delivery_id(receipt_event) == queued_delivery_id
+    asyncio.run(runner._finish_completion_delivery_receipt(delivered, "committed"))
+
+    asyncio.run(_run_gateway_completion_queue(monkeypatch, runner, isolated_registry))
+
+    adapter.handle_message.assert_awaited_once()
+    receipt = ad.get_durable_event_delivery(queued_event)
+    assert receipt is not None
+    assert receipt["delivery_state"] == "delivered"

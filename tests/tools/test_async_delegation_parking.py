@@ -537,9 +537,7 @@ def test_malformed_abandoned_task_is_parked_without_blocking_neighbor(delegation
         ("parent_session_id", "foreign-parent"),
     ],
 )
-def test_restored_async_routing_is_bound_to_dispatch_row(
-    delegation_db, field, forged
-):
+def test_restored_async_routing_is_bound_to_dispatch_row(delegation_db, field, forged):
     ad = delegation_db
     event = {
         "type": "async_delegation",
@@ -584,10 +582,12 @@ def test_restored_async_routing_missing_payload_fields_rebuilt_from_row(delegati
     ad._persist_dispatch({**event, "dispatched_at": 1.0})
     ad._persist_completion(event, {"status": "completed", "summary": "done"})
     with ad._connect() as conn:
-        stored = json.loads(conn.execute(
-            "SELECT event_json FROM async_delegations WHERE delegation_id=?",
-            (event["delegation_id"],),
-        ).fetchone()[0])
+        stored = json.loads(
+            conn.execute(
+                "SELECT event_json FROM async_delegations WHERE delegation_id=?",
+                (event["delegation_id"],),
+            ).fetchone()[0]
+        )
         for field in routing:
             stored.pop(field, None)
         conn.execute(
@@ -651,14 +651,14 @@ def test_unverifiable_effect_owner_moves_to_no_replay_recovery(
             )
     monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: True)
     if probe == "unreadable-current-start":
-        monkeypatch.setattr(
-            "gateway.status.get_process_start_time", lambda _pid: None
-        )
+        monkeypatch.setattr("gateway.status.get_process_start_time", lambda _pid: None)
 
     restored = queue.Queue()
     assert ad.restore_undelivered_completions(restored) == 0
     assert restored.empty()
-    assert ad.get_durable_event_delivery(event)["delivery_state"].startswith("recovery_")
+    assert ad.get_durable_event_delivery(event)["delivery_state"].startswith(
+        "recovery_"
+    )
 
 
 def test_checkpoint_ack_tombstone_survives_result_cap_and_stale_publication(
@@ -715,7 +715,9 @@ def test_checkpoint_ack_tombstone_survives_result_cap_and_stale_publication(
     restored = queue.Queue()
     assert ad.restore_undelivered_completions(restored) == 0
     assert restored.empty()
-    assert ad.get_durable_delegation(event["delegation_id"])["delivery_state"] != "pending"
+    assert (
+        ad.get_durable_delegation(event["delegation_id"])["delivery_state"] != "pending"
+    )
 
 
 def test_zero_row_checkpoint_ack_creates_no_replay_tombstone(
@@ -743,3 +745,61 @@ def test_zero_row_checkpoint_ack_creates_no_replay_tombstone(
     durable = ad.get_durable_delegation(event["delegation_id"])
     assert durable is not None
     assert durable["delivery_state"].startswith("recovery_")
+
+
+def test_async_committed_effect_age_prune_retains_no_replay_identity(delegation_db):
+    ad = delegation_db
+    event = {
+        "type": "async_delegation",
+        "delegation_id": "deleg-aged-committed-effect",
+        "session_key": "owner",
+        "status": "completed",
+        "summary": "done",
+        "dispatched_at": 1.0,
+    }
+    ad._persist_dispatch(event)
+    ad._persist_completion(event, {"status": "completed", "summary": "done"})
+    claim = ad.claim_event_delivery(event, "first-effect")
+    assert claim
+    assert ad.complete_event_delivery(event, claim)
+
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute(
+            "UPDATE async_delegations SET delivery_tombstoned_at=? "
+            "WHERE delegation_id=?",
+            (
+                time.time() - ad._DURABLE_RETENTION_SECONDS - 1,
+                event["delegation_id"],
+            ),
+        )
+    ad._prune_durable_records()
+    assert ad.get_durable_delegation(event["delegation_id"]) is None
+
+    ad._persist_dispatch(event)
+    ad._persist_completion(event, {"status": "completed", "summary": "done"})
+    assert ad.claim_event_delivery(event, "stale-publication") is None
+    assert ad.get_durable_delegation(event["delegation_id"]) is None
+
+
+def test_ordinary_committed_effect_age_prune_retains_no_replay_identity(delegation_db):
+    ad = delegation_db
+    event = _ordinary_event("aged-committed-effect", 44.0)
+    assert ad.persist_event_delivery(event)
+    claim = ad.claim_event_delivery(event, "first-effect")
+    assert claim
+    assert ad.complete_event_delivery(event, claim)
+    delivery_id = ad._ordinary_completion_delivery_id(event)
+    assert delivery_id
+
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute(
+            "UPDATE ordinary_completion_deliveries SET delivery_tombstoned_at=? "
+            "WHERE delivery_id=?",
+            (time.time() - ad._DURABLE_RETENTION_SECONDS - 1, delivery_id),
+        )
+    ad._prune_durable_records()
+    assert ad.get_durable_event_delivery(event) is None
+
+    assert ad.persist_event_delivery(event)
+    assert ad.claim_event_delivery(event, "stale-publication") is None
+    assert ad.get_durable_event_delivery(event) is None

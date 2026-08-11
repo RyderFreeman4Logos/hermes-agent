@@ -243,6 +243,14 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         )"""
     )
     conn.execute(
+        """CREATE TABLE IF NOT EXISTS completion_delivery_retirements (
+            delivery_kind TEXT NOT NULL,
+            delivery_id TEXT NOT NULL,
+            retired_at REAL NOT NULL,
+            PRIMARY KEY (delivery_kind, delivery_id)
+        ) WITHOUT ROWID"""
+    )
+    conn.execute(
         """CREATE TABLE IF NOT EXISTS completion_delivery_recoveries (
             session_id TEXT NOT NULL,
             event_json TEXT NOT NULL,
@@ -268,7 +276,8 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         if name not in columns:
             conn.execute(f"ALTER TABLE async_delegations ADD COLUMN {name} {sql_type}")
     ordinary_columns = {
-        row[1] for row in conn.execute("PRAGMA table_info(ordinary_completion_deliveries)")
+        row[1]
+        for row in conn.execute("PRAGMA table_info(ordinary_completion_deliveries)")
     }
     if "delivery_tombstoned_at" not in ordinary_columns:
         conn.execute(
@@ -322,6 +331,19 @@ def _transaction() -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
+def _delivery_retired(
+    conn: sqlite3.Connection, delivery_kind: str, delivery_id: str
+) -> bool:
+    return (
+        conn.execute(
+            """SELECT 1 FROM completion_delivery_retirements
+               WHERE delivery_kind=? AND delivery_id=?""",
+            (delivery_kind, delivery_id),
+        ).fetchone()
+        is not None
+    )
+
+
 def _persist_dispatch(record: Dict[str, Any]) -> None:
     now = time.time()
     try:
@@ -335,6 +357,8 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
         if key in record
     }
     with _DB_LOCK, _transaction() as conn:
+        if _delivery_retired(conn, "async_delegations", record["delegation_id"]):
+            return
         conn.execute(
             """INSERT OR IGNORE INTO async_delegations
                (delegation_id, origin_session, origin_ui_session_id,
@@ -366,12 +390,24 @@ def _prune_durable_records() -> None:
     now = time.time()
     cutoff = now - _DURABLE_RETENTION_SECONDS
     with _DB_LOCK, _transaction() as conn:
-        for table in ("async_delegations", "ordinary_completion_deliveries"):
+        for table, id_column in (
+            ("async_delegations", "delegation_id"),
+            ("ordinary_completion_deliveries", "delivery_id"),
+        ):
             conn.execute(
                 f"""UPDATE {table} SET delivery_tombstoned_at=?
                     WHERE delivery_tombstoned_at IS NULL
                       AND delivery_state NOT IN ('pending', 'effect_started')""",
                 (now,),
+            )
+            # ponytail: compact IDs persist; reclaim only after producer
+            # epochs/watermarks prove stale publications are impossible.
+            conn.execute(
+                f"""INSERT OR IGNORE INTO completion_delivery_retirements
+                    (delivery_kind, delivery_id, retired_at)
+                    SELECT ?, {id_column}, delivery_tombstoned_at FROM {table}
+                     WHERE delivery_tombstoned_at < ?""",
+                (table, cutoff),
             )
             conn.execute(
                 f"DELETE FROM {table} WHERE delivery_tombstoned_at < ?",
@@ -382,15 +418,23 @@ def _prune_durable_records() -> None:
         ).fetchone()[0]
         excess = max(0, terminal_count - _MAX_RETAINED_COMPLETED)
         if excess:
-            conn.execute(
-                """DELETE FROM async_delegations WHERE delegation_id IN (
-                     SELECT delegation_id FROM async_delegations
-                     WHERE state NOT IN ('running','finalizing')
-                       AND delivery_state NOT IN ('pending', 'effect_started', 'delivered')
-                       AND delivery_state NOT LIKE 'recovery_%'
-                     ORDER BY updated_at ASC LIMIT ?
-                   )""",
+            retired_ids = conn.execute(
+                """SELECT delegation_id FROM async_delegations
+                   WHERE state NOT IN ('running','finalizing')
+                     AND delivery_state NOT IN ('pending', 'effect_started', 'delivered')
+                     AND delivery_state NOT LIKE 'recovery_%'
+                   ORDER BY updated_at ASC LIMIT ?""",
                 (excess,),
+            ).fetchall()
+            conn.executemany(
+                """INSERT OR IGNORE INTO completion_delivery_retirements
+                   (delivery_kind, delivery_id, retired_at)
+                   VALUES ('async_delegations', ?, ?)""",
+                ((delegation_id, now) for (delegation_id,) in retired_ids),
+            )
+            conn.executemany(
+                "DELETE FROM async_delegations WHERE delegation_id=?",
+                retired_ids,
             )
         pending_count = conn.execute(
             """SELECT COUNT(*) FROM async_delegations
@@ -624,6 +668,9 @@ def _reconcile_committed_ack_events(conn, events, now: float) -> int:
             delegation_id = event.get("delegation_id")
             if not isinstance(delegation_id, str) or not delegation_id:
                 continue
+            if _delivery_retired(conn, "async_delegations", delegation_id):
+                reconciled += 1
+                continue
             conn.execute(
                 """INSERT INTO async_delegations
                    (delegation_id, origin_session, origin_ui_session_id, state,
@@ -650,10 +697,11 @@ def _reconcile_committed_ack_events(conn, events, now: float) -> int:
         delivery_id = _ordinary_completion_delivery_id(event)
         if delivery_id is None:
             continue
+        if _ordinary_delivery_retired(conn, event, delivery_id):
+            reconciled += 1
+            continue
         payload = json.dumps(_durable_event_payload(event), sort_keys=True)
-        _migrate_ordinary_completion_legacy_row(
-            conn, event, delivery_id, payload, now
-        )
+        _migrate_ordinary_completion_legacy_row(conn, event, delivery_id, payload, now)
         conn.execute(
             """INSERT INTO ordinary_completion_deliveries
                (delivery_id, event_json, delivery_state, updated_at,
@@ -933,6 +981,15 @@ def restore_undelivered_completions(target_queue) -> int:
             if event is None:
                 continue
             normalized_id = _ordinary_completion_delivery_id(event)
+            if normalized_id is not None and _ordinary_delivery_retired(
+                conn, event, normalized_id
+            ):
+                conn.execute(
+                    """DELETE FROM ordinary_completion_deliveries
+                       WHERE delivery_id=? AND delivery_state='pending'""",
+                    (delivery_id,),
+                )
+                continue
             normalized_payload = json.dumps(
                 _durable_event_payload(event), sort_keys=True
             )
@@ -1115,7 +1172,9 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
             (delegation_id,),
         ).fetchone()
         if row is None:
-            return True  # legacy event created before durable dispatch
+            return not _delivery_retired(
+                conn, "async_delegations", delegation_id
+            )  # legacy event created before durable dispatch
         cur = conn.execute(
             """UPDATE async_delegations SET delivery_state='effect_started',
                       delivery_claim=?, delivery_claimed_at=?,
@@ -1161,6 +1220,19 @@ def _ordinary_completion_legacy_delivery_id(evt: Dict[str, Any]) -> Optional[str
     return json.dumps(identity, ensure_ascii=False, separators=(",", ":"))
 
 
+def _ordinary_delivery_retired(
+    conn: sqlite3.Connection, evt: Dict[str, Any], delivery_id: str
+) -> bool:
+    if _delivery_retired(conn, "ordinary_completion_deliveries", delivery_id):
+        return True
+    legacy_id = _ordinary_completion_legacy_delivery_id(evt)
+    return bool(
+        legacy_id
+        and legacy_id != delivery_id
+        and _delivery_retired(conn, "ordinary_completion_deliveries", legacy_id)
+    )
+
+
 def _durable_event_payload(evt: Dict[str, Any]) -> Dict[str, Any]:
     """Strip process-local delivery state before persistence or replay."""
     return {
@@ -1198,7 +1270,10 @@ def _migrate_ordinary_completion_legacy_row(
         stored = _load_durable_event_payload(legacy[0])
     except (TypeError, ValueError):
         return
-    if not isinstance(stored, dict) or _ordinary_completion_delivery_id(stored) != delivery_id:
+    if (
+        not isinstance(stored, dict)
+        or _ordinary_completion_delivery_id(stored) != delivery_id
+    ):
         return
     target = conn.execute(
         "SELECT delivery_state FROM ordinary_completion_deliveries WHERE delivery_id=?",
@@ -1237,6 +1312,8 @@ def persist_event_delivery(evt: Dict[str, Any]) -> bool:
     now = time.time()
     payload = json.dumps(_durable_event_payload(evt), sort_keys=True)
     with _DB_LOCK, _transaction() as conn:
+        if _ordinary_delivery_retired(conn, evt, delivery_id):
+            return True
         _migrate_ordinary_completion_legacy_row(conn, evt, delivery_id, payload, now)
         conn.execute(
             """INSERT OR IGNORE INTO ordinary_completion_deliveries
@@ -1367,6 +1444,8 @@ def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
         if delivery_id is None:
             return None
         with _DB_LOCK, _transaction() as conn:
+            if _ordinary_delivery_retired(conn, evt, delivery_id):
+                return None
             payload = json.dumps(_durable_event_payload(evt), sort_keys=True)
             _migrate_ordinary_completion_legacy_row(
                 conn, evt, delivery_id, payload, now
@@ -1403,6 +1482,8 @@ def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
     now = time.time()
     payload = json.dumps(_durable_event_payload(evt), sort_keys=True)
     with _DB_LOCK, _transaction() as conn:
+        if _ordinary_delivery_retired(conn, evt, delivery_id):
+            return None
         _migrate_ordinary_completion_legacy_row(conn, evt, delivery_id, payload, now)
         conn.execute(
             """INSERT OR IGNORE INTO ordinary_completion_deliveries
@@ -1518,6 +1599,8 @@ def mark_completion_delivery_recovery(
             ).fetchone()
             if row is not None:
                 return row[0] == "delivered" or str(row[0]).startswith("recovery_")
+            if _delivery_retired(conn, "async_delegations", delegation_id):
+                return True
             cur = conn.execute(
                 """INSERT OR IGNORE INTO async_delegations
                    (delegation_id, origin_session, origin_ui_session_id, state,

@@ -394,7 +394,7 @@ def restore_undelivered_completions(target_queue) -> int:
     restored = 0
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
-            """UPDATE async_delegations SET delivery_state='pending',
+            """UPDATE async_delegations SET delivery_state='recovery_effect_started',
                       delivery_claim=NULL, delivery_claimed_at=NULL, updated_at=?
                WHERE state != 'running' AND delivery_state='effect_started'
                  AND event_json IS NOT NULL""",
@@ -458,7 +458,7 @@ def restore_undelivered_completions(target_queue) -> int:
                 continue
             conn.execute(
                 """UPDATE ordinary_completion_deliveries
-                   SET delivery_state='pending', delivery_claim=NULL,
+                   SET delivery_state='recovery_effect_started', delivery_claim=NULL,
                        delivery_claimed_at=NULL, delivery_owner_pid=NULL,
                        delivery_owner_started_at=NULL, updated_at=?
                    WHERE delivery_id=? AND delivery_state='effect_started'""",

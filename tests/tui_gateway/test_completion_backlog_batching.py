@@ -416,17 +416,14 @@ def test_idle_batch_retries_transient_requeue_exception_without_drop(
     assert ad.persist_event_delivery(event)
     registry.completion_queue.put(event)
     selected = registry.completion_queue.get_nowait()
-    original_requeue = registry.requeue_completions_front
     requeue_calls = 0
 
-    def fail_once(events):
+    def fail_requeue(_events):
         nonlocal requeue_calls
         requeue_calls += 1
-        if requeue_calls == 1:
-            raise OSError("requeue unavailable")
-        return original_requeue(events)
+        raise OSError("requeue wrapper unavailable")
 
-    monkeypatch.setattr(registry, "requeue_completions_front", fail_once)
+    monkeypatch.setattr(registry, "_requeue_completions_front", fail_requeue)
 
     def submit(_rid, _sid, session, _text, **kwargs):
         kwargs["completion_delivery_callback"]("provider_failed")
@@ -440,7 +437,7 @@ def test_idle_batch_retries_transient_requeue_exception_without_drop(
         consumer="tui-test",
     )
 
-    assert requeue_calls == 2
+    assert requeue_calls == 3
     remaining = registry.completion_queue.get_nowait()
     assert remaining["session_id"] == event["session_id"]
     assert registry.completion_queue.empty()

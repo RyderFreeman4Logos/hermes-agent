@@ -23,7 +23,10 @@ keep the exact logger name (``"agent.conversation_loop"``).
 from __future__ import annotations
 
 import copy
+import errno
+import math
 import os
+import time
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.message_content import flatten_message_text
@@ -38,6 +41,186 @@ from agent.message_sanitization import (
     completion_delivery_suffix_start,
     completion_delivery_transcript_content,
 )
+from agent.retry_utils import jittered_backoff
+
+
+_COMPLETION_COMMIT_DEFAULTS = (32, 0.05, 5.0, 120.0)
+
+
+def _get_completion_delivery_commit_config() -> tuple[int, float, float, float]:
+    """Read the completion commit retry policy at its use site."""
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        session = load_config_readonly().get("session") or {}
+        retry = session.get("completion_delivery_commit") or {}
+        values = (
+            float(retry.get("initial_backoff_s", 0.05)),
+            float(retry.get("max_backoff_s", 5.0)),
+            float(retry.get("patience_s", 120.0)),
+        )
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("retry durations must be finite")
+        return (
+            max(1, int(retry.get("max_attempts", 32))),
+            max(0.0, values[0]),
+            max(0.0, values[1]),
+            max(0.0, values[2]),
+        )
+    except Exception:
+        return _COMPLETION_COMMIT_DEFAULTS
+
+
+def _completion_delivery_commit_failure_kind(error) -> str:
+    try:
+        from hermes_state import is_disk_full_error
+
+        if is_disk_full_error(error):
+            return "storage_full"
+    except Exception:
+        pass
+    text = str(error or "").lower()
+    if (
+        isinstance(error, PermissionError)
+        or getattr(error, "errno", None) in {errno.EPERM, errno.EACCES, errno.EROFS}
+        or any(
+            marker in text
+            for marker in (
+                "permission denied",
+                "operation not permitted",
+                "not writable",
+                "read-only",
+                "readonly",
+            )
+        )
+    ):
+        return "permission"
+    if any(
+        marker in text
+        for marker in (
+            "compare-and-set",
+            "compare and set",
+            "does not match durable transcript tail",
+        )
+    ):
+        return "cas_conflict"
+    if any(
+        marker in text
+        for marker in (
+            "locked",
+            "busy",
+            "timed out waiting for compression",
+        )
+    ):
+        return "lock_busy"
+    return "unknown"
+
+
+def completion_delivery_commit_error_message(agent, *, prior: bool = False) -> str:
+    """Describe why a retained completion still cannot become durable."""
+    failure = getattr(agent, "_completion_delivery_commit_failure", "unknown")
+    details = {
+        "lock_busy": (
+            "SessionDB is locked or busy; retries for the exact retained suffix "
+            "were exhausted"
+        ),
+        "storage_full": (
+            "SessionDB has no space left (ENOSPC/database full); the exact "
+            "retained suffix was not published"
+        ),
+        "permission": (
+            "SessionDB has a permission or read-only write failure; the exact "
+            "retained suffix was not published"
+        ),
+        "cas_conflict": (
+            "SessionDB completion compare-and-set conflict; the retained suffix "
+            "does not match the active durable event"
+        ),
+        "missing_pending_suffix": (
+            "the pending completion suffix is missing and its durable recovery "
+            "record could not be written"
+        ),
+        "missing_active_marker": (
+            "the active completion marker is missing and its durable recovery "
+            "record could not be written"
+        ),
+        "unknown": (
+            "SessionDB rejected the exact retained suffix for an unclassified "
+            "write failure"
+        ),
+    }
+    prefix = (
+        "A prior completion delivery is still pending: "
+        if prior
+        else "Completion delivery is still pending: "
+    )
+    return (
+        prefix
+        + details.get(failure, details["unknown"])
+        + ". Retry after resolving this SessionDB condition; a process restart "
+        "is not required."
+    )
+
+
+def _flush_completion_delivery_with_retry(agent, staged, metadata_cas) -> bool:
+    """Retry one immutable suffix under the hot-read count/time budget."""
+    attempts = 0
+    started = time.monotonic()
+    while True:
+        max_attempts, _initial, _maximum, patience = (
+            _get_completion_delivery_commit_config()
+        )
+        if attempts and (
+            attempts >= max_attempts or time.monotonic() - started >= patience
+        ):
+            return False
+
+        attempts += 1
+        error = None
+        try:
+            committed = (
+                agent._flush_messages_to_session_db(
+                    staged,
+                    display_metadata_cas=metadata_cas,
+                )
+                is True
+            )
+        except Exception as exc:
+            committed = False
+            error = exc
+        if committed:
+            agent._completion_delivery_commit_failure = None
+            return True
+
+        if error is None:
+            error = getattr(agent, "_last_session_db_flush_error", None)
+        agent._completion_delivery_commit_failure = (
+            _completion_delivery_commit_failure_kind(error)
+        )
+
+        # Re-read after the failed flush: an operator may tune the policy while
+        # a long SessionDB attempt is blocked, without restarting the process.
+        max_attempts, initial, maximum, patience = (
+            _get_completion_delivery_commit_config()
+        )
+        elapsed = time.monotonic() - started
+        if attempts >= max_attempts or elapsed >= patience:
+            return False
+        remaining = patience - elapsed
+        delay = 0.0
+        if initial > 0 and maximum > 0:
+            delay = min(
+                jittered_backoff(
+                    attempts,
+                    base_delay=initial,
+                    max_delay=maximum,
+                    jitter_ratio=0.5,
+                ),
+                maximum,
+                remaining,
+            )
+        if delay > 0:
+            time.sleep(delay)
 
 
 def _is_pure_tool_call_tail(msg: dict) -> bool:
@@ -111,6 +294,7 @@ def finalize_completion_delivery_suffix(
         agent._pending_completion_delivery_suffix = None
         agent._pending_completion_delivery_display_metadata_cas = None
         agent._completion_delivery_commit_failed = False
+        agent._completion_delivery_commit_failure = None
         agent._persist_user_message_idx = None
         agent._persist_user_message_override = None
         agent._db_flush_scan_prefix = None
@@ -199,27 +383,17 @@ def finalize_completion_delivery_suffix(
     agent._persist_user_message_idx = start
     agent._persist_user_message_override = clean_content
 
-    # The normal incremental writer is already atomic for a new suffix.  Use
-    # its marker protocol on the staged copy; only publish those exact dicts to
-    # the live list after SessionDB accepts them.  One immediate retry covers a
-    # transient append failure without risking duplication: failed transactions
-    # stamp no message markers, while a successful one stamps the staged rows.
+    # The normal incremental writer is already atomic for a new suffix. Use its
+    # marker protocol on the staged copy; only publish those exact dicts to the
+    # live list after SessionDB accepts them. Failed transactions stamp no
+    # message markers, so the configured retries cannot duplicate the suffix.
     db_bound = (
         getattr(agent, "_session_db", None) is not None
         and not getattr(agent, "_persist_disabled", False)
     )
     committed = not db_bound
     if db_bound:
-        for _attempt in range(2):
-            try:
-                committed = agent._flush_messages_to_session_db(
-                    staged,
-                    display_metadata_cas=metadata_cas,
-                ) is True
-            except Exception:
-                committed = False
-            if committed:
-                break
+        committed = _flush_completion_delivery_with_retry(agent, staged, metadata_cas)
     if not committed:
         if commit_tool_intent:
             agent._persist_user_message_idx = previous_persist_idx
@@ -238,6 +412,7 @@ def finalize_completion_delivery_suffix(
     agent._pending_completion_delivery_suffix = None
     agent._pending_completion_delivery_display_metadata_cas = None
     agent._completion_delivery_commit_failed = False
+    agent._completion_delivery_commit_failure = None
     # Keep the canonical override after response repair so later incremental
     # suffix flushes cannot restore the API-only instruction.
     # Earlier incremental flushes intentionally stopped at this same dict.
@@ -277,12 +452,14 @@ def retry_pending_completion_delivery_commit(agent, messages) -> str:
         except Exception:
             recovery_committed = False
         if not recovery_committed:
+            agent._completion_delivery_commit_failure = outcome
             return "pending"
         if start is not None:
             del messages[start:]
         agent._pending_completion_delivery_suffix = None
         agent._pending_completion_delivery_display_metadata_cas = None
         agent._completion_delivery_commit_failed = False
+        agent._completion_delivery_commit_failure = None
         agent._persist_user_message_idx = None
         agent._persist_user_message_override = None
         agent._db_flush_scan_prefix = None
@@ -295,19 +472,14 @@ def retry_pending_completion_delivery_commit(agent, messages) -> str:
     metadata_cas = copy.deepcopy(getattr(
         agent, "_pending_completion_delivery_display_metadata_cas", None
     ))
-    try:
-        committed = agent._flush_messages_to_session_db(
-            staged,
-            display_metadata_cas=metadata_cas,
-        ) is True
-    except Exception:
-        committed = False
+    committed = _flush_completion_delivery_with_retry(agent, staged, metadata_cas)
     if not committed:
         return "pending"
     messages[:] = staged
     agent._pending_completion_delivery_suffix = None
     agent._pending_completion_delivery_display_metadata_cas = None
     agent._completion_delivery_commit_failed = False
+    agent._completion_delivery_commit_failure = None
     try:
         agent._save_session_log(messages)
     except Exception:
@@ -1023,7 +1195,7 @@ def finalize_turn(
                 "session_persistence_failed:" + (_cause or "unknown")
             )
     elif _completion_delivery_status == "pending":
-        result["error"] = "completion delivery could not be committed to SessionDB"
+        result["error"] = completion_delivery_commit_error_message(agent)
     # Surface any post-loop cleanup failures so the caller can distinguish a
     # clean turn from one whose trajectory/session/resource teardown raised
     # (the response is still returned either way — #8049).

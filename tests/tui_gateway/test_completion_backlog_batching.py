@@ -6,6 +6,7 @@ not delivery; fallback is one bounded idle turn with per-event claims.
 
 from __future__ import annotations
 
+import queue
 import threading
 import time
 from types import SimpleNamespace
@@ -829,3 +830,166 @@ def test_foreign_poller_preserves_owner_fifo_and_unrelated_progress(
         poller_a.join(2)
         poller_b.join(2)
         poller_a_restarted.join(2)
+
+
+def test_shutdown_foreign_poller_preserves_fifo_with_concurrent_producer(
+    isolated_registry, monkeypatch
+):
+    """A stopped foreign poller cannot append old completions after a new one."""
+    from tools import async_delegation as ad
+
+    producer_start = threading.Event()
+    producer_done = threading.Event()
+
+    class InterleavingQueue(queue.Queue):
+        def __init__(self):
+            super().__init__()
+            self.legacy_gets = 0
+            self.triggered = False
+
+        def get_nowait(self):
+            self.legacy_gets += 1
+            return super().get_nowait()
+
+        def release_during_selective_drain(self):
+            if not self.legacy_gets and not self.triggered:
+                self.triggered = True
+                producer_start.set()
+                assert producer_done.wait(2), "producer did not finish"
+
+        def empty(self):
+            with self.mutex:
+                observed_empty = not self._qsize()
+            if observed_empty and self.legacy_gets and not self.triggered:
+                self.triggered = True
+                producer_start.set()
+                assert producer_done.wait(2), "producer did not finish"
+                return True
+            return observed_empty
+
+    registry = isolated_registry
+    interleaving_queue = InterleavingQueue()
+    registry.completion_queue = interleaving_queue
+    monkeypatch.setattr(
+        server,
+        "_notification_event_requires_owner",
+        _REAL_NOTIFICATION_EVENT_REQUIRES_OWNER,
+    )
+    monkeypatch.setattr(
+        server,
+        "_session_owns_notification_event",
+        _REAL_SESSION_OWNS_NOTIFICATION_EVENT,
+    )
+
+    real_belongs_elsewhere = _REAL_NOTIFICATION_EVENT_BELONGS_ELSEWHERE
+
+    def belongs_elsewhere(sid, session, event):
+        interleaving_queue.release_during_selective_drain()
+        return real_belongs_elsewhere(sid, session, event)
+
+    monkeypatch.setattr(
+        server, "_notification_event_belongs_elsewhere", belongs_elsewhere
+    )
+    monkeypatch.setattr(server, "_emit", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_NOTIFICATION_QUEUE_WAIT_SECONDS", 0.01)
+    monkeypatch.setattr(server, "_COMPLETION_BACKLOG_COALESCE_WINDOW_SECONDS", 0.0)
+
+    session_a = _session(session_key="conversation-A")
+    session_b = _session(session_key="conversation-B")
+    monkeypatch.setitem(server._sessions, "A", session_a)
+    monkeypatch.setitem(server._sessions, "B", session_b)
+    fence = server._begin_manual_compression_fence(session_a)
+
+    events = [
+        _completion_event(
+            f"proc-a-{position}",
+            session_key="conversation-A",
+            origin_ui_session_id="A",
+            output=f"owner-{position}",
+            started_at=float(position),
+        )
+        for position in (1, 2, 3)
+    ]
+    for event in events:
+        assert ad.persist_event_delivery(event)
+    for event in events[:2]:
+        interleaving_queue.put(event)
+
+    delivered: list[int] = []
+    delivery_done = threading.Event()
+
+    def run_completion(_rid, _sid, session, text, **kwargs):
+        positions = [
+            (text.index(f"owner-{position}"), position)
+            for position in (1, 2, 3)
+            if f"owner-{position}" in text
+        ]
+        delivered.extend(position for _index, position in sorted(positions))
+        callback = kwargs.get("completion_delivery_callback")
+        assert callback is not None
+        callback("committed")
+        with session["history_lock"]:
+            session["running"] = False
+        if len(delivered) == 3:
+            delivery_done.set()
+
+    monkeypatch.setattr(server, "_run_prompt_submit", run_completion)
+
+    def produce():
+        assert producer_start.wait(2), "shutdown drain did not reach producer boundary"
+        interleaving_queue.put(events[2])
+        producer_done.set()
+
+    producer = threading.Thread(target=produce, daemon=True)
+    producer.start()
+    stop_b = threading.Event()
+    stop_b.set()
+    foreign = threading.Thread(
+        target=server._notification_poller_loop,
+        args=(stop_b, "B", session_b),
+        daemon=True,
+    )
+    poller_a = None
+    stop_a = None
+    foreign.start()
+    try:
+        foreign.join(2)
+        assert not foreign.is_alive()
+        producer.join(2)
+        assert not producer.is_alive()
+        with interleaving_queue.mutex:
+            physical_order = [
+                int(event["session_id"].rsplit("-", 1)[1])
+                for event in interleaving_queue.queue
+            ]
+
+        stop_a = threading.Event()
+        poller_a = threading.Thread(
+            target=server._notification_poller_loop,
+            args=(stop_a, "A", session_a),
+            daemon=True,
+        )
+        poller_a.start()
+        server._finish_manual_compression_fence(session_a, fence)
+        assert delivery_done.wait(3), delivered
+
+        receipts = [ad.get_durable_event_delivery(event) for event in events]
+        for receipt in receipts:
+            assert receipt is not None
+            assert receipt["delivery_state"] == "delivered"
+            assert receipt["delivery_attempts"] == 1
+        assert physical_order == [1, 2, 3] and delivered == [1, 2, 3], (
+            f"shutdown drain reordered owner A: queue={physical_order}, "
+            f"visible={delivered}"
+        )
+        restarted = ProcessRegistry()
+        assert restarted.completion_queue.empty()
+    finally:
+        producer_start.set()
+        producer.join(2)
+        server._finish_manual_compression_fence(session_a, fence)
+        stop_b.set()
+        foreign.join(2)
+        if poller_a is not None and stop_a is not None:
+            stop_a.set()
+            poller_a.join(2)

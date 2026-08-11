@@ -572,10 +572,14 @@ def _completion_reservation_identity(event: dict) -> "tuple | None":
     return (event_type, session_id, started_at, session_key)
 
 
-def _find_completion_queue_reservation(reservations, event: dict):
+def _find_completion_queue_reservation(
+    reservations, event: dict, *, exact_only: bool = False
+):
     exact = reservations.get(id(event))
     if exact is event:
         return id(event), event
+    if exact_only:
+        return None
     identity = _completion_reservation_identity(event)
     if identity is None:
         return None
@@ -644,13 +648,17 @@ def _restore_completion_queue_items(completion_queue, events: "list[dict]") -> N
         completion_queue.not_empty.notify_all()
 
 
-def _complete_completion_queue_reservation(completion_queue, event: dict) -> bool:
+def _complete_completion_queue_reservation(
+    completion_queue, event: dict, *, exact_only: bool = False
+) -> bool:
     """Remove one terminal bounded reservation and wake a blocked producer."""
     if completion_queue.maxsize <= 0:
         return False
     with completion_queue.not_full:
         reservations = _completion_queue_reservations(completion_queue)
-        reservation = _find_completion_queue_reservation(reservations, event)
+        reservation = _find_completion_queue_reservation(
+            reservations, event, exact_only=exact_only
+        )
         if reservation is None:
             return False
         key, reserved_event = reservation
@@ -2833,8 +2841,10 @@ class ProcessRegistry:
         self._retire_terminal_completion_spool(evt)
 
     def consume_completion_event(self, evt: dict) -> None:
-        """Terminally remove a selected event without changing its delivery ledger."""
-        _complete_completion_queue_reservation(self.completion_queue, evt)
+        """Terminally remove the exact selected event without changing its ledger."""
+        _complete_completion_queue_reservation(
+            self.completion_queue, evt, exact_only=True
+        )
 
     def release_completion_delivery(self, evt: dict) -> None:
         identity = self._completion_claim_identity(evt)

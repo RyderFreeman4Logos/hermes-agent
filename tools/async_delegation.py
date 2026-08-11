@@ -834,6 +834,47 @@ def restore_undelivered_completions(target_queue) -> int:
     restored_events = []
     with _DB_LOCK, _transaction() as conn:
         now = time.time()
+
+        def settle_retired_ordinary_row(
+            delivery_id: str,
+            normalized_id: Optional[str],
+            legacy_id: Optional[str],
+        ) -> bool:
+            if normalized_id is None or not _ordinary_delivery_retired(
+                conn, normalized_id
+            ):
+                return False
+            if delivery_id in {normalized_id, legacy_id}:
+                conn.execute(
+                    """DELETE FROM ordinary_completion_deliveries
+                       WHERE delivery_id=? AND delivery_state='pending'""",
+                    (delivery_id,),
+                )
+            else:
+                diagnostic = (
+                    "ordinary completion identity does not match its durable row"
+                )
+                conn.execute(
+                    """UPDATE ordinary_completion_deliveries
+                       SET event_json=?, delivery_state='parked_corrupt', updated_at=?
+                       WHERE delivery_id=? AND delivery_state='pending'""",
+                    (
+                        _corrupt_completion_payload(
+                            expected_type="completion",
+                            row_id=delivery_id,
+                            diagnostic=diagnostic,
+                        ),
+                        now,
+                        delivery_id,
+                    ),
+                )
+                logger.warning(
+                    "Parking corrupt ordinary completion row %s: %s",
+                    delivery_id,
+                    diagnostic,
+                )
+            return True
+
         claimed_async_rows = conn.execute(
             """SELECT delegation_id, event_json, owner_pid, owner_started_at
                FROM async_delegations
@@ -1077,16 +1118,7 @@ def restore_undelivered_completions(target_queue) -> int:
                 continue
             normalized_id = _ordinary_completion_delivery_id(event)
             legacy_id = _ordinary_completion_legacy_delivery_id(event)
-            if (
-                normalized_id is not None
-                and delivery_id in {normalized_id, legacy_id}
-                and _ordinary_delivery_retired(conn, normalized_id)
-            ):
-                conn.execute(
-                    """DELETE FROM ordinary_completion_deliveries
-                       WHERE delivery_id=? AND delivery_state='pending'""",
-                    (delivery_id,),
-                )
+            if settle_retired_ordinary_row(delivery_id, normalized_id, legacy_id):
                 continue
             normalized_payload = json.dumps(
                 _durable_event_payload(event), sort_keys=True
@@ -1240,6 +1272,10 @@ def restore_undelivered_completions(target_queue) -> int:
                 )
                 continue
             if event is None:
+                continue
+            normalized_id = _ordinary_completion_delivery_id(event)
+            legacy_id = _ordinary_completion_legacy_delivery_id(event)
+            if settle_retired_ordinary_row(delivery_id, normalized_id, legacy_id):
                 continue
             event["restored"] = True
             restored_events.append(event)

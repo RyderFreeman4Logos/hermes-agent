@@ -878,3 +878,35 @@ def test_retired_payload_under_wrong_row_key_is_parked_before_cleanup(delegation
     assert row[0] == "parked_corrupt"
     assert "does not match" in row[1]
     assert restored.items == []
+
+
+def test_retired_payload_in_closed_mismatch_cycle_is_parked(delegation_db):
+    ad = delegation_db
+    retired = _ordinary_event("retired-cycle-a", 47.0)
+    live = _ordinary_event("retired-cycle-b", 48.0)
+    retired_id = ad._ordinary_completion_delivery_id(retired)
+    live_id = ad._ordinary_completion_delivery_id(live)
+    assert retired_id and live_id and retired_id != live_id
+
+    assert ad.persist_event_delivery(retired)
+    claim = ad.claim_event_delivery(retired, "first-effect")
+    assert claim and ad.complete_event_delivery(retired, claim)
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute(
+            """UPDATE ordinary_completion_deliveries
+               SET delivery_tombstoned_at=? WHERE delivery_id=?""",
+            (time.time() - ad._DURABLE_RETENTION_SECONDS - 1, retired_id),
+        )
+    ad._prune_durable_records()
+    assert ad.claim_event_delivery(retired, "retirement-control") is None
+
+    _insert_ordinary(ad, retired_id, json.dumps(live, sort_keys=True), 2.0)
+    _insert_ordinary(ad, live_id, json.dumps(retired, sort_keys=True), 3.0)
+    restored = _Queue()
+    ad.restore_undelivered_completions(restored)
+
+    assert _ordinary_state(ad, live_id) == "parked_corrupt"
+    assert retired["session_id"] not in {
+        event["session_id"] for event in restored.items
+    }
+    assert ad.claim_event_delivery(retired, "post-restore-stale") is None

@@ -2178,55 +2178,55 @@ def test_drain_notifications_formatter_error_restores_selected_batch_before_tail
         producer.join(2)
 
 
-def test_batch_front_restore_is_atomic_and_nonblocking_for_bounded_queue(registry):
-    completion_queue = queue.Queue(maxsize=3)
+@pytest.mark.parametrize("maxsize", [1, 2])
+def test_batch_front_restore_keeps_native_bound_across_retry_cycles(registry, maxsize):
+    completion_queue = queue.Queue(maxsize=maxsize)
     registry.completion_queue = completion_queue
-    first = {"owner": "A", "seq": 1}
-    foreign = {"owner": "B", "seq": 1}
-    second = {"owner": "A", "seq": 2}
-    concurrent = {"owner": "C", "seq": 1}
-    blocked = {"owner": "D", "seq": 1}
-    for event in (first, foreign, second):
+    original = [{"owner": "A", "seq": seq} for seq in range(1, maxsize + 1)]
+    for event in original:
         completion_queue.put(event)
+    expected = list(original)
 
-    detached = registry.drain_matching_completions(
-        lambda event: event.get("owner") == "A"
+    for cycle in range(3):
+        detached = registry.drain_matching_completions(lambda _event: True)
+        assert detached == expected
+        produced = [
+            {"owner": f"P{cycle}", "seq": len(expected) + offset}
+            for offset in range(1, maxsize + 1)
+        ]
+        producer_done = threading.Event()
+
+        def produce(items=produced):
+            for event in items:
+                completion_queue.put(event)
+            producer_done.set()
+
+        producer = threading.Thread(target=produce, daemon=True)
+        producer.start()
+        assert producer_done.wait(1), "drain did not wake the bounded producer"
+        producer.join(1)
+
+        restored = threading.Event()
+
+        def restore():
+            registry.requeue_completions_front(detached)
+            restored.set()
+
+        restorer = threading.Thread(target=restore, daemon=True)
+        restorer.start()
+        assert restored.wait(1), "retry restore deadlocked behind its producer"
+        restorer.join(1)
+        expected.extend(produced)
+        assert completion_queue.qsize() <= maxsize
+        assert completion_queue.unfinished_tasks == len(expected)
+
+    foreign = registry.drain_matching_completions(
+        lambda event: event.get("owner", "").startswith("P")
     )
-    completion_queue.put(concurrent)
-    restored = threading.Event()
-
-    def restore():
-        registry.requeue_completions_front(detached)
-        restored.set()
-
-    restorer = threading.Thread(target=restore, daemon=True)
-    restorer.start()
-    assert restored.wait(1), "batch restore deadlocked behind a concurrent producer"
-    restorer.join(1)
-
-    with completion_queue.mutex:
-        queued = list(completion_queue.queue)
-        unfinished = completion_queue.unfinished_tasks
-    expected = [first, second, foreign, concurrent]
-    assert queued == expected
-    assert all(actual is wanted for actual, wanted in zip(queued, expected))
-    assert unfinished == 4
-
-    producer_done = threading.Event()
-
-    def produce_blocked():
-        completion_queue.put(blocked)
-        producer_done.set()
-
-    producer = threading.Thread(target=produce_blocked, daemon=True)
-    producer.start()
-    assert not producer_done.wait(0.05)
-    assert completion_queue.get_nowait() is first
-    assert completion_queue.get_nowait() is second
-    assert producer_done.wait(1), "restored over-capacity queue lost not_full wakeup"
-    producer.join(1)
-    with completion_queue.mutex:
-        assert list(completion_queue.queue) == [foreign, concurrent, blocked]
+    assert foreign == expected[maxsize:]
+    remaining = registry.drain_matching_completions(lambda _event: True)
+    assert remaining == original
+    assert all(actual is wanted for actual, wanted in zip(remaining, original))
 
 
 def test_drain_notifications_filters_async_delegation_by_session_key():

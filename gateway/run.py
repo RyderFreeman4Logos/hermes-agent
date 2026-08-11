@@ -23308,6 +23308,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         from tools.process_registry import (
             finish_completion_event_delivery,
             process_registry,
+            reconcile_committed_completion_event_delivery,
+            restore_completion_event_retries,
         )
 
         retry_events: list[dict] = []
@@ -23327,25 +23329,50 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             claim_id = str(receipt.get("claim_id") or "")
             if not isinstance(delivery_event, dict) or not claim_id:
                 continue
-            terminal = await asyncio.to_thread(
-                finish_completion_event_delivery,
-                delivery_event,
-                claim_id,
-                outcome,
-                retry_queue=retry_events,
-            )
-            identity = self._completion_delivery_identity(delivery_event)
-            if identity is not None:
-                with self._completion_delivery_lock:
-                    self._completion_deliveries_inflight.discard(identity)
-                    if terminal:
-                        self._completion_deliveries_delivered[identity] = None
-                        while (
-                            len(self._completion_deliveries_delivered)
-                            > self._completion_delivery_retention
-                        ):
-                            self._completion_deliveries_delivered.popitem(last=False)
-        process_registry.requeue_completions_front(retry_events)
+            try:
+                terminal = await asyncio.to_thread(
+                    finish_completion_event_delivery,
+                    delivery_event,
+                    claim_id,
+                    outcome,
+                    retry_queue=retry_events,
+                )
+            except Exception:
+                logger.warning(
+                    "Completion receipt settlement failed; retaining its fence",
+                    exc_info=True,
+                )
+                if outcome == "committed":
+                    terminal = await asyncio.to_thread(
+                        reconcile_committed_completion_event_delivery,
+                        delivery_event,
+                        claim_id,
+                        registry=process_registry,
+                    )
+                else:
+                    retry_event = dict(delivery_event)
+                    retry_event["_completion_delivery_retained_claim_id"] = claim_id
+                    retry_events.append(retry_event)
+                    terminal = False
+            try:
+                identity = self._completion_delivery_identity(delivery_event)
+                if identity is not None:
+                    with self._completion_delivery_lock:
+                        self._completion_deliveries_inflight.discard(identity)
+                        if terminal:
+                            self._completion_deliveries_delivered[identity] = None
+                            while (
+                                len(self._completion_deliveries_delivered)
+                                > self._completion_delivery_retention
+                            ):
+                                self._completion_deliveries_delivered.popitem(
+                                    last=False
+                                )
+            except Exception:
+                logger.warning(
+                    "Completion receipt identity bookkeeping failed", exc_info=True
+                )
+        restore_completion_event_retries(retry_events, registry=process_registry)
 
     @staticmethod
     def _completion_delivery_identity(evt: dict) -> Optional[tuple[str, str, object]]:
@@ -23470,7 +23497,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if model_text is None:
                 settled = True
                 finish_completion_event_delivery(
-                    evt, claim_id, "committed", retry_queue=retry_queue
+                    evt, claim_id, "visibility_noop", retry_queue=retry_queue
                 )
                 return None
             synth_text = model_text

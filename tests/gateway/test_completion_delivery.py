@@ -1203,6 +1203,51 @@ def test_committed_gateway_effect_ack_failure_reconciles_without_provider_replay
     assert receipt and receipt["delivery_state"] == "recovery_committed_ack_failed"
 
 
+@pytest.mark.parametrize("failure_index", [0, 1])
+def test_gateway_receipt_consumer_isolates_settlement_exception(
+    monkeypatch, isolated_registry, failure_index
+):
+    from tools import async_delegation as ad
+    import tools.process_registry as registry_module
+
+    events = [
+        _completion_event(
+            started_at=2.61 + index / 100,
+            session_id=f"proc-receipt-isolation-{index}",
+        )
+        for index in range(3)
+    ]
+    receipts = []
+    for event in events:
+        assert ad.persist_event_delivery(event)
+        assert isolated_registry.claim_completion_delivery(event)
+        claim = ad.claim_event_delivery(event, "gateway-receipt-test")
+        assert claim
+        receipts.append({"event": event, "claim_id": claim})
+    message = MagicMock(metadata={"_completion_delivery_receipts": receipts})
+    attempted = []
+    finish = registry_module.finish_completion_event_delivery
+
+    def fail_one(event, claim_id, outcome, **kwargs):
+        attempted.append(event)
+        if event is events[failure_index]:
+            raise OSError("receipt settlement unavailable")
+        return finish(event, claim_id, outcome, **kwargs)
+
+    monkeypatch.setattr(registry_module, "finish_completion_event_delivery", fail_one)
+    runner = _runner(SimpleNamespace())
+
+    asyncio.run(runner._finish_completion_delivery_receipt(message, "committed"))
+
+    assert attempted == events
+    assert message.metadata == {}
+    for event in events:
+        receipt = ad.get_durable_event_delivery(event)
+        assert receipt is not None
+        assert receipt["delivery_state"] == "delivered"
+    assert isolated_registry.completion_queue.empty()
+
+
 def test_busy_gateway_merge_finalizes_every_completion_receipt(
     monkeypatch, isolated_registry
 ):

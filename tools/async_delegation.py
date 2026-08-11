@@ -121,8 +121,8 @@ def _delivery_owner_live(
     owner_started_at,
     pid_exists,
     get_process_start_time,
-) -> bool:
-    """Validate a durable PID incarnation; uncertainty stays fail-closed."""
+) -> Optional[bool]:
+    """Return verified liveness, or None when the incarnation is unverifiable."""
     if owner_pid is None:
         return False
     if type(owner_pid) is not int or owner_pid <= 0:
@@ -132,19 +132,21 @@ def _delivery_owner_live(
     ):
         raise ValueError("owner_started_at must be a positive integer or null")
     if pid_exists is None:
-        return True
+        return None
     try:
         if not pid_exists(owner_pid):
             return False
     except Exception:
-        return True
+        return None
     if owner_started_at is None or get_process_start_time is None:
-        return True
+        return None
     try:
         current_started_at = get_process_start_time(owner_pid)
     except Exception:
-        return True
-    return current_started_at is None or current_started_at == owner_started_at
+        return None
+    if current_started_at is None:
+        return None
+    return current_started_at == owner_started_at
 
 
 def _delivery_attempt_count(value) -> int:
@@ -226,7 +228,8 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             task_json TEXT,
             delivery_claim TEXT,
             delivery_claimed_at REAL,
-            origin_session_id TEXT NOT NULL DEFAULT ''
+            origin_session_id TEXT NOT NULL DEFAULT '',
+            delivery_tombstoned_at REAL
         )"""
     )
     conn.execute(
@@ -240,7 +243,8 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             delivery_claim TEXT,
             delivery_claimed_at REAL,
             delivery_owner_pid INTEGER,
-            delivery_owner_started_at INTEGER
+            delivery_owner_started_at INTEGER,
+            delivery_tombstoned_at REAL
         )"""
     )
     conn.execute(
@@ -264,9 +268,44 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         # completions recovered after a process restart are unroutable on
         # api_server (the in-memory record that carried it is gone).
         ("origin_session_id", "TEXT"),
+        ("delivery_tombstoned_at", "REAL"),
     ):
         if name not in columns:
             conn.execute(f"ALTER TABLE async_delegations ADD COLUMN {name} {sql_type}")
+    ordinary_columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(ordinary_completion_deliveries)")
+    }
+    if "delivery_tombstoned_at" not in ordinary_columns:
+        conn.execute(
+            "ALTER TABLE ordinary_completion_deliveries "
+            "ADD COLUMN delivery_tombstoned_at REAL"
+        )
+    for table, id_column in (
+        ("async_delegations", "delegation_id"),
+        ("ordinary_completion_deliveries", "delivery_id"),
+    ):
+        conn.execute(
+            f"""CREATE TRIGGER IF NOT EXISTS {table}_tombstone_insert
+                AFTER INSERT ON {table}
+                WHEN NEW.delivery_state NOT IN ('pending', 'effect_started')
+                 AND NEW.delivery_tombstoned_at IS NULL
+                BEGIN
+                  UPDATE {table}
+                     SET delivery_tombstoned_at=CAST(strftime('%s','now') AS REAL)
+                   WHERE {id_column}=NEW.{id_column};
+                END"""
+        )
+        conn.execute(
+            f"""CREATE TRIGGER IF NOT EXISTS {table}_tombstone_update
+                AFTER UPDATE OF delivery_state ON {table}
+                WHEN NEW.delivery_state NOT IN ('pending', 'effect_started')
+                 AND NEW.delivery_tombstoned_at IS NULL
+                BEGIN
+                  UPDATE {table}
+                     SET delivery_tombstoned_at=CAST(strftime('%s','now') AS REAL)
+                   WHERE {id_column}=NEW.{id_column};
+                END"""
+        )
 
 
 @contextmanager
@@ -339,7 +378,7 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
     }
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
-            """INSERT OR REPLACE INTO async_delegations
+            """INSERT OR IGNORE INTO async_delegations
                (delegation_id, origin_session, origin_ui_session_id,
                 parent_session_id, state, dispatched_at, updated_at,
                 delivery_state, delivery_attempts, owner_pid,
@@ -356,18 +395,30 @@ def _persist_dispatch(record: Dict[str, Any]) -> None:
 
 def _delete_durable_delegation(delegation_id: str) -> None:
     with _DB_LOCK, _transaction() as conn:
-        conn.execute("DELETE FROM async_delegations WHERE delegation_id=?", (delegation_id,))
+        conn.execute(
+            """DELETE FROM async_delegations WHERE delegation_id=?
+               AND state='running' AND delivery_state='pending'
+               AND delivery_tombstoned_at IS NULL""",
+            (delegation_id,),
+        )
 
 
 def _prune_durable_records() -> None:
-    """Bound terminal history, preferring delivered records for deletion."""
+    """Retire only delivery facts that completed the full retention window."""
     now = time.time()
     cutoff = now - _DURABLE_RETENTION_SECONDS
     with _DB_LOCK, _transaction() as conn:
-        conn.execute(
-            "DELETE FROM async_delegations WHERE delivery_state='delivered' AND updated_at < ?",
-            (cutoff,),
-        )
+        for table in ("async_delegations", "ordinary_completion_deliveries"):
+            conn.execute(
+                f"""UPDATE {table} SET delivery_tombstoned_at=?
+                    WHERE delivery_tombstoned_at IS NULL
+                      AND delivery_state NOT IN ('pending', 'effect_started')""",
+                (now,),
+            )
+            conn.execute(
+                f"DELETE FROM {table} WHERE delivery_tombstoned_at < ?",
+                (cutoff,),
+            )
         terminal_count = conn.execute(
             "SELECT COUNT(*) FROM async_delegations WHERE state NOT IN ('running','finalizing')"
         ).fetchone()[0]
@@ -377,8 +428,9 @@ def _prune_durable_records() -> None:
                 """DELETE FROM async_delegations WHERE delegation_id IN (
                      SELECT delegation_id FROM async_delegations
                      WHERE state NOT IN ('running','finalizing')
-                     ORDER BY CASE delivery_state WHEN 'delivered' THEN 0 ELSE 1 END,
-                              updated_at ASC LIMIT ?
+                       AND delivery_state NOT IN ('pending', 'effect_started', 'delivered')
+                       AND delivery_state NOT LIKE 'recovery_%'
+                     ORDER BY updated_at ASC LIMIT ?
                    )""",
                 (excess,),
             )
@@ -404,7 +456,8 @@ def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
         conn.execute(
             """UPDATE async_delegations SET state=?, completed_at=?, updated_at=?,
                event_json=?, result_json=?, delivery_state='pending'
-               WHERE delegation_id=?""",
+               WHERE delegation_id=? AND state IN ('running', 'finalizing')
+                 AND delivery_state='pending' AND delivery_tombstoned_at IS NULL""",
             (event.get("status", "completed"), event.get("completed_at", now), now,
              json.dumps(event), json.dumps(result), event["delegation_id"]),
         )
@@ -420,10 +473,15 @@ def _note_delivery_attempt(delegation_id: str) -> None:
 
 def recover_abandoned_delegations() -> int:
     """Classify records whose owning process disappeared as outcome unknown."""
+    pid_exists: Optional[Callable[[int], bool]] = None
+    process_start_time: Optional[Callable[[int], Optional[int]]] = None
     try:
-        from gateway.status import _pid_exists, get_process_start_time
+        from gateway.status import (
+            _pid_exists as pid_exists,
+            get_process_start_time as process_start_time,
+        )
     except Exception:
-        return 0
+        pass
     now = time.time()
     recovered = 0
     with _DB_LOCK, _transaction() as conn:
@@ -438,7 +496,7 @@ def recover_abandoned_delegations() -> int:
              pid, started, task_json, origin_session_id) = row
             try:
                 live = _delivery_owner_live(
-                    pid, started, _pid_exists, get_process_start_time
+                    pid, started, pid_exists, process_start_time
                 )
             except (TypeError, ValueError) as exc:
                 diagnostic = f"{type(exc).__name__}: {exc}"
@@ -462,7 +520,25 @@ def recover_abandoned_delegations() -> int:
                     diagnostic,
                 )
                 continue
-            if live:
+            if live is True:
+                continue
+            if live is None:
+                conn.execute(
+                    """UPDATE async_delegations
+                       SET state='unknown', completed_at=?, updated_at=?,
+                           delivery_state='recovery_owner_unverifiable',
+                           delivery_tombstoned_at=COALESCE(delivery_tombstoned_at, ?),
+                           delivery_claim=NULL, delivery_claimed_at=NULL,
+                           owner_pid=NULL, owner_started_at=NULL
+                       WHERE delegation_id=? AND state IN ('running','finalizing')""",
+                    (now, now, now, delegation_id),
+                )
+                logger.warning(
+                    "Async delegation %s has an unverifiable owner; retaining "
+                    "no-replay recovery state.",
+                    delegation_id,
+                )
+                recovered += 1
                 continue
             try:
                 task = json.loads(task_json or "{}")
@@ -523,8 +599,34 @@ def recover_abandoned_delegations() -> int:
     return recovered
 
 
+def _bind_async_routing_fields(
+    event: Dict[str, Any], routing: Dict[str, Any]
+) -> Optional[str]:
+    """Replace persisted routing aliases only when they agree with row authority."""
+    for field, authoritative in routing.items():
+        if authoritative is None:
+            authoritative = ""
+        if not isinstance(authoritative, str):
+            return f"authoritative routing field {field} is invalid"
+        candidate = event.get(field)
+        if candidate is not None and not isinstance(candidate, str):
+            return f"routing field {field} is invalid"
+        if field in event and (candidate or "") != authoritative:
+            return f"routing field {field} does not match its durable row"
+        event[field] = authoritative
+    if "origin_session" in event:
+        candidate = event.pop("origin_session")
+        if not isinstance(candidate, str) or candidate != event["session_key"]:
+            return "origin_session does not match its durable row"
+    return None
+
+
 def _decode_restored_completion(
-    payload: str, *, expected_type: str, row_id: str
+    payload: str,
+    *,
+    expected_type: str,
+    row_id: str,
+    routing: Optional[Dict[str, Any]] = None,
 ) -> tuple[Optional[Dict[str, Any]], Optional[str]]:
     try:
         event = _load_durable_event_payload(payload)
@@ -537,6 +639,10 @@ def _decode_restored_completion(
     if expected_type == "async_delegation":
         if event.get("delegation_id") != row_id:
             return event, "delegation identity does not match its durable row"
+        if routing is not None:
+            diagnostic = _bind_async_routing_fields(event, routing)
+            if diagnostic is not None:
+                return event, diagnostic
     elif _ordinary_completion_delivery_id(event) is None:
         return event, "ordinary completion identity is invalid"
     return event, None
@@ -566,45 +672,66 @@ def _reconcile_committed_ack_events(conn, events, now: float) -> int:
             delegation_id = event.get("delegation_id")
             if not isinstance(delegation_id, str) or not delegation_id:
                 continue
-            cur = conn.execute(
-                """UPDATE async_delegations
-                   SET delivery_state='recovery_committed_ack_failed',
-                       delivery_claim=NULL, delivery_claimed_at=NULL,
-                       owner_pid=NULL, owner_started_at=NULL, updated_at=?
-                   WHERE delegation_id=?
-                     AND delivery_state IN ('pending', 'effect_started')""",
-                (now, delegation_id),
+            conn.execute(
+                """INSERT INTO async_delegations
+                   (delegation_id, origin_session, origin_ui_session_id, state,
+                    dispatched_at, updated_at, delivery_state,
+                    delivery_tombstoned_at)
+                   VALUES (?, '', '', 'tombstone', ?, ?,
+                           'recovery_committed_ack_failed', ?)
+                   ON CONFLICT(delegation_id) DO UPDATE SET
+                     delivery_state=CASE
+                       WHEN async_delegations.delivery_state='delivered'
+                       THEN 'delivered'
+                       ELSE 'recovery_committed_ack_failed'
+                     END,
+                     delivery_claim=NULL, delivery_claimed_at=NULL,
+                     owner_pid=NULL, owner_started_at=NULL,
+                     delivery_tombstoned_at=COALESCE(
+                       async_delegations.delivery_tombstoned_at, excluded.delivery_tombstoned_at
+                     ),
+                     updated_at=excluded.updated_at""",
+                (delegation_id, now, now, now),
             )
-            reconciled += cur.rowcount
+            reconciled += 1
             continue
         delivery_id = _ordinary_completion_delivery_id(event)
         if delivery_id is None:
             continue
         payload = json.dumps(_durable_event_payload(event), sort_keys=True)
+        _migrate_ordinary_completion_legacy_row(
+            conn, event, delivery_id, payload, now
+        )
         conn.execute(
-            """INSERT OR IGNORE INTO ordinary_completion_deliveries
-               (delivery_id, event_json, delivery_state, updated_at)
-               VALUES (?, ?, 'recovery_committed_ack_failed', ?)""",
-            (delivery_id, payload, now),
+            """INSERT INTO ordinary_completion_deliveries
+               (delivery_id, event_json, delivery_state, updated_at,
+                delivery_tombstoned_at)
+               VALUES (?, ?, 'recovery_committed_ack_failed', ?, ?)
+               ON CONFLICT(delivery_id) DO UPDATE SET
+                 delivery_state=CASE
+                   WHEN ordinary_completion_deliveries.delivery_state='delivered'
+                   THEN 'delivered'
+                   ELSE 'recovery_committed_ack_failed'
+                 END,
+                 delivery_claim=NULL, delivery_claimed_at=NULL,
+                 delivery_owner_pid=NULL, delivery_owner_started_at=NULL,
+                 delivery_tombstoned_at=COALESCE(
+                   ordinary_completion_deliveries.delivery_tombstoned_at,
+                   excluded.delivery_tombstoned_at
+                 ),
+                 updated_at=excluded.updated_at""",
+            (delivery_id, payload, now, now),
         )
-        cur = conn.execute(
-            """UPDATE ordinary_completion_deliveries
-               SET delivery_state='recovery_committed_ack_failed',
-                   delivery_claim=NULL, delivery_claimed_at=NULL,
-                   delivery_owner_pid=NULL, delivery_owner_started_at=NULL,
-                   updated_at=?
-               WHERE delivery_id=?
-                 AND delivery_state IN ('pending', 'effect_started')""",
-            (now, delivery_id),
-        )
-        reconciled += cur.rowcount
+        reconciled += 1
     return reconciled
 
 
 def reconcile_committed_completion_acks(events) -> int:
     """Reconcile durable ACK-only facts without re-running provider effects."""
     with _DB_LOCK, _transaction() as conn:
-        return _reconcile_committed_ack_events(conn, events, time.time())
+        reconciled = _reconcile_committed_ack_events(conn, events, time.time())
+    _prune_durable_records()
+    return reconciled
 
 
 def restore_undelivered_completions(target_queue) -> int:
@@ -692,12 +819,24 @@ def restore_undelivered_completions(target_queue) -> int:
 
         rows = conn.execute(
             """SELECT delegation_id, event_json, completed_at, dispatched_at,
-                      delivery_attempts
+                      delivery_attempts, origin_session, origin_ui_session_id,
+                      origin_session_id, parent_session_id
                FROM async_delegations
-               WHERE state != 'running' AND delivery_state='pending' AND event_json IS NOT NULL
+               WHERE state != 'running' AND delivery_state='pending'
+                 AND event_json IS NOT NULL
                ORDER BY completed_at, delegation_id"""
         ).fetchall()
-        for delegation_id, payload, completed_at, dispatched_at, attempts in rows:
+        for (
+            delegation_id,
+            payload,
+            completed_at,
+            dispatched_at,
+            attempts,
+            origin_session,
+            origin_ui_session_id,
+            origin_session_id,
+            parent_session_id,
+        ) in rows:
             try:
                 attempt_count = _delivery_attempt_count(attempts)
             except (TypeError, ValueError) as exc:
@@ -753,7 +892,15 @@ def restore_undelivered_completions(target_queue) -> int:
                 )
                 continue
             event, diagnostic = _decode_restored_completion(
-                payload, expected_type="async_delegation", row_id=delegation_id
+                payload,
+                expected_type="async_delegation",
+                row_id=delegation_id,
+                routing={
+                    "session_key": origin_session,
+                    "origin_ui_session_id": origin_ui_session_id,
+                    "origin_session_id": origin_session_id,
+                    "parent_session_id": parent_session_id,
+                },
             )
             if diagnostic is not None:
                 parked_payload = _corrupt_completion_payload(
@@ -1104,19 +1251,75 @@ def _load_durable_event_payload(payload: str) -> Any:
     return _durable_event_payload(event) if isinstance(event, dict) else event
 
 
+def _migrate_ordinary_completion_legacy_row(
+    conn: sqlite3.Connection,
+    evt: Dict[str, Any],
+    delivery_id: str,
+    payload: str,
+    now: float,
+) -> None:
+    """Re-key an honest tuple-era row before a current event can republish it."""
+    legacy_id = _ordinary_completion_legacy_delivery_id(evt)
+    if legacy_id is None or legacy_id == delivery_id:
+        return
+    legacy = conn.execute(
+        """SELECT event_json, delivery_state, delivery_tombstoned_at
+           FROM ordinary_completion_deliveries WHERE delivery_id=?""",
+        (legacy_id,),
+    ).fetchone()
+    if legacy is None:
+        return
+    try:
+        stored = _load_durable_event_payload(legacy[0])
+    except (TypeError, ValueError):
+        return
+    if not isinstance(stored, dict) or _ordinary_completion_delivery_id(stored) != delivery_id:
+        return
+    target = conn.execute(
+        "SELECT delivery_state FROM ordinary_completion_deliveries WHERE delivery_id=?",
+        (delivery_id,),
+    ).fetchone()
+    if target is None:
+        conn.execute(
+            """UPDATE ordinary_completion_deliveries
+               SET delivery_id=?, event_json=? WHERE delivery_id=?""",
+            (delivery_id, payload, legacy_id),
+        )
+        return
+    if legacy[1] != "pending" and target[0] == "pending":
+        state = (
+            "recovery_legacy_identity_conflict"
+            if legacy[1] == "effect_started"
+            else legacy[1]
+        )
+        conn.execute(
+            """UPDATE ordinary_completion_deliveries
+               SET delivery_state=?, delivery_claim=NULL,
+                   delivery_claimed_at=NULL, delivery_owner_pid=NULL,
+                   delivery_owner_started_at=NULL,
+                   delivery_tombstoned_at=COALESCE(delivery_tombstoned_at, ?),
+                   updated_at=?
+               WHERE delivery_id=? AND delivery_state='pending'""",
+            (state, legacy[2] or now, now, delivery_id),
+        )
+
+
 def persist_event_delivery(evt: Dict[str, Any]) -> bool:
     """Create the durable ordinary-completion receipt before queue delivery."""
     delivery_id = _ordinary_completion_delivery_id(evt)
     if delivery_id is None:
         return True
     now = time.time()
+    payload = json.dumps(_durable_event_payload(evt), sort_keys=True)
     with _DB_LOCK, _transaction() as conn:
+        _migrate_ordinary_completion_legacy_row(conn, evt, delivery_id, payload, now)
         conn.execute(
             """INSERT OR IGNORE INTO ordinary_completion_deliveries
                (delivery_id, event_json, delivery_state, updated_at)
                VALUES (?, ?, 'pending', ?)""",
-            (delivery_id, json.dumps(_durable_event_payload(evt), sort_keys=True), now),
+            (delivery_id, payload, now),
         )
+    _prune_durable_records()
     return True
 
 
@@ -1164,6 +1367,52 @@ def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
         from tools.runtime_heartbeat import runtime_heartbeat
 
         return "" if runtime_heartbeat.is_event_current(evt) else None
+    if evt.get("type") == "async_delegation":
+        delegation_id = str(evt.get("delegation_id") or "")
+        if not delegation_id:
+            return None
+        with _DB_LOCK, _transaction() as conn:
+            row = conn.execute(
+                """SELECT origin_session, origin_ui_session_id,
+                          origin_session_id, parent_session_id, delivery_state
+                   FROM async_delegations WHERE delegation_id=?""",
+                (delegation_id,),
+            ).fetchone()
+            if row is None:
+                evt["_completion_delivery_legacy_async"] = True
+            else:
+                evt.pop("_completion_delivery_legacy_async", None)
+            if row is not None and row[4] not in {"pending", "effect_started"}:
+                return None
+            if row is not None:
+                diagnostic = _bind_async_routing_fields(
+                    evt,
+                    {
+                        "session_key": row[0],
+                        "origin_ui_session_id": row[1],
+                        "origin_session_id": row[2],
+                        "parent_session_id": row[3],
+                    },
+                )
+                if diagnostic is not None:
+                    conn.execute(
+                        """UPDATE async_delegations
+                           SET event_json=?, delivery_state='parked_corrupt',
+                               delivery_claim=NULL, delivery_claimed_at=NULL,
+                               owner_pid=NULL, owner_started_at=NULL, updated_at=?
+                           WHERE delegation_id=?
+                             AND delivery_state IN ('pending', 'effect_started')""",
+                        (
+                            _corrupt_completion_payload(
+                                expected_type="async_delegation",
+                                row_id=delegation_id,
+                                diagnostic=diagnostic,
+                            ),
+                            time.time(),
+                            delegation_id,
+                        ),
+                    )
+                    return None
     retained_claim = str(evt.get("_completion_delivery_retained_claim_id") or "")
     if retained_claim:
         now = time.time()
@@ -1193,6 +1442,10 @@ def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
         if delivery_id is None:
             return None
         with _DB_LOCK, _transaction() as conn:
+            payload = json.dumps(_durable_event_payload(evt), sort_keys=True)
+            _migrate_ordinary_completion_legacy_row(
+                conn, evt, delivery_id, payload, now
+            )
             cur = conn.execute(
                 """UPDATE ordinary_completion_deliveries
                    SET delivery_attempts=delivery_attempts+1, updated_at=?
@@ -1223,12 +1476,14 @@ def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
     owner_pid, owner_started_at = _current_process_identity()
     claim_id = f"{consumer}:{owner_pid}:{uuid.uuid4().hex}"
     now = time.time()
+    payload = json.dumps(_durable_event_payload(evt), sort_keys=True)
     with _DB_LOCK, _transaction() as conn:
+        _migrate_ordinary_completion_legacy_row(conn, evt, delivery_id, payload, now)
         conn.execute(
             """INSERT OR IGNORE INTO ordinary_completion_deliveries
                (delivery_id, event_json, delivery_state, updated_at)
                VALUES (?, ?, 'pending', ?)""",
-            (delivery_id, json.dumps(_durable_event_payload(evt), sort_keys=True), now),
+            (delivery_id, payload, now),
         )
         cur = conn.execute(
             """UPDATE ordinary_completion_deliveries
@@ -1321,13 +1576,29 @@ def mark_completion_delivery_recovery(
         if not delegation_id:
             return False
         with _DB_LOCK, _transaction() as conn:
+            recovery_state = f"recovery_{reason}"
             cur = conn.execute(
                 """UPDATE async_delegations SET delivery_state=?, delivery_claim=NULL,
                           delivery_claimed_at=NULL, owner_pid=NULL,
                           owner_started_at=NULL, updated_at=?
                    WHERE delegation_id=? AND delivery_state='effect_started'
                      AND delivery_claim=?""",
-                (f"recovery_{reason}", now, delegation_id, claim_id),
+                (recovery_state, now, delegation_id, claim_id),
+            )
+            if cur.rowcount == 1:
+                return True
+            row = conn.execute(
+                "SELECT delivery_state FROM async_delegations WHERE delegation_id=?",
+                (delegation_id,),
+            ).fetchone()
+            if row is not None:
+                return row[0] == "delivered" or str(row[0]).startswith("recovery_")
+            cur = conn.execute(
+                """INSERT OR IGNORE INTO async_delegations
+                   (delegation_id, origin_session, origin_ui_session_id, state,
+                    dispatched_at, updated_at, delivery_state)
+                   VALUES (?, '', '', 'tombstone', ?, ?, ?)""",
+                (delegation_id, now, now, recovery_state),
             )
             return cur.rowcount == 1
     delivery_id = _ordinary_completion_delivery_id(evt)
@@ -1390,6 +1661,8 @@ def release_event_delivery(evt: Dict[str, Any], claim_id: str) -> bool:
     if not claim_id:
         return True
     if evt.get("type") == "async_delegation":
+        if evt.get("_completion_delivery_legacy_async") is True:
+            return True
         return release_completion_delivery(
             str(evt.get("delegation_id") or ""), claim_id
         )

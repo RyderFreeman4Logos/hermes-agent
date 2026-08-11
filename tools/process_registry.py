@@ -55,9 +55,16 @@ from hermes_cli.config import get_hermes_home
 
 from agent.redact import redact_sensitive_text
 from tools.completion_identity import (
+    CompletionDeliveryBinding as _CompletionDeliveryBinding,
+    CompletionDeliveryToken as _CompletionDeliveryToken,
+    bound_completion_delivery_metadata as _bound_completion_delivery_metadata,
+    bound_completion_delivery_token as _bound_completion_delivery_token,
+    bound_completion_event_fingerprint as _bound_completion_event_fingerprint,
+    bound_completion_projection as _bound_completion_projection,
     canonical_completion_fingerprint as _canonical_completion_fingerprint,
     completion_authority_fingerprint as _completion_authority_fingerprint,
     completion_core_identity as _completion_core_identity,
+    completion_durable_identity as _public_completion_durable_identity,
     completion_durable_payload as _completion_durable_payload,
     completion_event_fingerprint as _completion_event_fingerprint,
     completion_identity as _public_completion_identity,
@@ -389,96 +396,6 @@ def format_uptime_short(seconds: int) -> str:
         return f"{mins}m {secs}s"
     hours, mins = divmod(mins, 60)
     return f"{hours}h {mins}m"
-
-
-class _CompletionDeliveryToken(str):
-    """Process-local authority whose type cannot survive JSON persistence."""
-
-
-class _CompletionDeliveryBinding(str):
-    """Exact private subtype binding a local token to its producer event."""
-
-
-def _bound_completion_delivery_metadata(evt: dict) -> "tuple | None":
-    """Decode exact local authority bound to its producer and original envelope."""
-    token = evt.get("_completion_delivery_token")
-    binding = evt.get("_completion_delivery_binding")
-    if (
-        type(token) is not _CompletionDeliveryToken
-        or type(binding) is not _CompletionDeliveryBinding
-        or not token
-        or not binding
-    ):
-        return None
-    try:
-        metadata = json.loads(str(binding))
-    except (TypeError, ValueError):
-        return None
-    if (
-        not isinstance(metadata, list)
-        or len(metadata) not in {3, 5}
-        or not isinstance(metadata[1], str)
-        or token.rpartition("|")[2] != metadata[1]
-    ):
-        return None
-    if len(metadata) == 3:
-        metadata.extend((None, None))
-    elif (
-        not isinstance(metadata[2], str)
-        or not metadata[2].startswith("completion-event-v1:")
-        or not isinstance(metadata[3], str)
-        or not metadata[3].startswith("completion-event-v1:")
-        or not isinstance(metadata[4], list)
-    ):
-        return None
-    return token, metadata[0], metadata[2], metadata[3], metadata[4]
-
-
-def _bound_completion_projection(evt: dict) -> "tuple | None":
-    """Recover producer identity only from a binding valid for this projection."""
-    metadata = _bound_completion_delivery_metadata(evt)
-    current_core = _completion_core_identity(evt)
-    current_fingerprint = _completion_authority_fingerprint(evt)
-    if (
-        metadata is None
-        or current_core is None
-        or metadata[1] != list(current_core)
-        or metadata[3] != current_fingerprint
-        or not metadata[4]
-        or any(
-            isinstance(value, bool)
-            or not isinstance(value, (str, int, float))
-            or (isinstance(value, float) and not math.isfinite(value))
-            for value in metadata[4]
-        )
-    ):
-        return None
-    return metadata[0], metadata[2], tuple(metadata[4])
-
-
-def _bound_completion_delivery_token(evt: dict) -> Optional[_CompletionDeliveryToken]:
-    """Return an exact local token only when its producer binding still matches."""
-    metadata = _bound_completion_delivery_metadata(evt)
-    return metadata[0] if metadata is not None else None
-
-
-def _bound_completion_event_fingerprint(evt: dict) -> Optional[str]:
-    """Return the original envelope fingerprint from valid local authority."""
-    metadata = _bound_completion_delivery_metadata(evt)
-    current_core = _completion_core_identity(evt)
-    current_fingerprint = _completion_authority_fingerprint(evt)
-    fingerprint = metadata[2] if metadata is not None else None
-    if (
-        current_core is None
-        or current_fingerprint is None
-        or metadata is None
-        or metadata[1] != list(current_core)
-        or fingerprint != current_fingerprint
-    ):
-        return None
-    if isinstance(fingerprint, str) and fingerprint.startswith("completion-event-v1:"):
-        return fingerprint
-    return None
 
 
 @dataclass
@@ -2462,21 +2379,7 @@ class ProcessRegistry:
     @staticmethod
     def _completion_durable_identity(evt: dict) -> "tuple | None":
         """Return canonical, bound-producer, or sanitized-envelope authority."""
-        if evt.get("type") == "async_delegation":
-            delegation_id = evt.get("delegation_id")
-            if isinstance(delegation_id, str) and delegation_id:
-                return "async-delegation", delegation_id
-            return None
-        projection = _bound_completion_projection(evt)
-        if projection is not None:
-            return projection[2]
-        identity = ProcessRegistry._completion_identity(evt)
-        if identity is not None:
-            return (*identity, _canonical_completion_fingerprint(evt))
-        fingerprint = _bound_completion_event_fingerprint(evt)
-        if fingerprint is None and _completion_core_identity(evt) is not None:
-            fingerprint = _completion_authority_fingerprint(evt)
-        return ("completion-event", fingerprint) if fingerprint is not None else None
+        return _public_completion_durable_identity(evt)
 
     @staticmethod
     def _completion_claim_identity(evt: dict) -> "tuple | None":

@@ -1317,6 +1317,56 @@ def test_bounded_restore_replaces_reserved_slot_with_retry_copy(registry):
     assert registry.drain_matching_completions(lambda _event: True) == [retry]
 
 
+def test_claim_denial_does_not_consume_another_reservation(registry):
+    from tools import process_registry as registry_module
+
+    completion_queue = queue.Queue(maxsize=1)
+    registry.completion_queue = completion_queue
+    winner = _completion_event(
+        session_id="claim-winner", session_key="owner", started_at=1.0
+    )
+    replacement = _completion_event(session_id="replacement", started_at=2.0)
+    completion_queue.put(winner)
+    assert registry.drain_matching_completions(lambda _event: True) == [winner]
+    assert registry.claim_completion_delivery(winner)
+
+    producer_started = threading.Event()
+    producer_done = threading.Event()
+
+    def produce():
+        producer_started.set()
+        completion_queue.put(replacement)
+        producer_done.set()
+
+    producer = threading.Thread(target=produce, daemon=True)
+    producer.start()
+    assert producer_started.wait(1)
+    assert not producer_done.wait(0.1), "precondition: producer was not blocked"
+
+    try:
+        loser = dict(winner)
+        assert (
+            registry_module.claim_completion_event_delivery(
+                loser, "copy-loser", registry=registry
+            )
+            is None
+        )
+        assert not producer_done.wait(0.2)
+
+        registry.release_completion_delivery(winner)
+        registry.requeue_completion_front(winner)
+        with completion_queue.mutex:
+            assert list(completion_queue.queue) == [winner]
+        assert completion_queue.get_nowait() is winner
+        assert producer_done.wait(1)
+    finally:
+        with completion_queue.not_full:
+            completion_queue.queue.clear()
+            completion_queue.not_full.notify_all()
+        producer.join(1)
+        assert not producer.is_alive()
+
+
 def test_drain_notifications_filters_async_delegation_by_session_key():
     """Async-delegation events should only be consumed by the matching session's drain.
 

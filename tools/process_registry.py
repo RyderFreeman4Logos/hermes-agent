@@ -225,29 +225,86 @@ def arm_process_heartbeat(
     return interval
 
 
-_COMPLETION_QUEUE_OVERFLOW = "_hermes_completion_overflow"
+_COMPLETION_QUEUE_RESERVATIONS = "_hermes_completion_reservations"
 
 
 def _completion_queue_items(completion_queue) -> "list[dict]":
-    """Return the logical FIFO while the caller holds ``queue.mutex``."""
-    return [
-        *completion_queue.queue,
-        *getattr(completion_queue, _COMPLETION_QUEUE_OVERFLOW, ()),
-    ]
+    """Return the native FIFO while the caller holds ``queue.mutex``."""
+    return list(completion_queue.queue)
+
+
+def _set_completion_queue_reservations(completion_queue, reservations) -> None:
+    if reservations:
+        setattr(completion_queue, _COMPLETION_QUEUE_RESERVATIONS, reservations)
+    elif hasattr(completion_queue, _COMPLETION_QUEUE_RESERVATIONS):
+        delattr(completion_queue, _COMPLETION_QUEUE_RESERVATIONS)
+
+
+def _completion_queue_reservations(completion_queue) -> "dict[int, dict]":
+    """Return live bounded-queue reservations while holding ``queue.mutex``."""
+    reservations = getattr(completion_queue, _COMPLETION_QUEUE_RESERVATIONS, {})
+    live = {id(event): event for event in completion_queue.queue}
+    reservations = {
+        key: event for key, event in reservations.items() if live.get(key) is event
+    }
+    _set_completion_queue_reservations(completion_queue, reservations)
+    return reservations
 
 
 def _replace_completion_queue_items(completion_queue, events: "list[dict]") -> None:
-    """Keep a bounded Queue native-sized while retaining its ordered overflow."""
-    physical_limit = (
-        completion_queue.maxsize if completion_queue.maxsize > 0 else len(events)
-    )
+    """Replace the native FIFO without bypassing ``Queue.maxsize``."""
+    if completion_queue.maxsize > 0 and len(events) > completion_queue.maxsize:
+        import queue as _queue_mod
+
+        raise _queue_mod.Full
+    reservations = _completion_queue_reservations(completion_queue)
     completion_queue.queue.clear()
-    completion_queue.queue.extend(events[:physical_limit])
-    overflow = events[physical_limit:]
-    if overflow:
-        setattr(completion_queue, _COMPLETION_QUEUE_OVERFLOW, overflow)
-    elif hasattr(completion_queue, _COMPLETION_QUEUE_OVERFLOW):
-        delattr(completion_queue, _COMPLETION_QUEUE_OVERFLOW)
+    completion_queue.queue.extend(events)
+    live = {id(event): event for event in events}
+    reservations = {
+        key: event for key, event in reservations.items() if live.get(key) is event
+    }
+    _set_completion_queue_reservations(completion_queue, reservations)
+
+
+def _restore_completion_queue_items(completion_queue, events: "list[dict]") -> None:
+    """Restore one detached unit or release its bounded native reservations."""
+    if not events:
+        return
+    with completion_queue.not_empty:
+        current = _completion_queue_items(completion_queue)
+        current_by_id = {id(event): event for event in current}
+        reservations = _completion_queue_reservations(completion_queue)
+        detached = []
+        for event in events:
+            key = id(event)
+            if current_by_id.get(key) is event:
+                reservations.pop(key, None)
+            else:
+                detached.append(event)
+        _set_completion_queue_reservations(completion_queue, reservations)
+        if detached:
+            _replace_completion_queue_items(completion_queue, [*detached, *current])
+        completion_queue.not_empty.notify_all()
+
+
+def _complete_completion_queue_reservation(completion_queue, event: dict) -> bool:
+    """Remove one terminal bounded reservation and wake a blocked producer."""
+    if completion_queue.maxsize <= 0:
+        return False
+    with completion_queue.not_full:
+        reservations = _completion_queue_reservations(completion_queue)
+        key = id(event)
+        if reservations.get(key) is not event:
+            return False
+        for index, current in enumerate(completion_queue.queue):
+            if current is event:
+                del completion_queue.queue[index]
+                reservations.pop(key, None)
+                _set_completion_queue_reservations(completion_queue, reservations)
+                completion_queue.not_full.notify()
+                return True
+        return False
 
 
 def drain_matching_queue_events(completion_queue, predicate) -> "list[dict]":
@@ -259,8 +316,11 @@ def drain_matching_queue_events(completion_queue, predicate) -> "list[dict]":
     """
     with completion_queue.mutex:
         snapshot = tuple(_completion_queue_items(completion_queue))
+        reserved = frozenset(_completion_queue_reservations(completion_queue))
 
-    selected = tuple(bool(predicate(event)) for event in snapshot)
+    selected = tuple(
+        id(event) not in reserved and bool(predicate(event)) for event in snapshot
+    )
     with completion_queue.not_empty:
         current = _completion_queue_items(completion_queue)
         if len(current) < len(snapshot) or any(
@@ -273,6 +333,15 @@ def drain_matching_queue_events(completion_queue, predicate) -> "list[dict]":
         ]
         if not drained:
             return []
+        if completion_queue.maxsize > 0:
+            reservations = _completion_queue_reservations(completion_queue)
+            reservations.update((id(event), event) for event in drained)
+            setattr(
+                completion_queue,
+                _COMPLETION_QUEUE_RESERVATIONS,
+                reservations,
+            )
+            return drained
         retained = [
             event for event, should_drain in zip(snapshot, selected) if not should_drain
         ]
@@ -2098,6 +2167,7 @@ class ProcessRegistry:
             self._write_checkpoint()
 
     def complete_completion_delivery(self, evt: dict) -> None:
+        _complete_completion_queue_reservation(self.completion_queue, evt)
         identity = self._completion_identity(evt)
         if identity is not None:
             with self._completion_disposition_lock:
@@ -2181,13 +2251,34 @@ class ProcessRegistry:
         while True:
             with completion_queue.mutex:
                 snapshot = tuple(_completion_queue_items(completion_queue))
+                reserved = frozenset(_completion_queue_reservations(completion_queue))
 
-            candidate = next((evt for evt in snapshot if owns_event(evt)), None)
+            candidate = next(
+                (
+                    evt
+                    for evt in snapshot
+                    if id(evt) not in reserved and owns_event(evt)
+                ),
+                None,
+            )
             if candidate is not None:
                 with completion_queue.not_empty:
                     current_events = _completion_queue_items(completion_queue)
                     for index, current in enumerate(current_events):
                         if current is candidate:
+                            if completion_queue.maxsize > 0:
+                                reservations = _completion_queue_reservations(
+                                    completion_queue
+                                )
+                                if id(candidate) in reservations:
+                                    break
+                                reservations[id(candidate)] = candidate
+                                setattr(
+                                    completion_queue,
+                                    _COMPLETION_QUEUE_RESERVATIONS,
+                                    reservations,
+                                )
+                                return candidate
                             del current_events[index]
                             _replace_completion_queue_items(
                                 completion_queue, current_events
@@ -2221,17 +2312,7 @@ class ProcessRegistry:
 
     def _requeue_completions_front(self, events: "list[Dict[str, Any]]") -> None:
         """Atomically restore detached work ahead of a concurrent producer tail."""
-        if not events:
-            return
-        completion_queue = self.completion_queue
-        # A producer may consume detached slots before rollback. Keep the native
-        # Queue bounded and retain the ordered tail alongside it; every selective
-        # completion consumer reads the combined logical FIFO.
-        with completion_queue.not_empty:
-            restored = list(events)
-            restored.extend(_completion_queue_items(completion_queue))
-            _replace_completion_queue_items(completion_queue, restored)
-            completion_queue.not_empty.notify_all()
+        _restore_completion_queue_items(self.completion_queue, events)
 
     def drain_notifications(
         self,
@@ -3453,8 +3534,11 @@ def restore_completion_event_retries(
         target._requeue_completions_front(events)
         return True
     except Exception:
-        logger.exception("Completion retry restoration failed permanently")
-        return False
+        logger.debug("Completion retry private restoration failed", exc_info=True)
+    # The queue itself is the final in-process owner. Bypass only failed method
+    # wrappers; this native restore either retains the unit or raises visibly.
+    _restore_completion_queue_items(target.completion_queue, events)
+    return True
 
 
 def reconcile_committed_completion_event_delivery(
@@ -3470,11 +3554,11 @@ def reconcile_committed_completion_event_delivery(
     for _attempt in range(2):
         try:
             if mark_completion_delivery_recovery(evt, claim_id, "committed_ack"):
-                break
+                target.complete_completion_delivery(evt)
+                return True
         except Exception:
             logger.debug("Failed to reconcile committed completion ACK", exc_info=True)
-    target.complete_completion_delivery(evt)
-    return True
+    return False
 
 
 def completion_result_delivery_outcome(result: dict) -> str:
@@ -3586,7 +3670,7 @@ def finish_completion_event_delivery(
     if released:
         target._retire_terminal_completion_spool(evt)
     target.release_completion_delivery(evt)
-    retry_event = dict(evt)
+    retry_event = evt
     if released:
         retry_event.pop("_completion_delivery_retained_claim_id", None)
     elif claim_id:

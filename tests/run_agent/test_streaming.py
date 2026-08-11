@@ -613,12 +613,12 @@ class TestCodexStreamCallbacks:
         mock_client = MagicMock()
         mock_client.responses.create.side_effect = _create_side_effect
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(httpx.RemoteProtocolError):
             agent._run_codex_stream({}, client=mock_client)
 
         # A RemoteProtocolError can arrive after provider acceptance; do not
         # blindly replay a potentially billable request.
-        assert call_count["n"] <= 1
+        assert call_count["n"] == 1
 
     def test_codex_create_stream_fallback_refreshes_activity_on_every_event(self):
         from run_agent import AIAgent

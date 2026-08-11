@@ -273,6 +273,189 @@ def test_turn_end_before_apply_batches_fallback_once(isolated_registry, monkeypa
         assert not registry.completion_event_should_deliver(evt)
 
 
+def test_idle_batch_transient_claim_failure_preserves_visible_fifo(
+    isolated_registry, monkeypatch
+):
+    from tools import async_delegation as ad
+
+    registry = isolated_registry
+    events = [
+        _completion_event(f"proc-claim-fifo-{seq}", started_at=float(seq))
+        for seq in (1, 2, 3)
+    ]
+    registry.completion_queue.put(events[2])
+    rendered = []
+
+    def submit(_rid, _sid, session, text, **kwargs):
+        rendered.append(text)
+        kwargs["completion_delivery_callback"]("committed")
+        session["running"] = False
+
+    monkeypatch.setattr(server, "_run_prompt_submit", submit)
+    claim_calls = 0
+
+    def transient_claim(_event, _consumer):
+        nonlocal claim_calls
+        claim_calls += 1
+        if claim_calls == 1:
+            raise OSError("claim storage unavailable")
+        return ""
+
+    monkeypatch.setattr(ad, "claim_event_delivery", transient_claim)
+    session = _session(running=True)
+    server._dispatch_completion_batch(
+        "sid",
+        session,
+        [
+            {"evt": events[0], "text": "owner-A-1"},
+            {"evt": events[1], "text": "owner-A-2"},
+        ],
+        consumer="tui-test",
+    )
+
+    assert len(rendered) == 1
+    assert rendered[0].index("owner-A-1") < rendered[0].index("owner-A-2")
+    with registry.completion_queue.mutex:
+        assert list(registry.completion_queue.queue) == [events[2]]
+
+
+@pytest.mark.parametrize("failure_index", [0, 1])
+def test_idle_batch_persistent_claim_failure_restores_untouched_tail(
+    isolated_registry, monkeypatch, failure_index
+):
+    from tools import async_delegation as ad
+
+    registry = isolated_registry
+    events = [
+        _completion_event(f"proc-claim-persistent-{seq}", started_at=float(seq))
+        for seq in (1, 2, 3)
+    ]
+    registry.completion_queue.put(events[2])
+    rendered = []
+
+    def submit(_rid, _sid, session, text, **kwargs):
+        rendered.append(text)
+        kwargs["completion_delivery_callback"]("committed")
+        session["running"] = False
+
+    monkeypatch.setattr(server, "_run_prompt_submit", submit)
+
+    def claim(event, _consumer):
+        if event is events[failure_index]:
+            raise OSError("claim storage unavailable")
+        return ""
+
+    monkeypatch.setattr(ad, "claim_event_delivery", claim)
+    session = _session(running=True)
+    server._dispatch_completion_batch(
+        "sid",
+        session,
+        [
+            {"evt": events[0], "text": "owner-A-1"},
+            {"evt": events[1], "text": "owner-A-2"},
+        ],
+        consumer="tui-test",
+    )
+
+    if failure_index:
+        assert len(rendered) == 1
+        assert "owner-A-1" in rendered[0]
+        expected = events[1:]
+    else:
+        assert rendered == []
+        assert session["running"] is False
+        expected = events
+    with registry.completion_queue.mutex:
+        remaining = list(registry.completion_queue.queue)
+    assert remaining == expected
+    assert all(actual is wanted for actual, wanted in zip(remaining, expected))
+
+
+def test_idle_batch_provider_failure_restores_one_ordered_retry_unit(
+    isolated_registry, monkeypatch
+):
+    from tools import async_delegation as ad
+
+    registry = isolated_registry
+    events = [
+        _completion_event(f"proc-receipt-retry-{seq}", started_at=float(seq))
+        for seq in (1, 2, 3)
+    ]
+    registry.completion_queue.put(events[2])
+    monkeypatch.setattr(ad, "claim_event_delivery", lambda *_args: "")
+
+    def submit(_rid, _sid, session, _text, **kwargs):
+        kwargs["completion_delivery_callback"]("provider_failed")
+        session["running"] = False
+
+    monkeypatch.setattr(server, "_run_prompt_submit", submit)
+    server._dispatch_completion_batch(
+        "sid",
+        _session(running=True),
+        [
+            {"evt": events[0], "text": "owner-A-1"},
+            {"evt": events[1], "text": "owner-A-2"},
+        ],
+        consumer="tui-test",
+    )
+
+    with registry.completion_queue.mutex:
+        retries = list(registry.completion_queue.queue)
+    assert [event["session_id"] for event in retries] == [
+        event["session_id"] for event in events
+    ]
+
+
+def test_shutdown_formatter_error_restores_batch_before_concurrent_tail(
+    isolated_registry, monkeypatch
+):
+    registry = isolated_registry
+    malformed = _delegation_event("deleg-malformed-shutdown", summary="bad")
+    malformed["is_batch"] = True
+    malformed["results"] = [None]
+    valid = _completion_event("proc-valid-shutdown", exit_code=1, started_at=2.0)
+    concurrent = _completion_event(
+        "proc-concurrent-shutdown", exit_code=1, started_at=3.0
+    )
+    registry.completion_queue.put(malformed)
+    registry.completion_queue.put(valid)
+    producer_start = threading.Event()
+    producer_done = threading.Event()
+    released = False
+
+    def owns(_sid, _session, _event):
+        nonlocal released
+        if not released:
+            released = True
+            producer_start.set()
+            assert producer_done.wait(2), "producer did not finish"
+        return True
+
+    monkeypatch.setattr(server, "_session_owns_notification_event", owns)
+
+    def produce():
+        assert producer_start.wait(2), "shutdown drain missed producer boundary"
+        registry.completion_queue.put(concurrent)
+        producer_done.set()
+
+    producer = threading.Thread(target=produce, daemon=True)
+    producer.start()
+    stopped = threading.Event()
+    stopped.set()
+    try:
+        server._notification_poller_loop(stopped, "sid", _session(running=False))
+        producer.join(2)
+        assert not producer.is_alive()
+        with registry.completion_queue.mutex:
+            remaining = list(registry.completion_queue.queue)
+        expected = [malformed, valid, concurrent]
+        assert remaining == expected
+        assert all(actual is wanted for actual, wanted in zip(remaining, expected))
+    finally:
+        producer_start.set()
+        producer.join(2)
+
+
 def test_idle_coalesce_overflow_is_lossless(isolated_registry, monkeypatch):
     registry = isolated_registry
     delivered: list[str] = []

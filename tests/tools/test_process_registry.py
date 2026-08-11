@@ -1141,6 +1141,112 @@ def test_drain_notifications_completion_callback_exception_fails_closed(registry
     assert registry.completion_queue.empty()
 
 
+@pytest.mark.parametrize("malformed_index", [0, 1])
+def test_drain_notifications_formatter_error_restores_selected_batch_before_tail(
+    registry, malformed_index
+):
+    producer_start = threading.Event()
+    producer_done = threading.Event()
+    malformed = {
+        "type": "async_delegation",
+        "delegation_id": "deleg-malformed",
+        "session_key": "A",
+        "is_batch": True,
+        "results": [None],
+    }
+    valid = _completion_event(session_id="proc-valid", session_key="A", exit_code=1)
+    pending = [malformed, valid]
+    if malformed_index:
+        pending.reverse()
+    concurrent = _completion_event(
+        session_id="proc-concurrent", session_key="A", exit_code=1
+    )
+    for event in pending:
+        registry.completion_queue.put(event)
+
+    def produce():
+        assert producer_start.wait(2), "drain did not reach producer boundary"
+        registry.completion_queue.put(concurrent)
+        producer_done.set()
+
+    producer = threading.Thread(target=produce, daemon=True)
+    producer.start()
+    released = False
+
+    def owns_a(_event):
+        nonlocal released
+        if not released:
+            released = True
+            producer_start.set()
+            assert producer_done.wait(2), "producer did not finish"
+        return True
+
+    try:
+        with pytest.raises(AttributeError):
+            registry.drain_notifications(session_key="A", owns_event=owns_a)
+        producer.join(2)
+        assert not producer.is_alive()
+        with registry.completion_queue.mutex:
+            remaining = list(registry.completion_queue.queue)
+        expected = [*pending, concurrent]
+        assert remaining == expected
+        assert all(actual is wanted for actual, wanted in zip(remaining, expected))
+    finally:
+        producer_start.set()
+        producer.join(2)
+
+
+def test_batch_front_restore_is_atomic_and_nonblocking_for_bounded_queue(registry):
+    completion_queue = queue.Queue(maxsize=3)
+    registry.completion_queue = completion_queue
+    first = {"owner": "A", "seq": 1}
+    foreign = {"owner": "B", "seq": 1}
+    second = {"owner": "A", "seq": 2}
+    concurrent = {"owner": "C", "seq": 1}
+    blocked = {"owner": "D", "seq": 1}
+    for event in (first, foreign, second):
+        completion_queue.put(event)
+
+    detached = registry.drain_matching_completions(
+        lambda event: event.get("owner") == "A"
+    )
+    completion_queue.put(concurrent)
+    restored = threading.Event()
+
+    def restore():
+        registry.requeue_completions_front(detached)
+        restored.set()
+
+    restorer = threading.Thread(target=restore, daemon=True)
+    restorer.start()
+    assert restored.wait(1), "batch restore deadlocked behind a concurrent producer"
+    restorer.join(1)
+
+    with completion_queue.mutex:
+        queued = list(completion_queue.queue)
+        unfinished = completion_queue.unfinished_tasks
+    expected = [first, second, foreign, concurrent]
+    assert queued == expected
+    assert all(actual is wanted for actual, wanted in zip(queued, expected))
+    assert unfinished == 4
+
+    producer_done = threading.Event()
+
+    def produce_blocked():
+        completion_queue.put(blocked)
+        producer_done.set()
+
+    producer = threading.Thread(target=produce_blocked, daemon=True)
+    producer.start()
+    assert not producer_done.wait(0.05)
+    assert completion_queue.get_nowait() is first
+    assert completion_queue.get_nowait() is second
+    assert producer_done.wait(1), "restored over-capacity queue lost not_full wakeup"
+    producer.join(1)
+    with completion_queue.mutex:
+        assert list(completion_queue.queue) == [foreign, concurrent, blocked]
+
+
 def test_drain_notifications_filters_async_delegation_by_session_key():
     """Async-delegation events should only be consumed by the matching session's drain.
 

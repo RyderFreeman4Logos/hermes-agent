@@ -769,6 +769,60 @@ def test_tui_storage_failure_retries_once_in_same_process(
     assert effects == ["completion"]
 
 
+def test_tui_settlement_exception_restores_retained_copy_under_capacity(
+    monkeypatch, tmp_path
+):
+    from tools import async_delegation as ad
+    import tools.process_registry as registry_module
+
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "bounded-copy.db")
+    registry = registry_module.ProcessRegistry()
+    registry.completion_queue = queue.Queue(maxsize=1)
+    monkeypatch.setattr(registry_module, "process_registry", registry)
+    event = {
+        "type": "completion",
+        "session_id": "proc-tui-bounded-copy",
+        "session_key": "active",
+        "started_at": 5.71,
+        "command": "true",
+        "exit_code": 0,
+        "completion_reason": "exited",
+        "termination_source": "",
+        "output": "done",
+    }
+    assert ad.persist_event_delivery(event)
+    registry.completion_queue.put(event)
+    assert registry.get_completion_for_owner(lambda _event: True, timeout=0.5) is event
+
+    monkeypatch.setattr(
+        server,
+        "_finish_completion_claim",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("settlement failed")),
+    )
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+
+    def submit(_rid, _sid, _session, _text, **kwargs):
+        kwargs["completion_delivery_callback"]("provider_failed")
+
+    monkeypatch.setattr(server, "_run_prompt_submit", submit)
+    server._dispatch_completion_batch(
+        "sid",
+        _session(types.SimpleNamespace()),
+        [{"evt": event, "model_text": "completion", "text": "completion"}],
+        consumer="tui-test",
+    )
+
+    retries = registry.drain_matching_completions(lambda _event: True)
+    receipt = ad.get_durable_event_delivery(event)
+    assert receipt is not None
+    assert receipt["delivery_state"] == "effect_started"
+    assert len(retries) == 1
+    assert (
+        retries[0]["_completion_delivery_retained_claim_id"]
+        == receipt["delivery_claim"]
+    )
+
+
 def test_committed_failure_suffix_is_a_terminal_delivery(turn_env):
     """A durable failed/effect suffix is an explicit non-replay disposition."""
     outcomes = []

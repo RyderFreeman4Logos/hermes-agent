@@ -24433,18 +24433,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         but injection is skipped entirely when
         ``display.background_process_notifications`` is ``off`` (#9290).
         """
+        from tools.process_registry import (
+            process_registry,
+            restore_completion_event_retries,
+        )
+
         watch_events = _drain_gateway_watch_events(completion_queue)
         if self._load_background_notifications_mode() == "off":
+            for evt in watch_events:
+                process_registry.consume_completion_event(evt)
             return
 
-        for evt in watch_events:
-            synth_text = _format_gateway_process_notification(evt)
-            if not synth_text:
-                continue
+        for index, evt in enumerate(watch_events):
             try:
-                await self._inject_watch_notification(synth_text, evt)
+                synth_text = _format_gateway_process_notification(evt)
+                if not synth_text:
+                    process_registry.consume_completion_event(evt)
+                    continue
+                accepted = await self._inject_watch_notification(synth_text, evt)
             except Exception as exc:
+                restore_completion_event_retries(
+                    watch_events[index:], registry=process_registry
+                )
                 logger.error("Watch notification injection error: %s", exc)
+                break
+            if accepted is False:
+                restore_completion_event_retries(
+                    watch_events[index:], registry=process_registry
+                )
+                break
+            process_registry.consume_completion_event(evt)
 
     async def _inject_watch_notification(
         self, synth_text: str, evt: dict,
@@ -25415,6 +25433,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             logger.error(
                                 "Heartbeat warm check-in injection error: %s", e
                             )
+                        finally:
+                            _pr.consume_completion_event(evt)
                         continue
                     retry_events: list[dict] = []
                     try:
@@ -25422,6 +25442,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             self._enrich_async_delegation_routing(evt)
                         synth_text = _format_gateway_process_notification(evt)
                         if not synth_text:
+                            _pr.consume_completion_event(evt)
                             continue
                         delivered = await self._deliver_completion_notification(
                             synth_text, evt, retry_queue=retry_events
@@ -25432,6 +25453,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         continue
                     if retry_events or delivered is False:
                         restore_owner_tail(event_index, owner, retry_events)
+                    elif delivered is None:
+                        _pr.consume_completion_event(evt)
             except Exception as e:
                 logger.debug("Async delegation watcher error: %s", e)
             await asyncio.sleep(interval)

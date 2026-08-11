@@ -1301,6 +1301,62 @@ def test_gateway_receipt_consumer_isolates_settlement_exception(
     assert isolated_registry.completion_queue.empty()
 
 
+def test_gateway_noncommitted_receipt_exception_restores_copies_under_capacity(
+    monkeypatch, isolated_registry
+):
+    from tools import async_delegation as ad
+    import tools.process_registry as registry_module
+
+    events = [
+        _completion_event(
+            started_at=2.65 + index / 100,
+            session_id=f"proc-bounded-receipt-{index}",
+        )
+        for index in range(2)
+    ]
+    isolated_registry.completion_queue = queue.Queue(maxsize=2)
+    for event in events:
+        assert ad.persist_event_delivery(event)
+        isolated_registry.completion_queue.put(event)
+    assert isolated_registry.drain_matching_completions(lambda _event: True) == events
+
+    receipts = []
+    for event in events:
+        assert isolated_registry.claim_completion_delivery(event)
+        claim = ad.claim_event_delivery(event, "gateway-bounded-test")
+        assert claim
+        receipts.append({"event": dict(event), "claim_id": claim})
+
+    finish = registry_module.finish_completion_event_delivery
+    attempted = []
+
+    def fail_first(event, claim_id, outcome, **kwargs):
+        attempted.append(event["session_id"])
+        if event["session_id"] == events[0]["session_id"]:
+            raise OSError("receipt settlement unavailable")
+        return finish(event, claim_id, outcome, **kwargs)
+
+    monkeypatch.setattr(registry_module, "finish_completion_event_delivery", fail_first)
+    message = MagicMock(metadata={"_completion_delivery_receipts": receipts})
+    asyncio.run(
+        _runner(SimpleNamespace())._finish_completion_delivery_receipt(
+            message, "provider_failed"
+        )
+    )
+
+    retries = isolated_registry.drain_matching_completions(lambda _event: True)
+    assert attempted == [event["session_id"] for event in events]
+    assert [event["session_id"] for event in retries] == [
+        event["session_id"] for event in events
+    ]
+    assert [
+        bool(event.get("_completion_delivery_retained_claim_id")) for event in retries
+    ] == [
+        True,
+        False,
+    ]
+
+
 def test_busy_gateway_merge_finalizes_every_completion_receipt(
     monkeypatch, isolated_registry
 ):

@@ -18868,15 +18868,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # ordinary recovery/retry envelopes), so this drain leaves them
             # queued and injects only watch-type events.
             try:
-                from tools.process_registry import process_registry as _pr
+                from tools.process_registry import (
+                    process_registry as _pr,
+                    restore_completion_event_retries,
+                )
+
                 _watch_events = _drain_gateway_watch_events(_pr.completion_queue)
-                for evt in _watch_events:
-                    synth_text = _format_gateway_process_notification(evt)
-                    if synth_text:
-                        try:
-                            await self._inject_watch_notification(synth_text, evt)
-                        except Exception as e2:
-                            logger.error("Watch notification injection error: %s", e2)
+                for _watch_index, evt in enumerate(_watch_events):
+                    try:
+                        synth_text = _format_gateway_process_notification(evt)
+                        if not synth_text:
+                            _pr.consume_completion_event(evt)
+                            continue
+                        accepted = await self._inject_watch_notification(
+                            synth_text, evt
+                        )
+                    except Exception as e2:
+                        restore_completion_event_retries(
+                            _watch_events[_watch_index:], registry=_pr
+                        )
+                        logger.error("Watch notification injection error: %s", e2)
+                        break
+                    if accepted is False:
+                        restore_completion_event_retries(
+                            _watch_events[_watch_index:], registry=_pr
+                        )
+                        break
+                    _pr.consume_completion_event(evt)
             except Exception as e:
                 logger.debug("Watch queue drain error: %s", e)
 
@@ -23737,6 +23755,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             logger.error(
                                 "Heartbeat warm check-in injection error: %s", e
                             )
+                        finally:
+                            _pr.consume_completion_event(evt)
                         continue
                     retry_events: list[dict] = []
                     try:
@@ -23744,6 +23764,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             self._enrich_async_delegation_routing(evt)
                         synth_text = _format_gateway_process_notification(evt)
                         if not synth_text:
+                            _pr.consume_completion_event(evt)
                             continue
                         delivered = await self._deliver_completion_notification(
                             synth_text, evt, retry_queue=retry_events
@@ -23754,6 +23775,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         continue
                     if retry_events or delivered is False:
                         restore_owner_tail(event_index, owner, retry_events)
+                    elif delivered is None:
+                        _pr.consume_completion_event(evt)
             except Exception as e:
                 logger.debug("Async delegation watcher error: %s", e)
             await asyncio.sleep(interval)

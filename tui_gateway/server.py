@@ -10722,17 +10722,28 @@ def _notification_poller_loop(
             sid, session, batch_items, consumer="tui-poller"
         )
 
-    # Drain any remaining events after stop signal (process all pending
-    # before exiting so nothing is lost on shutdown). Events owned by other
-    # live sessions are set aside and re-queued so their poller still sees them.
-    # Orphaned events (owner gone) are dropped — same guard as the main loop.
-    deferred: list = []
+    # Drain only this session's bounded queue snapshot after stop. Foreign
+    # events never leave the queue, so a concurrent producer cannot append a
+    # newer event ahead of records this poller would otherwise put back.
+    def should_shutdown_drain(evt: dict) -> bool:
+        if _notification_event_belongs_elsewhere(sid, session, evt):
+            return False
+        requires_owner = _notification_event_requires_owner(evt)
+        if requires_owner and not _session_owns_notification_event(sid, session, evt):
+            return evt.get("type") != "async_delegation"
+        return True
+
+    try:
+        shutdown_events = process_registry.drain_matching_completions(
+            should_shutdown_drain
+        )
+    except Exception as exc:
+        logger.debug("Completion shutdown selection failed: %s", exc)
+        return
+
+    deferred: list[dict] = []
     shutdown_batch: list[dict] = []
-    while not process_registry.completion_queue.empty():
-        try:
-            evt = process_registry.completion_queue.get_nowait()
-        except Exception:
-            break
+    for event_index, evt in enumerate(shutdown_events):
         if _notification_event_belongs_elsewhere(sid, session, evt):
             deferred.append(evt)
             continue
@@ -10772,7 +10783,11 @@ def _notification_poller_loop(
 
         with session["history_lock"]:
             if session.get("running"):
-                process_registry.completion_queue.put(evt)
+                retry_events = [item["evt"] for item in shutdown_batch]
+                retry_events.extend(shutdown_events[event_index:])
+                shutdown_batch.clear()
+                for retry_event in reversed(retry_events):
+                    process_registry.requeue_completion_front(retry_event)
                 break
         shutdown_batch.append({"evt": evt, "model_text": model_text, "text": text})
 
@@ -10780,13 +10795,13 @@ def _notification_poller_loop(
         dispatch_items: list[dict] = []
         with session["history_lock"]:
             if session.get("running"):
-                for item in shutdown_batch:
-                    process_registry.completion_queue.put(item["evt"])
+                for item in reversed(shutdown_batch):
+                    process_registry.requeue_completion_front(item["evt"])
             else:
                 session["running"] = True
                 batch_items, overflow = _bound_completion_batch(shutdown_batch)
-                for item in overflow:
-                    process_registry.completion_queue.put(item["evt"])
+                for item in reversed(overflow):
+                    process_registry.requeue_completion_front(item["evt"])
                 if batch_items:
                     dispatch_items = batch_items
                 else:
@@ -10796,9 +10811,10 @@ def _notification_poller_loop(
                 sid, session, dispatch_items, consumer="tui-poller"
             )
 
-    # Hand any other sessions' events back to the shared queue.
-    for evt in deferred:
-        process_registry.completion_queue.put(evt)
+    # Ownership can change after the snapshot predicate. Fail closed and put
+    # those rare records ahead of any newer producer tail in original order.
+    for evt in reversed(deferred):
+        process_registry.requeue_completion_front(evt)
 
 
 def _handle_heartbeat_event(sid: str, session: dict, evt: dict) -> None:
@@ -12202,7 +12218,7 @@ def _run_prompt_submit(
         #
         # Ownership filter (#42674, #35652): a turn finishing in session B
         # must not consume an event that belongs to session A. The registry
-        # requeues every addressed event this session cannot positively claim;
+        # leaves every addressed event this session cannot positively claim;
         # the poller then delivers it to a live owner or drops an orphan.
         try:
             from tools.process_registry import process_registry

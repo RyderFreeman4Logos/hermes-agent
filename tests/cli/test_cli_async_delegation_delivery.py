@@ -1,6 +1,7 @@
 """Regression coverage for CLI async-delegation completion ownership."""
 
 import queue
+import threading
 import types
 
 import pytest
@@ -61,6 +62,83 @@ def test_cli_completion_drain_uses_visible_session_identity(monkeypatch):
     assert pending.claim_id == "claim-token"
     assert claimed == [(event, "cli-idle")]
     assert completed == []
+
+
+def test_cli_transient_claim_failure_keeps_visible_and_physical_fifo(
+    monkeypatch, tmp_path
+):
+    from tools import async_delegation as ad
+    import tools.process_registry as registry_module
+
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    registry = registry_module.ProcessRegistry()
+    monkeypatch.setattr(registry_module, "process_registry", registry)
+    cli = HermesCLI.__new__(HermesCLI)
+    cli.session_id = "visible-session"
+    cli._session_db = None
+    cli._pending_input = queue.Queue()
+    events = [
+        {
+            "type": "completion",
+            "session_id": f"proc-cli-fifo-{seq}",
+            "session_key": "visible-session",
+            "started_at": float(seq),
+            "command": "false",
+            "exit_code": 1,
+            "completion_reason": "exited",
+            "termination_source": "",
+            "output": f"failure-{seq}",
+        }
+        for seq in (1, 2, 3)
+    ]
+    registry.completion_queue.put(events[0])
+    registry.completion_queue.put(events[1])
+    producer_start = threading.Event()
+    producer_done = threading.Event()
+    released = False
+
+    def owns_event(event: dict) -> bool:
+        nonlocal released
+        if not released:
+            released = True
+            producer_start.set()
+            assert producer_done.wait(2), "producer did not finish"
+        return event.get("session_key") == "visible-session"
+
+    cli._owns_process_notification = owns_event
+
+    def produce():
+        assert producer_start.wait(2), "CLI drain did not reach producer boundary"
+        registry.completion_queue.put(events[2])
+        producer_done.set()
+
+    producer = threading.Thread(target=produce, daemon=True)
+    producer.start()
+    claim_calls = 0
+
+    def transient_claim(_event, _consumer):
+        nonlocal claim_calls
+        claim_calls += 1
+        if claim_calls == 1:
+            raise OSError("claim storage unavailable")
+        return ""
+
+    monkeypatch.setattr(ad, "claim_event_delivery", transient_claim)
+    try:
+        cli._drain_process_notifications("cli-idle")
+        producer.join(2)
+        assert not producer.is_alive()
+        with cli._pending_input.mutex:
+            visible = list(cli._pending_input.queue)
+        with registry.completion_queue.mutex:
+            remaining = list(registry.completion_queue.queue)
+        assert len(visible) == 1
+        assert visible[0].event is events[0]
+        assert remaining == events[1:]
+        assert all(actual is wanted for actual, wanted in zip(remaining, events[1:]))
+    finally:
+        producer_start.set()
+        producer.join(2)
 
 
 @pytest.mark.parametrize("storage_failure", ["claim", "release"])
@@ -125,22 +203,24 @@ def test_cli_storage_failure_retries_once_in_same_process(
             completion_event=first.event,
             completion_claim=first.claim_id,
         ) is None
-    assert cli._pending_input.empty()
-    assert effects == []
-    assert registry.completion_event_should_deliver(event)
-    retry = registry.completion_queue.get_nowait()
-    assert registry.completion_queue.empty()
-    receipt = ad.get_durable_event_delivery(event)
-    assert receipt is not None
-    assert receipt["delivery_state"] == (
-        "pending" if storage_failure == "claim" else "effect_started"
-    )
-    if storage_failure == "release":
+        assert cli._pending_input.empty()
+        assert effects == []
+        assert registry.completion_event_should_deliver(event)
+        retry = registry.completion_queue.get_nowait()
+        assert registry.completion_queue.empty()
+        receipt = ad.get_durable_event_delivery(event)
+        assert receipt is not None
+        assert receipt["delivery_state"] == "effect_started"
         assert retry["_completion_delivery_retained_claim_id"] == receipt["delivery_claim"]
-
-    registry.completion_queue.put(retry)
-    cli._drain_process_notifications("cli-idle")
-    pending = cli._pending_input.get_nowait()
+        registry.completion_queue.put(retry)
+        cli._drain_process_notifications("cli-idle")
+        pending = cli._pending_input.get_nowait()
+    else:
+        pending = cli._pending_input.get_nowait()
+        assert registry.completion_queue.empty()
+        receipt = ad.get_durable_event_delivery(event)
+        assert receipt is not None
+        assert receipt["delivery_state"] == "effect_started"
 
     def committed(message, **kwargs):
         effects.append(message)
@@ -239,7 +319,10 @@ def test_cli_visibility_suppression_records_durable_disposition(
 def test_cli_numeric_completion_queues_model_nudge_and_nonterminal_fails_open(
     monkeypatch,
 ):
-    from tools.process_registry import ProcessRegistry
+    from tools.process_registry import (
+        ProcessRegistry,
+        finish_completion_event_delivery,
+    )
 
     cli = HermesCLI.__new__(HermesCLI)
     cli.session_id = "visible-session"
@@ -252,7 +335,7 @@ def test_cli_numeric_completion_queues_model_nudge_and_nonterminal_fails_open(
         lambda _event, _consumer: "claim-token",
     )
     monkeypatch.setattr(
-        "tools.async_delegation.complete_event_delivery", lambda *_args: None
+        "tools.async_delegation.complete_event_delivery", lambda *_args: True
     )
 
     registry.completion_queue.put(
@@ -282,6 +365,11 @@ def test_cli_numeric_completion_queues_model_nudge_and_nonterminal_fails_open(
     assert isinstance(prompt, cli_module._CompletionDeliveryMessage)
     assert "Background process proc-done completed normally" in prompt
     assert "must be literally empty (zero characters)" in prompt
+    assert prompt.event is not None
+    assert finish_completion_event_delivery(
+        prompt.event, prompt.claim_id, "committed", registry=registry
+    )
+    cli._drain_process_notifications("cli-idle")
     nonterminal = cli._pending_input.get_nowait()
     assert isinstance(nonterminal, cli_module._CompletionDeliveryMessage)
     assert "Background process proc-running exited (exit code None)" in nonterminal

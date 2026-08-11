@@ -22450,15 +22450,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     ) -> None:
         """Resolve push completions only after the gateway turn is terminal."""
         metadata = getattr(event, "metadata", None) or {}
-        from tools.process_registry import finish_completion_event_delivery
+        from tools.process_registry import (
+            finish_completion_event_delivery,
+            process_registry,
+        )
 
+        retry_events: list[dict] = []
         while True:
             receipt = metadata.pop("_completion_delivery_receipt", None)
             if not isinstance(receipt, dict):
                 receipts = metadata.get("_completion_delivery_receipts")
                 if not isinstance(receipts, list) or not receipts:
                     metadata.pop("_completion_delivery_receipts", None)
-                    return
+                    break
                 receipt = receipts.pop(0)
                 if not receipts:
                     metadata.pop("_completion_delivery_receipts", None)
@@ -22473,6 +22477,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 delivery_event,
                 claim_id,
                 outcome,
+                retry_queue=retry_events,
             )
             identity = self._completion_delivery_identity(delivery_event)
             if identity is not None:
@@ -22485,6 +22490,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             > self._completion_delivery_retention
                         ):
                             self._completion_deliveries_delivered.popitem(last=False)
+        process_registry.requeue_completions_front(retry_events)
 
     @staticmethod
     def _completion_delivery_identity(evt: dict) -> Optional[tuple[str, str, object]]:
@@ -22561,7 +22567,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return "deliver"
 
     async def _deliver_completion_notification(
-        self, synth_text: str, evt: dict,
+        self,
+        synth_text: str,
+        evt: dict,
+        *,
+        retry_queue: Optional[list[dict]] = None,
     ) -> Optional[bool]:
         """Deliver once per live gateway, or return False for a retry.
 
@@ -22581,7 +22591,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         process_claimed = False
         ordinary_claim_id = ""
         if evt.get("type", "completion") == "completion":
-            ordinary_claim = claim_completion_event_delivery(evt, "gateway")
+            ordinary_claim = claim_completion_event_delivery(
+                evt, "gateway", retry_queue=retry_queue
+            )
             if ordinary_claim is None:
                 return None
             process_claimed = True
@@ -22594,13 +22606,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except BaseException:
             if process_claimed:
                 finish_completion_event_delivery(
-                    evt, ordinary_claim_id, "provider_failed"
+                    evt,
+                    ordinary_claim_id,
+                    "provider_failed",
+                    retry_queue=retry_queue,
                 )
             raise
         if model_text is None:
             if process_claimed:
                 finish_completion_event_delivery(
-                    evt, ordinary_claim_id, "committed"
+                    evt,
+                    ordinary_claim_id,
+                    "committed",
+                    retry_queue=retry_queue,
                 )
             return None
         synth_text = model_text
@@ -22700,7 +22718,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         self._completion_deliveries_delivered.popitem(last=False)
             if process_claimed:
                 finish_completion_event_delivery(
-                    evt, ordinary_claim_id, "committed"
+                    evt,
+                    ordinary_claim_id,
+                    "committed",
+                    retry_queue=retry_queue,
                 )
 
             # If the durable async-delegation producer branch is present, its
@@ -22725,7 +22746,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     self._completion_deliveries_inflight.discard(identity)
             if process_claimed and not accepted:
                 finish_completion_event_delivery(
-                    evt, ordinary_claim_id, "provider_failed"
+                    evt,
+                    ordinary_claim_id,
+                    "provider_failed",
+                    retry_queue=retry_queue,
                 )
             if durable_claim_id and not accepted:
                 try:
@@ -22858,12 +22882,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             process_registry as _pr,
         )
 
+        def owner_key(evt: dict) -> tuple:
+            for field in ("session_key", "origin_ui_session_id", "origin_session_id"):
+                value = str(evt.get(field) or "")
+                if value:
+                    return ("owner", value)
+            return (
+                "route",
+                str(evt.get("platform") or ""),
+                str(evt.get("chat_type") or ""),
+                str(evt.get("chat_id") or ""),
+                str(evt.get("thread_id") or ""),
+            )
+
         while self._running:
             try:
                 # Select this watcher's bounded snapshot without moving watch
                 # events behind a producer that appends concurrently.
-                completion_events = []
-                heartbeat_events = []
                 events = drain_matching_queue_events(
                     _pr.completion_queue,
                     lambda evt: (
@@ -22871,32 +22906,48 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         in {"completion", "async_delegation", "heartbeat"}
                     ),
                 )
-                for evt in events:
-                    if evt.get("type", "completion") in {
-                        "completion",
-                        "async_delegation",
-                    }:
-                        completion_events.append(evt)
-                    elif evt.get("type") == "heartbeat":
-                        heartbeat_events.append(evt)
-                for evt in completion_events:
-                    if evt.get("type") == "async_delegation":
-                        self._enrich_async_delegation_routing(evt)
-                    synth_text = _format_gateway_process_notification(evt)
-                    if not synth_text:
+                restored_indexes: set[int] = set()
+
+                def restore_owner_tail(
+                    event_index: int,
+                    owner: tuple,
+                    retry_events: list[dict],
+                ) -> None:
+                    restore = retry_events or [events[event_index]]
+                    for later_index in range(event_index + 1, len(events)):
+                        if owner_key(events[later_index]) == owner:
+                            restore.append(events[later_index])
+                            restored_indexes.add(later_index)
+                    _pr.requeue_completions_front(restore)
+
+                for event_index, evt in enumerate(events):
+                    if event_index in restored_indexes:
                         continue
+                    owner = owner_key(evt)
+                    if evt.get("type") == "heartbeat":
+                        try:
+                            await self._handle_heartbeat_event(evt)
+                        except Exception as e:
+                            logger.error(
+                                "Heartbeat warm check-in injection error: %s", e
+                            )
+                        continue
+                    retry_events: list[dict] = []
                     try:
-                        delivered = await self._deliver_completion_notification(synth_text, evt)
-                        if delivered is False:
-                            _pr.completion_queue.put(evt)
+                        if evt.get("type") == "async_delegation":
+                            self._enrich_async_delegation_routing(evt)
+                        synth_text = _format_gateway_process_notification(evt)
+                        if not synth_text:
+                            continue
+                        delivered = await self._deliver_completion_notification(
+                            synth_text, evt, retry_queue=retry_events
+                        )
                     except Exception as e:
-                        _pr.completion_queue.put(evt)
+                        restore_owner_tail(event_index, owner, retry_events)
                         logger.error("Completion injection error: %s", e)
-                for evt in heartbeat_events:
-                    try:
-                        await self._handle_heartbeat_event(evt)
-                    except Exception as e:
-                        logger.error("Heartbeat warm check-in injection error: %s", e)
+                        continue
+                    if retry_events or delivered is False:
+                        restore_owner_tail(event_index, owner, retry_events)
             except Exception as e:
                 logger.debug("Async delegation watcher error: %s", e)
             await asyncio.sleep(interval)
@@ -23000,10 +23051,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     synth_text = format_process_notification(completion_evt)
                     if not synth_text:
                         break
+                    retry_events: list[dict] = []
                     delivered = await self._deliver_completion_notification(
-                        synth_text, completion_evt,
+                        synth_text,
+                        completion_evt,
+                        retry_queue=retry_events,
                     )
-                    if delivered is False:
+                    if retry_events or delivered is False:
                         # The process remains terminal; retry after failed
                         # adapter injection instead of suppressing the result.
                         continue

@@ -3575,6 +3575,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         cwd: str = None,
         profile_name: str = None,
         git_repo_root: str = None,
+        patience_s: Optional[float] = None,
     ) -> None:
         """Insert a session row, enriching NULL metadata on conflict.
 
@@ -3724,7 +3725,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # Session-row creation is transcript-critical: if it fails, the
         # first flush of a new session fails and the turn is aborted as
         # session_persistence_failed. Ride out long sibling holds.
-        self._execute_write(_do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S)
+        self._execute_write(
+            _do,
+            patience_s=(
+                self._TRANSCRIPT_WRITE_PATIENCE_S
+                if patience_s is None
+                else patience_s
+            ),
+        )
 
     def create_session(self, session_id: str, source: str, **kwargs) -> str:
         """Create a new session record. Returns the session_id."""
@@ -7173,6 +7181,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         chunk_rows: Optional[int] = None,
         compression_patience_s: Optional[float] = None,
         display_metadata_cas: Optional[Dict[str, Any]] = None,
+        patience_s: Optional[float] = None,
     ) -> int:
         """Append multiple messages atomically in ONE write transaction.
 
@@ -7206,6 +7215,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         append.  The match includes the row's complete provider/transcript
         identity and expected metadata, so a stale finalizer cannot update a
         different occurrence of the same user text.
+
+        ``patience_s`` overrides the transcript write-lock budget when a caller
+        is spending a shorter absolute deadline.
         """
         if not messages and not display_metadata_cas:
             return 0
@@ -7222,6 +7234,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     messages[start:start + chunk_rows],
                     compression_lock_holder=compression_lock_holder,
                     compression_patience_s=compression_patience_s,
+                    patience_s=patience_s,
                 )
             return inserted_total
 
@@ -7294,7 +7307,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # Same criticality as append_message: this IS the turn's transcript.
         return self._execute_write(
             _do,
-            patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S,
+            patience_s=(
+                self._TRANSCRIPT_WRITE_PATIENCE_S
+                if patience_s is None
+                else patience_s
+            ),
             compression_patience_s=compression_patience_s,
         )
 

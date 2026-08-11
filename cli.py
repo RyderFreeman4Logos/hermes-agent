@@ -12118,17 +12118,21 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     event_is_current = False
                 if not event_is_current:
                     complete_event_delivery(event, claim)
+                    process_registry.consume_completion_event(event)
                     continue
                 status = str(event.get("status") or "").upper()
                 if status in {"STUCK", "UNKNOWN"}:
                     _cprint(f"\n⚠ {synthetic_message}")
                     complete_event_delivery(event, claim)
+                    process_registry.consume_completion_event(event)
                     continue
                 if status != "ALIVE":
                     complete_event_delivery(event, claim)
+                    process_registry.consume_completion_event(event)
                     continue
                 if event.get("heartbeat_warm_owned"):
                     complete_event_delivery(event, claim)
+                    process_registry.consume_completion_event(event)
                     continue
                 agent = getattr(self, "agent", None)
 
@@ -12152,6 +12156,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     name="heartbeat-warm",
                 ).start()
                 complete_event_delivery(event, claim)
+                process_registry.consume_completion_event(event)
                 continue
             elif event.get("type") in {"completion", "async_delegation"}:
                 queued_message = _CompletionDeliveryMessage(
@@ -12171,6 +12176,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 break
             else:
                 complete_event_delivery(event, claim)
+                process_registry.consume_completion_event(event)
 
     def _drain_interrupt_queue_to_pending_input(self) -> None:
         """Move stray messages from ``_interrupt_queue`` into ``_pending_input``.

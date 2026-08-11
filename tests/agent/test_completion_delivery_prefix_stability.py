@@ -1464,6 +1464,73 @@ def test_completion_commit_retry_defaults_favor_recovery():
     assert retry["patience_s"] == 120.0
 
 
+def test_huge_completion_commit_policy_retains_sticky_suffix(monkeypatch):
+    from agent import turn_finalizer
+
+    canonical, wire = _completion_texts()
+    messages = [
+        {
+            "role": "user",
+            "content": wire,
+            "_completion_delivery_synthetic": True,
+        },
+        {"role": "assistant", "content": "visible effect already completed"},
+    ]
+    now = 0.0
+    unsafe_delays: list[float] = []
+
+    def sleep(delay):
+        if delay > 1_000_000:
+            unsafe_delays.append(delay)
+            raise OverflowError("timestamp too large for platform sleep")
+        raise RuntimeError("sleep interrupted")
+
+    agent = SimpleNamespace(
+        _session_db=object(),
+        _persist_disabled=False,
+        _persist_user_message_idx=None,
+        _persist_user_message_override=None,
+        _flush_messages_to_session_db=lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: _completion_commit_config(
+            max_attempts=10**100,
+            initial_backoff_s=1e308,
+            max_backoff_s=1e308,
+            patience_s=1e308,
+        ),
+    )
+    monkeypatch.setattr(
+        turn_finalizer,
+        "time",
+        SimpleNamespace(monotonic=lambda: now, sleep=sleep),
+    )
+
+    assert (
+        turn_finalizer.finalize_completion_delivery_suffix(
+            agent,
+            messages,
+            final_response="visible effect already completed",
+            failed=False,
+            interrupted=False,
+        )
+        == "pending"
+    )
+    assert unsafe_delays == []
+    assert agent._completion_delivery_commit_failed is True
+    assert agent._pending_completion_delivery_suffix == [
+        {
+            "role": "user",
+            "content": canonical,
+            "api_content": wire,
+            "display_kind": "hidden",
+            "display_metadata": {"completion_delivery_status": "complete"},
+        },
+        {"role": "assistant", "content": "visible effect already completed"},
+    ]
+
+
 def test_pending_commit_hot_reloads_budget_and_exponential_backoff(monkeypatch):
     from agent.turn_finalizer import retry_pending_completion_delivery_commit
 
@@ -1616,6 +1683,71 @@ def test_pending_commit_patience_caps_high_attempt_budget(monkeypatch):
     )
     assert attempts == 2
     assert now == pytest.approx(0.06)
+
+
+def test_pending_commit_patience_bounds_real_sessiondb_lock(tmp_path, monkeypatch):
+    from agent.turn_finalizer import retry_pending_completion_delivery_commit
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: _completion_commit_config(
+            max_attempts=32,
+            initial_backoff_s=0,
+            max_backoff_s=0,
+            patience_s=0.01,
+        ),
+    )
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "completion-real-lock-patience"
+    db.create_session(session_id, source="tui", model="test-model")
+    db.append_messages_batch(
+        session_id,
+        [
+            {"role": "user", "content": "before"},
+            {"role": "assistant", "content": "working"},
+        ],
+    )
+    before = db.get_messages_as_conversation(session_id)
+    agent = _make_agent(tmp_path, db, session_id)
+    canonical, wire = _completion_texts()
+    live_event = {
+        "role": "user",
+        "content": wire,
+        "_completion_delivery_synthetic": True,
+    }
+    retained = [
+        {
+            "role": "user",
+            "content": canonical,
+            "api_content": wire,
+            "display_kind": "hidden",
+            "display_metadata": {"completion_delivery_status": "complete"},
+        },
+        {"role": "assistant", "content": "effect already visible"},
+    ]
+    messages = [*before, live_event]
+    agent._session_messages = messages
+    setattr(agent, "_pending_completion_delivery_suffix", copy.deepcopy(retained))
+    setattr(agent, "_pending_completion_delivery_display_metadata_cas", None)
+    setattr(agent, "_completion_delivery_commit_failed", True)
+    db._TRANSCRIPT_WRITE_PATIENCE_S = 0.75
+    blocker = sqlite3.connect(str(db.db_path), timeout=0, isolation_level=None)
+    blocker.execute("PRAGMA busy_timeout=0")
+    blocker.execute("BEGIN IMMEDIATE")
+
+    started = time.monotonic()
+    try:
+        status = retry_pending_completion_delivery_commit(agent, messages)
+    finally:
+        elapsed = time.monotonic() - started
+        blocker.rollback()
+        blocker.close()
+        db.close()
+
+    assert status == "pending"
+    assert elapsed < 0.25
+    assert getattr(agent, "_completion_delivery_commit_failure") == "lock_busy"
+    assert getattr(agent, "_pending_completion_delivery_suffix") == retained
 
 
 @pytest.mark.parametrize(

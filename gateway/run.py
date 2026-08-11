@@ -23160,7 +23160,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             adapter,
                             text=synth_text,
                             session_id=raw_sid,
-                            completion_delivery=evt.get("type") in {
+                            completion_delivery=evt.get("type")
+                            in {
                                 "completion",
                                 "async_delegation",
                             },
@@ -23235,7 +23236,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter,
                     text=synth_text,
                     session_id=raw_sid,
-                    completion_delivery=evt.get("type") in {
+                    completion_delivery=evt.get("type")
+                    in {
                         "completion",
                         "async_delegation",
                     },
@@ -23754,17 +23756,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     else:
                         _out = _raw
                     completion_evt = _pr_check._completion_event(session)
-                    completion_evt.update({
-                        "platform": platform_name,
-                        "chat_type": watcher.get("chat_type", ""),
-                        "chat_id": chat_id,
-                        "thread_id": thread_id,
-                        "user_id": user_id,
-                        "user_name": user_name,
-                        "message_id": message_id,
-                        "command": _command,
-                        "output": _out,
-                    })
+                    completion_evt = _pr_check._completion_presentation_event(
+                        completion_evt,
+                        {
+                            "platform": platform_name,
+                            "chat_type": watcher.get("chat_type", ""),
+                            "chat_id": chat_id,
+                            "thread_id": thread_id,
+                            "user_id": user_id,
+                            "user_name": user_name,
+                            "message_id": message_id,
+                            "command": _command,
+                            "output": _out,
+                        },
+                    )
                     synth_text = format_process_notification(completion_evt)
                     if not synth_text:
                         break

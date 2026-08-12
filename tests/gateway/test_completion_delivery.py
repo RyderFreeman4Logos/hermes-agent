@@ -12,7 +12,7 @@ import threading
 import time
 from collections import OrderedDict
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -814,6 +814,78 @@ async def test_gateway_push_completion_literal_empty_is_silent_and_terminal(
         assert ad.restore_undelivered_completions(queue.Queue()) == 0
         assert await runner._deliver_completion_notification("ignored", dict(event)) is None
         assert provider_calls == 1
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_gateway_push_proxy_completion_noop_is_silent_and_terminal(
+    monkeypatch, tmp_path, isolated_registry
+):
+    """A proxy completion no-op remains a one-call, terminal silent delivery."""
+    from hermes_state import SessionDB
+    from tests.gateway.test_first_turn_session_meta_rebaseline import (
+        SESSION_ID,
+        SESSION_KEY,
+        _bootstrap,
+    )
+    from tests.gateway.test_proxy_mode import (
+        _FakeSSEResponse,
+        _FakeSession,
+        _patch_aiohttp,
+    )
+    from tools import async_delegation as ad
+
+    db = SessionDB(db_path=tmp_path / "sessions.db")
+    db.create_session(SESSION_ID, source="telegram")
+    runner = _bootstrap(monkeypatch, tmp_path, db)
+    runner._running = True
+    runner.session_store._entries = {}
+    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "-1001")
+    monkeypatch.setenv("GATEWAY_PROXY_URL", "http://host:8642")
+    monkeypatch.setenv("GATEWAY_PROXY_KEY", "test-key-123")
+    adapter = _RecordingPushAdapter()
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    adapter.set_message_handler(
+        lambda event: runner._handle_message_with_agent(
+            event, event.source, SESSION_KEY, 1
+        )
+    )
+    event = _async_event("deleg-proxy-literal-empty")
+    event["session_key"] = SESSION_KEY
+    event.update({
+        "platform": "telegram",
+        "chat_type": "group",
+        "chat_id": "-1001",
+        "user_id": "12345",
+    })
+    _persist_pending_completion(event)
+    isolated_registry.completion_queue.put(event)
+    remote = _FakeSession(_FakeSSEResponse(sse_chunks=[
+        'data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n',
+        'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"hermes":{"completed":true,"completion_delivery_status":"dropped","turn_exit_reason":"completion_delivery_noop"}}\n\n',
+        "data: [DONE]\n\n",
+    ]))
+
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+    try:
+        with patch("gateway.run._load_gateway_config", return_value={}):
+            with _patch_aiohttp(remote):
+                with patch("aiohttp.ClientTimeout"):
+                    await runner._async_delegation_watcher(interval=0)
+                    await asyncio.gather(*tuple(adapter._background_tasks))
+
+        assert remote.captured_headers[
+            "X-Hermes-Internal-Completion-Delivery"
+        ] == "test-key-123"
+        assert adapter.sent == []
+        receipt = ad.get_durable_delegation(event["delegation_id"])
+        assert receipt is not None
+        assert receipt["delivery_state"] == "delivered"
+        assert ad.restore_undelivered_completions(queue.Queue()) == 0
+        assert await runner._deliver_completion_notification("ignored", dict(event)) is None
+        assert remote.captured_url == "http://host:8642/v1/chat/completions"
+        assert remote.post_calls == 1
     finally:
         db.close()
 

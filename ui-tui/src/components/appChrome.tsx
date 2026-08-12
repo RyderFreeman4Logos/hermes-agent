@@ -431,10 +431,13 @@ function StatusRows({
     multiline && item.width > itemWidth
       ? {
           ...item,
+          // Never wrap Box-bearing interactive nodes in <Text> — Ink throws
+          // "<Box> can't be nested inside <Text>". Prefer narrowNode (text-only
+          // child + outer Box). Generic Text wrap is for text-compatible nodes.
           node: item.narrowNode ? (
             item.narrowNode(itemWidth)
           ) : (
-            <Box width={itemWidth}>
+            <Box overflow="hidden" width={itemWidth}>
               <Text wrap="truncate-end">{item.node}</Text>
             </Box>
           ),
@@ -905,7 +908,27 @@ export function StatusRule({
         ? { id: 'voice', node: <Text color={t.color.muted}>{voiceLabel}</Text>, width: stringWidth(voiceLabel!) }
         : null,
       (keepAll ? shows('sessions') && !!sessionCountText : showSessionCount)
-        ? { id: 'sessions', node: sessionCountNode, width: stringWidth(sessionCountText) }
+        ? {
+            id: 'sessions',
+            // Keep interactive outer Box; only the text child truncate-ends.
+            // Generic StatusRows Text-wrap would nest this Box inside Text.
+            narrowNode: (width: number) =>
+              onSessionCountClick ? (
+                <Box flexShrink={0} onClick={handleSessionCountClick} width={width}>
+                  <Text color={t.color.accent} wrap="truncate-end">
+                    {sessionCountText}
+                  </Text>
+                </Box>
+              ) : (
+                <Box width={width}>
+                  <Text color={t.color.muted} wrap="truncate-end">
+                    {sessionCountText}
+                  </Text>
+                </Box>
+              ),
+            node: sessionCountNode,
+            width: stringWidth(sessionCountText)
+          }
         : null,
       (keepAll ? shows('bg_tasks') && bgCount > 0 : showBg)
         ? { id: 'bg_tasks', node: <Text color={t.color.muted}>{bgCount} bg</Text>, width: stringWidth(`${bgCount} bg`) }

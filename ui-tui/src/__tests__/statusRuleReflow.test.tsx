@@ -2,13 +2,14 @@ import { PassThrough } from 'stream'
 
 import { AlternateScreen, Box, forceRedraw, renderSync, stringWidth, Text } from '@hermes/ink'
 import React, { Fragment } from 'react'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import { patchDelegationState, resetDelegationState } from '../app/delegationStore.js'
 import { StatusRule } from '../components/appChrome.js'
 import { DEFAULT_STATUS_BAR_SEGMENTS } from '../lib/statusBar.js'
 import { stripAnsi } from '../lib/text.js'
 import { DEFAULT_THEME } from '../theme.js'
+import instances from '../../packages/hermes-ink/src/ink/instances.js'
 
 type StatusRuleProps = React.ComponentProps<typeof StatusRule>
 
@@ -101,7 +102,8 @@ const mount = (node: React.ReactElement, columns: number) => {
       await flush()
 
       return frameLines(output)
-    }
+    },
+    stdout: stdout as unknown as NodeJS.WriteStream
   }
 }
 
@@ -235,6 +237,37 @@ describe('StatusRule responsive Ink layout', () => {
     } finally {
       contextMeter.cleanup()
       model.cleanup()
+    }
+  })
+
+  it('ellipsizes an over-wide clickable session count without losing its click path', async () => {
+    const openSwitcher = vi.fn()
+    const mounted = mount(
+      <AlternateScreen>
+        {status(12, {
+          cwdLabel: '',
+          liveSessionCount: 10,
+          model: '',
+          onSessionCountClick: openSwitcher,
+          status: '',
+          statusBarSegments: ['sessions'],
+          usage: { calls: 0, input: 0, output: 0, total: 0 }
+        })}
+      </AlternateScreen>,
+      12
+    )
+
+    try {
+      await flush()
+      const output = mounted.lines().join('\n')
+
+      expect(output).toContain('10 sessio')
+      expect(output).toContain('…')
+      expect(mounted.lines().every(line => stringWidth(line) <= 12)).toBe(true)
+      expect(instances.get(mounted.stdout)?.dispatchClick(2, 0)).toBe(true)
+      expect(openSwitcher).toHaveBeenCalledOnce()
+    } finally {
+      mounted.cleanup()
     }
   })
 

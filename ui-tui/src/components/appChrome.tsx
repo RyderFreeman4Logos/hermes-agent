@@ -382,6 +382,7 @@ function SpawnHud({ t }: { t: Theme }) {
 interface StatusRenderItem {
   breakBefore?: boolean
   id: string
+  narrowNode?: (width: number) => ReactNode
   node: ReactNode
   width: number
 }
@@ -402,7 +403,17 @@ function StatusRows({
   const delegation = useStore($delegationState)
   const subagents = useTurnSelector(state => state.subagents)
   const spawnHud = useMemo(() => spawnHudLabel(delegation, subagents), [delegation, subagents])
-  const visibleItems = [...items]
+  const itemWidth = Math.max(1, Math.floor(cols || 1) - stringWidth('─ '))
+
+  const visibleItems = items.map(item =>
+    multiline && item.width > itemWidth && item.narrowNode
+      ? {
+          ...item,
+          node: item.narrowNode(itemWidth),
+          width: itemWidth
+        }
+      : item
+  )
 
   if (showSpawnHud && spawnHud.label) {
     visibleItems.push({
@@ -851,6 +862,13 @@ export function StatusRule({
       (keepAll ? shows('resume') && !busy && subagentCount > 0 : showResumeHint)
         ? {
             id: 'resume',
+            narrowNode: (width: number) => (
+              <Box width={width}>
+                <Text color={t.color.muted} dim wrap="truncate-end">
+                  {resumeHintText}
+                </Text>
+              </Box>
+            ),
             node: (
               <Text color={t.color.muted} dim>
                 {resumeHintText}
@@ -869,6 +887,13 @@ export function StatusRule({
       visibleCwdLabel && (keepAll || rightWidth > 0)
         ? {
             id: 'cwd',
+            narrowNode: (width: number) => (
+              <Box width={width}>
+                <Text color={t.color.label} wrap="truncate-end">
+                  {visibleCwdLabel}
+                </Text>
+              </Box>
+            ),
             node: keepAll ? (
               <Text color={t.color.label}>{visibleCwdLabel}</Text>
             ) : (

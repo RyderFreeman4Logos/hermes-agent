@@ -552,7 +552,8 @@ def test_cli_does_not_duplicate_runtime_owned_warm(monkeypatch):
     assert completed == [(event, "claim-token")]
 
 
-def test_cli_unhealthy_heartbeat_is_printed_without_agent_turn(monkeypatch):
+@pytest.mark.parametrize("status", ["STUCK", "UNKNOWN", "CHECKIN_FAILED"])
+def test_cli_unhealthy_heartbeat_is_printed_without_agent_turn(monkeypatch, status):
     from tools.process_registry import ProcessRegistry
 
     cli = HermesCLI.__new__(HermesCLI)
@@ -579,7 +580,7 @@ def test_cli_unhealthy_heartbeat_is_printed_without_agent_turn(monkeypatch):
             "type": "heartbeat",
             "target_id": "proc-heartbeat",
             "session_key": "visible-session",
-            "status": "STUCK",
+            "status": status,
             "evidence": "no progress",
         }
     )
@@ -588,7 +589,7 @@ def test_cli_unhealthy_heartbeat_is_printed_without_agent_turn(monkeypatch):
 
     assert cli._pending_input.empty()
     assert len(printed) == 1
-    assert "STUCK" in printed[0]
+    assert status in printed[0]
     assert "no progress" in printed[0]
 
 

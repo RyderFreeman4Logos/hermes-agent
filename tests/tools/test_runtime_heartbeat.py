@@ -743,6 +743,64 @@ def test_same_visible_session_keeps_distinct_agent_owners_and_warms_each(monkeyp
     assert all(event["heartbeat_warm_owned"] is True for event in published)
 
 
+def test_failed_owned_warm_publishes_visible_current_failure(monkeypatch):
+    from tools.runtime_heartbeat import RuntimeHeartbeat
+
+    class ImmediateThread:
+        def __init__(self, target, **_kwargs):
+            self.target = target
+
+        def start(self):
+            self.target()
+
+    class Owner:
+        provider = "custom"
+        requested_provider = "custom:localrouter"
+        base_url = "https://localrouter.invalid/v1"
+        model = "model"
+        api_mode = "chat_completions"
+
+        def run_conversation(self, _message, **_kwargs):
+            return {
+                "heartbeat_warm_status": "degraded",
+                "heartbeat_warm_reason": "provider_error:APIStatusError",
+            }
+
+    monkeypatch.setattr("tools.runtime_heartbeat.threading.Thread", ImmediateThread)
+    FakeTimer.created = []
+    events = queue.Queue()
+    manager = RuntimeHeartbeat(event_queue=events, timer_factory=FakeTimer)
+    snapshots = iter(
+        (
+            {"alive": True, "output_size": 0, "cpu_seconds": 0.0},
+            {"alive": True, "output_size": 1, "cpu_seconds": 0.0},
+        )
+    )
+    owner = Owner()
+    assert manager.arm(
+        "target",
+        caller_id="owner",
+        kind="process",
+        interval=3300,
+        inspect=lambda: next(snapshots),
+        provider="custom:localrouter",
+        cache_context="cache",
+        owner=owner,
+    )
+
+    FakeTimer.created[0].callback()
+
+    assert events.qsize() == 2
+    queued = [events.get_nowait(), events.get_nowait()]
+    published = {event["status"]: event for event in queued}
+    failed = published["CHECKIN_FAILED"]
+    assert set(published) == {"ALIVE", "CHECKIN_FAILED"}
+    assert failed["evidence"] == "KV cache warm check-in failed"
+    assert failed["heartbeat_warm_reason"] == "provider_error:APIStatusError"
+    assert manager.is_event_current(failed) is True
+    assert manager.active_snapshots()[0]["last_success_at"] is None
+
+
 def test_provider_activity_resets_only_the_exact_agent_owner(monkeypatch):
     from tools.runtime_heartbeat import RuntimeHeartbeat
 

@@ -4431,6 +4431,46 @@ def test_tui_unhealthy_heartbeat_revalidates_at_notice_boundary(monkeypatch):
     assert emitted == []
 
 
+def test_tui_failed_checkin_is_visible_without_model_turn(
+    monkeypatch, current_heartbeat
+):
+    class _Agent:
+        def run_conversation(self, *_args, **_kwargs):
+            pytest.fail("failed heartbeat started another model turn")
+
+    session = _session(agent=_Agent(), session_key="heartbeat-owner")
+    event = _runtime_heartbeat_event(
+        status="CHECKIN_FAILED",
+        evidence="KV cache warm check-in failed",
+        heartbeat_warm_owned=True,
+        heartbeat_warm_capability="degraded",
+        heartbeat_warm_reason="provider_error:APIStatusError",
+    )
+    emitted = []
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event_type, sid, payload: emitted.append((event_type, sid, payload)),
+    )
+
+    server._handle_heartbeat_event("heartbeat-sid", session, event)
+
+    assert emitted == [
+        (
+            "status.update",
+            "heartbeat-sid",
+            {
+                "kind": "process",
+                "text": (
+                    '[HEARTBEAT] Background target "proc-heartbeat" is '
+                    "CHECKIN_FAILED: KV cache warm check-in failed. Elapsed: 0s. "
+                    "KV cache warm check-in."
+                ),
+            },
+        )
+    ]
+
+
 def test_tui_alive_heartbeat_warms_independently_of_busy_turn(
     monkeypatch, current_heartbeat
 ):

@@ -3902,6 +3902,7 @@ def run_conversation(
                     post_compression_cache = _ingest_successful_provider_usage(
                         agent, usage_dict, first_call=api_call_count == 1
                     )
+                    cache_record = agent._provider_response_records[-1]
                     agent.context_compressor.update_from_response(usage_dict)
                 elif getattr(
                     agent.context_compressor,
@@ -3938,14 +3939,24 @@ def run_conversation(
                     agent.session_reasoning_tokens += canonical_usage.reasoning_tokens
 
                     # Log API call details for debugging/observability
-                    _cache_pct = ""
+                    _cache_suffix = ""
                     if canonical_usage.cache_read_tokens and prompt_tokens:
-                        _cache_pct = f" cache={canonical_usage.cache_read_tokens}/{prompt_tokens} ({100*canonical_usage.cache_read_tokens/prompt_tokens:.0f}%)"
+                        _cache_suffix = f" cache={canonical_usage.cache_read_tokens}/{prompt_tokens} ({100 * canonical_usage.cache_read_tokens / prompt_tokens:.0f}%)"
+                    _cache_suffix += f" cache_state={cache_record['state']}"
+                    if "cache_read_tokens" in cache_record:
+                        _cache_suffix += (
+                            f" cache_read={cache_record['cache_read_tokens']}"
+                            f" cache_write={cache_record['cache_write_tokens']}"
+                        )
+                    if "prompt_tokens" in cache_record:
+                        _cache_suffix += (
+                            f" cache_prompt={cache_record['prompt_tokens']}"
+                        )
                     logger.info(
                         "API call #%d: model=%s provider=%s in=%d out=%d total=%d latency=%.1fs%s",
                         agent.session_api_calls, agent.model, agent.provider or "unknown",
                         prompt_tokens, completion_tokens, total_tokens,
-                        api_duration, _cache_pct,
+                        api_duration, _cache_suffix,
                     )
 
                     # On the MoA path, agent.model/provider are the virtual

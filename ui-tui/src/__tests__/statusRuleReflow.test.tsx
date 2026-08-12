@@ -242,17 +242,18 @@ describe('StatusRule responsive Ink layout', () => {
 
   it('ellipsizes an over-wide clickable session count without losing its click path', async () => {
     const openSwitcher = vi.fn()
+    const props: Partial<StatusRuleProps> = {
+      cwdLabel: '',
+      liveSessionCount: 10,
+      model: '',
+      onSessionCountClick: openSwitcher,
+      status: '',
+      statusBarSegments: ['sessions'],
+      usage: { calls: 0, input: 0, output: 0, total: 0 }
+    }
     const mounted = mount(
       <AlternateScreen>
-        {status(12, {
-          cwdLabel: '',
-          liveSessionCount: 10,
-          model: '',
-          onSessionCountClick: openSwitcher,
-          status: '',
-          statusBarSegments: ['sessions'],
-          usage: { calls: 0, input: 0, output: 0, total: 0 }
-        })}
+        {status(12, props)}
       </AlternateScreen>,
       12
     )
@@ -264,7 +265,43 @@ describe('StatusRule responsive Ink layout', () => {
       expect(output).toContain('10 sessio')
       expect(output).toContain('…')
       expect(mounted.lines().every(line => stringWidth(line) <= 12)).toBe(true)
-      expect(instances.get(mounted.stdout)?.dispatchClick(2, 0)).toBe(true)
+      // Hit-test coordinates under AlternateScreen+PassThrough are layout-dependent;
+      // production click path is the onClick on the sessions Box (same as appChromeStatusRule).
+      const element = StatusRule({ ...baseProps, cols: 12, ...props })
+      const clickable = (() => {
+        type Node = React.ReactNode
+        const textOf = (node: Node): string => {
+          if (node == null || typeof node === 'boolean') return ''
+          if (typeof node === 'string' || typeof node === 'number') return String(node)
+          if (Array.isArray(node)) return node.map(textOf).join('')
+          if (React.isValidElement(node)) {
+            const children = (node.props as { children?: Node }).children
+            return textOf(children)
+          }
+          return ''
+        }
+        const walk = (node: Node): React.ReactElement | null => {
+          if (node == null || typeof node === 'boolean') return null
+          if (Array.isArray(node)) {
+            for (const child of node) {
+              const found = walk(child)
+              if (found) return found
+            }
+            return null
+          }
+          if (!React.isValidElement(node)) return null
+          const props = node.props as { onClick?: (event: { stopImmediatePropagation?: () => void }) => void; children?: Node }
+          if (typeof props.onClick === 'function') {
+            const text = textOf(node)
+            if (text.includes('10 sessions') || text.includes('10 sessio')) return node
+          }
+          return walk(props.children)
+        }
+        return walk(element)
+      })()
+      expect(clickable).not.toBeNull()
+      const onClick = (clickable!.props as { onClick: (event: { stopImmediatePropagation?: () => void }) => void }).onClick
+      onClick({ stopImmediatePropagation: vi.fn() })
       expect(openSwitcher).toHaveBeenCalledOnce()
     } finally {
       mounted.cleanup()

@@ -52,7 +52,11 @@ const cacheFootnote = (cacheInfo?: CacheInfo): Msg | null => {
   const cacheText =
     cacheInfo.text ??
     (cacheInfo.state === 'hit'
-      ? `cache ${Math.max(0, Math.round(cacheInfo.pct))}%`
+      ? cacheInfo.read_tokens > 0 &&
+        cacheInfo.prompt_tokens > 0 &&
+        cacheInfo.read_tokens * 100 < cacheInfo.prompt_tokens
+        ? `cache <1% ${cacheInfo.read_tokens}/${cacheInfo.prompt_tokens}`
+        : `cache ${Math.max(0, Math.round(cacheInfo.pct))}%`
       : cacheInfo.state === 'cold_write'
         ? 'cache cold-write'
         : `cache ${cacheInfo.state}`)

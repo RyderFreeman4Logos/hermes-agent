@@ -890,6 +890,112 @@ async def test_gateway_push_proxy_completion_noop_is_silent_and_terminal(
         db.close()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("interrupted", [False, True])
+async def test_gateway_push_proxy_committed_error_terminal_does_not_replay(
+    monkeypatch, tmp_path, isolated_registry, interrupted
+):
+    """A remote committed tool effect stays terminal across an SSE error frame."""
+    from gateway.platforms.api_server import APIServerAdapter
+    from hermes_state import SessionDB
+    from tests.gateway.test_first_turn_session_meta_rebaseline import (
+        SESSION_ID,
+        SESSION_KEY,
+        _bootstrap,
+    )
+    from tests.gateway.test_proxy_mode import _FakeSSEResponse, _FakeSession
+    from tools import async_delegation as ad
+
+    class _CapturingStreamResponse:
+        def __init__(self):
+            self.frames = []
+
+        async def prepare(self, _request):
+            return None
+
+        async def write(self, payload):
+            self.frames.append(payload)
+
+    tool_effects = []
+
+    async def remote_result():
+        tool_effects.append("ran once")
+        return (
+            {
+                "completed": False,
+                "failed": not interrupted,
+                "interrupted": interrupted,
+                "error": "provider failed after tool effect",
+                "completion_delivery_status": "committed",
+                "turn_exit_reason": "interrupted" if interrupted else "provider_failed",
+            },
+            {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+        )
+
+    stream_q = asyncio.Queue()
+    stream_q.put_nowait(None)
+    remote_adapter = APIServerAdapter(PlatformConfig(enabled=True))
+    remote_response = _CapturingStreamResponse()
+    with patch(
+        "gateway.platforms.api_server.web",
+        SimpleNamespace(StreamResponse=lambda **_kwargs: remote_response),
+    ):
+        await remote_adapter._write_sse_chat_completion(
+            SimpleNamespace(headers={}),
+            "completion-id",
+            "test-model",
+            0,
+            stream_q,
+            asyncio.create_task(remote_result()),
+        )
+
+    db = SessionDB(db_path=tmp_path / "sessions.db")
+    db.create_session(SESSION_ID, source="telegram")
+    runner = _bootstrap(monkeypatch, tmp_path, db)
+    runner._running = True
+    runner.session_store._entries = {}
+    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "-1001")
+    monkeypatch.setenv("GATEWAY_PROXY_URL", "http://host:8642")
+    monkeypatch.setenv("GATEWAY_PROXY_KEY", "test-key-123")
+    adapter = _RecordingPushAdapter()
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    adapter.set_message_handler(
+        lambda event: runner._handle_message_with_agent(
+            event, event.source, SESSION_KEY, 1
+        )
+    )
+    event = _async_event(f"deleg-proxy-committed-error-{interrupted}")
+    event["session_key"] = SESSION_KEY
+    event.update({
+        "platform": "telegram",
+        "chat_type": "group",
+        "chat_id": "-1001",
+        "user_id": "12345",
+    })
+    _persist_pending_completion(event)
+    isolated_registry.completion_queue.put(event)
+    remote = _FakeSession(_FakeSSEResponse(sse_chunks=remote_response.frames))
+
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+    try:
+        with patch("gateway.run._load_gateway_config", return_value={}):
+            with patch.dict(
+                "sys.modules",
+                {"aiohttp": SimpleNamespace(ClientSession=lambda **_kwargs: remote, ClientTimeout=MagicMock())},
+            ):
+                await runner._async_delegation_watcher(interval=0)
+                await asyncio.gather(*tuple(adapter._background_tasks))
+
+        assert tool_effects == ["ran once"]
+        receipt = ad.get_durable_delegation(event["delegation_id"])
+        assert receipt is not None
+        assert receipt["delivery_state"] == "delivered"
+        assert ad.restore_undelivered_completions(queue.Queue()) == 0
+        assert remote.post_calls == 1
+    finally:
+        db.close()
+
+
 def test_gateway_recovers_checkpointed_completion_through_history_commit(
     monkeypatch, tmp_path, isolated_registry
 ):

@@ -139,6 +139,7 @@ async def test_raw_api_heartbeat_is_directly_visible_without_model_turn(
         "custom:pm|https://user:password@pm.invalid/v1"
         "?api_key=secret#fragment|model-a|chat_completions"
     )
+    provider_identity = "custom:https://user:password@pm.invalid?api_key=secret#fragment"
 
     await runner._handle_heartbeat_event(
         {
@@ -149,7 +150,7 @@ async def test_raw_api_heartbeat_is_directly_visible_without_model_turn(
             "evidence": "not healthy",
             "generation": 17,
             "target_kind": "process",
-            "provider": "custom:pm",
+            "provider": provider_identity,
             "cache_context": cache_context,
             "heartbeat_warm_reason": "provider_error:APIStatusError",
             "heartbeat_group_token": 23,
@@ -186,7 +187,9 @@ async def test_raw_api_heartbeat_is_directly_visible_without_model_turn(
             marker in serialized
             for marker in (
                 cache_context,
+                provider_identity,
                 "cache_context",
+                '"provider":',
                 "user:password@",
                 "api_key=secret",
                 "#fragment",
@@ -202,5 +205,5 @@ async def test_raw_api_heartbeat_is_directly_visible_without_model_turn(
         assert notice["reason"] == "provider_error:APIStatusError"
         assert notice["generation"] == 17
         assert notice["target_kind"] == "process"
-        assert notice["provider"] == "custom:pm"
+        assert "provider" not in notice
         assert notice["heartbeat_group_token"] == 23

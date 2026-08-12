@@ -9,6 +9,7 @@ import {
   normalizeIndicatorStyle,
   normalizeMouseTracking,
   normalizeStatusBar,
+  normalizeStatusBarSegments,
   syncMcpReload
 } from '../app/useConfigSync.js'
 
@@ -30,7 +31,8 @@ describe('applyDisplay', () => {
             show_reasoning: true,
             streaming: false,
             tui_compact: true,
-            tui_statusbar: false
+            tui_statusbar: false,
+            tui_statusbar_segments: [' MODEL ', 'cwd', 'model', 'unknown']
           }
         }
       },
@@ -44,6 +46,7 @@ describe('applyDisplay', () => {
     expect(s.inlineDiffs).toBe(false)
     expect(s.showReasoning).toBe(true)
     expect(s.statusBar).toBe('off')
+    expect(s.statusBarSegments).toEqual(['model', 'cwd'])
     expect(s.streaming).toBe(false)
   })
 
@@ -190,6 +193,54 @@ describe('normalizeStatusBar', () => {
     expect(normalizeStatusBar('TOP')).toBe('top')
     expect(normalizeStatusBar('  on  ')).toBe('top')
     expect(normalizeStatusBar('OFF')).toBe('off')
+  })
+})
+
+describe('normalizeStatusBarSegments', () => {
+  it('keeps backward-compatible defaults for missing, malformed, and all-unknown values', () => {
+    const defaults = normalizeStatusBarSegments(undefined)
+
+    expect(defaults).toEqual([
+      'battery',
+      'indicator',
+      'model',
+      'context_tokens',
+      'context_bar',
+      'context_percent',
+      'focus',
+      'heartbeat',
+      'session_duration',
+      'idle',
+      'compressions',
+      'voice',
+      'sessions',
+      'bg_tasks',
+      'subagents',
+      'resume',
+      'dev_credits',
+      'spawn_hud',
+      'cwd'
+    ])
+    expect(normalizeStatusBarSegments(null)).toEqual(defaults)
+    expect(normalizeStatusBarSegments('model')).toEqual(defaults)
+    expect(normalizeStatusBarSegments(['typo', 42, null])).toEqual(defaults)
+  })
+
+  it('trims, lowercases, filters, and de-duplicates known IDs', () => {
+    expect(normalizeStatusBarSegments([' MODEL ', 'cwd', 'model', false, 'unknown'])).toEqual(['model', 'cwd'])
+  })
+
+  it('expands the legacy context ID without duplicating explicit context pieces', () => {
+    expect(normalizeStatusBarSegments(['context', 'context_percent', 'voice'])).toEqual([
+      'context_tokens',
+      'context_bar',
+      'context_percent',
+      'voice'
+    ])
+  })
+
+  it('preserves an explicit empty array as hide-all', () => {
+    expect(normalizeStatusBarSegments([])).toEqual([])
   })
 })
 

@@ -179,6 +179,15 @@ display:
 
 Or in-session: `/indicator emoji` (etc.). Styles ship with matched glyph widths so the rest of the status bar doesn't jitter on rotation.
 
+The status bar wraps configured fields onto extra rows below 72 columns. To hide fields persistently, set a flat list in `config.yaml`:
+
+```yaml
+display:
+  tui_statusbar_segments: [indicator, model, context_tokens, cwd]
+```
+
+Available IDs are `battery`, `indicator`, `model`, `context_tokens`, `context_bar`, `context_percent`, `focus`, `heartbeat`, `session_duration`, `idle`, `compressions`, `voice`, `sessions`, `bg_tasks`, `subagents`, `resume`, `dev_credits`, `spawn_hud`, and `cwd`. The legacy ID `context` expands to all three context fields. Unknown entries are ignored; an explicit empty list hides the status bar, while missing, non-list, or all-unknown values keep the default fields.
+
 ## Auto-resume
 
 By default, `hermes --tui` starts a fresh session each launch. To re-attach to the most recent TUI session automatically (useful when your terminal or SSH connection drops unexpectedly), opt in:

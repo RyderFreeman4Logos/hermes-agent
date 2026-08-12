@@ -12074,6 +12074,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         """
         from tools.process_registry import (
             claim_completion_event_delivery,
+            is_completion_delivery_event,
             process_registry,
             restore_completion_event_retries,
         )
@@ -12158,7 +12159,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 complete_event_delivery(event, claim)
                 process_registry.consume_completion_event(event)
                 continue
-            elif event.get("type") in {"completion", "async_delegation"}:
+            elif is_completion_delivery_event(event):
                 queued_message = _CompletionDeliveryMessage(
                     synthetic_message,
                     event=event,

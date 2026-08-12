@@ -24778,6 +24778,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             key: hermes[key]
                                             for key in (
                                                 "completed",
+                                                "partial",
+                                                "failed",
+                                                "interrupted",
+                                                "error",
+                                                "error_code",
                                                 "completion_delivery_status",
                                                 "turn_exit_reason",
                                             )

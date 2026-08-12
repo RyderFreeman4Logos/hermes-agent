@@ -4437,6 +4437,15 @@ class APIServerAdapter(BasePlatformAdapter):
                     "failed": is_failed,
                     "error": err_msg,
                     "error_code": "output_truncated" if finish_reason == "length" else "agent_error",
+                    **{
+                        key: result[key]
+                        for key in (
+                            "completion_delivery_status",
+                            "turn_exit_reason",
+                            "interrupted",
+                        )
+                        if isinstance(result, dict) and key in result
+                    },
                 }
             elif isinstance(result, dict) and (
                 result.get("turn_exit_reason") or result.get("completion_delivery_status")

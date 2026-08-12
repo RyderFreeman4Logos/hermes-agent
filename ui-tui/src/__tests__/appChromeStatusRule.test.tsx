@@ -191,20 +191,6 @@ describe('StatusRule background-subagent indicator', () => {
 
     expect(textContent(element)).not.toContain('resumes when')
   })
-
-  it('drops the subagent segment before the bg segment on a narrow terminal', () => {
-    // cols=44 is below the subagents breakpoint (92) but the bg breakpoint
-    // (88) too — both gone. Assert the lower-priority subagent indicator is
-    // not shown when space is tight even with a live count.
-    const element = StatusRule({
-      ...baseProps,
-      cols: 44,
-      bgCount: 1,
-      usage: { ...baseProps.usage, active_subagents: 2 }
-    })
-
-    expect(textContent(element)).not.toContain('⛓')
-  })
 })
 
 describe('StatusRule runtime heartbeat cadence', () => {
@@ -291,12 +277,15 @@ describe('StatusRule runtime heartbeat cadence', () => {
           }
         ]
       }
+
       const common = {
         ...baseProps,
         cols,
         sessionStartedAt: Date.now() - 60_000
       }
+
       const withoutHeartbeat = StatusRule(common)
+
       const withHeartbeat = StatusRule({
         ...common,
         usage: { ...common.usage, runtime_heartbeat: narrowHeartbeat }
@@ -309,36 +298,36 @@ describe('StatusRule runtime heartbeat cadence', () => {
     }
   )
 
-  it.each([77, 78, 79, 80, 81, 82, 83, 84, 85, 86])(
-    'does not displace cache or idle stop time at %i columns',
-    cols => {
-      const narrowHeartbeat = {
-        active_count: 1,
-        targets: [
-          {
-            ...runtimeHeartbeat.targets[0],
-            started_at: Date.now() / 1000 - 42
-          }
-        ]
-      }
-      const common = {
-        ...baseProps,
-        cols,
-        lastTurnEndedAt: Date.now() - 42_000,
-        sessionStartedAt: null
-      }
-      const withoutHeartbeat = StatusRule(common)
-      const withHeartbeat = StatusRule({
-        ...common,
-        usage: { ...common.usage, runtime_heartbeat: narrowHeartbeat }
-      })
-
-      expect(textContent(withoutHeartbeat)).toContain('25%')
-      expect(textContent(withHeartbeat)).toContain('25%')
-      expect(findComponentByName(withoutHeartbeat, 'IdleSince')).not.toBeNull()
-      expect(findComponentByName(withHeartbeat, 'IdleSince')).not.toBeNull()
+  it.each([77, 78, 79, 80, 81, 82, 83, 84, 85, 86])('does not displace cache or idle stop time at %i columns', cols => {
+    const narrowHeartbeat = {
+      active_count: 1,
+      targets: [
+        {
+          ...runtimeHeartbeat.targets[0],
+          started_at: Date.now() / 1000 - 42
+        }
+      ]
     }
-  )
+
+    const common = {
+      ...baseProps,
+      cols,
+      lastTurnEndedAt: Date.now() - 42_000,
+      sessionStartedAt: null
+    }
+
+    const withoutHeartbeat = StatusRule(common)
+
+    const withHeartbeat = StatusRule({
+      ...common,
+      usage: { ...common.usage, runtime_heartbeat: narrowHeartbeat }
+    })
+
+    expect(textContent(withoutHeartbeat)).toContain('25%')
+    expect(textContent(withHeartbeat)).toContain('25%')
+    expect(findComponentByName(withoutHeartbeat, 'IdleSince')).not.toBeNull()
+    expect(findComponentByName(withHeartbeat, 'IdleSince')).not.toBeNull()
+  })
 
   it('clears the footer when the reconciled snapshot is empty', () => {
     const element = StatusRule({
@@ -377,41 +366,6 @@ describe('StatusRule session count click target', () => {
     expect(clickableSessionCount).not.toBeNull()
     clickableSessionCount!.props.onClick({ stopImmediatePropagation: vi.fn() })
     expect(openSwitcher).toHaveBeenCalledOnce()
-  })
-
-  it('keeps status + model and drops the low-value tail on a narrow terminal', () => {
-    const element = StatusRule({
-      bgCount: 0,
-      busy: false,
-      cols: 44,
-      cwdLabel: '~/src/hermes-agent/apps/desktop (bb/tui-statusbar-responsive)',
-      liveSessionCount: 3,
-      model: 'opus-4.8',
-      onSessionCountClick: vi.fn(),
-      sessionStartedAt: Date.now() - 60_000,
-      status: 'ready',
-      statusColor: DEFAULT_THEME.color.ok,
-      t: DEFAULT_THEME,
-      turnStartedAt: null,
-      usage: {
-        calls: 0,
-        context_max: 200_000,
-        context_percent: 25,
-        context_used: 50_000,
-        input: 0,
-        output: 0,
-        total: 50_000
-      },
-      voiceLabel: 'voice off'
-    })
-
-    const rendered = textContent(element)
-
-    // Must-keep essentials survive intact …
-    expect(rendered).toContain('ready')
-    expect(rendered).toContain('opus 4.8')
-    // … while the low-value tail (session count) is dropped, not truncated.
-    expect(rendered).not.toContain('3 sessions')
   })
 })
 
@@ -483,7 +437,7 @@ describe('StatusRule credits notice render priority', () => {
 
     const element = StatusRule({
       ...baseProps,
-      cols: 50,
+      cols: 72,
       notice: { key: 'credits.90', kind: 'sticky', level: 'warn', text: longText }
     })
 

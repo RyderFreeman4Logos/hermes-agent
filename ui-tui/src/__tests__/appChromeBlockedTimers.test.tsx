@@ -286,6 +286,7 @@ describe('status-chrome timers under an occluding overlay', () => {
     patchOverlayState({ sessions: true })
 
     const rule = mount(idleProps)
+    await flush()
 
     expect(rule.output()).toContain('1m 0s')
     expect(rule.output()).toContain('✓ 5s')

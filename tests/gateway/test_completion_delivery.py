@@ -16,7 +16,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from gateway.config import Platform
+from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.run import GatewayRunner, _drain_gateway_watch_events
 from gateway.session import SessionSource
 from tools.process_registry import ProcessRegistry, ProcessSession
@@ -48,6 +49,30 @@ def _runner(adapter, *, origins=None):
     runner._completion_deliveries_delivered = OrderedDict()
     runner._completion_delivery_retention = 2048
     return runner
+
+
+class _RecordingPushAdapter(BasePlatformAdapter):
+    """Minimal push surface for completion-delivery end-to-end coverage."""
+
+    def __init__(self):
+        super().__init__(
+            PlatformConfig(enabled=True, token="test", typing_indicator=False),
+            Platform.TELEGRAM,
+        )
+        self.sent = []
+
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        return True
+
+    async def disconnect(self) -> None:
+        return None
+
+    async def get_chat_info(self, chat_id):
+        return {"id": chat_id}
+
+    async def send(self, chat_id, content, reply_to=None, metadata=None) -> SendResult:
+        self.sent.append((chat_id, content, reply_to, metadata))
+        return SendResult(success=True, message_id="sent")
 
 
 def _async_event(delegation_id="deleg_duplicate"):
@@ -718,6 +743,79 @@ async def _run_gateway_completion_queue(monkeypatch, runner, registry):
     assert not registry.completion_queue.empty()
     _stop_after_sleeps(monkeypatch, runner, count=2)
     await runner._async_delegation_watcher(interval=0)
+
+
+@pytest.mark.asyncio
+async def test_gateway_push_completion_literal_empty_is_silent_and_terminal(
+    monkeypatch, tmp_path, isolated_registry
+):
+    """A completed async-delegation no-op sends nothing and cannot replay."""
+    from hermes_state import SessionDB
+    from tests.gateway.test_first_turn_session_meta_rebaseline import (
+        SESSION_ID,
+        SESSION_KEY,
+        _bootstrap,
+    )
+    from tools import async_delegation as ad
+
+    db = SessionDB(db_path=tmp_path / "sessions.db")
+    db.create_session(SESSION_ID, source="telegram")
+    runner = _bootstrap(monkeypatch, tmp_path, db)
+    runner._running = True
+    runner.session_store._entries = {}
+    monkeypatch.setenv("TELEGRAM_HOME_CHANNEL", "-1001")
+    adapter = _RecordingPushAdapter()
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    adapter.set_message_handler(
+        lambda event: runner._handle_message_with_agent(
+            event, event.source, SESSION_KEY, 1
+        )
+    )
+    provider_calls = 0
+
+    async def run_agent(**_kwargs):
+        nonlocal provider_calls
+        provider_calls += 1
+        return {
+            "final_response": "",
+            "messages": [],
+            "tools": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+            "api_calls": 1,
+            "completed": True,
+            "turn_exit_reason": "completion_delivery_noop",
+            "completion_delivery_status": "dropped",
+        }
+
+    runner._run_agent = AsyncMock(side_effect=run_agent)
+    event = _async_event("deleg-literal-empty")
+    event["session_key"] = SESSION_KEY
+    event.update({
+        "platform": "telegram",
+        "chat_type": "group",
+        "chat_id": "-1001",
+        "user_id": "12345",
+    })
+    _persist_pending_completion(event)
+    isolated_registry.completion_queue.put(event)
+
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+    try:
+        await runner._async_delegation_watcher(interval=0)
+        assert adapter._background_tasks
+        await asyncio.gather(*tuple(adapter._background_tasks))
+
+        assert provider_calls == 1
+        assert adapter.sent == []
+        receipt = ad.get_durable_delegation(event["delegation_id"])
+        assert receipt is not None
+        assert receipt["delivery_state"] == "delivered"
+        assert ad.restore_undelivered_completions(queue.Queue()) == 0
+        assert await runner._deliver_completion_notification("ignored", dict(event)) is None
+        assert provider_calls == 1
+    finally:
+        db.close()
 
 
 def test_gateway_recovers_checkpointed_completion_through_history_commit(

@@ -3466,6 +3466,14 @@ def _normalize_empty_agent_response(
     if response:
         return response
 
+    if (
+        agent_result.get("turn_exit_reason") == "completion_delivery_noop"
+        and agent_result.get("completed")
+        and not agent_result.get("failed")
+        and not agent_result.get("interrupted")
+    ):
+        return ""
+
     if agent_result.get("failed"):
         error_detail = agent_result.get("error", "unknown error")
         error_str = str(error_detail).lower()
@@ -5616,6 +5624,7 @@ class TurnRunner:
                 "completion_delivery_status": result.get(
                     "completion_delivery_status"
                 ),
+                "turn_exit_reason": result.get("turn_exit_reason"),
                 "compression_exhausted": result.get("compression_exhausted", False),
                 "compression_deferred": result.get("compression_deferred", False),
                 "tools": ctx.tools_holder[0] or [],
@@ -5752,6 +5761,9 @@ class TurnRunner:
             "completion_delivery_status": (
                 ctx.result_holder[0].get("completion_delivery_status")
                 if ctx.result_holder[0] else None
+            ),
+            "turn_exit_reason": (
+                ctx.result_holder[0].get("turn_exit_reason") if ctx.result_holder[0] else None
             ),
             "interrupt_message": ctx.result_holder[0].get("interrupt_message") if ctx.result_holder[0] else None,
             # Soft lock-contention defer (#69870 consumer): distinct from

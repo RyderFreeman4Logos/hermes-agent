@@ -19,6 +19,7 @@ pass identically in CI and locally.
 
 import copy
 import json
+import logging
 import os
 import queue
 import threading
@@ -2392,6 +2393,73 @@ def test_post_compression_cache_attribution_survives_retry_then_clears():
         False,
     ]
     assert "\033[31m94%\033[0m" not in cache_lines[1]
+
+
+@pytest.mark.parametrize(
+    ("cache_details", "expected_suffix"),
+    [
+        (
+            SimpleNamespace(cached_tokens=1_880, cache_write_tokens=0),
+            "cache=1880/2000 (94%) cache_state=hit cache_read=1880 cache_write=0 cache_prompt=2000",
+        ),
+        (
+            SimpleNamespace(cached_tokens=0, cache_write_tokens=0),
+            "cache_state=miss cache_read=0 cache_write=0 cache_prompt=2000",
+        ),
+        (
+            SimpleNamespace(cached_tokens=0, cache_write_tokens=2_000),
+            "cache_state=cold_write cache_read=0 cache_write=2000 cache_prompt=2000",
+        ),
+        (None, "cache_state=no_field cache_prompt=2000"),
+    ],
+)
+def test_api_call_cache_log_preserves_canonical_states_and_scalars(
+    caplog, cache_details, expected_suffix
+):
+    sensitive = {
+        "prompt": "PROMPT_CONTENT_SENTINEL",
+        "response": "RESPONSE_CONTENT_SENTINEL",
+        "request": "REQUEST_BODY_SENTINEL",
+        "header": "HEADER_SENTINEL",
+        "credential": "CREDENTIAL_SENTINEL",
+        "provider": "PROVIDER_PAYLOAD_SENTINEL",
+    }
+    agent = _make_agent()
+    agent.api_key = sensitive["credential"]
+    client = MagicMock()
+    client.default_headers = {"Authorization": sensitive["header"]}
+    agent.client = client
+    response = _mock_response(content=sensitive["response"])
+    response.usage = SimpleNamespace(
+        prompt_tokens=2_000,
+        completion_tokens=10,
+        total_tokens=2_010,
+        prompt_tokens_details=cache_details,
+        provider_payload=sensitive["provider"],
+    )
+    agent.client.chat.completions.create.return_value = response
+
+    with (
+        caplog.at_level(logging.INFO, logger="agent.conversation_loop"),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        agent.run_conversation(f"{sensitive['prompt']} {sensitive['request']}")
+
+    cache_log = next(
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "agent.conversation_loop"
+        and "API call #" in record.getMessage()
+    )
+    assert cache_log.endswith(expected_suffix)
+    assert "cache_state=unknown" not in cache_log
+    if cache_details is None:
+        assert "cache_read=" not in cache_log
+        assert "cache_write=" not in cache_log
+    for value in sensitive.values():
+        assert value not in cache_log
 
 
 def test_run_conversation_partial_stream_recovery_surfaces_explanation():

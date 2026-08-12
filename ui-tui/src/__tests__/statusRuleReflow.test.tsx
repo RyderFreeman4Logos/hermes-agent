@@ -9,7 +9,6 @@ import { StatusRule } from '../components/appChrome.js'
 import { DEFAULT_STATUS_BAR_SEGMENTS } from '../lib/statusBar.js'
 import { stripAnsi } from '../lib/text.js'
 import { DEFAULT_THEME } from '../theme.js'
-import instances from '../../packages/hermes-ink/src/ink/instances.js'
 
 type StatusRuleProps = React.ComponentProps<typeof StatusRule>
 

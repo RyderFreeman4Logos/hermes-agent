@@ -18,6 +18,8 @@ from hermes_constants import PARTIAL_STREAM_STUB_ID
 
 logger = logging.getLogger(__name__)
 
+DIRECT_HEARTBEAT_STATUSES = frozenset({"STUCK", "UNKNOWN", "CHECKIN_FAILED"})
+
 _current_provider: contextvars.ContextVar[str] = contextvars.ContextVar(
     "runtime_heartbeat_provider", default=""
 )
@@ -1334,7 +1336,10 @@ class RuntimeHeartbeat:
         try:
             alive = dict(target.inspect() or {}).get("alive") is True
         except Exception:
-            alive = str(event.get("status") or "").upper() == "UNKNOWN"
+            alive = str(event.get("status") or "").upper() in {
+                "UNKNOWN",
+                "CHECKIN_FAILED",
+            }
         if not alive:
             return False
         with self._lock:
@@ -1545,13 +1550,11 @@ class RuntimeHeartbeat:
         """Run the isolated warm on the exact AIAgent that launched the target."""
         owner = target.owner_ref() if callable(target.owner_ref) else None
         if owner is None:
-            event["heartbeat_warm_capability"] = "degraded"
-            event["heartbeat_warm_reason"] = "owner_unavailable"
-            logger.warning(
-                "runtime heartbeat cannot warm exact owner target=%s provider=%s: "
-                "owner is no longer available",
-                target.target_id,
-                target.provider,
+            self.record_warm_outcome(
+                event,
+                status="degraded",
+                reason="owner_unavailable",
+                expected_target=target,
             )
             return
 
@@ -1592,16 +1595,11 @@ class RuntimeHeartbeat:
             with self._lock:
                 target.warm_inflight = False
                 self._publication_done.notify_all()
-            event["heartbeat_warm_capability"] = "degraded"
-            event["heartbeat_warm_reason"] = (
-                f"owner_dispatch_start_error:{type(exc).__name__}"
-            )
-            logger.warning(
-                "runtime heartbeat could not start exact-owner warm target=%s "
-                "provider=%s error=%s",
-                target.target_id,
-                target.provider,
-                type(exc).__name__,
+            self.record_warm_outcome(
+                event,
+                status="degraded",
+                reason=f"owner_dispatch_start_error:{type(exc).__name__}",
+                expected_target=target,
             )
 
     def record_warm_outcome(
@@ -1617,6 +1615,7 @@ class RuntimeHeartbeat:
         generation = event.get("generation")
         event["heartbeat_warm_capability"] = status
         event["heartbeat_warm_reason"] = reason
+        failure_event = None
         with self._lock:
             target = self._targets.get(target_id)
             current = target is not None and (
@@ -1624,12 +1623,18 @@ class RuntimeHeartbeat:
                 if expected_target is not None
                 else target.generation == generation
             )
-            if current:
+            if current and target is not None:
                 # A successful warm rearms this same target before returning,
                 # so its generation legitimately advances.  Object identity
                 # distinguishes that rearm from target-id reuse after cancel.
                 target.warm_capability = status
                 target.warm_reason = reason
+                if status == "degraded" and target.generation == generation:
+                    failure_event = dict(event)
+                    failure_event.update(
+                        status="CHECKIN_FAILED",
+                        evidence="KV cache warm check-in failed",
+                    )
         log = logger.warning if status == "degraded" else logger.debug
         log(
             "runtime heartbeat warm outcome target=%s owner=%s provider=%s "
@@ -1640,6 +1645,8 @@ class RuntimeHeartbeat:
             status,
             reason or "none",
         )
+        if failure_event is not None:
+            self._queue().put(failure_event)
         return current
 
 

@@ -10776,7 +10776,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         from tools.async_delegation import (
             complete_event_delivery,
         )
-        from tools.runtime_heartbeat import runtime_heartbeat
+        from tools.runtime_heartbeat import (
+            DIRECT_HEARTBEAT_STATUSES,
+            runtime_heartbeat,
+        )
 
         if getattr(self, "_completion_delivery_inflight", False):
             return
@@ -10817,7 +10820,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     process_registry.consume_completion_event(event)
                     continue
                 status = str(event.get("status") or "").upper()
-                if status in {"STUCK", "UNKNOWN"}:
+                if status in DIRECT_HEARTBEAT_STATUSES:
                     _cprint(f"\n⚠ {synthetic_message}")
                     complete_event_delivery(event, claim)
                     process_registry.consume_completion_event(event)

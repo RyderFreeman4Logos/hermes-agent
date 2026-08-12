@@ -1433,6 +1433,7 @@ def run_heartbeat_warm(
         }
 
     from tools.runtime_heartbeat import (
+        DIRECT_HEARTBEAT_STATUSES,
         claim_warm_snapshot,
         commit_warm_snapshot_dispatch,
         dispatch_warm_snapshot_request,
@@ -1468,7 +1469,7 @@ def run_heartbeat_warm(
             reason=f"event_validation_exception:{type(exc).__name__}",
         )
     status = str(heartbeat_event.get("status") or "").upper()
-    if status in {"STUCK", "UNKNOWN"}:
+    if status in DIRECT_HEARTBEAT_STATUSES:
         return finish(
             silent=False,
             status=status,

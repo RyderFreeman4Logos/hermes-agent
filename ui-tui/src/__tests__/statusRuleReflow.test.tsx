@@ -241,6 +241,7 @@ describe('StatusRule responsive Ink layout', () => {
 
   it('ellipsizes an over-wide clickable session count without losing its click path', async () => {
     const openSwitcher = vi.fn()
+
     const props: Partial<StatusRuleProps> = {
       cwdLabel: '',
       liveSessionCount: 10,
@@ -250,6 +251,7 @@ describe('StatusRule responsive Ink layout', () => {
       statusBarSegments: ['sessions'],
       usage: { calls: 0, input: 0, output: 0, total: 0 }
     }
+
     const mounted = mount(
       <AlternateScreen>
         {status(12, props)}
@@ -269,11 +271,14 @@ describe('StatusRule responsive Ink layout', () => {
       const root = StatusRule({ ...baseProps, cols: 12, ...props }) as React.ReactElement<{
         items: Array<{ id: string; narrowNode?: (width: number) => React.ReactNode; node: React.ReactNode; width: number }>
       }>
+
       const sessions = root.props.items.find(item => item.id === 'sessions')
       expect(sessions?.narrowNode).toEqual(expect.any(Function))
       const narrow = sessions!.narrowNode!(10)
+
       const onClick = (narrow as React.ReactElement<{ onClick?: (event: { stopImmediatePropagation?: () => void }) => void }>).props
         .onClick
+
       expect(onClick).toEqual(expect.any(Function))
       onClick!({ stopImmediatePropagation: vi.fn() })
       expect(openSwitcher).toHaveBeenCalledOnce()

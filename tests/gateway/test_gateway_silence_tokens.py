@@ -1,5 +1,6 @@
 """Gateway intentional-silence token behavior."""
 
+import json
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock
 
@@ -129,9 +130,14 @@ async def test_raw_api_heartbeat_is_directly_visible_without_model_turn(
     runner.session_store._entries = {caller_id: object()}
     runner._inject_watch_notification = AsyncMock(return_value=True)
     runner._deliver_platform_notice = AsyncMock(return_value=True)
+    is_event_current = MagicMock(return_value=True)
     monkeypatch.setattr(
         "tools.runtime_heartbeat.runtime_heartbeat.is_event_current",
-        lambda *_args, **_kwargs: True,
+        is_event_current,
+    )
+    cache_context = (
+        "custom:pm|https://user:password@pm.invalid/v1"
+        "?api_key=secret#fragment|model-a|chat_completions"
     )
 
     await runner._handle_heartbeat_event(
@@ -144,7 +150,8 @@ async def test_raw_api_heartbeat_is_directly_visible_without_model_turn(
             "generation": 17,
             "target_kind": "process",
             "provider": "custom:pm",
-            "cache_context": "custom:pm|https://pm.invalid/v1|model-a|chat_completions",
+            "cache_context": cache_context,
+            "heartbeat_warm_reason": "provider_error:APIStatusError",
             "heartbeat_group_token": 23,
         }
     )
@@ -153,15 +160,47 @@ async def test_raw_api_heartbeat_is_directly_visible_without_model_turn(
     runner._deliver_platform_notice.assert_not_awaited()
     from gateway.status import read_runtime_status
 
-    notices = read_runtime_status()["runtime_notices"]
-    assert notices[-1]["type"] == "runtime_heartbeat"
-    assert notices[-1]["status"] == status
-    assert notices[-1]["session_key"] == caller_id
-    assert notices[-1]["target_id"] == "proc-heartbeat"
-    assert notices[-1]["generation"] == 17
-    assert notices[-1]["target_kind"] == "process"
-    assert notices[-1]["provider"] == "custom:pm"
-    assert notices[-1]["cache_context"] == (
-        "custom:pm|https://pm.invalid/v1|model-a|chat_completions"
+    assert is_event_current.call_count == 2
+    persisted_text = (tmp_path / "gateway_state.json").read_text(encoding="utf-8")
+    runtime_status = read_runtime_status()
+    assert runtime_status is not None
+    persisted_notice = runtime_status["runtime_notices"][-1]
+
+    from gateway.config import PlatformConfig
+    from gateway.platforms.api_server import APIServerAdapter
+
+    adapter = APIServerAdapter(
+        PlatformConfig(enabled=True, extra={"key": "fixture-gateway-key"})
     )
-    assert notices[-1]["heartbeat_group_token"] == 23
+    request = MagicMock()
+    request.headers = {"Authorization": "Bearer fixture-gateway-key"}
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda: "test/model")
+    response = await adapter._handle_health_detailed(request)
+    assert response.status == 200
+    api_text = response.text
+    assert api_text is not None
+    api_notice = json.loads(api_text)["runtime_notices"][-1]
+
+    for serialized in (persisted_text, api_text):
+        leaked = any(
+            marker in serialized
+            for marker in (
+                cache_context,
+                "cache_context",
+                "user:password@",
+                "api_key=secret",
+                "#fragment",
+            )
+        )
+        assert not leaked, "credential-shaped cache identity reached an operational notice"
+    for notice in (persisted_notice, api_notice):
+        assert notice["type"] == "runtime_heartbeat"
+        assert notice["status"] == status
+        assert notice["session_key"] == caller_id
+        assert notice["target_id"] == "proc-heartbeat"
+        assert notice["evidence"] == "not healthy"
+        assert notice["reason"] == "provider_error:APIStatusError"
+        assert notice["generation"] == 17
+        assert notice["target_kind"] == "process"
+        assert notice["provider"] == "custom:pm"
+        assert notice["heartbeat_group_token"] == 23

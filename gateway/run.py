@@ -22867,6 +22867,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "target_id": target[:500],
                         "session_key": caller_id[:500],
                         "evidence": evidence[:2000],
+                        "reason": str(evt.get("heartbeat_warm_reason") or "")[:500],
                         "elapsed_s": elapsed,
                         "generation": (
                             generation
@@ -22876,9 +22877,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         ),
                         "target_kind": str(evt.get("target_kind") or "")[:100],
                         "provider": str(evt.get("provider") or "")[:500],
-                        "cache_context": str(
-                            evt.get("cache_context") or ""
-                        )[:1000],
                         "heartbeat_group_token": (
                             group_token
                             if isinstance(group_token, int)

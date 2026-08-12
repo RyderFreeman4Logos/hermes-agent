@@ -405,15 +405,7 @@ function StatusRows({
   const spawnHud = useMemo(() => spawnHudLabel(delegation, subagents), [delegation, subagents])
   const itemWidth = Math.max(1, Math.floor(cols || 1) - stringWidth('─ '))
 
-  const visibleItems = items.map(item =>
-    multiline && item.width > itemWidth && item.narrowNode
-      ? {
-          ...item,
-          node: item.narrowNode(itemWidth),
-          width: itemWidth
-        }
-      : item
-  )
+  const visibleItems = [...items]
 
   if (showSpawnHud && spawnHud.label) {
     visibleItems.push({
@@ -435,11 +427,27 @@ function StatusRows({
     })
   }
 
-  if (!visibleItems.length) {
+  const boundedItems = visibleItems.map(item =>
+    multiline && item.width > itemWidth
+      ? {
+          ...item,
+          node: item.narrowNode ? (
+            item.narrowNode(itemWidth)
+          ) : (
+            <Box width={itemWidth}>
+              <Text wrap="truncate-end">{item.node}</Text>
+            </Box>
+          ),
+          width: itemWidth
+        }
+      : item
+  )
+
+  if (!boundedItems.length) {
     return null
   }
 
-  const rows = multiline ? packStatusRows(visibleItems, cols, stringWidth(' │ '), stringWidth('─ ')) : [visibleItems]
+  const rows = multiline ? packStatusRows(boundedItems, cols, stringWidth(' │ '), stringWidth('─ ')) : [boundedItems]
 
   return (
     <Box flexDirection="column" flexShrink={0} width={Math.max(1, Math.floor(cols || 1))}>

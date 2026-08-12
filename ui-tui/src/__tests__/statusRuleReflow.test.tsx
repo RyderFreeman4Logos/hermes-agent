@@ -191,6 +191,53 @@ describe('StatusRule responsive Ink layout', () => {
     }
   })
 
+  it('ellipsizes over-wide fallback segments at the Ink boundary', async () => {
+    const contextMeter = mount(
+      status(12, {
+        cwdLabel: '',
+        model: '',
+        status: '',
+        statusBarSegments: ['context_bar', 'context_percent'],
+        usage: {
+          context_max: 128_000,
+          context_percent: 25,
+          context_used: 32_000,
+          calls: 0,
+          input: 0,
+          output: 0,
+          total: 0
+        }
+      }),
+      12
+    )
+
+    const model = mount(
+      status(12, {
+        cwdLabel: '',
+        model: 'provider/over-wide-model-name',
+        status: '',
+        statusBarSegments: ['model'],
+        usage: { calls: 0, input: 0, output: 0, total: 0 }
+      }),
+      12
+    )
+
+    try {
+      await flush()
+      const contextOutput = contextMeter.lines().join('\n')
+      const modelOutput = model.lines().join('\n')
+
+      expect(contextOutput).toContain('[███')
+      expect(contextOutput).toContain('…')
+      expect(modelOutput).toContain('over wide…')
+      expect(contextMeter.lines().every(line => stringWidth(line) <= 12)).toBe(true)
+      expect(model.lines().every(line => stringWidth(line) <= 12)).toBe(true)
+    } finally {
+      contextMeter.cleanup()
+      model.cleanup()
+    }
+  })
+
   it('bounds over-wide resume and Unicode cwd segments instead of clipping them', async () => {
     const resume = mount(
       status(12, {

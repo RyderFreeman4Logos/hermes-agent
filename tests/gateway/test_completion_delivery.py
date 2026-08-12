@@ -841,6 +841,7 @@ def test_gateway_retries_retained_same_process_claim(monkeypatch, isolated_regis
 def test_raw_api_async_ack_failure_uses_shared_committed_recovery(
     monkeypatch, isolated_registry
 ):
+    from agent.message_sanitization import COMPLETION_DELIVERY_INSTRUCTION
     from tools import async_delegation as ad
 
     event = _async_event("deleg-raw-api-ack")
@@ -870,7 +871,11 @@ def test_raw_api_async_ack_failure_uses_shared_committed_recovery(
     assert (
         asyncio.run(runner._deliver_completion_notification("VISIBLE", event)) is True
     )
-    assert visible_effects == [("VISIBLE", "raw-api-session", True)]
+    assert visible_effects == [(
+        f"VISIBLE{COMPLETION_DELIVERY_INSTRUCTION}",
+        "raw-api-session",
+        True,
+    )]
     durable = ad.get_durable_delegation(event["delegation_id"])
     assert durable is not None
     assert durable["delivery_state"] == "recovery_committed_ack"
@@ -893,6 +898,8 @@ def test_duplicate_async_queue_replay_injects_once(monkeypatch, isolated_registr
     asyncio.run(runner._async_delegation_watcher(interval=0))
 
     adapter.handle_message.assert_awaited_once()
+    delivered_event = adapter.handle_message.await_args.args[0]
+    assert delivered_event.metadata["_completion_delivery_synthetic"] is True
 
 
 def test_unroutable_async_event_is_not_requeued_forever(

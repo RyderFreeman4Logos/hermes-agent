@@ -208,6 +208,135 @@ def test_no_effect_provider_failure_releases_ordinary_claim(turn_env, monkeypatc
     assert session["history"] == []
 
 
+def test_pure_async_empty_is_one_call_noop_and_terminal_ack(
+    monkeypatch, tmp_path
+):
+    """A literal-empty async result is silent, ACKed, and never polled twice."""
+    import functools
+
+    from agent import conversation_loop
+    from agent.message_sanitization import COMPLETION_DELIVERY_INSTRUCTION
+    from tests.agent.test_completion_delivery_prefix_stability import (
+        _capture_client,
+        _make_agent,
+    )
+    from tests.run_agent.test_run_agent import _mock_response
+    from tools import async_delegation as ad
+    import tools.process_registry as registry_module
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    monkeypatch.setattr(conversation_loop, "jittered_backoff", lambda *_a, **_kw: 0.0)
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "deliveries.db")
+    registry = registry_module.ProcessRegistry()
+    monkeypatch.setattr(registry_module, "process_registry", registry)
+
+    db = SessionDB(tmp_path / "sessions.db")
+    db.create_session(session_id="active", source="tui", model="test-model")
+    event = {
+        "type": "async_delegation",
+        "delegation_id": "deleg-empty-noop",
+        "session_key": "active",
+        "origin_ui_session_id": "sid",
+        "parent_session_id": "active",
+        "goal": "check whether anything needs surfacing",
+        "status": "completed",
+        "summary": "nothing actionable",
+        "api_calls": 1,
+        "duration_seconds": 1.0,
+        "dispatched_at": 1.0,
+        "completed_at": 2.0,
+    }
+    ad._persist_dispatch(event)
+    ad._persist_completion(event, {
+        "status": "completed",
+        "summary": event["summary"],
+    })
+
+    agent = _make_agent(tmp_path, db, "active")
+    requests = _capture_client(
+        agent,
+        [_mock_response(content="", finish_reason="stop") for _ in range(4)],
+    )
+    results = []
+    real_run = agent.run_conversation
+
+    @functools.wraps(real_run)
+    def record_result(*args, **kwargs):
+        result = real_run(*args, **kwargs)
+        results.append(result)
+        return result
+
+    agent.run_conversation = record_result
+    monkeypatch.setattr(server.threading, "Thread", _InlineThread)
+    monkeypatch.setattr(server, "make_stream_renderer", lambda _cols: None)
+    monkeypatch.setattr(server, "render_message", lambda _raw, _cols: None)
+    monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
+    monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda *_args: None)
+    monkeypatch.setattr(server, "_session_cwd", lambda _session: str(tmp_path))
+    monkeypatch.setattr(server, "_register_session_cwd", lambda _session: None)
+    monkeypatch.setattr(server, "_set_session_context", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(server, "_clear_session_context", lambda _tokens: None)
+    monkeypatch.setattr(server, "_get_usage", lambda _agent: {})
+    monkeypatch.setattr(
+        server, "_sync_session_key_after_compress", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(server, "_drain_queued_prompt", lambda *_args: False)
+    monkeypatch.setattr(server, "_voice_tts_enabled", lambda: False)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    session = _session(agent)
+    emitted = []
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event_type, sid, payload=None: emitted.append(
+            (event_type, sid, payload)
+        ),
+    )
+    text = registry_module.format_process_notification(event)
+    assert text is not None
+    model_text = registry_module.completion_delivery_prompt(event, text)
+
+    try:
+        server._dispatch_completion_batch(
+            "sid",
+            session,
+            [{"evt": event, "model_text": model_text, "text": text}],
+            consumer="tui-test",
+        )
+
+        assert len(requests) == 1
+        assert requests[0][-1]["content"].endswith(COMPLETION_DELIVERY_INSTRUCTION)
+        assert results[0]["final_response"] == ""
+        assert results[0]["turn_exit_reason"] == "completion_delivery_noop"
+        assert results[0]["completion_delivery_status"] == "dropped"
+        completions = [payload for kind, _sid, payload in emitted if kind == "message.complete"]
+        assert len(completions) == 1
+        assert completions[0]["text"] == ""
+        assert "No reply" not in str(completions[0])
+        durable = ad.get_durable_delegation(event["delegation_id"])
+        assert durable is not None
+        assert durable["delivery_state"] == "delivered"
+        assert not ad.claim_completion_delivery(event["delegation_id"], "claim-2")
+
+        stop = threading.Event()
+        original_get = registry.get_completion_for_owner
+
+        def get_stale_once(*args, **kwargs):
+            stale = original_get(*args, **kwargs)
+            stop.set()
+            return stale
+
+        monkeypatch.setattr(registry, "get_completion_for_owner", get_stale_once)
+        registry.completion_queue.put(dict(event))
+        starts_before = sum(kind == "message.start" for kind, _sid, _payload in emitted)
+        server._notification_poller_loop(stop, "sid", session)
+        assert len(requests) == 1
+        assert sum(kind == "message.start" for kind, _sid, _payload in emitted) == starts_before
+        assert registry.completion_queue.empty()
+    finally:
+        db.close()
+
+
 def test_completion_history_conflict_gets_explicit_recovery_outcome(turn_env):
     """A durable suffix cannot be called delivered when live history rejects it."""
     outcomes = []

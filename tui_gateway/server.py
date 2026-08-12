@@ -29,6 +29,7 @@ from agent.usage_pricing import (
     POST_COMPRESSION_CACHE_NOTE,
     POST_COMPRESSION_CACHE_WARM_NOTE,
     cache_hit_percent,
+    format_cache_hit_percent,
 )
 from hermes_constants import (
     DEFAULT_INDICATOR_STYLE,
@@ -5273,8 +5274,11 @@ def _cache_level(pct: int) -> str:
 def _cache_badge_text(cache_info: dict[str, int | str]) -> str:
     state = str(cache_info["state"])
     if state in {"cold_write", "hit", "miss"}:
+        pct = format_cache_hit_percent(
+            int(cache_info["read_tokens"]), int(cache_info["prompt_tokens"])
+        )
         text = (
-            f"cache {cache_info['pct']}% "
+            f"cache {pct} "
             f"{cache_info['read_tokens']}/{cache_info['prompt_tokens']}"
         )
     elif state == "unavailable":

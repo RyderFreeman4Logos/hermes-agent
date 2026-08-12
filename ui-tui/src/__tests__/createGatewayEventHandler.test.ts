@@ -2129,6 +2129,30 @@ describe('createGatewayEventHandler', () => {
     ])
   })
 
+  it('renders a positive sub-percent cache hit as nonzero with its token pair', () => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+    onEvent({
+      payload: {
+        cache_info: {
+          level: 'error',
+          pct: 0,
+          prompt_tokens: 165_611,
+          read_tokens: 128,
+          state: 'hit'
+        },
+        text: 'final answer'
+      },
+      type: 'message.complete'
+    } as any)
+
+    expect(appended).toEqual([
+      { role: 'assistant', text: 'final answer' },
+      { kind: 'event', role: 'system', text: 'cache <1% 128/165611', tone: 'error' }
+    ])
+  })
+
   it('keeps an exact-95 post-compression cache hit warm and non-error', () => {
     const appended: Msg[] = []
     const onEvent = createGatewayEventHandler(buildCtx(appended))

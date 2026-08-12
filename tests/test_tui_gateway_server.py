@@ -18704,6 +18704,20 @@ def test_cache_info_builds_gateway_owned_token_badge_text():
     assert cache_info["text"] == "cache 98% 12345/12600"
 
 
+def test_cache_info_renders_positive_subpercent_hit_as_nonzero():
+    cache_info = server._cache_info_from_usage(
+        {
+            "cache_telemetry_present": True,
+            "cache_read_tokens": 128,
+            "cache_write_tokens": 0,
+            "prompt_tokens": 165_611,
+        }
+    )
+
+    assert cache_info is not None
+    assert cache_info["text"] == "cache <1% 128/165611"
+
+
 def test_tui_cache_callback_labels_post_compression_usage():
     class _Agent:
         _first_turn_usage = {

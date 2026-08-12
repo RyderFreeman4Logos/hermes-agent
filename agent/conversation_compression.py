@@ -3513,6 +3513,11 @@ def _compress_context_impl(
                 published_config = copy.deepcopy(
                     getattr(agent, "_session_init_model_config", {}) or {}
                 )
+                from agent.cache_attribution import (
+                    POST_COMPRESSION_CACHE_PENDING_KEY,
+                )
+
+                published_config[POST_COMPRESSION_CACHE_PENDING_KEY] = True
 
                 if in_place:
                     # ── In-place compaction: keep the same session_id ──────────

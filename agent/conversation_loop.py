@@ -113,10 +113,10 @@ logger = logging.getLogger(__name__)
 
 def _ingest_successful_provider_usage(agent, usage: dict, *, first_call: bool) -> bool:
     """Store usage and emit content-free cache records for this provider response."""
+    from agent.cache_attribution import consume_post_compression_cache_pending
+
     agent._last_turn_usage = dict(usage)
-    post_compression = bool(
-        getattr(agent, "_awaiting_cache_usage_after_compression", False)
-    )
+    post_compression = consume_post_compression_cache_pending(agent)
     prior_cache_usage = getattr(agent, "_first_turn_usage", None)
     clear_post_compression = (
         isinstance(prior_cache_usage, dict)
@@ -143,7 +143,6 @@ def _ingest_successful_provider_usage(agent, usage: dict, *, first_call: bool) -
     if post_compression:
         request_index = 1
         cache_usage["cache_attribution"] = "post_compression"
-        agent._awaiting_cache_usage_after_compression = False
     else:
         request_index = int(getattr(agent, "_provider_response_request_index", 0)) + 1
     agent._provider_response_request_index = request_index

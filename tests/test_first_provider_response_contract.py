@@ -1,10 +1,148 @@
 import threading
 import types
+from unittest.mock import patch
 
 import pytest
 
 from tools import async_delegation as ad
 from tui_gateway import server
+
+
+def test_post_compression_attribution_survives_resume_and_clears_marker(tmp_path):
+    from agent.conversation_loop import _ingest_successful_provider_usage
+    from hermes_state import SessionDB
+    from run_agent import AIAgent
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "resumed-after-compression"
+    db.create_session(
+        session_id,
+        source="tui",
+        model="test/model",
+        model_config={"_awaiting_cache_usage_after_compression": True},
+    )
+    try:
+        with patch.dict("os.environ", {"OPENROUTER_API_KEY": "test-key"}):
+            agent = AIAgent(
+                api_key="test-key",
+                base_url="https://openrouter.ai/api/v1",
+                model="test/model",
+                quiet_mode=True,
+                session_db=db,
+                session_id=session_id,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+
+        assert agent._awaiting_cache_usage_after_compression is True
+        _ingest_successful_provider_usage(
+            agent,
+            {
+                "cache_telemetry_present": True,
+                "cache_read_tokens": 1_880,
+                "cache_write_tokens": 0,
+                "prompt_tokens": 2_000,
+            },
+            first_call=True,
+        )
+
+        cache_info = server._cache_info_from_usage(agent._first_turn_usage)
+        assert cache_info is not None
+        assert cache_info["level"] == "info"
+        assert cache_info["note"] == "post-compression warmup (expected)"
+        assert db.get_session_model_config_value(
+            session_id,
+            "_awaiting_cache_usage_after_compression",
+        ) is None
+    finally:
+        db.close()
+
+
+def test_terminal_empty_usage_clears_durable_post_compression_marker(tmp_path):
+    from agent.codex_runtime import _record_codex_app_server_usage
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "empty-usage-after-compression"
+    db.create_session(
+        session_id,
+        source="tui",
+        model="test/model",
+        model_config={"_awaiting_cache_usage_after_compression": True},
+    )
+    agent = types.SimpleNamespace(
+        _awaiting_cache_usage_after_compression=True,
+        _session_db=db,
+        _session_db_created=True,
+        session_id=session_id,
+        session_api_calls=0,
+        model="test/model",
+        provider="openai",
+        base_url="https://openai.invalid/v1",
+        context_compressor=types.SimpleNamespace(
+            awaiting_real_usage_after_compression=False,
+            update_from_response=lambda _usage: None,
+        ),
+    )
+    try:
+        assert _record_codex_app_server_usage(
+            agent,
+            types.SimpleNamespace(token_usage_last=None),
+        ) == {}
+        assert agent._awaiting_cache_usage_after_compression is False
+        assert db.get_session_model_config_value(
+            session_id,
+            "_awaiting_cache_usage_after_compression",
+        ) is None
+    finally:
+        db.close()
+
+
+def test_standard_terminal_empty_usage_clears_durable_marker(tmp_path):
+    from agent.cache_attribution import (
+        clear_post_compression_cache_pending_after_empty_usage,
+    )
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "standard-empty-usage-after-compression"
+    db.create_session(
+        session_id,
+        source="tui",
+        model="test/model",
+        model_config={"_awaiting_cache_usage_after_compression": True},
+    )
+    agent = types.SimpleNamespace(
+        _awaiting_cache_usage_after_compression=True,
+        _last_turn_usage=None,
+        _turn_received_provider_response=True,
+        _session_db=db,
+        session_id=session_id,
+    )
+    try:
+        assert clear_post_compression_cache_pending_after_empty_usage(agent) is True
+        assert agent._awaiting_cache_usage_after_compression is False
+        assert db.get_session_model_config_value(
+            session_id,
+            "_awaiting_cache_usage_after_compression",
+        ) is None
+    finally:
+        db.close()
+
+
+def test_nonterminal_empty_usage_does_not_consume_marker():
+    from agent.cache_attribution import (
+        clear_post_compression_cache_pending_after_empty_usage,
+    )
+
+    agent = types.SimpleNamespace(
+        _awaiting_cache_usage_after_compression=True,
+        _last_turn_usage=None,
+        _turn_received_provider_response=False,
+    )
+
+    assert clear_post_compression_cache_pending_after_empty_usage(agent) is False
+    assert agent._awaiting_cache_usage_after_compression is True
 
 
 @pytest.mark.parametrize("origin", ["user", "background_completion", "subagent_result"])

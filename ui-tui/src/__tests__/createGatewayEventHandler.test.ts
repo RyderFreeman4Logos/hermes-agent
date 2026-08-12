@@ -2110,7 +2110,14 @@ describe('createGatewayEventHandler', () => {
 
     onEvent({
       payload: {
-        cache_info: { level: 'error', pct: 94, prompt_tokens: 2_000, read_tokens: 1_880, state: 'hit' },
+        cache_info: {
+          level: 'error',
+          pct: 94,
+          prompt_tokens: 2_000,
+          read_tokens: 1_880,
+          state: 'hit',
+          text: 'cache 94% 1880/2000'
+        },
         text: 'final answer'
       },
       type: 'message.complete'
@@ -2118,7 +2125,7 @@ describe('createGatewayEventHandler', () => {
 
     expect(appended).toEqual([
       { role: 'assistant', text: 'final answer' },
-      { kind: 'event', role: 'system', text: 'cache 94%', tone: 'error' }
+      { kind: 'event', role: 'system', text: 'cache 94% 1880/2000', tone: 'error' }
     ])
   })
 
@@ -2135,7 +2142,8 @@ describe('createGatewayEventHandler', () => {
           pct: 95,
           prompt_tokens: 2_000,
           read_tokens: 1_900,
-          state: 'hit'
+          state: 'hit',
+          text: 'cache 95% 1900/2000 · post-compression cache warm'
         },
         text: 'final answer'
       },
@@ -2144,7 +2152,11 @@ describe('createGatewayEventHandler', () => {
 
     expect(appended).toEqual([
       { role: 'assistant', text: 'final answer' },
-      { kind: 'event', role: 'system', text: 'cache 95% · post-compression cache warm' }
+      {
+        kind: 'event',
+        role: 'system',
+        text: 'cache 95% 1900/2000 · post-compression cache warm'
+      }
     ])
   })
 
@@ -2161,7 +2173,8 @@ describe('createGatewayEventHandler', () => {
           pct: 94,
           prompt_tokens: 2_000,
           read_tokens: 1_880,
-          state: 'hit'
+          state: 'hit',
+          text: 'cache 94% 1880/2000 · post-compression warmup (expected)'
         },
         text: 'final answer'
       },
@@ -2170,7 +2183,11 @@ describe('createGatewayEventHandler', () => {
 
     expect(appended).toEqual([
       { role: 'assistant', text: 'final answer' },
-      { kind: 'event', role: 'system', text: 'cache 94% · post-compression warmup (expected)' }
+      {
+        kind: 'event',
+        role: 'system',
+        text: 'cache 94% 1880/2000 · post-compression warmup (expected)'
+      }
     ])
   })
 

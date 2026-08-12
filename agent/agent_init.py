@@ -2658,7 +2658,9 @@ def init_agent(
     agent.session_estimated_cost_usd = 0.0
     agent.session_cost_status = "unknown"
     agent.session_cost_source = "none"
-    agent._awaiting_cache_usage_after_compression = False
+    from agent.cache_attribution import load_post_compression_cache_pending
+
+    load_post_compression_cache_pending(agent)
     
     # ── Ollama num_ctx injection ──
     # Ollama defaults to 2048 context regardless of the model's capabilities.

@@ -1196,6 +1196,7 @@ def test_full_in_place_compression_atomically_clears_durable_prune_runway(
     agent.compression_in_place = True
     agent.context_compressor._proactive_prune_rearm_tokens = 120_000
     expected_model_config = copy.deepcopy(agent._session_init_model_config)
+    expected_model_config["_awaiting_cache_usage_after_compression"] = True
 
     compressed, _sp = agent._compress_context(
         messages, "sys", approx_tokens=120_000,

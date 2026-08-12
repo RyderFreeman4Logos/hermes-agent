@@ -65,6 +65,12 @@ def _record_codex_app_server_usage(
 
     usage = getattr(turn, "token_usage_last", None)
     if not isinstance(usage, dict) or not usage:
+        if consume_post_compression_attribution:
+            from agent.cache_attribution import (
+                consume_post_compression_cache_pending,
+            )
+
+            consume_post_compression_cache_pending(agent)
         compressor = getattr(agent, "context_compressor", None)
         if (
             compressor is not None
@@ -233,7 +239,9 @@ def _record_codex_app_server_compaction(
         turn_id,
         force,
     )
-    agent._awaiting_cache_usage_after_compression = True
+    from agent.cache_attribution import set_post_compression_cache_pending
+
+    set_post_compression_cache_pending(agent, True)
     if not force:
         try:
             from agent.conversation_compression import COMPACTION_STATUS

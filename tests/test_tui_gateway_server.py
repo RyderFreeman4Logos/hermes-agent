@@ -18656,8 +18656,52 @@ def test_tui_cache_callback_uses_95_percent_error_boundary(pct, kind):
         getattr(agent, "_tui_cache_callback")("hit", pct, pct * 20, 2_000)
 
     assert emitted == [
-        ("status.update", "cache-sid", {"kind": kind, "text": f"cache {pct}%"})
+        (
+            "status.update",
+            "cache-sid",
+            {
+                "kind": kind,
+                "text": f"cache {pct}% {pct * 20}/2000",
+            },
+        )
     ]
+
+
+def test_tui_cache_callback_adds_cached_and_prompt_token_counts():
+    class _Agent:
+        pass
+
+    agent = _Agent()
+    emitted: list[tuple[str, str, dict]] = []
+    with patch.object(
+        server,
+        "_emit",
+        lambda event_type, sid, payload: emitted.append((event_type, sid, payload)),
+    ):
+        server._attach_tui_cache_callback(agent, "cache-sid")
+        getattr(agent, "_tui_cache_callback")("hit", 98, 12_345, 12_600)
+
+    assert emitted == [
+        (
+            "status.update",
+            "cache-sid",
+            {"kind": "cache_hit", "text": "cache 98% 12345/12600"},
+        )
+    ]
+
+
+def test_cache_info_builds_gateway_owned_token_badge_text():
+    cache_info = server._cache_info_from_usage(
+        {
+            "cache_telemetry_present": True,
+            "cache_read_tokens": 12_345,
+            "cache_write_tokens": 0,
+            "prompt_tokens": 12_600,
+        }
+    )
+
+    assert cache_info is not None
+    assert cache_info["text"] == "cache 98% 12345/12600"
 
 
 def test_tui_cache_callback_labels_post_compression_usage():
@@ -18686,7 +18730,10 @@ def test_tui_cache_callback_labels_post_compression_usage():
             "cache-sid",
             {
                 "kind": "cache_hit",
-                "text": "cache 94% · post-compression warmup (expected)",
+                "text": (
+                    "cache 94% 1880/2000 · "
+                    "post-compression warmup (expected)"
+                ),
             },
         )
     ]
@@ -18733,6 +18780,7 @@ def test_cache_info_classifies_first_call_usage():
         "pct": 87,
         "state": "hit",
         "level": "error",
+        "text": "cache 87% 1740/2000",
     }
 
 
@@ -18751,6 +18799,7 @@ def test_cache_info_distinguishes_unavailable_from_reported_zero():
         "pct": 0,
         "state": "unavailable",
         "level": "info",
+        "text": "cache unavailable",
     }
     assert server._cache_info_from_usage(
         {**base, "cache_telemetry_present": True}
@@ -18760,6 +18809,7 @@ def test_cache_info_distinguishes_unavailable_from_reported_zero():
         "pct": 0,
         "state": "miss",
         "level": "error",
+        "text": "cache 0% 0/2000",
     }
 
 
@@ -18780,6 +18830,9 @@ def test_cache_info_keeps_post_compression_low_hit_neutral():
         "state": "hit",
         "level": "info",
         "note": "post-compression warmup (expected)",
+        "text": (
+            "cache 94% 1880/2000 · post-compression warmup (expected)"
+        ),
     }
 
 
@@ -18799,6 +18852,7 @@ def test_cache_info_attributes_post_compression_usage():
         "state": "hit",
         "level": "info",
         "note": "post-compression cache warm",
+        "text": "cache 95% 1900/2000 · post-compression cache warm",
     }
 
 

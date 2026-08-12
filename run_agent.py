@@ -832,6 +832,10 @@ class AIAgent:
             except Exception as exc:
                 logger.debug("context engine bind_session_state during reset: %s", exc)
 
+        from agent.cache_attribution import load_post_compression_cache_pending
+
+        load_post_compression_cache_pending(self)
+
     @staticmethod
     def _effective_lmstudio_context_length(
         config_context_length: Optional[int],
@@ -8296,6 +8300,11 @@ class AIAgent:
                 finish_task_run(**task_context, error=exc)
             raise
         finally:
+            from agent.cache_attribution import (
+                clear_post_compression_cache_pending_after_empty_usage,
+            )
+
+            clear_post_compression_cache_pending_after_empty_usage(self)
             _dropped_pending_completion = False
             for _completion_owner in (
                 conversation_history,

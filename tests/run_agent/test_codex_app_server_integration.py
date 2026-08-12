@@ -399,7 +399,10 @@ class TestRunConversationCodexPath:
                 "codex-cache-sid",
                 {
                     "kind": "cache_hit",
-                    "text": "cache 95% · post-compression cache warm",
+                    "text": (
+                        "cache 95% 285000/300000 · "
+                        "post-compression cache warm"
+                    ),
                 },
             )
         ]
@@ -413,6 +416,7 @@ class TestRunConversationCodexPath:
             "state": "hit",
             "level": "info",
             "note": "post-compression cache warm",
+            "text": "cache 95% 285000/300000 · post-compression cache warm",
         }
         assert getattr(agent, "_awaiting_cache_usage_after_compression") is False
         assert events == [

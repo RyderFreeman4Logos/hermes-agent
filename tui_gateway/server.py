@@ -5235,6 +5235,22 @@ def _cache_level(pct: int) -> str:
     return "error" if pct < CACHE_HIT_ERROR_THRESHOLD else "info"
 
 
+def _cache_badge_text(cache_info: dict[str, int | str]) -> str:
+    state = str(cache_info["state"])
+    if state in {"cold_write", "hit", "miss"}:
+        text = (
+            f"cache {cache_info['pct']}% "
+            f"{cache_info['read_tokens']}/{cache_info['prompt_tokens']}"
+        )
+    elif state == "unavailable":
+        text = "cache unavailable"
+    else:
+        text = f"cache {state.upper()}"
+    if cache_info.get("note"):
+        text += f" · {cache_info['note']}"
+    return text
+
+
 def _cache_info_from_usage(usage: Any) -> dict[str, int | str] | None:
     if not isinstance(usage, dict):
         return None
@@ -5277,6 +5293,7 @@ def _cache_info_from_usage(usage: Any) -> dict[str, int | str] | None:
                 attribution="post_compression",
                 note="post-compression cache unavailable",
             )
+        cache_info["text"] = _cache_badge_text(cache_info)
         return cache_info
 
     pct = cache_hit_percent(read_tokens, prompt_tokens)
@@ -5304,6 +5321,7 @@ def _cache_info_from_usage(usage: Any) -> dict[str, int | str] | None:
             if state == "hit" and pct >= CACHE_HIT_ERROR_THRESHOLD
             else POST_COMPRESSION_CACHE_NOTE
         )
+    cache_info["text"] = _cache_badge_text(cache_info)
     return cache_info
 
 
@@ -6156,15 +6174,7 @@ def _attach_tui_cache_callback(agent, sid: str):
         else:
             state = str(cache_info["state"])
             pct = int(cache_info["pct"])
-        text = (
-            f"cache {pct}%"
-            if state == "hit"
-            else "cache unavailable"
-            if state == "unavailable"
-            else f"cache {state.upper()}"
-        )
-        if cache_info.get("note"):
-            text += f" · {cache_info['note']}"
+        text = str(cache_info.get("text") or _cache_badge_text(cache_info))
         kind = "error" if cache_info["level"] == "error" else "cache_hit"
         payload = {"kind": kind, "text": text}
         if publish_record:

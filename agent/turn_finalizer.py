@@ -1332,6 +1332,11 @@ def finalize_turn(
     except Exception as exc:
         logger.warning("on_session_end hook failed: %s", exc)
 
+    from agent.cache_attribution import (
+        clear_post_compression_cache_pending_after_empty_usage,
+    )
+
+    clear_post_compression_cache_pending_after_empty_usage(agent)
     agent._turn_preflight_display_snapshot = None
     agent._turn_received_provider_response = False
 

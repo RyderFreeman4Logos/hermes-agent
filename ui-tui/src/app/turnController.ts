@@ -41,6 +41,7 @@ type CacheInfo = {
   prompt_tokens: number
   read_tokens: number
   state: 'cold_write' | 'hit' | 'miss' | 'unavailable' | 'unknown'
+  text?: string
 }
 
 const cacheFootnote = (cacheInfo?: CacheInfo): Msg | null => {
@@ -49,14 +50,15 @@ const cacheFootnote = (cacheInfo?: CacheInfo): Msg | null => {
   }
 
   const cacheText =
-    cacheInfo.state === 'hit'
+    cacheInfo.text ??
+    (cacheInfo.state === 'hit'
       ? `cache ${Math.max(0, Math.round(cacheInfo.pct))}%`
       : cacheInfo.state === 'cold_write'
         ? 'cache cold-write'
-        : `cache ${cacheInfo.state}`
+        : `cache ${cacheInfo.state}`)
 
   const attribution =
-    cacheInfo.attribution === 'post_compression'
+    !cacheInfo.text && cacheInfo.attribution === 'post_compression'
       ? ` · ${
           cacheInfo.note ??
           (cacheInfo.state === 'hit' && cacheInfo.pct >= 95

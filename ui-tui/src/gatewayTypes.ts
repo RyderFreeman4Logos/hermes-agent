@@ -759,6 +759,7 @@ export type GatewayEvent =
           prompt_tokens: number
           read_tokens: number
           state: 'cold_write' | 'hit' | 'miss' | 'unavailable' | 'unknown'
+          text?: string
         }
         completed_at?: number
         failure_reason?: string

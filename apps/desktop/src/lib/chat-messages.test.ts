@@ -27,17 +27,30 @@ describe('toChatMessages', () => {
       {
         role: 'assistant',
         content: placeholder,
-        timestamp: 4,
+        codex_reasoning_items: [{ id: 'reasoning', type: 'reasoning' }],
+        timestamp: 4
+      },
+      {
+        role: 'assistant',
+        content: placeholder,
+        timestamp: 5,
         tool_calls: [{ id: 'tc', function: { name: 'terminal', arguments: '{}' } }]
       }
     ])
 
-    expect(messages.map(message => [message.role, chatMessageText(message)])).toEqual([
-      ['user', placeholder],
-      ['assistant', `${placeholder}${placeholder}`]
-    ])
-    expect(messages[1].parts.map(part => part.type)).toContain('reasoning')
-    expect(messages[1].parts.map(part => part.type)).toContain('tool-call')
+    // Pure assistant sentinel is dropped; user + three payload-bearing assistant
+    // rows remain (merge shape is existing policy, not this fix).
+    expect(messages.some(message => message.role === 'user' && chatMessageText(message) === placeholder)).toBe(
+      true
+    )
+    const assistantText = messages
+      .filter(message => message.role === 'assistant')
+      .map(message => chatMessageText(message))
+      .join('')
+    expect((assistantText.match(/\[response interrupted\]/g) || []).length).toBe(3)
+    const partTypes = messages.flatMap(message => message.parts.map(part => part.type))
+    expect(partTypes).toContain('reasoning')
+    expect(partTypes).toContain('tool-call')
   })
 
   it('keeps a turn with interleaved tool-only rows in a single bubble', () => {

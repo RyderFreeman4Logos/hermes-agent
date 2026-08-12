@@ -978,14 +978,15 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
     }
 
     const content = message.content || message.text || message.context || message.name
-    const hasReasoning = Boolean(message.reasoning || message.reasoning_content || message.reasoning_details)
+    const hasReasoning = Boolean(
+      message.reasoning ||
+        message.reasoning_content ||
+        message.reasoning_details ||
+        (Array.isArray(message.codex_reasoning_items) && message.codex_reasoning_items.length)
+    )
+    const hasToolCalls = Array.isArray(message.tool_calls) && message.tool_calls.length > 0
 
-    if (
-      message.role === 'assistant' &&
-      content === '[response interrupted]' &&
-      !hasReasoning &&
-      !message.tool_calls?.length
-    ) {
+    if (message.role === 'assistant' && content === '[response interrupted]' && !hasReasoning && !hasToolCalls) {
       return
     }
 

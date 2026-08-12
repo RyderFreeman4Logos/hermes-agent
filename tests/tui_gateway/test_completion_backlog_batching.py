@@ -122,6 +122,52 @@ def isolated_registry(monkeypatch, tmp_path):
     return registry
 
 
+@pytest.mark.parametrize("count", [1, 2], ids=["single", "batch"])
+def test_pure_async_batch_is_completion_delivery(count, monkeypatch):
+    from agent.message_sanitization import COMPLETION_DELIVERY_INSTRUCTION
+    from tools.process_registry import (
+        completion_delivery_prompt,
+        format_process_notification,
+    )
+
+    items = []
+    for index in range(count):
+        event = _delegation_event(f"deleg-{index}", summary=f"result-{index}")
+        text = format_process_notification(event)
+        assert text is not None
+        items.append({
+            "evt": event,
+            "text": text,
+            "model_text": completion_delivery_prompt(event, text),
+        })
+
+    prompt, is_delivery = server._compose_completion_batch_prompt(items)
+
+    assert is_delivery is True
+    assert prompt.endswith(COMPLETION_DELIVERY_INSTRUCTION)
+
+    if count > 1:
+        submitted = []
+        monkeypatch.setattr(
+            "tools.process_registry.claim_completion_event_delivery",
+            lambda *_args, **_kwargs: "claim",
+        )
+        monkeypatch.setattr(
+            server,
+            "_run_prompt_submit",
+            lambda _rid, _sid, _session, text, **kwargs: submitted.append(
+                (text, kwargs["model_text"])
+            ),
+        )
+        server._dispatch_completion_batch(
+            "sid", _session(running=True), items, consumer="tui-test"
+        )
+        assert submitted == [(
+            prompt.removesuffix(COMPLETION_DELIVERY_INSTRUCTION),
+            prompt,
+        )]
+
+
 def test_busy_tool_chain_steers_once_and_skips_idle_duplicate(
     isolated_registry, monkeypatch
 ):

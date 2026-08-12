@@ -3649,9 +3649,13 @@ def _format_gateway_process_notification(evt: dict) -> "str | None":
         text += "]"
         return text
 
-    if evt_type in {"completion", "async_delegation"}:
+    from tools.process_registry import (
+        format_process_notification,
+        is_completion_delivery_event,
+    )
+
+    if is_completion_delivery_event(evt):
         # Reuse the shared rich formatter (self-contained task-source block).
-        from tools.process_registry import format_process_notification
         return format_process_notification(evt)
 
     return None
@@ -3664,13 +3668,16 @@ def _drain_gateway_watch_events(completion_queue) -> "list[dict]":
     heartbeat events are owned by ``_async_delegation_watcher`` (with ordinary
     live-process delivery arbitrated against ``_run_process_watcher``).
     """
-    from tools.process_registry import drain_matching_queue_events
+    from tools.process_registry import (
+        drain_matching_queue_events,
+        is_completion_delivery_event,
+    )
 
     return drain_matching_queue_events(
         completion_queue,
         lambda evt: (
-            evt.get("type", "completion")
-            not in {"completion", "async_delegation", "heartbeat"}
+            not is_completion_delivery_event(evt)
+            and evt.get("type", "completion") != "heartbeat"
         ),
     )
 
@@ -24476,6 +24483,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         is not a transactional boundary: a process crash after adapter
         acceptance can still cause durable at-least-once replay.
         """
+        from tools.process_registry import is_completion_delivery_event
+
         source = await asyncio.to_thread(self._build_process_event_source, evt)
         if not source:
             # API-server-originated sessions bind a RAW session key (the
@@ -24504,8 +24513,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             adapter,
                             text=synth_text,
                             session_id=raw_sid,
-                            completion_delivery=evt.get("type")
-                            in {"completion", "async_delegation"},
+                            completion_delivery=is_completion_delivery_event(evt),
                         )
                         return True
                     except Exception as e:
@@ -24577,8 +24585,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter,
                     text=synth_text,
                     session_id=raw_sid,
-                    completion_delivery=evt.get("type")
-                    in {"completion", "async_delegation"},
+                    completion_delivery=is_completion_delivery_event(evt),
                 )
                 return True
             except Exception as e:
@@ -24613,7 +24620,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message_id=str(evt.get("message_id") or "").strip() or None,
                 metadata={
                     **metadata,
-                    "_completion_delivery_synthetic": evt.get("type") == "completion",
+                    "_completion_delivery_synthetic": is_completion_delivery_event(evt),
                 },
             )
             logger.info(

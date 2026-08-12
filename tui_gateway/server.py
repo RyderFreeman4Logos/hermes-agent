@@ -10005,13 +10005,16 @@ def _bound_completion_batch(items: list[dict]) -> tuple[list[dict], list[dict]]:
 def _compose_completion_batch_prompt(items: list[dict]) -> tuple[str, bool]:
     """Build one model prompt for a bounded completion batch."""
     from agent.message_sanitization import COMPLETION_DELIVERY_INSTRUCTION
-    from tools.process_registry import completion_delivery_prompt
+    from tools.process_registry import (
+        completion_delivery_prompt,
+        is_completion_delivery_event,
+    )
 
     parts: list[str] = []
     any_completion = False
     for item in items:
         evt = item["evt"]
-        if evt.get("type", "completion") == "completion":
+        if is_completion_delivery_event(evt):
             any_completion = True
         text = item.get("model_text") or item.get("text") or ""
         if isinstance(text, str) and text.endswith(COMPLETION_DELIVERY_INSTRUCTION):
@@ -10024,7 +10027,7 @@ def _compose_completion_batch_prompt(items: list[dict]) -> tuple[str, bool]:
         only = items[0]
         evt = only["evt"]
         prompt = only.get("model_text") or only.get("text") or parts[0]
-        return prompt, evt.get("type", "completion") == "completion"
+        return prompt, is_completion_delivery_event(evt)
     body = (
         f"[IMPORTANT: {len(parts)} background completions arrived as a backlog. "
         f"Review each entry below. Surface or act on failures and actionable results. "
@@ -10197,6 +10200,10 @@ def _dispatch_completion_batch(
         if async_claims:
             evt = async_claims[0][0]["evt"]
             text = claimed[0][0].get("text") or prompt if len(claimed) == 1 else prompt
+            if len(async_claims) == len(claimed) > 1:
+                from agent.message_sanitization import COMPLETION_DELIVERY_INSTRUCTION
+
+                text = text.removesuffix(COMPLETION_DELIVERY_INSTRUCTION)
             _run_prompt_submit(
                 rid,
                 sid,
@@ -10204,6 +10211,7 @@ def _dispatch_completion_batch(
                 text,
                 display_kind="async_delegation_complete",
                 display_metadata=_async_delegation_display_metadata(evt),
+                model_text=prompt,
                 turn_origin="subagent_result",
                 **kwargs,
             )
@@ -11347,6 +11355,7 @@ def _run_prompt_submit(
     queued_prompt_generation: int | None = None,
     completion_delivery: bool = False,
     completion_delivery_callback: Callable[[str], None] | None = None,
+    model_text: Any = None,
     turn_origin: str | None = None,
     heartbeat_event: Any = None,
 ) -> None:
@@ -11501,7 +11510,7 @@ def _run_prompt_submit(
             _register_session_cwd(session)
             cols = session.get("cols", 80)
             streamer = make_stream_renderer(cols)
-            prompt = text
+            prompt = model_text if model_text is not None else text
 
             if isinstance(prompt, str) and "@" in prompt:
                 from agent.context_references import preprocess_context_references
@@ -11684,13 +11693,15 @@ def _run_prompt_submit(
                 "conversation_history": list(history),
                 "stream_callback": None if heartbeat_turn else _stream,
                 "persist_user_message": (
-                    _build_persist_user_message(prompt, images, run_message) if images else prompt
+                    _build_persist_user_message(text, images, run_message)
+                    if images
+                    else text
                 ),
             }
             if completion_delivery:
                 agent._pending_cli_user_message = {
                     "role": "user",
-                    "content": prompt,
+                    "content": text,
                     "_completion_delivery_synthetic": True,
                 }
             # Type a synthesized turn at turn START so the crash persist writes
@@ -11745,11 +11756,6 @@ def _run_prompt_submit(
                 completion_suffix_status = str(
                     result.get("completion_delivery_status") or "none"
                 )
-            completion_suffix_committed = completion_suffix_status == "committed"
-            completion_suffix_dispositioned = completion_suffix_status in {
-                "committed",
-                "dropped",
-            }
             display_stamp_committed = not bool(display_kind)
             if display_kind and isinstance(text, str):
                 db = getattr(agent, "_session_db", None)
@@ -11994,12 +12000,26 @@ def _run_prompt_submit(
                     (result.get("error") if isinstance(result, dict) else "") or raw
                 )
                 payload["recoverable"] = True
-            if status != "complete" and not completion_suffix_committed:
-                completion_outcome = "provider_failed"
-            elif not (completion_suffix_dispositioned and display_stamp_committed):
-                completion_outcome = "missing_active_marker"
-            elif not history_committed:
-                completion_outcome = "history_conflict"
+            if completion_delivery_callback is not None:
+                if not isinstance(result, dict):
+                    completion_outcome = "provider_failed"
+                else:
+                    from tools.process_registry import completion_result_delivery_outcome
+
+                    delivery_result = dict(result)
+                    delivery_result.setdefault("completed", status == "complete")
+                    delivery_result.setdefault(
+                        "completion_delivery_status", completion_suffix_status
+                    )
+                    completion_outcome = completion_result_delivery_outcome(delivery_result)
+                    if (
+                        completion_outcome == "committed"
+                        and completion_suffix_status == "committed"
+                        and not display_stamp_committed
+                    ):
+                        completion_outcome = "missing_active_marker"
+                    elif completion_outcome == "committed" and not history_committed:
+                        completion_outcome = "history_conflict"
             else:
                 completion_outcome = "committed"
             _finish_completion_delivery(completion_outcome)

@@ -2873,7 +2873,7 @@ class ProcessRegistry:
             if text is not None:
                 results.append((evt, text))
                 continue
-            if evt.get("type") not in {"completion", "async_delegation"}:
+            if not is_completion_delivery_event(evt):
                 self.consume_completion_event(evt)
                 continue
             if not self.claim_completion_delivery(evt):
@@ -4319,14 +4319,20 @@ def format_runtime_heartbeat(evt: dict) -> str:
     )
 
 
+def is_completion_delivery_event(evt: dict) -> bool:
+    """Return whether a host terminal event uses completion-delivery policy."""
+    return evt.get("type", "completion") in {"completion", "async_delegation"}
+
+
 def completion_delivery_prompt(evt: dict, payload: str) -> "str | None":
     """Return a model-only completion prompt, or None for an explicit no-op."""
-    if evt.get("type", "completion") != "completion":
+    if not is_completion_delivery_event(evt):
         return payload
-    if type(evt.get("exit_code")) is not int:
-        return payload
-    if not _completion_visibility_should_deliver(evt):
-        return None
+    if evt.get("type", "completion") == "completion":
+        if type(evt.get("exit_code")) is not int:
+            return payload
+        if not _completion_visibility_should_deliver(evt):
+            return None
     from agent.message_sanitization import build_completion_delivery_prompt
 
     return build_completion_delivery_prompt(payload)

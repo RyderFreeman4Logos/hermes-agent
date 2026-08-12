@@ -191,6 +191,68 @@ describe('StatusRule responsive Ink layout', () => {
     }
   })
 
+  it('bounds over-wide resume and Unicode cwd segments instead of clipping them', async () => {
+    const resume = mount(
+      status(12, {
+        cwdLabel: '',
+        model: '',
+        status: '',
+        statusBarSegments: ['resume'],
+        usage: { active_subagents: 2, calls: 0, input: 0, output: 0, total: 0 }
+      }),
+      12
+    )
+
+    const cwd = mount(
+      status(12, {
+        cwdLabel: '目录/分支🌟長い作業ディレクトリ',
+        model: '',
+        status: '',
+        statusBarSegments: ['cwd'],
+        usage: { calls: 0, input: 0, output: 0, total: 0 }
+      }),
+      12
+    )
+
+    try {
+      await flush()
+      const resumeOutput = resume.lines().join('\n')
+      const cwdOutput = cwd.lines().join('\n')
+
+      expect(resumeOutput).toContain('↩ resumes…')
+      expect(cwdOutput).toContain('目录/分支…')
+      expect(resume.lines().every(line => stringWidth(line) <= 12)).toBe(true)
+      expect(cwd.lines().every(line => stringWidth(line) <= 12)).toBe(true)
+    } finally {
+      resume.cleanup()
+      cwd.cleanup()
+    }
+  })
+
+  it('keeps bounded rows natural after resize', async () => {
+    const props: Partial<StatusRuleProps> = {
+      cwdLabel: '目录/分支🌟長い作業ディレクトリ',
+      model: '',
+      status: '',
+      statusBarSegments: ['resume', 'cwd'],
+      usage: { active_subagents: 2, calls: 0, input: 0, output: 0, total: 0 }
+    }
+
+    const mounted = mount(status(12, props), 12)
+
+    try {
+      await flush()
+      expect(mounted.lines().every(line => stringWidth(line) <= 12)).toBe(true)
+
+      const wider = await mounted.rerender(status(44, props), 44)
+
+      expect(wider).toHaveLength(2)
+      expect(wider.every(line => stringWidth(line) <= 44)).toBe(true)
+    } finally {
+      mounted.cleanup()
+    }
+  })
+
   it('reflows across 71 → 72 → tiny resize transitions', async () => {
     const mounted = mount(status(71), 71)
 

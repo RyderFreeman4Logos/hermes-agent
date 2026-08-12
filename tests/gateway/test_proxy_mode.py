@@ -69,8 +69,10 @@ class _FakeSession:
         self.captured_url = None
         self.captured_json = None
         self.captured_headers = None
+        self.post_calls = 0
 
     def post(self, url, json=None, headers=None, **kwargs):
+        self.post_calls += 1
         self.captured_url = url
         self.captured_json = json
         self.captured_headers = headers
@@ -168,6 +170,41 @@ class TestRunAgentProxyDispatch:
 
 class TestRunAgentViaProxy:
     """Test the actual proxy HTTP forwarding logic."""
+
+    @pytest.mark.asyncio
+    async def test_completion_delivery_forwards_authenticated_noop_outcome(self, monkeypatch):
+        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://host:8642")
+        monkeypatch.setenv("GATEWAY_PROXY_KEY", "test-key-123")
+        runner = _make_runner()
+        source = _make_source()
+        resp = _FakeSSEResponse(
+            sse_chunks=[
+                'data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n',
+                'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"hermes":{"completed":true,"completion_delivery_status":"dropped","turn_exit_reason":"completion_delivery_noop"}}\n\n',
+                "data: [DONE]\n\n",
+            ],
+        )
+        session = _FakeSession(resp)
+
+        with patch("gateway.run._load_gateway_config", return_value={}):
+            with _patch_aiohttp(session):
+                with patch("aiohttp.ClientTimeout"):
+                    result = await runner._run_agent_via_proxy(
+                        message="completion payload",
+                        context_prompt="",
+                        history=[],
+                        source=source,
+                        session_id="session-abc",
+                        completion_delivery_synthetic=True,
+                    )
+
+        assert session.captured_headers[
+            "X-Hermes-Internal-Completion-Delivery"
+        ] == "test-key-123"
+        assert result["final_response"] == ""
+        assert result["completed"] is True
+        assert result["completion_delivery_status"] == "dropped"
+        assert result["turn_exit_reason"] == "completion_delivery_noop"
 
     @pytest.mark.asyncio
     async def test_builds_correct_request(self, monkeypatch):

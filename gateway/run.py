@@ -27236,6 +27236,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str = None,
         run_generation: Optional[int] = None,
         event_message_id: Optional[str] = None,
+        completion_delivery_synthetic: bool = False,
     ) -> Dict[str, Any]:
         """Forward the message to a remote Hermes API server instead of
         running a local AIAgent.
@@ -27316,6 +27317,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             headers["Authorization"] = f"Bearer {proxy_key}"
         if session_id:
             headers["X-Hermes-Session-Id"] = session_id
+        if completion_delivery_synthetic and proxy_key:
+            from gateway.wake import INTERNAL_COMPLETION_DELIVERY_HEADER
+
+            headers[INTERNAL_COMPLETION_DELIVERY_HEADER] = proxy_key
 
         body = {
             "model": "hermes-agent",
@@ -27382,6 +27387,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Make the HTTP request with SSE streaming -----------------------
         full_response = ""
+        terminal_outcome: Dict[str, Any] = {}
         _start = time.time()
 
         try:
@@ -27439,6 +27445,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 try:
                                     obj = json.loads(data)
                                     choices = obj.get("choices", [])
+                                    hermes = obj.get("hermes")
+                                    if isinstance(hermes, dict):
+                                        terminal_outcome.update({
+                                            key: hermes[key]
+                                            for key in (
+                                                "completed",
+                                                "completion_delivery_status",
+                                                "turn_exit_reason",
+                                            )
+                                            if key in hermes
+                                        })
                                     if choices:
                                         delta = choices[0].get("delta", {})
                                         content = delta.get("content", "")
@@ -27497,7 +27514,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
 
         return {
-            "final_response": full_response or "(No response from remote agent)",
+            "final_response": full_response or (
+                "" if terminal_outcome.get("turn_exit_reason") == "completion_delivery_noop"
+                else "(No response from remote agent)"
+            ),
             "messages": [
                 {"role": "user", "content": message},
                 {"role": "assistant", "content": full_response},
@@ -27507,6 +27527,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "history_offset": len(history),
             "session_id": session_id,
             "response_previewed": _stream_consumer is not None and bool(full_response),
+            **terminal_outcome,
         }
 
     # ------------------------------------------------------------------
@@ -27728,6 +27749,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key=session_key,
                 run_generation=run_generation,
                 event_message_id=event_message_id,
+                completion_delivery_synthetic=completion_delivery_synthetic,
             )
 
         from run_agent import AIAgent

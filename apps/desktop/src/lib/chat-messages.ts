@@ -732,6 +732,25 @@ function parseMaybeJsonObject(value: unknown): Record<string, unknown> {
   }
 }
 
+// REST cold-resume transcripts leave codex_reasoning_items as a JSON string
+// (SessionDB stores it serialized; get_messages() only decodes tool_calls).
+// Gateway-shaped messages already supply a decoded array.
+function hasCodexReasoningItems(value: unknown): boolean {
+  if (Array.isArray(value)) {
+    return value.length > 0
+  }
+  if (typeof value !== 'string' || !value.trim()) {
+    return false
+  }
+  try {
+    const parsed = JSON.parse(value) as unknown
+    return Array.isArray(parsed) ? parsed.length > 0 : Boolean(parsed)
+  } catch {
+    // Non-JSON but non-empty string still marks a payload-bearing row.
+    return true
+  }
+}
+
 function firstNonEmptyObject(...values: unknown[]): Record<string, unknown> {
   for (const value of values) {
     const parsed = parseMaybeJsonObject(value)
@@ -997,7 +1016,7 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
       message.reasoning ||
         message.reasoning_content ||
         message.reasoning_details ||
-        (Array.isArray(message.codex_reasoning_items) && message.codex_reasoning_items.length)
+        hasCodexReasoningItems(message.codex_reasoning_items)
     )
     const hasToolCalls = Array.isArray(message.tool_calls) && message.tool_calls.length > 0
 

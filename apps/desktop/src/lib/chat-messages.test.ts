@@ -58,12 +58,18 @@ describe('toChatMessages', () => {
       {
         role: 'assistant',
         content: placeholder,
-        timestamp: 5,
+        codex_reasoning_items: '[{"id":"reasoning","type":"reasoning"}]',
+        timestamp: 5
+      },
+      {
+        role: 'assistant',
+        content: placeholder,
+        timestamp: 6,
         tool_calls: [{ id: 'tc', function: { name: 'terminal', arguments: '{}' } }]
       }
     ])
 
-    // Pure assistant sentinel is dropped; user + three payload-bearing assistant
+    // Pure assistant sentinel is dropped; user + four payload-bearing assistant
     // rows remain (merge shape is existing policy, not this fix).
     expect(messages.some(message => message.role === 'user' && chatMessageText(message) === placeholder)).toBe(
       true
@@ -72,7 +78,8 @@ describe('toChatMessages', () => {
       .filter(message => message.role === 'assistant')
       .map(message => chatMessageText(message))
       .join('')
-    expect((assistantText.match(/\[response interrupted\]/g) || []).length).toBe(3)
+    // reasoning + array codex + REST-string codex + tool_calls
+    expect((assistantText.match(/\[response interrupted\]/g) || []).length).toBe(4)
     const partTypes = messages.flatMap(message => message.parts.map(part => part.type))
     expect(partTypes).toContain('reasoning')
     expect(partTypes).toContain('tool-call')

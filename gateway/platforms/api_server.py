@@ -4156,9 +4156,17 @@ class APIServerAdapter(BasePlatformAdapter):
             )
 
         stream = _coerce_request_bool(body.get("stream"), default=False)
-        internal_completion_delivery = hmac.compare_digest(
-            request.headers.get(INTERNAL_COMPLETION_DELIVERY_HEADER, "").encode(),
-            self._completion_delivery_token.encode(),
+        completion_delivery_marker = request.headers.get(
+            INTERNAL_COMPLETION_DELIVERY_HEADER, ""
+        ).encode()
+        expected_api_key = self._expected_api_key().encode()
+        internal_completion_delivery = (
+            hmac.compare_digest(
+                completion_delivery_marker, self._completion_delivery_token.encode()
+            )
+            or (bool(expected_api_key) and hmac.compare_digest(
+                completion_delivery_marker, expected_api_key
+            ))
         )
 
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
@@ -4655,6 +4663,18 @@ class APIServerAdapter(BasePlatformAdapter):
                     "failed": is_failed,
                     "error": err_msg,
                     "error_code": "output_truncated" if finish_reason == "length" else "agent_error",
+                }
+            elif isinstance(result, dict) and (
+                result.get("turn_exit_reason") or result.get("completion_delivery_status")
+            ):
+                finish_chunk["hermes"] = {
+                    key: result[key]
+                    for key in (
+                        "completed",
+                        "completion_delivery_status",
+                        "turn_exit_reason",
+                    )
+                    if key in result
                 }
             await response.write(_sse_frame(finish_chunk))
             await response.write(b"data: [DONE]\n\n")

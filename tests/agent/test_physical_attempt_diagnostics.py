@@ -102,11 +102,12 @@ def test_pair_emits_only_hmac_digests_for_final_then_next_first_attempt(
     assert pair["previous_loop"] == 1
     assert pair["current_loop"] == 2
     assert pair["previous_attempt_retry"] == 1
-    assert set(pair["digests"]) == {"cache_scope", "prefix", "tools"}
+    assert set(pair["digests"]) == {"cache_scope", "later_history", "prefix", "tools"}
     assert all(len(value) == 64 for value in pair["digests"].values())
     assert pair["first_differing_segment"] == "prefix"
     assert pair["equal"] == {
         "cache_scope": False,
+        "later_history": True,
         "prefix": False,
         "tools": False,
     }
@@ -129,9 +130,12 @@ def test_pair_emits_only_hmac_digests_for_final_then_next_first_attempt(
             separators=(",", ":"),
             sort_keys=True,
         ).encode("utf-8")),
+        "later_history": len(json.dumps(
+            [], ensure_ascii=False, separators=(",", ":"), sort_keys=True,
+        ).encode("utf-8")),
     }
     assert all(
-        set(record["byte_lengths"]) == {"cache_scope", "prefix", "tools"}
+        set(record["byte_lengths"]) == {"cache_scope", "later_history", "prefix", "tools"}
         for record in records
     )
     assert sentinel not in json.dumps(records, sort_keys=True)
@@ -173,6 +177,71 @@ def test_pair_classifies_first_changed_tools_segment(monkeypatch, tmp_path):
     assert pair["first_differing_segment"] == "tools"
     assert pair["equal"] == {
         "cache_scope": True,
+        "later_history": True,
         "prefix": True,
         "tools": False,
     }
+
+
+def test_pair_distinguishes_later_history_from_complete_equality(monkeypatch, tmp_path):
+    from agent import physical_attempt_diagnostics as diagnostics
+    from hermes_cli import config
+
+    monkeypatch.setattr(diagnostics, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(config, "read_raw_config_readonly", lambda: _config(True))
+    diagnostics._LAST_ATTEMPT.clear()
+    common = {
+        "messages": [
+            {"role": "system", "content": "fixed"},
+            {"role": "user", "content": "old"},
+        ],
+        "prompt_cache_key": "fixed",
+        "tools": [{"name": "fixed"}],
+    }
+    changed_history = {
+        **common,
+        "messages": [
+            {"role": "system", "content": "fixed"},
+            {"role": "user", "content": "nëw"},
+        ],
+    }
+    for loop, request in ((1, common), (2, changed_history), (3, changed_history)):
+        diagnostics.start_attempt(
+            request,
+            api_mode="chat_completions",
+            route="chat_completions",
+            provider="provider",
+            model="model",
+            retry=0,
+            loop=loop,
+            correlation="later-history",
+        )
+
+    records = [
+        json.loads(line)
+        for line in (
+            tmp_path / "observability" / "physical_attempt_digests.jsonl"
+        ).read_text().splitlines()
+    ]
+    pairs = [record for record in records if record["phase"] == "pair"]
+    assert [pair["first_differing_segment"] for pair in pairs] == [
+        "later_history",
+        "none",
+    ]
+    assert pairs[0]["equal"] == {
+        "cache_scope": True,
+        "later_history": False,
+        "prefix": True,
+        "tools": True,
+    }
+    assert pairs[1]["equal"] == {
+        "cache_scope": True,
+        "later_history": True,
+        "prefix": True,
+        "tools": True,
+    }
+    assert pairs[0]["byte_lengths"]["later_history"] == len(json.dumps(
+        changed_history["messages"][1:], ensure_ascii=False, separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8"))
+    assert all(len(pair["digests"]["later_history"]) == 64 for pair in pairs)

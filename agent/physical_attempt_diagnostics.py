@@ -87,6 +87,7 @@ def start_attempt(
             "prefix": _prefix(request),
             "tools": request.get("tools") or request.get("toolConfig") or [],
             "cache_scope": {"scope": (scope or {}).get("digest"), "key": _cache_key(request)},
+            "later_history": _later_history(request),
         }
         component_bytes = {
             name: _serialized(value) for name, value in component_values.items()
@@ -128,7 +129,7 @@ def _pair(current: Attempt) -> None:
         _LAST_ATTEMPT[identity] = current
     if previous is None or previous.loop != current.loop - 1:
         return
-    names = ("prefix", "tools", "cache_scope")
+    names = ("prefix", "tools", "cache_scope", "later_history")
     equal = {name: previous.components[name] == current.components[name] for name in names}
     _append({
         "schema": "hermes.physical_attempt.v1",
@@ -140,7 +141,7 @@ def _pair(current: Attempt) -> None:
         "previous_attempt_retry": previous.retry,
         "digests": {
             name: current.components[name]
-            for name in ("cache_scope", "prefix", "tools")
+            for name in ("cache_scope", "later_history", "prefix", "tools")
         },
         "byte_lengths": current.byte_lengths,
         "equal": equal,
@@ -164,6 +165,18 @@ def _prefix(request: dict[str, Any]) -> Any:
             break
         prefix.append(message)
     return prefix
+
+
+def _later_history(request: dict[str, Any]) -> Any:
+    messages = request.get("messages")
+    if not isinstance(messages, list):
+        return []
+    if request.get("instructions") is not None or request.get("system") is not None:
+        return messages
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict) or message.get("role") not in {"system", "developer"}:
+            return messages[index:]
+    return []
 
 
 def _cache_key(request: dict[str, Any]) -> Any:

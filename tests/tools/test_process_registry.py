@@ -1584,7 +1584,7 @@ class TestHandleProcessRedaction:
         assert "sk-proj-AAAABBBBCCCCDDDDEEEEFFFFGGGG" not in entry["output_preview"]
         assert "curl" in entry["command"]
 
-    def test_disabled_passes_through(self, monkeypatch):
+    def test_summary_redacts_when_disabled(self, monkeypatch):
         import agent.redact as _r
         monkeypatch.setattr(_r, "_REDACT_ENABLED", False)
         from tools import process_registry as pr
@@ -1596,7 +1596,45 @@ class TestHandleProcessRedaction:
         reg._running[sess.id] = sess
         monkeypatch.setattr(pr, "process_registry", reg)
         out = json.loads(pr._handle_process({"action": "log", "session_id": sess.id}))
-        assert "zzzopaque1234567890abcdef" in out["output"]
+        assert "zzzopaque1234567890abcdef" not in out["output"]
+
+    def test_process_summary_strictly_redacts_config_secrets_beside_urls(self, monkeypatch):
+        import agent.redact as redact
+
+        monkeypatch.setattr(redact, "_REDACT_ENABLED", False)
+        canaries = ("SYNTHETIC_YAML_8a1d", "SYNTHETIC_DOTTED_4b2e")
+        output = "\n".join(
+            (
+                f"api_key: {canaries[0]} see https://example.invalid/docs",
+                f"service.auth.token={canaries[1]} url=https://example.invalid/result",
+            )
+        )
+        pr, sess = self._setup(monkeypatch, "python app.py", output)
+
+        redacted = json.loads(
+            pr._handle_process({"action": "log", "session_id": sess.id})
+        )["output"]
+        assert all(canary not in redacted for canary in canaries)
+
+    def test_process_summary_redacts_config_and_url_credentials(self, monkeypatch):
+        import agent.redact as redact
+
+        monkeypatch.setattr(redact, "_REDACT_ENABLED", False)
+        config_secret = "SYNTHETIC_CONFIG_SECRET_3d7a"
+        query_secret = "SYNTHETIC_QUERY_SECRET_9c2d"
+        output = "\n".join(
+            (
+                f"service.auth.token={config_secret}",
+                f"https://example.invalid/result?token={query_secret}",
+            )
+        )
+        pr, sess = self._setup(monkeypatch, "python app.py", output)
+
+        redacted = json.loads(
+            pr._handle_process({"action": "log", "session_id": sess.id})
+        )["output"]
+        assert config_secret not in redacted
+        assert query_secret not in redacted
 
 
 # =========================================================================
@@ -1700,7 +1738,6 @@ class TestReaderLoopOrphanedPipe:
                 os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
                 pass
-
 # =========================================================================
 # systemd cgroup isolation for gateway-spawned local executors (#70716)
 # =========================================================================

@@ -415,6 +415,7 @@ class ProcessSession:
     watcher_message_id: str = ""                # Triggering message id — reply anchor for topic routing
     watcher_interval: int = 0                   # 0 = no watcher configured
     notify_on_complete: bool = False             # Queue agent notification on exit
+    heartbeat_provider: str = ""                 # Canonical provider for recovery preflight
     # Watch patterns — trigger agent notification when output matches any pattern
     watch_patterns: List[str] = field(default_factory=list)
     _watch_hits: int = field(default=0, repr=False)          # total matches delivered
@@ -446,6 +447,58 @@ class ProcessSession:
     _completion_supervisor_started: bool = field(default=False, repr=False)
     _subreaper_managed: bool = field(default=False, repr=False)
     _termination_in_progress: bool = field(default=False, repr=False)
+
+
+def arm_process_heartbeat(
+    session: ProcessSession,
+    *,
+    interval: Optional[int] = None,
+    caller_id: Optional[str] = None,
+) -> int:
+    """Arm the runtime heartbeat for one managed process or raise clearly."""
+    from tools.runtime_heartbeat import (
+        HeartbeatConfigError,
+        inspect_process,
+        preflight_current_heartbeat,
+        runtime_heartbeat,
+    )
+
+    caller_id = caller_id or getattr(session, "session_key", "") or getattr(
+        session, "task_id", ""
+    )
+    if not caller_id:
+        raise HeartbeatConfigError(
+            f"process {session.id} has no session ownership key"
+        )
+    if interval is None:
+        provider = getattr(session, "heartbeat_provider", "")
+        interval = (
+            preflight_current_heartbeat(provider)
+            if provider
+            else preflight_current_heartbeat()
+        )
+    if interval is None:
+        raise HeartbeatConfigError(
+            "runtime heartbeat interval is unavailable for managed process "
+            f"{session.id}"
+        )
+    armed = runtime_heartbeat.arm(
+        session.id,
+        caller_id=caller_id,
+        kind="process",
+        interval=interval,
+        inspect=lambda _id=session.id: inspect_process(_id),
+    )
+    if not armed:
+        raise RuntimeError(
+            f"runtime heartbeat did not arm for managed process {session.id}"
+        )
+
+    # Completion may have won before the heartbeat was armed.
+    completion_event = getattr(session, "_completion_event", None)
+    if completion_event is not None and completion_event.is_set():
+        runtime_heartbeat.cancel(session.id)
+    return interval
 
 
 class ProcessRegistry:
@@ -3231,6 +3284,7 @@ class ProcessRegistry:
                             "watcher_message_id": s.watcher_message_id,
                             "watcher_interval": s.watcher_interval,
                             "notify_on_complete": s.notify_on_complete,
+                            "heartbeat_provider": s.heartbeat_provider,
                             "watch_patterns": s.watch_patterns,
                         })
                 if extra_entries:
@@ -3330,12 +3384,31 @@ class ProcessRegistry:
                 watcher_message_id=entry.get("watcher_message_id", ""),
                 watcher_interval=entry.get("watcher_interval", 0),
                 notify_on_complete=entry.get("notify_on_complete", False),
+                heartbeat_provider=entry.get("heartbeat_provider", ""),
                 watch_patterns=entry.get("watch_patterns", []),
             )
             with self._lock:
                 self._running[session.id] = session
             recovered += 1
             logger.info("Recovered detached process: %s (pid=%d)", session.command[:60], pid)
+
+            if session.notify_on_complete:
+                try:
+                    interval = arm_process_heartbeat(session)
+                except Exception as exc:
+                    logger.warning(
+                        "Recovered process %s without runtime heartbeat; "
+                        "check-in is degraded: %s",
+                        session.id,
+                        exc,
+                    )
+                else:
+                    logger.info(
+                        "Re-armed runtime heartbeat for recovered process %s "
+                        "(interval_s=%s)",
+                        session.id,
+                        interval,
+                    )
 
             # Re-enqueue watcher so gateway can resume notifications
             if session.watcher_interval > 0:

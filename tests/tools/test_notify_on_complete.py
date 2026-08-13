@@ -318,8 +318,18 @@ def _silent_bg_harness(monkeypatch, tmp_path):
     monkeypatch.setattr(terminal_tool_module, "_start_cleanup_thread", lambda: None)
     monkeypatch.setattr(terminal_tool_module, "_check_all_guards", lambda *_args, **_kwargs: {"approved": True})
     monkeypatch.setattr(process_registry_module.process_registry, "spawn_local", fake_spawn_local)
+    monkeypatch.setattr(
+        "tools.approval.get_current_session_key", lambda default="": "owner"
+    )
     monkeypatch.setitem(terminal_tool_module._active_environments, "default", dummy_env)
     monkeypatch.setitem(terminal_tool_module._last_activity, "default", 0.0)
+    monkeypatch.setattr(
+        "tools.runtime_heartbeat.preflight_current_heartbeat", lambda: 1700
+    )
+    monkeypatch.setattr(
+        "tools.runtime_heartbeat.runtime_heartbeat.arm",
+        lambda *_args, **_kwargs: True,
+    )
     return terminal_tool_module
 
 

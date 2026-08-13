@@ -749,6 +749,21 @@ class TestSpawnEnvSanitization:
         assert f"{_HERMES_PROVIDER_ENV_FORCE_PREFIX}TELEGRAM_BOT_TOKEN" not in env
         assert env["PYTHONUNBUFFERED"] == "1"
 
+    def test_spawn_local_marks_delegated_child_completion(self, registry):
+        proc = MagicMock(pid=4321, stdout=iter([]), stdin=MagicMock())
+        fake_thread = MagicMock()
+
+        from agent.delegation_context import delegated_child_context
+
+        with patch("tools.process_registry._find_shell", return_value="/bin/bash"), \
+            patch("subprocess.Popen", return_value=proc), \
+            patch("threading.Thread", return_value=fake_thread), \
+            patch.object(registry, "_write_checkpoint"), \
+            delegated_child_context():
+            session = registry.spawn_local("echo hello", cwd="/tmp")
+
+        assert session.delegated_child is True
+
     def test_spawn_via_env_checks_returncode_when_wrapper_fails(self, registry):
         class FakeEnv:
             def __init__(self):
@@ -1160,6 +1175,48 @@ class TestProcessToolHandler:
 # =========================================================================
 
 from tools.process_registry import format_process_notification
+
+
+def test_delegated_wrapper_freeze_failure_keeps_green_pytest_classification(registry, monkeypatch):
+    session = _make_session(
+        sid="proc_wrapper_91",
+        command="pytest -q",
+        exited=True,
+        exit_code=91,
+        output="pytest: 33 passed\nPOST_FOREIGN_CWD: wrapper refused foreign cwd\n",
+    )
+    session.delegated_child = True
+    session.notify_on_complete = True
+    registry._running[session.id] = session
+    monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+
+    registry._move_to_finished(session)
+    notifications = registry.drain_notifications()
+
+    assert len(notifications) == 1
+    text = notifications[0][1]
+    assert "freeze/foreign-CWD wrapper failure" in text
+    assert "pytest: 33 passed" in text
+    assert "product-test failure" not in text
+    assert "POST_FOREIGN_CWD" not in text
+
+
+def test_delegated_pytest_failure_is_not_classified_as_wrapper_failure(registry):
+    event = {
+        "type": "completion",
+        "session_id": "proc_pytest_failure",
+        "session_key": "parent",
+        "command": "pytest -q",
+        "exit_code": 1,
+        "output": "pytest: 31 passed, 2 failed\n",
+        "delegated_child": True,
+    }
+
+    text = format_process_notification(event)
+
+    assert text is not None
+    assert "freeze/foreign-CWD wrapper failure" not in text
+    assert "exit code 1" in text
 
 
 def test_drain_notifications_completion_callback_exception_fails_closed(registry):

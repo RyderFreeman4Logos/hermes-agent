@@ -934,7 +934,14 @@ def _finish_finalization(delegation_id: str, status: str) -> None:
         record = _records.get(delegation_id)
         if record is not None:
             record["status"] = status
+            parent_session_id = str(record.get("parent_session_id") or "")
+        else:
+            parent_session_id = ""
         _prune_completed_locked()
+    if parent_session_id:
+        from tools.runtime_heartbeat import runtime_heartbeat
+
+        runtime_heartbeat.complete_delegation(parent_session_id, delegation_id)
 
 
 def _push_completion_event(

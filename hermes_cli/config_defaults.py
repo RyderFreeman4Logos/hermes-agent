@@ -24,6 +24,10 @@ DEFAULT_CONFIG = {
     # Clamped to the OS hard limit; 0/false/null disables the adjustment.
     "runtime": {
         "nofile_soft_limit": 4096,
+        # Exact route mappings are deliberately opt-in: a family fallback could
+        # send a warm request to a different provider-side prompt cache.
+        "warm_kv_timeout": {"providers": {}},
+        "heartbeat": {"enabled": False},
     },
     # Global active chat session cap across CLI, TUI/dashboard, and messaging.
     # None/0 = unbounded.

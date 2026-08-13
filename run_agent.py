@@ -8114,7 +8114,10 @@ class AIAgent:
             # replaces the value with the live runtime after fallback restoration.
             # Keep the scope local instead of storing ContextVar tokens on the agent,
             # which may be observed from another thread.
-            with bind_subagent_parent(self), scoped_runtime_main({}):
+            from tools.runtime_heartbeat import bind_owner, runtime_heartbeat
+
+            runtime_heartbeat.on_caller_active(self)
+            with bind_subagent_parent(self), scoped_runtime_main({}), bind_owner(self):
                 result = run_conversation(
                     self,
                     user_message,
@@ -8185,6 +8188,11 @@ class AIAgent:
                         reset_accounting_context(acct_token)
                     if token is not None:
                         reset_conversation_context(token)
+                    from tools.runtime_heartbeat import runtime_heartbeat
+
+                    runtime_heartbeat.on_loop_stop(
+                        self, completed=relay_outcome == "success"
+                    )
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """

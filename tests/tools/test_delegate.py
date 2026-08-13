@@ -30,6 +30,7 @@ from tools.delegate_tool import (
     _strip_blocked_tools,
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
+    _resolve_workspace_hint,
 )
 
 
@@ -137,6 +138,476 @@ class TestChildSystemPrompt(unittest.TestCase):
         self.assertIn("Fix the tests", prompt)
         self.assertIn("YOUR TASK", prompt)
         self.assertNotIn("CONTEXT", prompt)
+
+    def test_task_workspace_precedes_parent_cwd_and_seeds_child_tools(self):
+        """Only structured task declarations can replace the parent workspace."""
+        from tools import file_tools, terminal_tool
+
+        parent_dir = self._make_workspace_dir("parent")
+        task_dir = self._make_workspace_dir("task")
+        spaced_task_dir = os.path.join(task_dir, "task workspace")
+        os.mkdir(spaced_task_dir)
+        task_link = os.path.join(parent_dir, "task-link")
+        os.symlink(spaced_task_dir, task_link)
+        self.addCleanup(os.unlink, task_link)
+        unrelated_file = self._make_workspace_file("unrelated.txt")
+        missing_dir = os.path.join(parent_dir, "missing")
+        parent = _make_mock_parent()
+        parent._current_task_id = "parent-task"
+        parent.terminal_cwd = parent_dir
+        terminal_cwd = patch.dict(os.environ, {"TERMINAL_CWD": parent_dir})
+        terminal_cwd.start()
+        self.addCleanup(terminal_cwd.stop)
+        terminal_tool.record_session_cwd("parent-task", parent_dir)
+        self.addCleanup(terminal_tool.clear_session_cwd, "parent-task")
+
+        self.assertEqual(_resolve_workspace_hint(parent, "inspect", spaced_task_dir), spaced_task_dir)
+        with patch(
+            "tools.delegate_tool.os.path.realpath", wraps=os.path.realpath
+        ) as canonicalize:
+            self.assertEqual(
+                _resolve_workspace_hint(
+                    parent, "inspect", f"{task_link}\nbranch: task-branch"
+                ),
+                spaced_task_dir,
+            )
+        canonicalize.assert_called_once_with(task_link)
+        self.assertEqual(
+            _resolve_workspace_hint(parent, "inspect", f"workspace: {spaced_task_dir}"),
+            spaced_task_dir,
+        )
+        for task_text in (
+            f"inspect {spaced_task_dir}",
+            f"evidence lives at {spaced_task_dir}",
+            f"repo: {unrelated_file}",
+            f"repo: {missing_dir}",
+            "repo: https://example.test/checkout",
+            "repo: relative/checkout",
+        ):
+            self.assertEqual(_resolve_workspace_hint(parent, task_text, None), parent_dir)
+
+        captured = {}
+        child = MagicMock()
+        child._credential_pool = None
+        child._delegate_output_schema = None
+        child.tool_progress_callback = None
+
+        def run_without_model(*, task_id, **_kwargs):
+            self.addCleanup(terminal_tool.clear_session_cwd, task_id)
+            captured["task_id"] = task_id
+            captured["relative_path"] = file_tools._resolve_path_for_task(
+                "target.py", task_id=task_id
+            )
+            return {"final_response": "done", "completed": True, "api_calls": 0}
+
+        child.run_conversation.side_effect = run_without_model
+        credentials = {
+            "model": None,
+            "provider": None,
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+        }
+        with (
+            patch("tools.delegate_tool._load_config", return_value={}),
+            patch("tools.delegate_tool._resolve_delegation_credentials", return_value=credentials),
+            patch("tools.delegation_live_log.create_live_transcripts", return_value=("test", [], [])),
+            patch("run_agent.AIAgent", return_value=child) as mock_agent,
+        ):
+            delegate_task(
+                goal="Inspect the requested checkout",
+                context=f"{task_link}\nbranch: task-branch\nHEAD: {'0' * 40}",
+                parent_agent=parent,
+            )
+
+        prompt = mock_agent.call_args.kwargs["ephemeral_system_prompt"]
+        self.assertIn(f"WORKSPACE PATH:\n{spaced_task_dir}", prompt)
+        self.assertTrue(captured["task_id"].startswith("sa-0-"))
+        self.assertEqual(terminal_tool.get_session_cwd(captured["task_id"]), spaced_task_dir)
+        self.assertEqual(captured["relative_path"], file_tools.Path(spaced_task_dir) / "target.py")
+        self.assertNotEqual(captured["relative_path"], file_tools.Path(parent_dir) / "target.py")
+
+    def test_workspace_parser_rejects_relative_and_fenced_candidates(self):
+        parent_dir = self._make_workspace_dir("parent-parser")
+        task_dir = self._make_workspace_dir("task-parser")
+        unrelated_file = self._make_workspace_file("parser-evidence.txt")
+        parent = _make_mock_parent()
+        parent._current_task_id = "parent-parser-task"
+        parent.terminal_cwd = parent_dir
+
+        with patch.dict(os.environ, {"TERMINAL_CWD": parent_dir}):
+            for task_text in (
+                ".",
+                "tools",
+                "~",
+                f"```text\n{task_dir}\n```",
+                f"```sh\nworkspace: {task_dir}\n```",
+                f"~~~command\nrepository: {task_dir}\n~~~",
+                f"\ufeff```text\n{task_dir}\n```",
+                f"    {task_dir}",
+                f"    workspace: {task_dir}",
+                f"<!--\n{task_dir}\n-->",
+                f"<!--\nworkspace: {task_dir}\n-->",
+                f"inspect {task_dir}",
+                f"https://example.test{task_dir}",
+                f"[workspace]({task_dir})",
+                unrelated_file,
+            ):
+                with self.subTest(task_text=task_text):
+                    self.assertEqual(
+                        _resolve_workspace_hint(parent, task_text, None), parent_dir
+                    )
+            self.assertEqual(
+                _resolve_workspace_hint(parent, f"\ufeffworkspace: {task_dir}", None),
+                task_dir,
+            )
+            self.assertEqual(
+                _resolve_workspace_hint(parent, f"\ufeff{task_dir}", None), task_dir
+            )
+
+    def test_workspace_parser_rejects_nested_markdown_candidates(self):
+        parent_dir = self._make_workspace_dir("nested-markdown-parent")
+        task_dir = self._make_workspace_dir("nested-markdown-task")
+        other_dir = self._make_workspace_dir("nested-markdown-other")
+        parent = _make_mock_parent()
+        parent._current_task_id = "nested-markdown-parent-task"
+        parent.terminal_cwd = parent_dir
+        hostile = {
+            "unordered-list-fence-path": f"- ```text\n  {task_dir}\n  ```",
+            "unordered-list-fence-label": f"- ```sh\n  workspace: {task_dir}\n  ```",
+            "ordered-list-fence-path": f"1. ```text\n   {task_dir}\n   ```",
+            "unordered-list-tilde-fence": f"- ~~~text\n  {task_dir}\n  ~~~",
+            "html-pre": f"<pre>\n{task_dir}\n</pre>",
+            "html-code": f"<code>\nworkspace: {task_dir}\n</code>",
+            "nested-list-example-label": f"- example\n  workspace: {task_dir}",
+            "asterisk-list-fence": f"* ```text\n  {task_dir}\n  ```",
+            "plus-list-fence": f"+ ```text\n  {task_dir}\n  ```",
+            "ordered-parenthesis-fence": f"1) ```text\n   {task_dir}\n   ```",
+            "nested-unordered-list-fence": (
+                f"- example\n  - ```text\n    {task_dir}\n    ```"
+            ),
+            "nested-ordered-list-fence": (
+                f"1. example\n   1. ```text\n      {task_dir}\n      ```"
+            ),
+            "two-space-list-path": f"- example\n  {task_dir}",
+            "lazy-list-path": f"- example\n{task_dir}",
+            "lazy-list-label": f"- example\nworkspace: {task_dir}",
+            "second-paragraph-lazy-path": (
+                f"- example\n\n  nested paragraph\n{task_dir}"
+            ),
+            "second-paragraph-lazy-label": (
+                f"- example\n\n  nested paragraph\nworkspace: {task_dir}"
+            ),
+            "unordered-list-label": f"- workspace: {task_dir}",
+            "ordered-list-path": f"1. {task_dir}",
+            "blockquote-list-fence": (f"> - ```text\n>   {task_dir}\n>   ```"),
+            "list-blockquote-fence": (f"- > ```text\n  > {task_dir}\n  > ```"),
+            "blockquote-list-label": (f"> - example\n>   workspace: {task_dir}"),
+            "nested-list-path": f"- example\n  - nested\n    {task_dir}",
+            "html-div": f"<div>\n{task_dir}\n</div>",
+            "html-details-label": (f"<details>\nworkspace: {task_dir}\n</details>"),
+            "html-pre-multiline-open": (f"<pre\nclass=example>\n{task_dir}\n</pre>"),
+            "html-div-multiline-open": (
+                f"<div\nclass=example>\nworkspace: {task_dir}\n</div>"
+            ),
+            "html-processing-instruction": f"<?example\n{task_dir}\n?>",
+            "html-cdata": f"<![CDATA[\nworkspace: {task_dir}\n]]>",
+            "html-declaration": f"<!DOCTYPE\n{task_dir}\n>",
+        }
+
+        with patch.dict(os.environ, {"TERMINAL_CWD": parent_dir}):
+            for name, task_text in hostile.items():
+                with self.subTest(name=name):
+                    self.assertEqual(
+                        _resolve_workspace_hint(parent, task_text, None), parent_dir
+                    )
+            for name, task_text in {
+                "standalone": task_dir,
+                "label": f"workspace: {task_dir}",
+                "bom-label": f"\ufeffrepository: {task_dir}",
+                "after-list": f"- example\n\nworkspace: {task_dir}",
+                "after-unordered-dedent": (f"- example\n\n workspace: {task_dir}"),
+                "after-ordered-dedent": f"1. example\n\n  {task_dir}",
+                "after-blockquote-dedent": (f"> example\n\n   workspace: {task_dir}"),
+                "after-fence": (f"```text\n{other_dir}\n```\nworkspace: {task_dir}"),
+                "after-html": (f"<pre>\n{other_dir}\n</pre>\nworkspace: {task_dir}"),
+            }.items():
+                with self.subTest(name=f"top-level-{name}"):
+                    self.assertEqual(
+                        _resolve_workspace_hint(parent, task_text, None), task_dir
+                    )
+
+    def test_list_nested_workspace_cannot_change_child_identity(self):
+        from tools import file_tools, terminal_tool
+
+        parent_dir = self._make_workspace_dir("hostile-parent")
+        bait_dir = self._make_workspace_dir("hostile-bait")
+        decoy_dir = self._make_workspace_dir("hostile-decoy")
+        parent = _make_mock_parent()
+        parent._current_task_id = "hostile-parent-task"
+        parent.terminal_cwd = parent_dir
+        terminal_tool.record_session_cwd("hostile-parent-task", parent_dir)
+        self.addCleanup(terminal_tool.clear_session_cwd, "hostile-parent-task")
+        captured = {}
+        child = MagicMock()
+        child._credential_pool = None
+        child._delegate_output_schema = None
+        child.tool_progress_callback = None
+
+        def run_without_model(*, task_id, **_kwargs):
+            self.addCleanup(terminal_tool.clear_session_cwd, task_id)
+            captured.update(
+                workspace=child._delegate_workspace_path,
+                record=terminal_tool.get_session_cwd(task_id),
+                terminal=terminal_tool._resolve_command_cwd(
+                    workdir=None, default_cwd=decoy_dir, session_key=task_id
+                ),
+                file=file_tools._resolve_path_for_task("first.txt", task_id=task_id),
+            )
+            return {"final_response": "done", "completed": True, "api_calls": 0}
+
+        child.run_conversation.side_effect = run_without_model
+        credentials = {
+            "model": None,
+            "provider": None,
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+        }
+        with (
+            patch.dict(os.environ, {"TERMINAL_CWD": decoy_dir}),
+            patch("tools.delegate_tool._load_config", return_value={}),
+            patch(
+                "tools.delegate_tool._resolve_delegation_credentials",
+                return_value=credentials,
+            ),
+            patch(
+                "tools.delegation_live_log.create_live_transcripts",
+                return_value=("test", [], []),
+            ),
+            patch("run_agent.AIAgent", return_value=child) as mock_agent,
+        ):
+            delegate_task(
+                goal="Inspect safely",
+                context=f"- ```text\n  {bait_dir}\n  ```",
+                parent_agent=parent,
+            )
+
+        expected = os.path.realpath(parent_dir)
+        prompt = mock_agent.call_args.kwargs["ephemeral_system_prompt"]
+        self.assertEqual(captured["workspace"], expected)
+        self.assertEqual(captured["record"], expected)
+        self.assertEqual(captured["terminal"], expected)
+        self.assertEqual(captured["file"], file_tools.Path(expected) / "first.txt")
+        self.assertIn(f"WORKSPACE PATH:\n{expected}\n", prompt)
+        self.assertNotIn(f"WORKSPACE PATH:\n{os.path.realpath(bait_dir)}\n", prompt)
+
+    def test_live_parent_session_cwd_precedes_stale_fallbacks(self):
+        from tools import terminal_tool
+
+        live_parent_dir = self._make_workspace_dir("live-parent")
+        stale_env_dir = self._make_workspace_dir("stale-env")
+        parent = _make_mock_parent()
+        parent._current_task_id = "live-parent-task"
+        parent.terminal_cwd = stale_env_dir
+        terminal_tool.record_session_cwd("live-parent-task", live_parent_dir)
+        self.addCleanup(terminal_tool.clear_session_cwd, "live-parent-task")
+
+        with patch.dict(os.environ, {"TERMINAL_CWD": stale_env_dir}):
+            self.assertEqual(
+                _resolve_workspace_hint(parent, "Inspect the parent checkout", None),
+                live_parent_dir,
+            )
+
+    def test_container_guard_checks_lexical_path_before_canonicalizing(self):
+        parent_dir = self._make_workspace_dir("container-parent")
+        task_dir = self._make_workspace_dir("container-task")
+        spaced_task_dir = os.path.join(task_dir, "task workspace")
+        os.mkdir(spaced_task_dir)
+        safe_link = os.path.join(parent_dir, "safe-link")
+        os.symlink(spaced_task_dir, safe_link)
+        self.addCleanup(os.unlink, safe_link)
+        inward_link = os.path.join(parent_dir, "inward-link")
+        inward_target = "/home/obj" if os.path.isdir("/home/obj") else "/home"
+        os.symlink(inward_target, inward_link)
+        self.addCleanup(os.unlink, inward_link)
+        guarded_link = "/home/user/guarded-workspace-link"
+        traversal = "/tmp/../home/obj"
+        parent = _make_mock_parent()
+        parent.terminal_cwd = parent_dir
+        host_realpath = os.path.realpath
+
+        def canonicalize(path):
+            return spaced_task_dir if path == guarded_link else host_realpath(path)
+
+        with (
+            patch.dict(os.environ, {"TERMINAL_CWD": parent_dir}),
+            patch("tools.file_tools._uses_container_paths", return_value=True),
+            patch("tools.delegate_tool.os.path.realpath", side_effect=canonicalize) as realpath,
+        ):
+            self.assertEqual(
+                _resolve_workspace_hint(parent, guarded_link, None), parent_dir
+            )
+        self.assertNotIn(guarded_link, [call.args[0] for call in realpath.call_args_list])
+
+        with (
+            patch.dict(os.environ, {"TERMINAL_CWD": parent_dir}),
+            patch("tools.file_tools._uses_container_paths", return_value=True),
+            patch(
+                "tools.delegate_tool.os.path.realpath", wraps=os.path.realpath
+            ) as canonicalize_traversal,
+        ):
+            self.assertEqual(
+                _resolve_workspace_hint(parent, traversal, None), parent_dir
+            )
+        self.assertNotIn(
+            traversal, [call.args[0] for call in canonicalize_traversal.call_args_list]
+        )
+
+        with (
+            patch.dict(os.environ, {"TERMINAL_CWD": parent_dir}),
+            patch("tools.file_tools._uses_container_paths", return_value=True),
+            patch(
+                "tools.delegate_tool.os.path.realpath", wraps=os.path.realpath
+            ) as canonicalize_inward,
+        ):
+            self.assertEqual(
+                _resolve_workspace_hint(parent, inward_link, None), parent_dir
+            )
+        self.assertIn(
+            inward_link, [call.args[0] for call in canonicalize_inward.call_args_list]
+        )
+
+        with (
+            patch.dict(os.environ, {"TERMINAL_CWD": parent_dir}),
+            patch("tools.file_tools._uses_container_paths", return_value=True),
+            patch(
+                "tools.delegate_tool.os.path.realpath", wraps=os.path.realpath
+            ) as canonicalize_safe,
+        ):
+            self.assertEqual(
+                _resolve_workspace_hint(parent, safe_link, None), spaced_task_dir
+            )
+        canonicalize_safe.assert_called_once_with(safe_link)
+
+    def test_batch_and_orchestrator_workspace_hints_are_isolated(self):
+        parent_dir = self._make_workspace_dir("parent")
+        task_a = self._make_workspace_dir("task-a")
+        task_b = self._make_workspace_dir("task-b")
+        parent = _make_mock_parent()
+        parent.terminal_cwd = parent_dir
+        terminal_cwd = patch.dict(os.environ, {"TERMINAL_CWD": parent_dir})
+        terminal_cwd.start()
+        self.addCleanup(terminal_cwd.stop)
+        credentials = {
+            "model": None,
+            "provider": None,
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+        }
+
+        def completed_child(*args, **kwargs):
+            return {
+                "task_index": kwargs["task_index"] if "task_index" in kwargs else args[0],
+                "status": "completed",
+                "summary": "done",
+                "api_calls": 0,
+                "duration_seconds": 0.0,
+                "_child_role": "leaf",
+                "_child_cost_usd": 0.0,
+            }
+
+        with (
+            patch("tools.delegate_tool._load_config", return_value={}),
+            patch("tools.delegate_tool._resolve_delegation_credentials", return_value=credentials),
+            patch("tools.delegate_tool._run_single_child", side_effect=completed_child),
+            patch("tools.delegation_live_log.create_live_transcripts", return_value=("test", [], [])),
+            patch("run_agent.AIAgent") as mock_agent,
+        ):
+            delegate_task(
+                tasks=[
+                    {"goal": "Inspect task A", "context": f"repository: {task_a}"},
+                    {"goal": "Inspect task B", "context": f"evidence: {task_b}"},
+                ],
+                parent_agent=parent,
+            )
+            batch_prompts = [call.kwargs["ephemeral_system_prompt"] for call in mock_agent.call_args_list]
+
+        self.assertIn(f"WORKSPACE PATH:\n{task_a}", batch_prompts[0])
+        self.assertIn(f"WORKSPACE PATH:\n{parent_dir}", batch_prompts[1])
+
+        with (
+            patch("tools.delegate_tool._load_config", return_value={}),
+            patch("tools.delegate_tool._resolve_delegation_credentials", return_value=credentials),
+            patch("tools.delegate_tool._run_single_child", side_effect=completed_child),
+            patch("tools.delegation_live_log.create_live_transcripts", return_value=("test", [], [])),
+            patch("tools.delegate_tool._get_orchestrator_enabled", return_value=True),
+            patch("tools.delegate_tool._get_max_spawn_depth", return_value=2),
+            patch("run_agent.AIAgent") as mock_agent,
+        ):
+            delegate_task(
+                goal="Coordinate task B",
+                context=f"checkout: {task_b}",
+                role="orchestrator",
+                parent_agent=parent,
+            )
+
+        self.assertIn(f"WORKSPACE PATH:\n{task_b}", mock_agent.call_args.kwargs["ephemeral_system_prompt"])
+
+    def test_workspace_parser_rejects_block_continuation_bait(self):
+        parent_dir = self._make_workspace_dir("block-parent")
+        bait_dir = self._make_workspace_dir("block-bait")
+        task_dir = self._make_workspace_dir("block-task")
+        parent = _make_mock_parent()
+        parent._current_task_id = "block-parent-task"
+        parent.terminal_cwd = parent_dir
+        hostile = {
+            "four-space-fence-closer": (
+                f"```text\nignored\n    ```\nworkspace: {bait_dir}\n```\n\nworkspace: {task_dir}"
+            ),
+            "tab-fence-closer": (
+                f"```text\nignored\n\t```\nworkspace: {bait_dir}\n```\n\nworkspace: {task_dir}"
+            ),
+            "closing-tag-opener": (
+                f"</div>\nworkspace: {bait_dir}\n\nworkspace: {task_dir}"
+            ),
+            "type-6-html": (
+                f"<div></div>\nworkspace: {bait_dir}\n\nworkspace: {task_dir}"
+            ),
+            "type-7-html": (
+                f"<widget></widget>\nworkspace: {bait_dir}\n\nworkspace: {task_dir}"
+            ),
+            "prose-path-soft-break": (
+                f"Example path follows:\n{bait_dir}\n\nworkspace: {task_dir}"
+            ),
+            "prose-label-soft-break": (
+                f"Example workspace follows:\nworkspace: {bait_dir}\n\nworkspace: {task_dir}"
+            ),
+        }
+
+        with patch.dict(os.environ, {"TERMINAL_CWD": parent_dir}):
+            for name, task_text in hostile.items():
+                with self.subTest(name=name):
+                    self.assertEqual(
+                        _resolve_workspace_hint(parent, task_text, None), task_dir
+                    )
+
+    def _make_workspace_dir(self, name):
+        import shutil
+        import tempfile
+
+        path = tempfile.mkdtemp(prefix=f"delegate-{name}-")
+        self.addCleanup(shutil.rmtree, path)
+        return path
+
+    def _make_workspace_file(self, name):
+        import tempfile
+
+        fd, path = tempfile.mkstemp(prefix="delegate-", suffix=f"-{name}")
+        os.close(fd)
+        self.addCleanup(os.unlink, path)
+        return path
 
 class TestStripBlockedTools(unittest.TestCase):
     def test_removes_blocked_toolsets(self):

@@ -989,14 +989,187 @@ def _build_child_system_prompt(
     return "\n".join(parts)
 
 
-def _resolve_workspace_hint(parent_agent) -> Optional[str]:
-    """Best-effort local workspace hint for child prompts.
+_TASK_WORKSPACE_DECLARATION_RE = re.compile(
+    r"^\s*(?:repo|repository|workspace|worktree|checkout)\s*:\s*(/.*)\s*$",
+    re.IGNORECASE,
+)
+_MARKDOWN_FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})(.*)$")
+_MARKDOWN_FENCE_CLOSE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*$")
+_MARKDOWN_CONTAINER_RE = re.compile(r"^( {0,3})(?:(>)|([-+*]|\d{1,9}[.)])([ \t]+|$))")
+_MARKDOWN_HTML_OPEN_RE = re.compile(
+    r"^ {0,3}<([A-Za-z][A-Za-z0-9-]*)(?=[\s/>]|$)", re.IGNORECASE
+)
+_MARKDOWN_HTML_CLOSE_RE = re.compile(
+    r"^ {0,3}</[A-Za-z][A-Za-z0-9-]*\s*>", re.IGNORECASE
+)
+_MARKDOWN_HTML_SPECIAL_RE = re.compile(r"^ {0,3}(<\?|<!\[CDATA\[|<![A-Z])")
+_MARKDOWN_RAW_HTML_TAGS = frozenset({"code", "pre", "script", "style", "textarea"})
 
-    We only inject a path when we have a concrete absolute directory. This avoids
-    teaching subagents a fake container path while still helping them avoid
-    guessing `/workspace/...` for local repo tasks.
-    """
+
+def _existing_workspace_directory(
+    candidate: Any, *, container_paths: bool = False
+) -> Optional[str]:
+    """Return a canonical existing directory for an absolute path candidate."""
+    if not isinstance(candidate, str):
+        return None
+    candidate = candidate.strip()
+    if not candidate or candidate.startswith("//") or not os.path.isabs(candidate):
+        return None
+    from tools.terminal_tool import _is_unusable_container_cwd
+
+    if container_paths and _is_unusable_container_cwd(os.path.normpath(candidate)):
+        return None
+    try:
+        path = os.path.realpath(os.path.expanduser(candidate))
+    except (OSError, TypeError, ValueError):
+        return None
+    if container_paths and _is_unusable_container_cwd(path):
+        return None
+    return path if os.path.isdir(path) else None
+
+
+def _resolve_workspace_hint(
+    parent_agent, goal: Optional[str] = None, context: Optional[str] = None
+) -> Optional[str]:
+    """Resolve a task-explicit workspace before falling back to the parent cwd."""
+    parent_task_id = getattr(parent_agent, "_current_task_id", None)
+    from tools.file_tools import _uses_container_paths
+
+    container_paths = _uses_container_paths(
+        parent_task_id
+        if isinstance(parent_task_id, str) and parent_task_id
+        else "default"
+    )
+    for task_text in (goal, context):
+        if not isinstance(task_text, str):
+            continue
+        task_text = task_text.removeprefix("\ufeff")
+        fence: Optional[tuple[str, int]] = None
+        html_comment = False
+        html_block: Optional[str] = None
+        html_block_raw = False
+        html_special_end: Optional[str] = None
+        markdown_container = False
+        container_indent = 0
+        container_break = False
+        markdown_paragraph = False
+        for line in task_text.splitlines():
+            fence_match = _MARKDOWN_FENCE_RE.match(line)
+            if fence is not None:
+                fence_close = _MARKDOWN_FENCE_CLOSE_RE.match(line)
+                if fence_close:
+                    marker = fence_close.group(1)
+                    if marker[0] == fence[0] and len(marker) >= fence[1]:
+                        fence = None
+                continue
+            if html_special_end is not None:
+                if html_special_end in line:
+                    html_special_end = None
+                continue
+            if html_block is not None:
+                if html_block_raw and re.search(
+                    rf"</{re.escape(html_block)}\s*>", line, re.IGNORECASE
+                ):
+                    html_block = None
+                    html_block_raw = False
+                elif not html_block_raw and not line.strip():
+                    html_block = None
+                continue
+            if html_comment:
+                if "-->" in line:
+                    html_comment = False
+                continue
+            if not line.strip():
+                markdown_paragraph = False
+                if markdown_container:
+                    container_break = True
+                continue
+            container_match = _MARKDOWN_CONTAINER_RE.match(line)
+            if container_match:
+                if not markdown_container:
+                    leading, quote, marker, spacing = container_match.groups()
+                    if quote:
+                        container_indent = 4
+                    else:
+                        prefix_width = len(leading) + len(marker or "")
+                        spacing_width = (
+                            len((" " * prefix_width + (spacing or "")).expandtabs(4))
+                            - prefix_width
+                        )
+                        if not 1 <= spacing_width <= 4:
+                            spacing_width = 1
+                        container_indent = prefix_width + spacing_width
+                markdown_container = True
+                container_break = False
+                continue
+            if markdown_container:
+                line_indent = len(line) - len(line.lstrip(" "))
+                if (
+                    container_break
+                    and not line.startswith("\t")
+                    and line_indent < container_indent
+                ):
+                    markdown_container = False
+                    container_indent = 0
+                    container_break = False
+                else:
+                    container_break = False
+                    continue
+            if fence_match:
+                marker = fence_match.group(1)
+                fence = (marker[0], len(marker))
+                markdown_paragraph = False
+                continue
+            if "<!--" in line:
+                html_comment = "-->" not in line.split("<!--", 1)[1]
+                markdown_paragraph = False
+                continue
+            html_special = _MARKDOWN_HTML_SPECIAL_RE.match(line)
+            if html_special:
+                opener = html_special.group(1)
+                terminator = {"<?": "?>", "<![CDATA[": "]]>"}.get(opener, ">")
+                if terminator not in line[html_special.end() :]:
+                    html_special_end = terminator
+                markdown_paragraph = False
+                continue
+            if _MARKDOWN_HTML_CLOSE_RE.match(line):
+                html_block = ""
+                markdown_paragraph = False
+                continue
+            html_match = _MARKDOWN_HTML_OPEN_RE.match(line)
+            if html_match:
+                tag = html_match.group(1).lower()
+                html_block = tag
+                html_block_raw = tag in _MARKDOWN_RAW_HTML_TAGS
+                if html_block_raw and re.search(
+                    rf"</{re.escape(tag)}\s*>", line[html_match.end() :], re.IGNORECASE
+                ):
+                    html_block = None
+                    html_block_raw = False
+                markdown_paragraph = False
+                continue
+            if line.startswith("\t") or len(line) - len(line.lstrip(" ")) >= 4:
+                markdown_paragraph = True
+                continue
+            declaration = _TASK_WORKSPACE_DECLARATION_RE.fullmatch(line)
+            workspace = _existing_workspace_directory(
+                declaration.group(1) if declaration else line.strip(),
+                container_paths=container_paths,
+            )
+            if workspace and not markdown_paragraph:
+                return workspace
+            markdown_paragraph = True
+
+    live_parent_cwd = None
+    if isinstance(parent_task_id, str) and parent_task_id:
+        try:
+            from tools.terminal_tool import get_session_cwd
+
+            live_parent_cwd = get_session_cwd(parent_task_id)
+        except Exception:
+            pass
     candidates = [
+        live_parent_cwd,
         os.getenv("TERMINAL_CWD"),
         getattr(
             getattr(parent_agent, "_subdirectory_hints", None), "working_dir", None
@@ -1005,14 +1178,11 @@ def _resolve_workspace_hint(parent_agent) -> Optional[str]:
         getattr(parent_agent, "cwd", None),
     ]
     for candidate in candidates:
-        if not candidate:
-            continue
-        try:
-            text = os.path.abspath(os.path.expanduser(str(candidate)))
-        except Exception:
-            continue
-        if os.path.isabs(text) and os.path.isdir(text):
-            return text
+        workspace = _existing_workspace_directory(
+            candidate, container_paths=container_paths
+        )
+        if workspace:
+            return workspace
     return None
 
 
@@ -1443,7 +1613,7 @@ def _build_child_agent(
     if effective_role == "orchestrator" and "delegation" not in child_toolsets:
         child_toolsets.append("delegation")
 
-    workspace_hint = _resolve_workspace_hint(parent_agent)
+    workspace_hint = _resolve_workspace_hint(parent_agent, goal, context)
     child_prompt = _build_child_system_prompt(
         goal,
         context,
@@ -1742,6 +1912,7 @@ def _build_child_agent(
     child._subagent_id = subagent_id
     child._parent_subagent_id = parent_subagent_id
     child._subagent_goal = goal
+    setattr(child, "_delegate_workspace_path", workspace_hint)
     child._parent_turn_id = getattr(parent_agent, "_current_turn_id", "") or ""
     # Stable sidebar marker: delegate subagent sessions must stay out of
     # session pickers even when a parent delete orphans them (parent_session_id
@@ -2362,10 +2533,10 @@ def _run_single_child(
 
         child_task_id = _subagent_id or f"subagent-{task_index}-{_uuid.uuid4().hex[:8]}"
         parent_task_id = getattr(parent_agent, "_current_task_id", None)
-        # Seed the child's session-cwd record from the parent's (cwd rearch):
+        # Seed the child's session-cwd record from its task workspace or parent.
         # children share the parent's container, and today they inherit the
         # parent's live env.cwd implicitly. Seeding at spawn preserves that
-        # starting directory while keeping the child's subsequent `cd`s
+        # fallback directory while keeping the child's subsequent `cd`s
         # isolated in its own record (a child's cd no longer bleeds back into
         # the parent once readers flip to the record store).
         try:
@@ -2375,7 +2546,13 @@ def _run_single_child(
                 register_container_alias,
             )
 
-            record_session_cwd(child_task_id, get_session_cwd(parent_task_id))
+            workspace_path = getattr(child, "_delegate_workspace_path", None)
+            record_session_cwd(
+                child_task_id,
+                workspace_path
+                if isinstance(workspace_path, str) and workspace_path
+                else get_session_cwd(parent_task_id),
+            )
             # Per-session container isolation (docker + container_persistent:
             # false) keys containers by session task_id. The child must share
             # the PARENT's container — register the alias so the child's

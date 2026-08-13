@@ -48,6 +48,11 @@ class SharedMetricsSubscriber:
         self._active = True
         self._lock = threading.RLock()
 
+    def activate(self) -> None:
+        """Resume accepting events after telemetry is enabled again."""
+        with self._lock:
+            self._active = True
+
     def deactivate(self) -> None:
         """Stop accepting events before telemetry is disabled or torn down."""
         with self._lock:

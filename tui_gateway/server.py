@@ -7347,11 +7347,19 @@ def _start_inflight_turn(session: dict, text: Any) -> None:
     now = time.time()
     session["inflight_turn"] = {
         "assistant": "",
+        "assistant_parts": [],
         "started_at": now,
         "streaming": True,
         "updated_at": now,
         "user": _inflight_text(text),
     }
+
+
+def _inflight_assistant(turn: dict) -> str:
+    parts = turn.get("assistant_parts")
+    if isinstance(parts, list):
+        return "".join(parts)
+    return str(turn.get("assistant") or "")
 
 
 def _append_inflight_delta(session: dict, delta: Any) -> None:
@@ -7360,8 +7368,13 @@ def _append_inflight_delta(session: dict, delta: Any) -> None:
         return
     turn = session.get("inflight_turn")
     if not isinstance(turn, dict):
-        turn = {"assistant": "", "streaming": True, "user": ""}
-    turn["assistant"] = f"{turn.get('assistant') or ''}{text}"
+        turn = {"assistant": "", "assistant_parts": [], "streaming": True, "user": ""}
+    parts = turn.get("assistant_parts")
+    if not isinstance(parts, list):
+        assistant = str(turn.get("assistant") or "")
+        parts = [assistant] if assistant else []
+        turn["assistant_parts"] = parts
+    parts.append(text)
     turn["streaming"] = True
     turn["updated_at"] = time.time()
     session["inflight_turn"] = turn
@@ -7413,7 +7426,8 @@ def _fail_inflight_turn(session: dict, error: Any) -> None:
     turn = session.get("inflight_turn")
     if not isinstance(turn, dict):
         turn = {"assistant": "", "user": "", "started_at": now}
-    turn["assistant"] = str(turn.get("assistant") or "")
+    turn["assistant"] = _inflight_assistant(turn)
+    turn.pop("assistant_parts", None)
     turn["user"] = str(turn.get("user") or "")
     turn["error"] = message or "turn failed"
     turn["status"] = "error"
@@ -7822,7 +7836,7 @@ def _inflight_snapshot(session: dict) -> dict | None:
     if not isinstance(turn, dict):
         return None
     user = str(turn.get("user") or "").strip()
-    assistant = str(turn.get("assistant") or "")
+    assistant = _inflight_assistant(turn)
     streaming = bool(turn.get("streaming"))
     error = str(turn.get("error") or "").strip()
     if not user and not assistant and not streaming and not error:
@@ -7860,7 +7874,7 @@ def _emit_terminal_turn_error(sid: str, session: dict, error: Any) -> None:
         _fail_inflight_turn(session, error)
         turn = session.get("inflight_turn") or {}
         message = str(turn.get("error") or "turn failed")
-        partial = str(turn.get("assistant") or "")
+        partial = _inflight_assistant(turn)
         cols = int(session.get("cols", 80))
     text = partial or f"Error: {message}"
     agent = session.get("agent")

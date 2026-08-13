@@ -135,6 +135,19 @@ def test_healthy_snapshot_carries_no_error_keys():
     assert snapshot == {"assistant": "hello", "streaming": True, "user": "hi"}
 
 
+def test_inflight_deltas_are_buffered_until_snapshot():
+    session = _session()
+    server._start_inflight_turn(session, "hi")
+
+    for _ in range(100):
+        server._append_inflight_delta(session, "x")
+
+    turn = session["inflight_turn"]
+    assert turn["assistant"] == ""
+    assert turn["assistant_parts"] == ["x"] * 100
+    assert server._inflight_snapshot(session)["assistant"] == "x" * 100
+
+
 # ── Returned-error path (run_conversation returns an error result) ────
 
 

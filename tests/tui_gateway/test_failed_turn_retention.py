@@ -25,6 +25,7 @@ import subprocess
 import threading
 import types
 from pathlib import Path
+from threading import Thread
 
 import pytest
 
@@ -224,8 +225,8 @@ def test_concurrent_live_snapshot_observes_production_stream_prefixes(
         except Exception as exc:  # surfaced in the owning test thread below
             sampler_errors.append(exc)
 
-    sampler = server._RealThread(target=_sample_live_resume_payloads, daemon=True)
-    producer = server._RealThread(
+    sampler = Thread(target=_sample_live_resume_payloads, daemon=True)
+    producer = Thread(
         target=lambda: server._run_prompt_submit("rid", "sid", session, "prompt"),
         daemon=True,
     )

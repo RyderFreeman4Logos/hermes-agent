@@ -23781,10 +23781,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             else None
                         ),
                         "target_kind": str(evt.get("target_kind") or "")[:100],
-                        "provider": str(evt.get("provider") or "")[:500],
-                        "cache_context": str(
-                            evt.get("cache_context") or ""
-                        )[:1000],
                         "heartbeat_group_token": (
                             group_token
                             if isinstance(group_token, int)

@@ -679,8 +679,11 @@ def test_profile_scoped_agent_build_starts_mcp_discovery_in_profile_home(
     server._sessions[sid] = session
     try:
         server._start_agent_build(sid, session)
-        assert built.wait(timeout=2)
+        assert ready.wait(timeout=10)
+        assert built.is_set()
     finally:
+        if stop := session.get("_notif_stop"):
+            stop.set()
         server._sessions.pop(sid, None)
 
     assert seen == [str(profile_home)]
@@ -734,8 +737,11 @@ def test_profile_scoped_agent_build_installs_secret_scope(monkeypatch, tmp_path)
     server._sessions[sid] = session
     try:
         server._start_agent_build(sid, session)
-        assert built.wait(timeout=2)
+        assert ready.wait(timeout=10)
+        assert built.is_set()
     finally:
+        if stop := session.get("_notif_stop"):
+            stop.set()
         server._sessions.pop(sid, None)
 
     assert scopes == [{"PROXMOX_TOKEN": "grace-secret"}]

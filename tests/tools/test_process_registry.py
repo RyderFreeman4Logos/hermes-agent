@@ -17,6 +17,7 @@ from tools.process_registry import (
     FINISHED_TTL_SECONDS,
     MAX_PROCESSES,
     MAX_ACTIVE_PROCESS_AGE,
+    format_process_notification,
 )
 
 
@@ -1088,6 +1089,52 @@ class TestCheckpoint:
 
             data = json.loads(checkpoint.read_text())
             assert data == []
+
+    def test_checkpoint_recovery_preserves_delegated_wrapper_classification(
+        self, registry, tmp_path, monkeypatch
+    ):
+        """Restarted delegated children retain wrapper-failure provenance."""
+        checkpoint = tmp_path / "procs.json"
+        session = ProcessSession(
+            id="proc_wrapper_91_recovered",
+            command="pytest -q",
+            pid=4242,
+            host_start_time=321,
+            started_at=1.0,
+            delegated_child=True,
+            notify_on_complete=True,
+        )
+        registry._running[session.id] = session
+
+        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+            registry._write_checkpoint()
+            recovered_registry = ProcessRegistry()
+            monkeypatch.setattr(
+                recovered_registry, "_host_pid_is_ours", lambda *_args: True
+            )
+            assert recovered_registry.recover_from_checkpoint() == 1
+
+        recovered = recovered_registry.get(session.id)
+        assert recovered is not None
+        assert recovered.delegated_child is True
+        recovered.exit_code = 91
+        recovered.output_buffer = (
+            "pytest: 33 passed\n"
+            "POST_FOREIGN_CWD: wrapper refused foreign cwd\n"
+        )
+        text = format_process_notification({
+            "type": "completion",
+            "session_id": recovered.id,
+            "command": recovered.command,
+            "exit_code": recovered.exit_code,
+            "output": recovered.output_buffer,
+            "delegated_child": recovered.delegated_child,
+        })
+
+        assert text is not None
+        assert "freeze/foreign-CWD wrapper failure" in text
+        assert "pytest: 33 passed" in text
+        assert "POST_FOREIGN_CWD" not in text
 
     def test_checkpoint_redacts_command_with_inline_secret(self, registry, tmp_path):
         """Issue #77484: the checkpoint file persists raw commands; inline

@@ -3087,6 +3087,20 @@ def terminal_tool(
                 env_type=env_type,
             )
             try:
+                from tools.runtime_heartbeat import (
+                    HeartbeatConfigError,
+                    get_current_provider,
+                    preflight_current_heartbeat,
+                )
+
+                heartbeat_interval = None
+                if notify_on_complete:
+                    heartbeat_interval = preflight_current_heartbeat()
+                    if heartbeat_interval is None:
+                        raise HeartbeatConfigError(
+                            "runtime heartbeat interval is unavailable for "
+                            "notify_on_complete"
+                        )
                 if env_type == "local":
                     proc_session = process_registry.spawn_local(
                         command=command,
@@ -3290,7 +3304,25 @@ def terminal_tool(
                 # Mark for agent notification on completion
                 if notify_on_complete and background:
                     proc_session.notify_on_complete = True
+                    proc_session.heartbeat_provider = get_current_provider()
                     result_data["notify_on_complete"] = True
+
+                    from tools.process_registry import arm_process_heartbeat
+
+                    try:
+                        arm_process_heartbeat(
+                            proc_session,
+                            interval=heartbeat_interval,
+                            caller_id=session_key,
+                        )
+                    except (HeartbeatConfigError, RuntimeError):
+                        proc_session.notify_on_complete = False
+                        process_registry.kill_process(
+                            proc_session.id,
+                            source="heartbeat_arm_failed",
+                            consume_output=False,
+                        )
+                        raise
 
                     # In gateway mode, auto-register a fast watcher so the
                     # gateway can detect completion and trigger a new agent

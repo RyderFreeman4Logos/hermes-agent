@@ -11,7 +11,7 @@ from collections.abc import Callable, Iterator
 from types import SimpleNamespace
 from typing import Any
 
-from agent import relay_runtime
+from agent import physical_attempt_diagnostics, relay_runtime
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +22,89 @@ _PROVIDER_MESSAGE_EXTENSION_KEYS = frozenset(
 _RELAY_INTERNAL_PROVIDER_HEADERS = frozenset(
     {"x-dynamo-parent-session-id", "x-dynamo-session-id"}
 )
+
+
+def _attempt_role(metadata: dict[str, Any] | None) -> str:
+    role = str((metadata or {}).get("call_role") or "").lower()
+    if role == "delegated":
+        return "subagent"
+    if role == "fallback":
+        return "fallback"
+    if role.startswith("auxiliary:"):
+        return "auxiliary"
+    return "main" if role in {"primary", "iteration_summary"} else "unknown"
+
+
+def _attempt_loop(metadata: dict[str, Any] | None) -> int | None:
+    request_id = str((metadata or {}).get("api_request_id") or "")
+    prefix, marker, value = request_id.rpartition(":api:")
+    if not marker or not prefix:
+        return None
+    try:
+        return max(0, int(value))
+    except ValueError:
+        return None
+
+
+def _start_attempt(
+    request: dict[str, Any], *, name: str, model_name: str, metadata: dict[str, Any] | None
+) -> physical_attempt_diagnostics.Attempt | None:
+    api_mode = str((metadata or {}).get("api_mode") or "unknown")
+    route = f"{api_mode}:{name}:{request.get('model') or model_name or 'unknown'}"
+    return physical_attempt_diagnostics.start_attempt(
+        request,
+        api_mode=api_mode,
+        route=route,
+        provider=name,
+        model=str(request.get("model") or model_name or "unknown"),
+        role=_attempt_role(metadata),
+        retry=max(0, int((metadata or {}).get("retry_count") or 0)),
+        continuation=max(0, int((metadata or {}).get("continuation") or 0)),
+        loop=_attempt_loop(metadata),
+        correlation=str((metadata or {}).get("api_request_id") or "").rpartition(":api:")[0],
+    )
+
+
+def _response_usage(response: Any) -> Any:
+    return response.get("usage") if isinstance(response, dict) else getattr(response, "usage", None)
+
+
+def _execute_attempt(
+    request: dict[str, Any], callback: Callable[[dict[str, Any]], Any], *, name: str,
+    model_name: str, metadata: dict[str, Any] | None,
+) -> Any:
+    attempt = _start_attempt(request, name=name, model_name=model_name, metadata=metadata)
+    try:
+        response = callback(request)
+    except BaseException:
+        physical_attempt_diagnostics.finish_attempt(
+            attempt, usage=None, outcome="error", api_mode=str((metadata or {}).get("api_mode") or "unknown"), provider=name,
+        )
+        raise
+    physical_attempt_diagnostics.finish_attempt(
+        attempt, usage=_response_usage(response), outcome="completed",
+        api_mode=str((metadata or {}).get("api_mode") or "unknown"), provider=name,
+    )
+    return response
+
+
+async def _execute_attempt_async(
+    request: dict[str, Any], callback: Callable[[dict[str, Any]], Any], *, name: str,
+    model_name: str, metadata: dict[str, Any] | None,
+) -> Any:
+    attempt = _start_attempt(request, name=name, model_name=model_name, metadata=metadata)
+    try:
+        response = await callback(request)
+    except BaseException:
+        physical_attempt_diagnostics.finish_attempt(
+            attempt, usage=None, outcome="error", api_mode=str((metadata or {}).get("api_mode") or "unknown"), provider=name,
+        )
+        raise
+    physical_attempt_diagnostics.finish_attempt(
+        attempt, usage=_response_usage(response), outcome="completed",
+        api_mode=str((metadata or {}).get("api_mode") or "unknown"), provider=name,
+    )
+    return response
 
 
 def execute(
@@ -37,7 +120,9 @@ def execute(
     """Run one non-streaming physical provider attempt through Relay."""
     runtime, session, parent = relay_runtime.resolve_execution_context(session_id)
     if runtime is None or session is None or not runtime.managed_execution_enabled():
-        return callback(request)
+        return _execute_attempt(
+            request, callback, name=name, model_name=model_name, metadata=metadata
+        )
     logical = _logical_parent(runtime, session, parent, metadata)
     parent = logical[1] if logical is not None else parent
 
@@ -70,7 +155,14 @@ def execute(
                 codec_baseline_body=codec_baseline_body,
                 metadata=metadata,
             )
-            raw = callback_context.copy().run(guarded, final_request)
+            raw = callback_context.copy().run(
+                _execute_attempt,
+                final_request,
+                guarded,
+                name=name,
+                model_name=model_name,
+                metadata=metadata,
+            )
         except BaseException as exc:
             callback_error = exc
             raise
@@ -129,7 +221,9 @@ async def execute_async(
     """Run one asynchronous physical provider attempt through Relay."""
     runtime, session, parent = relay_runtime.resolve_execution_context(session_id)
     if runtime is None or session is None or not runtime.managed_execution_enabled():
-        return await callback(request)
+        return await _execute_attempt_async(
+            request, callback, name=name, model_name=model_name, metadata=metadata
+        )
     logical = _logical_parent(runtime, session, parent, metadata)
     parent = logical[1] if logical is not None else parent
 
@@ -156,10 +250,19 @@ async def execute_async(
                 metadata=metadata,
             )
             async def call_provider() -> Any:
-                # Nested relay calls inside a managed provider callback must
-                # run unmanaged (#77244).
-                with relay_runtime.managed_callback_guard():
-                    return await callback(final_request)
+                async def guarded(attempt_request: dict[str, Any]) -> Any:
+                    # Nested relay calls inside a managed provider callback must
+                    # run unmanaged (#77244).
+                    with relay_runtime.managed_callback_guard():
+                        return await callback(attempt_request)
+
+                return await _execute_attempt_async(
+                    final_request,
+                    guarded,
+                    name=name,
+                    model_name=model_name,
+                    metadata=metadata,
+                )
 
             task = callback_context.copy().run(
                 asyncio.create_task,
@@ -400,6 +503,9 @@ class ManagedLlmStream(Iterator[Any]):
         self._relay_observes_chunks = False
         self._provider_completed = False
         self._raw_chunks: list[tuple[Any, Any]] = []
+        self._diagnostic_attempt: physical_attempt_diagnostics.Attempt | None = None
+        self._diagnostic_api_mode = str((metadata or {}).get("api_mode") or "unknown")
+        self._diagnostic_provider = name
         self.output_modified = False
         callback_context = contextvars.copy_context()
 
@@ -421,7 +527,14 @@ class ManagedLlmStream(Iterator[Any]):
             or session is None
             or not runtime.managed_execution_enabled()
         ):
-            raw_stream = stream_factory(request)
+            self._diagnostic_attempt = _start_attempt(
+                request, name=name, model_name=model_name, metadata=metadata
+            )
+            try:
+                raw_stream = stream_factory(request)
+            except BaseException:
+                self._finish_diagnostic("error")
+                raise
             if completed_response_predicate is not None and completed_response_predicate(
                 raw_stream
             ):
@@ -449,16 +562,17 @@ class ManagedLlmStream(Iterator[Any]):
         async def provider_stream(next_request: Any):
             raw_stream = None
             try:
-                raw_stream = run_callback(
-                    stream_factory,
-                    _provider_request(
-                        request,
-                        next_request,
-                        relay_request_body=relay_request_body,
-                        codec_baseline_body=codec_baseline_body,
-                        metadata=metadata,
-                    )
+                final_request = _provider_request(
+                    request,
+                    next_request,
+                    relay_request_body=relay_request_body,
+                    codec_baseline_body=codec_baseline_body,
+                    metadata=metadata,
                 )
+                self._diagnostic_attempt = _start_attempt(
+                    final_request, name=name, model_name=model_name, metadata=metadata
+                )
+                raw_stream = run_callback(stream_factory, final_request)
                 if (
                     completed_response_predicate is not None
                     and run_callback(
@@ -645,6 +759,15 @@ class ManagedLlmStream(Iterator[Any]):
         if close_error is not None:
             raise close_error
 
+    def _finish_diagnostic(self, outcome: str) -> None:
+        physical_attempt_diagnostics.finish_attempt(
+            self._diagnostic_attempt,
+            usage=None,
+            outcome=outcome,
+            api_mode=self._diagnostic_api_mode,
+            provider=self._diagnostic_provider,
+        )
+
     def _preserve_pending_provider_chunks(self) -> None:
         """Switch a failed Relay stream to its undelivered provider chunks."""
         pending = [raw for _encoded, raw in self._raw_chunks]
@@ -683,6 +806,7 @@ class ManagedLlmStream(Iterator[Any]):
     def _close(self, *, logical_outcome: str) -> None:
         if self._closed:
             return
+        self._finish_diagnostic(logical_outcome)
         self._closed = True
         loop = self._loop
         self._loop = None

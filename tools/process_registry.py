@@ -2522,6 +2522,7 @@ class ProcessRegistry:
                             "watcher_message_id": s.watcher_message_id,
                             "watcher_interval": s.watcher_interval,
                             "notify_on_complete": s.notify_on_complete,
+                            "delegated_child": s.delegated_child,
                             "watch_patterns": s.watch_patterns,
                         })
                 if extra_entries:
@@ -2618,6 +2619,7 @@ class ProcessRegistry:
                 watcher_message_id=entry.get("watcher_message_id", ""),
                 watcher_interval=entry.get("watcher_interval", 0),
                 notify_on_complete=entry.get("notify_on_complete", False),
+                delegated_child=entry.get("delegated_child", False),
                 watch_patterns=entry.get("watch_patterns", []),
             )
             with self._lock:

@@ -958,7 +958,7 @@ class _Target:
 
 
 class RuntimeHeartbeat:
-    """One process coordinator with isolated per-owner, per-target timers."""
+    """One process coordinator with one timer per owner/provider group."""
 
     def __init__(
         self,
@@ -979,6 +979,7 @@ class RuntimeHeartbeat:
         self._group_replacements: Dict[
             tuple[str, int, str, str, int], Dict[str, Any]
         ] = {}
+        self._timer_redirects: Dict[tuple[str, int], str] = {}
         self._next_group_token = 0
         self._next_generation = 0
 
@@ -1050,6 +1051,12 @@ class RuntimeHeartbeat:
         owner_ref = _weak_owner(owner)
         if owner_ref is None:
             return False
+        with self._lock:
+            if any(
+                target.owner_id == id(owner) and self._shared_group(target)
+                for target in self._targets.values()
+            ):
+                return False
 
         return self.arm(
             target_id,
@@ -1118,6 +1125,9 @@ class RuntimeHeartbeat:
         self.cancel(key)
         with self._lock:
             group = self._group_key(target)
+            has_shared_timer = self._shared_group(target) and any(
+                self._group_key(other) == group for other in self._targets.values()
+            )
             if not any(
                 self._group_key(other) == group
                 for other in self._targets.values()
@@ -1139,7 +1149,8 @@ class RuntimeHeartbeat:
                 self._targets.pop(key, None)
                 return False
             target.baseline = baseline
-            self._schedule_locked(key, target)
+            if not has_shared_timer:
+                self._schedule_locked(key, target)
         logger.info(
             "Runtime heartbeat phase=arm target=%s owner=%s kind=%s "
             "provider=%s interval_s=%s",
@@ -1193,6 +1204,32 @@ class RuntimeHeartbeat:
             target.owner_id,
         )
 
+    @staticmethod
+    def _shared_group(target: _Target) -> bool:
+        return target.owner_id != 0 and target.kind in {"process", "delegation"}
+
+    def restart_for_owner(self, owner: Any) -> int:
+        """Restart each live managed-owner timer from its exact interval."""
+        if owner is None:
+            return 0
+        with self._lock:
+            groups = {}
+            for target in self._targets.values():
+                if target.owner_id == id(owner) and self._shared_group(target):
+                    groups.setdefault(self._group_key(target), target)
+            for group, target in groups.items():
+                for candidate in self._targets.values():
+                    if self._group_key(candidate) == group and candidate.timer is not None:
+                        candidate.timer.cancel()
+                        candidate.timer = None
+                self._schedule_locked(target.target_id, target)
+                self._next_group_token += 1
+                self._group_tokens[group] = self._next_group_token
+                self._group_next_emit.pop(group, None)
+                self._group_pending.pop(group, None)
+                self._group_replacements.pop(group, None)
+        return len(groups)
+
     def cancel(self, target_id: str) -> bool:
         replacement_event = None
         with self._lock:
@@ -1200,15 +1237,26 @@ class RuntimeHeartbeat:
             if target is None:
                 return False
             group = self._group_key(target)
-            if not any(
-                self._group_key(candidate) == group
+            siblings = [
+                candidate
                 for candidate in self._targets.values()
-            ):
+                if self._group_key(candidate) == group
+            ]
+            if not siblings:
                 self._next_group_token += 1
                 self._group_tokens[group] = self._next_group_token
                 self._group_next_emit.pop(group, None)
                 self._group_pending.pop(group, None)
                 self._group_replacements.pop(group, None)
+            elif self._shared_group(target) and target.timer is not None:
+                self._timer_redirects[(target.target_id, target.generation)] = (
+                    siblings[0].target_id
+                )
+                siblings[0].timer = target.timer
+                siblings[0].generation = target.generation
+                siblings[0].deadline = target.deadline
+                siblings[0].scheduled_at = target.scheduled_at
+                target.timer = None
             else:
                 pending = self._group_pending.get(group)
                 if pending is not None and pending.get("target_id") == target.target_id:
@@ -1261,6 +1309,7 @@ class RuntimeHeartbeat:
         count = 0
         with self._lock:
             groups: Dict[tuple[str, int, str, str, int], float] = {}
+            reset_groups = set()
             now = time.monotonic()
             dispatch_at = now if activity_at is None else min(now, float(activity_at))
             for key, target in tuple(self._targets.items()):
@@ -1277,7 +1326,15 @@ class RuntimeHeartbeat:
                 deadline = dispatch_at + target.interval
                 if deadline <= target.deadline:
                     continue
-                if target.timer is not None:
+                if self._shared_group(target):
+                    if group in reset_groups:
+                        continue
+                    reset_groups.add(group)
+                    for candidate in self._targets.values():
+                        if self._group_key(candidate) == group and candidate.timer is not None:
+                            candidate.timer.cancel()
+                            candidate.timer = None
+                elif target.timer is not None:
                     target.timer.cancel()
                 self._schedule_locked(
                     key, target, delay=deadline - now, deadline=deadline
@@ -1460,6 +1517,9 @@ class RuntimeHeartbeat:
     def _fire(self, key: str, generation: int) -> None:
         with self._lock:
             target = self._targets.get(key)
+            if target is None:
+                redirected = self._timer_redirects.pop((key, generation), None)
+                target = self._targets.get(redirected) if redirected else None
             if target is None or target.generation != generation:
                 return
             target.timer = None

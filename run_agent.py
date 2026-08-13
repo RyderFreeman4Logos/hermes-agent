@@ -8279,6 +8279,7 @@ class AIAgent:
             try:
                 from tools.runtime_heartbeat import runtime_heartbeat
 
+                runtime_heartbeat.restart_for_owner(self)
                 runtime_heartbeat.arm_session_after_turn(self, result)
             except Exception:
                 logger.debug("session heartbeat arm failed", exc_info=True)

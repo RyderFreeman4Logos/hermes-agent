@@ -320,6 +320,12 @@ def test_turn_compress_and_model_switch_manage_session_warm(monkeypatch):
         lambda owner, turn_result: calls.append(("arm", owner, turn_result)),
     )
     monkeypatch.setattr(
+        runtime_heartbeat,
+        "restart_for_owner",
+        lambda owner: calls.append(("restart", owner)),
+        raising=False,
+    )
+    monkeypatch.setattr(
         "agent.conversation_compression.compress_context",
         lambda _owner, messages, system_message, **_kwargs: (
             messages,
@@ -338,10 +344,68 @@ def test_turn_compress_and_model_switch_manage_session_warm(monkeypatch):
     assert AIAgent.switch_model(agent, "new-model", "openai") == "switched"
     assert calls == [
         ("cancel", agent),
+        ("restart", agent),
         ("arm", agent, result),
         ("cancel", agent),
         ("cancel", agent),
     ]
+
+
+def test_live_owner_uses_one_timer_keeps_it_after_first_exit_and_restarts_on_loop_stop(
+    monkeypatch,
+):
+    from tools.runtime_heartbeat import RuntimeHeartbeat
+
+    class Owner:
+        provider = "openai"
+        requested_provider = "openai"
+        base_url = "https://api.openai.invalid/v1"
+        model = "model"
+        api_mode = "chat_completions"
+        platform = "tui"
+        session_id = "owner"
+        _turn_received_provider_response = True
+
+    monkeypatch.setattr("tools.runtime_heartbeat._runtime_config", _runtime)
+    monkeypatch.setattr(
+        "tools.runtime_heartbeat.runtime_warm_capability",
+        lambda _owner: ("eligible", "test"),
+    )
+    FakeTimer.created = []
+    manager = RuntimeHeartbeat(event_queue=queue.Queue(), timer_factory=FakeTimer)
+    owner = Owner()
+    alive = lambda: {"alive": True, "progress": True}
+    for target_id in ("first", "second"):
+        assert manager.arm(
+            target_id,
+            caller_id="owner",
+            kind="delegation",
+            interval=1700,
+            inspect=alive,
+            provider="custom:pm",
+            cache_context="cache",
+            owner=owner,
+        )
+
+    assert len(FakeTimer.created) == 1
+    first = FakeTimer.created[0]
+    assert first.interval == 1700
+    assert manager.arm_session_after_turn(
+        owner, {"completed": True, "api_calls": 1}, caller_id="owner"
+    ) is False
+    assert len(FakeTimer.created) == 1
+
+    assert manager.cancel("first") is True
+    assert first.cancelled is False
+    assert len(FakeTimer.created) == 1
+
+    assert manager.restart_for_owner(owner) == 1
+    assert first.cancelled is True
+    assert FakeTimer.created[-1].interval == 1700
+
+    assert manager.cancel("second") is True
+    assert FakeTimer.created[-1].cancelled is True
+    assert manager.outstanding_for_caller("owner") == []
 
 
 def test_per_target_owner_isolation_and_cancel():

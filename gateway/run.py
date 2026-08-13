@@ -24038,6 +24038,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "completion_reason": getattr(session, "completion_reason", "exited"),
                         "termination_source": getattr(session, "termination_source", ""),
                         "output": _out,
+                        "delegated_child": getattr(session, "delegated_child", False),
                     }
                     synth_text = format_process_notification(completion_evt)
                     if not synth_text:

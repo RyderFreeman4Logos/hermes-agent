@@ -9,6 +9,7 @@ thinking block tagged with its source model.
 
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -22,7 +23,9 @@ def server():
         "sys.modules",
         {
             "hermes_constants": MagicMock(
-                get_hermes_home=MagicMock(return_value="/tmp/hermes_test_moa_emit")
+                get_hermes_home=MagicMock(
+                    return_value=Path("/tmp/hermes_test_moa_emit")
+                )
             ),
             "hermes_cli.env_loader": MagicMock(),
             "hermes_cli.banner": MagicMock(),

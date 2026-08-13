@@ -9,6 +9,7 @@ silently reset mid-turn.
 from __future__ import annotations
 
 import importlib
+from pathlib import Path
 
 from unittest.mock import MagicMock, patch
 
@@ -23,7 +24,9 @@ def server():
         "sys.modules",
         {
             "hermes_constants": MagicMock(
-                get_hermes_home=MagicMock(return_value="/tmp/hermes_test_compaction")
+                get_hermes_home=MagicMock(
+                    return_value=Path("/tmp/hermes_test_compaction")
+                )
             ),
             "hermes_cli.env_loader": MagicMock(),
             "hermes_cli.banner": MagicMock(),

@@ -869,7 +869,7 @@ def dispatch_async_delegation(
         try:
             result = runner() or {}
             status = result.get("status") or "completed"
-        except Exception as exc:  # noqa: BLE001 — must never crash the worker
+        except BaseException as exc:  # noqa: BLE001 — detached workers must always settle
             logger.exception("Async delegation %s crashed", delegation_id)
             result = {
                 "status": "error",
@@ -1147,7 +1147,7 @@ def dispatch_async_delegation_batch(
                 status = "error"
             else:
                 status = "completed"
-        except Exception as exc:  # noqa: BLE001 — must never crash the worker
+        except BaseException as exc:  # noqa: BLE001 — detached workers must always settle
             logger.exception("Async delegation batch %s crashed", delegation_id)
             combined = {
                 "results": [],

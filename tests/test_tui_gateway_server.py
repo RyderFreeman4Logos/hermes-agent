@@ -2314,6 +2314,28 @@ def test_history_to_messages_still_drops_empty_assistant_without_reasoning():
     ]
 
 
+def test_history_to_messages_hides_pure_interrupted_response_placeholder():
+    placeholder = "[response interrupted]"
+    history = [
+        {"role": "assistant", "content": placeholder},
+        {"role": "user", "content": placeholder},
+        {"role": "assistant", "content": placeholder, "reasoning": "partial thought"},
+        {
+            "role": "assistant",
+            "content": placeholder,
+            "tool_calls": [
+                {"id": "call_1", "function": {"name": "terminal", "arguments": "{}"}}
+            ],
+        },
+    ]
+
+    assert server._history_to_messages(history) == [
+        {"role": "user", "text": placeholder},
+        {"role": "assistant", "text": placeholder, "reasoning": "partial thought"},
+        {"role": "assistant", "text": placeholder},
+    ]
+
+
 def test_history_to_messages_renders_multimodal_content():
     # bb/gui preserves image URLs in the resume payload so the desktop
     # renderer's extractEmbeddedImages can pull them back out and display

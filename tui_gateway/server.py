@@ -7221,6 +7221,13 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
         has_reasoning = role == "assistant" and any(
             m.get(key) for key in reasoning_keys
         )
+        if (
+            role == "assistant"
+            and content_text == "[response interrupted]"
+            and not m.get("tool_calls")
+            and not has_reasoning
+        ):
+            continue
         if not content_text.strip() and not has_reasoning:
             continue
         msg = {"role": role, "text": content_text}

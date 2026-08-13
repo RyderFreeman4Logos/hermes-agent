@@ -248,11 +248,8 @@ def test_real_storage_error_keeps_exact_fatal_safeguard() -> None:
         is False
     )
     session_db.append_messages_batch.assert_called_once()
-    assert AIAgent._format_turn_completion_explanation(
+    explanation = AIAgent._format_turn_completion_explanation(
         "session_persistence_failed"
-        ) == (
-            "⚠️ No reply: the turn was stopped because session storage could not be "
-            "written (the transcript would have been lost on restart). This is often "
-            "a full disk — free some space (or fix state.db permissions), then send "
-            "your message again."
-        )
+    ).lower()
+    assert "session storage" in explanation
+    assert "hermes doctor" in explanation

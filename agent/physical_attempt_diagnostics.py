@@ -21,6 +21,7 @@ _KEY_FILE = "physical_attempt_digests.key"
 _RECORDS_FILE = "physical_attempt_digests.jsonl"
 _LOCK = threading.Lock()
 _LAST_ATTEMPT: dict[tuple[str, str], "Attempt"] = {}
+_CACHE_SCOPE_ENVELOPE = "_hermes_physical_attempt_cache_scope"
 
 
 @dataclass
@@ -33,6 +34,7 @@ class Attempt:
     retry: int
     correlation: str
     components: dict[str, str]
+    byte_lengths: dict[str, int]
 
 
 def enabled() -> bool:
@@ -57,6 +59,12 @@ def prepare_cache_scope(value: Any) -> dict[str, str] | None:
         return None
 
 
+def take_cache_scope(request: dict[str, Any]) -> dict[str, str] | None:
+    """Remove and return the private, short-lived cache-scope envelope."""
+    scope = request.pop(_CACHE_SCOPE_ENVELOPE, None)
+    return scope if isinstance(scope, dict) else None
+
+
 def start_attempt(
     request: dict[str, Any],
     *,
@@ -75,15 +83,19 @@ def start_attempt(
         return None
     try:
         key = _key()
-        components = {
-            "prefix": _digest(key, "prefix", _prefix(request)),
-            "tools": _digest(key, "tools", request.get("tools") or request.get("toolConfig") or []),
-            "cache_scope": _digest(
-                key,
-                "cache_scope",
-                {"scope": (scope or {}).get("digest"), "key": _cache_key(request)},
-            ),
+        component_values = {
+            "prefix": _prefix(request),
+            "tools": request.get("tools") or request.get("toolConfig") or [],
+            "cache_scope": {"scope": (scope or {}).get("digest"), "key": _cache_key(request)},
         }
+        component_bytes = {
+            name: _serialized(value) for name, value in component_values.items()
+        }
+        components = {
+            name: hmac.new(key, name.encode() + b"\0" + value, hashlib.sha256).hexdigest()
+            for name, value in component_bytes.items()
+        }
+        byte_lengths = {name: len(value) for name, value in component_bytes.items()}
         attempt = Attempt(
             digest=hmac.new(key, b"attempt\0" + secrets.token_bytes(32), hashlib.sha256).hexdigest(),
             route=_label(route),
@@ -91,6 +103,7 @@ def start_attempt(
             retry=max(0, int(retry)),
             correlation=correlation,
             components=components,
+            byte_lengths=byte_lengths,
         )
         _append({
             "schema": "hermes.physical_attempt.v1",
@@ -100,6 +113,7 @@ def start_attempt(
             "loop": attempt.loop,
             "retry": attempt.retry,
             "digests": components,
+            "byte_lengths": byte_lengths,
         })
         _pair(attempt)
         return attempt
@@ -114,6 +128,8 @@ def _pair(current: Attempt) -> None:
         _LAST_ATTEMPT[identity] = current
     if previous is None or previous.loop != current.loop - 1:
         return
+    names = ("prefix", "tools", "cache_scope")
+    equal = {name: previous.components[name] == current.components[name] for name in names}
     _append({
         "schema": "hermes.physical_attempt.v1",
         "phase": "pair",
@@ -126,6 +142,11 @@ def _pair(current: Attempt) -> None:
             name: current.components[name]
             for name in ("cache_scope", "prefix", "tools")
         },
+        "byte_lengths": current.byte_lengths,
+        "equal": equal,
+        "first_differing_segment": next(
+            (name for name in names if not equal[name]), "none"
+        ),
     })
 
 
@@ -153,8 +174,14 @@ def _cache_key(request: dict[str, Any]) -> Any:
 
 
 def _digest(key: bytes, label: str, value: Any) -> str:
-    encoded = json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str).encode("utf-8")
+    encoded = _serialized(value)
     return hmac.new(key, label.encode() + b"\0" + encoded, hashlib.sha256).hexdigest()
+
+
+def _serialized(value: Any) -> bytes:
+    return json.dumps(
+        value, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str
+    ).encode("utf-8")
 
 
 def _label(value: Any) -> str:

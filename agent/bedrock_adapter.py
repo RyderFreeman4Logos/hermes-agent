@@ -95,8 +95,12 @@ def _get_bedrock_runtime_client(region: str):
     """
     if region not in _bedrock_runtime_client_cache:
         boto3 = _require_boto3()
+        from botocore.config import Config
+
         _bedrock_runtime_client_cache[region] = boto3.client(
-            "bedrock-runtime", region_name=region,
+            "bedrock-runtime",
+            region_name=region,
+            config=Config(retries={"total_max_attempts": 1}),
         )
     return _bedrock_runtime_client_cache[region]
 

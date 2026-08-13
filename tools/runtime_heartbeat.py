@@ -1327,7 +1327,7 @@ class RuntimeHeartbeat:
         try:
             alive = dict(target.inspect() or {}).get("alive") is True
         except Exception:
-            alive = str(event.get("status") or "").upper() == "UNKNOWN"
+            alive = str(event.get("status") or "").upper() in {"UNKNOWN", "CHECKIN_FAILED"}
         if not alive:
             return False
         with self._lock:
@@ -1584,6 +1584,7 @@ class RuntimeHeartbeat:
         generation = event.get("generation")
         event["heartbeat_warm_capability"] = status
         event["heartbeat_warm_reason"] = reason
+        failure_event = None
         with self._lock:
             target = self._targets.get(target_id)
             current = target is not None and (
@@ -1597,6 +1598,11 @@ class RuntimeHeartbeat:
                 # distinguishes that rearm from target-id reuse after cancel.
                 target.warm_capability = status
                 target.warm_reason = reason
+                if status == "degraded" and target.generation == generation:
+                    failure_event = dict(event)
+                    failure_event.update(status="CHECKIN_FAILED", evidence="KV cache warm check-in failed")
+        if failure_event is not None:
+            self._queue().put(failure_event)
         log = logger.warning if status == "degraded" else logger.debug
         log(
             "runtime heartbeat warm outcome target=%s owner=%s provider=%s "

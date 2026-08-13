@@ -23734,7 +23734,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _handle_heartbeat_event(self, evt: dict) -> None:
         """Surface unhealthy status and warm targets that remain live."""
-        from tools.runtime_heartbeat import runtime_heartbeat
+        from tools.runtime_heartbeat import (
+            DIRECT_HEARTBEAT_STATUSES,
+            runtime_heartbeat,
+        )
 
         if not runtime_heartbeat.is_event_current(evt):
             return
@@ -23750,7 +23753,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             f'[HEARTBEAT] Background target "{target}" is {status}: {evidence}. '
             f"Elapsed: {elapsed}s. KV cache warm check-in."
         )
-        if status in {"STUCK", "UNKNOWN"}:
+        if status in DIRECT_HEARTBEAT_STATUSES:
             source = self._build_process_event_source(evt)
             if source is None:
                 entry = entries[caller_id]

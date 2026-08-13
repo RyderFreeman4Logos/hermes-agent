@@ -88,7 +88,7 @@ def test_blank_and_prose_mentions_are_not_silence():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", ["STUCK", "UNKNOWN"])
+@pytest.mark.parametrize("status", ["STUCK", "UNKNOWN", "CHECKIN_FAILED"])
 async def test_unhealthy_heartbeat_is_directly_visible_without_model_turn(
     monkeypatch, tmp_path, status
 ):
@@ -118,7 +118,7 @@ async def test_unhealthy_heartbeat_is_directly_visible_without_model_turn(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", ["STUCK", "UNKNOWN"])
+@pytest.mark.parametrize("status", ["STUCK", "UNKNOWN", "CHECKIN_FAILED"])
 async def test_raw_api_heartbeat_is_directly_visible_without_model_turn(
     monkeypatch, tmp_path, status
 ):

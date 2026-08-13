@@ -868,10 +868,11 @@ def redact_sensitive_text(
             # matches URL params; the lowercase one would (issue #77484).
             if "://" not in text:
                 text = _ENV_ASSIGN_LOWER_RE.sub(_redact_env, text)
-            # Lowercase/dotted config keys (issue #16413). Skip URLs entirely —
+            # Lowercase/dotted config keys (issue #16413). Skip URL lines —
             # web-URL query params are intentionally passed through (see note
             # near the bottom of this function); _DB_CONNSTR_RE still guards
-            # connection-string passwords.
+            # connection-string passwords. A URL on one log line must not
+            # suppress config redaction on another.
             #
             # Extra gate: every _CFG_*_RE match requires a secret keyword in
             # the key, so a text without any secret keyword cannot match —
@@ -880,9 +881,15 @@ def redact_sensitive_text(
             # (e.g. base64/hex blobs in compaction payloads); the linear
             # keyword scan prevents that pathological path on secret-free
             # text.
-            if "://" not in text and _CFG_SECRET_WORD_RE.search(text):
-                text = _CFG_DOTTED_RE.sub(_redact_env, text)
-                text = _CFG_ANCHORED_RE.sub(_redact_env, text)
+            if _CFG_SECRET_WORD_RE.search(text):
+                text = "".join(
+                    line
+                    if "://" in line and not redact_url_credentials
+                    else _CFG_ANCHORED_RE.sub(
+                        _redact_env, _CFG_DOTTED_RE.sub(_redact_env, line)
+                    )
+                    for line in text.splitlines(keepends=True)
+                )
 
         # JSON fields: "apiKey": "***"  (skip for code files — false positives)
         if ":" in text and '"' in text:
@@ -898,8 +905,8 @@ def redact_sensitive_text(
 
         # Unquoted YAML / colon config: password: ***  (after JSON so quoted
         # values are handled there; the lookahead in _YAML_ASSIGN_RE skips
-        # quotes). Skip URLs — web-URL query params pass through by design.
-        if ":" in text and "://" not in text:
+        # quotes). Skip URL lines — web-URL query params pass through by design.
+        if ":" in text:
             def _redact_yaml(m):
                 key, sep, value = m.group(1), m.group(2), m.group(3)
                 # Same programmatic-env-lookup exception as _redact_env above
@@ -913,7 +920,12 @@ def redact_sensitive_text(
                 if not _key_has_secret_keyword(key):
                     return m.group(0)
                 return f"{key}{sep}{_mask_token(value)}"
-            text = _YAML_ASSIGN_RE.sub(_redact_yaml, text)
+            text = "".join(
+                line
+                if "://" in line and not redact_url_credentials
+                else _YAML_ASSIGN_RE.sub(_redact_yaml, line)
+                for line in text.splitlines(keepends=True)
+            )
 
     # Authorization headers — _AUTH_HEADER_RE matches any scheme after
     # "[Proxy-]Authorization:" case-insensitively, so "uthorization" is the

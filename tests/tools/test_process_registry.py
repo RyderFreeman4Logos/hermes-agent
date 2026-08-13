@@ -1598,6 +1598,42 @@ class TestHandleProcessRedaction:
         out = json.loads(pr._handle_process({"action": "log", "session_id": sess.id}))
         assert "zzzopaque1234567890abcdef" in out["output"]
 
+    def test_strict_redaction_masks_config_secrets_beside_urls(self, monkeypatch):
+        import agent.redact as redact
+
+        monkeypatch.setattr(redact, "_REDACT_ENABLED", True)
+        canaries = ("SYNTHETIC_YAML_8a1d", "SYNTHETIC_DOTTED_4b2e")
+        output = "\n".join(
+            (
+                f"api_key: {canaries[0]} see https://example.invalid/docs",
+                f"service.auth.token={canaries[1]} url=https://example.invalid/result",
+            )
+        )
+
+        redacted = redact.redact_sensitive_text(
+            output, redact_url_credentials=True
+        )
+        assert all(canary not in redacted for canary in canaries)
+
+    def test_url_line_does_not_suppress_adjacent_config_redaction(self, monkeypatch):
+        import agent.redact as redact
+
+        monkeypatch.setattr(redact, "_REDACT_ENABLED", True)
+        config_secret = "SYNTHETIC_CONFIG_SECRET_3d7a"
+        query_secret = "SYNTHETIC_QUERY_SECRET_9c2d"
+        output = "\n".join(
+            (
+                f"service.auth.token={config_secret}",
+                f"https://example.invalid/result?token={query_secret}",
+            )
+        )
+
+        redacted = redact.redact_sensitive_text(
+            output, redact_url_credentials=True
+        )
+        assert config_secret not in redacted
+        assert query_secret not in redacted
+
 
 # =========================================================================
 # Reader loop: orphaned grandchild holding the stdout pipe (issue #68915)

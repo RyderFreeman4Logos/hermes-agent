@@ -1035,6 +1035,8 @@ def dispatch_async_delegation_batch(
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     delegation_id: Optional[str] = None,
     progress_fn: Optional[Callable[[], tuple]] = None,
+    before_submit: Optional[Callable[[str], None]] = None,
+    on_submit_failure: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any]:
     """Dispatch a WHOLE fan-out batch as ONE background unit.
 
@@ -1132,9 +1134,19 @@ def dispatch_async_delegation_batch(
             _finalize_batch(delegation_id, combined, status)
 
     try:
+        if before_submit is not None:
+            before_submit(delegation_id)
         # Propagate the dispatching profile to the detached batch children.
         executor.submit(propagate_context_to_thread(_worker))
     except Exception as exc:  # pragma: no cover
+        if on_submit_failure is not None:
+            try:
+                on_submit_failure(delegation_id)
+            except Exception:
+                logger.exception(
+                    "Async delegation batch %s failed to unwind accepted ownership",
+                    delegation_id,
+                )
         with _records_lock:
             _records.pop(delegation_id, None)
         _delete_durable_delegation(delegation_id)

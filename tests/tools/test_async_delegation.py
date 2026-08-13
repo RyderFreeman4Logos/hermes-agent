@@ -623,6 +623,113 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     assert "the real task" in text
 
 
+def test_background_batch_registers_heartbeat_before_an_immediate_worker_finishes(monkeypatch):
+    """A terminal batch must remove its heartbeat child before dispatch returns."""
+    from unittest.mock import MagicMock
+    import tools.delegate_tool as dt
+    import tools.runtime_heartbeat as rh
+
+    class ImmediateExecutor:
+        def submit(self, fn):
+            fn()
+
+    class Timer:
+        def __init__(self, _delay, _callback):
+            self.cancelled = False
+
+        def start(self):
+            pass
+
+        def cancel(self):
+            self.cancelled = True
+
+    heartbeat = rh.RuntimeHeartbeat(
+        config={"providers": {"custom:localrouter": 30}}, timer_factory=Timer
+    )
+    parent = MagicMock()
+    parent._delegate_depth = 0
+    parent.session_id = "heartbeat-parent"
+    parent.provider = "custom"
+    parent.requested_provider = "custom:localrouter"
+    parent._interrupt_requested = False
+    parent._active_children = []
+    parent._active_children_lock = None
+    child = MagicMock()
+    child._delegate_role = "leaf"
+
+    monkeypatch.setattr(ad, "_get_executor", lambda _limit: ImmediateExecutor())
+    monkeypatch.setattr(rh, "runtime_heartbeat", heartbeat)
+    monkeypatch.setattr(dt, "_build_child_agent", lambda **_kwargs: child)
+    monkeypatch.setattr(
+        dt,
+        "_resolve_delegation_credentials",
+        lambda *_args, **_kwargs: {
+            "model": "m", "provider": None, "base_url": None, "api_key": None,
+            "api_mode": None, "command": None, "args": None,
+        },
+    )
+    monkeypatch.setattr(
+        dt,
+        "_run_single_child",
+        lambda *_args, **_kwargs: {
+            "task_index": 0, "status": "completed", "summary": "done",
+            "api_calls": 1, "duration_seconds": 0.1, "model": "m",
+            "exit_reason": "completed",
+        },
+    )
+
+    assert json.loads(
+        dt.delegate_task(goal="instant task", background=True, parent_agent=parent)
+    )["status"] == "dispatched"
+    assert heartbeat.timer_for(parent) is None
+
+
+def test_background_batch_unwinds_heartbeat_when_submit_fails(monkeypatch):
+    """Rejected scheduling must not retain pre-submit heartbeat ownership."""
+    import tools.runtime_heartbeat as rh
+
+    class FailingExecutor:
+        def submit(self, _fn):
+            raise RuntimeError("submit failed")
+
+    heartbeat = rh.RuntimeHeartbeat(
+        config={"providers": {"custom:localrouter": 30}}, timer_factory=_Timer
+    )
+    parent = type("Parent", (), {
+        "provider": "custom",
+        "requested_provider": "custom:localrouter",
+        "session_id": "heartbeat-parent",
+    })()
+    monkeypatch.setattr(ad, "_get_executor", lambda _limit: FailingExecutor())
+
+    result = ad.dispatch_async_delegation_batch(
+        goals=["task"], context=None, toolsets=None, role="leaf", model="m",
+        session_key="", parent_session_id="heartbeat-parent", runner=lambda: {},
+        before_submit=lambda delegation_id: heartbeat.register_child(
+            parent, "subagent", delegation_id
+        ),
+        on_submit_failure=lambda delegation_id: heartbeat.complete_child(
+            parent, "subagent", delegation_id
+        ),
+    )
+
+    assert result["status"] == "rejected"
+    assert heartbeat.timer_for(parent) is None
+    assert heartbeat._child_owners == {}
+    assert not heartbeat._owners[id(parent)].children
+
+
+class _Timer:
+    def __init__(self, _delay, _callback):
+        self.cancelled = False
+
+    def start(self):
+        pass
+
+    def cancel(self):
+        self.cancelled = True
+
+
 def test_delegate_task_background_uses_live_tui_agent_session_id(monkeypatch):
     """TUI async delegation must route to the live/compressed agent id.
 

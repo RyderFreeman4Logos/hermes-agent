@@ -406,6 +406,7 @@ class ProcessSession:
     detached: bool = False                      # True if recovered from crash (no pipe)
     pid_scope: str = "host"                     # "host" for local/PTY PIDs, "sandbox" for env-local PIDs
     systemd_unit: str = ""                      # transient scope unit name when spawned under systemd-run (#70716)
+    delegated_child: bool = False                # Spawned while delegate_task child context was active
     # Watcher/notification metadata (persisted for crash recovery)
     watcher_platform: str = ""
     watcher_chat_id: str = ""
@@ -1355,6 +1356,7 @@ class ProcessRegistry:
         from tools.terminal_tool import _rewrite_compound_background as _rewrite_bg
 
         safe_command = _rewrite_bg(command)
+        from agent.delegation_context import is_delegated_child_process_context
 
         started_at = time.time()
         session = ProcessSession(
@@ -1369,6 +1371,7 @@ class ProcessRegistry:
                 if execution_timeout is not None
                 else None
             ),
+            delegated_child=is_delegated_child_process_context(),
             **(notification_metadata or {}),
         )
 
@@ -2199,6 +2202,7 @@ class ProcessRegistry:
                 "completion_reason": session.completion_reason,
                 "termination_source": session.termination_source,
                 "output": output_tail,
+                "delegated_child": session.delegated_child,
                 # Stable producer identity across checkpoint recovery; unlike
                 # a consumer-observed completion timestamp, this does not vary
                 # based on which watcher notices exit first.
@@ -3647,6 +3651,25 @@ def format_process_notification(evt: dict) -> "str | None":
 
     _exit = evt.get("exit_code", "?")
     _out = evt.get("output", "")
+    if (
+        evt.get("delegated_child")
+        and _exit == 91
+        and isinstance(_out, str)
+        and "POST_FOREIGN_CWD" in _out
+    ):
+        pytest_summary = next(
+            (line.strip() for line in _out.splitlines() if line.startswith("pytest:")),
+            "",
+        )
+        text = (
+            f"[IMPORTANT: Delegated child {_sid} had a "
+            f"freeze/foreign-CWD wrapper failure (exit code {_exit}).\n"
+            f"Command: {_cmd}"
+        )
+        if pytest_summary:
+            text += f"\nGate summary: {pytest_summary}"
+        return text + "]"
+
     _reason = evt.get("completion_reason") or "exited"
     _source = evt.get("termination_source") or ""
     _signal = ""

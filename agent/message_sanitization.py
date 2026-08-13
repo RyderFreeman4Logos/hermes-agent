@@ -20,7 +20,170 @@ import logging
 import re
 from typing import Any
 
+from agent.message_content import flatten_message_text
+
 logger = logging.getLogger(__name__)
+
+# Internal flags that mark model-only recovery/prefill scaffolding. These
+# messages may drive an API retry but must never reach a durable transcript.
+_EPHEMERAL_SCAFFOLDING_FLAGS = (
+    "_empty_recovery_synthetic",
+    "_empty_terminal_sentinel",
+    "_thinking_prefill",
+    "_verification_stop_synthetic",
+    "_pre_verify_synthetic",
+    "_kanban_stop_synthetic",
+    "_completion_delivery_synthetic",
+    "_dropped_toolcall_nudge",
+)
+
+
+COMPLETION_DELIVERY_INSTRUCTION = (
+    "\n\nInspect the completion payload above. Surface or act on important "
+    "information. If no user-visible action is needed, your final assistant "
+    "message must be literally empty (zero characters): no parentheses, no "
+    "Chinese or English filler, and no meta narration."
+)
+
+# Provider-visible, transcript-hidden closure for a completion event that did
+# meaningful tool work and then obeyed the literal-empty final-answer contract.
+COMPLETION_DELIVERY_TOOL_CLOSURE = "Operation completed."
+COMPLETION_DELIVERY_INTERRUPTED_CLOSURE = "Operation interrupted."
+
+
+def build_completion_delivery_prompt(payload: str) -> str:
+    """Append the model-only completion-delivery instruction to *payload*."""
+    return f"{payload}{COMPLETION_DELIVERY_INSTRUCTION}"
+
+
+def completion_delivery_transcript_content(prompt: Any) -> Any:
+    """Return the event text without the model-only delivery instruction.
+
+    The complete prompt remains available through ``api_content`` when a
+    meaningful completion turn is committed.  Keeping the clean event text in
+    ``content`` prevents an internal instruction from appearing as authored
+    transcript prose while replay still sends the exact original bytes.
+    """
+    if (
+        isinstance(prompt, str)
+        and prompt.endswith(COMPLETION_DELIVERY_INSTRUCTION)
+    ):
+        return prompt[: -len(COMPLETION_DELIVERY_INSTRUCTION)]
+    return prompt
+
+
+def completion_delivery_suffix_has_meaningful_work(
+    messages: list,
+    start: int,
+) -> bool:
+    """Return whether a completion-delivery suffix contains durable work.
+
+    A literal-empty model response is a true no-op only before the model has
+    emitted text or executed a tool.  Once either event exists,
+    the suffix must be committed atomically even when the terminal response is
+    empty.
+    """
+    for message in messages[start + 1:]:
+        if not isinstance(message, dict) or _is_ephemeral_scaffolding(message):
+            continue
+        role = message.get("role")
+        if role == "tool":
+            return True
+        if role == "assistant":
+            text = flatten_message_text(message.get("content")).strip()
+            if text and text != "(empty)":
+                return True
+    return False
+
+
+def completion_delivery_suffix_start(messages: Any) -> int | None:
+    """Return the newest pending completion-event index, if any."""
+    if not isinstance(messages, list):
+        return None
+    return next(
+        (
+            idx
+            for idx in range(len(messages) - 1, -1, -1)
+            if isinstance(messages[idx], dict)
+            and messages[idx].get("role") == "user"
+            and (
+                messages[idx].get("_completion_delivery_synthetic")
+                or messages[idx].get("_completion_delivery_active")
+            )
+        ),
+        None,
+    )
+
+
+def close_completion_delivery_predecessor(messages: Any) -> bool:
+    """Close a settled user tail before appending a completion event.
+
+    Completion delivery is itself a user-role model input.  Appending it after
+    a durable user tail would make the pre-request alternation repair merge the
+    two rows, destroying the completion marker and rewriting old prompt bytes.
+    A hidden assistant boundary is append-only and therefore preserves both the
+    prior prefix and the marker's identity.
+    """
+    if not isinstance(messages, list) or not messages:
+        return False
+    tail = messages[-1]
+    if not isinstance(tail, dict) or tail.get("role") != "user":
+        return False
+    messages.append(
+        {
+            "role": "assistant",
+            "content": COMPLETION_DELIVERY_INTERRUPTED_CLOSURE,
+            "display_kind": "hidden",
+        }
+    )
+    return True
+
+
+def drop_uncommitted_completion_delivery_suffix(
+    messages: Any,
+    *,
+    preserve_meaningful_work: bool = False,
+) -> bool:
+    """Discard a completion suffix whose finalizer never chose a disposition.
+
+    Successful meaningful completion turns remove the marker before returning.
+    If it survives an early return or exception, neither the marker nor any
+    assistant/tool rows after it may enter the caller's live continuation
+    history.  The persistence layer already defers the same suffix.
+    """
+    start = completion_delivery_suffix_start(messages)
+    if start is None:
+        return False
+    if preserve_meaningful_work and completion_delivery_suffix_has_meaningful_work(
+        messages, start
+    ):
+        return False
+    del messages[start:]
+    return True
+
+
+def durable_messages_before_pending_completion(messages: Any) -> Any:
+    """Return the durable view before the newest pending completion event.
+
+    The returned object is the original list when no barrier exists and a
+    shallow prefix copy when it does.  Live messages are never mutated.  Every
+    full-transcript writer/rewrite must use this view so assistant/tool rows
+    after an outcome-dependent completion event cannot be orphaned durably.
+    """
+    if not isinstance(messages, list):
+        return messages
+    start = completion_delivery_suffix_start(messages)
+    if start is not None:
+        return messages[:start]
+    return messages
+
+
+def _is_ephemeral_scaffolding(msg: Any) -> bool:
+    """Return whether a message is model-only, non-durable scaffolding."""
+    return isinstance(msg, dict) and any(
+        msg.get(flag) for flag in _EPHEMERAL_SCAFFOLDING_FLAGS
+    )
+
 
 # Lone surrogate code points are invalid in UTF-8 and crash json.dumps
 # inside the OpenAI SDK.  Used by every surrogate-sanitization helper
@@ -477,7 +640,17 @@ def _sanitize_structure_non_ascii(payload: Any) -> bool:
 
 __all__ = [
     "_SURROGATE_RE",
+    "COMPLETION_DELIVERY_INSTRUCTION",
+    "COMPLETION_DELIVERY_INTERRUPTED_CLOSURE",
+    "COMPLETION_DELIVERY_TOOL_CLOSURE",
+    "build_completion_delivery_prompt",
+    "close_completion_delivery_predecessor",
     "close_interrupted_tool_sequence",
+    "completion_delivery_suffix_has_meaningful_work",
+    "completion_delivery_suffix_start",
+    "completion_delivery_transcript_content",
+    "drop_uncommitted_completion_delivery_suffix",
+    "durable_messages_before_pending_completion",
     "_sanitize_surrogates",
     "_sanitize_structure_surrogates",
     "_sanitize_messages_surrogates",

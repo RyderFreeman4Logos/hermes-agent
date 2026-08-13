@@ -3535,7 +3535,7 @@ def _drain_gateway_watch_events(completion_queue) -> "list[dict]":
         evt_type = evt.get("type", "completion")
         if evt_type in {"watch_match", "watch_disabled"}:
             watch_events.append(evt)
-        elif evt_type == "async_delegation":
+        elif evt_type in {"async_delegation", "heartbeat"}:
             requeue.append(evt)
         # else: process completion events are handled by the watcher task
     for evt in requeue:
@@ -5649,6 +5649,16 @@ class TurnRunner:
                 "conversation_history": agent_history,
                 "task_id": ctx.session_id,
             }
+            if ctx.completion_delivery_synthetic:
+                agent._pending_cli_user_message = {
+                    "role": "user",
+                    "content": (
+                        _persist_user_message_override
+                        if _persist_user_message_override is not None
+                        else _api_run_message
+                    ),
+                    "_completion_delivery_synthetic": True,
+                }
             if _persist_user_message_override is not None:
                 _conversation_kwargs["persist_user_message"] = _persist_user_message_override
             elif observed_group_context:
@@ -5795,14 +5805,17 @@ class TurnRunner:
         _effective_history_offset = (
             0 if (_session_was_split or _compacted_in_place) else len(agent_history)
         )
-
         if not final_response:
             final_response = _normalize_empty_agent_response(
                 result, final_response or "", history_len=len(agent_history),
             )
-            final_response = _sanitize_gateway_final_response(ctx.source.platform, final_response)
+            final_response = _sanitize_gateway_final_response(
+                ctx.source.platform, final_response
+            )
             if not final_response:
-                final_response = f"⚠️ {result['error']}" if result.get("error") else ""
+                final_response = (
+                    f"⚠️ {result['error']}" if result.get("error") else ""
+                )
             return {
                 "final_response": final_response,
                 "messages": result.get("messages", []),
@@ -14898,6 +14911,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return format_status_text()
 
     async def _busy_stop_command(self, event: MessageEvent, quick_key: str, source):
+        state = self._peek_session_state(quick_key)
+        if state is not None and state.turn.heartbeat_owner is not None:
+            return EphemeralReply(
+                "⏳ Heartbeat check-in is still running — session remains busy."
+            )
         # /stop must hard-kill the session when an agent is running.
         # A soft interrupt (agent.interrupt()) doesn't help when the agent
         # is truly hung — the executor thread is blocked and never checks
@@ -15656,6 +15674,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if running_agent is _AGENT_PENDING_SENTINEL:
                 # Agent is being set up but not ready yet.
                 if event.get_command() == "stop":
+                    if (
+                        _ra_state is not None
+                        and _ra_state.turn.heartbeat_owner is not None
+                    ):
+                        return EphemeralReply(
+                            "⏳ Heartbeat check-in is still running — session remains busy."
+                        )
                     # Force-clean the sentinel so the session is unlocked.
                     self._release_running_agent_state(_quick_key)
                     logger.info("HARD STOP (pending) for session %s — sentinel cleared", _quick_key)
@@ -17370,6 +17395,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
         return source
 
+    async def _run_isolated_heartbeat(
+        self, message: str, session_key: str, heartbeat_event: Any
+    ) -> None:
+        """Use only the session's existing agent for an isolated warm request."""
+        cache = getattr(self, "_agent_cache", None)
+        cache_lock = getattr(self, "_agent_cache_lock", None)
+        if cache is None or cache_lock is None:
+            return
+        with cache_lock:
+            cached = cache.get(session_key)
+            agent = cached[0] if isinstance(cached, tuple) and cached else None
+        if agent is None or agent is _AGENT_PENDING_SENTINEL:
+            return
+        history = list(getattr(agent, "_session_messages", None) or [])
+        try:
+            await self._run_in_executor_with_context(
+                lambda: agent.run_conversation(
+                    message,
+                    conversation_history=history,
+                    turn_origin="heartbeat_warm",
+                    heartbeat_event=heartbeat_event,
+                )
+            )
+        except Exception:
+            logger.debug("Isolated gateway heartbeat failed", exc_info=True)
+
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
@@ -17377,6 +17428,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _msg_preview = (event.text or "")[:80].replace("\n", " ")
         _reply_id = getattr(event, "reply_to_message_id", None)
         _reply_txt = (getattr(event, "reply_to_text", None) or "")[:80].replace("\n", " ")
+        _completion_delivery_synthetic = bool(
+            (getattr(event, "metadata", None) or {}).get(
+                "_completion_delivery_synthetic"
+            )
+        )
         logger.info(
             "inbound message: platform=%s user=%s chat=%s msg=%r reply_to_id=%s reply_to_text=%r",
             _platform_name, source.user_name or source.user_id or "unknown",
@@ -18703,6 +18759,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=event.message_type,
+                completion_delivery_synthetic=_completion_delivery_synthetic,
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
@@ -18755,7 +18812,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             try:
                 from gateway.response_filters import is_intentional_silence_agent_result
                 _intentional_silence = is_intentional_silence_agent_result(
-                    agent_result, response,
+                    agent_result, response
                 )
             except Exception:
                 _intentional_silence = False
@@ -19127,7 +19184,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # entries that were stripped before the agent saw them.
             if is_context_overflow_failure:
                 pass  # handled above — skip all transcript writes
-            elif agent_failed_early or hidden_reasoning_incomplete:
+            elif (
+                agent_failed_early or hidden_reasoning_incomplete
+            ) and not _completion_delivery_synthetic:
                 # Transient failure (429/timeout/5xx): persist only the user
                 # message so the next message can load a transcript that
                 # reflects what was said.  Skip the assistant error text since
@@ -19177,26 +19236,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                 # If no new messages found (edge case), fall back to simple user/assistant
                 if not new_messages:
-                    _user_entry = {
-                        "role": "user",
-                        "content": (
-                            persist_user_message
-                            if persist_user_message is not None
-                            else message_text
-                        ),
-                        "timestamp": (
-                            persist_user_timestamp
-                            if persist_user_timestamp is not None
-                            else ts
-                        ),
-                    }
-                    if event.message_id:
-                        _user_entry["message_id"] = str(event.message_id)
-                    await self.async_session_store.append_to_transcript(
-                        session_entry.session_id,
-                        _user_entry,
-                        skip_db=agent_persisted,
-                    )
+                    if not _completion_delivery_synthetic:
+                        _user_entry = {
+                            "role": "user",
+                            "content": (
+                                persist_user_message
+                                if persist_user_message is not None
+                                else message_text
+                            ),
+                            "timestamp": (
+                                persist_user_timestamp
+                                if persist_user_timestamp is not None
+                                else ts
+                            ),
+                        }
+                        if event.message_id:
+                            _user_entry["message_id"] = str(event.message_id)
+                        await self.async_session_store.append_to_transcript(
+                            session_entry.session_id,
+                            _user_entry,
+                            skip_db=agent_persisted,
+                        )
                     if response:
                         await self.async_session_store.append_to_transcript(
                             session_entry.session_id,
@@ -19212,6 +19272,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     for msg in new_messages:
                         # Skip system messages (they're rebuilt each run)
                         if msg.get("role") == "system":
+                            continue
+                        if _completion_delivery_synthetic and msg.get("role") == "user":
+                            continue
+                        from agent.message_sanitization import _is_ephemeral_scaffolding
+
+                        if _is_ephemeral_scaffolding(msg):
                             continue
                         # Add timestamp to each message for debugging
                         entry = {**msg, "timestamp": ts}
@@ -19349,7 +19415,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # agent already reached its early turn-start persistence, the latest
             # transcript user row will match and we skip the duplicate.
             try:
-                if 'message_text' in locals() and message_text is not None and session_entry is not None:
+                if (
+                    not _completion_delivery_synthetic
+                    and 'message_text' in locals()
+                    and message_text is not None
+                    and session_entry is not None
+                ):
                     _already_persisted = False
                     try:
                         _recent_transcript = await self.async_session_store.load_transcript(session_entry.session_id)
@@ -23208,7 +23279,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "session %s via self-post",
                             raw_sid,
                         )
-                        await deliver_wake(adapter, text=synth_text, session_id=raw_sid)
+                        await deliver_wake(
+                            adapter,
+                            text=synth_text,
+                            session_id=raw_sid,
+                            completion_delivery=evt.get("type") == "completion",
+                        )
                         return True
                     except Exception as e:
                         logger.warning(
@@ -23275,7 +23351,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "%s via self-post",
                     raw_sid,
                 )
-                await deliver_wake(adapter, text=synth_text, session_id=raw_sid)
+                await deliver_wake(
+                    adapter,
+                    text=synth_text,
+                    session_id=raw_sid,
+                    completion_delivery=evt.get("type") == "completion",
+                )
                 return True
             except Exception as e:
                 logger.warning(
@@ -23295,7 +23376,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 source=source,
                 internal=True,
                 message_id=str(evt.get("message_id") or "").strip() or None,
-                metadata=metadata,
+                metadata={
+                    **metadata,
+                    "_completion_delivery_synthetic": evt.get("type") == "completion",
+                },
             )
             logger.info(
                 "Watch pattern notification — injecting for %s chat=%s thread=%s",
@@ -23417,7 +23501,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         event or the event has no gateway route. No cross-process exactly-once
         guarantee is claimed.
         """
-        identity = self._completion_delivery_identity(evt)
+        from tools.process_registry import completion_delivery_prompt, process_registry
+
+        process_claimed = False
+        if evt.get("type", "completion") == "completion":
+            process_claimed = process_registry.claim_completion_delivery(evt)
+            if not process_claimed:
+                return None
+
+        try:
+            model_text = await asyncio.to_thread(
+                completion_delivery_prompt, evt, synth_text
+            )
+        except BaseException:
+            if process_claimed:
+                process_registry.release_completion_delivery(evt)
+            raise
+        if model_text is None:
+            if process_claimed:
+                process_registry.complete_completion_delivery(evt)
+            return None
+        synth_text = model_text
+        identity = None if process_claimed else self._completion_delivery_identity(evt)
         durable_claim_id = ""
         durable_delegation_id = ""
         if evt.get("type") == "async_delegation":
@@ -23505,6 +23610,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         > self._completion_delivery_retention
                     ):
                         self._completion_deliveries_delivered.popitem(last=False)
+            if process_claimed:
+                process_registry.complete_completion_delivery(evt)
 
             # If the durable async-delegation producer branch is present, its
             # SQLite row remains the authoritative replay state. Acknowledge it
@@ -23526,6 +23633,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if identity is not None and not accepted:
                 with self._completion_delivery_lock:
                     self._completion_deliveries_inflight.discard(identity)
+            if process_claimed and not accepted:
+                process_registry.release_completion_delivery(evt)
             if durable_claim_id and not accepted:
                 try:
                     from tools.async_delegation import release_completion_delivery
@@ -23557,6 +23666,118 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if parsed.get("thread_id"):
             evt["thread_id"] = parsed["thread_id"]
 
+    async def _handle_heartbeat_event(self, evt: dict) -> None:
+        """Warm ALIVE targets silently; surface unhealthy targets directly."""
+        from tools.runtime_heartbeat import runtime_heartbeat
+
+        if not runtime_heartbeat.is_event_current(evt):
+            return
+        caller_id = str(evt.get("session_key") or "")
+        entries = getattr(getattr(self, "session_store", None), "_entries", {})
+        if not caller_id or caller_id not in entries:
+            return
+        target = str(evt.get("target_id") or evt.get("session_id") or "unknown")
+        status = str(evt.get("status") or "").upper()
+        evidence = str(evt.get("evidence") or "no evidence available")
+        elapsed = max(0, int(evt.get("elapsed_s") or 0))
+        text = (
+            f'[HEARTBEAT] Background target "{target}" is {status}: {evidence}. '
+            f"Elapsed: {elapsed}s. KV cache warm check-in."
+        )
+        if status in {"STUCK", "UNKNOWN"}:
+            source = self._build_process_event_source(evt)
+            if source is None:
+                entry = entries[caller_id]
+                source = SessionSource(
+                    platform=getattr(entry, "platform", None) or Platform.API_SERVER,
+                    chat_id=caller_id,
+                    chat_type=getattr(entry, "chat_type", None) or "private",
+                )
+            if not runtime_heartbeat.is_event_current(evt):
+                return
+            if source.platform == Platform.API_SERVER:
+                from gateway.status import write_runtime_status
+
+                generation = evt.get("generation")
+                group_token = evt.get("heartbeat_group_token")
+                write_runtime_status(
+                    runtime_notice={
+                        "type": "runtime_heartbeat",
+                        "status": status,
+                        "target_id": target[:500],
+                        "session_key": caller_id[:500],
+                        "evidence": evidence[:2000],
+                        "elapsed_s": elapsed,
+                        "generation": (
+                            generation
+                            if isinstance(generation, int)
+                            and not isinstance(generation, bool)
+                            else None
+                        ),
+                        "target_kind": str(evt.get("target_kind") or "")[:100],
+                        "provider": str(evt.get("provider") or "")[:500],
+                        "cache_context": str(
+                            evt.get("cache_context") or ""
+                        )[:1000],
+                        "heartbeat_group_token": (
+                            group_token
+                            if isinstance(group_token, int)
+                            and not isinstance(group_token, bool)
+                            else None
+                        ),
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
+                return
+            await self._deliver_platform_notice(source, text)
+            return
+        if status != "ALIVE":
+            return
+        source = self._build_process_event_source(evt)
+        if source is None or source.platform == Platform.API_SERVER:
+            return
+        adapter = self._adapter_for_source(source)
+        if adapter is None:
+            return
+        pending_drain_owners = getattr(adapter, "_pending_drain_owners", None)
+        state = self._session_state(caller_id)
+        if state.turn.agent is not None:
+            return
+        heartbeat_owner = object()
+        state.turn.agent = _AGENT_PENDING_SENTINEL
+        state.turn.started_ts = time.time()
+        state.turn.heartbeat_owner = heartbeat_owner
+        if isinstance(pending_drain_owners, dict):
+            pending_drain_owners[caller_id] = heartbeat_owner
+        self._persist_active_agents()
+        try:
+            if not runtime_heartbeat.is_event_current(evt):
+                return
+            await self._run_isolated_heartbeat(text, caller_id, evt)
+        finally:
+            released = self._release_running_agent_state(
+                caller_id, heartbeat_owner=heartbeat_owner
+            )
+            if (
+                isinstance(pending_drain_owners, dict)
+                and pending_drain_owners.get(caller_id) is heartbeat_owner
+            ):
+                pending_drain_owners.pop(caller_id, None)
+                active_sessions = getattr(adapter, "_active_sessions", {})
+                get_pending_message = getattr(adapter, "get_pending_message", None)
+                start_session_processing = getattr(
+                    adapter, "_start_session_processing", None
+                )
+                if (
+                    released
+                    and caller_id not in active_sessions
+                    and callable(get_pending_message)
+                    and callable(start_session_processing)
+                ):
+                    pending = get_pending_message(caller_id)
+                    if pending is not None:
+                        start_session_processing(pending, caller_id)
+
     async def _async_delegation_watcher(self, interval: float = 2.0) -> None:
         """Drain async-delegation completions and inject them as new turns.
 
@@ -23580,6 +23801,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # so requeue anything that isn't ours.
                 requeue = []
                 async_events = []
+                heartbeat_events = []
                 while not _pr.completion_queue.empty():
                     try:
                         evt = _pr.completion_queue.get_nowait()
@@ -23587,6 +23809,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         break
                     if evt.get("type") == "async_delegation":
                         async_events.append(evt)
+                    elif evt.get("type") == "heartbeat":
+                        heartbeat_events.append(evt)
                     else:
                         requeue.append(evt)
                 for evt in requeue:
@@ -23603,6 +23827,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     except Exception as e:
                         _pr.completion_queue.put(evt)
                         logger.error("Async delegation injection error: %s", e)
+                for evt in heartbeat_events:
+                    try:
+                        await self._handle_heartbeat_event(evt)
+                    except Exception as e:
+                        logger.error("Heartbeat warm check-in injection error: %s", e)
             except Exception as e:
                 logger.debug("Async delegation watcher error: %s", e)
             await asyncio.sleep(interval)
@@ -23662,11 +23891,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             if session.exited:
                 # --- Agent-triggered completion: inject synthetic message ---
-                # Skip if the agent already consumed the result via wait/log.
-                # poll() is read-only and intentionally does NOT mark consumed
-                # (#10156) — a status check must not suppress this delivery turn.
+                # The shared registry claim suppresses only a normal success
+                # already observed by this owner; failures and unknown shapes
+                # remain fail-open.
                 from tools.process_registry import format_process_notification, process_registry as _pr_check
-                if agent_notify and not _pr_check.is_completion_consumed(session_id):
+                if agent_notify:
                     from agent.redact import redact_terminal_output
                     from tools.ansi_strip import strip_ansi
                     _command = getattr(session, "command", "") or ""
@@ -23716,16 +23945,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     break
 
                 # --- Normal text-only notification ---
-                # Skip when the agent already consumed this completion via
-                # wait/log (#65379): process(wait) returned the exit code and
-                # output inline, so the raw "[Background process ... finished
-                # with exit code ...]" message would be a duplicate delivery
-                # of the same completion. The agent_notify branch above
-                # already honors _completion_consumed; without this check its
-                # skip FALLS THROUGH to this block and re-delivers the output
-                # the agent is actively summarizing. poll() is read-only and
-                # intentionally does not mark consumed (#10156), so a status
-                # check never suppresses this message.
+                # Raw text-only notifications keep the legacy wait/log
+                # suppression (#65379). Agent-triggered model turns above use
+                # the stricter lifecycle identity and fail-open classification.
                 if _pr_check.is_completion_consumed(session_id):
                     logger.debug(
                         "Process watcher: completion for %s already consumed "
@@ -24117,6 +24339,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str,
         *,
         run_generation: Optional[int] = None,
+        heartbeat_owner: Any = None,
     ) -> bool:
         """Pop ALL per-running-agent state entries for ``session_key``.
 
@@ -24149,6 +24372,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return False
         state = self._peek_session_state(session_key)
         if state is not None:
+            slot_owner = state.turn.heartbeat_owner
+            if slot_owner is not None and (
+                heartbeat_owner is not slot_owner
+                or state.turn.agent is not _AGENT_PENDING_SENTINEL
+            ):
+                return False
+            if heartbeat_owner is not None and slot_owner is not heartbeat_owner:
+                return False
             lease = state.turn.lease
             if lease is not None:
                 try:
@@ -25627,6 +25858,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        completion_delivery_synthetic: bool = False,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -25646,6 +25878,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
+                completion_delivery_synthetic=completion_delivery_synthetic,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -25658,6 +25891,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
+                completion_delivery_synthetic=completion_delivery_synthetic,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -25800,6 +26034,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        completion_delivery_synthetic: bool = False,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -26084,6 +26319,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             moa_config=moa_config,
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
+            completion_delivery_synthetic=completion_delivery_synthetic,
         )
         turn_runner = TurnRunner(self, turn_ctx)
         # Callback invoked by agent on tool lifecycle events — extracted to

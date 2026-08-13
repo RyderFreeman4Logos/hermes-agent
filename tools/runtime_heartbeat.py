@@ -1,0 +1,657 @@
+"""Per-target warm-KV heartbeats for managed background work."""
+
+from __future__ import annotations
+
+import atexit
+import contextvars
+import logging
+import queue
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, Optional
+
+logger = logging.getLogger(__name__)
+
+_current_provider: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "runtime_heartbeat_provider", default=""
+)
+_current_cache_context: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "runtime_heartbeat_cache_context", default=""
+)
+
+
+class HeartbeatConfigError(ValueError):
+    """The active provider has no valid exact heartbeat interval."""
+
+
+def canonical_runtime_provider_identity(agent) -> str:
+    """Return the active provider's existing canonical routing identity."""
+    provider = str(getattr(agent, "provider", "") or "").strip().lower()
+    requested = str(
+        getattr(agent, "requested_provider", "") or ""
+    ).strip().lower()
+    if requested.startswith("custom:"):
+        return requested
+    if provider == "custom" or requested == "custom":
+        from hermes_cli.runtime_provider import canonical_custom_identity
+
+        recovered = canonical_custom_identity(
+            base_url=getattr(agent, "base_url", None),
+            model=getattr(agent, "model", None),
+        )
+        return str(recovered or requested or provider).strip().lower()
+    return provider or requested
+
+
+def canonical_runtime_cache_context_identity(agent) -> str:
+    """Return the secret-free deployment identity that owns a prompt cache."""
+    from agent.backend_identity import BackendIdentity
+
+    identity = BackendIdentity.build(
+        canonical_runtime_provider_identity(agent),
+        getattr(agent, "model", ""),
+        getattr(agent, "base_url", ""),
+    )
+    api_mode = str(getattr(agent, "api_mode", "") or "").strip().lower()
+    return "|".join((identity.provider, identity.base_url, identity.model, api_mode))
+
+
+def set_current_provider(provider: str | None) -> contextvars.Token[str]:
+    return _current_provider.set(str(provider or "").strip().lower())
+
+
+def reset_current_provider(token) -> None:
+    if isinstance(token, tuple):
+        provider_token, cache_token = token
+        _current_cache_context.reset(cache_token)
+        _current_provider.reset(provider_token)
+        return
+    _current_provider.reset(token)
+
+
+def get_current_provider() -> str:
+    return _current_provider.get()
+
+
+def get_current_cache_context() -> str:
+    return _current_cache_context.get()
+
+
+def bind_agent_provider(agent):
+    return (
+        set_current_provider(canonical_runtime_provider_identity(agent)),
+        _current_cache_context.set(canonical_runtime_cache_context_identity(agent)),
+    )
+
+
+def resolve_heartbeat_interval(
+    runtime_config: Optional[Dict[str, Any]], provider: str | None
+) -> Optional[int]:
+    """Resolve only the exact positive-integer provider mapping."""
+    runtime = runtime_config if isinstance(runtime_config, dict) else {}
+    heartbeat = runtime.get("heartbeat")
+    if not isinstance(heartbeat, dict) or heartbeat.get("enabled") is not True:
+        return None
+    if heartbeat.get("mode", "per_target") != "per_target":
+        return None
+
+    provider_id = str(provider or "").strip().lower()
+    providers = (runtime.get("warm_kv_timeout") or {}).get("providers")
+    if not isinstance(providers, dict):
+        providers = {}
+    exact = {
+        str(key).strip().lower(): value for key, value in providers.items()
+    }.get(provider_id)
+    if (
+        not provider_id
+        or not isinstance(exact, int)
+        or isinstance(exact, bool)
+        or exact <= 0
+    ):
+        raise HeartbeatConfigError(
+            "runtime.warm_kv_timeout.providers must contain a positive "
+            f"integer exact mapping for canonical provider {provider_id or '<missing>'}"
+        )
+    return exact
+
+
+def _runtime_config() -> Dict[str, Any]:
+    from hermes_cli.config import load_config_readonly
+
+    config = load_config_readonly() or {}
+    runtime = config.get("runtime") if isinstance(config, dict) else None
+    return runtime if isinstance(runtime, dict) else {}
+
+
+def preflight_current_heartbeat() -> Optional[int]:
+    """Validate the current provider before a managed target is created."""
+    return resolve_heartbeat_interval(_runtime_config(), get_current_provider())
+
+
+@dataclass
+class _Target:
+    target_id: str
+    caller_id: str
+    kind: str
+    interval: int
+    inspect: Callable[[], Dict[str, Any]]
+    started_at: float
+    provider: str = ""
+    cache_context: str = ""
+    generation: int = 0
+    timer: Any = None
+    deadline: float = 0.0
+    baseline: Dict[str, Any] = field(default_factory=dict)
+    publishing: bool = False
+
+
+class RuntimeHeartbeat:
+    """One process coordinator with isolated per-owner, per-target timers."""
+
+    def __init__(
+        self,
+        *,
+        event_queue: Optional[queue.Queue] = None,
+        timer_factory: Callable[[float, Callable[[], None]], Any] = threading.Timer,
+    ) -> None:
+        self._event_queue = event_queue
+        self._timer_factory = timer_factory
+        self._lock = threading.RLock()
+        self._publication_done = threading.Condition(self._lock)
+        self._targets: Dict[str, _Target] = {}
+        self._group_tokens: Dict[tuple[str, int, str, str], int] = {}
+        self._group_next_emit: Dict[tuple[str, int, str, str], float] = {}
+        self._group_pending: Dict[tuple[str, int, str, str], Dict[str, Any]] = {}
+        self._group_replacements: Dict[
+            tuple[str, int, str, str], Dict[str, Any]
+        ] = {}
+        self._next_group_token = 0
+        self._next_generation = 0
+
+    def _queue(self):
+        if self._event_queue is not None:
+            return self._event_queue
+        from tools.process_registry import process_registry
+
+        return process_registry.completion_queue
+
+    def arm(
+        self,
+        target_id: str,
+        *,
+        caller_id: str,
+        kind: str,
+        interval: Optional[int],
+        inspect: Callable[[], Dict[str, Any]],
+        provider: str | None = None,
+        cache_context: str | None = None,
+    ) -> bool:
+        """Arm after target creation using its already validated interval."""
+        if interval is None:
+            return False
+        if (
+            not target_id
+            or not caller_id
+            or not isinstance(interval, int)
+            or isinstance(interval, bool)
+            or interval <= 0
+        ):
+            raise ValueError("heartbeat target, owner, and interval must be valid")
+        key = str(target_id)
+        target = _Target(
+            target_id=key,
+            caller_id=str(caller_id),
+            kind=str(kind),
+            interval=interval,
+            inspect=inspect,
+            started_at=time.time(),
+            provider=str(provider if provider is not None else get_current_provider()),
+            cache_context=str(
+                cache_context
+                if cache_context is not None
+                else get_current_cache_context()
+            ),
+        )
+        self.cancel(key)
+        with self._lock:
+            group = self._group_key(target)
+            if not any(
+                self._group_key(other) == group
+                for other in self._targets.values()
+            ):
+                self._next_group_token += 1
+                self._group_tokens[group] = self._next_group_token
+                self._group_next_emit.pop(group, None)
+                self._group_pending.pop(group, None)
+                self._group_replacements.pop(group, None)
+            self._targets[key] = target
+        try:
+            baseline = dict(inspect() or {})
+        except Exception:
+            baseline = {}
+        with self._lock:
+            if self._targets.get(key) is not target:
+                return False
+            if baseline.get("alive") is False:
+                self._targets.pop(key, None)
+                return False
+            target.baseline = baseline
+            self._schedule_locked(key, target)
+        return True
+
+    def _schedule_locked(
+        self,
+        key: str,
+        target: _Target,
+        *,
+        delay: Optional[float] = None,
+        deadline: Optional[float] = None,
+    ) -> None:
+        if deadline is None:
+            delay = float(target.interval if delay is None else max(0.0, delay))
+            deadline = time.monotonic() + delay
+        else:
+            delay = float(
+                max(0.0, deadline - time.monotonic())
+                if delay is None
+                else max(0.0, delay)
+            )
+        target.deadline = deadline
+        self._next_generation += 1
+        target.generation = self._next_generation
+        generation = target.generation
+        timer = self._timer_factory(
+            delay,
+            lambda: self._fire(key, generation),
+        )
+        if hasattr(timer, "daemon"):
+            timer.daemon = True
+        target.timer = timer
+        timer.start()
+
+    @staticmethod
+    def _group_key(target: _Target) -> tuple[str, int, str, str]:
+        return (
+            target.caller_id,
+            target.interval,
+            target.provider,
+            target.cache_context,
+        )
+
+    def cancel(self, target_id: str) -> bool:
+        replacement_event = None
+        with self._lock:
+            target = self._targets.pop(str(target_id), None)
+            if target is None:
+                return False
+            group = self._group_key(target)
+            if not any(
+                self._group_key(candidate) == group
+                for candidate in self._targets.values()
+            ):
+                self._next_group_token += 1
+                self._group_tokens[group] = self._next_group_token
+                self._group_next_emit.pop(group, None)
+                self._group_pending.pop(group, None)
+                self._group_replacements.pop(group, None)
+            else:
+                pending = self._group_pending.get(group)
+                if pending is not None and pending.get("target_id") == target.target_id:
+                    self._group_pending.pop(group, None)
+                    replacement_event = self._group_replacements.pop(group, None)
+                    if replacement_event is None:
+                        self._group_next_emit[group] = 0.0
+                    else:
+                        self._group_pending[group] = replacement_event
+            if target.timer is not None:
+                target.timer.cancel()
+            while target.publishing:
+                self._publication_done.wait()
+        if replacement_event is not None:
+            self._queue().put(replacement_event)
+        return True
+
+    def cancel_for_caller(self, caller_id: str) -> int:
+        with self._lock:
+            target_ids = [
+                target.target_id
+                for target in self._targets.values()
+                if target.caller_id == str(caller_id)
+            ]
+        return sum(self.cancel(target_id) for target_id in target_ids)
+
+    def cancel_all(self) -> int:
+        with self._lock:
+            target_ids = list(self._targets)
+        return sum(self.cancel(target_id) for target_id in target_ids)
+
+    def reset_for_caller(
+        self,
+        caller_id: str,
+        *,
+        provider: str | None = None,
+        cache_context: str | None = None,
+        activity_at: float | None = None,
+    ) -> int:
+        """Rearm matching live targets from a successful provider dispatch."""
+        if (provider is None) != (cache_context is None):
+            raise ValueError("provider and cache_context must be supplied together")
+        count = 0
+        with self._lock:
+            groups: Dict[tuple[str, int, str, str], float] = {}
+            now = time.monotonic()
+            dispatch_at = now if activity_at is None else min(now, float(activity_at))
+            for key, target in tuple(self._targets.items()):
+                if target.caller_id != str(caller_id):
+                    continue
+                group = self._group_key(target)
+                if provider is not None and group[2:] != (
+                    str(provider),
+                    str(cache_context),
+                ):
+                    continue
+                deadline = dispatch_at + target.interval
+                if deadline <= target.deadline:
+                    continue
+                if target.timer is not None:
+                    target.timer.cancel()
+                self._schedule_locked(
+                    key, target, delay=deadline - now, deadline=deadline
+                )
+                groups[group] = deadline
+                count += 1
+            for group, deadline in groups.items():
+                self._next_group_token += 1
+                self._group_tokens[group] = self._next_group_token
+                self._group_next_emit[group] = max(
+                    deadline, self._group_next_emit.get(group, 0.0)
+                )
+                self._group_pending.pop(group, None)
+                self._group_replacements.pop(group, None)
+        return count
+
+    def is_event_current(
+        self, event: Dict[str, Any], agent=None, *, consume: bool = False
+    ) -> bool:
+        """Return whether the event's exact target generation is still live."""
+        if event.get("type") != "heartbeat":
+            return True
+        token = event.get("heartbeat_group_token")
+        interval = event.get("heartbeat_interval")
+        generation = event.get("generation")
+        target_id = str(event.get("target_id") or "")
+        caller_id = str(event.get("session_key") or "")
+        if (
+            not target_id
+            or not isinstance(token, int)
+            or not isinstance(interval, int)
+            or not isinstance(generation, int)
+        ):
+            return False
+        provider = str(event.get("provider") or "")
+        cache_context = str(event.get("cache_context") or "")
+        group = (caller_id, interval, provider, cache_context)
+        if agent is not None and (
+            provider != canonical_runtime_provider_identity(agent)
+            or cache_context != canonical_runtime_cache_context_identity(agent)
+        ):
+            return False
+        with self._lock:
+            if self._group_tokens.get(group) != token:
+                return False
+            target = self._targets.get(target_id)
+            if (
+                target is None
+                or self._group_key(target) != group
+                or target.generation != generation
+            ):
+                return False
+        try:
+            alive = dict(target.inspect() or {}).get("alive") is True
+        except Exception:
+            alive = str(event.get("status") or "").upper() == "UNKNOWN"
+        if not alive:
+            return False
+        with self._lock:
+            current = (
+                self._targets.get(target_id) is target
+                and target.generation == generation
+                and self._group_tokens.get(group) == token
+                and (
+                    agent is None
+                    or (
+                        provider == canonical_runtime_provider_identity(agent)
+                        and cache_context
+                        == canonical_runtime_cache_context_identity(agent)
+                    )
+                )
+            )
+            pending = self._group_pending.get(group)
+            if (
+                current
+                and consume
+                and pending is not None
+                and pending.get("target_id") == target_id
+                and pending.get("generation") == generation
+            ):
+                self._group_pending.pop(group, None)
+                self._group_replacements.pop(group, None)
+            return current
+
+    @staticmethod
+    def _retarget_event(event: Dict[str, Any], target: _Target) -> None:
+        event["target_id"] = target.target_id
+        event["target_ids"] = [target.target_id]
+        event["generation"] = target.generation
+        event["generations"] = [target.generation]
+        event["target_kind"] = target.kind
+        event["session_id"] = target.target_id if target.kind == "process" else ""
+
+    def outstanding_for_caller(self, caller_id: str) -> list[str]:
+        with self._lock:
+            return [
+                target.target_id
+                for target in self._targets.values()
+                if target.caller_id == str(caller_id)
+            ]
+
+    @staticmethod
+    def _assess(target: _Target, snapshot: Dict[str, Any]) -> tuple[str, str]:
+        if target.kind == "process":
+            old_output = int(target.baseline.get("output_size") or 0)
+            new_output = int(snapshot.get("output_size") or 0)
+            old_cpu = float(target.baseline.get("cpu_seconds") or 0.0)
+            new_cpu = float(snapshot.get("cpu_seconds") or 0.0)
+            if new_output > old_output:
+                return "ALIVE", f"output grew {old_output}->{new_output} bytes"
+            if new_cpu > old_cpu:
+                return "ALIVE", f"CPU advanced {old_cpu:.2f}->{new_cpu:.2f}s"
+            old_by_identity = target.baseline.get("cpu_by_identity") or {}
+            new_by_identity = snapshot.get("cpu_by_identity") or {}
+            if any(
+                total > float(old_by_identity.get(identity) or 0.0)
+                for identity, total in new_by_identity.items()
+            ):
+                return "ALIVE", "CPU advanced for a live PID/start identity"
+            return "STUCK", str(
+                snapshot.get("evidence")
+                or "process is live but produced no output or CPU progress"
+            )
+        if snapshot.get("progress") is True:
+            return "ALIVE", str(
+                snapshot.get("evidence") or "delegation in progress"
+            )
+        return "STUCK", str(snapshot.get("evidence") or "target made no progress")
+
+    def _fire(self, key: str, generation: int) -> None:
+        with self._lock:
+            target = self._targets.get(key)
+            if target is None or target.generation != generation:
+                return
+            target.timer = None
+        inspection_error = None
+        try:
+            snapshot = dict(target.inspect() or {})
+        except Exception as exc:
+            inspection_error = exc
+            snapshot = {
+                "alive": True,
+                "evidence": f"heartbeat inspection failed: {type(exc).__name__}: {exc}",
+            }
+        if snapshot.get("alive") is not True:
+            self.cancel(key)
+            return
+        if inspection_error is not None:
+            status, evidence = "UNKNOWN", str(snapshot["evidence"])
+        else:
+            status, evidence = self._assess(target, snapshot)
+        with self._lock:
+            current = self._targets.get(key)
+            if current is not target or current.generation != generation:
+                return
+            if inspection_error is None:
+                target.baseline = snapshot
+                self._schedule_locked(key, target)
+            group = self._group_key(target)
+            now = time.monotonic()
+            if status == "ALIVE":
+                if now < self._group_next_emit.get(group, 0.0):
+                    pending = self._group_pending.get(group)
+                    if pending is not None:
+                        replacement = dict(pending)
+                        self._retarget_event(replacement, target)
+                        replacement["evidence"] = evidence[:500]
+                        replacement["elapsed_s"] = max(
+                            0, int(time.time() - target.started_at)
+                        )
+                        self._group_replacements[group] = replacement
+                    return
+                self._group_next_emit[group] = now + target.interval
+            group_token = self._group_tokens[group]
+            target.publishing = True
+            event_generation = target.generation
+            event = {
+                "type": "heartbeat",
+                "target_id": target.target_id,
+                "target_ids": [target.target_id],
+                "generation": event_generation,
+                "generations": [event_generation],
+                "target_kind": target.kind,
+                "session_id": target.target_id if target.kind == "process" else "",
+                "session_key": target.caller_id,
+                "provider": target.provider,
+                "cache_context": target.cache_context,
+                "status": status,
+                "evidence": evidence[:500],
+                "elapsed_s": max(0, int(time.time() - target.started_at)),
+                "heartbeat_interval": target.interval,
+                "heartbeat_group_token": group_token,
+                "heartbeat_terminal": inspection_error is not None,
+            }
+            if status == "ALIVE":
+                self._group_replacements.pop(group, None)
+                self._group_pending[group] = event
+        try:
+            self._queue().put(event)
+        finally:
+            with self._lock:
+                target.publishing = False
+                self._publication_done.notify_all()
+
+
+def inspect_process(target_id: str) -> Dict[str, Any]:
+    from tools.process_registry import process_registry
+
+    session = process_registry.get(target_id)
+    if session is None:
+        return {"alive": False, "evidence": "process is not registered"}
+    with session._lock:
+        exited = bool(session.exited)
+        output_size = int(session.output_size)
+        pid = session.pid
+        pid_scope = session.pid_scope
+        host_start_time = session.host_start_time
+    if exited:
+        return {"alive": False, "evidence": "process exited"}
+    cpu_seconds = 0.0
+    cpu_by_identity = {}
+    if (
+        pid
+        and pid_scope == "host"
+        and host_start_time is not None
+        and process_registry._safe_host_start_time(pid) == host_start_time
+    ):
+        try:
+            import psutil
+
+            process_registry._remember_local_descendants(
+                session, include_subreaper=True
+            )
+            with session._lock:
+                tracked = dict(session._tracked_descendants)
+            processes = [(pid, host_start_time), *tracked.items()]
+            for process_pid, expected_start in processes:
+                if process_pid != pid and expected_start is None:
+                    continue
+                if (
+                    expected_start is not None
+                    and process_registry._safe_host_start_time(process_pid)
+                    != expected_start
+                ):
+                    continue
+                try:
+                    cpu = psutil.Process(process_pid).cpu_times()
+                except Exception:
+                    continue
+                total = float(cpu.user + cpu.system)
+                cpu_seconds += total
+                cpu_by_identity[(process_pid, expected_start)] = total
+            if process_registry._safe_host_start_time(pid) != host_start_time:
+                cpu_seconds = 0.0
+                cpu_by_identity = {}
+        except Exception:
+            pass
+    return {
+        "alive": True,
+        "output_size": output_size,
+        "cpu_seconds": cpu_seconds,
+        "cpu_by_identity": cpu_by_identity,
+    }
+
+
+def inspect_delegation(target_id: str) -> Dict[str, Any]:
+    from tools.async_delegation import list_async_delegations
+
+    record = next(
+        (
+            item
+            for item in list_async_delegations()
+            if item.get("delegation_id") == target_id
+        ),
+        None,
+    )
+    status = str((record or {}).get("status") or "")
+    if status in {"queued", "running"}:
+        return {
+            "alive": True,
+            "progress": True,
+            "evidence": f"delegation in progress; status={status}",
+        }
+    if status == "finalizing":
+        return {
+            "alive": True,
+            "progress": True,
+            "evidence": "delegation finalizing",
+        }
+    if status == "stalling":
+        return {
+            "alive": True,
+            "progress": False,
+            "evidence": "delegation interrupt requested; status=stalling",
+        }
+    return {"alive": False, "evidence": f"delegation status={status or 'missing'}"}
+
+
+runtime_heartbeat = RuntimeHeartbeat()
+atexit.register(runtime_heartbeat.cancel_all)

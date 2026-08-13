@@ -59,6 +59,104 @@ _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
 _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _resolve_codex_stream_watchdogs(
+    agent, api_kwargs: dict, *, log_adjustments: bool = True
+) -> tuple[bool, bool, int, bool, float, bool, float]:
+    """Resolve the request-sensitive Codex first-event and SSE-idle limits."""
+    enabled = agent.api_mode == "codex_responses"
+    openai_backend = _is_openai_codex_backend(agent)
+    est_tokens = estimate_request_context_tokens(api_kwargs)
+    if est_tokens > 100_000:
+        idle_default = 180.0
+    elif est_tokens > 50_000:
+        idle_default = 120.0
+    elif est_tokens > 10_000:
+        idle_default = 60.0
+    else:
+        idle_default = 12.0
+
+    ttfb_enabled = enabled
+    ttfb_timeout = _env_float("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", 120.0)
+    if ttfb_timeout <= 0:
+        ttfb_enabled = False
+    elif openai_backend:
+        disable_above = _env_float(
+            "HERMES_CODEX_TTFB_DISABLE_ABOVE_TOKENS", 10_000.0
+        )
+        strict = os.environ.get("HERMES_CODEX_TTFB_STRICT", "").strip().lower() in {
+            "1", "true", "yes", "on"
+        }
+        if (
+            not strict
+            and disable_above > 0
+            and est_tokens >= disable_above
+            and ttfb_timeout < idle_default
+        ):
+            if log_adjustments:
+                logger.info(
+                    "Scaling openai-codex no-byte TTFB watchdog from %.0fs to %.0fs "
+                    "for large request (context=~%s tokens >= %.0f). "
+                    "Set HERMES_CODEX_TTFB_STRICT=1 to keep the smaller cutoff.",
+                    ttfb_timeout,
+                    idle_default,
+                    f"{est_tokens:,}",
+                    disable_above,
+                )
+            ttfb_timeout = idle_default
+        # Implicit default must not cancel adaptive scale-up. Only an explicit
+        # positive HERMES_CODEX_TTFB_MAX_SECONDS caps the timeout (#92 / upstream #69228).
+        ttfb_cap = _env_float("HERMES_CODEX_TTFB_MAX_SECONDS", 0.0)
+        if ttfb_cap > 0 and ttfb_timeout > ttfb_cap:
+            if log_adjustments:
+                logger.info(
+                    "Capping openai-codex no-byte TTFB timeout from %.0fs to %.0fs "
+                    "(context=~%s tokens). Set HERMES_CODEX_TTFB_MAX_SECONDS to tune.",
+                    ttfb_timeout,
+                    ttfb_cap,
+                    f"{est_tokens:,}",
+                )
+            ttfb_timeout = ttfb_cap
+
+    idle_timeout = _env_float(
+        "HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS", idle_default
+    )
+    idle_enabled = enabled and idle_timeout > 0
+    return (
+        enabled,
+        openai_backend,
+        est_tokens,
+        ttfb_enabled,
+        ttfb_timeout,
+        idle_enabled,
+        idle_timeout,
+    )
+
+
+def codex_pre_dispatch_watchdog_allowance(agent, api_kwargs: dict) -> float:
+    """Return the first-event plus stall allowance a Codex call needs."""
+    (
+        enabled,
+        _openai_backend,
+        _est_tokens,
+        ttfb_enabled,
+        ttfb_timeout,
+        idle_enabled,
+        idle_timeout,
+    ) = _resolve_codex_stream_watchdogs(agent, api_kwargs, log_adjustments=False)
+    if not enabled:
+        return 0.0
+    return (ttfb_timeout if ttfb_enabled else 0.0) + (
+        idle_timeout if idle_enabled else 0.0
+    )
+
+
 def _context_thread_target(callback):
     """Bind a no-argument thread target to the caller's ContextVars."""
     context = contextvars.copy_context()
@@ -2131,6 +2229,15 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             previous_base_url=old_base_url,
             previous_model=old_model,
         )
+        try:
+            from tools.runtime_heartbeat import bind_agent_provider
+
+            bind_agent_provider(agent)
+        except Exception:
+            logger.debug(
+                "Could not refresh runtime heartbeat fallback provider",
+                exc_info=True,
+            )
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent._fallback_activated = True
@@ -2743,7 +2850,13 @@ def _build_partial_stream_stub(
     )
 
 
-def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=None):
+def interruptible_streaming_api_call(
+    agent,
+    api_kwargs: dict,
+    *,
+    on_first_delta=None,
+    on_provider_dispatch=None,
+):
     """Streaming variant of _interruptible_api_call for real-time token delivery.
 
     Handles all three api_modes:
@@ -2804,7 +2917,17 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     # branch below — routing through the _interruptible_api_call method keeps the
     # outer loop's per-request retry/refresh seam intact.
     if should_use_direct_api_call(agent):
-        return agent._interruptible_api_call(api_kwargs)
+        if on_provider_dispatch is not None:
+            on_provider_dispatch(None)
+        dispatch_started_at = time.monotonic()
+        if on_provider_dispatch is not None:
+            on_provider_dispatch(dispatch_started_at)
+        try:
+            return agent._interruptible_api_call(api_kwargs)
+        except BaseException:
+            if on_provider_dispatch is not None:
+                on_provider_dispatch(None)
+            raise
 
     if agent.api_mode == "codex_responses":
         # Codex streams internally via _run_codex_stream. The main dispatch
@@ -3376,7 +3499,15 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             attempt_request_client["value"] = request_client
             last_chunk_time["t"] = time.time()
             agent._touch_activity("waiting for provider response (streaming)")
-            return request_client.chat.completions.create(**stream_kwargs)
+            dispatch_started_at = time.monotonic()
+            if on_provider_dispatch is not None:
+                on_provider_dispatch(dispatch_started_at)
+            try:
+                return request_client.chat.completions.create(**stream_kwargs)
+            except BaseException:
+                if on_provider_dispatch is not None:
+                    on_provider_dispatch(None)
+                raise
 
         def _stream_created(raw_stream: Any) -> None:
             response = getattr(raw_stream, "response", None)
@@ -3437,6 +3568,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
         from agent import relay_llm
 
+        if on_provider_dispatch is not None:
+            # A retry may follow a physical stream that failed validation.
+            on_provider_dispatch(None)
         stream = _set_managed_stream(
             relay_llm.stream(
                 api_kwargs,

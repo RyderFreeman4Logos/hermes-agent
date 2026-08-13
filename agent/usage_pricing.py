@@ -13,6 +13,21 @@ from utils import base_url_host_matches
 logger = logging.getLogger(__name__)
 
 DEFAULT_PRICING = {"input": 0.0, "output": 0.0}
+CACHE_HIT_ERROR_THRESHOLD = 95
+
+
+def cache_hit_percent(cache_read_tokens: int, prompt_tokens: int) -> int:
+    return round(100 * cache_read_tokens / prompt_tokens) if prompt_tokens > 0 else 0
+
+
+def format_cache_hit_percent(cache_read_tokens: int, prompt_tokens: int) -> str:
+    if (
+        cache_read_tokens > 0
+        and prompt_tokens > 0
+        and 100 * cache_read_tokens < prompt_tokens
+    ):
+        return "<1%"
+    return f"{cache_hit_percent(cache_read_tokens, prompt_tokens)}%"
 
 _ZERO = Decimal("0")
 _ONE_MILLION = Decimal("1000000")

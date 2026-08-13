@@ -481,6 +481,15 @@ def build_turn_context(
     # Restore the primary runtime if the previous turn activated fallback.
     agent._restore_primary_runtime()
 
+    # Tool workers inherit this turn context. Preserve named custom-provider
+    # identity (for example custom:pm) instead of the resolved "custom" class.
+    try:
+        from tools.runtime_heartbeat import bind_agent_provider
+
+        bind_agent_provider(agent)
+    except Exception:
+        logger.debug("Could not bind runtime heartbeat provider", exc_info=True)
+
     # Tell auxiliary_client what the live main provider/model are for this turn
     # after primary restoration has settled the runtime.
     try:
@@ -630,11 +639,17 @@ def build_turn_context(
             agent._pending_cli_user_message = None
 
     # Hydrate todo store from conversation history.
-    if conversation_history and not agent._todo_store.has_items():
+    if (
+        conversation_history
+        and not agent._todo_store.has_items()
+    ):
         agent._hydrate_todo_store(conversation_history)
 
     # Hydrate per-session nudge counters from persisted history (issue #22357).
-    if conversation_history and agent._user_turn_count == 0:
+    if (
+        conversation_history
+        and agent._user_turn_count == 0
+    ):
         prior_user_turns = sum(
             1 for m in conversation_history if m.get("role") == "user"
         )
@@ -659,11 +674,19 @@ def build_turn_context(
         if persist_user_display_metadata:
             user_msg["display_metadata"] = persist_user_display_metadata
 
+    if user_msg.get("_completion_delivery_synthetic"):
+        from agent.message_sanitization import (
+            close_completion_delivery_predecessor,
+        )
+
+        user_msg["display_kind"] = "hidden"
+        close_completion_delivery_predecessor(messages)
+
     messages.append(user_msg)
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx
 
-    # Track user turns for memory flush and periodic nudge logic.
+    # Track real user turns for memory flush and periodic nudge logic.
     agent._user_turn_count += 1
     # Copilot x-initiator: the first API call of this user turn is
     # user-initiated; tool-loop follow-ups revert to "agent" (#3040).
@@ -748,7 +771,11 @@ def build_turn_context(
         # create and the late crash-persist below — doesn't leave a stale
         # _pending_cli_user_message that the next turn would mistake for a
         # fresh staged input.
-        if not isinstance(pending_cli_message, dict) or pending_cli_message.get("_db_persisted"):
+        if (
+            not isinstance(pending_cli_message, dict)
+            or pending_cli_message.get("_db_persisted")
+            or pending_cli_message.get("_completion_delivery_synthetic")
+        ):
             agent._pending_cli_user_message = None
 
     # ── Idle-triggered compaction (opt-in; ``idle_compact_after_seconds``) ──
@@ -761,7 +788,11 @@ def build_turn_context(
     # the previous turn finished. The cheap gap pre-check gates the (more
     # expensive) token estimate, mirroring ``_should_run_preflight_estimate``.
     _idle_after = getattr(agent, "compression_idle_compact_after_seconds", 0)
-    if agent.compression_enabled and _idle_after > 0 and messages:
+    if (
+        agent.compression_enabled
+        and _idle_after > 0
+        and messages
+    ):
         _idle_gap = time.time() - getattr(agent, "_last_activity_ts", time.time())
         if _idle_gap >= _idle_after:
             _compressor = agent.context_compressor
@@ -838,11 +869,14 @@ def build_turn_context(
     _preflight_compression_blocked = False
     agent._turn_received_provider_response = False
     agent._turn_preflight_display_snapshot = None
-    if agent.compression_enabled and _should_run_preflight_estimate(
-        messages,
-        agent.context_compressor.protect_first_n,
-        agent.context_compressor.protect_last_n,
-        agent.context_compressor.threshold_tokens,
+    if (
+        agent.compression_enabled
+        and _should_run_preflight_estimate(
+            messages,
+            agent.context_compressor.protect_first_n,
+            agent.context_compressor.protect_last_n,
+            agent.context_compressor.threshold_tokens,
+        )
     ):
         _preflight_tokens = estimate_request_tokens_rough(
             messages,
@@ -1345,12 +1379,16 @@ def build_turn_context(
             agent.session_id or "none",
             exc_info=True,
         )
-    finally:
-        # Keep an unmarked staged input available to a later close retry if the
-        # normal persistence attempt failed. Once the marker is present, the
-        # close path must no longer treat it as a pre-worker UI input.
-        if not isinstance(pending_cli_message, dict) or pending_cli_message.get("_db_persisted"):
-            agent._pending_cli_user_message = None
+
+    # Keep an unmarked staged input available to a later close retry if the
+    # normal persistence attempt failed. Once the marker is present, the
+    # close path must no longer treat it as a pre-worker UI input.
+    if (
+        not isinstance(pending_cli_message, dict)
+        or pending_cli_message.get("_db_persisted")
+        or pending_cli_message.get("_completion_delivery_synthetic")
+    ):
+        agent._pending_cli_user_message = None
 
     # Title the session from this user message, now — the row exists and the
     # turn has not called the model yet. Titling is derived from the user's

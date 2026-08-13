@@ -185,6 +185,14 @@ def finalize_completion_delivery_suffix(
         if close_interrupted_tool_sequence(staged, closure):
             staged[-1]["display_kind"] = "hidden"
 
+    # Keep persistence aligned with the canonical transcript event before the
+    # first atomic intent flush; a later generic override must not write the
+    # provider-facing prompt over this SQLite row.
+    previous_persist_idx = getattr(agent, "_persist_user_message_idx", None)
+    previous_persist_override = getattr(agent, "_persist_user_message_override", None)
+    agent._persist_user_message_idx = start
+    agent._persist_user_message_override = clean_content
+
     # The normal incremental writer is already atomic for a new suffix.  Use
     # its marker protocol on the staged copy; only publish those exact dicts to
     # the live list after SessionDB accepts them.  One immediate retry covers a
@@ -207,6 +215,9 @@ def finalize_completion_delivery_suffix(
             if committed:
                 break
     if not committed:
+        if commit_tool_intent:
+            agent._persist_user_message_idx = previous_persist_idx
+            agent._persist_user_message_override = previous_persist_override
         agent._pending_completion_delivery_suffix = copy.deepcopy(staged[start:])
         agent._pending_completion_delivery_display_metadata_cas = copy.deepcopy(
             metadata_cas

@@ -167,3 +167,65 @@ async def test_prepare_route_identity_check_keeps_event_loop_responsive(monkeypa
     assert result == "inspect @AGENTS.md"
     assert seen["event_loop_progressed"] is True
     assert seen["thread"] is not main_thread
+
+
+@pytest.mark.asyncio
+async def test_pre_turn_vision_uses_logical_scope_without_leaking(
+    tmp_path, monkeypatch
+):
+    from types import SimpleNamespace
+
+    from agent.auxiliary_client import _runtime_main_value, scoped_runtime_main
+    from hermes_state import SessionDB
+
+    runner = _make_runner()
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        db.create_session("root", source="gateway")
+        db.end_session("root", "compression")
+        db.create_session(
+            "continuation",
+            source="gateway",
+            parent_session_id="root",
+        )
+        runner._session_db = SimpleNamespace(_db=db)
+        runner.session_store = SimpleNamespace(
+            peek_session_id=lambda session_key: (
+                "continuation" if session_key == "routing-key" else None
+            )
+        )
+        monkeypatch.setattr(
+            runner,
+            "_decide_image_input_mode",
+            lambda **_kwargs: "text",
+        )
+        monkeypatch.setattr(
+            runner,
+            "_resolve_session_agent_runtime",
+            lambda **_kwargs: (
+                "gpt-5.4",
+                {"provider": "openai-codex", "api_mode": "codex_responses"},
+            ),
+        )
+        observed = []
+
+        async def fake_enrich(message_text, _image_paths):
+            observed.append(_runtime_main_value("cache_scope"))
+            return f"vision: {message_text}"
+
+        monkeypatch.setattr(runner, "_enrich_message_with_vision", fake_enrich)
+
+        with scoped_runtime_main({"cache_scope": "caller"}):
+            result = await runner._prepare_inbound_message_text(
+                event=_image_event(),
+                source=_source(),
+                history=[],
+                session_key="routing-key",
+            )
+            assert _runtime_main_value("cache_scope") == "caller"
+
+        assert result == "vision: look"
+        assert observed == ["root"]
+        assert _runtime_main_value("cache_scope") == ""
+    finally:
+        db.close()

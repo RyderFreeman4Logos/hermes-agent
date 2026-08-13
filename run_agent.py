@@ -7667,6 +7667,11 @@ class AIAgent:
             reset_conversation_context,
             set_conversation_context,
         )
+        from agent.auxiliary_client import (
+            _normalize_main_runtime,
+            scoped_runtime_main,
+        )
+        from contextlib import ExitStack
         # Out-of-turn compaction entry points — ``/compact`` (cli.py), the
         # gateway ``/compress`` command and its hygiene sweep (both of which
         # build a throwaway agent), and partial head compression — call this
@@ -7702,7 +7707,14 @@ class AIAgent:
                 "_active_compression_commit_fence", missing_fence
             )
             self._active_compression_commit_fence = active_fence
+        runtime_scope = ExitStack()
         try:
+            compression_runtime = _normalize_main_runtime(None)
+            compression_runtime["cache_scope"] = (
+                AIAgent._prompt_cache_scope_id(self) or ""
+            )
+            runtime_scope.enter_context(scoped_runtime_main(compression_runtime))
+
             def _run(fence=None, target_messages=None):
                 return compress_context(
                     self,
@@ -7877,8 +7889,11 @@ class AIAgent:
                     self._active_compression_commit_fence = previous_fence
             # Restore whatever the caller had, so a compaction never leaks its
             # tag into the surrounding scope.
-            if token is not None:
-                reset_conversation_context(token)
+            try:
+                if token is not None:
+                    reset_conversation_context(token)
+            finally:
+                runtime_scope.close()
 
     def _set_tool_guardrail_halt(self, decision: ToolGuardrailDecision) -> None:
         """Record the first guardrail decision that should stop this turn."""
@@ -8056,6 +8071,26 @@ class AIAgent:
         from agent.chat_completion_helpers import handle_max_iterations
         return handle_max_iterations(self, messages, api_call_count)
 
+    def _prompt_cache_scope_id(self) -> Optional[str]:
+        """Return a stable cache namespace for this logical session."""
+        sid = str(getattr(self, "session_id", None) or "")
+        if not sid:
+            return None
+        from hermes_state import resolve_prompt_cache_scope
+
+        return resolve_prompt_cache_scope(
+            sid,
+            getattr(self, "_session_db", None),
+            # Native delegates create their DB row lazily, so their first call
+            # needs the parent hint.  Branch/tool children must keep their own
+            # namespace and are resolved from their persisted marker instead.
+            parent_session_id=(
+                getattr(self, "_parent_session_id", None)
+                if getattr(self, "platform", None) == "subagent"
+                else None
+            ),
+        )
+
     def _conversation_root_id(self) -> Optional[str]:
         """Resolve the stable conversation id for Portal usage attribution.
 
@@ -8232,7 +8267,9 @@ class AIAgent:
             # replaces the value with the live runtime after fallback restoration.
             # Keep the scope local instead of storing ContextVar tokens on the agent,
             # which may be observed from another thread.
-            with bind_subagent_parent(self), scoped_runtime_main({}):
+            with bind_subagent_parent(self), scoped_runtime_main({
+                "cache_scope": AIAgent._prompt_cache_scope_id(self) or "",
+            }):
                 result = run_conversation(
                     self,
                     user_message,

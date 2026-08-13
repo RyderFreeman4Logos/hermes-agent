@@ -87,6 +87,109 @@ def test_blank_and_prose_mentions_are_not_silence():
     assert not is_intentional_silence_response("The reply was [SILENT], intentionally.")
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["STUCK", "UNKNOWN"])
+async def test_unhealthy_heartbeat_is_directly_visible_without_model_turn(
+    monkeypatch, tmp_path, status
+):
+    runner = _runner(monkeypatch, tmp_path)
+    caller_id = "agent:main:telegram:group:-1001:12345"
+    runner.session_store._entries = {caller_id: object()}
+    runner._inject_watch_notification = AsyncMock(return_value=True)
+    runner._deliver_platform_notice = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        "tools.runtime_heartbeat.runtime_heartbeat.is_event_current",
+        lambda *_args, **_kwargs: True,
+    )
+
+    await runner._handle_heartbeat_event(
+        {
+            "type": "heartbeat",
+            "target_id": "proc-heartbeat",
+            "session_key": caller_id,
+            "status": status,
+            "evidence": "not healthy",
+        }
+    )
+
+    runner._inject_watch_notification.assert_not_awaited()
+    runner._deliver_platform_notice.assert_awaited_once()
+    assert status in runner._deliver_platform_notice.await_args_list[0].args[1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["STUCK", "UNKNOWN"])
+async def test_raw_api_heartbeat_is_directly_visible_without_model_turn(
+    monkeypatch, tmp_path, status
+):
+    runner = _runner(monkeypatch, tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    caller_id = "raw-api-session"
+    runner.session_store._entries = {caller_id: object()}
+    runner._inject_watch_notification = AsyncMock(return_value=True)
+    runner._deliver_platform_notice = AsyncMock(return_value=True)
+    is_event_current = MagicMock(return_value=True)
+    monkeypatch.setattr(
+        "tools.runtime_heartbeat.runtime_heartbeat.is_event_current",
+        is_event_current,
+    )
+    cache_context = (
+        "custom:pm|https://user:password@pm.invalid/v1"
+        "?api_key=secret#fragment|model-a|chat_completions"
+    )
+    provider_identity = "custom:https://user:password@pm.invalid?api_key=secret#fragment"
+
+    await runner._handle_heartbeat_event(
+        {
+            "type": "heartbeat",
+            "target_id": "proc-heartbeat",
+            "session_key": caller_id,
+            "status": status,
+            "evidence": "not healthy",
+            "generation": 17,
+            "target_kind": "process",
+            "provider": provider_identity,
+            "cache_context": cache_context,
+            "heartbeat_group_token": 23,
+        }
+    )
+
+    runner._inject_watch_notification.assert_not_awaited()
+    runner._deliver_platform_notice.assert_not_awaited()
+    from gateway.status import read_runtime_status
+
+    assert is_event_current.call_count == 2
+    persisted_text = (tmp_path / "gateway_state.json").read_text(encoding="utf-8")
+    runtime_status = read_runtime_status()
+    assert runtime_status is not None
+    persisted_notice = runtime_status["runtime_notices"][-1]
+
+    for serialized in (persisted_text,):
+        leaked = any(
+            marker in serialized
+            for marker in (
+                cache_context,
+                provider_identity,
+                "cache_context",
+                '"provider":',
+                "user:password@",
+                "api_key=secret",
+                "#fragment",
+            )
+        )
+        assert not leaked, "credential-shaped cache identity reached an operational notice"
+    for notice in (persisted_notice,):
+        assert notice["type"] == "runtime_heartbeat"
+        assert notice["status"] == status
+        assert notice["session_key"] == caller_id
+        assert notice["target_id"] == "proc-heartbeat"
+        assert notice["evidence"] == "not healthy"
+        assert notice["generation"] == 17
+        assert notice["target_kind"] == "process"
+        assert "provider" not in notice
+        assert notice["heartbeat_group_token"] == 23
+
+
 def test_failed_agent_result_never_counts_as_intentional_silence():
     assert is_intentional_silence_agent_result({"failed": False}, "NO_REPLY")
     assert not is_intentional_silence_agent_result({"failed": True}, "NO_REPLY")

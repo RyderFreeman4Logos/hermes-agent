@@ -3004,6 +3004,7 @@ def terminal_tool(
                         session_key=session_key,
                         env_vars=env.env if hasattr(env, 'env') else None,
                         use_pty=effective_pty,
+                        notify_on_complete=notify_on_complete,
                     )
                 else:
                     proc_session = process_registry.spawn_via_env(
@@ -3012,6 +3013,7 @@ def terminal_tool(
                         cwd=effective_cwd,
                         task_id=effective_task_id,
                         session_key=session_key,
+                        notify_on_complete=notify_on_complete,
                     )
 
                 result_data = {

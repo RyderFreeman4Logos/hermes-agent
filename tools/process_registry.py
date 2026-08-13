@@ -394,6 +394,7 @@ class ProcessSession:
     watcher_message_id: str = ""                # Triggering message id — reply anchor for topic routing
     watcher_interval: int = 0                   # 0 = no watcher configured
     notify_on_complete: bool = False             # Queue agent notification on exit
+    delegated_child: bool = False                # Spawned while native delegation owns execution
     # Watch patterns — trigger agent notification when output matches any pattern
     watch_patterns: List[str] = field(default_factory=list)
     _watch_hits: int = field(default=0, repr=False)          # total matches delivered
@@ -971,6 +972,7 @@ class ProcessRegistry:
         session_key: str = "",
         env_vars: dict = None,
         use_pty: bool = False,
+        notify_on_complete: bool = False,
     ) -> ProcessSession:
         """
         Spawn a background process locally.
@@ -988,6 +990,7 @@ class ProcessRegistry:
         # The rewriter wraps it to ``A && { B & }`` so no subshell fork.
         # Lazy import avoids circular dependency (terminal_tool imports this).
         from tools.terminal_tool import _rewrite_compound_background as _rewrite_bg
+        from agent.delegation_context import is_delegated_child_process_context
 
         safe_command = _rewrite_bg(command)
 
@@ -998,6 +1001,10 @@ class ProcessRegistry:
             session_key=session_key,
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
             started_at=time.time(),
+            notify_on_complete=notify_on_complete,
+            delegated_child=(
+                notify_on_complete and is_delegated_child_process_context()
+            ),
         )
 
         pty_scope_attempted = False
@@ -1209,6 +1216,7 @@ class ProcessRegistry:
         task_id: str = "",
         session_key: str = "",
         timeout: int = 10,
+        notify_on_complete: bool = False,
     ) -> ProcessSession:
         """
         Spawn a background process through a non-local environment backend.
@@ -1221,6 +1229,8 @@ class ProcessRegistry:
         This is less capable than local spawn (no live stdout pipe, no stdin),
         but it ensures the command runs in the correct sandbox context.
         """
+        from agent.delegation_context import is_delegated_child_process_context
+
         session = ProcessSession(
             id=f"proc_{uuid.uuid4().hex[:12]}",
             command=command,
@@ -1230,6 +1240,10 @@ class ProcessRegistry:
             started_at=time.time(),
             env_ref=env,
             pid_scope="sandbox",
+            notify_on_complete=notify_on_complete,
+            delegated_child=(
+                notify_on_complete and is_delegated_child_process_context()
+            ),
         )
 
         # Run the command in the sandbox with output capture
@@ -1572,6 +1586,7 @@ class ProcessRegistry:
                 "completion_reason": session.completion_reason,
                 "termination_source": session.termination_source,
                 "output": output_tail,
+                "delegated_child": session.delegated_child,
                 # Stable producer identity across checkpoint recovery; unlike
                 # a consumer-observed completion timestamp, this does not vary
                 # based on which watcher notices exit first.
@@ -1635,6 +1650,25 @@ class ProcessRegistry:
         """
         return session_id in self._completion_consumed or (
             skip_poll_observed and session_id in self._poll_observed
+        )
+
+    @staticmethod
+    def _is_routine_delegated_child_completion(evt: dict) -> bool:
+        """True only for a child-owned command tail with a normal success."""
+        return (
+            evt.get("type") == "completion"
+            and evt.get("delegated_child") is True
+            and type(evt.get("exit_code")) is int
+            and evt["exit_code"] == 0
+            and evt.get("completion_reason") == "exited"
+            and evt.get("termination_source") == ""
+            and not any(
+                evt.get(key)
+                for key in (
+                    "error", "stderr", "error_message", "exception", "warning",
+                    "safety_alert", "timed_out", "cancelled", "canceled", "failed", "lost",
+                )
+            )
         )
 
     def drain_notifications(
@@ -1716,7 +1750,11 @@ class ProcessRegistry:
                 _evt_sid, skip_poll_observed=skip_poll_observed
             ):
                 continue
-
+            if self._is_routine_delegated_child_completion(evt):
+                # Native delegation owns routine child command tails. Retain
+                # their durable producer record without turning it into a
+                # parent prompt; terminal outcomes remain deduped by move.
+                continue
             text = format_process_notification(evt)
             if text:
                 results.append((evt, text))
@@ -2518,6 +2556,7 @@ class ProcessRegistry:
                             "watcher_message_id": s.watcher_message_id,
                             "watcher_interval": s.watcher_interval,
                             "notify_on_complete": s.notify_on_complete,
+                            "delegated_child": s.delegated_child,
                             "watch_patterns": s.watch_patterns,
                         })
                 if extra_entries:
@@ -2614,6 +2653,7 @@ class ProcessRegistry:
                 watcher_message_id=entry.get("watcher_message_id", ""),
                 watcher_interval=entry.get("watcher_interval", 0),
                 notify_on_complete=entry.get("notify_on_complete", False),
+                delegated_child=entry.get("delegated_child", False),
                 watch_patterns=entry.get("watch_patterns", []),
             )
             with self._lock:
@@ -2829,6 +2869,9 @@ def format_process_notification(evt: dict) -> "str | None":
 
     if evt_type == "async_delegation":
         return _format_async_delegation(evt)
+
+    if ProcessRegistry._is_routine_delegated_child_completion(evt):
+        return None
 
     _exit = evt.get("exit_code", "?")
     _out = evt.get("output", "")

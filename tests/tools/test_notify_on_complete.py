@@ -34,6 +34,9 @@ def _make_session(
     exit_code=None,
     output="",
     notify_on_complete=False,
+    delegated_child=False,
+    completion_reason="exited",
+    termination_source="",
 ) -> ProcessSession:
     s = ProcessSession(
         id=sid,
@@ -44,6 +47,9 @@ def _make_session(
         exit_code=exit_code,
         output_buffer=output,
         notify_on_complete=notify_on_complete,
+        delegated_child=delegated_child,
+        completion_reason=completion_reason,
+        termination_source=termination_source,
     )
     return s
 
@@ -130,6 +136,85 @@ class TestCompletionQueue:
         ids = {c["session_id"] for c in completions}
         assert ids == {"proc_0", "proc_1", "proc_2"}
 
+    @pytest.mark.parametrize("command", ("pytest -q", "pre-commit run"))
+    def test_delegated_child_routine_success_stays_durable_but_silent(self, registry, command):
+        session = _make_session(
+            command=command,
+            notify_on_complete=True,
+            delegated_child=True,
+            output="passed",
+            exit_code=0,
+        )
+        registry._running[session.id] = session
+        with patch.object(registry, "_write_checkpoint"):
+            registry._move_to_finished(session)
+
+        assert registry._finished[session.id].output_buffer == "passed"
+        assert registry.drain_notifications() == []
+        assert registry.completion_queue.empty()
+
+    @pytest.mark.parametrize(
+        ("exit_code", "completion_reason"),
+        ((1, "exited"), (-15, "killed"), (-1, "lost")),
+    )
+    def test_delegated_child_actionable_completion_reaches_parent(
+        self, registry, exit_code, completion_reason
+    ):
+        session = _make_session(
+            notify_on_complete=True,
+            delegated_child=True,
+            output="failure details",
+            exit_code=exit_code,
+            completion_reason=completion_reason,
+        )
+        registry._running[session.id] = session
+        with patch.object(registry, "_write_checkpoint"):
+            registry._move_to_finished(session)
+
+        drained = registry.drain_notifications()
+        assert len(drained) == 1
+        assert "failure details" in drained[0][1]
+
+    def test_parent_owned_success_still_notifies(self, registry):
+        session = _make_session(notify_on_complete=True, output="done", exit_code=0)
+        registry._running[session.id] = session
+        with patch.object(registry, "_write_checkpoint"):
+            registry._move_to_finished(session)
+
+        assert len(registry.drain_notifications()) == 1
+
+    def test_async_delegation_batch_still_reaches_parent(self, registry):
+        registry.completion_queue.put(
+            {
+                "type": "async_delegation",
+                "delegation_id": "deleg_96",
+                "is_batch": True,
+                "results": [{"task_index": 0, "status": "completed", "summary": "done"}],
+            }
+        )
+
+        drained = registry.drain_notifications()
+        assert len(drained) == 1
+        assert "[ASYNC DELEGATION BATCH COMPLETE — deleg_96]" in drained[0][1]
+
+    def test_late_delegated_child_tail_is_not_a_fresh_parent_request(self, registry):
+        session = _make_session(
+            notify_on_complete=True,
+            delegated_child=True,
+            output="GREEN",
+            exit_code=0,
+        )
+        registry._running[session.id] = session
+        with patch.object(registry, "_write_checkpoint"):
+            registry._move_to_finished(session)
+            session.output_buffer += "\nlate tail"
+            registry._move_to_finished(session)
+
+        assert registry._finished[session.id].output_buffer == "GREEN\nlate tail"
+        assert registry.completion_queue.qsize() == 1
+        assert registry.drain_notifications() == []
+        assert registry.completion_queue.empty()
+
 
 # =========================================================================
 # Checkpoint persistence
@@ -138,13 +223,14 @@ class TestCompletionQueue:
 class TestCheckpointNotify:
     def test_checkpoint_includes_notify(self, registry, tmp_path):
         with patch("tools.process_registry.CHECKPOINT_PATH", tmp_path / "procs.json"):
-            s = _make_session(notify_on_complete=True)
+            s = _make_session(notify_on_complete=True, delegated_child=True)
             registry._running[s.id] = s
             registry._write_checkpoint()
 
             data = json.loads((tmp_path / "procs.json").read_text())
             assert len(data) == 1
             assert data[0]["notify_on_complete"] is True
+            assert data[0]["delegated_child"] is True
 
 
     def test_recover_defaults_false(self, registry, tmp_path):

@@ -782,6 +782,7 @@ class TestSpawnEnvSanitization:
                 self.commands = []
                 self._responses = iter([
                     {"output": "hello\n"},
+                    {"output": "\n"},
                     {"output": "1\n"},
                     {"output": "0\n"},
                 ])
@@ -803,8 +804,52 @@ class TestSpawnEnvSanitization:
             )
 
         assert env.commands[0][0] == "cat '/path with spaces/hermes_bg.log' 2>/dev/null"
-        assert env.commands[1][0] == "kill -0 \"$(cat '/path with spaces/hermes_bg.pid' 2>/dev/null)\" 2>/dev/null; echo $?"
-        assert env.commands[2][0] == "cat '/path with spaces/hermes_bg.exit' 2>/dev/null"
+        assert env.commands[1][0] == "cat '/path with spaces/hermes_bg.exit' 2>/dev/null"
+        assert env.commands[2][0] == "kill -0 \"$(cat '/path with spaces/hermes_bg.pid' 2>/dev/null)\" 2>/dev/null; echo $?"
+        assert env.commands[3][0] == "cat '/path with spaces/hermes_bg.exit' 2>/dev/null"
+
+
+    def test_env_poller_exit_marker_wins_over_stale_live_pid(self, registry):
+        """A durable successful exit cannot remain in a running gate state."""
+        session = _make_session(sid="proc_gate_done")
+        session.pid = 4053252
+        registry._running[session.id] = session
+        commands = []
+        log_reads = 0
+
+        class FakeEnv:
+            def execute(self, command, **_kwargs):
+                nonlocal log_reads
+                commands.append(command)
+                if "hermes_bg_proc_gate_done.log" in command:
+                    log_reads += 1
+                    if log_reads > 1:
+                        raise AssertionError("poller kept trusting the live PID")
+                    return {"output": "GATE_EXIT=0\n"}
+                if "hermes_bg_proc_gate_done.exit" in command:
+                    return {"output": "0\n"}
+                # Simulate a stale/reused PID: the durable marker says the
+                # wrapper already exited, but kill -0 still reports alive.
+                if "kill -0" in command:
+                    return {"output": "0\n"}
+                raise AssertionError(f"unexpected environment command: {command}")
+
+        with patch("tools.process_registry.time.sleep", return_value=None), \
+             patch.object(registry, "_write_checkpoint"):
+            registry._env_poller_loop(
+                session,
+                FakeEnv(),
+                "/tmp/hermes_bg_proc_gate_done.log",
+                "/tmp/hermes_bg_proc_gate_done.pid",
+                "/tmp/hermes_bg_proc_gate_done.exit",
+            )
+
+        assert session.exited is True
+        assert session.exit_code == 0
+        assert session.completion_reason == "exited"
+        assert session.id in registry._finished
+        assert session.id not in registry._running
+        assert not any("kill -0" in command for command in commands)
 
 
 # =========================================================================

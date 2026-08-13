@@ -391,7 +391,7 @@ function SessionDuration({ startedAt }: { startedAt: number }) {
     return () => clearInterval(id)
   }, [isOccluded, startedAt])
 
-  return fmtDuration(now - startedAt)
+  return <Text>{fmtDuration(now - startedAt)}</Text>
 }
 
 function IdleSince({ endedAt }: { endedAt: number }) {
@@ -414,7 +414,7 @@ function IdleSince({ endedAt }: { endedAt: number }) {
     return () => clearInterval(id)
   }, [endedAt, isOccluded])
 
-  return `✓ ${fmtDuration(now - endedAt)}`
+  return <Text>{`✓ ${fmtDuration(now - endedAt)}`}</Text>
 }
 
 const effortLabel = (effort?: string) => {

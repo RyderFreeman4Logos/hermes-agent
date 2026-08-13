@@ -6150,6 +6150,9 @@ def run_conversation(
             break
 
         try:
+            from tools.runtime_heartbeat import runtime_heartbeat
+
+            runtime_heartbeat.capture_successful_request(agent, api_kwargs)
             _transport = agent._get_transport()
             _normalize_kwargs = {}
             if agent.api_mode == "anthropic_messages":

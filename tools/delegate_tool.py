@@ -4029,6 +4029,11 @@ def delegate_task(
         )
 
         if dispatch.get("status") == "dispatched":
+            from tools.runtime_heartbeat import runtime_heartbeat
+
+            runtime_heartbeat.register_child(
+                parent_agent, "subagent", dispatch["delegation_id"]
+            )
             n = len(_goals)
             note = (
                 "Subagent is running in the background. You and the user can "

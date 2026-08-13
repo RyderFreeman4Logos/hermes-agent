@@ -2051,7 +2051,27 @@ class ProcessRegistry:
                         self._check_watch_patterns(session, delta)
                         self._emit_output(session, delta)
 
-                # Check if process is still running
+                # The exit marker is the wrapper's durable terminal receipt.
+                # Read it before probing the PID: a completed PID may be stale
+                # or already reused, and kill -0 alone would leave the session
+                # falsely running forever.
+                exit_result = env.execute(
+                    f"cat {quoted_exit_path} 2>/dev/null",
+                    timeout=5,
+                )
+                exit_str = exit_result.get("output", "").strip()
+                if exit_str:
+                    try:
+                        session.exit_code = int(exit_str.splitlines()[-1].strip())
+                    except (ValueError, IndexError):
+                        session.exit_code = -1
+                    session.exited = True
+                    if session.completion_reason != "killed":
+                        session.completion_reason = "exited"
+                    self._move_to_finished(session)
+                    return
+
+                # Check if process is still running when no terminal marker exists.
                 check = env.execute(
                     f"kill -0 \"$(cat {quoted_pid_path} 2>/dev/null)\" 2>/dev/null; echo $?",
                     timeout=5,

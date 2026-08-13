@@ -124,6 +124,9 @@ FOREGROUND_MAX_TIMEOUT = _safe_parse_import_env(
     "integer",
 )
 
+# Fixed execution budget for model calls promoted off the foreground turn.
+AUTO_BACKGROUND_TIMEOUT = 7200
+
 # Disk usage warning threshold (in GB)
 DISK_USAGE_WARNING_THRESHOLD_GB = _safe_parse_import_env(
     "TERMINAL_DISK_WARNING_GB",
@@ -2600,14 +2603,14 @@ def _resolve_command_cwd(
 
 def terminal_tool(
     command: str,
-    background: bool = False,
+    background: Optional[bool] = None,
     timeout: Optional[int] = None,
     task_id: Optional[str] = None,
     session_id: Optional[str] = None,
     force: bool = False,
     workdir: Optional[str] = None,
     pty: bool = False,
-    notify_on_complete: bool = False,
+    notify_on_complete: Optional[bool] = None,
     watch_patterns: Optional[List[str]] = None,
 ) -> str:
     """
@@ -2746,6 +2749,30 @@ def terminal_tool(
                 f"timeout must be a positive number of seconds (got {timeout})."
             )
         effective_timeout = timeout or default_timeout
+        background_was_omitted = background is None
+        notify_was_omitted = notify_on_complete is None
+        background = bool(background)
+        notify_on_complete = bool(notify_on_complete)
+        auto_background_threshold = int(
+            config.get("auto_background_timeout_threshold", 200)
+        )
+        auto_promoted = (
+            background_was_omitted
+            and notify_was_omitted
+            and not watch_patterns
+            and effective_timeout > auto_background_threshold
+        )
+        if auto_promoted:
+            from gateway.session_context import async_delivery_supported
+
+            if not async_delivery_supported():
+                return tool_error(
+                    "Long terminal command was not started: this session cannot "
+                    "deliver a managed background completion."
+                )
+            background = True
+            notify_on_complete = True
+            effective_timeout = AUTO_BACKGROUND_TIMEOUT
 
         # Reject foreground commands where the model explicitly requests
         # a timeout above FOREGROUND_MAX_TIMEOUT — nudge it toward background.
@@ -2865,6 +2892,8 @@ def terminal_tool(
         from tools.approval import get_current_session_key
 
         session_key = get_current_session_key(default="") or (task_id or "")
+        if auto_promoted and not session_key:
+            session_key = "default"
 
         # Hard-block: gateway lifecycle commands (systemctl/launchctl/hermes
         # restart|stop targeting hermes-gateway) must never run inside the
@@ -3094,7 +3123,7 @@ def terminal_tool(
                 )
 
                 heartbeat_interval = None
-                if notify_on_complete:
+                if notify_on_complete and not auto_promoted:
                     heartbeat_interval = preflight_current_heartbeat()
                     if heartbeat_interval is None:
                         raise HeartbeatConfigError(
@@ -3109,6 +3138,8 @@ def terminal_tool(
                         session_key=session_key,
                         env_vars=env.env if hasattr(env, 'env') else None,
                         use_pty=effective_pty,
+                        execution_timeout=effective_timeout,
+                        notification_metadata={"notify_on_complete": notify_on_complete},
                     )
                 else:
                     proc_session = process_registry.spawn_via_env(
@@ -3117,6 +3148,8 @@ def terminal_tool(
                         cwd=effective_cwd,
                         task_id=effective_task_id,
                         session_key=session_key,
+                        execution_timeout=effective_timeout,
+                        notification_metadata={"notify_on_complete": notify_on_complete},
                     )
 
                 result_data = {
@@ -3307,22 +3340,23 @@ def terminal_tool(
                     proc_session.heartbeat_provider = get_current_provider()
                     result_data["notify_on_complete"] = True
 
-                    from tools.process_registry import arm_process_heartbeat
+                    if not auto_promoted:
+                        from tools.process_registry import arm_process_heartbeat
 
-                    try:
-                        arm_process_heartbeat(
-                            proc_session,
-                            interval=heartbeat_interval,
-                            caller_id=session_key,
-                        )
-                    except (HeartbeatConfigError, RuntimeError):
-                        proc_session.notify_on_complete = False
-                        process_registry.kill_process(
-                            proc_session.id,
-                            source="heartbeat_arm_failed",
-                            consume_output=False,
-                        )
-                        raise
+                        try:
+                            arm_process_heartbeat(
+                                proc_session,
+                                interval=heartbeat_interval,
+                                caller_id=session_key,
+                            )
+                        except (HeartbeatConfigError, RuntimeError):
+                            proc_session.notify_on_complete = False
+                            process_registry.kill_process(
+                                proc_session.id,
+                                source="heartbeat_arm_failed",
+                                consume_output=False,
+                            )
+                            raise
 
                     # In gateway mode, auto-register a fast watcher so the
                     # gateway can detect completion and trigger a new agent
@@ -3922,13 +3956,13 @@ def _handle_terminal(args, **kw):
         )
     return terminal_tool(
         command=args.get("command"),
-        background=args.get("background", False),
+        background=args.get("background"),
         timeout=args.get("timeout"),
         task_id=kw.get("task_id"),
         session_id=kw.get("session_id"),
         workdir=args.get("workdir"),
         pty=args.get("pty", False),
-        notify_on_complete=args.get("notify_on_complete", False),
+        notify_on_complete=args.get("notify_on_complete"),
         watch_patterns=args.get("watch_patterns"),
     )
 

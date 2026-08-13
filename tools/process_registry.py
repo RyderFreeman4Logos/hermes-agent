@@ -999,8 +999,10 @@ class ProcessRegistry:
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
             started_at=time.time(),
         )
+        from tools.runtime_heartbeat import runtime_heartbeat
 
         pty_scope_attempted = False
+        heartbeat_registered = False
         if use_pty:
             # Try PTY mode for interactive CLI tools
             try:
@@ -1048,6 +1050,12 @@ class ProcessRegistry:
                 # Store the pty handle on the session for read/write
                 session._pty = pty_proc
 
+                with self._lock:
+                    self._prune_if_needed()
+                    self._running[session.id] = session
+
+                runtime_heartbeat.register_current_child("process", session.id)
+                heartbeat_registered = True
                 # PTY reader thread
                 reader = threading.Thread(
                     target=self._pty_reader_loop,
@@ -1058,10 +1066,6 @@ class ProcessRegistry:
                 session._reader_thread = reader
                 reader.start()
 
-                with self._lock:
-                    self._prune_if_needed()
-                    self._running[session.id] = session
-
                 self._write_checkpoint()
                 return session
 
@@ -1069,6 +1073,11 @@ class ProcessRegistry:
                 logger.warning("ptyprocess not installed, falling back to pipe mode")
             except Exception as e:
                 logger.warning("PTY spawn failed (%s), falling back to pipe mode", e)
+                if heartbeat_registered:
+                    with self._lock:
+                        self._running.pop(session.id, None)
+                    runtime_heartbeat.complete_process(session.session_key, session.id)
+                    heartbeat_registered = False
                 if pty_scope_attempted and session.systemd_unit:
                     if not _stop_systemd_unit(session.systemd_unit):
                         raise RuntimeError(
@@ -1154,6 +1163,12 @@ class ProcessRegistry:
         session.host_start_time = self._safe_host_start_time(session.pid)
 
         try:
+            with self._lock:
+                self._prune_if_needed()
+                self._running[session.id] = session
+
+            runtime_heartbeat.register_current_child("process", session.id)
+            heartbeat_registered = True
             # Start output reader thread
             reader = threading.Thread(
                 target=self._reader_loop,
@@ -1164,12 +1179,12 @@ class ProcessRegistry:
             session._reader_thread = reader
             reader.start()
 
-            with self._lock:
-                self._prune_if_needed()
-                self._running[session.id] = session
-
             self._write_checkpoint()
         except Exception:
+            with self._lock:
+                self._running.pop(session.id, None)
+            if heartbeat_registered:
+                runtime_heartbeat.complete_process(session.session_key, session.id)
             # Post-Popen setup failed — kill the orphaned subprocess (and any
             # descendants spawned via setsid) before re-raising so they do not
             # leak as untracked background processes.
@@ -1280,8 +1295,16 @@ class ProcessRegistry:
             session.termination_source = "failed_start"
             session.output_buffer = f"Failed to start: {e}"
 
+        with self._lock:
+            self._prune_if_needed()
+            if not session.exited:
+                self._running[session.id] = session
+
         if not session.exited:
-            # Start a poller thread that periodically reads the log file
+            from tools.runtime_heartbeat import runtime_heartbeat
+
+            runtime_heartbeat.register_current_child("process", session.id)
+            # Start a poller thread that periodically reads the log file.
             reader = threading.Thread(
                 target=self._env_poller_loop,
                 args=(session, env, log_path, pid_path, exit_path),
@@ -1289,14 +1312,13 @@ class ProcessRegistry:
                 name=f"proc-poller-{session.id}",
             )
             session._reader_thread = reader
-            reader.start()
-
-        with self._lock:
-            self._prune_if_needed()
-            if not session.exited:
-                self._running[session.id] = session
-
-        if not session.exited:
+            try:
+                reader.start()
+            except Exception:
+                with self._lock:
+                    self._running.pop(session.id, None)
+                runtime_heartbeat.complete_process(session.session_key, session.id)
+                raise
             self._write_checkpoint()
 
         return session

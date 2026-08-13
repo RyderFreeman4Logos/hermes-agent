@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import threading
 
 import pytest
 
@@ -117,6 +118,39 @@ def test_zero_child_idle_timer_arms_after_success_and_caller_activation_cancels(
 
     heartbeat.on_caller_active(agent)
     assert timer.cancelled
+    assert heartbeat.timer_for(agent) is None
+
+
+def test_caller_activation_cancels_an_inflight_idle_warm(heartbeat):
+    agent = _Agent()
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_create(**kwargs):
+        agent.completions.requests.append(kwargs)
+        started.set()
+        assert release.wait(timeout=1)
+        return object()
+
+    agent.completions.create = blocking_create
+    heartbeat.capture_successful_request(
+        agent,
+        {
+            "model": "test-model",
+            "messages": [{"role": "system", "content": "prefix"}],
+        },
+    )
+    heartbeat.on_loop_stop(agent, completed=True)
+    timer = heartbeat.timer_for(agent)
+
+    worker = threading.Thread(target=timer.fire)
+    worker.start()
+    assert started.wait(timeout=1)
+    heartbeat.on_caller_active(agent)
+    release.set()
+    worker.join(timeout=1)
+
+    assert not worker.is_alive()
     assert heartbeat.timer_for(agent) is None
 
 

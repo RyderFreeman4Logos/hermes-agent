@@ -1512,7 +1512,7 @@ def run_heartbeat_warm(
             "response_previewed": False,
         }
 
-    from tools.runtime_heartbeat import runtime_heartbeat
+    from tools.runtime_heartbeat import DIRECT_HEARTBEAT_STATUSES, runtime_heartbeat
 
     if not isinstance(heartbeat_event, dict) or not runtime_heartbeat.is_event_current(
         heartbeat_event, agent

@@ -35,8 +35,6 @@ _HINT_FILENAMES = [
 
 # Maximum chars per hint file to prevent context bloat
 _MAX_HINT_CHARS = 8_000
-_MAX_TOTAL_HINT_CHARS = 16_000
-_TOTAL_HINT_TRUNCATION_MARKER = "\n\n[...subdirectory hints truncated to 16,000 characters]"
 
 # Tool argument keys that typically contain file paths
 _PATH_ARG_KEYS = {"path", "file_path", "workdir"}
@@ -137,13 +135,7 @@ class SubdirectoryHintTracker:
         if not all_hints:
             return None
 
-        combined = "\n\n" + "\n\n".join(all_hints)
-        if len(combined) > _MAX_TOTAL_HINT_CHARS:
-            combined = (
-                combined[:_MAX_TOTAL_HINT_CHARS - len(_TOTAL_HINT_TRUNCATION_MARKER)]
-                + _TOTAL_HINT_TRUNCATION_MARKER
-            )
-        return combined
+        return "\n\n" + "\n\n".join(all_hints)
 
     def _extract_directories(
         self, tool_name: str, args: Dict[str, Any]
@@ -163,7 +155,7 @@ class SubdirectoryHintTracker:
             if isinstance(cmd, str):
                 self._extract_paths_from_command(cmd, candidates)
 
-        return sorted(candidates, key=lambda path: (-len(path.parts), str(path)))
+        return list(candidates)
 
     def _add_path_candidate(self, raw_path: str, candidates: Set[Path]):
         """Resolve a raw path and add its directory + ancestors to candidates.

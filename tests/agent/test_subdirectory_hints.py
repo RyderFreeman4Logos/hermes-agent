@@ -108,28 +108,6 @@ class TestSubdirectoryHintTracker:
         # Should be capped
         assert len(result) < 20_000
 
-    def test_total_hint_cap_keeps_nearest_unicode_context(self, tmp_path):
-        directory = tmp_path
-        for name in ("parent", "middle", "deepest"):
-            directory = directory / name
-            directory.mkdir()
-            (directory / "AGENTS.md").write_text(
-                f"{name}-rules\n" + "λ" * 9_000,
-                encoding="utf-8",
-            )
-        target = directory / "file.py"
-        target.write_text("pass\n")
-
-        result = SubdirectoryHintTracker(str(tmp_path)).check_tool_call(
-            "read_file", {"path": str(target)}
-        )
-
-        assert result is not None
-        assert len(result) <= 16_000
-        assert result.index("deepest-rules") < result.index("middle-rules")
-        assert "truncated" in result[-100:].lower()
-        assert result.encode("utf-8").decode("utf-8") == result
-
     def test_empty_args(self, project):
         """Empty args should not crash."""
         tracker = SubdirectoryHintTracker(working_dir=str(project))

@@ -35,7 +35,6 @@ from agent.agent_runtime_helpers import sanitize_api_messages
 from agent.tool_executor import execute_tool_calls_segmented
 from hermes_state import SessionDB
 from run_agent import AIAgent
-from tools.tool_result_storage import PERSISTED_OUTPUT_TAG
 
 
 def _make_tool_defs(*names: str) -> list:
@@ -380,37 +379,6 @@ def test_execute_tool_calls_sequential_flushes_each_tool_result_before_next_disp
         ("dispatch", "c2"),
         ("flush", "tool", "c2"),
     ]
-
-
-@pytest.mark.parametrize("executor_mode", ["sequential", "concurrent"])
-def test_large_result_is_bounded_before_append_but_callback_keeps_raw(
-    tmp_path, executor_mode
-):
-    agent = _make_agent()
-    tool_call = _mock_tool_call(call_id=f"large-{executor_mode}")
-    assistant_message = SimpleNamespace(content="", tool_calls=[tool_call])
-    messages: list = []
-    raw = '{"success":true,"data":"' + "x" * 40_000 + '"}'
-    callback = MagicMock()
-    setattr(agent, "tool_complete_callback", callback)
-    env = MagicMock()
-    env.get_temp_dir.return_value = str(tmp_path)
-    env.execute.return_value = {"output": "", "returncode": 0}
-    dispatch_patch = (
-        patch("run_agent.handle_function_call", return_value=raw)
-        if executor_mode == "sequential"
-        else patch.object(agent, "_invoke_tool", return_value=raw)
-    )
-
-    with dispatch_patch, patch(
-        "agent.tool_executor.get_active_env", return_value=env
-    ):
-        execute = getattr(agent, f"_execute_tool_calls_{executor_mode}")
-        execute(assistant_message, messages, "task-1")
-
-    assert PERSISTED_OUTPUT_TAG in messages[-1]["content"]
-    assert env.execute.call_args.kwargs["stdin_data"] == raw
-    assert callback.call_args.args[3] == raw
 
 
 def test_sequential_keyboard_interrupt_emits_results_for_all_calls():

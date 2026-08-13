@@ -22,6 +22,7 @@ import contextvars
 import json
 import logging
 import re
+import shutil
 
 logger = logging.getLogger(__name__)
 import os
@@ -648,9 +649,8 @@ def _get_max_async_children() -> int:
     DEPRECATED KNOB: ``delegation.max_async_children`` has been unified into
     ``delegation.max_concurrent_children`` — one cap governs both a single
     synchronous batch's parallelism and how many background delegation units
-    may run at once. When at capacity, a new async dispatch is REJECTED (not
-    queued) so a runaway model can't pile up unbounded background work; the
-    caller falls back to running the work synchronously.
+    may run at once. Additional top-level dispatches stay registered on the
+    background executor queue until worker capacity becomes available.
 
     A leftover ``max_async_children`` in config.yaml is ignored (the config
     migration removes it, folding a raised value into
@@ -2671,8 +2671,9 @@ def _run_single_child(
         duration = round(time.monotonic() - child_start, 2)
 
         summary = result.get("final_response") or ""
-        completed = result.get("completed", False)
+        completed = result.get("completed") is True
         interrupted = result.get("interrupted", False)
+        turn_exit_reason = result.get("turn_exit_reason")
         api_calls = result.get("api_calls", 0)
 
         # The child emits the literal "(empty)" sentinel (see run_agent.py) when
@@ -2684,10 +2685,7 @@ def _run_single_child(
 
         if interrupted:
             status = "interrupted"
-        elif summary and not _empty_sentinel:
-            # A summary means the subagent produced usable output.
-            # exit_reason ("completed" vs "max_iterations") already
-            # tells the parent *how* the task ended.
+        elif completed and summary and not _empty_sentinel:
             status = "completed"
         else:
             status = "failed"
@@ -2731,7 +2729,9 @@ def _run_single_child(
                         tool_trace[-1].update(result_meta)
 
         # Determine exit reason
-        if interrupted:
+        if turn_exit_reason:
+            exit_reason = turn_exit_reason
+        elif interrupted:
             exit_reason = "interrupted"
         elif completed:
             exit_reason = "completed"
@@ -2747,6 +2747,8 @@ def _run_single_child(
             "task_index": task_index,
             "status": status,
             "summary": summary,
+            "completed": completed,
+            "turn_exit_reason": turn_exit_reason,
             "api_calls": api_calls,
             "duration_seconds": duration,
             "model": _model if isinstance(_model, str) else None,
@@ -2880,6 +2882,8 @@ def _run_single_child(
         complete_kwargs: Dict[str, Any] = {
             "preview": summary[:160] if summary else entry.get("error", ""),
             "status": status,
+            "completed": completed,
+            "turn_exit_reason": turn_exit_reason,
             "duration_seconds": duration,
             "summary": summary[:500] if summary else entry.get("error", ""),
             "input_tokens": (
@@ -3142,6 +3146,46 @@ def _finalize_child_results(
                     parent_agent.session_cost_status = "estimated"
             except Exception:
                 logger.debug("Subagent cost rollup failed", exc_info=True)
+
+
+def _finalize_unstarted_children(
+    children: List[tuple[int, Dict[str, Any], Any]],
+    parent_agent,
+    status: str,
+) -> None:
+    """Close prebuilt children and balance lifecycle when no runner starts."""
+    with _parent_finalization_lock(parent_agent):
+        try:
+            from hermes_cli.plugins import invoke_hook
+        except Exception:
+            invoke_hook = None
+
+        for _task_index, _task, child in children:
+            child_role = getattr(child, "_delegate_role", None)
+            try:
+                if hasattr(child, "close"):
+                    child.close()
+            except Exception:
+                logger.debug(
+                    "Failed to close unstarted delegation child", exc_info=True
+                )
+
+            if invoke_hook is None:
+                continue
+            try:
+                invoke_hook(
+                    "subagent_stop",
+                    parent_session_id=getattr(parent_agent, "session_id", None),
+                    parent_turn_id=getattr(parent_agent, "_current_turn_id", "") or "",
+                    child_session_id=getattr(child, "session_id", None),
+                    child_role=child_role,
+                    child_summary=None,
+                    child_status=status,
+                    tool_call_history=[],
+                    duration_ms=0,
+                )
+            except Exception:
+                logger.debug("subagent_stop hook invocation failed", exc_info=True)
 
 
 def _run_child_lifecycle(
@@ -3434,6 +3478,7 @@ def delegate_task(
     # live_paths is empty and delegation proceeds exactly as before.
     from tools.delegation_live_log import (
         create_live_transcripts,
+        live_transcript_root,
         update_manifest_statuses,
         wrap_progress_callback,
     )
@@ -3834,6 +3879,17 @@ def delegate_task(
                 except ValueError:
                     pass
 
+        _not_started_lock = threading.Lock()
+        _not_started_finalized = False
+
+        def _finalize_not_started(status: str) -> None:
+            nonlocal _not_started_finalized
+            with _not_started_lock:
+                if _not_started_finalized:
+                    return
+                _not_started_finalized = True
+            _finalize_unstarted_children(children, parent_agent, status)
+
         def _batch_runner():
             # This batch is detached from the foreground turn. Its lifecycle is
             # owned by the async registry and cancelled only via _batch_interrupt.
@@ -3901,6 +3957,7 @@ def delegate_task(
             parent_session_id=_parent_session_id,
             runner=_batch_runner,
             interrupt_fn=_batch_interrupt,
+            on_not_started=_finalize_not_started,
             max_async_children=_get_max_async_children(),
             # Reuse the live-transcript directory's id (when created) so the
             # returned delegation_id matches cache/delegation/live/<id>/.
@@ -3940,24 +3997,13 @@ def delegate_task(
                 )
             return json.dumps(payload, ensure_ascii=False)
 
-        # Pool at capacity / schedule failure — children are still attached
-        # (we detach above only on the parent list, but the async unit was
-        # never accepted, so re-attaching isn't needed: we just run inline).
-        logger.info(
-            "delegate_task: async pool at capacity (%s); running the whole "
-            "batch synchronously instead.",
-            dispatch.get("error", "rejected"),
-        )
-        _cap_result = _execute_and_aggregate()
-        if isinstance(_cap_result, dict):
-            _cap_result["note"] = (
-                "The background delegation pool was at capacity "
-                "(delegation.max_concurrent_children), so the subagent(s) ran "
-                "SYNCHRONOUSLY and the result is included above. Raise "
-                "delegation.max_concurrent_children in config.yaml to allow "
-                "more concurrent background delegations."
-            )
-        return json.dumps(_cap_result, ensure_ascii=False)
+        _finalize_not_started("error")
+        if live_deleg_id:
+            shutil.rmtree(live_transcript_root() / live_deleg_id, ignore_errors=True)
+
+        # A full backlog or submit failure is a scheduling error, not
+        # permission to occupy the foreground turn.
+        return tool_error(dispatch.get("error", "Failed to schedule delegation."))
 
     # ----- Synchronous path -----
     return json.dumps(_execute_and_aggregate(), ensure_ascii=False)

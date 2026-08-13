@@ -25,6 +25,7 @@ import ssl
 import time
 from typing import Any, Dict, List, Optional
 
+from agent import relay_llm
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.conversation_compression import (
     COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
@@ -1638,6 +1639,13 @@ def run_conversation(
         )
 
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
+        terminal_text_only = (
+            getattr(agent, "_delegate_depth", 0) > 0
+            and min(
+                agent.max_iterations - api_call_count,
+                agent.iteration_budget.remaining,
+            ) == 1
+        )
         _redirect_text = agent._drain_pending_redirect()
         if _redirect_text:
             _apply_active_turn_redirect(agent, messages, _redirect_text)
@@ -2530,6 +2538,8 @@ def run_conversation(
                         is_github_responses=agent._is_copilot_url(),
                         sanitize_harmony_tokens=agent._is_codex_backend(),
                     )
+                if terminal_text_only:
+                    relay_llm.disable_tools(api_kwargs)
                 # Copilot x-initiator: the first API call of a user turn is
                 # marked "user" so Copilot bills a premium request; tool-loop
                 # follow-ups keep the default "agent" header (#3040).
@@ -2683,6 +2693,9 @@ def run_conversation(
                         _use_streaming = False
 
                 def _perform_api_call(next_api_kwargs):
+                    if terminal_text_only:
+                        next_api_kwargs = dict(next_api_kwargs)
+                        relay_llm.disable_tools(next_api_kwargs)
                     if agent.api_mode == "codex_responses":
                         next_api_kwargs = agent._get_transport().preflight_kwargs(
                             next_api_kwargs,
@@ -2690,32 +2703,31 @@ def run_conversation(
                             is_github_responses=agent._is_copilot_url(),
                             sanitize_harmony_tokens=agent._is_codex_backend(),
                         )
-                    if _use_streaming:
-                        return agent._interruptible_streaming_api_call(
-                            next_api_kwargs, on_first_delta=_stop_spinner
+                    with relay_llm.text_only_requests(terminal_text_only):
+                        if _use_streaming:
+                            return agent._interruptible_streaming_api_call(
+                                next_api_kwargs, on_first_delta=_stop_spinner
+                            )
+                        return relay_llm.execute(
+                            next_api_kwargs,
+                            agent._interruptible_api_call,
+                            session_id=str(agent.session_id or ""),
+                            name=str(agent.provider or "provider"),
+                            model_name=str(agent.model or ""),
+                            metadata={
+                                "api_mode": agent.api_mode,
+                                "api_request_id": api_request_id,
+                                "call_role": (
+                                    "delegated"
+                                    if getattr(agent, "is_subagent", False)
+                                    else "fallback"
+                                    if int(getattr(agent, "_fallback_index", 0) or 0) > 0
+                                    else "primary"
+                                ),
+                                "retry_count": retry_count,
+                            },
+                            defer_logical_completion=True,
                         )
-                    from agent import relay_llm
-
-                    return relay_llm.execute(
-                        next_api_kwargs,
-                        agent._interruptible_api_call,
-                        session_id=str(agent.session_id or ""),
-                        name=str(agent.provider or "provider"),
-                        model_name=str(agent.model or ""),
-                        metadata={
-                            "api_mode": agent.api_mode,
-                            "api_request_id": api_request_id,
-                            "call_role": (
-                                "delegated"
-                                if getattr(agent, "is_subagent", False)
-                                else "fallback"
-                                if int(getattr(agent, "_fallback_index", 0) or 0) > 0
-                                else "primary"
-                            ),
-                            "retry_count": retry_count,
-                        },
-                        defer_logical_completion=True,
-                    )
 
                 from hermes_cli.middleware import run_llm_execution_middleware
 
@@ -3812,8 +3824,6 @@ def run_conversation(
                         clear_nous_rate_limit()
                     except Exception:
                         pass
-                from agent import relay_llm
-
                 relay_llm.complete_logical_call(
                     api_request_id,
                     outcome="success",
@@ -6177,6 +6187,23 @@ def run_conversation(
                     except Exception:
                         pass
             
+            if terminal_text_only and (
+                has_incomplete_scratchpad(assistant_message.content or "")
+                or not agent._strip_think_blocks(assistant_message.content or "").strip()
+                or assistant_message.tool_calls
+                or finish_reason in {"incomplete", "length", "tool_calls"}
+            ):
+                _turn_exit_reason = (
+                    f"terminal_slot_exhausted({api_call_count}/{agent.max_iterations})"
+                )
+                final_response = (
+                    "I reached the iteration limit before producing a final response."
+                )
+                agent._emit_status(
+                    "⚠️ Final delegated iteration did not produce terminal text; stopping"
+                )
+                break
+
             # Check for incomplete <REASONING_SCRATCHPAD> (opened but never closed)
             # This means the model ran out of output tokens mid-reasoning — retry up to 2 times
             if has_incomplete_scratchpad(assistant_message.content or ""):
@@ -7333,7 +7360,8 @@ def run_conversation(
 
                 _ack_mode = intent_ack_continuation_mode(agent)
                 if (
-                    _ack_mode != "off"
+                    not terminal_text_only
+                    and _ack_mode != "off"
                     and agent.valid_tool_names
                     and codex_ack_continuations < 2
                     and agent._looks_like_codex_intermediate_ack(

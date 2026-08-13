@@ -86,6 +86,7 @@ class _OwnerState:
     snapshot: dict[str, Any] | None = None
     timer: Any = None
     warming: bool = False
+    idle_generation: int = 0
 
 
 class RuntimeHeartbeat:
@@ -236,21 +237,29 @@ class RuntimeHeartbeat:
     def _restart_locked(self, agent: Any, state: _OwnerState) -> None:
         if state.timer is not None:
             state.timer.cancel()
-        timer = self._timer_factory(state.interval, lambda: self._fire(agent))
+        state.idle_generation += 1
+        generation = state.idle_generation
+        timer = self._timer_factory(state.interval, lambda: self._fire(agent, generation))
         if hasattr(timer, "daemon"):
             timer.daemon = True
         state.timer = timer
         timer.start()
 
     def _cancel_locked(self, agent: Any, state: _OwnerState) -> None:
+        state.idle_generation += 1
         if state.timer is not None:
             state.timer.cancel()
             state.timer = None
 
-    def _fire(self, agent: Any) -> None:
+    def _fire(self, agent: Any, generation: int) -> None:
         with self._lock:
             state = self._owners.get(self._key(agent))
-            if state is None or state.owner_ref() is not agent or state.warming:
+            if (
+                state is None
+                or state.owner_ref() is not agent
+                or state.warming
+                or state.idle_generation != generation
+            ):
                 return
             snapshot = state.snapshot
             if snapshot is None:
@@ -281,7 +290,9 @@ class RuntimeHeartbeat:
                 state = self._owners.get(self._key(agent))
                 if state is not None and state.owner_ref() is agent:
                     state.warming = False
-                    if state.children or state.snapshot is not None:
+                    if state.idle_generation == generation and (
+                        state.children or state.snapshot is not None
+                    ):
                         self._restart_locked(agent, state)
 
 

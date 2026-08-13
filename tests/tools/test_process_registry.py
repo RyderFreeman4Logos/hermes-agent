@@ -19,6 +19,7 @@ from tools.process_registry import (
     MAX_ACTIVE_PROCESS_AGE,
     format_process_notification,
 )
+from tools.runtime_heartbeat import RuntimeHeartbeat, bind_owner
 
 
 @pytest.fixture()
@@ -69,6 +70,74 @@ def _spawn_python_sleep(seconds: float) -> subprocess.Popen:
     return subprocess.Popen(
         [sys.executable, "-c", f"import time; time.sleep({seconds})"],
     )
+
+
+def test_spawn_local_registers_before_an_immediate_reader_completion(registry, monkeypatch):
+    class _Timer:
+        def __init__(self, _delay, _callback):
+            self.cancelled = False
+
+        def start(self):
+            pass
+
+        def cancel(self):
+            self.cancelled = True
+
+    class _Agent:
+        provider = "custom"
+        requested_provider = "custom:localrouter"
+        session_id = "session-1"
+
+    class _Process:
+        pid = 999999999
+
+    class _Thread:
+        def __init__(self, *, target, args, **_kwargs):
+            self._target = target
+            self._args = args
+
+        def start(self):
+            self._target(*self._args)
+
+    heartbeat = RuntimeHeartbeat(
+        config={"providers": {"custom:localrouter": 30}}, timer_factory=_Timer
+    )
+    agent = _Agent()
+    heartbeat.capture_successful_request(
+        agent,
+        {"model": "test-model", "messages": [{"role": "system", "content": "prefix"}]},
+    )
+    registered = []
+    completed = []
+    original_register = heartbeat.register_current_child
+    original_complete = heartbeat.complete_process
+
+    def register(kind, child_id):
+        registered.append((kind, child_id))
+        original_register(kind, child_id)
+
+    def complete(session_id, process_id):
+        completed.append((session_id, process_id))
+        original_complete(session_id, process_id)
+
+    monkeypatch.setattr("tools.runtime_heartbeat.runtime_heartbeat", heartbeat)
+    monkeypatch.setattr(heartbeat, "register_current_child", register)
+    monkeypatch.setattr(heartbeat, "complete_process", complete)
+    monkeypatch.setattr(
+        "tools.process_registry.subprocess.Popen", lambda *_args, **_kwargs: _Process()
+    )
+    monkeypatch.setattr("tools.process_registry.threading.Thread", _Thread)
+    monkeypatch.setattr("tools.process_registry._find_shell", lambda: "/bin/bash")
+    monkeypatch.setattr(registry, "_reader_loop", lambda session: registry._move_to_finished(session))
+    monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+
+    with bind_owner(agent):
+        session = registry.spawn_local("exit 0", session_key=agent.session_id)
+
+    assert session.id in registry._finished
+    assert registered == [("process", session.id)]
+    assert completed == [(agent.session_id, session.id)]
+    assert heartbeat.timer_for(agent) is None
 
 
 def test_kill_started_since_preserves_preexisting_and_foreign_processes(registry):

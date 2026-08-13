@@ -1557,6 +1557,10 @@ class ProcessRegistry:
         with self._lock:
             was_running = self._running.pop(session.id, None) is not None
             self._finished[session.id] = session
+        if was_running:
+            from tools.runtime_heartbeat import runtime_heartbeat
+
+            runtime_heartbeat.complete_process(session.session_key, session.id)
         session._completion_event.set()
         self._write_checkpoint()
 

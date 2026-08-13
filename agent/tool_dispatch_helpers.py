@@ -32,6 +32,7 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from agent.tool_guardrails import NO_PROGRESS_LOOP_HALT_AFTER
 from agent.tool_result_classification import (
     FILE_MUTATING_TOOL_NAMES as _FILE_MUTATING_TOOLS,
 )
@@ -141,6 +142,9 @@ def _plan_tool_batch_segments(tool_calls, *, execution_cwd: Optional[Path] = Non
       argument.
     * Anything not in ``_PARALLEL_SAFE_TOOLS`` and not an opted-in MCP
       tool → barrier.
+    * The call that can reach the identical-result halt threshold, and later
+      repetitions with the same tool name and arguments → barrier, so the
+      result-based guardrail observes each before starting the next.
 
     Parallel runs shorter than two calls are demoted to sequential (no
     concurrency win, and the sequential executor owns the richer inline
@@ -148,6 +152,7 @@ def _plan_tool_batch_segments(tool_calls, *, execution_cwd: Optional[Path] = Non
     """
     segments: list[list] = []  # [kind, calls] pairs, normalized to tuples on return
     current: list = []
+    signature_counts: dict[tuple[str, str], int] = {}
     # (canonical_path, is_writer) reservations for the current parallel run.
     reserved_paths: list[tuple[Path, bool]] = []
 
@@ -189,6 +194,21 @@ def _plan_tool_batch_segments(tool_calls, *, execution_cwd: Optional[Path] = Non
                 tool_name,
                 type(function_args).__name__,
             )
+            _add_sequential(tool_call)
+            continue
+
+        signature = (
+            tool_name,
+            json.dumps(
+                function_args,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        )
+        signature_count = signature_counts.get(signature, 0) + 1
+        signature_counts[signature] = signature_count
+        if signature_count >= NO_PROGRESS_LOOP_HALT_AFTER:
             _add_sequential(tool_call)
             continue
 

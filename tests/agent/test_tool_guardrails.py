@@ -63,7 +63,7 @@ def test_config_parses_nested_warn_and_hard_stop_thresholds():
     assert cfg.no_progress_block_after == 8
 
 
-def test_default_repeated_identical_failed_call_warns_without_blocking():
+def test_default_repeated_identical_failed_call_warns_then_halts():
     controller = ToolCallGuardrailController()
     args = {"query": "same"}
 
@@ -75,10 +75,31 @@ def test_default_repeated_identical_failed_call_warns_without_blocking():
         )
 
     assert decisions[0].action == "allow"
-    assert [d.action for d in decisions[1:]] == ["warn", "warn", "warn", "warn"]
-    assert {d.code for d in decisions[1:]} == {"repeated_exact_failure_warning"}
-    assert controller.before_call("web_search", args).action == "allow"
-    assert controller.halt_decision is None
+    assert [d.action for d in decisions[1:]] == ["warn", "warn", "warn", "halt"]
+    assert {d.code for d in decisions[1:4]} == {"repeated_exact_failure_warning"}
+    assert decisions[4].code == "no_progress_loop"
+    controller.break_observation_streak()
+    blocked = controller.before_call("web_search", args)
+    assert blocked.action == "block"
+    assert blocked.code == "guardrail_turn_halted"
+    assert controller.halt_decision == decisions[4]
+
+
+def test_default_repeated_equivalent_success_result_halts_after_five():
+    controller = ToolCallGuardrailController()
+    args = {"query": "same"}
+    results = ['{"value":1,"ok":true}', '{"ok":true,"value":1}']
+
+    decisions = [
+        controller.after_call("web_search", args, results[index % 2], failed=False)
+        for index in range(5)
+    ]
+
+    assert all(decision.code != "no_progress_loop" for decision in decisions[:4])
+    assert decisions[4].action == "halt"
+    assert decisions[4].code == "no_progress_loop"
+    assert decisions[4].count == 5
+    assert "equivalent result 5 consecutive times" in decisions[4].message
 
 
 def test_hard_stop_enabled_blocks_repeated_exact_failure_before_next_execution():
@@ -119,16 +140,56 @@ def test_hard_stop_enabled_blocks_repeated_exact_failure_before_next_execution()
 
 
 
-def test_mutating_or_unknown_tools_are_not_blocked_for_repeated_identical_success_output_by_default():
+def test_stateful_or_unknown_tools_fail_open_for_repeated_identical_success_output():
     controller = ToolCallGuardrailController(
         ToolCallGuardrailConfig(no_progress_warn_after=2, no_progress_block_after=2)
     )
 
-    for _ in range(3):
-        assert controller.before_call("write_file", {"path": "/tmp/x", "content": "x"}).action == "allow"
-        assert controller.after_call("write_file", {"path": "/tmp/x", "content": "x"}, "ok", failed=False).action == "allow"
-        assert controller.before_call("custom_tool", {"x": 1}).action == "allow"
-        assert controller.after_call("custom_tool", {"x": 1}, "ok", failed=False).action == "allow"
+    for tool_name, args in (
+        ("browser_scroll", {"direction": "down"}),
+        ("custom_tool", {"x": 1}),
+    ):
+        decisions = [
+            controller.after_call(tool_name, args, "ok", failed=False)
+            for _ in range(6)
+        ]
+        assert all(decision.code != "no_progress_loop" for decision in decisions)
+
+
+def test_no_progress_halt_requires_consecutive_equivalent_call_and_result():
+    controller = ToolCallGuardrailController()
+    repeated = ("web_search", {"query": "same"}, '{"value":1}')
+
+    for changed in (
+        ("web_search", {"query": "different"}, repeated[2], False),
+        ("read_file", repeated[1], repeated[2], False),
+        ("web_search", repeated[1], '{"value":2}', False),
+        ("web_search", repeated[1], repeated[2], True),
+    ):
+        decisions = [
+            controller.after_call(*repeated, failed=False) for _ in range(4)
+        ]
+        decisions.append(
+            controller.after_call(*changed[:3], failed=changed[3])
+        )
+        decisions.extend(
+            controller.after_call(*repeated, failed=False) for _ in range(4)
+        )
+        assert all(decision.code != "no_progress_loop" for decision in decisions)
+
+        controller.reset_for_turn()
+
+
+def test_no_progress_halt_fails_open_for_none_and_structured_results():
+    controller = ToolCallGuardrailController()
+
+    for result in (None, {"value": 1}):
+        decisions = [
+            controller.after_call("web_search", {"x": 1}, result)
+            for _ in range(6)
+        ]
+        assert all(decision.code != "no_progress_loop" for decision in decisions)
+        controller.reset_for_turn()
 
 
 
@@ -167,13 +228,4 @@ def test_web_search_cap_blocks_after_limit_regardless_of_hard_stop():
     assert decision.action == "block"
     assert decision.code == "loop_web_search_cap"
     assert decision.should_halt is True
-
-
-
-
-
-
-
-
-
 

@@ -33,14 +33,27 @@ def canonical_runtime_provider_identity(agent) -> str:
     ).strip().lower()
     if requested.startswith("custom:"):
         return requested
-    if provider == "custom" or requested == "custom":
+    try:
         from hermes_cli.runtime_provider import canonical_custom_identity
 
         recovered = canonical_custom_identity(
             base_url=getattr(agent, "base_url", None),
+            config_provider=requested or provider,
             model=getattr(agent, "model", None),
         )
-        return str(recovered or requested or provider).strip().lower()
+    except Exception:
+        recovered = None
+    if recovered:
+        recovered = str(recovered).strip().lower()
+        # Accept recovered custom identities for bare ``custom`` and for named
+        # aliases (``pm``/``localrouter``), but never rewrite a builtin provider.
+        if provider == "custom" or requested == "custom":
+            return recovered
+        if recovered in {
+            f"custom:{provider}" if provider else "",
+            f"custom:{requested}" if requested else "",
+        }:
+            return recovered
     return provider or requested
 
 

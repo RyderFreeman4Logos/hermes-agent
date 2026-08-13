@@ -4541,6 +4541,17 @@ class APIServerAdapter(BasePlatformAdapter):
                     "error": err_msg,
                     "error_code": "output_truncated" if finish_reason == "length" else "agent_error",
                 }
+            if isinstance(result, dict) and (
+                result.get("turn_exit_reason") or result.get("completion_delivery_status")
+            ):
+                finish_chunk["hermes"] = {
+                    key: result[key]
+                    for key in (
+                        "completed", "partial", "failed", "interrupted", "error",
+                        "error_code", "completion_delivery_status", "turn_exit_reason",
+                    )
+                    if key in result
+                }
             await response.write(_sse_frame(finish_chunk))
             await response.write(b"data: [DONE]\n\n")
         except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):

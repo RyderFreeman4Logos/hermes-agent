@@ -8,6 +8,7 @@ import inspect
 import json
 import logging
 from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any
 
@@ -22,6 +23,25 @@ _PROVIDER_MESSAGE_EXTENSION_KEYS = frozenset(
 _RELAY_INTERNAL_PROVIDER_HEADERS = frozenset(
     {"x-dynamo-parent-session-id", "x-dynamo-session-id"}
 )
+_TEXT_ONLY_REQUEST = contextvars.ContextVar(
+    "relay_text_only_request",
+    default=False,
+)
+
+
+def disable_tools(request: dict[str, Any]) -> None:
+    """Make one provider request text-only without changing transports."""
+    for key in ("tools", "tool_choice", "parallel_tool_calls", "toolConfig"):
+        request.pop(key, None)
+
+
+@contextmanager
+def text_only_requests(enabled: bool) -> Iterator[None]:
+    token = _TEXT_ONLY_REQUEST.set(enabled)
+    try:
+        yield
+    finally:
+        _TEXT_ONLY_REQUEST.reset(token)
 
 
 def execute(
@@ -1028,6 +1048,8 @@ def _provider_request(
             **dict(final.get("extra_headers") or {}),
             **headers,
         }
+    if _TEXT_ONLY_REQUEST.get():
+        disable_tools(final)
     return final
 
 

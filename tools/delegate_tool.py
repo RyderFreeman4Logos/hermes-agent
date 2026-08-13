@@ -4007,6 +4007,8 @@ def delegate_task(
             return tuple(parts), in_tool
 
         _goals = [t["goal"] for t in task_list]
+        from tools.runtime_heartbeat import runtime_heartbeat
+
         dispatch = dispatch_async_delegation_batch(
             goals=_goals,
             context=context,
@@ -4026,14 +4028,15 @@ def delegate_task(
             # returned delegation_id matches cache/delegation/live/<id>/.
             delegation_id=live_deleg_id,
             progress_fn=_batch_progress,
+            before_submit=lambda delegation_id: runtime_heartbeat.register_child(
+                parent_agent, "subagent", delegation_id
+            ),
+            on_submit_failure=lambda delegation_id: runtime_heartbeat.complete_child(
+                parent_agent, "subagent", delegation_id
+            ),
         )
 
         if dispatch.get("status") == "dispatched":
-            from tools.runtime_heartbeat import runtime_heartbeat
-
-            runtime_heartbeat.register_child(
-                parent_agent, "subagent", dispatch["delegation_id"]
-            )
             n = len(_goals)
             note = (
                 "Subagent is running in the background. You and the user can "

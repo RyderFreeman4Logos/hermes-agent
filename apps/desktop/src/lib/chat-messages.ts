@@ -993,6 +993,16 @@ export function toChatMessages(messages: SessionMessage[]): ChatMessage[] {
     }
 
     const content = message.content || message.text || message.context || message.name
+    const hasReasoning = Boolean(message.reasoning || message.reasoning_content || message.reasoning_details)
+
+    if (
+      message.role === 'assistant' &&
+      content === '[response interrupted]' &&
+      !hasReasoning &&
+      !message.tool_calls?.length
+    ) {
+      return
+    }
 
     const rawDisplayContent = transcriptContent(
       message.display_kind,

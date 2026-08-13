@@ -42,6 +42,29 @@ describe('toChatMessages', () => {
     expect((toolPart as { args: { command?: string } }).args.command).toBe(longCommand)
   })
 
+  it('hides a pure interrupted-response placeholder while preserving payload-bearing turns', () => {
+    const placeholder = '[response interrupted]'
+
+    const messages = toChatMessages([
+      { role: 'assistant', content: placeholder, timestamp: 1 },
+      { role: 'user', content: placeholder, timestamp: 2 },
+      { role: 'assistant', content: placeholder, reasoning: 'partial thought', timestamp: 3 },
+      {
+        role: 'assistant',
+        content: placeholder,
+        timestamp: 4,
+        tool_calls: [{ id: 'tc', function: { name: 'terminal', arguments: '{}' } }]
+      }
+    ])
+
+    expect(messages.map(message => [message.role, chatMessageText(message)])).toEqual([
+      ['user', placeholder],
+      ['assistant', `${placeholder}${placeholder}`]
+    ])
+    expect(messages[1].parts.map(part => part.type)).toContain('reasoning')
+    expect(messages[1].parts.map(part => part.type)).toContain('tool-call')
+  })
+
   it('keeps a turn with interleaved tool-only rows in a single bubble', () => {
     const messages = toChatMessages([
       { role: 'assistant', content: 'Planning.', timestamp: 1 },

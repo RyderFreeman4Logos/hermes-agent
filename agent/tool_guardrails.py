@@ -64,9 +64,8 @@ MUTATING_TOOL_NAMES = frozenset(
 class ToolCallGuardrailConfig:
     """Thresholds for per-turn tool-call loop detection.
 
-    Warnings are enabled by default and never prevent tool execution. Hard stops
-    are explicit opt-in so interactive CLI/TUI sessions get a gentle nudge unless
-    the user enables circuit-breaker behavior in config.yaml.
+    Warnings are enabled by default and never prevent tool execution. Configured
+    hard stops are opt-in; the deterministic identical-result ceiling is always on.
     """
 
     warnings_enabled: bool = True
@@ -134,6 +133,8 @@ class ToolCallGuardrailConfig:
 # pathological, so the defaults are deliberately low.
 _DEFAULT_MAX_WEB_SEARCHES_PER_TURN = 50
 _DEFAULT_MAX_SUBAGENTS_PER_TURN = 50
+# Always-on deterministic loop breaker; configurable stops remain separate.
+NO_PROGRESS_LOOP_HALT_AFTER = 5
 
 
 @dataclass(frozen=True)
@@ -235,7 +236,7 @@ def canonical_tool_args(args: Mapping[str, Any]) -> str:
     )
 
 
-def classify_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str]:
+def classify_tool_failure(tool_name: str, result: Any) -> tuple[bool, str]:
     """Safety-fallback classifier used only when callers don't pass ``failed``.
 
     Mirrors ``agent.display._detect_tool_failure`` exactly so the guardrail
@@ -244,7 +245,7 @@ def classify_tool_failure(tool_name: str, result: str | None) -> tuple[bool, str
     from ``_detect_tool_failure``; this function exists so standalone callers
     (tests, tooling) still get consistent behavior.
     """
-    if result is None:
+    if not isinstance(result, str):
         return False, ""
     if file_mutation_result_landed(tool_name, result):
         return False, ""
@@ -281,6 +282,7 @@ class ToolCallGuardrailController:
         self._exact_failure_counts: dict[ToolCallSignature, int] = {}
         self._same_tool_failure_counts: dict[str, int] = {}
         self._no_progress: dict[ToolCallSignature, tuple[str, int]] = {}
+        self._last_observation: tuple[ToolCallSignature, str, bool, int] | None = None
         self._halt_decision: ToolGuardrailDecision | None = None
         # Per-turn runaway-loop cap counters. Reset every turn (this method
         # runs at the start of each run_conversation), so the caps bound a
@@ -292,8 +294,25 @@ class ToolCallGuardrailController:
     def halt_decision(self) -> ToolGuardrailDecision | None:
         return self._halt_decision
 
+    def break_observation_streak(self) -> None:
+        """Make a synthetic result interrupt consecutive real observations."""
+        self._last_observation = None
+
     def before_call(self, tool_name: str, args: Mapping[str, Any] | None) -> ToolGuardrailDecision:
         signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
+        if (
+            self._halt_decision is not None
+            and self._halt_decision.code == "no_progress_loop"
+        ):
+            halted = self._halt_decision
+            return ToolGuardrailDecision(
+                action="block",
+                code="guardrail_turn_halted",
+                message=f"Skipped {tool_name}: this turn already halted after {halted.code}.",
+                tool_name=tool_name,
+                count=halted.count,
+                signature=signature,
+            )
 
         # ── Per-turn runaway-loop caps ──────────────────────────────────
         # These are hard ceilings on how many times a runaway-prone tool may
@@ -351,7 +370,7 @@ class ToolCallGuardrailController:
         self,
         tool_name: str,
         args: Mapping[str, Any] | None,
-        result: str | None,
+        result: Any,
         *,
         failed: bool | None = None,
     ) -> ToolGuardrailDecision:
@@ -359,6 +378,40 @@ class ToolCallGuardrailController:
         signature = ToolCallSignature.from_call(tool_name, args)
         if failed is None:
             failed, _ = classify_tool_failure(tool_name, result)
+
+        result_hash = None
+        if isinstance(result, str) and (failed or self._is_idempotent(tool_name)):
+            result_hash = _result_hash(result)
+            previous = self._last_observation
+            repeat_count = (
+                previous[3] + 1
+                if previous is not None
+                and previous[0] == signature
+                and previous[1] == result_hash
+                and previous[2] is failed
+                else 1
+            )
+            self._last_observation = (signature, result_hash, failed, repeat_count)
+            if repeat_count == 1:
+                self._no_progress.clear()
+            if repeat_count >= NO_PROGRESS_LOOP_HALT_AFTER:
+                decision = ToolGuardrailDecision(
+                    action="halt",
+                    code="no_progress_loop",
+                    message=(
+                        f"Stopped {tool_name}: the same tool call returned an equivalent "
+                        f"result {repeat_count} consecutive times in this turn."
+                    ),
+                    tool_name=tool_name,
+                    count=repeat_count,
+                    signature=signature,
+                )
+                self._halt_decision = decision
+                return decision
+        else:
+            # ponytail: fail open until provider-specific structured results
+            # have one canonical, agent-visible representation to compare.
+            self._last_observation = None
 
         if failed:
             exact_count = self._exact_failure_counts.get(signature, 0) + 1
@@ -416,7 +469,9 @@ class ToolCallGuardrailController:
             self._no_progress.pop(signature, None)
             return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
 
-        result_hash = _result_hash(result)
+        if result_hash is None:
+            self._no_progress.pop(signature, None)
+            return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
         previous = self._no_progress.get(signature)
         repeat_count = 1
         if previous is not None and previous[0] == result_hash:

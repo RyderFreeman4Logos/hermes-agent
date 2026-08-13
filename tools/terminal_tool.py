@@ -3026,10 +3026,6 @@ def terminal_tool(
                         session_key=session_key,
                     )
 
-                from tools.runtime_heartbeat import runtime_heartbeat
-
-                runtime_heartbeat.register_current_child("process", proc_session.id)
-
                 result_data = {
                     "output": "Background process started",
                     "session_id": proc_session.id,

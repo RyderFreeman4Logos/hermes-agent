@@ -834,8 +834,6 @@ _CODEX_INCOMPLETE_NUDGE = (
     "Produce your final answer as plain text now (or make the tool call "
     "you were planning).]"
 )
-# The retry counter includes the initial incomplete response, not just follow-ups.
-_CODEX_INCOMPLETE_CONTINUATION_LIMIT = 3
 
 
 # Re-prompt sent after a Codex/Responses turn ends with an acknowledgment-only
@@ -6619,7 +6617,7 @@ def run_conversation(
                         messages.append(interim_msg)
                         agent._emit_interim_assistant_message(interim_msg)
 
-                if agent._codex_incomplete_retries <= _CODEX_INCOMPLETE_CONTINUATION_LIMIT:
+                if agent._codex_incomplete_retries < 3:
                     # When the interim message has nothing the Responses
                     # input converter will replay (no visible content, no
                     # encrypted reasoning items, no replayable message
@@ -6659,7 +6657,7 @@ def run_conversation(
                                 "content": _CODEX_INCOMPLETE_NUDGE,
                             })
                     if not agent.quiet_mode:
-                        agent._vprint(f"{agent.log_prefix}↻ Codex response incomplete; continuing turn ({agent._codex_incomplete_retries}/{_CODEX_INCOMPLETE_CONTINUATION_LIMIT})")
+                        agent._vprint(f"{agent.log_prefix}↻ Codex response incomplete; continuing turn ({agent._codex_incomplete_retries}/3)")
                     # Surface the continuation on the live spinner/status line
                     # (CLI/TUI/Desktop) and gateway heartbeat: each of these
                     # retries can spend minutes waiting on the provider, and
@@ -6668,25 +6666,20 @@ def run_conversation(
                     agent._emit_wait_notice(
                         f"↻ model returned reasoning with no final answer — "
                         f"asking it to continue "
-                        f"({agent._codex_incomplete_retries}/{_CODEX_INCOMPLETE_CONTINUATION_LIMIT})"
+                        f"({agent._codex_incomplete_retries}/3)"
                     )
                     agent._session_messages = messages
                     continue
 
-                continuation_attempts = agent._codex_incomplete_retries - 1
-                continuation_error = (
-                    f"Codex response remained incomplete after "
-                    f"{continuation_attempts} continuation attempts"
-                )
                 agent._codex_incomplete_retries = 0
                 agent._persist_session(messages, conversation_history)
                 return {
-                    "final_response": continuation_error,
+                    "final_response": "Codex response remained incomplete after 3 continuation attempts",
                     "messages": messages,
                     "api_calls": api_call_count,
                     "completed": False,
                     "partial": True,
-                    "error": continuation_error,
+                    "error": "Codex response remained incomplete after 3 continuation attempts",
                 }
             elif hasattr(agent, "_codex_incomplete_retries"):
                 agent._codex_incomplete_retries = 0

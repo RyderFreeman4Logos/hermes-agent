@@ -6,6 +6,7 @@ import type { GatewayClient } from '../gatewayClient.js'
 import type { ConfigFullResponse, ConfigMtimeResponse, ReloadMcpResponse } from '../gatewayTypes.js'
 import { DEFAULT_VOICE_RECORD_KEY, type ParsedVoiceRecordKey, parseVoiceRecordKey } from '../lib/platform.js'
 import { asRpcResult } from '../lib/rpc.js'
+import { normalizeStatusBarSegments as normalizeSegments } from '../lib/statusBar.js'
 
 import { applyConfiguredTuiTheme } from './createGatewayEventHandler.js'
 import {
@@ -27,6 +28,8 @@ const STATUSBAR_ALIAS: Record<string, StatusBarMode> = {
 
 export const normalizeStatusBar = (raw: unknown): StatusBarMode =>
   raw === false ? 'off' : typeof raw === 'string' ? (STATUSBAR_ALIAS[raw.trim().toLowerCase()] ?? 'top') : 'top'
+
+export const normalizeStatusBarSegments = normalizeSegments
 
 const BUSY_MODES = new Set<BusyInputMode>(['interrupt', 'queue', 'steer'])
 
@@ -284,6 +287,7 @@ export const applyDisplay = (
     sections: resolveSections(d.sections),
     showReasoning: !!d.show_reasoning,
     statusBar: normalizeStatusBar(d.tui_statusbar),
+    statusBarSegments: normalizeStatusBarSegments(d.tui_statusbar_segments),
     streaming: d.streaming !== false
   })
 }

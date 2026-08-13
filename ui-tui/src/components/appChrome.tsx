@@ -3,7 +3,7 @@ import { useStore } from '@nanostores/react'
 import { type ReactNode, type RefObject, useEffect, useMemo, useRef, useState } from 'react'
 import unicodeSpinners from 'unicode-animations'
 
-import { $delegationState } from '../app/delegationStore.js'
+import { $delegationState, type DelegationState } from '../app/delegationStore.js'
 import type { BatteryInfo, IndicatorStyle, Notice } from '../app/interfaces.js'
 import { $isStatusRuleOccluded } from '../app/overlayStore.js'
 import { useTurnSelector } from '../app/turnStore.js'
@@ -12,11 +12,12 @@ import { FACES } from '../content/faces.js'
 import { VERBS } from '../content/verbs.js'
 import { fmtDuration } from '../domain/messages.js'
 import { stickyPromptFromViewport } from '../domain/viewport.js'
+import { DEFAULT_STATUS_BAR_SEGMENTS, packStatusRows, type StatusBarSegment } from '../lib/statusBar.js'
 import { buildSubagentTree, treeTotals, widthByDepth } from '../lib/subagentTree.js'
 import { fmtK } from '../lib/text.js'
 import { useScrollbarSnapshot, useViewportSnapshot } from '../lib/viewportStore.js'
 import type { Theme } from '../theme.js'
-import type { Msg, Usage } from '../types.js'
+import type { Msg, RuntimeHeartbeatStatus, SubagentProgress, Usage } from '../types.js'
 
 import { scrollbarColors } from './overlayPrimitives.js'
 
@@ -312,17 +313,14 @@ export function statusBarSegments(cols: number): StatusBarSegments {
   }
 }
 
-function SpawnHud({ t }: { t: Theme }) {
+function spawnHudLabel(delegation: DelegationState, subagents: readonly SubagentProgress[]) {
   // Tight HUD that only appears when the session is actually fanning out.
   // Colour escalates to warn/error as depth or concurrency approaches the cap.
-  const delegation = useStore($delegationState)
-  const subagents = useTurnSelector(state => state.subagents)
-
-  const tree = useMemo(() => buildSubagentTree(subagents), [subagents])
-  const totals = useMemo(() => treeTotals(tree), [tree])
+  const tree = buildSubagentTree(subagents)
+  const totals = treeTotals(tree)
 
   if (!totals.descendantCount && !delegation.paused) {
-    return null
+    return { atCap: false, label: '', ratio: 0 }
   }
 
   const maxDepth = delegation.maxSpawnDepth
@@ -339,8 +337,6 @@ function SpawnHud({ t }: { t: Theme }) {
   const depthRatio = maxDepth ? depth / maxDepth : 0
   const concRatio = maxConc ? widestLevel / maxConc : 0
   const ratio = Math.max(depthRatio, concRatio)
-
-  const color = delegation.paused || ratio >= 1 ? t.color.error : ratio >= 0.66 ? t.color.warn : t.color.muted
 
   const pieces: string[] = []
 
@@ -363,13 +359,91 @@ function SpawnHud({ t }: { t: Theme }) {
     }
   }
 
-  const atCap = depthRatio >= 1 || concRatio >= 1
+  return { atCap: depthRatio >= 1 || concRatio >= 1, label: pieces.join(' '), ratio }
+}
+
+function SpawnHud({ t }: { t: Theme }) {
+  const delegation = useStore($delegationState)
+  const subagents = useTurnSelector(state => state.subagents)
+  const { atCap, label, ratio } = useMemo(() => spawnHudLabel(delegation, subagents), [delegation, subagents])
+
+  if (!label) {
+    return null
+  }
 
   return (
-    <Text color={color}>
+    <Text color={delegation.paused || ratio >= 1 ? t.color.error : ratio >= 0.66 ? t.color.warn : t.color.muted}>
       {atCap ? ' │ ⚠ ' : ' │ '}
-      {pieces.join(' ')}
+      {label}
     </Text>
+  )
+}
+
+interface StatusRenderItem {
+  breakBefore?: boolean
+  id: string
+  node: ReactNode
+  width: number
+}
+
+function StatusRows({
+  cols,
+  items,
+  multiline,
+  showSpawnHud,
+  t
+}: {
+  cols: number
+  items: readonly StatusRenderItem[]
+  multiline: boolean
+  showSpawnHud: boolean
+  t: Theme
+}) {
+  const delegation = useStore($delegationState)
+  const subagents = useTurnSelector(state => state.subagents)
+  const spawnHud = useMemo(() => spawnHudLabel(delegation, subagents), [delegation, subagents])
+  const visibleItems = [...items]
+
+  if (showSpawnHud && spawnHud.label) {
+    visibleItems.push({
+      id: 'spawn_hud',
+      node: (
+        <Text
+          color={
+            delegation.paused || spawnHud.ratio >= 1
+              ? t.color.error
+              : spawnHud.ratio >= 0.66
+                ? t.color.warn
+                : t.color.muted
+          }
+        >
+          {spawnHud.atCap ? `⚠ ${spawnHud.label}` : spawnHud.label}
+        </Text>
+      ),
+      width: stringWidth(`${spawnHud.atCap ? '⚠ ' : ''}${spawnHud.label}`)
+    })
+  }
+
+  if (!visibleItems.length) {
+    return null
+  }
+
+  const rows = multiline ? packStatusRows(visibleItems, cols, stringWidth(' │ '), stringWidth('─ ')) : [visibleItems]
+
+  return (
+    <Box flexDirection="column" flexShrink={0} width={Math.max(1, Math.floor(cols || 1))}>
+      {rows.map((row, rowIndex) => (
+        <Box flexDirection="row" flexShrink={0} height={1} key={row.map(item => item.id).join(':')} overflow="hidden">
+          {rowIndex === 0 ? <Text color={t.color.border}>─ </Text> : null}
+          {row.map((item, itemIndex) => (
+            <Box flexDirection="row" flexShrink={0} key={item.id}>
+              {itemIndex ? <Text color={t.color.muted}> │ </Text> : null}
+              {item.node}
+            </Box>
+          ))}
+        </Box>
+      ))}
+    </Box>
   )
 }
 
@@ -391,7 +465,7 @@ function SessionDuration({ startedAt }: { startedAt: number }) {
     return () => clearInterval(id)
   }, [isOccluded, startedAt])
 
-  return fmtDuration(now - startedAt)
+  return <Text>{fmtDuration(now - startedAt)}</Text>
 }
 
 function IdleSince({ endedAt }: { endedAt: number }) {
@@ -414,7 +488,7 @@ function IdleSince({ endedAt }: { endedAt: number }) {
     return () => clearInterval(id)
   }, [endedAt, isOccluded])
 
-  return `✓ ${fmtDuration(now - endedAt)}`
+  return <Text>{`✓ ${fmtDuration(now - endedAt)}`}</Text>
 }
 
 const effortLabel = (effort?: string) => {
@@ -470,6 +544,7 @@ export function StatusRule({
   cols,
   busy,
   status,
+  statusBarSegments: configuredSegments = DEFAULT_STATUS_BAR_SEGMENTS,
   statusColor,
   model,
   modelFast,
@@ -487,33 +562,46 @@ export function StatusRule({
   onSessionCountClick,
   t
 }: StatusRuleProps) {
+  const enabled = new Set(configuredSegments)
+
+  if (!enabled.size) {
+    return null
+  }
+
+  const shows = (segment: StatusBarSegment) => enabled.has(segment)
+  const customSegments = enabled.size !== DEFAULT_STATUS_BAR_SEGMENTS.length
   const pct = usage.context_percent
   const barColor = ctxBarColor(pct, t)
   const segs = statusBarSegments(cols)
 
   // On narrow terminals the context read-out collapses to a bare token count
   // (`12k tok`) and the visual fill bar is dropped entirely.
-  const ctxLabel = usage.context_max
-    ? segs.compactCtx
-      ? `${fmtK(usage.context_used ?? 0)} tok`
-      : `${fmtK(usage.context_used ?? 0)}/${fmtK(usage.context_max)}`
-    : usage.total > 0
-      ? `${fmtK(usage.total)} tok`
-      : ''
+  const ctxLabel =
+    shows('context_tokens') && usage.context_max
+      ? segs.compactCtx
+        ? `${fmtK(usage.context_used ?? 0)} tok`
+        : `${fmtK(usage.context_used ?? 0)}/${fmtK(usage.context_max)}`
+      : shows('context_tokens') && usage.total > 0
+        ? `${fmtK(usage.total)} tok`
+        : ''
 
-  const bar = !segs.compactCtx && usage.context_max ? ctxBar(pct) : ''
+  const configuredBar = shows('context_bar') && usage.context_max ? ctxBar(pct) : ''
+  const configuredPercent = shows('context_percent') && pct != null ? `${pct}%` : ''
+  const bar = !segs.compactCtx ? configuredBar : ''
+  const contextPercentText = !segs.compactCtx ? configuredPercent : ''
   const modelText = modelLabel(model, modelReasoningEffort, modelFast)
+  const showModel = shows('model') && !!modelText
 
   // Battery read-out — the first (pinned) status-bar element when enabled.
-  const showBattery = !!battery && battery.available && battery.percent != null
+  const showBattery = shows('battery') && !!battery && battery.available && battery.percent != null
   const batteryText = showBattery ? batteryLabel(battery!) : ''
   const batteryColorVal = showBattery ? batteryColor(battery!, t) : ''
-  const batteryWidth = showBattery ? stringWidth(`${batteryText} │ `) : 0
 
   // A credits notice replaces the status/verb slot, but only when idle —
   // while busy the FaceTicker always wins (R1 render priority). The notice
   // text carries its own glyph; we only tint it (R1) and let it shrink (R3-M7).
-  const showNotice = !busy && !!notice?.text
+  const showIndicator = shows('indicator') && (busy || !!notice?.text || !!status)
+  const showNotice = showIndicator && !busy && !!notice?.text
   // The notice slot is shrinkable (flexShrink={1}, truncate-end), so reserve
   // only a small bounded width for it in the essentials budget — enough that
   // a short notice never gets crushed, but a long one ellipsizes instead of
@@ -527,22 +615,28 @@ export function StatusRule({
   // yields first. The busy face width depends on the active /indicator style
   // (kaomoji is wide + verb; unicode is a bare 1-col spinner). When a notice
   // occupies the slot it reserves only `noticeReserve` (it shrinks/truncates).
-  const slotWidth = busy
-    ? busyIndicatorWidth(indicatorStyle, turnStartedAt != null)
-    : showNotice
-      ? noticeReserve
-      : stringWidth(status)
+  const slotWidth = showIndicator
+    ? busy
+      ? busyIndicatorWidth(indicatorStyle, turnStartedAt != null)
+      : showNotice
+        ? noticeReserve
+        : stringWidth(status)
+    : 0
 
   const essentialWidth =
     stringWidth('─ ') +
-    batteryWidth +
-    slotWidth +
-    stringWidth(' │ ') +
-    stringWidth(modelText) +
-    (ctxLabel ? stringWidth(' │ ') + stringWidth(ctxLabel) : 0)
+    [
+      showBattery ? stringWidth(batteryText) : 0,
+      slotWidth,
+      showModel ? stringWidth(modelText) : 0,
+      stringWidth(ctxLabel)
+    ]
+      .filter(Boolean)
+      .reduce((total, width, index) => total + width + (index ? stringWidth(' │ ') : 0), 0)
 
   const rightLabel = sessionTitle ? ` ${sessionTitle} ` : cwdLabel
-  const { leftWidth, rightWidth, separatorWidth } = statusRuleWidths(cols, rightLabel, essentialWidth)
+  const visibleCwdLabel = shows('cwd') ? rightLabel : ''
+  const { leftWidth, rightWidth, separatorWidth } = statusRuleWidths(cols, visibleCwdLabel, essentialWidth)
 
   // Whole-segment progressive disclosure for the tail: a segment renders only
   // if it fits in the space left after the pinned essentials, evaluated in
@@ -574,21 +668,48 @@ export function StatusRule({
       ? `Δ ${(usage.dev_credits_spent_micros / 10000).toFixed(1)}¢`
       : ''
 
-  const showBar = !!bar && fits(SEP + stringWidth(`[${bar}] ${pct != null ? `${pct}%` : ''}`))
-  const showDuration = segs.duration && !!sessionStartedAt && fits(SEP + MAX_DURATION_WIDTH)
+  const contextMeterText = [bar ? `[${bar}]` : '', contextPercentText].filter(Boolean).join(' ')
+  const showBar = !!contextMeterText && fits(SEP + stringWidth(contextMeterText))
+
+  const showDuration =
+    shows('session_duration') &&
+    (customSegments || segs.duration) &&
+    !!sessionStartedAt &&
+    fits(SEP + MAX_DURATION_WIDTH)
 
   // Idle clock — time since the last final agent response. Hidden while busy
   // (the FaceTicker's elapsed tail covers the live turn) and before the first
   // turn completes. Shares the duration breakpoint and width reservation.
   const showIdle =
-    segs.duration && !busy && lastTurnEndedAt != null && fits(SEP + stringWidth('✓ ') + MAX_DURATION_WIDTH)
+    shows('idle') &&
+    (customSegments || segs.duration) &&
+    !busy &&
+    lastTurnEndedAt != null &&
+    fits(SEP + stringWidth('✓ ') + MAX_DURATION_WIDTH)
 
-  const showCompressions = segs.compressions && compressions > 0 && fits(SEP + stringWidth(`cmp ${compressions}`))
-  const showVoice = segs.voice && !!voiceLabel && fits(SEP + stringWidth(voiceLabel))
-  const showSessionCount = !!sessionCountText && fits(SEP + stringWidth(sessionCountText))
-  const showBg = segs.bg && bgCount > 0 && fits(SEP + stringWidth(`${bgCount} bg`))
+  const showHeartbeat = shows('heartbeat') && !!heartbeatText && fits(SEP + stringWidth(heartbeatText))
+
+  const showCompressions =
+    shows('compressions') &&
+    (customSegments || segs.compressions) &&
+    compressions > 0 &&
+    fits(SEP + stringWidth(`cmp ${compressions}`))
+
+  const showVoice =
+    shows('voice') && (customSegments || segs.voice) && !!voiceLabel && fits(SEP + stringWidth(voiceLabel))
+
+  const showSessionCount = shows('sessions') && !!sessionCountText && fits(SEP + stringWidth(sessionCountText))
+
+  const showBg =
+    shows('bg_tasks') && (customSegments || segs.bg) && bgCount > 0 && fits(SEP + stringWidth(`${bgCount} bg`))
+
   const subagentCount = typeof usage.active_subagents === 'number' ? usage.active_subagents : 0
-  const showSubagents = segs.subagents && subagentCount > 0 && fits(SEP + stringWidth(`⛓ ${subagentCount}`))
+
+  const showSubagents =
+    shows('subagents') &&
+    (customSegments || segs.subagents) &&
+    subagentCount > 0 &&
+    fits(SEP + stringWidth(`⛓ ${subagentCount}`))
 
   // Parked-background reassurance: a top-level delegate_task runs in the
   // background, so the turn ends (idle) while the subagent keeps working and its
@@ -599,15 +720,15 @@ export function StatusRule({
   const resumeHintText =
     subagentCount === 1 ? '↩ resumes when subagent finishes' : `↩ resumes when ${subagentCount} subagents finish`
 
-  const showResumeHint = !busy && subagentCount > 0 && fits(SEP + stringWidth(resumeHintText))
+  const showResumeHint = shows('resume') && !busy && subagentCount > 0 && fits(SEP + stringWidth(resumeHintText))
   // Dev-gated readout (HERMES_DEV_CREDITS), lowest priority,
   // so it consumes tail budget LAST and drops first on a narrow terminal.
-  const showDevCredits = !!devCreditsText && fits(SEP + stringWidth(devCreditsText))
+  const showDevCredits = shows('dev_credits') && !!devCreditsText && fits(SEP + stringWidth(devCreditsText))
 
   // Focus-view badge. Pinned (not tail-budgeted) on purpose: the whole point of
   // the indicator is that the user can never be in reduced-output mode without
   // seeing it, so it must not drop off a narrow terminal.
-  const showFocus = !!focusView
+  const showFocus = shows('focus') && !!focusView
 
   const handleSessionCountClick = (event: { stopImmediatePropagation?: () => void }) => {
     event.stopImmediatePropagation?.()
@@ -616,11 +737,178 @@ export function StatusRule({
 
   const sessionCountNode = onSessionCountClick ? (
     <Box flexShrink={0} onClick={handleSessionCountClick}>
+      <Text color={t.color.accent}>{sessionCountText}</Text>
+    </Box>
+  ) : (
+    <Text color={t.color.muted}>{sessionCountText}</Text>
+  )
+
+  const wideSessionCountNode = onSessionCountClick ? (
+    <Box flexShrink={0} onClick={handleSessionCountClick}>
       <Text color={t.color.accent}> │ {sessionCountText}</Text>
     </Box>
   ) : (
     <Text color={t.color.muted}> │ {sessionCountText}</Text>
   )
+
+  if (cols < 72 || customSegments) {
+    const keepAll = cols < 72
+    const configuredMeterText = [configuredBar ? `[${configuredBar}]` : '', configuredPercent].filter(Boolean).join(' ')
+
+    const items = [
+      showBattery
+        ? { id: 'battery', node: <Text color={batteryColorVal}>{batteryText}</Text>, width: stringWidth(batteryText) }
+        : null,
+      showIndicator
+        ? {
+            id: 'indicator',
+            node: busy ? (
+              <FaceTicker color={statusColor} startedAt={turnStartedAt} style={indicatorStyle} />
+            ) : showNotice ? (
+              <Text color={noticeColor(notice!.level, t)} wrap="truncate-end">
+                {notice!.text}
+              </Text>
+            ) : (
+              <Text color={statusColor} wrap="truncate-end">
+                {status}
+              </Text>
+            ),
+            width: slotWidth
+          }
+        : null,
+      showModel
+        ? {
+            breakBefore: cols < 72,
+            id: 'model',
+            node: <Text color={t.color.muted}>{modelText}</Text>,
+            width: stringWidth(modelText)
+          }
+        : null,
+      ctxLabel
+        ? { id: 'context_tokens', node: <Text color={t.color.muted}>{ctxLabel}</Text>, width: stringWidth(ctxLabel) }
+        : null,
+      DEV_CREDITS_MODE && shows('dev_credits')
+        ? {
+            id: 'dev_banner',
+            node: <Text color={t.color.warn}>(dev credits)</Text>,
+            width: stringWidth('(dev credits)')
+          }
+        : null,
+      showFocus
+        ? { id: 'focus', node: <Text color={t.color.warn}>◉ focus</Text>, width: stringWidth('◉ focus') }
+        : null,
+      (keepAll ? shows('heartbeat') && !!heartbeatText : showHeartbeat)
+        ? {
+            id: 'heartbeat',
+            node: (
+              <Text color={t.color.muted}>
+                <RuntimeHeartbeatCheckin heartbeat={usage.runtime_heartbeat!} />
+              </Text>
+            ),
+            width: stringWidth(heartbeatText)
+          }
+        : null,
+      (keepAll ? !!configuredMeterText : showBar)
+        ? {
+            id: 'context_meter',
+            node: <Text color={barColor}>{configuredMeterText}</Text>,
+            width: stringWidth(configuredMeterText)
+          }
+        : null,
+      (keepAll ? shows('session_duration') && !!sessionStartedAt : showDuration)
+        ? { id: 'session_duration', node: <SessionDuration startedAt={sessionStartedAt!} />, width: MAX_DURATION_WIDTH }
+        : null,
+      (keepAll ? shows('idle') && !busy && lastTurnEndedAt != null : showIdle)
+        ? { id: 'idle', node: <IdleSince endedAt={lastTurnEndedAt!} />, width: stringWidth('✓ ') + MAX_DURATION_WIDTH }
+        : null,
+      (keepAll ? shows('compressions') && compressions > 0 : showCompressions)
+        ? {
+            id: 'compressions',
+            node: (
+              <Text color={compressions >= 10 ? t.color.error : compressions >= 5 ? t.color.warn : t.color.muted}>
+                cmp {compressions}
+              </Text>
+            ),
+            width: stringWidth(`cmp ${compressions}`)
+          }
+        : null,
+      (keepAll ? shows('voice') && !!voiceLabel : showVoice)
+        ? { id: 'voice', node: <Text color={t.color.muted}>{voiceLabel}</Text>, width: stringWidth(voiceLabel!) }
+        : null,
+      (keepAll ? shows('sessions') && !!sessionCountText : showSessionCount)
+        ? { id: 'sessions', node: sessionCountNode, width: stringWidth(sessionCountText) }
+        : null,
+      (keepAll ? shows('bg_tasks') && bgCount > 0 : showBg)
+        ? { id: 'bg_tasks', node: <Text color={t.color.muted}>{bgCount} bg</Text>, width: stringWidth(`${bgCount} bg`) }
+        : null,
+      (keepAll ? shows('subagents') && subagentCount > 0 : showSubagents)
+        ? {
+            id: 'subagents',
+            node: <Text color={t.color.muted}>⛓ {subagentCount}</Text>,
+            width: stringWidth(`⛓ ${subagentCount}`)
+          }
+        : null,
+      (keepAll ? shows('resume') && !busy && subagentCount > 0 : showResumeHint)
+        ? {
+            id: 'resume',
+            node: (
+              <Text color={t.color.muted} dim>
+                {resumeHintText}
+              </Text>
+            ),
+            width: stringWidth(resumeHintText)
+          }
+        : null,
+      (keepAll ? shows('dev_credits') && !!devCreditsText : showDevCredits)
+        ? {
+            id: 'dev_credits',
+            node: <Text color={t.color.accent}>{devCreditsText}</Text>,
+            width: stringWidth(devCreditsText)
+          }
+        : null,
+      visibleCwdLabel && (keepAll || rightWidth > 0)
+        ? {
+            id: 'cwd',
+            node: keepAll ? (
+              <Text color={t.color.label}>{visibleCwdLabel}</Text>
+            ) : (
+              <Box width={rightWidth}>
+                <Text color={t.color.label} wrap="truncate-end">
+                  {visibleCwdLabel}
+                </Text>
+              </Box>
+            ),
+            width: keepAll ? stringWidth(visibleCwdLabel) : rightWidth
+          }
+        : null
+    ].filter((item): item is NonNullable<typeof item> => item !== null)
+
+    return <StatusRows cols={cols} items={items} multiline={cols < 72} showSpawnHud={shows('spawn_hud')} t={t} />
+  }
+
+  const hasWideContent =
+    showBattery ||
+    showIndicator ||
+    (DEV_CREDITS_MODE && shows('dev_credits')) ||
+    showModel ||
+    !!ctxLabel ||
+    showFocus ||
+    showHeartbeat ||
+    showBar ||
+    showDuration ||
+    showIdle ||
+    showCompressions ||
+    showVoice ||
+    showSessionCount ||
+    showBg ||
+    showSubagents ||
+    showResumeHint ||
+    showDevCredits ||
+    !!visibleCwdLabel
+
+  if (!hasWideContent) {
+    return <StatusRows cols={cols} items={[]} multiline={false} showSpawnHud={shows('spawn_hud')} t={t} />
+  }
 
   return (
     <Box height={1}>
@@ -637,13 +925,15 @@ export function StatusRule({
               <Text color={t.color.muted}>{' │ '}</Text>
             </Text>
           ) : null}
-          {busy ? (
-            <FaceTicker color={statusColor} startedAt={turnStartedAt} style={indicatorStyle} />
-          ) : showNotice ? null : (
-            <Text color={statusColor} wrap="truncate-end">
-              {status}
-            </Text>
-          )}
+          {showIndicator ? (
+            busy ? (
+              <FaceTicker color={statusColor} startedAt={turnStartedAt} style={indicatorStyle} />
+            ) : showNotice ? null : (
+              <Text color={statusColor} wrap="truncate-end">
+                {status}
+              </Text>
+            )
+          ) : null}
         </Box>
         {/* Notice slot — the only shrinkable left element (R3-M7). Sits in a
             flexShrink={1} box with truncate-end so it yields/ellipsizes
@@ -657,18 +947,20 @@ export function StatusRule({
         ) : null}
         {/* Pinned essentials — model + context never shrink, always visible. */}
         <Box flexDirection="row" flexShrink={0}>
-          {DEV_CREDITS_MODE ? (
+          {DEV_CREDITS_MODE && shows('dev_credits') ? (
             <Text color={t.color.warn} wrap="truncate-end">
               {' (dev credits)'}
             </Text>
           ) : null}
-          <Text color={t.color.muted} wrap="truncate-end">
-            {' │ '}
-            {modelText}
-          </Text>
+          {showModel ? (
+            <Text color={t.color.muted} wrap="truncate-end">
+              {showBattery || showIndicator ? ' │ ' : ''}
+              {modelText}
+            </Text>
+          ) : null}
           {ctxLabel ? (
             <Text color={t.color.muted} wrap="truncate-end">
-              {' │ '}
+              {showBattery || showIndicator || showModel ? ' │ ' : ''}
               {ctxLabel}
             </Text>
           ) : null}
@@ -682,7 +974,7 @@ export function StatusRule({
         {showBar ? (
           <Text color={t.color.muted} wrap="truncate-end">
             {' │ '}
-            <Text color={barColor}>[{bar}]</Text> <Text color={barColor}>{pct != null ? `${pct}%` : ''}</Text>
+            <Text color={barColor}>{contextMeterText}</Text>
           </Text>
         ) : null}
         {showDuration ? (
@@ -716,7 +1008,7 @@ export function StatusRule({
             {voiceLabel}
           </Text>
         ) : null}
-        {showSessionCount ? sessionCountNode : null}
+        {showSessionCount ? wideSessionCountNode : null}
         {showBg ? (
           <Text color={t.color.muted} wrap="truncate-end">
             {' │ '}
@@ -743,7 +1035,7 @@ export function StatusRule({
         {/* SpawnHud isn't part of the tail budget (its width is dynamic), so it
             renders last — any overflow truncates the HUD itself rather than the
             budgeted segments before it. It self-hides when no delegation runs. */}
-        <SpawnHud t={t} />
+        {shows('spawn_hud') ? <SpawnHud t={t} /> : null}
       </Box>
 
       {rightWidth > 0 ? (
@@ -751,7 +1043,8 @@ export function StatusRule({
           <Text color={t.color.border}>{separatorWidth >= 3 ? ' ─ ' : ' '}</Text>
           <Box flexShrink={0} width={rightWidth}>
             <Text bold={!!sessionTitle} color={sessionTitle ? t.color.accent : t.color.label} wrap="truncate-end">
-              {rightLabel}
+              {visibleCwdLabel}
+            </Text>
             </Text>
           </Box>
         </>
@@ -872,6 +1165,7 @@ interface StatusRuleProps {
   sessionStartedAt?: null | number
   sessionTitle?: string
   status: string
+  statusBarSegments?: readonly StatusBarSegment[]
   statusColor: string
   t: Theme
   turnStartedAt?: null | number

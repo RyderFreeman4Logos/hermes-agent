@@ -226,6 +226,23 @@ afterEach(() => {
 })
 
 describe('status-chrome timers under an occluding overlay', () => {
+  it('mounts zero-second configured duration and idle read-outs', async () => {
+    const rule = mount({
+      ...idleProps,
+      lastTurnEndedAt: T0,
+      sessionStartedAt: T0,
+      statusBarSegments: ['session_duration', 'idle']
+    })
+
+    await flush()
+
+    const output = rule.output()
+
+    expect(output).not.toContain('Text string "0s" must be rendered inside <Text> component')
+    expect(output).toContain('0s')
+    expect(output).toContain('✓ 0s')
+  })
+
   it('arms the one-second SessionDuration + IdleSince clocks when nothing covers the rule', () => {
     mount(idleProps)
 
@@ -287,6 +304,7 @@ describe('status-chrome timers under an occluding overlay', () => {
     patchOverlayState({ sessions: true })
 
     const rule = mount(idleProps)
+    await flush()
 
     expect(rule.output()).toContain('1m 0s')
     expect(rule.output()).toContain('✓ 5s')

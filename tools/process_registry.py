@@ -2388,6 +2388,51 @@ class ProcessRegistry:
         """
         return not self.completion_event_should_deliver(evt)
 
+    def get_completion_for_owner(self, owns_event, *, timeout: float | None = None):
+        """Remove the first matching completion without disturbing foreign FIFO."""
+        import queue as queue_mod
+
+        if timeout is not None and timeout < 0:
+            raise ValueError("'timeout' must be a non-negative number")
+        deadline = None if timeout is None else time.monotonic() + timeout
+        completion_queue = self.completion_queue
+        while True:
+            with completion_queue.mutex:
+                snapshot = tuple(completion_queue.queue)
+            candidate = next((evt for evt in snapshot if owns_event(evt)), None)
+            if candidate is not None:
+                with completion_queue.not_empty:
+                    for index, current in enumerate(completion_queue.queue):
+                        if current is candidate:
+                            del completion_queue.queue[index]
+                            completion_queue.not_full.notify()
+                            return candidate
+                continue
+            remaining = None
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise queue_mod.Empty
+            with completion_queue.not_empty:
+                current = tuple(completion_queue.queue)
+                if len(current) != len(snapshot) or any(
+                    left is not right for left, right in zip(current, snapshot)
+                ):
+                    continue
+                completion_queue.not_empty.wait(remaining)
+
+    def requeue_completion_front(self, evt: Dict[str, Any]) -> None:
+        """Return a held completion to its original FIFO boundary."""
+        completion_queue = self.completion_queue
+        with completion_queue.not_full:
+            while (
+                completion_queue.maxsize > 0
+                and len(completion_queue.queue) >= completion_queue.maxsize
+            ):
+                completion_queue.not_full.wait()
+            completion_queue.queue.appendleft(evt)
+            completion_queue.not_empty.notify()
+
     def drain_notifications(
         self,
         session_key: str = "",

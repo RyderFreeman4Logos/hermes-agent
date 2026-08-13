@@ -957,10 +957,11 @@ def _(rid, params: dict) -> dict:
     if name in {"compress", "compact"}:
         if not session:
             return _err(rid, 4001, "no active session to compress")
+        busy_response = _err(
+            rid, 4009, "session busy — /interrupt the current turn before /compress"
+        )
         if session.get("running"):
-            return _err(
-                rid, 4009, "session busy — /interrupt the current turn before /compress"
-            )
+            return busy_response
         from agent.conversation_compression import (
             finalize_context_engine_compression_notification,
         )
@@ -988,6 +989,10 @@ def _(rid, params: dict) -> dict:
                 rid,
                 {"type": "exec", "output": str(ack.get("output") or "")},
             )
+        try:
+            manual_compression_fence = _begin_manual_compression_fence(session)
+        except RuntimeError:
+            return busy_response
         try:
             from agent.manual_compression_feedback import summarize_manual_compression
             from agent.model_metadata import estimate_request_tokens_rough
@@ -1070,6 +1075,8 @@ def _(rid, params: dict) -> dict:
                 committed=False,
             )
             return _err(rid, 5009, f"compress failed: {exc}")
+        finally:
+            _finish_manual_compression_fence(session, manual_compression_fence)
 
     return _err(rid, 4018, f"not a quick/plugin/bundle/skill command: {name}")
 

@@ -53,6 +53,8 @@ from tui_gateway.transport import (
 
 logger = logging.getLogger(__name__)
 
+_NOTIFICATION_REQUEUE_BACKOFF_SECONDS = 0.1
+
 _hermes_home = get_hermes_home()
 load_hermes_dotenv(
     hermes_home=_hermes_home, project_env=Path(__file__).parent.parent / ".env"
@@ -4776,6 +4778,31 @@ class CompressionLockHeld(Exception):
     def __init__(self, holder: str | None = None):
         self.holder = holder
         super().__init__(f"Compression lock held: {holder or 'unknown'}")
+
+
+def _begin_manual_compression_fence(session: dict) -> threading.Event:
+    """Return the generation token that owns this compression boundary."""
+    with session["history_lock"]:
+        if session.get("running") or session.get("_manual_compression_fence") is not None:
+            raise RuntimeError(
+                "session busy — /interrupt the current turn before /compress"
+            )
+        fence = threading.Event()
+        session["_manual_compression_fence"] = fence
+        session["running"] = True
+        return fence
+
+
+def _finish_manual_compression_fence(
+    session: dict, fence: threading.Event | None
+) -> None:
+    """Release only the compression generation represented by ``fence``."""
+    with session["history_lock"]:
+        if fence is None or session.get("_manual_compression_fence") is not fence:
+            return
+        session["running"] = False
+        session.pop("_manual_compression_fence", None)
+    fence.set()
 
 
 def _compress_session_history(
@@ -9514,7 +9541,7 @@ def _collect_idle_completion_batch(
         except Exception:
             break
         if _notification_event_belongs_elsewhere(sid, session, evt):
-            _restore_completion_events(process_registry, [evt])
+            process_registry.requeue_completion_front(evt)
             time.sleep(_NOTIFICATION_REQUEUE_BACKOFF_SECONDS)
             continue
         requires_owner = _notification_event_requires_owner(evt)
@@ -9790,7 +9817,12 @@ def _notification_poller_loop(
                         with session["history_lock"]:
                             session["running"] = False
         try:
-            evt = process_registry.completion_queue.get(timeout=0.5)
+            evt = process_registry.get_completion_for_owner(
+                lambda candidate: not _notification_event_belongs_elsewhere(
+                    sid, session, candidate
+                ),
+                timeout=0.5,
+            )
         except Exception:
             continue
 
@@ -9800,8 +9832,8 @@ def _notification_poller_loop(
         # session's poller happened to wake first (Ben's "reported in a
         # different session" bug). Leave foreign events for their owner.
         if _notification_event_belongs_elsewhere(sid, session, evt):
-            process_registry.completion_queue.put(evt)
-            time.sleep(0.1)
+            process_registry.requeue_completion_front(evt)
+            time.sleep(_NOTIFICATION_REQUEUE_BACKOFF_SECONDS)
             continue
 
         # What reaches here is not owned by another LIVE session. Addressed
@@ -9872,7 +9904,7 @@ def _notification_poller_loop(
         _requeued = False
         with session["history_lock"]:
             if session.get("running"):
-                process_registry.completion_queue.put(evt)
+                process_registry.requeue_completion_front(evt)
                 _requeued = True
             else:
                 session["running"] = True
@@ -13673,6 +13705,13 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
     if name in _MUTATES_WHILE_RUNNING and session.get("running"):
         return f"session busy — /interrupt the current turn before running /{name}"
 
+    manual_compression_fence = None
+    if name == "compress":
+        try:
+            manual_compression_fence = _begin_manual_compression_fence(session)
+        except RuntimeError as exc:
+            return str(exc)
+
     try:
         if name == "model" and arg and agent:
             result = _apply_model_switch(sid, session, arg)
@@ -13780,6 +13819,9 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
                 committed=False,
             )
         return f"live session sync failed: {e}"
+    finally:
+        if manual_compression_fence is not None:
+            _finish_manual_compression_fence(session, manual_compression_fence)
     return ""
 
 

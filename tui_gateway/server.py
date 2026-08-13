@@ -9934,7 +9934,7 @@ def _notification_poller_loop(
 
 
 def _handle_heartbeat_event(sid: str, session: dict, evt: dict) -> None:
-    """Warm ALIVE targets silently; surface unhealthy targets directly."""
+    """Surface unhealthy status and warm targets that remain live."""
     from tools.runtime_heartbeat import runtime_heartbeat
 
     if not runtime_heartbeat.is_event_current(evt):
@@ -9957,8 +9957,9 @@ def _handle_heartbeat_event(sid: str, session: dict, evt: dict) -> None:
         if not runtime_heartbeat.is_event_current(evt):
             return
         _emit("status.update", sid, {"kind": "process", "text": prompt})
-        return
-    if status != "ALIVE":
+        if status == "UNKNOWN":
+            return
+    if status not in {"ALIVE", "STUCK"}:
         return
     with session["history_lock"]:
         if session.get("running"):

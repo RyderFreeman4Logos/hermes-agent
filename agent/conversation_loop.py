@@ -1519,7 +1519,7 @@ def run_heartbeat_warm(
     ):
         return finish(silent=True)
     status = str(heartbeat_event.get("status") or "").upper()
-    if status in {"STUCK", "UNKNOWN"}:
+    if status == "UNKNOWN":
         return finish(
             silent=False,
             status=status,
@@ -1533,7 +1533,7 @@ def run_heartbeat_warm(
     from agent.gemini_native_adapter import GeminiNativeClient
 
     if (
-        status != "ALIVE"
+        status not in {"ALIVE", "STUCK"}
         or moa_config is not None
         or provider in {
             "anthropic",

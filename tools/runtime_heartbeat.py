@@ -942,6 +942,7 @@ class _Target:
     owner_id: int = 0
     warm_capability: str = "degraded"
     warm_reason: str = "owner_unavailable"
+    warm_inflight: bool = False
     generation: int = 0
     timer: Any = None
     deadline: float = 0.0
@@ -1210,7 +1211,7 @@ class RuntimeHeartbeat:
                         self._group_pending[group] = replacement_event
             if target.timer is not None:
                 target.timer.cancel()
-            while target.publishing:
+            while target.publishing or target.warm_inflight:
                 self._publication_done.wait()
         if replacement_event is not None:
             self._queue().put(replacement_event)
@@ -1521,6 +1522,11 @@ class RuntimeHeartbeat:
             )
             return
 
+        with self._lock:
+            if self._targets.get(target.target_id) is not target:
+                return
+            target.warm_inflight = True
+
         def _warm() -> None:
             try:
                 result = owner.run_conversation(
@@ -1531,12 +1537,17 @@ class RuntimeHeartbeat:
             except Exception as exc:
                 status = "degraded"
                 reason = f"owner_dispatch_error:{type(exc).__name__}"
-            self.record_warm_outcome(
-                event,
-                status=status,
-                reason=reason,
-                expected_target=target,
-            )
+            try:
+                self.record_warm_outcome(
+                    event,
+                    status=status,
+                    reason=reason,
+                    expected_target=target,
+                )
+            finally:
+                with self._lock:
+                    target.warm_inflight = False
+                    self._publication_done.notify_all()
 
         try:
             threading.Thread(
@@ -1545,6 +1556,9 @@ class RuntimeHeartbeat:
                 name=f"heartbeat-warm-{target.target_id[:12]}",
             ).start()
         except Exception as exc:
+            with self._lock:
+                target.warm_inflight = False
+                self._publication_done.notify_all()
             event["heartbeat_warm_capability"] = "degraded"
             event["heartbeat_warm_reason"] = (
                 f"owner_dispatch_start_error:{type(exc).__name__}"

@@ -147,12 +147,9 @@ def _content_cache_key(
     sharing a scope, system prompt, and tool set intentionally resolve to the
     same warm prefix bucket.
 
-    ``scope_id`` (pass ``_cache_scope_from_session_id(session_id)``) keeps
-    unrelated sessions — independent conversations, main vs. child/subagent,
-    sibling children — from concentrating onto the same bucket merely because
-    their static prefix matches (see #78941), while still letting recurring
-    cron fires of one job share a stable key across their timestamped
-    session_ids (the original #51395/#52295 fix this built on). Sorting tools
+    ``scope_id`` keeps unrelated conversations from sharing a bucket. Runtime
+    callers pass the logical lineage root; calls without one use the normalized
+    physical session id, including cron's stable per-job scope. Sorting tools
     by name keeps the hash insertion-order independent.
     """
     if not instructions and not tools:
@@ -384,7 +381,15 @@ class ResponsesApiTransport(ProviderTransport):
         # untouched for transcript isolation and the cache-scope routing
         # headers below. Falls back to session_id when there is no static
         # content to hash.
-        _cache_scope = _cache_scope_from_session_id(session_id)
+        _cache_scope = ""
+        try:
+            from agent.auxiliary_client import _runtime_main_value
+
+            _cache_scope = str(_runtime_main_value("cache_scope") or "")
+        except Exception:
+            pass
+        if not _cache_scope:
+            _cache_scope = _cache_scope_from_session_id(session_id)
         cache_key = _content_cache_key(
             instructions, response_tools, _cache_scope
         ) or _cache_scope

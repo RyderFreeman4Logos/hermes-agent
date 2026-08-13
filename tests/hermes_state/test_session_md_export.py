@@ -50,7 +50,6 @@ def test_get_compression_lineage_returns_only_compression_chain(tmp_path):
     finally:
         db.close()
 
-
 def test_fork_children_created_before_continuation_do_not_hijack_lineage(tmp_path):
     # Regression: the forward walk used to accept any non-branch child as the
     # compression continuation. A delegate/tool child spawned BEFORE the real
@@ -92,4 +91,3 @@ def test_fork_children_created_before_continuation_do_not_hijack_lineage(tmp_pat
         assert contents == ["root msg", "continuation msg"]
     finally:
         db.close()
-

@@ -38,6 +38,7 @@ def _attempt_loop(metadata: dict[str, Any] | None) -> tuple[int | None, str]:
 def _record_attempt(
     request: dict[str, Any], *, name: str, model_name: str, metadata: dict[str, Any] | None
 ) -> None:
+    scope = physical_attempt_diagnostics.take_cache_scope(request)
     loop, correlation = _attempt_loop(metadata)
     physical_attempt_diagnostics.start_attempt(
         request,
@@ -48,6 +49,7 @@ def _record_attempt(
         retry=int((metadata or {}).get("retry_count") or 0),
         loop=loop,
         correlation=correlation,
+        scope=scope,
     )
 
 
@@ -67,6 +69,23 @@ async def _execute_attempt_async(
     return await callback(request)
 
 
+def _request_with_cache_scope(request: dict[str, Any], session_id: str) -> dict[str, Any]:
+    """Attach a diagnostic-only cache scope before Relay sees the request."""
+    extra_body = request.get("extra_body")
+    cache_scope = (
+        request.get("prompt_cache_key")
+        if request.get("prompt_cache_key") is not None
+        else extra_body.get("prompt_cache_key")
+        if isinstance(extra_body, dict)
+        else session_id
+    )
+    scope = physical_attempt_diagnostics.prepare_cache_scope(cache_scope)
+    return request if scope is None else {
+        **request,
+        "_hermes_physical_attempt_cache_scope": scope,
+    }
+
+
 def execute(
     request: dict[str, Any],
     callback: Callable[[dict[str, Any]], Any],
@@ -78,6 +97,7 @@ def execute(
     defer_logical_completion: bool = False,
 ) -> Any:
     """Run one non-streaming physical provider attempt through Relay."""
+    request = _request_with_cache_scope(request, session_id)
     runtime, session, parent = relay_runtime.resolve_execution_context(session_id)
     if runtime is None or session is None or not runtime.managed_execution_enabled():
         return _execute_attempt(
@@ -179,6 +199,7 @@ async def execute_async(
     defer_logical_completion: bool = False,
 ) -> Any:
     """Run one asynchronous physical provider attempt through Relay."""
+    request = _request_with_cache_scope(request, session_id)
     runtime, session, parent = relay_runtime.resolve_execution_context(session_id)
     if runtime is None or session is None or not runtime.managed_execution_enabled():
         return await _execute_attempt_async(
@@ -437,6 +458,7 @@ class ManagedLlmStream(Iterator[Any]):
         metadata: dict[str, Any] | None,
         defer_logical_completion: bool,
     ) -> None:
+        request = _request_with_cache_scope(request, session_id)
         self.final_response: Any = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stream: Any = None
@@ -1100,6 +1122,7 @@ def _relay_request_body(
     body = _jsonable(request)
     if not isinstance(body, dict):
         return {}
+    body.pop("_hermes_physical_attempt_cache_scope", None)
     # The Responses SDK accepts ``tools=None`` as "no tools", while Relay's
     # typed Responses codec correctly expects either an array or an absent
     # field. Normalize only the codec-facing copy; the original provider

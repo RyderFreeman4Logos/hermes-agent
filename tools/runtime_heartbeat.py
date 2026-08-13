@@ -100,9 +100,10 @@ def resolve_heartbeat_interval(
     providers = (runtime.get("warm_kv_timeout") or {}).get("providers")
     if not isinstance(providers, dict):
         providers = {}
-    exact = {
-        str(key).strip().lower(): value for key, value in providers.items()
-    }.get(provider_id)
+    normalized = {str(key).strip().lower(): value for key, value in providers.items()}
+    if provider_id == "custom:openai-codex" and provider_id not in normalized:
+        normalized[provider_id] = normalized.get("openai-codex")
+    exact = normalized.get(provider_id)
     if (
         not provider_id
         or not isinstance(exact, int)

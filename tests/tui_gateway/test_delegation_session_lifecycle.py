@@ -69,38 +69,42 @@ class TestSessionOwnsNotificationEvent:
 
 
 class TestInterruptForSession:
-    def _seed_record(self, delegation_id, parent_session_id="", status="running"):
+    def _seed_record(self, delegation_id, session_key="", origin_ui_session_id="", status="running"):
         fn = MagicMock()
         with ad._records_lock:
             ad._records[delegation_id] = {
                 "delegation_id": delegation_id,
                 "status": status,
-                "parent_session_id": parent_session_id,
+                "session_key": session_key,
+                "origin_ui_session_id": origin_ui_session_id,
                 "interrupt_fn": fn,
             }
         return fn
 
-    def test_interrupts_only_matching_parent(self):
-        mine = self._seed_record("d1", parent_session_id="sess_A")
-        other = self._seed_record("d2", parent_session_id="sess_B")
-        n = ad.interrupt_for_session(parent_session_id="sess_A")
+    def test_interrupts_only_matching_session(self):
+        mine = self._seed_record("d1", session_key="sess_A")
+        other = self._seed_record("d2", session_key="sess_B")
+        n = ad.interrupt_for_session(session_key="sess_A")
         assert n == 1
         mine.assert_called_once()
         other.assert_not_called()
 
-    def test_routing_selectors_cannot_interrupt(self):
-        fn = self._seed_record("d1", parent_session_id="parent")
-        assert ad.interrupt_for_session(session_key="shared", origin_ui_session_id="tab1") == 0
-        fn.assert_not_called()
+    def test_matches_by_origin_ui_session_id(self):
+        mine = self._seed_record("d1", origin_ui_session_id="tab1")
+        other = self._seed_record("d2", origin_ui_session_id="tab2")
+        n = ad.interrupt_for_session(origin_ui_session_id="tab1")
+        assert n == 1
+        mine.assert_called_once()
+        other.assert_not_called()
 
     def test_no_selector_is_noop(self):
-        fn = self._seed_record("d1", parent_session_id="sess_A")
+        fn = self._seed_record("d1", session_key="sess_A")
         assert ad.interrupt_for_session() == 0
         fn.assert_not_called()
 
     def test_completed_records_untouched(self):
-        fn = self._seed_record("d1", parent_session_id="sess_A", status="completed")
-        assert ad.interrupt_for_session(parent_session_id="sess_A") == 0
+        fn = self._seed_record("d1", session_key="sess_A", status="completed")
+        assert ad.interrupt_for_session(session_key="sess_A") == 0
         fn.assert_not_called()
 
 
@@ -131,7 +135,8 @@ class TestFinalizeInterruptsOwnDelegations:
 
         mock_int.assert_called_once()
         kwargs = mock_int.call_args.kwargs
-        assert kwargs["parent_session_id"] == "sess_A"
+        assert kwargs["session_key"] == "sess_A"
+        assert kwargs["origin_ui_session_id"] == "tab1"
 
     @patch("tui_gateway.server._get_db")
     def test_viewer_of_gateway_session_only_interrupts_by_origin(self, mock_get_db):
@@ -149,4 +154,5 @@ class TestFinalizeInterruptsOwnDelegations:
             )
 
         kwargs = mock_int.call_args.kwargs
-        assert kwargs["parent_session_id"] == ""
+        assert kwargs["session_key"] == ""
+        assert kwargs["origin_ui_session_id"] == "tab9"

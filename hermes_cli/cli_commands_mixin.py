@@ -490,10 +490,8 @@ class CLICommandsMixin:
 
         # Background (async) delegations — delegate_task(background=true)
         try:
-            from tools.async_delegation import list_async_delegations_for_owner
-            delegations = list_async_delegations_for_owner(
-                parent_session_id=str(getattr(self, "session_id", "") or "")
-            )
+            from tools.async_delegation import list_async_delegations
+            delegations = list_async_delegations()
         except Exception:
             delegations = []
         running_d = [
@@ -503,8 +501,12 @@ class CLICommandsMixin:
         if delegations:
             _cprint(f"  Background delegations: {len(running_d)} running")
             for d in delegations:
+                goal = (d.get("goal") or "")[:60]
                 status = d.get("status", "?")
-                line = f"    {d.get('delegation_id', '?')} · {status}"
+                line = (
+                    f"    {d.get('delegation_id', '?')} · "
+                    f"{status} · {goal}"
+                )
                 # Live-status detail for in-flight delegations (#51690).
                 if status == "stalling":
                     quiet = d.get("stalled_after_quiet_seconds")

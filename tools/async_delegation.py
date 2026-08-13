@@ -788,10 +788,11 @@ def _matches_session_selectors(
     origin_ui_session_id: str = "",
     parent_session_id: str = "",
 ) -> bool:
-    """Authorize lifecycle control only by the spawning parent principal."""
-    del session_key, origin_ui_session_id
-    record_parent = str(record.get("parent_session_id") or "")
-    return bool(parent_session_id and record_parent == str(parent_session_id))
+    return (
+        (origin_ui_session_id and str(record.get("origin_ui_session_id") or "") == origin_ui_session_id)
+        or (session_key and str(record.get("session_key") or "") == session_key)
+        or (parent_session_id and str(record.get("parent_session_id") or "") == parent_session_id)
+    )
 
 
 def has_live_for_session(
@@ -803,7 +804,7 @@ def has_live_for_session(
 
     Live states are defined by ``_ACTIVE_STATUSES``.
     """
-    if not parent_session_id:
+    if not session_key and not origin_ui_session_id and not parent_session_id:
         return False
     with _records_lock:
         return any(
@@ -1012,29 +1013,6 @@ def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
     if claimed is None:
         return
     event_record, _interrupt_fn, on_not_started = claimed
-
-    if event_record.get("_stall_grace_expired"):
-        completed_at = event_record.get("completed_at") or time.time()
-        duration = round(
-            completed_at - (event_record.get("dispatched_at") or completed_at), 2
-        )
-        stall_in_tool = event_record.get("_stall_in_tool")
-        status = "stalled"
-        result = {
-            "status": "stalled",
-            "summary": None,
-            "error": (
-                f"Async delegation {delegation_id} stalled and only returned "
-                "after its interruption grace window expired."
-            ),
-            "api_calls": 0,
-            "duration_seconds": duration,
-            "exit_reason": "stalled",
-            "stalled_after_quiet_seconds": event_record.get("_stall_quiet_seconds"),
-            "stall_threshold_seconds": event_record.get("_stall_threshold_seconds"),
-            "stall_phase": "in_tool" if stall_in_tool else "idle",
-            "stall_grace_seconds": _STALL_GRACE_SECONDS,
-        }
 
     _invoke_not_started(on_not_started, status)
     _push_completion_event(event_record, result, status)
@@ -1480,21 +1458,75 @@ def _stale_monitor_loop() -> None:
 
 
 def _finalize_stalled(delegation_id: str) -> None:
-    """Record stall grace expiry without freeing a live worker's capacity."""
-    with _records_lock:
-        record = _records.get(delegation_id)
-        if (
-            record is None
-            or record.get("status") != "stalling"
-            or record.get("_stall_grace_expired")
-        ):
-            return
-        record["_stall_grace_expired"] = True
-    logger.error(
-        "Async delegation %s ignored the stall interrupt; retaining its "
-        "capacity slot until the worker exits",
-        delegation_id,
+    """Force-finalize a stalling delegation whose runner never returned."""
+    claimed = _begin_finalization(delegation_id)
+    if claimed is None:
+        return
+    event_record, _interrupt_fn, on_not_started = claimed
+    _invoke_not_started(on_not_started, "stalled")
+
+    completed_at = event_record.get("completed_at") or time.time()
+    duration = round(
+        completed_at - (event_record.get("dispatched_at") or completed_at),
+        2,
     )
+    quiet_seconds = event_record.get("_stall_quiet_seconds")
+    threshold_seconds = event_record.get("_stall_threshold_seconds")
+    stall_in_tool = event_record.get("_stall_in_tool")
+    error = (
+        f"Async delegation {delegation_id} stalled: the detached subagent "
+        "stopped making progress (no new API calls, tool activity, or "
+        "streamed tokens), did not respond to interruption, and never "
+        "produced a completion event. The worker may be wedged inside a "
+        "model API call — this is a known failure mode of long-lived "
+        "gateway processes (#60203). Re-dispatch the task if it is still "
+        "needed."
+    )
+    logger.error(
+        "Async delegation %s force-finalized as stalled after %.0fs",
+        delegation_id, duration,
+    )
+    # Structured stall metadata (#51690): lets parents and UIs distinguish
+    # a stall-monitor kill from other failures without parsing the error
+    # string, mirroring the sync path's timeout_seconds/timed_out_after_
+    # seconds/timeout_phase fields.
+    stall_meta = {
+        "stalled_after_quiet_seconds": quiet_seconds,
+        "stall_threshold_seconds": threshold_seconds,
+        "stall_phase": (
+            "in_tool" if stall_in_tool
+            else "idle" if stall_in_tool is not None
+            else None
+        ),
+        "stall_grace_seconds": _STALL_GRACE_SECONDS,
+    }
+    if event_record.get("is_batch"):
+        _push_batch_completion_event(
+            event_record,
+            {
+                "results": [],
+                "error": error,
+                "total_duration_seconds": duration,
+                **stall_meta,
+            },
+            "stalled",
+        )
+    else:
+        _push_completion_event(
+            event_record,
+            {
+                "status": "stalled",
+                "summary": None,
+                "error": error,
+                "api_calls": 0,
+                "duration_seconds": duration,
+                "exit_reason": "stalled",
+                **stall_meta,
+            },
+            "stalled",
+        )
+    _finish_finalization(delegation_id, "stalled")
+
 
 def _children_activity_from_token(token: Any, now: float) -> Optional[List]:
     """Parse a progress token into per-child activity dicts (best-effort).
@@ -1585,22 +1617,6 @@ def list_async_delegations() -> List[Dict[str, Any]]:
             item["children_activity"] = activity
         item["in_tool"] = bool(in_tool)
     return items
-
-
-def list_async_delegations_for_owner(*, parent_session_id: str) -> List[Dict[str, Any]]:
-    """Return the calling parent's delegation status without task payloads."""
-    if not parent_session_id:
-        return []
-    allowed = {
-        "delegation_id", "status", "dispatched_at", "completed_at", "is_batch",
-        "seconds_since_progress", "children_activity", "in_tool",
-        "stalled_after_quiet_seconds", "stall_threshold_seconds", "stall_in_tool",
-    }
-    return [
-        {key: value for key, value in item.items() if key in allowed}
-        for item in list_async_delegations()
-        if _matches_session_selectors(item, parent_session_id=parent_session_id)
-    ]
 
 
 def interrupt_all(reason: str = "shutdown") -> int:
@@ -1703,7 +1719,7 @@ def interrupt_for_session(
 
     Returns how many were interrupted.
     """
-    if not parent_session_id:
+    if not session_key and not origin_ui_session_id and not parent_session_id:
         return 0
     count = 0
     with _records_lock:

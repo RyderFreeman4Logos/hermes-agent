@@ -8,8 +8,6 @@ live sampling → /agents rendering.
 
 import threading
 import time
-from types import SimpleNamespace
-from unittest.mock import AsyncMock
 
 import pytest
 
@@ -39,13 +37,6 @@ def _make_runner():
     runner._running_agents_ts = {}
     runner._background_tasks = set()
     runner._session_key_for_source = lambda source: "agent:main:test:dm:1"
-    runner.session_store = object()
-    runner._async_session_store = SimpleNamespace(
-        _store=runner.session_store,
-        get_or_create_session=AsyncMock(
-            return_value=SimpleNamespace(session_id="parent-session")
-        ),
-    )
     return runner
 
 
@@ -63,8 +54,7 @@ async def test_agents_command_marks_stalling_delegation(monkeypatch):
 
     res = ad.dispatch_async_delegation(
         goal="wedged child", context=None, toolsets=None, role="leaf",
-        model="m", session_key="agent:main:test:dm:1",
-        parent_session_id="parent-session", max_async_children=1,
+        model="m", session_key="agent:main:test:dm:1", max_async_children=1,
         runner=lambda: {} if gate.wait(timeout=10) else {},
         progress_fn=lambda: ((0, None), False),
     )

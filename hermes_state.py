@@ -1802,7 +1802,7 @@ def preflight_db_writability(
             _ensure_writable(p)
 
 
-def _db_opens_cleanly(db_path: Path) -> Optional[str]:
+def _db_opens_cleanly_locked(db_path: Path) -> Optional[str]:
     """Probe a DB on a fresh connection. Returns None if healthy, else a reason.
 
     Runs the same first-statement (``PRAGMA journal_mode``) that trips the
@@ -1928,7 +1928,44 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
         conn.close()
 
 
+def _uses_delete_journal_on_disk(db_path: Path) -> bool:
+    """Return true only when an existing SQLite header declares DELETE mode."""
+    try:
+        header = db_path.open("rb").read(20)
+    except OSError:
+        return False
+    return len(header) >= 20 and header.startswith(b"SQLite format 3\x00") and header[18] == 1
+
+
+def _db_opens_cleanly(db_path: Path) -> Optional[str]:
+    """Run the rolled-back state write probe under writer coordination."""
+    db_path = Path(db_path)
+    patience_s = SessionDB._WRITE_PATIENCE_S
+    with _session_db_advisory_write_lock(
+        db_path,
+        deadline=time.monotonic() + patience_s,
+        patience_s=patience_s,
+        allow_unsupported=_uses_delete_journal_on_disk(db_path),
+    ):
+        return _db_opens_cleanly_locked(db_path)
+
+
 def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, Any]:
+    """Repair state.db while excluding every other Hermes state writer."""
+    db_path = Path(db_path)
+    patience_s = SessionDB._WRITE_PATIENCE_S
+    with _session_db_advisory_write_lock(
+        db_path,
+        deadline=time.monotonic() + patience_s,
+        patience_s=patience_s,
+        allow_unsupported=_uses_delete_journal_on_disk(db_path),
+    ):
+        return _repair_state_db_schema_advisory_locked(db_path, backup=backup)
+
+
+def _repair_state_db_schema_advisory_locked(
+    db_path: Path, *, backup: bool = True
+) -> Dict[str, Any]:
     """Repair a state.db whose ``sqlite_master`` schema is malformed or whose
     FTS indexes reject writes.
 
@@ -1978,7 +2015,7 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
             # Another process is still inside its critical section. It may
             # nonetheless have healed the file already (long VACUUM after a
             # successful strategy), so re-probe before reporting failure.
-            if _db_opens_cleanly(db_path) is None:
+            if _db_opens_cleanly_locked(db_path) is None:
                 report["repaired"] = True
                 report["strategy"] = "repaired_by_other_process"
                 return report
@@ -1987,10 +2024,12 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
                 "schema surgery to avoid racing it"
             )
             return report
-        return _repair_state_db_schema_locked(db_path, backup=backup, report=report)
+        return _repair_state_db_schema_crossprocess_locked(
+            db_path, backup=backup, report=report
+        )
 
 
-def _repair_state_db_schema_locked(
+def _repair_state_db_schema_crossprocess_locked(
     db_path: Path, *, backup: bool, report: Dict[str, Any]
 ) -> Dict[str, Any]:
     """Repair strategies for :func:`repair_state_db_schema`.
@@ -2001,7 +2040,7 @@ def _repair_state_db_schema_locked(
     # repaired the file, in which case redoing the surgery would undo its
     # work on a now-healthy DB (the repair/re-corrupt cascade this lock
     # exists to break).
-    if _db_opens_cleanly(db_path) is None:
+    if _db_opens_cleanly_locked(db_path) is None:
         report["repaired"] = True
         report["strategy"] = "already_healthy"
         return report
@@ -2046,7 +2085,7 @@ def _repair_state_db_schema_locked(
                     continue
         finally:
             conn.close()
-        if _db_opens_cleanly(db_path) is None:
+        if _db_opens_cleanly_locked(db_path) is None:
             report["repaired"] = True
             report["strategy"] = "rebuild_fts"
             logger.warning(
@@ -2070,7 +2109,7 @@ def _repair_state_db_schema_locked(
             conn.commit()
         finally:
             conn.close()
-        if _db_opens_cleanly(db_path) is None:
+        if _db_opens_cleanly_locked(db_path) is None:
             report["repaired"] = True
             report["strategy"] = "reindex_btree"
             logger.warning(
@@ -2101,7 +2140,7 @@ def _repair_state_db_schema_locked(
             conn.commit()
         finally:
             conn.close()
-        if _db_opens_cleanly(db_path) is None:
+        if _db_opens_cleanly_locked(db_path) is None:
             report["repaired"] = True
             report["strategy"] = "dedup_schema"
             logger.warning(
@@ -2124,7 +2163,7 @@ def _repair_state_db_schema_locked(
             conn.execute("VACUUM")
         finally:
             conn.close()
-        reason = _db_opens_cleanly(db_path)
+        reason = _db_opens_cleanly_locked(db_path)
         if reason is None:
             report["repaired"] = True
             report["strategy"] = "drop_fts_rebuild"
@@ -2676,6 +2715,126 @@ def count_db_holders(db_path: Path) -> Optional[int]:
         return None
 
 
+def session_db_write_lock_path(db_path: Path) -> Path:
+    """Return the cross-process advisory writer lock for *db_path*."""
+    return Path(str(db_path) + ".write.lock")
+
+
+_ADVISORY_LOCK_CONTENTION_ERRNOS = {errno.EACCES, errno.EAGAIN, errno.EDEADLK}
+_ADVISORY_LOCK_UNSUPPORTED_ERRNOS = {
+    errno.ENOLCK,
+    errno.ENOSYS,
+    errno.ENOTSUP,
+    getattr(errno, "EOPNOTSUPP", errno.ENOTSUP),
+}
+_WINDOWS_LOCK_CONTENTION_ERRORS = {32, 33}
+_WINDOWS_LOCK_UNSUPPORTED_ERRORS = {1, 50}
+
+
+def _is_advisory_lock_contention(exc: OSError) -> bool:
+    return (
+        exc.errno in _ADVISORY_LOCK_CONTENTION_ERRNOS
+        or getattr(exc, "winerror", None) in _WINDOWS_LOCK_CONTENTION_ERRORS
+    )
+
+
+def _is_advisory_lock_unsupported(exc: OSError) -> bool:
+    return (
+        exc.errno in _ADVISORY_LOCK_UNSUPPORTED_ERRNOS
+        or getattr(exc, "winerror", None) in _WINDOWS_LOCK_UNSUPPORTED_ERRORS
+    )
+
+
+def _try_acquire_exclusive_file_lock(handle) -> bool:
+    """Try to acquire an exclusive advisory lock without blocking."""
+    import platform
+
+    if platform.system() == "Windows":
+        import msvcrt
+
+        try:
+            handle.seek(0, os.SEEK_END)
+            if handle.tell() == 0:
+                handle.write(b"\0")
+                handle.flush()
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError as exc:
+            if _is_advisory_lock_contention(exc):
+                return False
+            raise
+
+    import fcntl
+
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError as exc:
+        if _is_advisory_lock_contention(exc):
+            return False
+        raise
+
+
+def _release_exclusive_file_lock(handle) -> None:
+    """Release an advisory lock, best-effort."""
+    import platform
+
+    try:
+        if platform.system() == "Windows":
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except (OSError, AttributeError):
+        pass
+
+
+@contextmanager
+def _session_db_advisory_write_lock(
+    db_path: Path, *, deadline: float, patience_s: float, allow_unsupported: bool
+):
+    """Hold the per-database writer lock, or safely use DELETE-mode locking."""
+    lock_path = session_db_write_lock_path(db_path)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+b")
+    acquired = False
+    started = deadline - patience_s
+    try:
+        while True:
+            try:
+                acquired = _try_acquire_exclusive_file_lock(handle)
+            except OSError as exc:
+                if allow_unsupported and _is_advisory_lock_unsupported(exc):
+                    yield False
+                    return
+                raise
+            if acquired:
+                break
+            now = time.monotonic()
+            if now >= deadline:
+                raise sqlite3.OperationalError(
+                    f"database is locked (another Hermes process held the "
+                    f"state.db write lock for over {patience_s:.0f}s — likely a "
+                    "long maintenance operation; the database itself is healthy)"
+                )
+            delay = (
+                random.uniform(0.250, 1.000)
+                if now - started >= 2.0
+                else random.uniform(0.020, 0.150)
+            )
+            time.sleep(min(delay, max(deadline - now, 0.001)))
+        yield True
+    finally:
+        if acquired:
+            _release_exclusive_file_lock(handle)
+        handle.close()
+
+
 class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin):
     """
     SQLite-backed session storage with FTS5 search.
@@ -2801,6 +2960,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self.read_only = read_only
 
         self._lock = threading.Lock()
+        # Serialize local writers before sidecar waits; readers only take _lock.
+        self._writer_lock = threading.Lock()
+        self._write_lock_owner = None
         # Read-path split (WAL only): recall/browse queries borrow a
         # read-only connection from a bounded pool so they never queue
         # behind writer flushes on self._lock. See _read_ctx().
@@ -2978,7 +3140,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 if qpath is None and self.db_path.exists() and is_zeroed_state_db(self.db_path):
                     raise sqlite3.DatabaseError(msg)
 
-            def _connect_and_init():
+            def _connect_and_init(deadline: float):
                 self._conn = _connect_tracked_db(
                     str(self.db_path),
                     check_same_thread=False,
@@ -2992,13 +3154,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     isolation_level=None,
                 )
                 self._conn.row_factory = sqlite3.Row
-                self._wal_active = (
-                    apply_wal_with_fallback(self._conn, db_label="state.db") == "wal"
-                )
-                apply_database_pragmas(self._conn, db_label="state.db")
-                self._conn.execute("PRAGMA foreign_keys=ON")
-                self._fts_cjk_loaded = load_fts5_cjk_extension(self._conn)
-                self._init_schema()
+                current_mode = _on_disk_journal_mode(self._conn)
+                with self._write_guard(
+                    deadline=deadline,
+                    allow_unsupported=current_mode == "delete",
+                ) as acquired:
+                    self._wal_active = (
+                        apply_wal_with_fallback(self._conn, db_label="state.db") == "wal"
+                        if acquired
+                        else False
+                    )
+                    apply_database_pragmas(self._conn, db_label="state.db")
+                    self._conn.execute("PRAGMA foreign_keys=ON")
+                    self._fts_cjk_loaded = load_fts5_cjk_extension(self._conn)
+                    self._init_schema()
 
             def _connect_and_init_with_lock_patience():
                 # Lock contention during open: _init_schema's DDL/reconcile
@@ -3014,7 +3183,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 deadline = time.monotonic() + self._WRITE_PATIENCE_S
                 while True:
                     try:
-                        _connect_and_init()
+                        _connect_and_init(deadline)
                         return
                     except sqlite3.OperationalError as exc:
                         err = str(exc).lower()
@@ -3290,6 +3459,39 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             yield self._conn
 
     # ── Core write helper ──
+
+    @contextmanager
+    def _write_guard(
+        self,
+        *,
+        patience_s: Optional[float] = None,
+        deadline: Optional[float] = None,
+        allow_unsupported: Optional[bool] = None,
+    ):
+        """Serialize one state mutation across threads and processes."""
+        owner = threading.get_ident()
+        if self._write_lock_owner == owner:
+            yield True
+            return
+        if patience_s is None:
+            patience_s = self._WRITE_PATIENCE_S
+        if deadline is None:
+            deadline = time.monotonic() + patience_s
+        if allow_unsupported is None:
+            allow_unsupported = not self._wal_active
+        with self._writer_lock:
+            with _session_db_advisory_write_lock(
+                self.db_path,
+                deadline=deadline,
+                patience_s=patience_s,
+                allow_unsupported=allow_unsupported,
+            ) as acquired:
+                with self._lock:
+                    self._write_lock_owner = owner
+                    try:
+                        yield acquired
+                    finally:
+                        self._write_lock_owner = None
 
     @staticmethod
     def _is_fts5_unavailable_error(exc: sqlite3.OperationalError) -> bool:
@@ -3584,7 +3786,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         while True:
             try:
-                with self._lock:
+                with self._write_guard(patience_s=patience_s, deadline=deadline):
                     remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
                     previous_busy_timeout_ms = int(
                         self._conn.execute("PRAGMA busy_timeout").fetchone()[0]
@@ -3932,7 +4134,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         from checkpointing thousands of frames at once (issue #45383).
         """
         try:
-            with self._lock:
+            with self._write_guard(patience_s=0.0):
                 result = self._conn.execute(
                     "PRAGMA wal_checkpoint(PASSIVE)"
                 ).fetchone()
@@ -3973,23 +4175,21 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             except queue.Empty:
                 break
             self._close_read_conn(conn)
-        with self._lock:
-            if self._conn:
-                if not self.read_only:
-                    # PASSIVE, not TRUNCATE. Every cron run_agent opens+closes a
-                    # transient SessionDB, so a TRUNCATE here fires a full WAL
-                    # reset many times/hour, racing the gateway's long-lived
-                    # writer on large WAL databases and tearing hot B-tree
-                    # pages -- the #45383 corruption this class's own periodic
-                    # checkpoint was already made PASSIVE to avoid. TRUNCATE
-                    # belongs only on a sole-opener/quiescent connection.
-                    try:
+        if self._conn:
+            if not self.read_only:
+                # PASSIVE, not TRUNCATE. Every cron run_agent opens+closes a
+                # transient SessionDB, so a TRUNCATE here fires a full WAL
+                # reset many times/hour, racing the gateway's long-lived
+                # writer on large WAL databases and tearing hot B-tree
+                # pages -- the #45383 corruption this class's own periodic
+                # checkpoint was already made PASSIVE to avoid. TRUNCATE
+                # belongs only on a sole-opener/quiescent connection.
+                try:
+                    with self._write_guard(patience_s=0.0):
                         self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-                    except Exception as exc:
-                        logger.debug(
-                            "WAL checkpoint (PASSIVE) at close failed: %s",
-                            exc,
-                        )
+                except Exception as exc:
+                    logger.debug("WAL checkpoint (PASSIVE) at close failed: %s", exc)
+            with self._lock:
                 self._conn.close()
                 self._conn = None
 
@@ -11287,7 +11487,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         except Exception as exc:
             logger.warning("FTS optimize before VACUUM failed: %s", exc)
         # VACUUM cannot be executed inside a transaction.
-        with self._lock:
+        with self._write_guard():
             # Best-effort WAL checkpoint first, then VACUUM. PASSIVE, not
             # TRUNCATE: a manual `hermes sessions vacuum` runs in a transient
             # CLI process, and a TRUNCATE reset here would race a live gateway

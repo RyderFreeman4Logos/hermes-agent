@@ -3301,6 +3301,7 @@ class ProcessRegistry:
                             "parent_session_id": s.parent_session_id,
                             "heartbeat_provider": s.heartbeat_provider,
                             "notify_on_complete": s.notify_on_complete,
+                            "delegated_child": s.delegated_child,
                             "watch_patterns": s.watch_patterns,
                         })
                 if extra_entries:
@@ -3401,6 +3402,7 @@ class ProcessRegistry:
                 parent_session_id=entry.get("parent_session_id", ""),
                 heartbeat_provider=entry.get("heartbeat_provider", ""),
                 notify_on_complete=entry.get("notify_on_complete", False),
+                delegated_child=entry.get("delegated_child", False),
                 watch_patterns=entry.get("watch_patterns", []),
             )
             with self._lock:

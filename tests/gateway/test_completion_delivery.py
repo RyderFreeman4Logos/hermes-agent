@@ -316,3 +316,46 @@ def test_autonomous_completion_redacts_real_command_and_output_secrets(monkeypat
     delivered = adapter.handle_message.await_args.args[0]
     assert secret not in delivered.text
     assert "HOME=/home/user" in delivered.text
+
+
+def test_gateway_watcher_preserves_delegated_wrapper_failure_classification(
+    monkeypatch, isolated_registry,
+):
+    """The synthetic gateway event keeps delegated-child provenance."""
+    session = ProcessSession(
+        id="proc_wrapper_91_gateway",
+        command="pytest -q",
+        task_id="task",
+        started_at=1.0,
+        output_buffer=(
+            "pytest: 33 passed\n"
+            "POST_FOREIGN_CWD: wrapper refused foreign cwd\n"
+        ),
+        exited=True,
+        exit_code=91,
+        notify_on_complete=True,
+        delegated_child=True,
+    )
+    isolated_registry._finished[session.id] = session
+
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+
+    async def _instant_sleep(*_a, **_kw):
+        pass
+
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+    asyncio.run(runner._run_process_watcher({
+        "session_id": session.id,
+        "check_interval": 0,
+        "session_key": "agent:main:telegram:dm:123",
+        "platform": "telegram",
+        "chat_type": "dm",
+        "chat_id": "123",
+        "notify_on_complete": True,
+    }))
+
+    delivered = adapter.handle_message.await_args.args[0]
+    assert "freeze/foreign-CWD wrapper failure" in delivered.text
+    assert "pytest: 33 passed" in delivered.text
+    assert "POST_FOREIGN_CWD" not in delivered.text

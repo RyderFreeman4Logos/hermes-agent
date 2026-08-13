@@ -587,6 +587,8 @@ def claim_warm_snapshot(agent) -> Optional[tuple[int, Dict[str, Any], Any]]:
         identity = _warm_snapshot_identity(agent)
     except Exception:
         logger.debug("Could not validate heartbeat request snapshot", exc_info=True)
+        with lock:
+            state["last_claim_reason"] = "identity_unavailable"
         return None
     with lock:
         if (
@@ -979,6 +981,83 @@ class RuntimeHeartbeat:
 
         return process_registry.completion_queue
 
+    @staticmethod
+    def _session_target_id(owner: Any) -> str:
+        return f"conversation:{id(owner):x}"
+
+    def cancel_session(self, owner: Any) -> bool:
+        """Cancel this agent's idle-conversation warm without touching processes."""
+        if owner is None:
+            return False
+        target_id = self._session_target_id(owner)
+        with self._lock:
+            target = self._targets.get(target_id)
+            if (
+                target is None
+                or target.kind != "session"
+                or target.owner_id != id(owner)
+            ):
+                return False
+        return self.cancel(target_id)
+
+    def arm_session_after_turn(
+        self,
+        owner: Any,
+        result: Any,
+        *,
+        caller_id: Optional[str] = None,
+    ) -> bool:
+        """Keep a successful main conversation warm while it is idle."""
+        if (
+            owner is None
+            or getattr(owner, "platform", "") == "subagent"
+            or not isinstance(result, dict)
+            or result.get("completed") is False
+            or result.get("failed") is True
+            or result.get("interrupted") is True
+            or not (
+                getattr(owner, "_turn_received_provider_response", False)
+                or result.get("api_calls")
+            )
+        ):
+            return False
+
+        if not caller_id:
+            try:
+                from tools.approval import get_current_session_key
+
+                caller_id = get_current_session_key(default="")
+            except Exception:
+                caller_id = ""
+        caller_id = str(caller_id or getattr(owner, "session_id", "") or "")
+        if not caller_id:
+            return False
+
+        provider = canonical_runtime_provider_identity(owner)
+        interval = resolve_heartbeat_interval(_runtime_config(), provider)
+        if interval is None or runtime_warm_capability(owner)[0] != "eligible":
+            return False
+        cache_context = canonical_runtime_cache_context_identity(owner)
+        target_id = self._session_target_id(owner)
+        owner_ref = _weak_owner(owner)
+        if owner_ref is None:
+            return False
+
+        return self.arm(
+            target_id,
+            caller_id=caller_id,
+            kind="session",
+            interval=interval,
+            inspect=lambda: {
+                "alive": owner_ref() is not None,
+                "progress": True,
+                "evidence": "conversation idle",
+            },
+            provider=provider,
+            cache_context=cache_context,
+            owner=owner,
+        )
+
     def arm(
         self,
         target_id: str,
@@ -1053,6 +1132,15 @@ class RuntimeHeartbeat:
                 return False
             target.baseline = baseline
             self._schedule_locked(key, target)
+        logger.info(
+            "Runtime heartbeat phase=arm target=%s owner=%s kind=%s "
+            "provider=%s interval_s=%s",
+            target.target_id,
+            target.caller_id,
+            target.kind,
+            target.provider or "-",
+            target.interval,
+        )
         return True
 
     def _schedule_locked(
@@ -1126,6 +1214,12 @@ class RuntimeHeartbeat:
                 self._publication_done.wait()
         if replacement_event is not None:
             self._queue().put(replacement_event)
+        logger.info(
+            "Runtime heartbeat phase=cancel target=%s owner=%s kind=%s",
+            target.target_id,
+            target.caller_id,
+            target.kind,
+        )
         return True
 
     def cancel_for_caller(self, caller_id: str) -> int:
@@ -1278,6 +1372,24 @@ class RuntimeHeartbeat:
                 if target.caller_id == str(caller_id)
             ]
 
+    def active_snapshots(self) -> list[Dict[str, Any]]:
+        """Return immutable UI-safe target timing snapshots."""
+        with self._lock:
+            targets = sorted(
+                self._targets.values(),
+                key=lambda target: (target.started_at, target.target_id),
+            )
+            return [
+                {
+                    "target_id": target.target_id,
+                    "caller_id": target.caller_id,
+                    "kind": target.kind,
+                    "started_at": target.started_at,
+                    "interval_s": target.interval,
+                }
+                for target in targets
+            ]
+
     @staticmethod
     def _assess(target: _Target, snapshot: Dict[str, Any]) -> tuple[str, str]:
         if target.kind == "process":
@@ -1312,6 +1424,14 @@ class RuntimeHeartbeat:
             if target is None or target.generation != generation:
                 return
             target.timer = None
+        logger.info(
+            "Runtime heartbeat phase=due target=%s owner=%s kind=%s "
+            "interval_s=%s",
+            target.target_id,
+            target.caller_id,
+            target.kind,
+            target.interval,
+        )
         inspection_error = None
         try:
             snapshot = dict(target.inspect() or {})

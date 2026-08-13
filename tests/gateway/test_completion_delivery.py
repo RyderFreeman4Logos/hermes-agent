@@ -246,6 +246,62 @@ def test_explicit_kill_returns_output_before_consuming_notification(monkeypatch)
     adapter.handle_message.assert_not_awaited()
 
 
+@pytest.mark.parametrize(
+    ("exit_code", "completion_reason", "termination_source", "injected"),
+    (
+        (0, "exited", "", False),
+        (1, "exited", "", True),
+        (-1, "lost", "backend_lost", True),
+        (-15, "killed", "process.kill", True),
+    ),
+    ids=("success", "nonzero", "lost", "killed"),
+)
+def test_delegated_child_watcher_suppresses_only_routine_success(
+    monkeypatch,
+    isolated_registry,
+    exit_code,
+    completion_reason,
+    termination_source,
+    injected,
+):
+    session = ProcessSession(
+        id="proc_delegated_child",
+        command="echo done",
+        task_id="task",
+        started_at=1.0,
+        output_buffer="done\n",
+        exited=True,
+        exit_code=exit_code,
+        completion_reason=completion_reason,
+        termination_source=termination_source,
+        notify_on_complete=True,
+        delegated_child=True,
+    )
+    isolated_registry._finished[session.id] = session
+
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+
+    async def _instant_sleep(*_a, **_kw):
+        pass
+
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+    asyncio.run(runner._run_process_watcher({
+        "session_id": session.id,
+        "check_interval": 0,
+        "session_key": "agent:main:telegram:dm:123",
+        "platform": "telegram",
+        "chat_type": "dm",
+        "chat_id": "123",
+        "notify_on_complete": True,
+    }))
+
+    if injected:
+        adapter.handle_message.assert_awaited_once()
+    else:
+        adapter.handle_message.assert_not_awaited()
+
+
 def test_process_tool_redacts_explicit_kill_output(monkeypatch):
     from tools import process_registry as pr_module
 

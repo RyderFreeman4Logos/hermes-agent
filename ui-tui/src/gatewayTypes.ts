@@ -107,6 +107,7 @@ export interface ConfigDisplayConfig {
   // validation anyway.
   tui_status_indicator?: string
   tui_statusbar?: 'bottom' | 'off' | 'on' | 'top' | boolean
+  tui_statusbar_segments?: unknown
   /** Theme mode pin: 'light' / 'dark' beat background auto-detection; 'auto'
    *  (default) trusts the OSC-11 probe + env signals. */
   tui_theme?: string

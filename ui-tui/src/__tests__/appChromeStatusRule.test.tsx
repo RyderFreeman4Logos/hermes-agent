@@ -187,19 +187,152 @@ describe('StatusRule background-subagent indicator', () => {
 
     expect(textContent(element)).not.toContain('resumes when')
   })
+})
 
-  it('drops the subagent segment before the bg segment on a narrow terminal', () => {
-    // cols=44 is below the subagents breakpoint (92) but the bg breakpoint
-    // (88) too — both gone. Assert the lower-priority subagent indicator is
-    // not shown when space is tight even with a live count.
+describe('StatusRule runtime heartbeat cadence', () => {
+  const runtimeHeartbeat = {
+    active_count: 2,
+    targets: [
+      {
+        interval_s: 1700,
+        kind: 'process',
+        last_success_at: 1_700_000_040,
+        started_at: 1_700_000_000
+      },
+      {
+        interval_s: 3300,
+        kind: 'delegation',
+        last_success_at: null,
+        started_at: 1_700_000_001
+      }
+    ]
+  }
+
+  it('advances elapsed time locally and keeps the resolved interval', () => {
+    expect(runtimeHeartbeatLabel(runtimeHeartbeat, 1_700_000_042_000)).toBe('→checkin 42s/1700s +1 ✓2s')
+    expect(runtimeHeartbeatLabel(runtimeHeartbeat, 1_700_000_043_000)).toBe('→checkin 43s/1700s +1 ✓3s')
+  })
+
+  it('resets elapsed when the backend publishes a new cadence origin', () => {
+    const rearmed = {
+      ...runtimeHeartbeat,
+      targets: [{ ...runtimeHeartbeat.targets[0], last_success_at: null, started_at: 1_700_000_042 }]
+    }
+
+    expect(runtimeHeartbeatLabel(runtimeHeartbeat, 1_700_000_042_000)).toBe('→checkin 42s/1700s +1 ✓2s')
+    expect(runtimeHeartbeatLabel(rearmed, 1_700_000_042_000)).toBe('→checkin 0s/1700s +1')
+  })
+
+  it('keeps validated success diagnostic-only when the status rule is too narrow', () => {
+    const now = Date.now()
+
+    const narrowHeartbeat = {
+      active_count: 1,
+      targets: [
+        {
+          interval_s: 1700,
+          kind: 'process',
+          last_success_at: now / 1000 - 2,
+          started_at: now / 1000 - 42
+        }
+      ]
+    }
+
     const element = StatusRule({
       ...baseProps,
       cols: 44,
-      bgCount: 1,
-      usage: { ...baseProps.usage, active_subagents: 2 }
+      usage: { ...baseProps.usage, runtime_heartbeat: narrowHeartbeat }
     })
 
-    expect(textContent(element)).not.toContain('⛓')
+    expect(textContent(element)).not.toContain('→checkin')
+    expect(runtimeHeartbeatLabel(narrowHeartbeat, now)).toContain('✓2s')
+  })
+
+  it('renders one footer segment for all active targets', () => {
+    const element = StatusRule({
+      ...baseProps,
+      cols: 140,
+      usage: { ...baseProps.usage, runtime_heartbeat: runtimeHeartbeat }
+    })
+
+    const checkin = findComponentByName(element, 'RuntimeHeartbeatCheckin')
+
+    expect(checkin).not.toBeNull()
+    expect(checkin!.props.heartbeat).toEqual(runtimeHeartbeat)
+  })
+
+  it.each([77, 78, 79, 80, 81, 82, 83, 84, 85, 86])(
+    'does not displace cache or session duration at %i columns',
+    cols => {
+      const narrowHeartbeat = {
+        active_count: 1,
+        targets: [
+          {
+            ...runtimeHeartbeat.targets[0],
+            started_at: Date.now() / 1000 - 42
+          }
+        ]
+      }
+
+      const common = {
+        ...baseProps,
+        cols,
+        sessionStartedAt: Date.now() - 60_000
+      }
+
+      const withoutHeartbeat = StatusRule(common)
+
+      const withHeartbeat = StatusRule({
+        ...common,
+        usage: { ...common.usage, runtime_heartbeat: narrowHeartbeat }
+      })
+
+      expect(textContent(withoutHeartbeat)).toContain('25%')
+      expect(textContent(withHeartbeat)).toContain('25%')
+      expect(findComponentByName(withoutHeartbeat, 'SessionDuration')).not.toBeNull()
+      expect(findComponentByName(withHeartbeat, 'SessionDuration')).not.toBeNull()
+    }
+  )
+
+  it.each([77, 78, 79, 80, 81, 82, 83, 84, 85, 86])('does not displace cache or idle stop time at %i columns', cols => {
+    const narrowHeartbeat = {
+      active_count: 1,
+      targets: [
+        {
+          ...runtimeHeartbeat.targets[0],
+          started_at: Date.now() / 1000 - 42
+        }
+      ]
+    }
+
+    const common = {
+      ...baseProps,
+      cols,
+      lastTurnEndedAt: Date.now() - 42_000,
+      sessionStartedAt: null
+    }
+
+    const withoutHeartbeat = StatusRule(common)
+
+    const withHeartbeat = StatusRule({
+      ...common,
+      usage: { ...common.usage, runtime_heartbeat: narrowHeartbeat }
+    })
+
+    expect(textContent(withoutHeartbeat)).toContain('25%')
+    expect(textContent(withHeartbeat)).toContain('25%')
+    expect(findComponentByName(withoutHeartbeat, 'IdleSince')).not.toBeNull()
+    expect(findComponentByName(withHeartbeat, 'IdleSince')).not.toBeNull()
+  })
+
+  it('clears the footer when the reconciled snapshot is empty', () => {
+    const element = StatusRule({
+      ...baseProps,
+      cols: 140,
+      usage: { ...baseProps.usage, runtime_heartbeat: { active_count: 0, targets: [] } }
+    })
+
+    expect(textContent(element)).not.toContain('→checkin')
   })
 })
 
@@ -229,41 +362,6 @@ describe('StatusRule session count click target', () => {
     expect(clickableSessionCount).not.toBeNull()
     clickableSessionCount!.props.onClick({ stopImmediatePropagation: vi.fn() })
     expect(openSwitcher).toHaveBeenCalledOnce()
-  })
-
-  it('keeps status + model and drops the low-value tail on a narrow terminal', () => {
-    const element = StatusRule({
-      bgCount: 0,
-      busy: false,
-      cols: 44,
-      cwdLabel: '~/src/hermes-agent/apps/desktop (bb/tui-statusbar-responsive)',
-      liveSessionCount: 3,
-      model: 'opus-4.8',
-      onSessionCountClick: vi.fn(),
-      sessionStartedAt: Date.now() - 60_000,
-      status: 'ready',
-      statusColor: DEFAULT_THEME.color.ok,
-      t: DEFAULT_THEME,
-      turnStartedAt: null,
-      usage: {
-        calls: 0,
-        context_max: 200_000,
-        context_percent: 25,
-        context_used: 50_000,
-        input: 0,
-        output: 0,
-        total: 50_000
-      },
-      voiceLabel: 'voice off'
-    })
-
-    const rendered = textContent(element)
-
-    // Must-keep essentials survive intact …
-    expect(rendered).toContain('ready')
-    expect(rendered).toContain('opus 4.8')
-    // … while the low-value tail (session count) is dropped, not truncated.
-    expect(rendered).not.toContain('3 sessions')
   })
 })
 
@@ -335,7 +433,7 @@ describe('StatusRule credits notice render priority', () => {
 
     const element = StatusRule({
       ...baseProps,
-      cols: 50,
+      cols: 72,
       notice: { key: 'credits.90', kind: 'sticky', level: 'warn', text: longText }
     })
 

@@ -14,6 +14,7 @@ from unittest.mock import MagicMock
 from tools.delegate_tool import (
     _register_subagent,
     _unregister_subagent,
+    interrupt_subagent,
     steer_subagent,
 )
 
@@ -23,6 +24,10 @@ class _StubAgent:
         self.accept = accept
         self.boom = boom
         self.steered: list[str] = []
+        self.interrupted: list[str | None] = []
+
+    def interrupt(self, message: str | None = None) -> None:
+        self.interrupted.append(message)
 
     def steer(self, text: str) -> bool:
         if self.boom:
@@ -154,6 +159,83 @@ def test_status_snapshot_never_leaks_owner_or_lifecycle_metadata():
         assert all(value is not owner_session_record for value in snapshot.values())
     finally:
         _unregister_subagent("sid-private-metadata", agent=agent)
+
+
+def test_status_snapshot_is_scoped_to_exact_owner_authority():
+    from tools.delegate_tool import list_active_subagents
+
+    owner_transport = object()
+    owner_record = {"session_key": "owner-session"}
+    foreign_transport = object()
+    foreign_record = {"session_key": "foreign-session"}
+    mine = _StubAgent()
+    foreign = _StubAgent()
+    _with_registered(
+        "sid-owned-snapshot",
+        mine,
+        owner_session_id="owner-session",
+        owner_transport=owner_transport,
+        owner_session_record=owner_record,
+    )
+    _with_registered(
+        "sid-foreign-snapshot",
+        foreign,
+        owner_session_id="foreign-session",
+        owner_transport=foreign_transport,
+        owner_session_record=foreign_record,
+    )
+    try:
+        owned = list_active_subagents(
+            owner_session_id="owner-session",
+            owner_transport=owner_transport,
+            owner_session_record=owner_record,
+        )
+        assert [item["subagent_id"] for item in owned] == ["sid-owned-snapshot"]
+
+        inaccessible = list_active_subagents(
+            owner_session_id="foreign-session",
+            owner_transport=owner_transport,
+            owner_session_record=owner_record,
+        )
+        assert inaccessible == []
+    finally:
+        _unregister_subagent("sid-owned-snapshot", agent=mine)
+        _unregister_subagent("sid-foreign-snapshot", agent=foreign)
+
+
+def test_interrupt_helper_requires_matching_owner_authority():
+    owner_transport = object()
+    owner_record = {"session_key": "owner-session"}
+    agent = _StubAgent()
+    _with_registered(
+        "sid-interrupt-owner",
+        agent,
+        owner_session_id="owner-session",
+        owner_transport=owner_transport,
+        owner_session_record=owner_record,
+    )
+    try:
+        assert (
+            interrupt_subagent(
+                "sid-interrupt-owner",
+                owner_session_id="owner-session",
+                owner_transport=owner_transport,
+                owner_session_record=owner_record,
+            )
+            is True
+        )
+        assert agent.interrupted == ["Interrupted via TUI (sid-interrupt-owner)"]
+        assert (
+            interrupt_subagent(
+                "sid-interrupt-owner",
+                owner_session_id="owner-session",
+                owner_transport=object(),
+                owner_session_record=owner_record,
+            )
+            is False
+        )
+    finally:
+        _unregister_subagent("sid-interrupt-owner", agent=agent)
 
 
 class TestMissedSteerRetention:
@@ -357,7 +439,14 @@ class TestSubagentSteerRPC:
         def close(self) -> None:
             return None
 
-    def _call(self, params: dict, *, transport=None, session_record=None) -> dict:
+    def _call(
+        self,
+        params: dict,
+        *,
+        transport=None,
+        session_record=None,
+        method="subagent.steer",
+    ) -> dict:
         import tui_gateway.server as srv
 
         session_id = params.get("session_id")
@@ -369,7 +458,7 @@ class TestSubagentSteerRPC:
             }
         try:
             return srv.dispatch(
-                {"id": 1, "method": "subagent.steer", "params": params},
+                {"id": 1, "method": method, "params": params},
                 transport=transport,
             )
         finally:
@@ -417,6 +506,125 @@ class TestSubagentSteerRPC:
             assert agent.steered == ["check the edge cases"]
         finally:
             _unregister_subagent("sid-rpc-2")
+
+    def test_interrupt_live_child_requires_exact_steer_authority(self):
+        owner_transport = self._Transport()
+        foreign_transport = self._Transport()
+        owner_record = {
+            "session_key": "owner-session",
+            "history": [],
+            "transport": owner_transport,
+        }
+        agent = _StubAgent()
+        _with_registered(
+            "sid-rpc-interrupt",
+            agent,
+            owner_session_id="owner-session",
+            owner_transport=owner_transport,
+            owner_session_record=owner_record,
+        )
+        try:
+            envelope = self._call(
+                {"session_id": "owner-session", "subagent_id": "sid-rpc-interrupt"},
+                transport=owner_transport,
+                session_record=owner_record,
+                method="subagent.interrupt",
+            )
+            assert envelope["result"] == {
+                "found": True,
+                "subagent_id": "sid-rpc-interrupt",
+            }
+            assert agent.interrupted == ["Interrupted via TUI (sid-rpc-interrupt)"]
+
+            envelope = self._call(
+                {"session_id": "owner-session", "subagent_id": "sid-rpc-interrupt"},
+                transport=foreign_transport,
+                session_record=owner_record,
+                method="subagent.interrupt",
+            )
+            assert envelope["result"] == {
+                "found": False,
+                "subagent_id": "sid-rpc-interrupt",
+            }
+            assert agent.interrupted == ["Interrupted via TUI (sid-rpc-interrupt)"]
+
+            recycled_record = {
+                "session_key": "owner-session",
+                "history": [],
+                "transport": owner_transport,
+            }
+            envelope = self._call(
+                {"session_id": "owner-session", "subagent_id": "sid-rpc-interrupt"},
+                transport=owner_transport,
+                session_record=recycled_record,
+                method="subagent.interrupt",
+            )
+            assert envelope["result"] == {
+                "found": False,
+                "subagent_id": "sid-rpc-interrupt",
+            }
+            assert agent.interrupted == ["Interrupted via TUI (sid-rpc-interrupt)"]
+        finally:
+            _unregister_subagent("sid-rpc-interrupt")
+
+    def test_interrupt_without_session_authority_does_not_probe_child(self):
+        agent = _StubAgent()
+        _with_registered("sid-rpc-no-authority", agent)
+        try:
+            envelope = self._call(
+                {"subagent_id": "sid-rpc-no-authority"},
+                method="subagent.interrupt",
+            )
+            assert envelope["error"]["code"] == 4001
+            assert agent.interrupted == []
+        finally:
+            _unregister_subagent("sid-rpc-no-authority")
+
+    def test_delegation_status_lists_only_children_owned_by_session(self):
+        owner_transport = self._Transport()
+        foreign_transport = self._Transport()
+        owner_record = {
+            "session_key": "owner-session",
+            "history": [],
+            "transport": owner_transport,
+        }
+        foreign_record = {
+            "session_key": "foreign-session",
+            "history": [],
+            "transport": foreign_transport,
+        }
+        mine = _StubAgent()
+        foreign = _StubAgent()
+        _with_registered(
+            "sid-status-owned",
+            mine,
+            owner_session_id="owner-session",
+            owner_transport=owner_transport,
+            owner_session_record=owner_record,
+        )
+        _with_registered(
+            "sid-status-foreign",
+            foreign,
+            owner_session_id="foreign-session",
+            owner_transport=foreign_transport,
+            owner_session_record=foreign_record,
+        )
+        try:
+            envelope = self._call(
+                {"session_id": "owner-session"},
+                transport=owner_transport,
+                session_record=owner_record,
+                method="delegation.status",
+            )
+            assert [item["subagent_id"] for item in envelope["result"]["active"]] == [
+                "sid-status-owned"
+            ]
+
+            envelope = self._call({}, transport=owner_transport, method="delegation.status")
+            assert envelope["result"]["active"] == []
+        finally:
+            _unregister_subagent("sid-status-owned", agent=mine)
+            _unregister_subagent("sid-status-foreign", agent=foreign)
 
     def test_run_single_child_binds_exact_runtime_owner_artifacts(self):
         from gateway.session_context import clear_session_vars, set_session_vars

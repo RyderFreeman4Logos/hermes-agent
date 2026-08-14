@@ -168,9 +168,11 @@ def _session_skills_catalog_mode(agent: Any) -> str:
 
     stored_prompt = getattr(agent, "_cached_system_prompt", None)
     if isinstance(stored_prompt, str):
-        match = _SKILLS_CATALOG_MODE_RE.search(stored_prompt)
-        if match:
-            mode = match.group("mode")
+        # Context files precede the core-emitted skills block. Use its last
+        # marker so an earlier context comment cannot shadow the session mode.
+        matches = list(_SKILLS_CATALOG_MODE_RE.finditer(stored_prompt))
+        if matches:
+            mode = matches[-1].group("mode")
             agent._skills_catalog_mode = mode
             return mode
 

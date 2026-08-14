@@ -9,6 +9,7 @@ import {
   toggleOverlaySection
 } from '../app/delegationStore.js'
 import { patchOverlayState } from '../app/overlayStore.js'
+import { getUiState } from '../app/uiStore.js'
 import { $spawnDiff, $spawnHistory, clearDiffPair, type SpawnSnapshot } from '../app/spawnHistoryStore.js'
 import { useTurnSelector } from '../app/turnStore.js'
 import type { GatewayClient } from '../gatewayClient.js'
@@ -681,7 +682,9 @@ export function AgentsOverlay({ gw, initialHistoryIndex = 0, onClose, t }: Agent
 
   useEffect(() => {
     // Warm caps + paused flag on open.
-    gw.request<DelegationStatusResponse>('delegation.status', {})
+    gw.request<DelegationStatusResponse>('delegation.status', {
+      session_id: getUiState().sid ?? undefined
+    })
       .then(r => applyDelegationStatus(asRpcResult<DelegationStatusResponse>(r)))
       .catch(() => {})
   }, [gw])
@@ -702,7 +705,11 @@ export function AgentsOverlay({ gw, initialHistoryIndex = 0, onClose, t }: Agent
     }
   }
 
-  const interrupt = (id: string) => gw.request<SubagentInterruptResponse>('subagent.interrupt', { subagent_id: id })
+  const interrupt = (id: string) =>
+    gw.request<SubagentInterruptResponse>('subagent.interrupt', {
+      session_id: getUiState().sid ?? undefined,
+      subagent_id: id
+    })
 
   const killOne = (id: string) =>
     guardLive(() => {

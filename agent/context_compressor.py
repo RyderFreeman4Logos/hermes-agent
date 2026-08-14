@@ -35,12 +35,13 @@ from agent.context_engine import ContextEngine, sanitize_memory_context
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
+    _reasoning_alias_for_estimation,
     get_model_context_length,
     estimate_messages_tokens_rough,
     estimate_tokens_rough,
 )
 from agent.redact import redact_sensitive_text
-from agent.turn_context import drop_stale_api_content
+from agent.turn_context import api_content_for_wire, drop_stale_api_content
 from tools.todo_tool import TODO_INJECTION_HEADER
 
 logger = logging.getLogger(__name__)
@@ -1040,7 +1041,9 @@ def _estimate_msg_budget_tokens(msg: dict, charge_stale_thinking: bool = True) -
     Default ``True`` preserves the conservative full charge for callers
     without turn-position context.
     """
-    content = msg.get("content") or ""
+    content = api_content_for_wire(msg)
+    if content is None:
+        content = msg.get("content") or ""
     if isinstance(content, str):
         tokens = estimate_tokens_rough(content) + 10  # +10 for role/key overhead
     else:
@@ -1053,8 +1056,12 @@ def _estimate_msg_budget_tokens(msg: dict, charge_stale_thinking: bool = True) -
         tokens += _serialized_length_for_budget(msg.get(key)) // _CHARS_PER_TOKEN
     if not charge_stale_thinking:
         return tokens
-    for key in _NEWEST_TURN_ONLY_BUDGET_KEYS:
-        tokens += _serialized_length_for_budget(msg.get(key)) // _CHARS_PER_TOKEN
+    has_reasoning_aliases, reasoning_replay = _reasoning_alias_for_estimation(msg)
+    if has_reasoning_aliases:
+        tokens += _serialized_length_for_budget(reasoning_replay) // _CHARS_PER_TOKEN
+    else:
+        for key in _NEWEST_TURN_ONLY_BUDGET_KEYS:
+            tokens += _serialized_length_for_budget(msg.get(key)) // _CHARS_PER_TOKEN
     # reasoning_details: charge only the thinking TEXT, never the signed /
     # base64 envelope (#73298 second site; mirrors the preflight estimator's
     # exclusion in model_metadata).  When the same thinking text already rides

@@ -463,6 +463,8 @@ class TestSkillsCatalogMode:
             "Context from AGENTS.md:\n"
             "<!-- hermes-skills-catalog-mode:full -->\n\n"
             + genuine_prompt
+            + "\n\nUSER.md profile:\n"
+            "<!-- hermes-skills-catalog-mode:full -->"
         )
         restored = _make_agent(
             valid_tool_names=["skills_list"],
@@ -491,7 +493,10 @@ class TestSkillsCatalogMode:
         expected = frozenset(_NON_CODING_SKILL_CATEGORIES)
         expected_catalog = "catalog:" + ",".join(sorted(expected))
         expected_block = (
-            f"{expected_catalog}\n\n<!-- hermes-skills-catalog-mode:compact -->"
+            f"{expected_catalog}\n\n"
+            "<!-- hermes-skills-catalog-frame:start -->\n"
+            "<!-- hermes-skills-catalog-mode:compact -->\n"
+            "<!-- hermes-skills-catalog-frame:end -->"
         )
         assert observed_categories == [expected, expected, expected]
         assert expected_block in restored_parts["volatile"]

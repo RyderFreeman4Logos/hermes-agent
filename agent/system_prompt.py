@@ -60,8 +60,15 @@ _PLUGIN_SECTION_FRAME_RE = re.compile(
     re.MULTILINE,
 )
 _SKILLS_CATALOG_MODE_MARKER = "<!-- hermes-skills-catalog-mode:{} -->"
+_SKILLS_CATALOG_MODE_FRAME = (
+    "<!-- hermes-skills-catalog-frame:start -->\n"
+    "{}\n"
+    "<!-- hermes-skills-catalog-frame:end -->"
+)
 _SKILLS_CATALOG_MODE_RE = re.compile(
-    r"<!-- hermes-skills-catalog-mode:(?P<mode>full|compact|names-only) -->"
+    _SKILLS_CATALOG_MODE_FRAME.format(
+        r"<!-- hermes-skills-catalog-mode:(?P<mode>full|compact|names-only) -->"
+    )
 )
 _SKILLS_CATALOG_MODES = frozenset({"full", "compact", "names-only"})
 
@@ -168,11 +175,12 @@ def _session_skills_catalog_mode(agent: Any) -> str:
 
     stored_prompt = getattr(agent, "_cached_system_prompt", None)
     if isinstance(stored_prompt, str):
-        # Context files precede the core-emitted skills block. Use its last
-        # marker so an earlier context comment cannot shadow the session mode.
+        # Context files precede the core-emitted skills block. Recover only
+        # the unique frame that the skills renderer appends around its marker;
+        # unrelated markers in later volatile sections are not candidates.
         matches = list(_SKILLS_CATALOG_MODE_RE.finditer(stored_prompt))
-        if matches:
-            mode = matches[-1].group("mode")
+        if len(matches) == 1:
+            mode = matches[0].group("mode")
             agent._skills_catalog_mode = mode
             return mode
 
@@ -481,9 +489,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             compact_categories=_compact_cats or None,
         )
         skills_prompt = (
-            f"{skills_prompt}\n\n{_SKILLS_CATALOG_MODE_MARKER.format(catalog_mode)}"
-            if skills_prompt
-            else _SKILLS_CATALOG_MODE_MARKER.format(catalog_mode)
+            f"{skills_prompt}\n\n" if skills_prompt else ""
+        ) + _SKILLS_CATALOG_MODE_FRAME.format(
+            _SKILLS_CATALOG_MODE_MARKER.format(catalog_mode)
         )
     else:
         skills_prompt = ""

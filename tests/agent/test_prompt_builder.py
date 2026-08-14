@@ -315,6 +315,32 @@ class TestBuildSkillsSystemPrompt:
         full = build_skills_system_prompt()
         assert "Write threads" in full
 
+    def test_all_categories_compaction_keeps_names_and_drops_descriptions(
+        self, monkeypatch, tmp_path
+    ):
+        from agent.prompt_builder import ALL_SKILL_CATEGORIES
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        for category, name in (("github", "review-pr"), ("travel", "plan-trip")):
+            skill_dir = tmp_path / "skills" / category / name
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text(
+                f"---\nname: {name}\ndescription: Full description for {name}\n---\n"
+            )
+
+        compact = build_skills_system_prompt(
+            compact_categories=ALL_SKILL_CATEGORIES
+        )
+        full = build_skills_system_prompt()
+
+        for name in ("review-pr", "plan-trip"):
+            assert name in compact
+            assert f"Full description for {name}" not in compact
+            assert f"Full description for {name}" in full
+        assert "skill_view(name)" in compact
+        assert "skills_list" in compact
+        assert "outside the current coding context" not in compact
+
 
 
     def test_excludes_disabled_skills(self, monkeypatch, tmp_path):

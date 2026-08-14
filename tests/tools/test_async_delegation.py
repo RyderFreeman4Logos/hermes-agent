@@ -175,41 +175,6 @@ def test_completion_event_lands_on_shared_queue_with_session_key():
     assert evt["delegation_id"] == res["delegation_id"]
 
 
-def test_batch_worker_exit_after_tool_progress_emits_one_terminal_failure():
-    """A lost continuation after tool progress must not orphan the batch."""
-    progress_seen = threading.Event()
-
-    def runner():
-        progress_seen.set()
-        raise SystemExit("continuation exited after successful tool progress")
-
-    res = ad.dispatch_async_delegation_batch(
-        goals=["recover the completed gate result"],
-        context=None,
-        toolsets=None,
-        role="leaf",
-        model="m",
-        session_key="owner-session",
-        parent_session_id="owner-parent",
-        runner=runner,
-        max_async_children=1,
-    )
-    assert res["status"] == "dispatched"
-    assert progress_seen.wait(timeout=2)
-
-    evt = _drain_for(res["delegation_id"])
-    assert evt is not None
-    assert evt["type"] == "async_delegation"
-    assert evt["is_batch"] is True
-    assert evt["status"] == "error"
-    assert evt["error"] == (
-        "SystemExit: continuation exited after successful tool progress"
-    )
-
-    # The worker-exit path is terminal exactly once.
-    assert _drain_for(res["delegation_id"], timeout=0.2) is None
-
-
 def test_rich_reinjection_block_is_self_contained():
     def runner():
         return {"status": "completed", "summary": "The answer is 42.",

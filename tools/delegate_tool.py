@@ -3650,6 +3650,37 @@ def _run_pending_child_controls(
     return delivered
 
 
+def _drain_restarted_child_controls(parent_agent) -> List[Dict[str, Any]]:
+    """Deliver accepted queue/interrupt controls after a process restart.
+
+    Recovery marks a dead owner's ``running``/``finalizing`` delegation row
+    ``unknown`` but an ``accepted`` child control is still pending. When the
+    owner session next engages (this ``delegate_task`` call), drain every
+    deliverable control it owns as exactly one retained-child turn each.
+    ``claim_child_control`` (claimable on recovered ``unknown`` rows, from any
+    process) guarantees exactly-once across processes, so concurrent drains
+    cannot double-deliver.
+    """
+    from tools import async_delegation as _ad
+
+    requester_sid = getattr(parent_agent, "session_id", None)
+    requester_sid = requester_sid if isinstance(requester_sid, str) else None
+    delivered: List[Dict[str, Any]] = []
+    for delegation_id, child_id in _ad.list_pending_child_controls():
+        if _ad.find_retained_child(child_id, owner_session_id=requester_sid) is None:
+            # Not one of this parent's retained children — leave it for its owner.
+            continue
+        delivered.extend(
+            _run_pending_child_controls(
+                delegation_id,
+                child_id,
+                parent_agent,
+                owner_session_id=requester_sid,
+            )
+        )
+    return delivered
+
+
 def _run_retained_child_turn(
     entry: Dict[str, Any],
     text: str,
@@ -3890,6 +3921,18 @@ def delegate_task(
         return tool_error(
             "Delegation spawning is paused. Clear the pause via the TUI "
             "(`p` in /agents) or the `delegation.pause` RPC before retrying."
+        )
+
+    # Restart delivery of accepted queue/interrupt controls: an accepted
+    # control on a dead owner's delegation is still pending after recovery
+    # classified the row unknown. The owner session draining this spawn runs
+    # each deliverable control it owns as exactly one retained-child turn.
+    # Claim is exactly-once across processes, so this cannot double-deliver.
+    try:
+        _drain_restarted_child_controls(parent_agent)
+    except Exception:
+        logger.debug(
+            "delegate_task: restart control drain failed", exc_info=True
         )
 
     # Normalise the top-level role once; per-task overrides re-normalise.

@@ -907,3 +907,123 @@ def test_gateway_cli_origin_event_left_unrouted():
     runner._enrich_async_delegation_routing(evt)
     assert "platform" not in evt
 
+
+# ---------------------------------------------------------------------------
+# Issue 73 unit 3 — cross-process exclusive acceptance + restart delivery
+# ---------------------------------------------------------------------------
+
+
+def _seed_control_delegation(db_path, delegation_id="deleg-succ", child_id="child-1"):
+    with ad._transaction() as conn:
+        conn.execute(
+            """INSERT INTO async_delegations
+               (delegation_id, origin_session, state, dispatched_at, updated_at,
+                children_json)
+               VALUES (?, ?, 'running', ?, ?, ?)""",
+            (
+                delegation_id,
+                "parent",
+                time.time(),
+                time.time(),
+                json.dumps([{"subagent_id": child_id, "session_id": "db-child"}]),
+            ),
+        )
+
+
+def test_restart_claim_works_after_recovery_marks_row_unknown(tmp_path, monkeypatch):
+    """An accepted control is still deliverable after the owner died.
+
+    recover_abandoned_delegations classifies a dead-owner running/finalizing
+    row as ``unknown``. A previously accepted queue/interrupt control on that
+    row must not be stranded: a fresh process must still be able to claim it
+    and start exactly one next/replacement turn.
+    """
+    db_path = tmp_path / "state.db"
+    monkeypatch.setattr(ad, "_db_path", lambda: db_path)
+    _seed_control_delegation(db_path)
+
+    receipt = ad.reserve_child_control("deleg-succ", "child-1", "queue", "next")
+    assert receipt["status"] == "accepted"
+
+    # Owner process dies before delivering; recovery marks the row unknown.
+    with ad._transaction() as conn:
+        conn.execute(
+            "UPDATE async_delegations SET state='unknown' WHERE delegation_id=?",
+            ("deleg-succ",),
+        )
+    # A fresh process takes over delivery.
+    monkeypatch.setattr(ad, "_CONTROL_PROCESS_TOKEN", "restarted-process")
+
+    claimed = ad.claim_child_control("deleg-succ", "child-1")
+    assert claimed is not None
+    assert claimed["generation"] == receipt["generation"]
+    assert claimed["state"] == "running"
+
+    # Exactly-once: a second claim in the same process delivers nothing.
+    assert ad.claim_child_control("deleg-succ", "child-1") is None
+
+
+_CAS_CHILD = r"""
+import json, os, sys, time
+from pathlib import Path
+from tools import async_delegation as ad
+
+db_path, delegation_id, child_id, action, message, result_file = sys.argv[1:7]
+ad._db_path = lambda: Path(db_path)
+# Synchronize so both processes try to reserve on the still-empty control row
+# at the same time, reproducing the two-readers-see-empty race.
+go = db_path + ".go"
+deadline = time.monotonic() + 10
+while not os.path.exists(go):
+    if time.monotonic() > deadline:
+        break
+    time.sleep(0.005)
+receipt = ad.reserve_child_control(delegation_id, child_id, action, message)
+with open(result_file, "w") as fh:
+    fh.write(json.dumps(receipt))
+"""
+
+
+def test_cross_process_reserve_reports_at_most_one_accepted(tmp_path, monkeypatch):
+    """Two processes reserving the same child cannot both report acceptance.
+
+    reserve_child_control's UPDATE is CAS-gated on the previously-read control
+    blob, so even two separate SQLite connections that both read an empty
+    control row can only let ONE commit accept. Without the CAS, both writes
+    succeed (last-writer-wins) and both callers receive `accepted` — the
+    mutually-exclusive queue/interrupt fence silently breaks across processes.
+    """
+    db_path = tmp_path / "state.db"
+    monkeypatch.setattr(ad, "_db_path", lambda: db_path)
+    _seed_control_delegation(db_path)
+
+    results = []
+    procs = []
+    for action in ("queue", "interrupt"):
+        result_file = tmp_path / f"res-{action}.json"
+        procs.append(
+            subprocess.Popen(
+                [
+                    sys.executable, "-c", _CAS_CHILD,
+                    os.fspath(db_path), "deleg-succ", "child-1",
+                    action, "next", os.fspath(result_file),
+                ],
+                cwd=os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+        )
+        results.append(result_file)
+    # Release both children simultaneously onto the empty control row.
+    (tmp_path / "state.db.go").write_text("go")
+    for proc in procs:
+        proc.wait(timeout=30)
+    receipts = []
+    for result_file in results:
+        receipts.append(json.loads(result_file.read_text()))
+
+    statuses = [r.get("status") for r in receipts]
+    assert statuses.count("accepted") <= 1, statuses
+    assert statuses.count("queued") <= 1, statuses
+    # The winner accepts; the loser never reports acceptance.
+    assert len([s for s in statuses if s in ("accepted", "queued")]) <= 1, statuses
+

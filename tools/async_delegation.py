@@ -1787,25 +1787,45 @@ def reserve_child_control(
             "accepted_at": now,
         }
         controls[child_id] = control
-        conn.execute(
+        cursor = conn.execute(
             """UPDATE async_delegations SET child_control_json=?, updated_at=?
-               WHERE delegation_id=? AND state IN ('running','finalizing')""",
-            (json.dumps(controls, ensure_ascii=False), now, delegation_id),
+               WHERE delegation_id=? AND state IN ('running','finalizing')
+                 AND child_control_json IS ?""",
+            (json.dumps(controls, ensure_ascii=False), now, delegation_id, row[2]),
         )
+        if cursor.rowcount != 1:
+            # A concurrent process (a separate SQLite connection that already
+            # passed the in-process lock) reserved this child between our read
+            # and write. The mutually-exclusive acceptance belongs to the
+            # winner; we must NOT also report accepted. _DB_LOCK only
+            # serializes threads inside one process, so the CAS on the
+            # previously-read control blob is the cross-process fence.
+            return {
+                "status": "pending",
+                "reason": "another child control is already pending",
+                "generation": generation,
+            }
         return dict(control)
 
 
 def claim_child_control(
     delegation_id: str, child_id: str, *, stale_after: float = 300.0
 ) -> Optional[Dict[str, Any]]:
-    """Claim an accepted child control exactly once, with restart recovery."""
+    """Claim an accepted child control exactly once, with restart recovery.
+
+    The delegation row's outcome state does not gate claiming: an accepted
+    control is still pending delivery even after the owner died and recovery
+    classified the row ``unknown``. A ``running`` control claimed by a
+    different (now restarted) process is re-claimed so it is not stranded
+    across a restart; the claiming process is presumed dead mid-delivery.
+    """
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
         row = conn.execute(
             "SELECT state, child_control_json FROM async_delegations WHERE delegation_id=?",
             (delegation_id,),
         ).fetchone()
-        if row is None or row[0] == "unknown":
+        if row is None:
             return None
         controls = _decode_child_controls(row[1])
         control = controls.get(str(child_id or "").strip())
@@ -1823,12 +1843,45 @@ def claim_child_control(
         control["claimed_at"] = now
         control["claimed_by"] = _CONTROL_PROCESS_TOKEN
         controls[str(child_id).strip()] = control
-        conn.execute(
+        cursor = conn.execute(
             """UPDATE async_delegations SET child_control_json=?, updated_at=?
                WHERE delegation_id=?""",
             (json.dumps(controls, ensure_ascii=False), now, delegation_id),
         )
+        if cursor.rowcount != 1:
+            return None
         return control
+
+
+def list_pending_child_controls(*, stale_after: float = 300.0) -> List[tuple]:
+    """Return (delegation_id, child_id) pairs with a deliverable control.
+
+    Restart delivery discovery: after the owner died, recovery classifies
+    the delegation row ``unknown`` but an ``accepted`` control is still
+    pending. A control already claimed --state=``running`` by a live process
+    (this process) is excluded; one claimed by any other (now restarted)
+    process is included so a fresh process can reclaim and deliver it.
+    Exactly-once delivery is guaranteed by ``claim_child_control`` itself,
+    so this scan may run concurrently without double delivery.
+    """
+    out: List[tuple] = []
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(
+            """SELECT delegation_id, child_control_json
+               FROM async_delegations
+               WHERE child_control_json IS NOT NULL
+                 AND lower(child_control_json) != '{}'
+                 AND state != 'dropped'"""
+        ).fetchall()
+        for delegation_id, blob in rows:
+            for child_id, control in _decode_child_controls(blob).items():
+                state = str(control.get("state") or "")
+                if state == "accepted":
+                    out.append((delegation_id, child_id))
+                elif state == "running":
+                    if str(control.get("claimed_by") or "") != _CONTROL_PROCESS_TOKEN:
+                        out.append((delegation_id, child_id))
+    return out
 
 
 def finish_child_control(

@@ -21,7 +21,7 @@ from tui_gateway._stdin_recovery import handle_spurious_eof
 
 from tui_gateway import server
 from tui_gateway.server import _CRASH_LOG, dispatch, resolve_skin, write_json
-from tui_gateway.transport import BufferedStreamWriter, TeeTransport
+from tui_gateway.transport import TeeTransport
 
 logger = logging.getLogger(__name__)
 
@@ -420,9 +420,6 @@ def ensure_mcp_discovery_started() -> None:
 
 def main():
     _install_sidecar_publisher()
-    previous_transport = server._stdio_transport
-    writer = BufferedStreamWriter(previous_transport)
-    server._stdio_transport = writer
 
     # MCP tool discovery — backgrounded so a slow or unreachable MCP server
     # can't freeze TUI startup (a dead stdio/http server burns 1+2+4s of
@@ -487,9 +484,6 @@ def main():
             if not write_json(resp):
                 _log_exit(f"response write failed for method={method!r} (broken stdout pipe)")
                 sys.exit(0)
-
-    writer.close()
-    server._stdio_transport = previous_transport
 
 
 if __name__ == "__main__":

@@ -1838,8 +1838,12 @@ def claim_child_control(
     The delegation row's outcome state does not gate claiming: an accepted
     control is still pending delivery even after the owner died and recovery
     classified the row ``unknown``. A ``running`` control claimed by a
-    different (now restarted) process is re-claimed so it is not stranded
-    across a restart; the claiming process is presumed dead mid-delivery.
+    different process is re-claimed ONLY on a dead-owner signal: recovery
+    flips the delegation row ``unknown`` only after confirming the owning
+    process PID is gone. A live foreign claimer (its own
+    ``_CONTROL_PROCESS_TOKEN``) must not be treated as "restarted", or two
+    live processes would both deliver a turn. Reclaim therefore fails closed
+    unless the recovered-dead ``unknown`` mark is present.
     """
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
@@ -1856,6 +1860,15 @@ def claim_child_control(
         state = str(control.get("state") or "")
         if state == "running":
             if control.get("claimed_by") == _CONTROL_PROCESS_TOKEN:
+                return None
+            # A running control claimed by a DIFFERENT process must only be
+            # reclaimed once its owner is provably dead. recover_abandoned_
+            # delegations flips the delegation row to 'unknown' only after it
+            # confirms the owning process PID is gone. Without that mark a live
+            # foreign process (with its own _CONTROL_PROCESS_TOKEN) would treat
+            # the claimer as "restarted" and both processes would deliver a
+            # turn. Fail closed: do not steal a live foreign claim.
+            if str(row[0] or "") != "unknown":
                 return None
         elif state != "accepted":
             return None

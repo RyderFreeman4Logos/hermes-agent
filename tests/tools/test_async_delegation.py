@@ -128,6 +128,14 @@ def test_child_control_receipt_is_durable_and_generation_fenced(tmp_path, monkey
     claimed = ad.claim_child_control("deleg-control", "child-1")
     assert claimed["generation"] == first["generation"]
     assert ad.claim_child_control("deleg-control", "child-1") is None
+    # The claiming process then dies before delivering; recovery classifies
+    # the dead owner's row `unknown`. Only that dead-owner signal entitles a
+    # different process to reclaim a running control.
+    with ad._transaction() as conn:
+        conn.execute(
+            "UPDATE async_delegations SET state='unknown' WHERE delegation_id=?",
+            ("deleg-control",),
+        )
     monkeypatch.setattr(ad, "_CONTROL_PROCESS_TOKEN", "restarted-process")
     reclaimed = ad.claim_child_control("deleg-control", "child-1")
     assert reclaimed is not None
@@ -1110,6 +1118,105 @@ def test_cross_process_claim_allows_at_most_one_winner(tmp_path, monkeypatch):
     results = [json.loads(r.read_text()) for r in result_files]
     winners = [r["claimed"] for r in results].count(True)
     assert winners <= 1, results
+
+
+# Production model: each OS process imports async_delegation and gets its own
+# `_CONTROL_PROCESS_TOKEN`. After process A claims an accepted control
+# (state=running, claimed_by=A), a LIVE process B with a distinct token must
+# NOT treat A as "restarted" and reclaim without a dead-owner signal. Blob CAS
+# alone is not enough: B compares against the running blob it just read (A's
+# claim), so the CAS succeeds. Only recovery's `unknown` row mark (owner PID
+# confirmed gone) entitles a foreign process to reclaim. This child runs ONE
+# claim with an explicitly distinct token; the parent serializes A then B so
+# B always observes A's running claim.
+_CLAIM_DISTINCT_CHILD = r"""
+import json, os, sys
+from pathlib import Path
+from tools import async_delegation as ad
+
+db_path, delegation_id, child_id, token, result_file = sys.argv[1:6]
+ad._db_path = lambda: Path(db_path)
+ad._CONTROL_PROCESS_TOKEN = token
+claimed = ad.claim_child_control(delegation_id, child_id)
+with open(result_file, "w") as fh:
+    fh.write(json.dumps({"claimed": bool(claimed)}))
+"""
+
+
+def test_cross_process_distinct_token_claim_allows_at_most_one_winner(tmp_path, monkeypatch):
+    """Two live OS processes with DISTINCT claim tokens: at most one wins.
+
+    Every process imports its own `_CONTROL_PROCESS_TOKEN`; giving the two
+    children different tokens models the real production path (unlike the
+    shared-token CAS test above). A claims the accepted control first. A live
+    second process B, reading A's running claim, must NOT reclaim merely
+    because `claimed_by != B` — that turns a live foreign claimer into
+    "restarted" and both drainers start a turn (winner_count=2). B may only
+    reclaim once recovery marks the row `unknown`.
+    """
+    db_path = tmp_path / "state.db"
+    monkeypatch.setattr(ad, "_db_path", lambda: db_path)
+    _seed_control_delegation(db_path)
+    receipt = ad.reserve_child_control("deleg-succ", "child-1", "queue", "next")
+    assert receipt["status"] == "accepted"
+
+    def run_child(token, result_name):
+        result_file = tmp_path / result_name
+        proc = subprocess.Popen(
+            [
+                sys.executable, "-c", _CLAIM_DISTINCT_CHILD,
+                os.fspath(db_path), "deleg-succ", "child-1",
+                token, os.fspath(result_file),
+            ],
+            cwd=os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        proc.wait(timeout=30)
+        return json.loads(result_file.read_text())
+
+    # A claims the accepted control first (row stays `running`: no recovery ran).
+    first = run_child("TOKEN-A", "distinct-a.json")
+    assert first["claimed"] is True
+    # A live foreign process must not reclaim A's running claim.
+    second = run_child("TOKEN-B", "distinct-b.json")
+    winners = [first["claimed"], second["claimed"]].count(True)
+    assert winners == 1, (first, second)
+    assert second["claimed"] is False
+
+
+def test_reclaim_dead_owner_running_control_allowed(tmp_path, monkeypatch):
+    """A recovered-dead owner's running control is still reclaimable.
+
+    The dead-owner signal (recovery flipping the row to `unknown`) is the ONLY
+    thing that entitles a different process to reclaim a running control. A
+    fresh process with a distinct token must be able to take over delivery of a
+    running control whose owner provably died mid-delivery; otherwise a crash
+    strands it and the replacement turn never runs.
+    """
+    db_path = tmp_path / "state.db"
+    monkeypatch.setattr(ad, "_db_path", lambda: db_path)
+    _seed_control_delegation(db_path)
+    receipt = ad.reserve_child_control("deleg-succ", "child-1", "queue", "next")
+    assert receipt["status"] == "accepted"
+
+    # Process A (distinct token) claims the accepted control.
+    monkeypatch.setattr(ad, "_CONTROL_PROCESS_TOKEN", "TOKEN-A")
+    claimed = ad.claim_child_control("deleg-succ", "child-1")
+    assert claimed is not None
+    assert claimed["state"] == "running"
+
+    # A dies before delivering; recovery classifies the dead owner's row unknown.
+    with ad._transaction() as conn:
+        conn.execute(
+            "UPDATE async_delegations SET state='unknown' WHERE delegation_id=?",
+            ("deleg-succ",),
+        )
+    # A fresh process B with a distinct token reclaims the running control.
+    monkeypatch.setattr(ad, "_CONTROL_PROCESS_TOKEN", "TOKEN-B")
+    reclaimed = ad.claim_child_control("deleg-succ", "child-1")
+    assert reclaimed is not None
+    assert reclaimed["claimed_by"] == "TOKEN-B"
+    assert reclaimed["generation"] == claimed["generation"]
 
 
 def test_recovery_retains_dead_owner_row_with_accepted_control(tmp_path, monkeypatch):

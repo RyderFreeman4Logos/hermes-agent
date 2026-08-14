@@ -364,6 +364,67 @@ class TestSkillsCatalogMode:
 
         load_config.assert_called_once_with()
 
+    def test_restored_agent_reuses_mode_from_persisted_prompt(self):
+        from agent.coding_context import _NON_CODING_SKILL_CATEGORIES
+        from agent.system_prompt import build_system_prompt, build_system_prompt_parts
+
+        observed_categories = []
+
+        def render_skills(*, compact_categories=None, **_kwargs):
+            categories = frozenset(compact_categories or ())
+            observed_categories.append(categories)
+            return "catalog:" + ",".join(sorted(categories))
+
+        first = _make_agent(valid_tool_names=["skills_list"])
+        with (
+            patch(
+                "hermes_cli.config.load_config_readonly",
+                return_value={"agent": {"skills_catalog_mode": "compact"}},
+            ),
+            patch("run_agent.load_soul_md", return_value=""),
+            patch("run_agent.build_nous_subscription_prompt", return_value=""),
+            patch("run_agent.build_environment_hints", return_value=""),
+            patch("run_agent.build_context_files_prompt", return_value=""),
+            patch("run_agent.get_toolset_for_tool", return_value=None),
+            patch(
+                "agent.coding_context.coding_compact_skill_categories",
+                return_value=frozenset(),
+            ),
+            patch(
+                "run_agent.build_skills_system_prompt",
+                side_effect=render_skills,
+            ),
+        ):
+            stored_prompt = build_system_prompt(first)
+
+        restored = _make_agent(
+            valid_tool_names=["skills_list"],
+            _cached_system_prompt=stored_prompt,
+        )
+        with (
+            patch(
+                "hermes_cli.config.load_config_readonly",
+                return_value={"agent": {"skills_catalog_mode": "full"}},
+            ),
+            patch("run_agent.load_soul_md", return_value=""),
+            patch("run_agent.build_nous_subscription_prompt", return_value=""),
+            patch("run_agent.build_environment_hints", return_value=""),
+            patch("run_agent.build_context_files_prompt", return_value=""),
+            patch("run_agent.get_toolset_for_tool", return_value=None),
+            patch(
+                "agent.coding_context.coding_compact_skill_categories",
+                return_value=frozenset(),
+            ),
+            patch(
+                "run_agent.build_skills_system_prompt",
+                side_effect=render_skills,
+            ),
+        ):
+            build_system_prompt_parts(restored)
+
+        expected = frozenset(_NON_CODING_SKILL_CATEGORIES)
+        assert observed_categories == [expected, expected]
+
     def test_modes_compose_with_existing_coding_demotions(self):
         from agent.coding_context import _NON_CODING_SKILL_CATEGORIES
         from agent.prompt_builder import ALL_SKILL_CATEGORIES

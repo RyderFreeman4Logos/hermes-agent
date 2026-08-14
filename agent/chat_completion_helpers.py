@@ -2138,7 +2138,6 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
 
         old_model = agent.model
         old_provider = agent.provider
-        old_base_url = agent.base_url
 
         # Clear the per-config context_length override so the fallback
         # model's actual context window is resolved instead of inheriting
@@ -2149,14 +2148,6 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         agent.requested_provider = fb_provider
         agent.base_url = fb_base_url
         agent.api_mode = fb_api_mode
-        from agent.agent_runtime_helpers import _rebuild_request_overrides_for_runtime
-
-        _rebuild_request_overrides_for_runtime(
-            agent,
-            previous_provider=old_provider,
-            previous_base_url=old_base_url,
-            previous_model=old_model,
-        )
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent._fallback_activated = True

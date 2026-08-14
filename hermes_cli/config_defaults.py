@@ -39,6 +39,7 @@ DEFAULT_CONFIG = {
     "max_live_sessions": 16,
     "observability": {
         "physical_attempt_digests": {"enabled": False},
+        "stream_stage_latency": {"enabled": False},
     },
     "agent": {
         "max_turns": 500,

@@ -3104,6 +3104,117 @@ class ContextCompressor(ContextEngine):
     # Tool output pruning (cheap pre-pass, no LLM call)
     # ------------------------------------------------------------------
 
+    def _demote_tool_result_at(
+        self,
+        result: List[Dict[str, Any]],
+        idx: int,
+        call_id_to_tool: dict,
+        protected_skills: set[str],
+        min_prune_chars: int,
+        *,
+        spare_protected_skills: bool = True,
+    ) -> bool:
+        """Replace one bulky tool result with its compact recovery summary."""
+        msg = result[idx]
+        if msg.get("role") != "tool":
+            return False
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            stripped = _strip_image_parts_from_parts(content)
+            if stripped is not None:
+                result[idx] = {**msg, "content": stripped}
+                return True
+            return False
+        if isinstance(content, dict) and content.get("_multimodal"):
+            summary = content.get("text_summary") or "[screenshot removed to save context]"
+            result[idx] = {**msg, "content": f"[screenshot removed] {summary[:200]}"}
+            return True
+        if not isinstance(content, str):
+            return False
+        if not content or content == _PRUNED_TOOL_PLACEHOLDER:
+            return False
+        if content.startswith("[Duplicate tool output"):
+            return False
+        if content.startswith("[") and " chars)" in content and len(content) < 400:
+            return False
+        if content.startswith("[screenshot removed"):
+            return False
+        if len(content) <= min_prune_chars:
+            return False
+        call_id = msg.get("tool_call_id", "")
+        tool_name, tool_args = call_id_to_tool.get(call_id, ("unknown", ""))
+        if spare_protected_skills and tool_name == "skill_view" and protected_skills:
+            try:
+                args = json.loads(tool_args) if tool_args else {}
+            except (json.JSONDecodeError, TypeError):
+                args = {}
+            skill = args.get("name", "") if isinstance(args, dict) else ""
+            if isinstance(skill, str) and skill.lower() in protected_skills:
+                return False
+        result[idx] = {
+            **msg,
+            "content": _summarize_tool_result(tool_name, tool_args, content),
+        }
+        return True
+
+    def _demote_post_summary_protected_tail(
+        self,
+        messages: List[Dict[str, Any]],
+        tail_start: int,
+    ) -> int:
+        """Demote bulky retained-tail tools before the single compression commit.
+
+        This is deliberately bounded to the final protected tail.  The full
+        compressor already invalidates the prompt prefix once, so changing
+        these message bodies here is coalesced into that same durable rewrite;
+        the independent proactive-prune path remains untouched.
+        """
+        if tail_start >= len(messages):
+            return 0
+
+        def _tail_tokens() -> int:
+            return sum(
+                _estimate_msg_budget_tokens(messages[idx])
+                for idx in range(tail_start, len(messages))
+            )
+
+        if _tail_tokens() <= self.tail_token_budget:
+            return 0
+
+        call_id_to_tool: dict[str, tuple[str, str]] = {}
+        for msg in messages:
+            if msg.get("role") != "assistant":
+                continue
+            for tool_call in msg.get("tool_calls") or []:
+                call_id = _extract_tool_call_id(tool_call)
+                if call_id:
+                    call_id_to_tool[call_id] = _extract_tool_call_name_and_args(tool_call)
+
+        protected_skills = _collect_protected_skill_names(messages, tail_start)
+        demote_end = max(tail_start, len(messages) - _PRESSURE_KEEP_RECENT_MESSAGES)
+        demoted = 0
+        for idx in range(tail_start, demote_end):
+            if self._is_context_summary_message(messages[idx]):
+                continue
+            if self._demote_tool_result_at(
+                messages,
+                idx,
+                call_id_to_tool,
+                protected_skills,
+                _PRUNE_MIN_CHARS,
+            ):
+                demoted += 1
+                if _tail_tokens() <= self.tail_token_budget:
+                    break
+        if demoted and not self.quiet_mode:
+            logger.info(
+                "Post-summary protected-tail demotion: reclaimed %d tool result(s) "
+                "before the compression commit (tail now ~%s tokens)",
+                demoted,
+                f"{_tail_tokens():,}",
+            )
+        return demoted
+
     def _prune_old_tool_results(
         self, messages: List[Dict[str, Any]], protect_tail_count: int,
         protect_tail_tokens: int | None = None,
@@ -3230,60 +3341,6 @@ class ContextCompressor(ContextEngine):
         # while the model still believes its instructions are in context.
         protected_skills = _collect_protected_skill_names(result, prune_boundary)
 
-        def _demote_tool_result_at(idx: int, *, spare_protected_skills: bool = True) -> bool:
-            """Replace a bulky tool result at ``idx`` with a 1-line summary.
-
-            Returns True when the message was modified.
-            """
-            nonlocal pruned
-            msg = result[idx]
-            if msg.get("role") != "tool":
-                return False
-            content = msg.get("content", "")
-            if isinstance(content, list):
-                stripped = _strip_image_parts_from_parts(content)
-                if stripped is not None:
-                    result[idx] = {**msg, "content": stripped}
-                    pruned += 1
-                    return True
-                return False
-            if isinstance(content, dict) and content.get("_multimodal"):
-                summary = content.get("text_summary") or "[screenshot removed to save context]"
-                result[idx] = {**msg, "content": f"[screenshot removed] {summary[:200]}"}
-                pruned += 1
-                return True
-            if not isinstance(content, str):
-                return False
-            if not content or content == _PRUNED_TOOL_PLACEHOLDER:
-                return False
-            if content.startswith("[Duplicate tool output"):
-                return False
-            # Already replaced by a prior prune/pressure pass (1-line summary).
-            if content.startswith("[") and " chars)" in content and len(content) < 400:
-                return False
-            if content.startswith("[screenshot removed"):
-                return False
-            # Only prune if the content is substantial (default >200 chars; the
-            # proactive path raises this floor via min_prune_chars).
-            if len(content) <= min_prune_chars:
-                return False
-            call_id = msg.get("tool_call_id", "")
-            tool_name, tool_args = call_id_to_tool.get(call_id, ("unknown", ""))
-            if spare_protected_skills and tool_name == "skill_view" and protected_skills:
-                # Just-loaded / actively-referenced skills survive verbatim
-                # (#32106). Pass-4 pressure demotion overrides this.
-                try:
-                    _args = json.loads(tool_args) if tool_args else {}
-                except (json.JSONDecodeError, TypeError):
-                    _args = {}
-                _skill = _args.get("name", "") if isinstance(_args, dict) else ""
-                if isinstance(_skill, str) and _skill.lower() in protected_skills:
-                    return False
-            summary = _summarize_tool_result(tool_name, tool_args, content)
-            result[idx] = {**msg, "content": summary}
-            pruned += 1
-            return True
-
         def _truncate_tool_call_args_at(idx: int) -> bool:
             """Shrink large tool_call argument payloads at ``idx``."""
             msg = result[idx]
@@ -3306,7 +3363,14 @@ class ContextCompressor(ContextEngine):
 
         # Pass 2: Replace old tool results with informative summaries
         for i in range(max(0, prune_boundary)):
-            _demote_tool_result_at(i)
+            if self._demote_tool_result_at(
+                result,
+                i,
+                call_id_to_tool,
+                protected_skills,
+                min_prune_chars,
+            ):
+                pruned += 1
 
         # Pass 3: Truncate large tool_call arguments in assistant messages
         # outside the protected tail. write_file with 50KB content, for
@@ -3346,7 +3410,15 @@ class ContextCompressor(ContextEngine):
                     # Pressure passes override the just-loaded-skill guard:
                     # when the protected region itself blows the soft budget,
                     # sparing skill bodies would recreate the #61932 dead-end.
-                    if _demote_tool_result_at(i, spare_protected_skills=False):
+                    if self._demote_tool_result_at(
+                        result,
+                        i,
+                        call_id_to_tool,
+                        protected_skills,
+                        min_prune_chars,
+                        spare_protected_skills=False,
+                    ):
+                        pruned += 1
                         pressure_hits += 1
                     if _truncate_tool_call_args_at(i):
                         pressure_hits += 1
@@ -3366,7 +3438,15 @@ class ContextCompressor(ContextEngine):
                         if last_tool_idx is not None and i == last_tool_idx:
                             continue
                         if result[i].get("role") == "tool":
-                            if _demote_tool_result_at(i, spare_protected_skills=False):
+                            if self._demote_tool_result_at(
+                                result,
+                                i,
+                                call_id_to_tool,
+                                protected_skills,
+                                min_prune_chars,
+                                spare_protected_skills=False,
+                            ):
+                                pruned += 1
                                 pressure_hits += 1
                         elif result[i].get("role") == "assistant":
                             if _truncate_tool_call_args_at(i):
@@ -3380,9 +3460,15 @@ class ContextCompressor(ContextEngine):
                         and last_tool_idx >= prune_boundary
                         and _protected_region_tokens() > soft_ceiling
                     ):
-                        if _demote_tool_result_at(
-                            last_tool_idx, spare_protected_skills=False
+                        if self._demote_tool_result_at(
+                            result,
+                            last_tool_idx,
+                            call_id_to_tool,
+                            protected_skills,
+                            min_prune_chars,
+                            spare_protected_skills=False,
                         ):
+                            pruned += 1
                             pressure_hits += 1
                 if pressure_hits and not self.quiet_mode:
                     logger.info(
@@ -6451,6 +6537,8 @@ This compaction should PRIORITISE preserving all information related to the focu
              prior real-usage ineffectiveness strike — the deterministic
              fallback drop recovers the negligible savings instead)
           5. On re-compression, iteratively update the previous summary
+          6. Demote bulky retained-tail tool results in that same compressed
+             list, before persistence can invalidate the prompt prefix
 
         Blank platform-echo user rows trailing the latest actionable user
         turn are removed in the same cheap pre-pass phase as tool-result
@@ -7130,6 +7218,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         _merge_target_idx = 0
         if _force_user_leading and first_tail_visible_idx is not None:
             _merge_target_idx = first_tail_visible_idx
+        post_summary_tail_start = len(compressed)
         for tail_idx, msg in enumerate(tail_messages):
             if _merge_summary_into_tail and tail_idx == _merge_target_idx:
                 # Merge the summary into the tail message that collided.
@@ -7177,6 +7266,11 @@ This compaction should PRIORITISE preserving all information related to the focu
                 drop_stale_api_content(msg)
                 _merge_summary_into_tail = False
             compressed.append(msg)
+
+        self._demote_post_summary_protected_tail(
+            compressed,
+            post_summary_tail_start,
+        )
 
         self.compression_count += 1
 

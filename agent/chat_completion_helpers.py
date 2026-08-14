@@ -228,6 +228,32 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def codex_pre_dispatch_watchdog_allowance(agent, api_kwargs: dict) -> float:
+    """Return the watchdog headroom a Codex request needs before dispatch.
+
+    A caller-owned turn deadline must cover the same first-byte and event-idle
+    windows used by the request watchdog.  Refusing a request that cannot fit
+    that window is safer than dispatching work that the client is guaranteed
+    to kill and then replaying it.
+    """
+    if getattr(agent, "api_mode", None) != "codex_responses":
+        return 0.0
+
+    est_tokens = estimate_request_context_tokens(api_kwargs)
+    if est_tokens > 100_000:
+        idle_default = 180.0
+    elif est_tokens > 50_000:
+        idle_default = 120.0
+    elif est_tokens > 10_000:
+        idle_default = 60.0
+    else:
+        idle_default = 12.0
+
+    ttfb = _env_float("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", 120.0)
+    idle = _env_float("HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS", idle_default)
+    return max(0.0, ttfb) + max(0.0, idle)
+
+
 def _estimate_chunk_bytes(chunk: Any) -> int:
     """Cheap per-chunk size estimate for the stream diagnostic counters.
 
@@ -1318,6 +1344,14 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 pass
             raise InterruptedError("Agent interrupted during API call")
     if result["error"] is not None:
+        if _codex_watchdog_enabled and isinstance(result["error"], TimeoutError):
+            # A watchdog fires after the provider request was dispatched.  A
+            # replay can duplicate work that the provider already accepted.
+            setattr(
+                result["error"],
+                "_hermes_ambiguous_provider_acceptance",
+                True,
+            )
         raise result["error"]
     # Success — clear the circuit breaker (#58962): the provider proved
     # responsive.  See the canonical comment block above ``_stale_streak()``.

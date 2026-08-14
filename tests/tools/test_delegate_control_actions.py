@@ -479,3 +479,82 @@ def test_foreign_parent_cannot_queue_or_interrupt_replacement(monkeypatch):
         )
     finally:
         _unregister_subagent(sid)
+
+
+def test_restart_drain_delivers_each_accepted_control_exactly_once(monkeypatch):
+    """After a restart, accepted controls start exactly one turn each.
+
+    When the owning process exits, recovery classifies its delegation row
+    ``unknown`` but an accepted queue/interrupt control is still pending. The
+    rebooted session's next delegate_task drains every accepted control it
+    owns as exactly one retained-child turn — they must not be stranded.
+    """
+    import tools.delegate_tool as dt
+    import tools.async_delegation as ad
+
+    parent = _StubParent()
+    parent.session_id = "owner-session"
+    entry = {"child_id": "child-restart", "child_session_id": "db-child"}
+    claimed = [
+        {"action": "queue", "message": "resume after restart", "generation": 7},
+        {"action": "queue", "message": "resume again", "generation": 8},
+    ]
+    delivered = []
+    turns = []
+
+    monkeypatch.setattr(
+        ad,
+        "list_pending_child_controls",
+        lambda **kw: [("deleg-restart", "child-restart")],
+    )
+    monkeypatch.setattr(ad, "find_retained_child", lambda *a, **k: entry)
+    monkeypatch.setattr(
+        ad,
+        "claim_child_control",
+        lambda *a, **k: (claimed.pop(0) if claimed else None),
+    )
+    monkeypatch.setattr(ad, "retain_completed_delegation", lambda *a, **k: None)
+    monkeypatch.setattr(ad, "claim_retained_child", lambda *a, **k: "resume-claim")
+    monkeypatch.setattr(ad, "release_retained_child", lambda *a, **k: None)
+    monkeypatch.setattr(
+        dt,
+        "_run_retained_child_turn",
+        lambda found, message, owner, **kwargs: turns.append((found, message))
+        or {"status": "completed", "summary": "delivered"},
+    )
+    monkeypatch.setattr(
+        ad, "finish_child_control", lambda *a, **k: delivered.append(a)
+    )
+
+    results = dt._drain_restarted_child_controls(parent)
+
+    assert len(results) == 2
+    assert turns == [
+        (entry, "resume after restart"),
+        (entry, "resume again"),
+    ]
+    assert len(delivered) == 2
+
+
+def test_restart_drain_skips_foreign_children(monkeypatch):
+    """A drained parent only delivers controls for children it owns."""
+    import tools.delegate_tool as dt
+    import tools.async_delegation as ad
+
+    parent = _StubParent()
+    parent.session_id = "owner-session"
+    run = []
+    monkeypatch.setattr(
+        ad,
+        "list_pending_child_controls",
+        lambda **kw: [("deleg-foreign", "child-other")],
+    )
+    monkeypatch.setattr(ad, "find_retained_child", lambda *a, **k: None)
+    monkeypatch.setattr(
+        dt,
+        "_run_pending_child_controls",
+        lambda *a, **k: run.append(a) or [{"status": "completed"}],
+    )
+
+    assert dt._drain_restarted_child_controls(parent) == []
+    assert run == []

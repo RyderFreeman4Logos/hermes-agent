@@ -104,6 +104,18 @@ class TestEstimateMessagesTokensRough:
         # substituted (which would undercount the real request).
         assert result >= (len(big_sidecar) // 4) * 0.9
 
+    def test_duplicate_reasoning_aliases_are_counted_once(self):
+        prose = "reasoning token pressure " * 2_000
+        wire_shape = {
+            "role": "assistant",
+            "content": "done",
+            "reasoning_content": prose,
+        }
+
+        assert estimate_messages_tokens_rough([
+            dict(wire_shape, reasoning=prose)
+        ]) == estimate_messages_tokens_rough([wire_shape])
+
     def test_non_string_api_content_does_not_displace_content(self):
         """Only a sidecar shape the wire actually substitutes may displace content.
 

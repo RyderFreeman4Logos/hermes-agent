@@ -808,6 +808,39 @@ def test_run_codex_stream_returns_terminal_response_when_post_terminal_drain_fai
     )
 
 
+@pytest.mark.parametrize("error_type", ["ReadError", "WriteError"])
+def test_run_conversation_codex_accepted_transport_error_is_not_replayed(
+    monkeypatch, error_type
+):
+    """An accepted HTTPX transport failure must fence generic conversation retry."""
+    import httpx
+
+    agent = _build_agent(monkeypatch)
+    calls = {"count": 0}
+
+    def _create(**_kwargs):
+        calls["count"] += 1
+        raise getattr(httpx, error_type)("accepted transport failure")
+
+    client = SimpleNamespace(responses=SimpleNamespace(create=_create))
+    monkeypatch.setattr(
+        agent,
+        "_create_request_openai_client",
+        lambda **_kwargs: client,
+    )
+    monkeypatch.setattr(
+        agent,
+        "_close_request_openai_client",
+        lambda *_args, **_kwargs: None,
+    )
+
+    result = agent.run_conversation("do not replay an accepted request")
+
+    assert calls["count"] == 1
+    assert result["failed"] is True
+    assert result["ambiguous_provider_attempt"] is True
+
+
 def test_run_conversation_codex_plain_text(monkeypatch):
     agent = _build_agent(monkeypatch)
     monkeypatch.setattr(agent, "_interruptible_api_call", lambda api_kwargs: _codex_message_response("OK"))

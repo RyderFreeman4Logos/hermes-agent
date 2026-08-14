@@ -9,14 +9,19 @@ backgrounded) and never consume the per-turn subagent spawn cap.
 """
 
 import json
+import time
 import weakref
+from concurrent.futures import ThreadPoolExecutor
 
 from tools.delegate_tool import (
     _handle_control_action,
     _is_descendant_of,
+    _run_pending_child_controls,
     _register_subagent,
     _unregister_subagent,
     delegate_task,
+    interrupt_subagent_with_replacement,
+    queue_subagent,
 )
 
 
@@ -336,3 +341,141 @@ def test_control_action_not_blocked_at_spawn_cap():
     )
     # And spawns remain blocked afterwards — the control call didn't reset it
     assert ctl2.before_call("delegate_task", {"goal": "c"}).action == "block"
+
+
+# ---------------------------------------------------------------------------
+# Running-child queue and interrupt-with-replacement
+# ---------------------------------------------------------------------------
+
+
+def test_queue_and_interrupt_are_serialized_per_child(monkeypatch):
+    """Only one mutually-exclusive delivery mode can reserve a child."""
+    import tools.async_delegation as ad
+    import tools.delegate_tool as dt
+
+    parent = _StubParent()
+    child = _StubChild(parent)
+    sid = "sid-ctl-delivery-race"
+    _register(sid, child, delegation_id="deleg-race")
+    monkeypatch.setattr(
+        ad,
+        "reserve_child_control",
+        lambda *args, **kwargs: {"status": "accepted", "generation": 1},
+    )
+    monkeypatch.setattr(dt, "request_hard_interrupt", lambda *args: True)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [
+                pool.submit(queue_subagent, sid, "next turn"),
+                pool.submit(interrupt_subagent_with_replacement, sid, "replace"),
+            ]
+            results = [future.result() for future in futures]
+        accepted = [item for item in results if item.get("status") in {"queued", "accepted"}]
+        pending = [item for item in results if item.get("status") == "pending"]
+        assert len(accepted) == 1
+        assert len(pending) == 1
+    finally:
+        _unregister_subagent(sid)
+
+
+def test_queue_subagent_uses_durable_acceptance_without_touching_current_child(
+    tmp_path, monkeypatch
+):
+    import tools.async_delegation as ad
+
+    db_path = tmp_path / "state.db"
+    monkeypatch.setattr(ad, "_db_path", lambda: db_path)
+    with ad._transaction() as conn:
+        conn.execute(
+            """INSERT INTO async_delegations
+               (delegation_id, origin_session, state, dispatched_at, updated_at,
+                children_json)
+               VALUES (?, ?, 'running', ?, ?, ?)""",
+            (
+                "deleg-queue-live",
+                "parent",
+                time.time(),
+                time.time(),
+                json.dumps([{"subagent_id": "sid-queue-live", "session_id": "db-child"}]),
+            ),
+        )
+    parent = _StubParent()
+    child = _StubChild(parent)
+    _register("sid-queue-live", child, delegation_id="deleg-queue-live")
+    try:
+        receipt = queue_subagent("sid-queue-live", "next turn")
+        assert receipt["status"] == "queued"
+        assert child.steered == []
+    finally:
+        _unregister_subagent("sid-queue-live")
+
+
+def test_pending_child_control_runs_one_turn_on_same_session(monkeypatch):
+    """A queued or replacement turn resumes the retained SessionDB child."""
+    import tools.async_delegation as ad
+    import tools.delegate_tool as dt
+
+    parent = _StubParent()
+    entry = {"child_id": "sid-ctl-same-session", "child_session_id": "db-child"}
+    claimed = [{"action": "interrupt", "message": "replace it", "generation": 4}]
+    retained = []
+    delivered = []
+    turns = []
+
+    monkeypatch.setattr(
+        ad,
+        "claim_child_control",
+        lambda *args, **kwargs: claimed.pop(0) if claimed else None,
+    )
+    monkeypatch.setattr(ad, "retain_completed_delegation", lambda *args, **kwargs: retained.append(args))
+    monkeypatch.setattr(ad, "find_retained_child", lambda *args, **kwargs: entry)
+    monkeypatch.setattr(ad, "claim_retained_child", lambda *args, **kwargs: "resume-claim")
+    monkeypatch.setattr(ad, "release_retained_child", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        dt,
+        "_run_retained_child_turn",
+        lambda found, message, owner, **kwargs: turns.append((found, message))
+        or {"status": "completed", "summary": "replacement"},
+    )
+    monkeypatch.setattr(
+        ad,
+        "finish_child_control",
+        lambda *args, **kwargs: delivered.append((args, kwargs)),
+    )
+
+    results = _run_pending_child_controls(
+        "deleg-same-session", "sid-ctl-same-session", parent,
+        current_result={"status": "interrupted"},
+    )
+
+    assert len(results) == 1
+    assert turns == [(entry, "replace it")]
+    assert retained
+    assert delivered
+
+
+def test_queue_and_interrupt_actions_are_control_only():
+    from agent.tool_guardrails import _subagent_spawn_count
+
+    assert _subagent_spawn_count({"action": "queue", "subagent_id": "x", "message": "m"}) == 0
+    assert _subagent_spawn_count({"action": "interrupt", "subagent_id": "x", "message": "m"}) == 0
+
+
+def test_foreign_parent_cannot_queue_or_interrupt_replacement(monkeypatch):
+    import tools.delegate_tool as dt
+
+    owner = _StubParent()
+    foreign = _StubParent()
+    child = _StubChild(owner)
+    sid = "sid-ctl-foreign-delivery"
+    _register(sid, child, delegation_id="deleg-foreign")
+    monkeypatch.setattr(dt, "request_hard_interrupt", lambda *args: True)
+    try:
+        assert "No live subagent" in _handle_control_action(
+            "queue", sid, "leak", foreign
+        )
+        assert "No live subagent" in _handle_control_action(
+            "interrupt", sid, "leak", foreign
+        )
+    finally:
+        _unregister_subagent(sid)

@@ -51,6 +51,7 @@ from tools.daemon_pool import DaemonThreadPoolExecutor
 from tools.thread_context import propagate_context_to_thread
 
 logger = logging.getLogger(__name__)
+_CONTROL_PROCESS_TOKEN = uuid.uuid4().hex
 
 # Back-compat alias — the daemon executor now lives in tools.daemon_pool so
 # other subsystems (tool_executor, memory_manager, delegate_tool, skills_hub)
@@ -167,7 +168,8 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             task_json TEXT,
             delivery_claim TEXT,
             delivery_claimed_at REAL,
-            origin_session_id TEXT NOT NULL DEFAULT ''
+            origin_session_id TEXT NOT NULL DEFAULT '',
+            child_control_json TEXT
         )"""
     )
     columns = {row[1] for row in conn.execute("PRAGMA table_info(async_delegations)")}
@@ -194,6 +196,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         ("usage_json", "TEXT"),
         ("resume_claim", "TEXT"),
         ("resume_claimed_at", "REAL"),
+        ("child_control_json", "TEXT"),
     ):
         if name not in columns:
             conn.execute(f"ALTER TABLE async_delegations ADD COLUMN {name} {sql_type}")
@@ -1698,6 +1701,176 @@ def _lineage_root(session_id: Optional[str]) -> Optional[str]:
     finally:
         if db is not None:
             db.close()
+
+
+def _decode_child_controls(raw: Optional[str]) -> Dict[str, Dict[str, Any]]:
+    try:
+        decoded = json.loads(raw or "{}")
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(decoded, dict):
+        return {}
+    return {
+        str(child_id): dict(control)
+        for child_id, control in decoded.items()
+        if isinstance(control, dict)
+    }
+
+
+def _child_manifest_ids(raw: Optional[str]) -> set[str]:
+    try:
+        manifest = json.loads(raw or "[]")
+    except (TypeError, ValueError):
+        return set()
+    if not isinstance(manifest, list):
+        return set()
+    ids: set[str] = set()
+    for child in manifest:
+        if not isinstance(child, dict):
+            continue
+        for key in ("subagent_id", "session_id"):
+            value = str(child.get(key) or "").strip()
+            if value:
+                ids.add(value)
+    return ids
+
+
+def reserve_child_control(
+    delegation_id: str, child_id: str, action: str, message: str
+) -> Dict[str, Any]:
+    """Durably reserve one running-child delivery mode.
+
+    The row is the cross-process fence: a retry for the same operation returns
+    its existing receipt, while a different queue/interrupt operation cannot
+    also report acceptance for the same child generation.
+    """
+    delegation_id = str(delegation_id or "").strip()
+    child_id = str(child_id or "").strip()
+    action = str(action or "").strip().lower()
+    message = str(message or "").strip()
+    if not delegation_id or not child_id or action not in {"queue", "interrupt"} or not message:
+        return {"status": "terminal", "reason": "invalid child control"}
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        row = conn.execute(
+            """SELECT state, children_json, child_control_json
+               FROM async_delegations WHERE delegation_id=?""",
+            (delegation_id,),
+        ).fetchone()
+        if row is None or child_id not in _child_manifest_ids(row[1]):
+            return {"status": "terminal", "reason": "child is unavailable"}
+        controls = _decode_child_controls(row[2])
+        current = controls.get(child_id)
+        if current is not None:
+            current_action = str(current.get("action") or "")
+            current_message = str(current.get("message") or "")
+            current_state = str(current.get("state") or "")
+            if current_action == action and current_message == message:
+                receipt = dict(current)
+                receipt.setdefault("status", "pending" if current_state == "running" else current_state)
+                return receipt
+            if current_state in {"accepted", "running", "indeterminate"}:
+                return {
+                    "status": "pending",
+                    "reason": "another child control is already pending",
+                    "generation": current.get("generation"),
+                }
+        if row[0] not in {"running", "finalizing"}:
+            return {"status": "terminal", "reason": "child task is already terminal"}
+        generation = int(current.get("generation") or 0) + 1 if current else 1
+        control = {
+            "action": action,
+            "message": message,
+            "generation": generation,
+            "state": "accepted",
+            "status": "accepted",
+            "accepted_at": now,
+        }
+        controls[child_id] = control
+        conn.execute(
+            """UPDATE async_delegations SET child_control_json=?, updated_at=?
+               WHERE delegation_id=? AND state IN ('running','finalizing')""",
+            (json.dumps(controls, ensure_ascii=False), now, delegation_id),
+        )
+        return dict(control)
+
+
+def claim_child_control(
+    delegation_id: str, child_id: str, *, stale_after: float = 300.0
+) -> Optional[Dict[str, Any]]:
+    """Claim an accepted child control exactly once, with restart recovery."""
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        row = conn.execute(
+            "SELECT state, child_control_json FROM async_delegations WHERE delegation_id=?",
+            (delegation_id,),
+        ).fetchone()
+        if row is None or row[0] == "unknown":
+            return None
+        controls = _decode_child_controls(row[1])
+        control = controls.get(str(child_id or "").strip())
+        if control is None:
+            return None
+        state = str(control.get("state") or "")
+        if state == "running":
+            if control.get("claimed_by") == _CONTROL_PROCESS_TOKEN:
+                return None
+        elif state != "accepted":
+            return None
+        control = dict(control)
+        control["state"] = "running"
+        control["status"] = "pending"
+        control["claimed_at"] = now
+        control["claimed_by"] = _CONTROL_PROCESS_TOKEN
+        controls[str(child_id).strip()] = control
+        conn.execute(
+            """UPDATE async_delegations SET child_control_json=?, updated_at=?
+               WHERE delegation_id=?""",
+            (json.dumps(controls, ensure_ascii=False), now, delegation_id),
+        )
+        return control
+
+
+def finish_child_control(
+    delegation_id: str,
+    child_id: str,
+    generation: int,
+    *,
+    state: str = "delivered",
+    error: Optional[str] = None,
+) -> bool:
+    """Record the terminal receipt for one claimed replacement turn."""
+    if state not in {"delivered", "indeterminate", "terminal"}:
+        state = "indeterminate"
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        row = conn.execute(
+            "SELECT child_control_json FROM async_delegations WHERE delegation_id=?",
+            (delegation_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        controls = _decode_child_controls(row[0])
+        control = controls.get(str(child_id or "").strip())
+        if control is None or int(control.get("generation") or 0) != int(generation):
+            return False
+        if str(control.get("state") or "") not in {"running", "indeterminate"}:
+            return False
+        if control.get("claimed_by") != _CONTROL_PROCESS_TOKEN:
+            return False
+        control = dict(control)
+        control["state"] = state
+        control["status"] = state
+        control["finished_at"] = now
+        if error:
+            control["error"] = str(error)
+        controls[str(child_id).strip()] = control
+        cursor = conn.execute(
+            """UPDATE async_delegations SET child_control_json=?, updated_at=?
+               WHERE delegation_id=?""",
+            (json.dumps(controls, ensure_ascii=False), now, delegation_id),
+        )
+        return cursor.rowcount == 1
 
 
 def record_dispatched_children(

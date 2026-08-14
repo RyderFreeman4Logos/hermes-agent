@@ -3051,7 +3051,10 @@ def _(rid, params: dict) -> dict:
 
 @method("subagent.interrupt")
 def _(rid, params: dict) -> dict:
-    from tools.delegate_tool import interrupt_subagent
+    from tools.delegate_tool import (
+        interrupt_subagent,
+        interrupt_subagent_with_replacement,
+    )
 
     subagent_id = str(params.get("subagent_id") or "").strip()
     if not subagent_id:
@@ -3063,15 +3066,63 @@ def _(rid, params: dict) -> dict:
     invoking_transport, invoking_session = _current_session_steer_authority(
         invoking_session_id
     )
-    found = False
+    message = str(params.get("message") or params.get("text") or "").strip()
+    if not message:
+        found = False
+        if invoking_transport is not None and invoking_session is not None:
+            found = interrupt_subagent(
+                subagent_id,
+                owner_session_id=invoking_session_id,
+                owner_transport=invoking_transport,
+                owner_session_record=invoking_session,
+            )
+        return _ok(rid, {"found": found, "subagent_id": subagent_id})
+    receipt = {"status": "terminal", "subagent_id": subagent_id}
     if invoking_transport is not None and invoking_session is not None:
-        found = interrupt_subagent(
+        receipt = interrupt_subagent_with_replacement(
             subagent_id,
+            message,
             owner_session_id=invoking_session_id,
             owner_transport=invoking_transport,
             owner_session_record=invoking_session,
         )
-    return _ok(rid, {"found": found, "subagent_id": subagent_id})
+    return _ok(rid, receipt)
+
+
+@method("subagent.queue")
+def _(rid, params: dict) -> dict:
+    """Queue one next user turn on a running child SessionDB session."""
+    from tools.delegate_tool import queue_subagent
+
+    subagent_id = str(params.get("subagent_id") or "").strip()
+    if not subagent_id:
+        return _err(rid, 4000, "subagent_id required")
+    message = str(params.get("message") or params.get("text") or "").strip()
+    if not message:
+        return _err(rid, 4002, "message is required")
+    _invoking_session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    invoking_session_id = str(params.get("session_id") or "").strip()
+    invoking_transport, invoking_session = _current_session_steer_authority(
+        invoking_session_id
+    )
+    if invoking_transport is None or invoking_session is None:
+        return _ok(
+            rid,
+            {
+                "status": "terminal",
+                "subagent_id": subagent_id,
+            },
+        )
+    receipt = queue_subagent(
+        subagent_id,
+        message,
+        owner_session_id=invoking_session_id,
+        owner_transport=invoking_transport,
+        owner_session_record=invoking_session,
+    )
+    return _ok(rid, receipt)
 
 
 @method("subagent.steer")

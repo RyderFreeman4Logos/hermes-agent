@@ -8,7 +8,9 @@ missed-steer retention race (a child that finishes before the drain) and
 the subagent.steer gateway RPC that fronts the helper.
 """
 
+import json
 import threading
+import time
 from unittest.mock import MagicMock
 
 from tools.delegate_tool import (
@@ -566,6 +568,84 @@ class TestSubagentSteerRPC:
             assert agent.interrupted == ["Interrupted via TUI (sid-rpc-interrupt)"]
         finally:
             _unregister_subagent("sid-rpc-interrupt")
+
+    def test_queue_live_child_requires_owner_and_foreign_fails_closed(self, monkeypatch, tmp_path):
+        import tools.async_delegation as ad
+
+        owner_transport = self._Transport()
+        foreign_transport = self._Transport()
+        owner_record = {
+            "session_key": "owner-session",
+            "history": [],
+            "transport": owner_transport,
+        }
+        agent = _StubAgent()
+        _with_registered(
+            "sid-rpc-queue",
+            agent,
+            owner_session_id="owner-session",
+            owner_transport=owner_transport,
+            owner_session_record=owner_record,
+        )
+        db_path = tmp_path / "state.db"
+        monkeypatch.setattr(ad, "_db_path", lambda: db_path)
+        _register_subagent(
+            {
+                "subagent_id": "sid-rpc-queue",
+                "parent_id": "root",
+                "depth": 1,
+                "goal": "test",
+                "status": "running",
+                "agent": agent,
+                "owner_session_id": "owner-session",
+                "owner_transport": owner_transport,
+                "owner_session_record": owner_record,
+                "delegation_id": "deleg-rpc-queue",
+            }
+        )
+        try:
+            with ad._transaction() as conn:
+                conn.execute(
+                    """INSERT INTO async_delegations
+                       (delegation_id, origin_session, state, dispatched_at,
+                        updated_at, children_json)
+                       VALUES (?, ?, 'running', ?, ?, ?)""",
+                    (
+                        "deleg-rpc-queue",
+                        "owner-session",
+                        time.time(),
+                        time.time(),
+                        json.dumps(
+                            [{"subagent_id": "sid-rpc-queue", "session_id": "db-child"}]
+                        ),
+                    ),
+                )
+            # Foreign transport fails closed — no durable acceptance recorded.
+            envelope = self._call(
+                {
+                    "session_id": "owner-session",
+                    "subagent_id": "sid-rpc-queue",
+                    "message": "next step",
+                },
+                transport=foreign_transport,
+                session_record=owner_record,
+                method="subagent.queue",
+            )
+            assert envelope["result"]["status"] == "terminal"
+            # Owner transport accepts and queues one durable next turn.
+            envelope = self._call(
+                {
+                    "session_id": "owner-session",
+                    "subagent_id": "sid-rpc-queue",
+                    "message": "next step",
+                },
+                transport=owner_transport,
+                session_record=owner_record,
+                method="subagent.queue",
+            )
+            assert envelope["result"]["status"] == "queued"
+        finally:
+            _unregister_subagent("sid-rpc-queue")
 
     def test_interrupt_without_session_authority_does_not_probe_child(self):
         agent = _StubAgent()

@@ -17,7 +17,10 @@ def _no_codex_backoff(monkeypatch):
     """Short-circuit retry backoff so Codex retry tests don't block on real
     wall-clock waits (5s jittered_backoff base delay + tight time.sleep loop)."""
     import time as _time
+    from agent import conversation_loop
+
     monkeypatch.setattr(run_agent, "jittered_backoff", lambda *a, **k: 0.0)
+    monkeypatch.setattr(conversation_loop, "jittered_backoff", lambda *a, **k: 0.0)
     monkeypatch.setattr(_time, "sleep", lambda *_a, **_k: None)
 
 
@@ -1565,7 +1568,11 @@ def test_mid_turn_compaction_does_not_double_persist_in_place_rows(monkeypatch, 
     )
 
 
-def _codex_incomplete_with_reasoning(text: str, reasoning_id: str = "rs_default"):
+def _codex_incomplete_with_reasoning(
+    text: str,
+    reasoning_id: str = "rs_default",
+    encrypted_content: str | None = None,
+):
     """Incomplete response with a reasoning item whose id/encrypted_content
     can vary independently of the visible message text."""
     return SimpleNamespace(
@@ -1573,7 +1580,11 @@ def _codex_incomplete_with_reasoning(text: str, reasoning_id: str = "rs_default"
             SimpleNamespace(
                 type="reasoning",
                 id=reasoning_id,
-                encrypted_content=f"opaque_{reasoning_id}",
+                encrypted_content=(
+                    encrypted_content
+                    if encrypted_content is not None
+                    else f"opaque_{reasoning_id}"
+                ),
                 summary=[SimpleNamespace(text="thinking...")],
             ),
             SimpleNamespace(
@@ -1647,6 +1658,94 @@ def test_codex_incomplete_opaque_state_updated_in_place(monkeypatch):
             (i.get("id") if isinstance(i, dict) else getattr(i, "id", None)) == "rs_2"
             for i in items
         )
+
+
+def test_codex_incomplete_continues_past_local_count_until_late_completion(monkeypatch):
+    """A continuation count is diagnostic, never a hard turn terminator."""
+    agent = _build_agent(monkeypatch)
+    agent.max_iterations = 4
+    responses = [
+        _codex_incomplete_with_reasoning(f"Partial {index}", f"rs_{index}")
+        for index in range(10)
+    ] + [_codex_message_response("Late completion")]
+    lineage = []
+
+    def _fake_api_call(_api_kwargs):
+        lineage.append(agent._codex_incomplete_retries)
+        return responses.pop(0)
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _fake_api_call)
+
+    result = agent.run_conversation("continue the same turn")
+
+    assert result["completed"] is True
+    assert result["final_response"] == "Late completion"
+    assert result["api_calls"] == 11
+    assert lineage == list(range(11))
+    assert agent._codex_incomplete_retries == 0
+    assert agent.iteration_budget.used == 1
+
+
+def test_codex_duplicate_replay_state_backs_off_before_a_new_billed_request(monkeypatch):
+    """Known-identical replay state must not busy-dispatch another request."""
+    from agent import conversation_loop
+
+    agent = _build_agent(monkeypatch)
+    responses = [
+        _codex_incomplete_with_reasoning(
+            "Same state", "rs_first", encrypted_content="opaque_same"
+        ),
+        _codex_incomplete_with_reasoning(
+            "Same state", "rs_second", encrypted_content="opaque_same"
+        ),
+        _codex_message_response("Must not dispatch"),
+    ]
+    requests = []
+    backoffs = []
+
+    def _fake_api_call(api_kwargs):
+        requests.append(api_kwargs)
+        return responses.pop(0)
+
+    def _interrupting_backoff(attempt, **_kwargs):
+        backoffs.append(attempt)
+        agent._interrupt_requested = True
+        return 0.4
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _fake_api_call)
+    monkeypatch.setattr(conversation_loop, "jittered_backoff", _interrupting_backoff)
+
+    result = agent.run_conversation("do not busy replay")
+
+    assert len(requests) == 2
+    assert backoffs == [2]
+    assert result["completed"] is False
+    assert result["interrupted"] is True
+
+
+def test_codex_pre_dispatch_deadline_rejects_too_small_watchdog_budget(monkeypatch):
+    """A short client deadline must not dispatch a request it cannot cover."""
+    from agent import conversation_loop
+
+    agent = _build_agent(monkeypatch)
+    monkeypatch.setenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "5")
+    monkeypatch.setenv("HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS", "5")
+    monkeypatch.setattr(conversation_loop.time, "monotonic", lambda: 100.0)
+    monkeypatch.setattr(
+        agent,
+        "_interruptible_api_call",
+        lambda _kwargs: pytest.fail("provider dispatch must not occur"),
+    )
+
+    result = agent.run_conversation(
+        "do not dispatch without watchdog headroom",
+        turn_deadline=107.0,
+    )
+
+    assert result["api_calls"] == 0
+    assert result["completed"] is False
+    assert result["failed"] is True
+    assert result.get("ambiguous_provider_attempt") is not True
 
 
 def test_normalize_codex_response_marks_commentary_only_message_as_incomplete(monkeypatch):

@@ -808,7 +808,7 @@ def test_run_codex_stream_returns_terminal_response_when_post_terminal_drain_fai
     )
 
 
-@pytest.mark.parametrize("error_type", ["ReadError", "WriteError"])
+@pytest.mark.parametrize("error_type", ["ReadError", "WriteError", "WriteTimeout"])
 def test_run_conversation_codex_accepted_transport_error_is_not_replayed(
     monkeypatch, error_type
 ):

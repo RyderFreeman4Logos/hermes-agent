@@ -1318,14 +1318,11 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
 
     active_client = client or agent._ensure_primary_openai_client(reason="codex_stream_direct")
     max_stream_retries = 1
-    # NetworkError covers the full httpx read/write/close family; once a
-    # request leaves the client, every member is ambiguous for billing.
-    _ambiguous_transport_errors = (
-        _httpx.RemoteProtocolError,
-        _httpx.ReadTimeout,
-        _httpx.NetworkError,
-        ConnectionError,
-    )
+    # TransportError includes TimeoutException (including WriteTimeout) and
+    # the full HTTPX read/write/close/protocol family. Transport failures are
+    # ambiguous once dispatched; only a ConnectError before writer claim is
+    # still safe to retry.
+    _ambiguous_transport_errors = (_httpx.TransportError, ConnectionError)
     # Accumulate streamed text so callers / compat shims can read it.
     agent._codex_streamed_text_parts: list = []
 

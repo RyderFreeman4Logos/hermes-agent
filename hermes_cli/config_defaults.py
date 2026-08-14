@@ -1826,6 +1826,10 @@ DEFAULT_CONFIG = {
         # Flip to true only if you trust delegated work to run dangerous cmds
         # without human review (cron pipelines, batch automation, etc.).
         "subagent_auto_approve": False,
+        # Completed children stay follow-up addressable until tombstoned by
+        # retention limits; tombstoning never deletes the child transcript.
+        "max_retained": 10,
+        "retained_ttl_hours": 72,
     },
 
     # Ephemeral prefill messages file — JSON list of {role, content} dicts

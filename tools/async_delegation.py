@@ -182,6 +182,18 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         # completions recovered after a process restart are unroutable on
         # api_server (the in-memory record that carried it is gone).
         ("origin_session_id", "TEXT"),
+        # Completed native children remain addressable through their durable
+        # SessionDB conversation. The manifest is JSON so one async batch can
+        # retain more than one child without a second runtime or registry.
+        ("child_session_id", "TEXT"),
+        ("children_json", "TEXT"),
+        ("retained", "INTEGER NOT NULL DEFAULT 0"),
+        ("retained_at", "REAL"),
+        ("tombstoned_at", "REAL"),
+        ("owner_profile", "TEXT"),
+        ("usage_json", "TEXT"),
+        ("resume_claim", "TEXT"),
+        ("resume_claimed_at", "REAL"),
     ):
         if name not in columns:
             conn.execute(f"ALTER TABLE async_delegations ADD COLUMN {name} {sql_type}")
@@ -283,11 +295,13 @@ def _prune_durable_records() -> None:
     cutoff = now - _DURABLE_RETENTION_SECONDS
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
-            "DELETE FROM async_delegations WHERE delivery_state='delivered' AND updated_at < ?",
+            "DELETE FROM async_delegations WHERE delivery_state='delivered' "
+            "AND COALESCE(retained, 0)=0 AND updated_at < ?",
             (cutoff,),
         )
         terminal_count = conn.execute(
-            "SELECT COUNT(*) FROM async_delegations WHERE state NOT IN ('running','finalizing')"
+            "SELECT COUNT(*) FROM async_delegations "
+            "WHERE state NOT IN ('running','finalizing') AND COALESCE(retained, 0)=0"
         ).fetchone()[0]
         excess = max(0, terminal_count - _MAX_RETAINED_COMPLETED)
         if excess:
@@ -295,22 +309,25 @@ def _prune_durable_records() -> None:
                 """DELETE FROM async_delegations WHERE delegation_id IN (
                      SELECT delegation_id FROM async_delegations
                      WHERE state NOT IN ('running','finalizing')
-                     ORDER BY CASE delivery_state WHEN 'delivered' THEN 0 ELSE 1 END,
+                       AND COALESCE(retained, 0)=0
+                      ORDER BY CASE delivery_state WHEN 'delivered' THEN 0 ELSE 1 END,
                               updated_at ASC LIMIT ?
                    )""",
                 (excess,),
             )
         pending_count = conn.execute(
             """SELECT COUNT(*) FROM async_delegations
-               WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'"""
+               WHERE state NOT IN ('running','finalizing')
+                 AND delivery_state='pending' AND COALESCE(retained, 0)=0"""
         ).fetchone()[0]
         overflow = max(0, pending_count - _MAX_DURABLE_PENDING)
         if overflow:
             conn.execute(
                 """DELETE FROM async_delegations WHERE delegation_id IN (
                      SELECT delegation_id FROM async_delegations
-                     WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'
-                     ORDER BY updated_at ASC LIMIT ?
+                     WHERE state NOT IN ('running','finalizing')
+                       AND delivery_state='pending' AND COALESCE(retained, 0)=0
+                      ORDER BY updated_at ASC LIMIT ?
                    )""",
                 (overflow,),
             )
@@ -326,6 +343,16 @@ def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
             (event.get("status", "completed"), event.get("completed_at", now), now,
              json.dumps(event), json.dumps(result), event["delegation_id"]),
         )
+    if event.get("status") == "completed":
+        # Retention is best-effort around the existing completion queue: a
+        # registry write must never turn a successful child into a failed one.
+        try:
+            retain_completed_delegation(
+                str(event.get("delegation_id") or ""),
+                usage=result.get("usage") if isinstance(result, dict) else None,
+            )
+        except Exception:
+            logger.debug("retaining completed delegation failed", exc_info=True)
 
 
 def _note_delivery_attempt(delegation_id: str) -> None:
@@ -390,6 +417,10 @@ def recover_abandoned_delegations() -> int:
                 (now, now, json.dumps(event), json.dumps(result), delegation_id),
             )
             recovered += 1
+    try:
+        rehydrate_retained_children()
+    except Exception:
+        logger.debug("retained-child rehydration failed", exc_info=True)
     return recovered
 
 
@@ -1605,6 +1636,285 @@ def interrupt_for_session(
             count, reason,
         )
     return count
+
+
+# ---------------------------------------------------------------------------
+# Durable retained-child registry
+# ---------------------------------------------------------------------------
+
+_DEFAULT_MAX_RETAINED = 10
+_DEFAULT_RETAINED_TTL_HOURS = 72.0
+_FOLLOW_UP_UNAVAILABLE = "Retained child is unavailable for this session."
+
+
+def _retention_limits() -> tuple[int, float]:
+    """Read bounded retained-child limits without making config mandatory."""
+    max_retained = _DEFAULT_MAX_RETAINED
+    ttl_hours = _DEFAULT_RETAINED_TTL_HOURS
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly().get("delegation") or {}
+        if isinstance(config, dict):
+            max_retained = max(1, int(config.get("max_retained", max_retained)))
+            ttl_hours = max(1.0, float(config.get("retained_ttl_hours", ttl_hours)))
+    except Exception:
+        pass
+    return max_retained, ttl_hours
+
+
+def _current_owner_profile() -> str:
+    try:
+        from agent.relay_runtime import current_profile_key
+
+        profile = current_profile_key()
+        return profile.strip() if isinstance(profile, str) else ""
+    except Exception:
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+
+            profile = get_active_profile_name()
+            return profile.strip() if isinstance(profile, str) else ""
+        except Exception:
+            return ""
+
+
+def _open_session_db_readonly():
+    from hermes_state import SessionDB
+
+    return SessionDB(get_hermes_home() / "state.db", read_only=True)
+
+
+def _lineage_root(session_id: Optional[str]) -> Optional[str]:
+    """Return a proven compression-only owner root, or ``None`` on doubt."""
+    if not isinstance(session_id, str) or not session_id.strip():
+        return None
+    db = None
+    try:
+        db = _open_session_db_readonly()
+        return db.get_compression_lineage_root(session_id.strip())
+    except Exception:
+        return None
+    finally:
+        if db is not None:
+            db.close()
+
+
+def record_dispatched_children(
+    delegation_id: str, children: List[Dict[str, Any]]
+) -> None:
+    """Persist stable child handles captured at async admission."""
+    if not delegation_id:
+        return
+    manifest = [child for child in children if isinstance(child, dict)]
+    child_session_id = (
+        str(manifest[0].get("session_id") or "") if len(manifest) == 1 else None
+    )
+    with _DB_LOCK, _transaction() as conn:
+        conn.execute(
+            """UPDATE async_delegations
+               SET children_json=?, child_session_id=?, owner_profile=?, updated_at=?
+               WHERE delegation_id=?""",
+            (
+                json.dumps(manifest, ensure_ascii=False),
+                child_session_id,
+                _current_owner_profile(),
+                time.time(),
+                delegation_id,
+            ),
+        )
+
+
+def retain_completed_delegation(
+    delegation_id: str, usage: Optional[Dict[str, Any]] = None
+) -> None:
+    """Make a completed async unit's child sessions follow-up addressable."""
+    if not delegation_id:
+        return
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        conn.execute(
+            """UPDATE async_delegations
+               SET retained=1, retained_at=?, usage_json=?, updated_at=?
+               WHERE delegation_id=? AND tombstoned_at IS NULL""",
+            (
+                now,
+                json.dumps(usage, ensure_ascii=False) if usage is not None else None,
+                now,
+                delegation_id,
+            ),
+        )
+    prune_retained_children()
+
+
+def _row_children(row) -> List[Dict[str, Any]]:
+    try:
+        children = json.loads(row[5] or "[]")
+    except (TypeError, ValueError):
+        children = []
+    if not children and row[6]:
+        children = [{"session_id": row[6]}]
+    return [child for child in children if isinstance(child, dict)]
+
+
+def _retained_rows() -> List[Any]:
+    with _DB_LOCK, _transaction() as conn:
+        return conn.execute(
+            """SELECT delegation_id, parent_session_id, owner_profile, state,
+                      retained_at, children_json, child_session_id, completed_at
+               FROM async_delegations
+               WHERE retained=1 AND tombstoned_at IS NULL
+               ORDER BY retained_at DESC"""
+        ).fetchall()
+
+
+def _owner_can_access(entry: Dict[str, Any], requester_session_id: Optional[str]) -> bool:
+    """Require profile equality and a compression-only parent lineage."""
+    owner_profile = str(entry.get("owner_profile") or "")
+    requester_profile = _current_owner_profile()
+    if not owner_profile or not requester_profile or owner_profile != requester_profile:
+        return False
+    child_session_id = str(entry.get("child_session_id") or "")
+    if not requester_session_id or requester_session_id == child_session_id:
+        return False
+    owner_root = _lineage_root(entry.get("parent_session_id"))
+    requester_root = _lineage_root(requester_session_id)
+    return owner_root is not None and owner_root == requester_root
+
+
+def list_retained_children(
+    owner_session_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """List retained children, optionally restricted to one proven owner."""
+    prune_retained_children()
+    out: List[Dict[str, Any]] = []
+    for row in _retained_rows():
+        children = _row_children(row)
+        for child in children:
+            entry = {
+                "delegation_id": row[0],
+                "parent_session_id": row[1],
+                "owner_profile": row[2] or "",
+                "state": row[3],
+                "retained_at": row[4],
+                "completed_at": row[7],
+                "child_id": child.get("subagent_id") or child.get("session_id") or "",
+                "child_session_id": child.get("session_id") or "",
+                "model": child.get("model"),
+                "provider": child.get("provider"),
+                "goal": child.get("goal"),
+            }
+            if owner_session_id is None or _owner_can_access(entry, owner_session_id):
+                out.append(entry)
+    return out
+
+
+def find_retained_child(
+    child_id: str, owner_session_id: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
+    """Resolve a handle without revealing a foreign retained record."""
+    if not isinstance(child_id, str) or not child_id.strip():
+        return None
+    needle = child_id.strip()
+    for entry in list_retained_children():
+        if needle not in {
+            entry.get("child_id"),
+            entry.get("child_session_id"),
+            entry.get("delegation_id"),
+        }:
+            continue
+        if owner_session_id is not None and not _owner_can_access(entry, owner_session_id):
+            return None
+        return entry
+    return None
+
+
+def check_follow_up_authority(
+    entry: Dict[str, Any], requester_session_id: Optional[str]
+) -> Optional[str]:
+    if _owner_can_access(entry, requester_session_id):
+        return None
+    return _FOLLOW_UP_UNAVAILABLE
+
+
+def claim_retained_child(entry: Dict[str, Any]) -> Optional[str]:
+    """CAS-claim one follow-up so concurrent callers cannot fork history."""
+    claim = uuid.uuid4().hex
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        current = now - 300.0
+        cursor = conn.execute(
+            """UPDATE async_delegations
+               SET resume_claim=?, resume_claimed_at=?
+               WHERE delegation_id=? AND retained=1 AND tombstoned_at IS NULL
+                 AND (resume_claim IS NULL OR resume_claimed_at < ?)""",
+            (claim, now, entry.get("delegation_id"), current),
+        )
+        return claim if cursor.rowcount == 1 else None
+
+
+def release_retained_child(entry: Dict[str, Any], claim: str) -> None:
+    if not claim:
+        return
+    with _DB_LOCK, _transaction() as conn:
+        conn.execute(
+            """UPDATE async_delegations SET resume_claim=NULL, resume_claimed_at=NULL
+               WHERE delegation_id=? AND resume_claim=?""",
+            (entry.get("delegation_id"), claim),
+        )
+
+
+def tombstone_retained_child(
+    child_id: str, owner_session_id: Optional[str] = None
+) -> bool:
+    entry = find_retained_child(child_id, owner_session_id=owner_session_id)
+    if entry is None:
+        return False
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        cursor = conn.execute(
+            """UPDATE async_delegations SET tombstoned_at=?, updated_at=?
+               WHERE delegation_id=? AND retained=1 AND tombstoned_at IS NULL""",
+            (now, now, entry["delegation_id"]),
+        )
+    return cursor.rowcount == 1
+
+
+def prune_retained_children(
+    max_retained: Optional[int] = None, ttl_hours: Optional[float] = None
+) -> int:
+    """Tombstone expired/excess records without deleting transcripts."""
+    configured_max, configured_ttl = _retention_limits()
+    max_retained = configured_max if max_retained is None else max(1, int(max_retained))
+    ttl_hours = configured_ttl if ttl_hours is None else max(0.0, float(ttl_hours))
+    now = time.time()
+    cutoff = now - ttl_hours * 3600.0
+    pruned = 0
+    with _DB_LOCK, _transaction() as conn:
+        cursor = conn.execute(
+            """UPDATE async_delegations SET tombstoned_at=?, updated_at=?
+               WHERE retained=1 AND tombstoned_at IS NULL AND retained_at < ?""",
+            (now, now, cutoff),
+        )
+        pruned += cursor.rowcount
+        rows = conn.execute(
+            """SELECT delegation_id FROM async_delegations
+               WHERE retained=1 AND tombstoned_at IS NULL
+               ORDER BY retained_at DESC"""
+        ).fetchall()
+        for row in rows[max_retained:]:
+            cursor = conn.execute(
+                """UPDATE async_delegations SET tombstoned_at=?, updated_at=?
+                   WHERE delegation_id=? AND tombstoned_at IS NULL""",
+                (now, now, row[0]),
+            )
+            pruned += cursor.rowcount
+    return pruned
+
+
+def rehydrate_retained_children() -> int:
+    prune_retained_children()
+    return len(_retained_rows())
 
 
 def _reset_for_tests() -> None:

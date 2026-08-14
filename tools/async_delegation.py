@@ -378,12 +378,13 @@ def recover_abandoned_delegations() -> int:
         rows = conn.execute(
             """SELECT delegation_id, origin_session, origin_ui_session_id,
                       parent_session_id, dispatched_at, owner_pid,
-                      owner_started_at, task_json, origin_session_id
+                      owner_started_at, task_json, origin_session_id,
+                      child_control_json
                FROM async_delegations WHERE state IN ('running','finalizing')"""
         ).fetchall()
         for row in rows:
             (delegation_id, session_key, origin_ui, parent_id, dispatched_at,
-             pid, started, task_json, origin_session_id) = row
+             pid, started, task_json, origin_session_id, control_json) = row
             live = False
             if pid:
                 live = _pid_exists(int(pid))
@@ -413,11 +414,32 @@ def recover_abandoned_delegations() -> int:
                 if task.get(_k):
                     event[_k] = task[_k]
             result = {"status": "unknown", "summary": None, "error": event["error"]}
+            # An accepted (undelivered) queue/interrupt control on this row is
+            # still pending delivery: the dead owner never got to the child.
+            # Retain the row so the restart drain (which finds children only via
+            # the retained registry, and still fail-closes on foreign owners)
+            # can deliver exactly one next/replacement turn. Without this, the
+            # accepted control strands on the unknown/unretained dead-owner path.
+            pending_controls = any(
+                str(c.get("state") or "") == "accepted"
+                for c in _decode_child_controls(control_json).values()
+            )
             conn.execute(
                 """UPDATE async_delegations SET state='unknown', completed_at=?,
-                   updated_at=?, event_json=?, result_json=?, delivery_state='pending'
+                   updated_at=?, event_json=?, result_json=?, delivery_state='pending',
+                   retained = CASE WHEN ? THEN 1 ELSE retained END,
+                   retained_at = CASE WHEN ? THEN ? ELSE retained_at END
                    WHERE delegation_id=?""",
-                (now, now, json.dumps(event), json.dumps(result), delegation_id),
+                (
+                    now,
+                    now,
+                    json.dumps(event),
+                    json.dumps(result),
+                    pending_controls,
+                    pending_controls,
+                    now,
+                    delegation_id,
+                ),
             )
             recovered += 1
     try:
@@ -1845,10 +1867,21 @@ def claim_child_control(
         controls[str(child_id).strip()] = control
         cursor = conn.execute(
             """UPDATE async_delegations SET child_control_json=?, updated_at=?
-               WHERE delegation_id=?""",
-            (json.dumps(controls, ensure_ascii=False), now, delegation_id),
+               WHERE delegation_id=? AND child_control_json IS ?""",
+            (
+                json.dumps(controls, ensure_ascii=False),
+                now,
+                delegation_id,
+                row[1],
+            ),
         )
         if cursor.rowcount != 1:
+            # A concurrent process (a separate SQLite connection that already
+            # passed the in-process lock) claimed this control between our read
+            # and write. Mutually-exclusive delivery belongs to the winner; the
+            # loser must NOT also start a turn. _DB_LOCK only serializes threads
+            # inside one process, so the CAS on the previously-read blob is the
+            # cross-process fence (same shape as reserve_child_control).
             return None
         return control
 

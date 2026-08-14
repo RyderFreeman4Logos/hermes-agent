@@ -2876,9 +2876,21 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     # Bedrock Converse uses boto3's converse_stream() with real-time delta
     # callbacks — same UX as Anthropic and chat_completions streaming.
     if agent.api_mode == "bedrock_converse":
+        stage = None
         result = {"response": None, "error": None}
         first_delta_fired = {"done": False}
         deltas_were_sent = {"yes": False}
+
+        def _stage_callback(callback):
+            if stage is None or callback is None:
+                return callback
+
+            def _wrapped(*args):
+                with stage.stage("callback"):
+                    return callback(*args)
+
+            return _wrapped
+
         # Wire-level liveness for the boto3 converse_stream worker: the worker
         # thread blocks inside ``for event in event_stream`` with NO read
         # timeout, so a provider that opens the stream then stops yielding
@@ -2898,11 +2910,17 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # the entry check on the OpenAI/Anthropic path below.
         _check_stale_giveup(agent)
 
+        stage = stream_stage_diagnostics.start_attempt()
+        _first_delta_callback = _stage_callback(on_first_delta)
+        _stream_delta_callback = _stage_callback(agent._fire_stream_delta)
+        _tool_callback = _stage_callback(agent._fire_tool_gen_started)
+        _reasoning_callback = _stage_callback(agent._fire_reasoning_delta)
+
         def _fire_first():
-            if not first_delta_fired["done"] and on_first_delta:
+            if not first_delta_fired["done"] and _first_delta_callback:
                 first_delta_fired["done"] = True
                 try:
-                    on_first_delta()
+                    _first_delta_callback()
                 except Exception:
                     pass
 
@@ -2955,16 +2973,24 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
                 def _on_text(text):
                     _fire_first()
-                    agent._fire_stream_delta(text)
+                    _stream_delta_callback(text)
                     deltas_were_sent["yes"] = True
 
                 def _on_tool(name):
                     _fire_first()
-                    agent._fire_tool_gen_started(name)
+                    _tool_callback(name)
 
                 def _on_reasoning(text):
                     _fire_first()
-                    agent._fire_reasoning_delta(text)
+                    _reasoning_callback(text)
+
+                def _observe_bedrock_event():
+                    if stage is not None:
+                        stage.observe_chunk()
+
+                def _on_bedrock_event():
+                    _observe_bedrock_event()
+                    _bedrock_last_event.__setitem__("t", time.time())
 
                 def _finalize_bedrock_stream():
                     return stream_converse_with_callbacks(
@@ -3023,7 +3049,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     if agent.reasoning_callback or agent.stream_delta_callback or plugin_reasoning_observer
                     else None,
                     on_interrupt_check=lambda: agent._interrupt_requested,
-                    on_event=lambda: _bedrock_last_event.__setitem__("t", time.time()),
+                    on_event=_on_bedrock_event,
                 )
                 result["response"] = stream.final_response or streamed_response
             except Exception as e:
@@ -3114,6 +3140,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         except Exception as exc:
             _emit_stream_end(final_text="", finished=False, error=str(exc))
             raise
+        finally:
+            if stage is not None:
+                stage.finish()
 
     result = {"response": None, "error": None, "partial_tool_names": []}
 
@@ -3127,19 +3156,32 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         "diag": None,
         "stage": None,
         "owner_tid": None,
+        "first_delta_callback": None,
+        "stream_delta_callback": None,
+        "reasoning_callback": None,
+        "tool_callback": None,
     }
 
-    def _run_stream_callback(callback, *args):
-        if callback is None:
-            return None
+    def _stage_callback(callback):
         stage = request_client_holder.get("stage")
-        if stage is None:
-            return callback(*args)
-        with stage.stage("callback"):
-            return callback(*args)
+        if stage is None or callback is None:
+            return callback
+
+        def _wrapped(*args):
+            with stage.stage("callback"):
+                return callback(*args)
+
+        return _wrapped
 
     def _finish_stage_diagnostic() -> None:
         stage = request_client_holder.pop("stage", None)
+        for key in (
+            "first_delta_callback",
+            "stream_delta_callback",
+            "reasoning_callback",
+            "tool_callback",
+        ):
+            request_client_holder.pop(key, None)
         if stage is not None:
             stage.finish()
 
@@ -3347,10 +3389,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             )
 
     def _fire_first_delta():
-        if not first_delta_fired["done"] and on_first_delta:
+        callback = request_client_holder.get("first_delta_callback")
+        if not first_delta_fired["done"] and callback:
             first_delta_fired["done"] = True
             try:
-                _run_stream_callback(on_first_delta)
+                callback()
             except Exception:
                 pass
 
@@ -3421,6 +3464,15 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         _diag = agent._stream_diag_init()
         request_client_holder["diag"] = _diag
         request_client_holder["stage"] = stream_stage_diagnostics.start_attempt()
+        _first_delta_callback = _stage_callback(on_first_delta)
+        _stream_delta_callback = _stage_callback(agent._fire_stream_delta)
+        _suppressed_stream_callback = _stage_callback(agent.stream_delta_callback)
+        _reasoning_callback = _stage_callback(agent._fire_reasoning_delta)
+        _tool_callback = _stage_callback(agent._fire_tool_gen_started)
+        request_client_holder["first_delta_callback"] = _first_delta_callback
+        request_client_holder["stream_delta_callback"] = _stream_delta_callback
+        request_client_holder["reasoning_callback"] = _reasoning_callback
+        request_client_holder["tool_callback"] = _tool_callback
         _writer_token = {"value": None}
         attempt_request_client = {"value": None}
 
@@ -3615,14 +3667,14 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 )
                 reasoning_parts.append(reasoning_text)
                 _fire_first_delta()
-                _run_stream_callback(agent._fire_reasoning_delta, reasoning_text)
+                _reasoning_callback(reasoning_text)
 
             # Accumulate text content — fire callback only when no tool calls
             if delta and delta.content:
                 content_parts.append(delta.content)
                 if not tool_calls_acc:
                     _fire_first_delta()
-                    _run_stream_callback(agent._fire_stream_delta, delta.content)
+                    _stream_delta_callback(delta.content)
                     deltas_were_sent["yes"] = True
                 # Tool calls suppress regular content streaming (avoids
                 # displaying chatty "I'll use the tool..." text alongside
@@ -3637,7 +3689,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 # box is already closed (tool boundary flush).
                 elif agent.stream_delta_callback:
                     try:
-                        _run_stream_callback(agent.stream_delta_callback, delta.content)
+                        _suppressed_stream_callback(delta.content)
                         agent._record_streamed_assistant_text(delta.content)
                     except Exception:
                         pass
@@ -3709,7 +3761,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     if name and idx not in tool_gen_notified:
                         tool_gen_notified.add(idx)
                         _fire_first_delta()
-                        _run_stream_callback(agent._fire_tool_gen_started, name)
+                        _tool_callback(name)
                         # Record the partial tool-call name so the outer
                         # stub-builder can surface a user-visible warning
                         # if streaming dies before this tool's arguments
@@ -3759,11 +3811,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 )
                 if isinstance(reasoning_text, str) and reasoning_text:
                     _fire_first_delta()
-                    _run_stream_callback(agent._fire_reasoning_delta, reasoning_text)
+                    _reasoning_callback(reasoning_text)
                 content = getattr(message, "content", None)
                 if isinstance(content, str) and content:
                     _fire_first_delta()
-                    _run_stream_callback(agent._fire_stream_delta, content)
+                    _stream_delta_callback(content)
             return final_response
 
         # Build mock response matching non-streaming shape
@@ -3944,6 +3996,15 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         _diag = agent._stream_diag_init()
         request_client_holder["diag"] = _diag
         request_client_holder["stage"] = stream_stage_diagnostics.start_attempt()
+        _first_delta_callback = _stage_callback(on_first_delta)
+        _stream_delta_callback = _stage_callback(agent._fire_stream_delta)
+        _suppressed_stream_callback = _stage_callback(agent.stream_delta_callback)
+        _reasoning_callback = _stage_callback(agent._fire_reasoning_delta)
+        _tool_callback = _stage_callback(agent._fire_tool_gen_started)
+        request_client_holder["first_delta_callback"] = _first_delta_callback
+        request_client_holder["stream_delta_callback"] = _stream_delta_callback
+        request_client_holder["reasoning_callback"] = _reasoning_callback
+        request_client_holder["tool_callback"] = _tool_callback
         _writer_token = {"value": None}
         _stream_context = {"manager": None, "stream": None}
         base_final_message = None
@@ -4040,7 +4101,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         tool_name = getattr(block, "name", None)
                         if tool_name:
                             _fire_first_delta()
-                            _run_stream_callback(agent._fire_tool_gen_started, tool_name)
+                            _tool_callback(tool_name)
                 elif event_type == "content_block_delta":
                     delta = getattr(event, "delta", None)
                     if delta:
@@ -4049,13 +4110,13 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             text = getattr(delta, "text", "")
                             if text and not has_tool_use:
                                 _fire_first_delta()
-                                _run_stream_callback(agent._fire_stream_delta, text)
+                                _stream_delta_callback(text)
                                 deltas_were_sent["yes"] = True
                         elif delta_type == "thinking_delta":
                             thinking_text = getattr(delta, "thinking", "")
                             if thinking_text:
                                 _fire_first_delta()
-                                _run_stream_callback(agent._fire_reasoning_delta, thinking_text)
+                                _reasoning_callback(thinking_text)
             if not agent._interrupt_requested:
                 raw_stream = _stream_context["stream"]
                 if raw_stream is not None:
@@ -4273,8 +4334,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         # emitted by ``_emit_stream_drop`` below; no
                         # additional INFO line needed.
                         try:
-                            _run_stream_callback(
-                                agent._fire_stream_delta,
+                            _retry_callback = (
+                                request_client_holder.get("stream_delta_callback")
+                                or agent._fire_stream_delta
+                            )
+                            _retry_callback(
                                 "\n\n⚠ Connection dropped mid tool-call; "
                                 "reconnecting…\n\n",
                             )
@@ -4695,7 +4759,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 _partial_text = (_partial_text or "") + _warn
                 # Fire as streaming delta so the user sees it immediately.
                 try:
-                    _run_stream_callback(agent._fire_stream_delta, _warn)
+                    agent._fire_stream_delta(_warn)
                 except Exception:
                     pass
                 logger.warning(

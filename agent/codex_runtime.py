@@ -23,6 +23,7 @@ from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
 
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
+from agent import stream_stage_diagnostics
 
 logger = logging.getLogger(__name__)
 
@@ -1303,6 +1304,28 @@ def _consume_codex_event_stream(
 
 
 def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta=None):
+    """Execute one Codex Responses stream with optional stage diagnostics."""
+    stage = stream_stage_diagnostics.start_attempt()
+    try:
+        return _run_codex_stream(
+            agent,
+            api_kwargs,
+            client=client,
+            on_first_delta=on_first_delta,
+            stage=stage,
+        )
+    finally:
+        if stage is not None:
+            stage.finish()
+
+
+def _run_codex_stream(
+    agent,
+    api_kwargs: dict,
+    client: Any = None,
+    on_first_delta=None,
+    stage=None,
+):
     """Execute one streaming Responses API request and return the final response.
 
     Uses ``responses.create(stream=True)`` (low-level raw event iteration)
@@ -1326,17 +1349,36 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     # Accumulate streamed text so callers / compat shims can read it.
     agent._codex_streamed_text_parts: list = []
 
+    def _stage_callback(callback: Callable[..., Any]) -> Callable[..., Any]:
+        if stage is None:
+            return callback
+
+        def _wrapped(*args):
+            with stage.stage("callback"):
+                return callback(*args)
+
+        return _wrapped
+
+    _stream_delta_callback = _stage_callback(agent._fire_stream_delta)
+    _reasoning_delta_callback = _stage_callback(agent._fire_reasoning_delta)
+    _commentary_callback = _stage_callback(agent._fire_streamed_codex_commentary)
+    _first_delta_callback = (
+        _stage_callback(on_first_delta) if on_first_delta is not None else None
+    )
+
     def _on_text_delta(text: str) -> None:
         agent._codex_streamed_text_parts.append(text)
-        agent._fire_stream_delta(text)
+        _stream_delta_callback(text)
 
     def _on_reasoning_delta(text: str) -> None:
-        agent._fire_reasoning_delta(text)
+        _reasoning_delta_callback(text)
 
     def _on_commentary_message(text: str) -> None:
-        agent._fire_streamed_codex_commentary(text)
+        _commentary_callback(text)
 
     def _on_event(event: Any) -> None:
+        if stage is not None:
+            stage.observe_chunk()
         # TTFB watchdog and activity touch — runs once per SSE event.
         agent._codex_stream_last_event_ts = time.time()
         agent._touch_activity("receiving stream response")
@@ -1454,7 +1496,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                         )
                         else None
                     ),
-                    on_first_delta=on_first_delta,
+                    on_first_delta=_first_delta_callback,
                     on_event=_on_event,
                     interrupt_check=_interrupt_or_superseded,
                 )

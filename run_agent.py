@@ -7921,6 +7921,7 @@ class AIAgent:
             action=function_args.get("action"),
             subagent_id=function_args.get("subagent_id"),
             message=function_args.get("message"),
+            follow_up=function_args.get("follow_up"),
             parent_agent=self,
         )
 

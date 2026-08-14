@@ -1526,6 +1526,8 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    # A completed retained child resumes on its original SessionDB id.
+    resume_session_id: Optional[str] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1819,6 +1821,7 @@ def _build_child_agent(
             base_url=effective_base_url,
             api_key=effective_api_key,
             model=effective_model,
+            session_id=resume_session_id,
             provider=effective_provider,
             api_mode=effective_api_mode,
             acp_command=effective_acp_command,
@@ -2609,11 +2612,18 @@ def _run_single_child(
             _worker_thread_holder["t"] = threading.current_thread()
             from agent.delegation_context import delegated_child_context
 
+            resume_history = getattr(child, "_delegate_resume_history", None)
+            extra_kwargs = (
+                {"conversation_history": resume_history}
+                if isinstance(resume_history, list) and resume_history
+                else {}
+            )
             with delegated_child_context(str(getattr(child, "session_id", "") or "")):
                 return child.run_conversation(
                     user_message=goal,
                     task_id=child_task_id,
                     stream_callback=_relay_child_text,
+                    **extra_kwargs,
                 )
 
         _child_context = contextvars.copy_context()
@@ -2909,6 +2919,8 @@ def _run_single_child(
             "api_calls": api_calls,
             "duration_seconds": duration,
             "model": _model if isinstance(_model, str) else None,
+            "child_session_id": str(getattr(child, "session_id", "") or "") or None,
+            "subagent_id": _subagent_id,
             "exit_reason": exit_reason,
             "tokens": {
                 "input": (
@@ -3409,6 +3421,115 @@ def _validate_batch_tasks(task_list: List[Dict[str, Any]]) -> Optional[str]:
     return None
 
 
+def _handle_follow_up(
+    follow_up: str,
+    goal: Optional[str],
+    context: Optional[str],
+    parent_agent,
+) -> str:
+    """Resume one completed retained child as its next user turn.
+
+    Running children intentionally do not enter this path. Live control stays
+    on the existing owner-bound steer primitive; a follow-up only resolves a
+    durable, terminal child record.
+    """
+    text = (goal or "").strip()
+    if context and str(context).strip():
+        text = (
+            f"{text}\n\nContext: {str(context).strip()}"
+            if text
+            else str(context).strip()
+        )
+    if not text:
+        return tool_error("follow_up requires 'goal' (the next child message).")
+
+    from tools.async_delegation import (
+        _FOLLOW_UP_UNAVAILABLE,
+        check_follow_up_authority,
+        claim_retained_child,
+        find_retained_child,
+        release_retained_child,
+    )
+
+    requester_sid = getattr(parent_agent, "session_id", None)
+    requester_sid = requester_sid if isinstance(requester_sid, str) else None
+    entry = find_retained_child(follow_up, owner_session_id=requester_sid)
+    if entry is None:
+        return tool_error(_FOLLOW_UP_UNAVAILABLE)
+    if check_follow_up_authority(entry, requester_sid) is not None:
+        return tool_error(_FOLLOW_UP_UNAVAILABLE)
+
+    claim = claim_retained_child(entry)
+    if claim is None:
+        return tool_error(_FOLLOW_UP_UNAVAILABLE)
+    try:
+        child_session_id = str(entry.get("child_session_id") or "")
+        session_db = getattr(parent_agent, "_session_db", None)
+        if not child_session_id or session_db is None:
+            return tool_error(_FOLLOW_UP_UNAVAILABLE)
+        try:
+            resume_sid = session_db.resolve_resume_session_id(child_session_id)
+            history = session_db.get_messages_as_conversation(
+                resume_sid, repair_alternation=True
+            )
+        except Exception:
+            return tool_error(_FOLLOW_UP_UNAVAILABLE)
+        if not history:
+            return tool_error(_FOLLOW_UP_UNAVAILABLE)
+        history = [
+            message
+            for message in history
+            if message.get("role") not in {"system", "session_meta"}
+        ]
+
+        cfg = _load_config()
+        try:
+            creds = _resolve_delegation_credentials(cfg, parent_agent)
+        except ValueError:
+            return tool_error(_FOLLOW_UP_UNAVAILABLE)
+        child = _build_child_preserving_parent_tools(
+            task_index=0,
+            goal=text,
+            context=None,
+            toolsets=None,
+            model=entry.get("model") or creds["model"],
+            max_iterations=cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS),
+            task_count=1,
+            parent_agent=parent_agent,
+            override_provider=entry.get("provider") or creds["provider"],
+            override_base_url=entry.get("base_url") or creds["base_url"],
+            override_api_key=creds["api_key"],
+            override_api_mode=entry.get("api_mode") or creds["api_mode"],
+            override_request_overrides=creds.get("request_overrides"),
+            override_max_tokens=creds.get("max_output_tokens"),
+            override_acp_command=creds.get("command"),
+            override_acp_args=creds.get("args"),
+            role=entry.get("role") or "leaf",
+            resume_session_id=resume_sid,
+        )
+        setattr(child, "_delegate_resume_history", history)
+        result = _run_single_child(0, text, child, parent_agent)
+        result.setdefault("task_index", 0)
+        _finalize_child_results(
+            [result], [{"goal": text}], [(0, {"goal": text}, child)], parent_agent
+        )
+        return json.dumps(
+            {
+                "mode": "follow_up",
+                "child_id": entry.get("child_id") or child_session_id,
+                "child_session_id": str(
+                    getattr(child, "session_id", "") or resume_sid
+                ),
+                "delegation_id": entry.get("delegation_id"),
+                "results": [result],
+                "note": "Follow-up resumed the retained child's next user turn.",
+            },
+            ensure_ascii=False,
+        )
+    finally:
+        release_retained_child(entry, claim)
+
+
 def delegate_task(
     goal: Optional[str] = None,
     context: Optional[str] = None,
@@ -3420,6 +3541,7 @@ def delegate_task(
     action: Optional[str] = None,
     subagent_id: Optional[str] = None,
     message: Optional[str] = None,
+    follow_up: Optional[str] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -3445,6 +3567,11 @@ def delegate_task(
     """
     if parent_agent is None:
         return tool_error("delegate_task requires a parent agent context.")
+
+    if follow_up is not None:
+        if action not in (None, "", "spawn"):
+            return tool_error("follow_up cannot be combined with a control action.")
+        return _handle_follow_up(follow_up, goal, context, parent_agent)
 
     # ── Control plane: list/steer/stop run synchronously and return here.
     # They never spawn, so they bypass the pause gate, depth limit, and the
@@ -4076,6 +4203,28 @@ def delegate_task(
             ),
         )
 
+        child_manifest: List[Dict[str, Any]] = []
+        if dispatch.get("status") == "dispatched":
+            child_manifest = [
+                {
+                    "session_id": str(getattr(child, "session_id", "") or ""),
+                    "subagent_id": str(getattr(child, "_subagent_id", "") or ""),
+                    "goal": task.get("goal", ""),
+                    "role": task.get("role") or top_role,
+                    "model": getattr(child, "model", None) or creds["model"],
+                    "provider": getattr(child, "provider", None) or creds["provider"],
+                    "base_url": getattr(child, "base_url", None) or creds["base_url"],
+                    "api_mode": getattr(child, "api_mode", None) or creds["api_mode"],
+                }
+                for task, (_, _, child) in zip(task_list, children)
+            ]
+            from tools.async_delegation import record_dispatched_children
+
+            try:
+                record_dispatched_children(dispatch["delegation_id"], child_manifest)
+            except Exception:
+                logger.debug("record_dispatched_children failed", exc_info=True)
+
         if dispatch.get("status") == "dispatched":
             n = len(_goals)
             note = (
@@ -4103,6 +4252,13 @@ def delegate_task(
             ]
             if any(isinstance(s, str) and s for s in _sids):
                 payload["subagent_ids"] = _sids
+                payload["children"] = [
+                    {
+                        "subagent_id": child.get("subagent_id"),
+                        "session_id": child.get("session_id"),
+                    }
+                    for child in child_manifest
+                ]
                 payload["control_hint"] = (
                     "While a child runs you can orchestrate it live with this "
                     "same tool: delegate_task(action='list') to see live "
@@ -4654,6 +4810,15 @@ DELEGATE_TASK_SCHEMA = {
                     "and return early results\")."
                 ),
             },
+            "follow_up": {
+                "type": "string",
+                "description": (
+                    "Resume a completed retained child by subagent_id, "
+                    "child SessionDB id, or delegation_id. Provide the next "
+                    "user turn in 'goal'. This is owner-scoped and never "
+                    "bypasses a running child."
+                ),
+            },
         },
         "required": [],
     },
@@ -4718,6 +4883,7 @@ registry.register(
         action=args.get("action"),
         subagent_id=args.get("subagent_id"),
         message=args.get("message"),
+        follow_up=args.get("follow_up"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,

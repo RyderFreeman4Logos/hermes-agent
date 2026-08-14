@@ -59,6 +59,11 @@ _PLUGIN_SECTION_FRAME_RE = re.compile(
     r"<!-- hermes-plugin-section-chars:(?P<chars>[0-9]{1,4}) -->\n\n",
     re.MULTILINE,
 )
+_SKILLS_CATALOG_MODE_MARKER = "<!-- hermes-skills-catalog-mode:{} -->"
+_SKILLS_CATALOG_MODE_RE = re.compile(
+    r"<!-- hermes-skills-catalog-mode:(?P<mode>full|compact|names-only) -->"
+)
+_SKILLS_CATALOG_MODES = frozenset({"full", "compact", "names-only"})
 
 
 def _ra():
@@ -159,7 +164,16 @@ def _session_skills_catalog_mode(agent: Any) -> str:
     """Resolve and freeze the skills catalog mode on this agent instance."""
     cached = getattr(agent, "_skills_catalog_mode", None)
     if cached is not None:
-        return cached if cached in {"full", "compact", "names-only"} else "full"
+        return cached if cached in _SKILLS_CATALOG_MODES else "full"
+
+    stored_prompt = getattr(agent, "_cached_system_prompt", None)
+    if isinstance(stored_prompt, str):
+        match = _SKILLS_CATALOG_MODE_RE.search(stored_prompt)
+        if match:
+            mode = match.group("mode")
+            agent._skills_catalog_mode = mode
+            return mode
+
     try:
         from hermes_cli.config import load_config_readonly
 
@@ -168,7 +182,7 @@ def _session_skills_catalog_mode(agent: Any) -> str:
     except Exception:
         raw = "full"
     mode = str(raw or "full").strip().lower()
-    if mode not in {"full", "compact", "names-only"}:
+    if mode not in _SKILLS_CATALOG_MODES:
         mode = "full"
     agent._skills_catalog_mode = mode
     return mode
@@ -463,6 +477,11 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             available_tools=agent.valid_tool_names,
             available_toolsets=avail_toolsets,
             compact_categories=_compact_cats or None,
+        )
+        skills_prompt = (
+            f"{skills_prompt}\n\n{_SKILLS_CATALOG_MODE_MARKER.format(catalog_mode)}"
+            if skills_prompt
+            else _SKILLS_CATALOG_MODE_MARKER.format(catalog_mode)
         )
     else:
         skills_prompt = ""

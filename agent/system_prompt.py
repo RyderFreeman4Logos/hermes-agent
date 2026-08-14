@@ -71,6 +71,7 @@ _SKILLS_CATALOG_MODE_RE = re.compile(
     )
 )
 _SKILLS_CATALOG_MODES = frozenset({"full", "compact", "names-only"})
+_SKILLS_CATALOG_MODE_SESSION_KEY = "_skills_catalog_mode"
 
 
 def _ra():
@@ -167,22 +168,74 @@ def _tui_embedded_pane_clarifier(hint: str) -> str:
     return hint + _TUI_EMBEDDED_PANE_CLARIFIER
 
 
+def _normalize_skills_catalog_mode(raw: Any) -> Optional[str]:
+    mode = str(raw or "").strip().lower()
+    return mode if mode in _SKILLS_CATALOG_MODES else None
+
+
+def _remember_skills_catalog_mode(agent: Any, mode: str) -> str:
+    agent._skills_catalog_mode = mode
+    state = getattr(agent, "_session_init_model_config", None)
+    if isinstance(state, dict):
+        state[_SKILLS_CATALOG_MODE_SESSION_KEY] = mode
+    return mode
+
+
+def restore_session_skills_catalog_mode(agent: Any, model_config: Any) -> bool:
+    """Restore the frozen catalog mode from a session's structured state."""
+    if isinstance(model_config, str):
+        try:
+            model_config = json.loads(model_config)
+        except (json.JSONDecodeError, TypeError):
+            return False
+    if not isinstance(model_config, dict) or _SKILLS_CATALOG_MODE_SESSION_KEY not in model_config:
+        return False
+    mode = _normalize_skills_catalog_mode(
+        model_config.get(_SKILLS_CATALOG_MODE_SESSION_KEY)
+    ) or "full"
+    _remember_skills_catalog_mode(agent, mode)
+    return True
+
+
+def persist_session_skills_catalog_mode(agent: Any) -> None:
+    """Persist the frozen catalog mode through the existing session JSON state."""
+    mode = _normalize_skills_catalog_mode(getattr(agent, "_skills_catalog_mode", None))
+    if mode is None:
+        return
+    _remember_skills_catalog_mode(agent, mode)
+    db = getattr(agent, "_session_db", None)
+    session_id = str(getattr(agent, "session_id", None) or "").strip()
+    patcher = getattr(db, "patch_session_model_config", None)
+    if session_id and callable(patcher):
+        try:
+            patcher(session_id, {_SKILLS_CATALOG_MODE_SESSION_KEY: mode})
+        except Exception:
+            logger.debug("failed to persist skills catalog mode", exc_info=True)
+
+
 def _session_skills_catalog_mode(agent: Any) -> str:
     """Resolve and freeze the skills catalog mode on this agent instance."""
     cached = getattr(agent, "_skills_catalog_mode", None)
     if cached is not None:
-        return cached if cached in _SKILLS_CATALOG_MODES else "full"
+        return _remember_skills_catalog_mode(
+            agent, _normalize_skills_catalog_mode(cached) or "full"
+        )
+
+    state = getattr(agent, "_session_init_model_config", None)
+    if isinstance(state, dict) and _SKILLS_CATALOG_MODE_SESSION_KEY in state:
+        return _remember_skills_catalog_mode(
+            agent,
+            _normalize_skills_catalog_mode(
+                state.get(_SKILLS_CATALOG_MODE_SESSION_KEY)
+            ) or "full",
+        )
 
     stored_prompt = getattr(agent, "_cached_system_prompt", None)
-    if isinstance(stored_prompt, str):
-        # Context files precede the core-emitted skills block. Recover only
-        # the unique frame that the skills renderer appends around its marker;
-        # unrelated markers in later volatile sections are not candidates.
-        matches = list(_SKILLS_CATALOG_MODE_RE.finditer(stored_prompt))
-        if len(matches) == 1:
-            mode = matches[0].group("mode")
-            agent._skills_catalog_mode = mode
-            return mode
+    if isinstance(stored_prompt, str) and _SKILLS_CATALOG_MODE_RE.search(stored_prompt):
+        # Prompt comments are diagnostic only. A stored frame without the
+        # structured session field is untrusted and fails closed without a
+        # live-config read.
+        return _remember_skills_catalog_mode(agent, "full")
 
     try:
         from hermes_cli.config import load_config_readonly
@@ -191,11 +244,9 @@ def _session_skills_catalog_mode(agent: Any) -> str:
         raw = ((config.get("agent") or {}).get("skills_catalog_mode", "full"))
     except Exception:
         raw = "full"
-    mode = str(raw or "full").strip().lower()
-    if mode not in _SKILLS_CATALOG_MODES:
-        mode = "full"
-    agent._skills_catalog_mode = mode
-    return mode
+    return _remember_skills_catalog_mode(
+        agent, _normalize_skills_catalog_mode(raw) or "full"
+    )
 
 
 def _plugin_session_info(agent: Any) -> Dict[str, str]:
@@ -866,6 +917,8 @@ __all__ = [
     "build_system_prompt_parts",
     "build_system_prompt",
     "invalidate_system_prompt",
+    "persist_session_skills_catalog_mode",
+    "restore_session_skills_catalog_mode",
     "restore_plugin_prompt_sections",
     "format_tools_for_system_message",
 ]

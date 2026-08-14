@@ -172,6 +172,10 @@ DEFAULT_CONFIG = {
         #   "on"             — force the prompt posture everywhere.
         #   "off"            — disable entirely.
         "coding_context": "auto",
+        # Skills catalog detail in the session-fixed system prompt. "compact"
+        # demotes non-coding categories to names-only; "names-only" demotes
+        # every category. Skill names always remain visible and loadable.
+        "skills_catalog_mode": "full",
         # Standing operator instructions for the coding posture. A string (or
         # list of strings) appended to the coding brief as an extra stable
         # system block — pin project-wide workflow rules here instead of editing

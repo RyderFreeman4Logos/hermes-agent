@@ -155,6 +155,25 @@ def _tui_embedded_pane_clarifier(hint: str) -> str:
     return hint + _TUI_EMBEDDED_PANE_CLARIFIER
 
 
+def _session_skills_catalog_mode(agent: Any) -> str:
+    """Resolve and freeze the skills catalog mode on this agent instance."""
+    cached = getattr(agent, "_skills_catalog_mode", None)
+    if cached is not None:
+        return cached if cached in {"full", "compact", "names-only"} else "full"
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly()
+        raw = ((config.get("agent") or {}).get("skills_catalog_mode", "full"))
+    except Exception:
+        raw = "full"
+    mode = str(raw or "full").strip().lower()
+    if mode not in {"full", "compact", "names-only"}:
+        mode = "full"
+    agent._skills_catalog_mode = mode
+    return mode
+
+
 def _plugin_session_info(agent: Any) -> Dict[str, str]:
     """Return immutable-at-render-time metadata exposed to prompt sections."""
     try:
@@ -431,6 +450,15 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             )
         except Exception:
             _compact_cats = frozenset()
+        catalog_mode = _session_skills_catalog_mode(agent)
+        if catalog_mode == "compact":
+            from agent.coding_context import _NON_CODING_SKILL_CATEGORIES
+
+            _compact_cats |= frozenset(_NON_CODING_SKILL_CATEGORIES)
+        elif catalog_mode == "names-only":
+            from agent.prompt_builder import ALL_SKILL_CATEGORIES
+
+            _compact_cats = ALL_SKILL_CATEGORIES
         skills_prompt = _r.build_skills_system_prompt(
             available_tools=agent.valid_tool_names,
             available_toolsets=avail_toolsets,

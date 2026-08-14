@@ -34,9 +34,6 @@ def _make_session(
     exit_code=None,
     output="",
     notify_on_complete=False,
-    delegated_child=False,
-    completion_reason="exited",
-    termination_source="",
 ) -> ProcessSession:
     s = ProcessSession(
         id=sid,
@@ -47,9 +44,6 @@ def _make_session(
         exit_code=exit_code,
         output_buffer=output,
         notify_on_complete=notify_on_complete,
-        delegated_child=delegated_child,
-        completion_reason=completion_reason,
-        termination_source=termination_source,
     )
     return s
 
@@ -135,43 +129,6 @@ class TestCompletionQueue:
         assert len(completions) == 3
         ids = {c["session_id"] for c in completions}
         assert ids == {"proc_0", "proc_1", "proc_2"}
-
-    @pytest.mark.parametrize(
-        ("exit_code", "completion_reason", "termination_source", "visible"),
-        (
-            (0, "exited", "", False),
-            (1, "exited", "", True),
-            (-1, "lost", "backend_lost", True),
-            (-15, "killed", "process.kill", True),
-        ),
-        ids=("success", "nonzero", "lost", "killed"),
-    )
-    def test_delegated_child_completion_suppresses_only_routine_success(
-        self, registry, exit_code, completion_reason, termination_source, visible
-    ):
-        session = _make_session(
-            notify_on_complete=True,
-            delegated_child=True,
-            output="child output",
-            exit_code=exit_code,
-            completion_reason=completion_reason,
-            termination_source=termination_source,
-        )
-        registry._running[session.id] = session
-        with patch.object(registry, "_write_checkpoint"):
-            registry._move_to_finished(session)
-
-        notifications = registry.drain_notifications()
-        assert (len(notifications) == 1) is visible
-        assert registry._finished[session.id].output_buffer == "child output"
-
-    def test_parent_owned_success_still_notifies(self, registry):
-        session = _make_session(notify_on_complete=True, output="done", exit_code=0)
-        registry._running[session.id] = session
-        with patch.object(registry, "_write_checkpoint"):
-            registry._move_to_finished(session)
-
-        assert len(registry.drain_notifications()) == 1
 
 
 # =========================================================================

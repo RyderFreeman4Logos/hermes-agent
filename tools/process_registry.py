@@ -1246,8 +1246,6 @@ class ProcessRegistry:
         This is less capable than local spawn (no live stdout pipe, no stdin),
         but it ensures the command runs in the correct sandbox context.
         """
-        from agent.delegation_context import is_delegated_child_process_context
-
         session = ProcessSession(
             id=f"proc_{uuid.uuid4().hex[:12]}",
             command=command,
@@ -1257,7 +1255,6 @@ class ProcessRegistry:
             started_at=time.time(),
             env_ref=env,
             pid_scope="sandbox",
-            delegated_child=is_delegated_child_process_context(),
         )
 
         # Run the command in the sandbox with output capture
@@ -1677,17 +1674,6 @@ class ProcessRegistry:
         """
         return session_id in self._completion_consumed or (
             skip_poll_observed and session_id in self._poll_observed
-        )
-
-    @staticmethod
-    def _is_routine_delegated_child_completion(evt: dict) -> bool:
-        """Whether a completed native-child command needs no parent turn."""
-        return (
-            evt.get("type") == "completion"
-            and evt.get("delegated_child") is True
-            and evt.get("exit_code") == 0
-            and evt.get("completion_reason", "exited") == "exited"
-            and not evt.get("termination_source")
         )
 
     def drain_notifications(
@@ -2891,9 +2877,6 @@ def format_process_notification(evt: dict) -> "str | None":
 
     if evt_type == "async_delegation":
         return _format_async_delegation(evt)
-
-    if ProcessRegistry._is_routine_delegated_child_completion(evt):
-        return None
 
     _exit = evt.get("exit_code", "?")
     _out = evt.get("output", "")

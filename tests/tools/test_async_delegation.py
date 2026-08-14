@@ -1027,3 +1027,126 @@ def test_cross_process_reserve_reports_at_most_one_accepted(tmp_path, monkeypatc
     # The winner accepts; the loser never reports acceptance.
     assert len([s for s in statuses if s in ("accepted", "queued")]) <= 1, statuses
 
+
+# Two processes both read the same accepted control and race to claim it.
+# claim_child_control must CAS its UPDATE on the previously-read blob (like
+# reserve), otherwise both processes see rowcount=1 and both start a next
+# turn — the mutually-exclusive delivery fence silently breaks. Both processes
+# share one claim token so only the CAS-race winner can own it; a shared
+# go-barrier parks them until each has observed the accepted blob.
+_CLAIM_CHILD = r"""
+import json, os, sys, time
+from pathlib import Path
+from tools import async_delegation as ad
+
+db_path, delegation_id, child_id, result_file = sys.argv[1:5]
+ad._db_path = lambda: Path(db_path)
+# A shared token: a running control claimed by ourselves returns None, so only
+# the CAS-race winner can report a successful claim — the loser must too.
+ad._CONTROL_PROCESS_TOKEN="***"
+ready = db_path + ".claim-ready"
+go = db_path + ".claim-go"
+# Observe the still-accepted blob, then park so both race the write together.
+with ad._transaction() as conn:
+    conn.execute(
+        "SELECT child_control_json FROM async_delegations WHERE delegation_id=?",
+        (delegation_id,),
+    ).fetchone()
+with open(ready, "a") as fh:
+    fh.write("x")
+deadline = time.monotonic() + 10
+while not os.path.exists(go):
+    if time.monotonic() > deadline:
+        break
+    time.sleep(0.005)
+claimed = ad.claim_child_control(delegation_id, child_id)
+with open(result_file, "w") as fh:
+    fh.write(json.dumps({"claimed": bool(claimed)}))
+"""
+
+
+def test_cross_process_claim_allows_at_most_one_winner(tmp_path, monkeypatch):
+    """Two OS processes claiming the same accepted control: at most one wins.
+
+    claim_child_control's UPDATE is CAS-gated on the previously-read control
+    blob. Two separate SQLite connections that both read the same ``accepted``
+    blob can still let only ONE commit the claim; without the CAS both writes
+    succeed with rowcount=1 and both processes start a replacement turn.
+    """
+    db_path = tmp_path / "state.db"
+    monkeypatch.setattr(ad, "_db_path", lambda: db_path)
+    _seed_control_delegation(db_path)
+    receipt = ad.reserve_child_control("deleg-succ", "child-1", "queue", "next")
+    assert receipt["status"] == "accepted"
+
+    procs, result_files = [], []
+    for _ in range(2):
+        result_file = tmp_path / f"claim-{len(result_files)}.json"
+        result_files.append(result_file)
+        procs.append(
+            subprocess.Popen(
+                [
+                    sys.executable, "-c", _CLAIM_CHILD,
+                    os.fspath(db_path), "deleg-succ", "child-1",
+                    os.fspath(result_file),
+                ],
+                cwd=os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+        )
+    # Release both claims only after every process observed the accepted blob.
+    ready_path = tmp_path / "state.db.claim-ready"
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        try:
+            if ready_path.stat().st_size >= 2:
+                break
+        except OSError:
+            pass
+        time.sleep(0.01)
+    (tmp_path / "state.db.claim-go").write_text("go")
+    for proc in procs:
+        proc.wait(timeout=30)
+    results = [json.loads(r.read_text()) for r in result_files]
+    winners = [r["claimed"] for r in results].count(True)
+    assert winners <= 1, results
+
+
+def test_recovery_retains_dead_owner_row_with_accepted_control(tmp_path, monkeypatch):
+    """Recovery retains a dead-owner row that still has an accepted control.
+
+    On the primary restart path the owning process dies while an accepted
+    queue/interrupt control is still pending. recover_abandoned_delegations
+    marks the row ``unknown``; it must ALSO retain it so the restart drain
+    (which delivers children found only via the retained registry, then still
+    fail-closes on foreign owners) starts exactly one next/replacement turn.
+    Without the retain the accepted control strands on the unknown+unretained
+    row and the drain skips it.
+    """
+    db_path = tmp_path / "state.db"
+    monkeypatch.setattr(ad, "_db_path", lambda: db_path)
+    _seed_control_delegation(db_path)
+    receipt = ad.reserve_child_control("deleg-succ", "child-1", "queue", "next")
+    assert receipt["status"] == "accepted"
+
+    # The row is running with no live owner pid -> recovery classifies it dead.
+    with ad._transaction() as conn:
+        before = conn.execute(
+            "SELECT retained FROM async_delegations WHERE delegation_id=?",
+            ("deleg-succ",),
+        ).fetchone()[0]
+    assert before == 0
+
+    ad.recover_abandoned_delegations()
+
+    with ad._transaction() as conn:
+        row = conn.execute(
+            "SELECT state, retained FROM async_delegations WHERE delegation_id=?",
+            ("deleg-succ",),
+        ).fetchone()
+    assert row[0] == "unknown"
+    assert row[1] == 1, "accepted control must be retained for restart drain"
+    assert any(r[0] == "deleg-succ" for r in ad._retained_rows()), (
+        "accepted control must be findable by the restart drain"
+    )
+

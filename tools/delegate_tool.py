@@ -187,6 +187,25 @@ def _unregister_subagent(subagent_id: str, *, agent: Any = None) -> None:
             _active_subagents.pop(subagent_id, None)
 
 
+def _subagent_owner_matches(
+    record: Dict[str, Any],
+    *,
+    owner_session_id: Optional[str],
+    owner_transport: Any,
+    owner_session_record: Any,
+) -> bool:
+    """Return whether *record* belongs to the exact supplied live authority."""
+    if owner_session_id is None:
+        return True
+    return (
+        record.get("owner_session_id") == owner_session_id
+        and owner_transport is not None
+        and record.get("owner_transport") is owner_transport
+        and owner_session_record is not None
+        and record.get("owner_session_record") is owner_session_record
+    )
+
+
 def _close_subagent_steering(subagent_id: str, agent: Any) -> Optional[str]:
     """Atomically close steer acceptance and drain its final durable artifact.
 
@@ -211,28 +230,39 @@ def _close_subagent_steering(subagent_id: str, agent: Any) -> Optional[str]:
         return pending if isinstance(pending, str) and pending.strip() else None
 
 
-def interrupt_subagent(subagent_id: str) -> bool:
+def interrupt_subagent(
+    subagent_id: str,
+    *,
+    owner_session_id: Optional[str] = None,
+    owner_transport: Any = None,
+    owner_session_record: Any = None,
+) -> bool:
     """Request that a single running subagent stop at its next iteration boundary.
 
     Does not hard-kill the worker thread (Python can't); sets the child's
     interrupt flag which propagates to in-flight tools and recurses into
     grandchildren via AIAgent.interrupt().  Returns True if a matching
-    subagent was found.
+    subagent was found and the supplied authority owns it.
     """
     with _active_subagents_lock:
         record = _active_subagents.get(subagent_id)
-    if not record:
-        return False
-    agent = record.get("agent")
-    if agent is None:
-        return False
-    try:
-        if not request_hard_interrupt(agent, f"Interrupted via TUI ({subagent_id})"):
+        if not record or not _subagent_owner_matches(
+            record,
+            owner_session_id=owner_session_id,
+            owner_transport=owner_transport,
+            owner_session_record=owner_session_record,
+        ):
             return False
-    except Exception as exc:
-        logger.debug("interrupt_subagent(%s) failed: %s", subagent_id, exc)
-        return False
-    return True
+        agent = record.get("agent")
+        if agent is None:
+            return False
+        try:
+            if not request_hard_interrupt(agent, f"Interrupted via TUI ({subagent_id})"):
+                return False
+        except Exception as exc:
+            logger.debug("interrupt_subagent(%s) failed: %s", subagent_id, exc)
+            return False
+        return True
 
 
 def steer_subagent(
@@ -264,15 +294,13 @@ def steer_subagent(
         record = _active_subagents.get(subagent_id)
         if not record or not record.get("accepting_steer", False):
             return False
-        if owner_session_id is not None:
-            if (
-                record.get("owner_session_id") != owner_session_id
-                or owner_transport is None
-                or record.get("owner_transport") is not owner_transport
-                or owner_session_record is None
-                or record.get("owner_session_record") is not owner_session_record
-            ):
-                return False
+        if not _subagent_owner_matches(
+            record,
+            owner_session_id=owner_session_id,
+            owner_transport=owner_transport,
+            owner_session_record=owner_session_record,
+        ):
+            return False
         agent = record.get("agent")
         if agent is None:
             return False
@@ -301,11 +329,17 @@ def _capture_gateway_steer_authority(
         return None, None
 
 
-def list_active_subagents() -> List[Dict[str, Any]]:
-    """Snapshot of the currently running subagent tree.
+def list_active_subagents(
+    *,
+    owner_session_id: Optional[str] = None,
+    owner_transport: Any = None,
+    owner_session_record: Any = None,
+) -> List[Dict[str, Any]]:
+    """Snapshot of currently running subagents visible to one owner.
 
-    Each record: {subagent_id, parent_id, depth, goal, model, started_at,
-    tool_count, status}.  Safe to call from any thread — returns a copy.
+    An omitted owner preserves the direct in-process helper contract. Gateway
+    callers pass the exact live session transport and record so a foreign or
+    stale session receives an empty snapshot without an ownership probe.
     """
     with _active_subagents_lock:
         return [
@@ -322,6 +356,12 @@ def list_active_subagents() -> List[Dict[str, Any]]:
                 }
             }
             for r in _active_subagents.values()
+            if _subagent_owner_matches(
+                r,
+                owner_session_id=owner_session_id,
+                owner_transport=owner_transport,
+                owner_session_record=owner_session_record,
+            )
         ]
 
 

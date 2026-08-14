@@ -97,6 +97,45 @@ def test_active_for_session_counts_every_live_delegation_state():
     assert ad.active_for_session("") == 0
 
 
+def test_child_control_receipt_is_durable_and_generation_fenced(tmp_path, monkeypatch):
+    """Queue/interrupt reservations survive retries without double delivery."""
+    db_path = tmp_path / "state.db"
+    monkeypatch.setattr(ad, "_db_path", lambda: db_path)
+    with ad._transaction() as conn:
+        conn.execute(
+            """INSERT INTO async_delegations
+               (delegation_id, origin_session, state, dispatched_at, updated_at,
+                children_json)
+               VALUES (?, ?, 'running', ?, ?, ?)""",
+            (
+                "deleg-control",
+                "parent",
+                time.time(),
+                time.time(),
+                json.dumps([{"subagent_id": "child-1", "session_id": "db-child"}]),
+            ),
+        )
+
+    first = ad.reserve_child_control("deleg-control", "child-1", "queue", "next")
+    retry = ad.reserve_child_control("deleg-control", "child-1", "queue", "next")
+    conflict = ad.reserve_child_control("deleg-control", "child-1", "interrupt", "replace")
+    assert first["state"] == "accepted"
+    assert first["status"] == "accepted"
+    assert retry["generation"] == first["generation"]
+    assert conflict["status"] == "pending"
+
+    ad._reset_for_tests()
+    claimed = ad.claim_child_control("deleg-control", "child-1")
+    assert claimed["generation"] == first["generation"]
+    assert ad.claim_child_control("deleg-control", "child-1") is None
+    monkeypatch.setattr(ad, "_CONTROL_PROCESS_TOKEN", "restarted-process")
+    reclaimed = ad.claim_child_control("deleg-control", "child-1")
+    assert reclaimed is not None
+    assert reclaimed["generation"] == first["generation"]
+    assert ad.finish_child_control("deleg-control", "child-1", first["generation"])
+    assert ad.reserve_child_control("deleg-control", "child-1", "queue", "next")["state"] == "delivered"
+
+
 def test_dispatch_returns_immediately_without_blocking():
     gate = threading.Event()
 

@@ -676,12 +676,13 @@ def _subagent_spawn_count(args: Mapping[str, Any]) -> int:
     delegate_task runs in one of two modes: a batch (``tasks`` is a non-empty
     list, one child per item) or a single task (``goal``). Count the batch size
     when present, otherwise 1, so the session subagent cap reflects real spawns
-    rather than delegate_task invocations. Control actions (list/steer/stop)
+    rather than delegate_task invocations. Control actions (list/steer/stop/
+    queue/interrupt)
     spawn nothing and must not consume the cap.
     """
     if isinstance(args, Mapping):
         action = str(args.get("action") or "").strip().lower()
-        if action in ("list", "steer", "stop"):
+        if action in ("list", "steer", "stop", "queue", "interrupt"):
             return 0
     tasks = args.get("tasks") if isinstance(args, Mapping) else None
     if isinstance(tasks, list) and tasks:

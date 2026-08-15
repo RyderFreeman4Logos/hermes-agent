@@ -5381,6 +5381,24 @@ def _cache_info_from_usage(usage: Any) -> dict[str, int | str] | None:
     return cache_info
 
 
+def _cache_info_from_turn_result(value: Any) -> dict[str, int | str] | None:
+    """Normalize agent-owned terminal cache evidence to the TUI wire shape."""
+    if not isinstance(value, dict):
+        return None
+    state = str(value.get("state") or "")
+    if not state:
+        return None
+    usage = {
+        "cache_read_tokens": value.get("cached_tokens", 0),
+        "cache_write_tokens": value.get("write_tokens", 0),
+        "prompt_tokens": value.get("prompt_tokens", 0),
+        "cache_telemetry_present": state != "no_field",
+    }
+    if value.get("attribution") == "post_compression":
+        usage["cache_attribution"] = "post_compression"
+    return _cache_info_from_usage(usage)
+
+
 def _emit_terminal_message_complete(sid: str, payload: dict, agent: Any) -> bool:
     """Emit one terminal frame and retire its cache backstop after delivery."""
     cache_usage = (
@@ -5390,6 +5408,10 @@ def _emit_terminal_message_complete(sid: str, payload: dict, agent: Any) -> bool
     terminal_payload = dict(payload)
     if cache_info is not None:
         terminal_payload["cache_info"] = cache_info
+    elif "cache_info" in terminal_payload:
+        normalized = _cache_info_from_turn_result(terminal_payload["cache_info"])
+        if normalized is not None:
+            terminal_payload["cache_info"] = normalized
     delivered = _emit("message.complete", sid, terminal_payload)
     if (
         delivered
@@ -10973,6 +10995,8 @@ def _run_prompt_submit(
                 status = "complete"
 
             payload = {"text": raw, "usage": _get_usage(agent), "status": status}
+            if isinstance(result, dict) and result.get("cache_info"):
+                payload["cache_info"] = result["cache_info"]
             if last_reasoning:
                 payload["reasoning"] = last_reasoning
             if status_note:

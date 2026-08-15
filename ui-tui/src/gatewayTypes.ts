@@ -7,6 +7,17 @@ import type { SessionInfo, SlashCategory, SubagentStatus, Usage } from './types.
  *  Includes the paired light_colors/dark_colors overlays from #20379. */
 export type GatewaySkin = HermesSkin
 
+export interface CacheInfo {
+  attribution?: 'post_compression'
+  level: 'error' | 'info'
+  note?: string
+  pct: number
+  percent_label?: string
+  prompt_tokens: number
+  read_tokens: number
+  state: 'cold_write' | 'hit' | 'miss' | 'unavailable' | 'unknown'
+}
+
 export interface GatewayCompletionItem {
   display: string
   /** Completion class, set by the gateway. `skill` covers skill commands and
@@ -739,16 +750,7 @@ export type GatewayEvent =
   | {
       payload?: {
         billing?: BillingBlock
-        cache_info?: {
-          attribution?: 'post_compression'
-          level: 'error' | 'info'
-          note?: string
-          pct: number
-          percent_label?: string
-          prompt_tokens: number
-          read_tokens: number
-          state: 'cold_write' | 'hit' | 'miss' | 'unavailable' | 'unknown'
-        }
+        cache_info?: CacheInfo
         completed_at?: number
         failure_reason?: string
         reasoning?: string

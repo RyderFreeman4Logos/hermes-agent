@@ -67,6 +67,37 @@ describe('createGatewayEventHandler', () => {
     patchUiState({ showReasoning: true })
   })
 
+  it('renders the gateway-owned positive sub-percent cache badge after the answer', () => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+    onEvent({
+      payload: {
+        cache_info: {
+          attribution: 'post_compression',
+          level: 'info',
+          note: 'post-compression warmup (expected)',
+          pct: 0,
+          percent_label: '<1%',
+          prompt_tokens: 165_611,
+          read_tokens: 128,
+          state: 'hit',
+        },
+        text: 'final answer'
+      },
+      type: 'message.complete'
+    } as any)
+
+    expect(appended).toEqual([
+      { role: 'assistant', text: 'final answer' },
+      {
+        kind: 'event',
+        role: 'system',
+        text: 'cache <1% · post-compression warmup (expected)'
+      }
+    ])
+  })
+
   it('archives incomplete todos into transcript flow at end of turn so they scroll up', () => {
     const appended: Msg[] = []
 

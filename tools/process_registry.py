@@ -2950,27 +2950,34 @@ def _redact_process_result(result: dict) -> dict:
     forced through config and URL-credential redaction regardless of the user
     setting. The command string is also strictly redacted because it is
     display-only here and can carry inline environment/config credentials.
+    Watch patterns are redacted only in returned/enqueued summaries; the raw
+    session patterns remain intact for matching.
     """
     if not isinstance(result, dict):
         return result
     from agent.redact import redact_sensitive_text
 
-    for field in ("output", "output_preview"):
-        value = result.get(field)
-        if isinstance(value, str) and value:
-            result[field] = redact_sensitive_text(
-                value,
-                force=True,
-                code_file=False,
-                redact_url_credentials=True,
-            )
-    if isinstance(result.get("command"), str) and result["command"]:
-        result["command"] = redact_sensitive_text(
-            result["command"],
+    def _redact_value(value: str) -> str:
+        return redact_sensitive_text(
+            value,
             force=True,
             code_file=False,
             redact_url_credentials=True,
         )
+
+    for field in ("output", "output_preview", "command", "pattern"):
+        value = result.get(field)
+        if isinstance(value, str) and value:
+            result[field] = _redact_value(value)
+
+    watch_patterns = result.get("watch_patterns")
+    if isinstance(watch_patterns, list):
+        result["watch_patterns"] = [
+            _redact_value(pattern)
+            if isinstance(pattern, str) and pattern
+            else pattern
+            for pattern in watch_patterns
+        ]
     return result
 
 

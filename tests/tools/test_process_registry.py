@@ -1666,6 +1666,42 @@ class TestHandleProcessRedaction:
             assert "state=keep" in redacted[field]
             assert "example.invalid" in redacted[field]
 
+    def test_process_list_force_strict_redacts_watch_patterns_when_disabled(
+        self, monkeypatch
+    ):
+        import agent.redact as _r
+        from tools import process_registry as pr
+
+        monkeypatch.setattr(_r, "_REDACT_ENABLED", False)
+        dotted_secret = "SYNTHETIC_PATTERN_DOTTED_1a2b"
+        opaque_secret = "SYNTHETIC_PATTERN_OPAQUE_3c4d"
+        url_secret = "SYNTHETIC_PATTERN_URL_5e6f"
+        patterns = [
+            f"service.auth.token={dotted_secret}",
+            f"CUSTOM_TOKEN={opaque_secret}",
+            (
+                "https://example.invalid/wait"
+                f"?access_token={url_secret}&state=keep"
+            ),
+        ]
+        reg = ProcessRegistry()
+        sess = _make_session(sid="proc_strict_patterns")
+        sess.watch_patterns = patterns
+        reg._running[sess.id] = sess
+        monkeypatch.setattr(pr, "process_registry", reg)
+
+        parsed = json.loads(pr._handle_process({"action": "list"}))
+        returned = parsed["processes"][0]["watch_patterns"]
+
+        assert dotted_secret not in returned[0]
+        assert opaque_secret not in returned[1]
+        assert url_secret not in returned[2]
+        assert "service.auth.token=" in returned[0]
+        assert "CUSTOM_TOKEN=" in returned[1]
+        assert "example.invalid" in returned[2]
+        assert "state=keep" in returned[2]
+        assert sess.watch_patterns == patterns
+
 
 # =========================================================================
 # Reader loop: orphaned grandchild holding the stdout pipe (issue #68915)
@@ -2463,3 +2499,46 @@ class TestNotificationRedaction:
         assert command_secret not in notification["command"]
         assert "state=keep" in notification["output"]
         assert "mode=inspect" in notification["command"]
+
+    @pytest.mark.parametrize(
+        ("pattern", "secret", "preserved"),
+        [
+            (
+                "service.auth.token=SYNTHETIC_WATCH_DOTTED_1a2b",
+                "SYNTHETIC_WATCH_DOTTED_1a2b",
+                ("service.auth.token=",),
+            ),
+            (
+                "CUSTOM_TOKEN=SYNTHETIC_WATCH_OPAQUE_3c4d",
+                "SYNTHETIC_WATCH_OPAQUE_3c4d",
+                ("CUSTOM_TOKEN=",),
+            ),
+            (
+                "https://example.invalid/wait"
+                "?access_token=SYNTHETIC_WATCH_URL_5e6f&state=keep",
+                "SYNTHETIC_WATCH_URL_5e6f",
+                ("example.invalid", "state=keep"),
+            ),
+        ],
+    )
+    def test_watch_match_force_strict_redacts_pattern_when_disabled(
+        self, monkeypatch, pattern, secret, preserved
+    ):
+        import agent.redact as _r
+
+        monkeypatch.setattr(_r, "_REDACT_ENABLED", False)
+        reg = ProcessRegistry()
+        sess = _make_session(sid="proc_strict_watch_pattern")
+        sess.watch_patterns = [pattern]
+        reg._running[sess.id] = sess
+
+        reg._check_watch_patterns(sess, pattern)
+
+        notification, text = reg.drain_notifications()[0]
+        assert secret not in notification["pattern"]
+        assert secret not in text
+        for fragment in preserved:
+            assert fragment in notification["pattern"]
+            assert fragment in text
+        assert sess.watch_patterns == [pattern]
+        assert sess._watch_hits == 1

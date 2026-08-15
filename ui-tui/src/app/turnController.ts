@@ -5,7 +5,7 @@ import {
   STREAM_SCROLL_BATCH_MS,
   STREAM_TYPING_BATCH_MS
 } from '../config/timing.js'
-import type { SessionInterruptResponse, SubagentEventPayload } from '../gatewayTypes.js'
+import type { CacheInfo, SessionInterruptResponse, SubagentEventPayload } from '../gatewayTypes.js'
 import { appendToolShelfMessage, isToolShelfMessage } from '../lib/liveProgress.js'
 import { hasReasoningTag, splitReasoning } from '../lib/reasoning.js'
 import {
@@ -28,6 +28,9 @@ import { getUiState, patchUiState } from './uiStore.js'
 const INTERRUPT_COOLDOWN_MS = 1500
 const ACTIVITY_LIMIT = 8
 const TRAIL_LIMIT = 8
+
+const cacheFootnote = (cacheInfo?: CacheInfo): Msg | null =>
+  cacheInfo?.text ? { kind: 'event', role: 'system', text: cacheInfo.text } : null
 
 // Extracts the raw patch from a diff-only segment produced by
 // pushInlineDiffSegment. Used at message.complete to dedupe against final
@@ -565,6 +568,7 @@ class TurnController {
   }
 
   recordMessageComplete(payload: {
+    cache_info?: CacheInfo
     rendered?: string
     reasoning?: string
     response_previewed?: boolean
@@ -642,6 +646,12 @@ class TurnController {
 
     if (finalText) {
       finalMessages.push({ role: 'assistant', text: finalText })
+    }
+
+    const cache = cacheFootnote(payload.cache_info)
+
+    if (cache && finalMessages.some(message => message.role === 'assistant')) {
+      finalMessages.push(cache)
     }
 
     const wasInterrupted = this.interrupted

@@ -138,6 +138,43 @@ class TestCompressionBoundaryHook:
 
             assert events == ["persist", "compression"]
 
+    @pytest.mark.parametrize("in_place", [False, True])
+    def test_cache_attribution_pending_is_persisted_on_compression_boundary(
+        self, in_place
+    ):
+        from agent.cache_attribution import POST_COMPRESSION_CACHE_PENDING_KEY
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+            agent = self._make_agent(db)
+            agent.compression_in_place = in_place
+            compressor = MagicMock()
+            compressor.compress.return_value = [
+                {"role": "user", "content": "compressed summary"}
+            ]
+            compressor.compression_count = 1
+            compressor.last_prompt_tokens = 0
+            compressor.last_completion_tokens = 0
+            compressor._last_summary_error = None
+            compressor._last_compress_aborted = False
+            agent.context_compressor = compressor
+            agent._ensure_db_session()
+
+            agent._compress_context(
+                [
+                    {"role": "user", "content": f"request {index} " * 100}
+                    for index in range(10)
+                ],
+                "sys",
+                approx_tokens=2_000,
+            )
+
+            assert db.get_session_model_config_value(
+                agent.session_id,
+                POST_COMPRESSION_CACHE_PENDING_KEY,
+            ) is True
+
     def test_failure_before_persistence_does_not_notify(self):
         from hermes_state import SessionDB
 
@@ -324,4 +361,3 @@ class TestSessionCompressEvent:
                 [{"role": "user", "content": "m"}], "sys", approx_tokens=100
             )
             assert compressed
-

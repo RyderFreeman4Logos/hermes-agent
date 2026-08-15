@@ -187,6 +187,25 @@ def _unregister_subagent(subagent_id: str, *, agent: Any = None) -> None:
             _active_subagents.pop(subagent_id, None)
 
 
+def _subagent_owner_matches(
+    record: Dict[str, Any],
+    *,
+    owner_session_id: Optional[str],
+    owner_transport: Any,
+    owner_session_record: Any,
+) -> bool:
+    """Return whether *record* belongs to the exact supplied live authority."""
+    if owner_session_id is None:
+        return True
+    return (
+        record.get("owner_session_id") == owner_session_id
+        and owner_transport is not None
+        and record.get("owner_transport") is owner_transport
+        and owner_session_record is not None
+        and record.get("owner_session_record") is owner_session_record
+    )
+
+
 def _close_subagent_steering(subagent_id: str, agent: Any) -> Optional[str]:
     """Atomically close steer acceptance and drain its final durable artifact.
 
@@ -226,13 +245,135 @@ def interrupt_subagent(subagent_id: str) -> bool:
     agent = record.get("agent")
     if agent is None:
         return False
+    with _active_subagents_lock:
+        record = _active_subagents.get(subagent_id)
+        if not record or record.get("control_action") in {"queue", "interrupt", "cancel"}:
+            return False
+        record["control_action"] = "cancel"
     try:
         if not request_hard_interrupt(agent, f"Interrupted via TUI ({subagent_id})"):
+            with _active_subagents_lock:
+                record.pop("control_action", None)
             return False
     except Exception as exc:
+        with _active_subagents_lock:
+            record.pop("control_action", None)
         logger.debug("interrupt_subagent(%s) failed: %s", subagent_id, exc)
         return False
     return True
+
+
+def _reserve_live_child_control(
+    subagent_id: str,
+    action: str,
+    message: str,
+    *,
+    owner_session_id: Optional[str] = None,
+    owner_transport: Any = None,
+    owner_session_record: Any = None,
+) -> Dict[str, Any]:
+    """Reserve queue/interrupt while holding the live-child ownership fence."""
+    text = (message or "").strip()
+    if not text:
+        return {"status": "terminal", "reason": "message is required"}
+    with _active_subagents_lock:
+        record = _active_subagents.get(subagent_id)
+        if not record or not _subagent_owner_matches(
+            record,
+            owner_session_id=owner_session_id,
+            owner_transport=owner_transport,
+            owner_session_record=owner_session_record,
+        ):
+            return {"status": "terminal", "reason": "child is unavailable"}
+        existing_action = record.get("control_action")
+        if existing_action in {"queue", "interrupt", "cancel"}:
+            existing_message = record.get("control_message")
+            if existing_action == action and existing_message == text:
+                return dict(record.get("control_receipt") or {
+                    "status": "pending", "action": action, "message": text,
+                })
+            return {
+                "status": "pending",
+                "reason": "another child control is already pending",
+                "action": existing_action,
+            }
+        if not record.get("accepting_steer", True) or record.get("agent") is None:
+            return {"status": "terminal", "reason": "child is no longer running"}
+        delegation_id = str(record.get("delegation_id") or "").strip()
+        if not delegation_id:
+            return {"status": "indeterminate", "reason": "child has no durable handle"}
+        try:
+            from tools.async_delegation import reserve_child_control
+
+            receipt = reserve_child_control(delegation_id, subagent_id, action, text)
+        except Exception as exc:
+            logger.debug("child control reservation failed for %s: %s", subagent_id, exc)
+            return {"status": "indeterminate", "reason": "durable reservation failed"}
+        status = str(receipt.get("status") or "")
+        if status not in {"accepted", "queued", "pending"}:
+            return receipt
+        if status == "pending":
+            return receipt
+        record["control_action"] = action
+        record["control_message"] = text
+        record["control_generation"] = receipt.get("generation")
+        record["control_receipt"] = dict(receipt)
+        return dict(receipt)
+
+
+def queue_subagent(
+    subagent_id: str,
+    message: str,
+    *,
+    owner_session_id: Optional[str] = None,
+    owner_transport: Any = None,
+    owner_session_record: Any = None,
+) -> Dict[str, Any]:
+    """Queue exactly one next user turn without changing the current task."""
+    receipt = _reserve_live_child_control(
+        subagent_id, "queue", message,
+        owner_session_id=owner_session_id,
+        owner_transport=owner_transport,
+        owner_session_record=owner_session_record,
+    )
+    if receipt.get("status") == "accepted":
+        receipt["status"] = "queued"
+    receipt.update({"action": "queue", "subagent_id": subagent_id})
+    return receipt
+
+
+def interrupt_subagent_with_replacement(
+    subagent_id: str,
+    message: str,
+    *,
+    owner_session_id: Optional[str] = None,
+    owner_transport: Any = None,
+    owner_session_record: Any = None,
+) -> Dict[str, Any]:
+    """Stop the current child cooperatively, then replace its next turn."""
+    receipt = _reserve_live_child_control(
+        subagent_id, "interrupt", message,
+        owner_session_id=owner_session_id,
+        owner_transport=owner_transport,
+        owner_session_record=owner_session_record,
+    )
+    if receipt.get("status") in {"accepted", "queued"}:
+        with _active_subagents_lock:
+            record = _active_subagents.get(subagent_id)
+            agent = record.get("agent") if record else None
+            if record is None or agent is None:
+                receipt["status"] = "indeterminate"
+            else:
+                try:
+                    interrupted = request_hard_interrupt(
+                        agent, f"Interrupted for replacement ({subagent_id})"
+                    )
+                except Exception:
+                    interrupted = False
+                if not interrupted:
+                    receipt["status"] = "indeterminate"
+    receipt.update({"action": "interrupt", "subagent_id": subagent_id})
+    return receipt
 
 
 def steer_subagent(
@@ -273,6 +414,8 @@ def steer_subagent(
                 or record.get("owner_session_record") is not owner_session_record
             ):
                 return False
+        if record.get("control_action") in {"queue", "interrupt", "cancel"}:
+            return False
         agent = record.get("agent")
         if agent is None:
             return False
@@ -319,6 +462,8 @@ def list_active_subagents() -> List[Dict[str, Any]]:
                     "owner_transport",
                     "owner_session_record",
                     "accepting_steer",
+                    "control_message",
+                    "control_receipt",
                 }
             }
             for r in _active_subagents.values()
@@ -348,7 +493,7 @@ def _is_descendant_of(child_agent: Any, parent_agent: Any, max_hops: int = 8) ->
 
 # Model-facing control actions accepted by delegate_task(action=...).
 # "spawn" (or omitted) keeps the historical spawn semantics.
-_CONTROL_ACTIONS = frozenset({"list", "steer", "stop"})
+_CONTROL_ACTIONS = frozenset({"list", "steer", "stop", "queue", "interrupt"})
 
 
 def _handle_control_action(
@@ -468,7 +613,32 @@ def _handle_control_action(
             "message; re-delegate a follow-up task if more work is needed."
         )
 
-    return tool_error(f"Unknown action '{action}'. Use spawn, list, steer, or stop.")
+    if action in {"queue", "interrupt"}:
+        text = (message or "").strip()
+        if not text:
+            return tool_error(
+                f"action='{action}' requires a non-empty 'message' for the "
+                "next child user turn."
+            )
+        owner_sid = record.get("owner_session_id")
+        owner_transport = owner_session_record = None
+        if owner_sid:
+            owner_transport, owner_session_record = _capture_gateway_steer_authority(owner_sid)
+        handler = queue_subagent if action == "queue" else interrupt_subagent_with_replacement
+        receipt = handler(
+            sid,
+            text,
+            owner_session_id=owner_sid,
+            owner_transport=owner_transport,
+            owner_session_record=owner_session_record,
+        )
+        receipt.setdefault("action", action)
+        receipt.setdefault("subagent_id", sid)
+        return json.dumps(receipt, ensure_ascii=False)
+
+    return tool_error(
+        f"Unknown action '{action}'. Use spawn, list, steer, stop, queue, or interrupt."
+    )
 
 
 def _extract_output_tail(
@@ -1685,6 +1855,8 @@ def _build_child_agent(
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
     command_policy: Optional[Dict[str, Any]] = None,
+    resume_session_id: Optional[str] = None,
+    resume_subagent_id: Optional[str] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1714,7 +1886,7 @@ def _build_child_agent(
     # spawn_requested event, and the _active_subagents registry all share
     # one key.  parent_id is non-None when THIS parent is itself a subagent
     # (nested orchestrator -> worker chain).
-    subagent_id = f"sa-{task_index}-{_uuid.uuid4().hex[:8]}"
+    subagent_id = resume_subagent_id or f"sa-{task_index}-{_uuid.uuid4().hex[:8]}"
     parent_subagent_id = getattr(parent_agent, "_subagent_id", None)
     tui_depth = max(0, child_depth - 1)  # 0 = first-level child for the UI
 
@@ -2077,6 +2249,7 @@ def _build_child_agent(
                 base_url=effective_base_url,
             api_key=effective_api_key,
             model=effective_model,
+            session_id=resume_session_id,
             provider=effective_provider,
             requested_provider=effective_requested_provider,
             api_mode=effective_api_mode,
@@ -2581,6 +2754,7 @@ def _run_single_child(
     child_start = time.monotonic()
     child_task_id = None
     child_command_policy_registered = False
+    _delegation_id = str(_kwargs.get("delegation_id") or "").strip()
 
     # Get the progress callback from the child agent
     child_progress_cb = getattr(child, "tool_progress_callback", None)
@@ -2739,6 +2913,7 @@ def _run_single_child(
                 "status": "running",
                 "tool_count": 0,
                 "agent": child,
+                "delegation_id": _delegation_id,
                 # Immutable live gateway/TUI session that commissioned this
                 # child. Empty outside those hosts; RPC authority fails closed.
                 "owner_session_id": owner_session_id,
@@ -2898,11 +3073,18 @@ def _run_single_child(
             _worker_thread_holder["t"] = threading.current_thread()
             from agent.delegation_context import delegated_child_context
 
+            resume_history = getattr(child, "_delegate_resume_history", None)
+            extra_kwargs = (
+                {"conversation_history": resume_history}
+                if isinstance(resume_history, list) and resume_history
+                else {}
+            )
             with delegated_child_context(str(getattr(child, "session_id", "") or "")):
                 return child.run_conversation(
                     user_message=goal,
                     task_id=child_task_id,
                     stream_callback=_relay_child_text,
+                    **extra_kwargs,
                 )
 
         _child_context = contextvars.copy_context()
@@ -3198,6 +3380,8 @@ def _run_single_child(
             "api_calls": api_calls,
             "duration_seconds": duration,
             "model": _model if isinstance(_model, str) else None,
+            "child_session_id": str(getattr(child, "session_id", "") or "") or None,
+            "subagent_id": _subagent_id,
             "exit_reason": exit_reason,
             # Explicit, parent-visible truncation flag. A subagent that
             # exhausts its per-child iteration budget still returns a summary,
@@ -3758,6 +3942,285 @@ def _resolve_force_background(value: Optional[bool]) -> bool:
     return is_truthy_value(value, default=False)
 
 
+def _run_pending_child_controls(
+    delegation_id: str,
+    child_id: str,
+    parent_agent,
+    *,
+    current_result: Optional[Dict[str, Any]] = None,
+    owner_session_id: Optional[str] = None,
+    owner_transport: Any = None,
+    owner_session_record: Any = None,
+) -> List[Dict[str, Any]]:
+    """Deliver accepted queue/interrupt controls after a durable child turn."""
+    from tools import async_delegation as _ad
+
+    delivered: List[Dict[str, Any]] = []
+    previous = current_result or {}
+    requester_sid = getattr(parent_agent, "session_id", None)
+    requester_sid = requester_sid if isinstance(requester_sid, str) else None
+    while True:
+        control = _ad.claim_child_control(delegation_id, child_id)
+        if control is None:
+            break
+        generation = int(control.get("generation") or 0)
+        _ad.retain_completed_delegation(
+            delegation_id,
+            usage=previous.get("usage") if isinstance(previous, dict) else None,
+        )
+        entry = _ad.find_retained_child(child_id, owner_session_id=requester_sid)
+        if entry is None:
+            _ad.finish_child_control(
+                delegation_id,
+                child_id,
+                generation,
+                state="indeterminate",
+                error="retained child is unavailable",
+            )
+            break
+        resume_claim = _ad.claim_retained_child(entry)
+        if resume_claim is None:
+            _ad.finish_child_control(
+                delegation_id,
+                child_id,
+                generation,
+                state="indeterminate",
+                error="child session is already claimed",
+            )
+            break
+        try:
+            result = _run_retained_child_turn(
+                entry,
+                str(control.get("message") or ""),
+                parent_agent,
+                owner_session_id=owner_session_id,
+                owner_transport=owner_transport,
+                owner_session_record=owner_session_record,
+                delegation_id=delegation_id,
+            )
+        except Exception as exc:  # noqa: BLE001 - detached delivery must settle
+            logger.exception("child control delivery failed for %s", child_id)
+            _ad.finish_child_control(
+                delegation_id,
+                child_id,
+                generation,
+                state="indeterminate",
+                error=str(exc),
+            )
+            break
+        finally:
+            _ad.release_retained_child(entry, resume_claim)
+        result.setdefault("task_index", previous.get("task_index", 0))
+        delivered.append(result)
+        _ad.finish_child_control(delegation_id, child_id, generation)
+        previous = result
+    return delivered
+
+
+def _drain_restarted_child_controls(parent_agent) -> List[Dict[str, Any]]:
+    """Deliver accepted queue/interrupt controls after a process restart.
+
+    Recovery marks a dead owner's ``running``/``finalizing`` delegation row
+    ``unknown`` but an ``accepted`` child control is still pending. When the
+    owner session next engages (this ``delegate_task`` call), drain every
+    deliverable control it owns as exactly one retained-child turn each.
+    ``claim_child_control`` (claimable on recovered ``unknown`` rows, from any
+    process) guarantees exactly-once across processes, so concurrent drains
+    cannot double-deliver.
+    """
+    from tools import async_delegation as _ad
+
+    requester_sid = getattr(parent_agent, "session_id", None)
+    requester_sid = requester_sid if isinstance(requester_sid, str) else None
+    delivered: List[Dict[str, Any]] = []
+    for delegation_id, child_id in _ad.list_pending_child_controls():
+        if _ad.find_retained_child(child_id, owner_session_id=requester_sid) is None:
+            # Not one of this parent's retained children — leave it for its owner.
+            continue
+        delivered.extend(
+            _run_pending_child_controls(
+                delegation_id,
+                child_id,
+                parent_agent,
+                owner_session_id=requester_sid,
+            )
+        )
+    return delivered
+
+
+def _run_retained_child_turn(
+    entry: Dict[str, Any],
+    text: str,
+    parent_agent,
+    *,
+    owner_session_id: Optional[str] = None,
+    owner_transport: Any = None,
+    owner_session_record: Any = None,
+    delegation_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Run one message on a retained child's existing SessionDB session."""
+    child_session_id = str(entry.get("child_session_id") or "")
+    session_db = getattr(parent_agent, "_session_db", None)
+    if not child_session_id or session_db is None:
+        raise RuntimeError("retained child is unavailable")
+    resume_sid = session_db.resolve_resume_session_id(child_session_id)
+    history = session_db.get_messages_as_conversation(
+        resume_sid, repair_alternation=True
+    )
+    if not history:
+        raise RuntimeError("retained child has no durable history")
+    history = [
+        message
+        for message in history
+        if message.get("role") not in {"system", "session_meta"}
+    ]
+    cfg = _load_config()
+    creds = _resolve_delegation_credentials(cfg, parent_agent)
+    child = _build_child_preserving_parent_tools(
+        task_index=0,
+        goal=text,
+        context=None,
+        toolsets=None,
+        model=entry.get("model") or creds["model"],
+        max_iterations=cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS),
+        task_count=1,
+        parent_agent=parent_agent,
+        override_provider=entry.get("provider") or creds["provider"],
+        override_base_url=entry.get("base_url") or creds["base_url"],
+        override_api_key=creds["api_key"],
+        override_api_mode=entry.get("api_mode") or creds["api_mode"],
+        override_request_overrides=creds.get("request_overrides"),
+        override_max_tokens=creds.get("max_output_tokens"),
+        override_acp_command=creds.get("command"),
+        override_acp_args=creds.get("args"),
+        role=entry.get("role") or "leaf",
+        resume_session_id=resume_sid,
+        resume_subagent_id=entry.get("child_id"),
+    )
+    setattr(child, "_delegate_resume_history", history)
+    return _run_single_child(
+        0,
+        text,
+        child,
+        parent_agent,
+        owner_session_id=owner_session_id,
+        owner_transport=owner_transport,
+        owner_session_record=owner_session_record,
+        delegation_id=delegation_id or entry.get("delegation_id"),
+    )
+
+
+def _handle_follow_up(
+    follow_up: str,
+    goal: Optional[str],
+    context: Optional[str],
+    parent_agent,
+) -> str:
+    """Resume one completed retained child as its next user turn.
+
+    Running children intentionally do not enter this path. Live control stays
+    on the existing owner-bound steer primitive; a follow-up only resolves a
+    durable, terminal child record.
+    """
+    text = (goal or "").strip()
+    if context and str(context).strip():
+        text = (
+            f"{text}\n\nContext: {str(context).strip()}"
+            if text
+            else str(context).strip()
+        )
+    if not text:
+        return tool_error("follow_up requires 'goal' (the next child message).")
+
+    from tools.async_delegation import (
+        _FOLLOW_UP_UNAVAILABLE,
+        check_follow_up_authority,
+        claim_retained_child,
+        find_retained_child,
+        release_retained_child,
+    )
+
+    requester_sid = getattr(parent_agent, "session_id", None)
+    requester_sid = requester_sid if isinstance(requester_sid, str) else None
+    entry = find_retained_child(follow_up, owner_session_id=requester_sid)
+    if entry is None:
+        return tool_error(_FOLLOW_UP_UNAVAILABLE)
+    if check_follow_up_authority(entry, requester_sid) is not None:
+        return tool_error(_FOLLOW_UP_UNAVAILABLE)
+
+    claim = claim_retained_child(entry)
+    if claim is None:
+        return tool_error(_FOLLOW_UP_UNAVAILABLE)
+    try:
+        child_session_id = str(entry.get("child_session_id") or "")
+        session_db = getattr(parent_agent, "_session_db", None)
+        if not child_session_id or session_db is None:
+            return tool_error(_FOLLOW_UP_UNAVAILABLE)
+        try:
+            resume_sid = session_db.resolve_resume_session_id(child_session_id)
+            history = session_db.get_messages_as_conversation(
+                resume_sid, repair_alternation=True
+            )
+        except Exception:
+            return tool_error(_FOLLOW_UP_UNAVAILABLE)
+        if not history:
+            return tool_error(_FOLLOW_UP_UNAVAILABLE)
+        history = [
+            message
+            for message in history
+            if message.get("role") not in {"system", "session_meta"}
+        ]
+
+        cfg = _load_config()
+        try:
+            creds = _resolve_delegation_credentials(cfg, parent_agent)
+        except ValueError:
+            return tool_error(_FOLLOW_UP_UNAVAILABLE)
+        child = _build_child_preserving_parent_tools(
+            task_index=0,
+            goal=text,
+            context=None,
+            toolsets=None,
+            model=entry.get("model") or creds["model"],
+            max_iterations=cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS),
+            task_count=1,
+            parent_agent=parent_agent,
+            override_provider=entry.get("provider") or creds["provider"],
+            override_base_url=entry.get("base_url") or creds["base_url"],
+            override_api_key=creds["api_key"],
+            override_api_mode=entry.get("api_mode") or creds["api_mode"],
+            override_request_overrides=creds.get("request_overrides"),
+            override_max_tokens=creds.get("max_output_tokens"),
+            override_acp_command=creds.get("command"),
+            override_acp_args=creds.get("args"),
+            role=entry.get("role") or "leaf",
+            resume_session_id=resume_sid,
+            resume_subagent_id=entry.get("child_id"),
+        )
+        setattr(child, "_delegate_resume_history", history)
+        result = _run_single_child(0, text, child, parent_agent)
+        result.setdefault("task_index", 0)
+        _finalize_child_results(
+            [result], [{"goal": text}], [(0, {"goal": text}, child)], parent_agent
+        )
+        return json.dumps(
+            {
+                "mode": "follow_up",
+                "child_id": entry.get("child_id") or child_session_id,
+                "child_session_id": str(
+                    getattr(child, "session_id", "") or resume_sid
+                ),
+                "delegation_id": entry.get("delegation_id"),
+                "results": [result],
+                "note": "Follow-up resumed the retained child's next user turn.",
+            },
+            ensure_ascii=False,
+        )
+    finally:
+        release_retained_child(entry, claim)
+
+
+
 def _force_background_rejection(error: str) -> str:
     return json.dumps(
         {
@@ -3783,6 +4246,7 @@ def delegate_task(
     action: Optional[str] = None,
     subagent_id: Optional[str] = None,
     message: Optional[str] = None,
+    follow_up: Optional[str] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -3809,6 +4273,11 @@ def delegate_task(
     if parent_agent is None:
         return tool_error("delegate_task requires a parent agent context.")
 
+    if follow_up is not None:
+        if action not in (None, "", "spawn"):
+            return tool_error("follow_up cannot be combined with a control action.")
+        return _handle_follow_up(follow_up, goal, context, parent_agent)
+
     # ── Control plane: list/steer/stop run synchronously and return here.
     # They never spawn, so they bypass the pause gate, depth limit, and the
     # async dispatch machinery entirely.
@@ -3819,7 +4288,8 @@ def delegate_task(
         )
     if normalized_action and normalized_action != "spawn":
         return tool_error(
-            f"Unknown action '{action}'. Use spawn (default), list, steer, or stop."
+            f"Unknown action '{action}'. Use spawn (default), list, steer, stop, "
+            "queue, or interrupt."
         )
 
     # Operator-controlled kill switch — lets the TUI freeze new fan-out
@@ -3830,6 +4300,11 @@ def delegate_task(
             "Delegation spawning is paused. Clear the pause via the TUI "
             "(`p` in /agents) or the `delegation.pause` RPC before retrying."
         )
+
+    try:
+        _drain_restarted_child_controls(parent_agent)
+    except Exception:
+        logger.debug("delegate_task: restart control drain failed", exc_info=True)
 
     # Normalise the top-level role once; per-task overrides re-normalise.
     top_role = _normalize_role(role)
@@ -4119,8 +4594,21 @@ def delegate_task(
                 owner_session_id=_origin_ui_session_id or None,
                 owner_transport=_origin_owner_transport,
                 owner_session_record=_origin_owner_session_record,
+                delegation_id=live_deleg_id,
             )
             results.append(result)
+            if getattr(child, "_subagent_id", None):
+                results.extend(
+                    _run_pending_child_controls(
+                        live_deleg_id,
+                        str(child._subagent_id),
+                        parent_agent,
+                        current_result=result,
+                        owner_session_id=_origin_ui_session_id or None,
+                        owner_transport=_origin_owner_transport,
+                        owner_session_record=_origin_owner_session_record,
+                    )
+                )
         else:
             # Batch -- run in parallel with per-task progress lines
             completed_count = 0
@@ -4144,6 +4632,7 @@ def delegate_task(
                         owner_session_id=_origin_ui_session_id or None,
                         owner_transport=_origin_owner_transport,
                         owner_session_record=_origin_owner_session_record,
+                        delegation_id=live_deleg_id,
                     )
                     futures[future] = i
 
@@ -4220,6 +4709,19 @@ def delegate_task(
                                 ),
                             }
                         results.append(entry)
+                        child_for_control = _child_by_index.get(entry.get("task_index"))
+                        if getattr(child_for_control, "_subagent_id", None):
+                            results.extend(
+                                _run_pending_child_controls(
+                                    str(live_deleg_id or ""),
+                                    str(child_for_control._subagent_id),
+                                    parent_agent,
+                                    current_result=entry,
+                                    owner_session_id=_origin_ui_session_id or None,
+                                    owner_transport=_origin_owner_transport,
+                                    owner_session_record=_origin_owner_session_record,
+                                )
+                            )
                         completed_count += 1
 
                         # Print per-task completion line above the spinner
@@ -4531,6 +5033,30 @@ def delegate_task(
             progress_fn=_batch_progress,
         )
 
+        child_manifest: List[Dict[str, Any]] = []
+        if dispatch.get("status") == "dispatched":
+            child_manifest = [
+                {
+                    "session_id": str(getattr(child, "session_id", "") or ""),
+                    "subagent_id": str(getattr(child, "_subagent_id", "") or ""),
+                    "goal": task.get("goal", ""),
+                    "role": task.get("role") or top_role,
+                    "model": getattr(child, "model", None) or child_creds["model"],
+                    "provider": getattr(child, "provider", None) or child_creds["provider"],
+                    "base_url": getattr(child, "base_url", None) or child_creds["base_url"],
+                    "api_mode": getattr(child, "api_mode", None) or child_creds["api_mode"],
+                }
+                for task, (_, _, child), child_creds in zip(
+                    task_list, children, task_credentials
+                )
+            ]
+            from tools.async_delegation import record_dispatched_children
+
+            try:
+                record_dispatched_children(dispatch["delegation_id"], child_manifest)
+            except Exception:
+                logger.debug("record_dispatched_children failed", exc_info=True)
+
         if dispatch.get("status") == "dispatched":
             n = len(_goals)
             note = (
@@ -4558,6 +5084,13 @@ def delegate_task(
             ]
             if any(isinstance(s, str) and s for s in _sids):
                 payload["subagent_ids"] = _sids
+                payload["children"] = [
+                    {
+                        "subagent_id": child.get("subagent_id"),
+                        "session_id": child.get("session_id"),
+                    }
+                    for child in child_manifest
+                ]
                 payload["control_hint"] = (
                     "While a child runs you can orchestrate it live with this "
                     "same tool: delegate_task(action='list') to see live "
@@ -5287,7 +5820,7 @@ DELEGATE_TASK_SCHEMA = {
             },
             "action": {
                 "type": "string",
-                "enum": ["spawn", "list", "steer", "stop"],
+                "enum": ["spawn", "list", "steer", "stop", "queue", "interrupt"],
                 "description": (
                     "Default 'spawn' (omit for normal delegation). Live "
                     "orchestration of running subagents: 'list' shows this "
@@ -5315,6 +5848,15 @@ DELEGATE_TASK_SCHEMA = {
                     "and specific — the child sees it appended to its next "
                     "tool result mid-run (e.g. \"Stop exploring X; focus on Y "
                     "and return early results\")."
+                ),
+            },
+            "follow_up": {
+                "type": "string",
+                "description": (
+                    "Resume a completed retained child by subagent_id, child "
+                    "SessionDB id, or delegation_id. Provide the next user "
+                    "turn in 'goal'. This is owner-scoped and never bypasses "
+                    "a running child."
                 ),
             },
         },
@@ -5375,6 +5917,7 @@ registry.register(
         action=args.get("action"),
         subagent_id=args.get("subagent_id"),
         message=args.get("message"),
+        follow_up=args.get("follow_up"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,

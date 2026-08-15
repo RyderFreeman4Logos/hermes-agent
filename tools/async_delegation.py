@@ -887,19 +887,9 @@ def dispatch_async_delegation(
     submit_error = None
     with _records_lock:
         try:
-            # Install the heartbeat under the same lock that prevents a fast
-            # worker from claiming terminal completion first.
             executor.submit(propagate_context_to_thread(_worker))
         except Exception as exc:  # pragma: no cover — pool submit failure is rare
             submit_error = exc
-        else:
-            runtime_heartbeat.arm(
-                delegation_id,
-                caller_id=session_key,
-                kind="delegation",
-                interval=heartbeat_interval,
-                inspect=lambda _id=delegation_id: inspect_delegation(_id),
-            )
     if submit_error is not None:
         with _records_lock:
             _records.pop(delegation_id, None)
@@ -908,6 +898,13 @@ def dispatch_async_delegation(
             "status": "rejected",
             "error": f"Failed to schedule async delegation: {submit_error}",
         }
+    runtime_heartbeat.arm(
+        delegation_id,
+        caller_id=session_key,
+        kind="delegation",
+        interval=heartbeat_interval,
+        inspect=lambda _id=delegation_id: inspect_delegation(_id),
+    )
     if progress_fn is not None:
         _ensure_stale_monitor()
 
@@ -1171,14 +1168,6 @@ def dispatch_async_delegation_batch(
             executor.submit(propagate_context_to_thread(_worker))
         except Exception as exc:  # pragma: no cover
             submit_error = exc
-        else:
-            runtime_heartbeat.arm(
-                delegation_id,
-                caller_id=session_key,
-                kind="delegation",
-                interval=heartbeat_interval,
-                inspect=lambda _id=delegation_id: inspect_delegation(_id),
-            )
     if submit_error is not None:
         if on_submit_failure is not None:
             try:
@@ -1195,6 +1184,13 @@ def dispatch_async_delegation_batch(
             "status": "rejected",
             "error": f"Failed to schedule async delegation batch: {submit_error}",
         }
+    runtime_heartbeat.arm(
+        delegation_id,
+        caller_id=session_key,
+        kind="delegation",
+        interval=heartbeat_interval,
+        inspect=lambda _id=delegation_id: inspect_delegation(_id),
+    )
     if progress_fn is not None:
         _ensure_stale_monitor()
 

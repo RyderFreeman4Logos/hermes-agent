@@ -139,6 +139,118 @@ def test_config_enabled_hard_stop_blocks_repeated_exact_failure_before_execution
     assert "repeated_exact_failure_block" in messages[0]["content"]
 
 
+def test_config_enabled_hard_stop_counts_multimodal_success_as_recovery():
+    agent = _make_agent("vision_analyze", config=_hard_stop_config())
+    args = {"image_url": "file:///tmp/test.png", "question": "same"}
+    calls = [
+        _mock_tool_call("vision_analyze", json.dumps(args), f"c-{index}")
+        for index in range(4)
+    ]
+    messages = []
+    failure = json.dumps({"error": "same failure"})
+    multimodal_success = {
+        "_multimodal": True,
+        "content": [{"type": "text", "text": "success"}],
+        "text_summary": "success",
+    }
+
+    with patch(
+        "run_agent.handle_function_call",
+        side_effect=[failure, multimodal_success, failure, "fourth call executed"],
+    ) as dispatch:
+        agent._execute_tool_calls_sequential(
+            SimpleNamespace(content="", tool_calls=calls), messages, "task-1"
+        )
+
+    assert dispatch.call_count == 4
+    assert [message["tool_call_id"] for message in messages] == [
+        f"c-{index}" for index in range(4)
+    ]
+    assert all(
+        "repeated_exact_failure_block" not in str(message["content"])
+        for message in messages
+    )
+
+
+def test_config_enabled_hard_stop_counts_sequential_timeouts_as_failures():
+    agent = _make_agent("web_search", config=_hard_stop_config())
+    args = {"query": "same"}
+    calls = [
+        _mock_tool_call("web_search", json.dumps(args), f"c-{index}")
+        for index in range(3)
+    ]
+    messages = []
+    release = threading.Event()
+
+    try:
+        with (
+            patch(
+                "agent.tool_executor._resolve_sequential_tool_timeout",
+                return_value=0.05,
+            ),
+            patch(
+                "run_agent.handle_function_call",
+                side_effect=lambda *_args, **_kwargs: release.wait(timeout=1) or "late",
+            ) as dispatch,
+        ):
+            agent._execute_tool_calls_sequential(
+                SimpleNamespace(content="", tool_calls=calls), messages, "task-1"
+            )
+    finally:
+        release.set()
+
+    assert dispatch.call_count == 2
+    assert all("timed out after 0.1s" in message["content"] for message in messages[:2])
+    assert "repeated_exact_failure_block" in messages[2]["content"]
+
+
+def test_config_enabled_hard_stop_ignores_concurrent_timeout_placeholders():
+    agent = _make_agent("web_search", config=_hard_stop_config())
+    args = {"query": "same"}
+    release = threading.Event()
+
+    try:
+        with (
+            patch(
+                "agent.tool_executor._resolve_concurrent_tool_timeout",
+                return_value=0.01,
+            ),
+            patch(
+                "run_agent.handle_function_call",
+                side_effect=lambda *_args, **_kwargs: release.wait(timeout=1) or "late",
+            ),
+        ):
+            for index in range(2):
+                agent._execute_tool_calls_concurrent(
+                    SimpleNamespace(
+                        content="",
+                        tool_calls=[
+                            _mock_tool_call(
+                                "web_search", json.dumps(args), f"c-timeout-{index}"
+                            )
+                        ],
+                    ),
+                    [],
+                    "task-1",
+                )
+    finally:
+        release.set()
+
+    messages = []
+    with patch("run_agent.handle_function_call", return_value="executed") as dispatch:
+        agent._execute_tool_calls_sequential(
+            SimpleNamespace(
+                content="",
+                tool_calls=[_mock_tool_call("web_search", json.dumps(args), "c-real")],
+            ),
+            messages,
+            "task-1",
+        )
+
+    dispatch.assert_called_once()
+    assert "repeated_exact_failure_block" not in messages[0]["content"]
+
+
 def test_sequential_after_call_appends_guidance_to_tool_result_without_extra_messages():
     agent = _make_agent("web_search")
     args = {"query": "same"}

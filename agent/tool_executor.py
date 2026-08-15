@@ -401,17 +401,22 @@ def _record_guardrail_result(
     *,
     failed: bool,
     synthetic: bool,
+    update_configured_state: bool,
 ) -> Any:
-    """Record one real observation, or break the streak for a synthetic result."""
-    if synthetic or not isinstance(function_result, str):
+    """Keep streak and configured accounting semantics independent."""
+    breaks_streak = synthetic or not isinstance(function_result, str)
+    if breaks_streak:
         agent._tool_guardrails.break_observation_streak()
-        return function_result
-    return agent._append_guardrail_observation(
-        function_name,
-        function_args,
-        function_result,
-        failed=failed,
-    )
+    if update_configured_state:
+        function_result = agent._append_guardrail_observation(
+            function_name,
+            function_args,
+            function_result,
+            failed=failed,
+        )
+        if breaks_streak:
+            agent._tool_guardrails.break_observation_streak()
+    return function_result
 
 
 class _ConcurrentToolAuthorizationGate:
@@ -1721,6 +1726,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             function_result,
             failed=is_error,
             synthetic=synthetic_result,
+            update_configured_state=r is not None and not blocked,
         )
         if r is not None:
             if is_error:
@@ -1950,6 +1956,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 malformed_args_result,
                 failed=True,
                 synthetic=True,
+                update_configured_state=False,
             )
             _emit_terminal_post_tool_call(
                 agent,
@@ -2539,6 +2546,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             function_result,
             failed=_is_error_result,
             synthetic=_execution_blocked or _execution_timed_out,
+            update_configured_state=not _execution_blocked,
         )
         if isinstance(function_result, str):
             result_preview = function_result if agent.verbose_logging else (

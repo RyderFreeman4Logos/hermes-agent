@@ -84,6 +84,11 @@ def cache_hit_percent_label(cache_read_tokens: int, prompt_tokens: int) -> str:
     return f"{cache_hit_percent(cache_read_tokens, prompt_tokens)}%"
 
 
+def format_cache_hit_percent(cache_read_tokens: int, prompt_tokens: int) -> str:
+    """Compatibility name used by runtime-heartbeat status surfaces."""
+    return cache_hit_percent_label(cache_read_tokens, prompt_tokens)
+
+
 @dataclass(frozen=True)
 class CanonicalUsage:
     input_tokens: int = 0

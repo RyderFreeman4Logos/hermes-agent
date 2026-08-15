@@ -205,7 +205,20 @@ export interface Usage {
   input: number
   output: number
   reasoning?: number
+  runtime_heartbeat?: RuntimeHeartbeatStatus
   total: number
+}
+
+export interface RuntimeHeartbeatTarget {
+  interval_s: number
+  kind: 'delegation' | 'process'
+  last_success_at: null | number
+  started_at: number
+}
+
+export interface RuntimeHeartbeatStatus {
+  active_count: number
+  targets: RuntimeHeartbeatTarget[]
 }
 
 export interface SudoReq {

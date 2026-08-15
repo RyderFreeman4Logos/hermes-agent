@@ -477,7 +477,11 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
 
 
 def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
-    """Claim a durable delegation event; non-durable events need no token."""
+    """Claim a durable delegation or reject a stale heartbeat event."""
+    if evt.get("type") == "heartbeat":
+        from tools.runtime_heartbeat import runtime_heartbeat
+
+        return "" if runtime_heartbeat.is_event_current(evt) else None
     if evt.get("type") != "async_delegation":
         return ""
     delegation_id = str(evt.get("delegation_id") or "")
@@ -808,6 +812,9 @@ def dispatch_async_delegation(
         ``{"status": "dispatched", "delegation_id": ...}`` on success, or
         ``{"status": "rejected", "error": ...}`` when at capacity.
     """
+    from tools.runtime_heartbeat import preflight_current_heartbeat
+
+    heartbeat_interval = preflight_current_heartbeat()
     delegation_id = _new_delegation_id()
     dispatched_at = time.time()
     record: Dict[str, Any] = {
@@ -875,17 +882,31 @@ def dispatch_async_delegation(
         finally:
             _finalize(delegation_id, result, status)
 
-    try:
-        # Propagate the dispatching profile so the detached child resolves
-        # get_hermes_home() under the right profile.
-        executor.submit(propagate_context_to_thread(_worker))
-    except Exception as exc:  # pragma: no cover — pool submit failure is rare
+    from tools.runtime_heartbeat import inspect_delegation, runtime_heartbeat
+
+    submit_error = None
+    with _records_lock:
+        try:
+            # Install the heartbeat under the same lock that prevents a fast
+            # worker from claiming terminal completion first.
+            executor.submit(propagate_context_to_thread(_worker))
+        except Exception as exc:  # pragma: no cover — pool submit failure is rare
+            submit_error = exc
+        else:
+            runtime_heartbeat.arm(
+                delegation_id,
+                caller_id=session_key,
+                kind="delegation",
+                interval=heartbeat_interval,
+                inspect=lambda _id=delegation_id: inspect_delegation(_id),
+            )
+    if submit_error is not None:
         with _records_lock:
             _records.pop(delegation_id, None)
         _delete_durable_delegation(delegation_id)
         return {
             "status": "rejected",
-            "error": f"Failed to schedule async delegation: {exc}",
+            "error": f"Failed to schedule async delegation: {submit_error}",
         }
     if progress_fn is not None:
         _ensure_stale_monitor()
@@ -925,6 +946,17 @@ def _begin_finalization(
         record["interrupt_fn"] = None  # drop the closure; child is done
         record["progress_fn"] = None  # stop stale-monitor sampling
         event_record = dict(record)
+
+    try:
+        from tools.runtime_heartbeat import runtime_heartbeat
+
+        runtime_heartbeat.cancel(delegation_id)
+    except Exception:
+        logger.debug(
+            "Failed to cancel heartbeat for delegation %s",
+            delegation_id,
+            exc_info=True,
+        )
 
     return event_record, interrupt_fn
 
@@ -1028,6 +1060,8 @@ def dispatch_async_delegation_batch(
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
     delegation_id: Optional[str] = None,
     progress_fn: Optional[Callable[[], tuple]] = None,
+    before_submit: Optional[Callable[[str], None]] = None,
+    on_submit_failure: Optional[Callable[[str], None]] = None,
 ) -> Dict[str, Any]:
     """Dispatch a WHOLE fan-out batch as ONE background unit.
 
@@ -1049,6 +1083,9 @@ def dispatch_async_delegation_batch(
     ``{"status": "rejected", "error": ...}`` when the async pool is at
     capacity.
     """
+    from tools.runtime_heartbeat import preflight_current_heartbeat
+
+    heartbeat_interval = preflight_current_heartbeat()
     delegation_id = delegation_id or _new_delegation_id()
     dispatched_at = time.time()
     n = len(goals)
@@ -1124,16 +1161,39 @@ def dispatch_async_delegation_batch(
         finally:
             _finalize_batch(delegation_id, combined, status)
 
-    try:
-        # Propagate the dispatching profile to the detached batch children.
-        executor.submit(propagate_context_to_thread(_worker))
-    except Exception as exc:  # pragma: no cover
+    from tools.runtime_heartbeat import inspect_delegation, runtime_heartbeat
+
+    submit_error = None
+    with _records_lock:
+        try:
+            if before_submit is not None:
+                before_submit(delegation_id)
+            executor.submit(propagate_context_to_thread(_worker))
+        except Exception as exc:  # pragma: no cover
+            submit_error = exc
+        else:
+            runtime_heartbeat.arm(
+                delegation_id,
+                caller_id=session_key,
+                kind="delegation",
+                interval=heartbeat_interval,
+                inspect=lambda _id=delegation_id: inspect_delegation(_id),
+            )
+    if submit_error is not None:
+        if on_submit_failure is not None:
+            try:
+                on_submit_failure(delegation_id)
+            except Exception:
+                logger.exception(
+                    "Async delegation batch %s failed to unwind accepted ownership",
+                    delegation_id,
+                )
         with _records_lock:
             _records.pop(delegation_id, None)
         _delete_durable_delegation(delegation_id)
         return {
             "status": "rejected",
-            "error": f"Failed to schedule async delegation batch: {exc}",
+            "error": f"Failed to schedule async delegation batch: {submit_error}",
         }
     if progress_fn is not None:
         _ensure_stale_monitor()

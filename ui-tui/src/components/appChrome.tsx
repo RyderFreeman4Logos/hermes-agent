@@ -17,7 +17,7 @@ import { fmtK } from '../lib/text.js'
 import { DEFAULT_STATUS_BAR_SEGMENTS, packStatusRows, type StatusBarSegment } from '../lib/statusBar.js'
 import { useScrollbarSnapshot, useViewportSnapshot } from '../lib/viewportStore.js'
 import type { Theme } from '../theme.js'
-import type { Msg, SubagentProgress, Usage } from '../types.js'
+import type { Msg, RuntimeHeartbeatStatus, SubagentProgress, Usage } from '../types.js'
 
 import { scrollbarColors } from './overlayPrimitives.js'
 
@@ -508,6 +508,57 @@ function IdleSince({ endedAt }: { endedAt: number }) {
   return <Text>{`✓ ${fmtDuration(now - endedAt)}`}</Text>
 }
 
+export const runtimeHeartbeatLabel = (heartbeat?: RuntimeHeartbeatStatus, now = Date.now()): string => {
+  const target = heartbeat?.targets[0]
+
+  if (
+    !target ||
+    !Number.isFinite(target.started_at) ||
+    !Number.isInteger(target.interval_s) ||
+    target.interval_s <= 0
+  ) {
+    return ''
+  }
+
+  const elapsed = Math.max(0, Math.floor(now / 1000 - target.started_at))
+  const extra = Math.max(heartbeat?.active_count ?? 0, heartbeat?.targets.length ?? 0) - 1
+
+  const lastSuccessAt = Math.max(
+    0,
+    ...heartbeat.targets.map(item =>
+      typeof item.last_success_at === 'number' && Number.isFinite(item.last_success_at) ? item.last_success_at : 0
+    )
+  )
+
+  const successAge =
+    lastSuccessAt > 0
+      ? Math.floor(Math.max(0, now / 1000 - lastSuccessAt)) >= 100 * 3600
+        ? '99h+'
+        : fmtDuration(Math.max(0, now - lastSuccessAt * 1000))
+      : ''
+
+  return `→checkin ${elapsed}s/${target.interval_s}s${extra > 0 ? ` +${extra}` : ''}${successAge ? ` ✓${successAge}` : ''}`
+}
+
+function RuntimeHeartbeatCheckin({ heartbeat }: { heartbeat: RuntimeHeartbeatStatus }) {
+  const [now, setNow] = useState(() => Date.now())
+  const isOccluded = useStore($isStatusRuleOccluded)
+  const target = heartbeat.targets[0]
+
+  useEffect(() => {
+    if (isOccluded || !target) {
+      return
+    }
+
+    setNow(Date.now())
+    const id = setInterval(() => setNow(Date.now()), 1000)
+
+    return () => clearInterval(id)
+  }, [isOccluded, target])
+
+  return runtimeHeartbeatLabel(heartbeat, now)
+}
+
 const effortLabel = (effort?: string) => {
   const value = String(effort ?? '')
     .trim()
@@ -648,8 +699,8 @@ export function StatusRule({
 
   // Whole-segment progressive disclosure for the tail: a segment renders only
   // if it fits in the space left after the pinned essentials, evaluated in
-  // descending priority order — bar, duration, compressions, voice, session
-  // count, bg, cost. Lower-priority segments drop first and nothing truncates
+  // descending priority order — bar, duration, idle, heartbeat, compressions,
+  // voice, session count, bg, cost. Lower-priority segments drop first and nothing truncates
   // mid-segment, so status/model/context are never crushed.
   const SEP = stringWidth(' │ ')
   let tailBudget = Math.max(0, leftWidth - essentialWidth)
@@ -666,6 +717,7 @@ export function StatusRule({
 
   const sessionCountText = liveSessionCount > 0 ? statusSessionCountLabel(liveSessionCount) : ''
   const compressions = typeof usage.compressions === 'number' ? usage.compressions : 0
+  const heartbeatText = runtimeHeartbeatLabel(usage.runtime_heartbeat)
 
   // Dev-only readout (HERMES_DEV_CREDITS). The server omits the key entirely unless the
   // flag is on, so this segment self-hides for normal users. micros→cents is allowed money
@@ -684,6 +736,7 @@ export function StatusRule({
   // turn completes. Shares the duration breakpoint and width reservation.
   const showIdle =
     segs.duration && !busy && lastTurnEndedAt != null && fits(SEP + stringWidth('✓ ') + MAX_DURATION_WIDTH)
+  const showHeartbeat = !!heartbeatText && fits(SEP + stringWidth(heartbeatText))
 
   const showCompressions = segs.compressions && compressions > 0 && fits(SEP + stringWidth(`cmp ${compressions}`))
   const showVoice = segs.voice && !!voiceLabel && fits(SEP + stringWidth(voiceLabel))
@@ -952,6 +1005,12 @@ export function StatusRule({
             <Text color={t.color.muted}>{' │ '}</Text>
             <Text color={t.color.warn}>◉ focus</Text>
           </Box>
+        ) : null}
+        {showHeartbeat ? (
+          <Text color={t.color.muted} wrap="truncate-end">
+            {' │ '}
+            <RuntimeHeartbeatCheckin heartbeat={usage.runtime_heartbeat!} />
+          </Text>
         ) : null}
         {showBar ? (
           <Text color={t.color.muted} wrap="truncate-end">

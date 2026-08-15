@@ -9919,11 +9919,32 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             return cursor.fetchone() is not None
 
+    def get_compaction_fingerprint(self, session_id: str) -> List[tuple]:
+        fingerprint, _ = self.get_compaction_snapshot(session_id)
+        return fingerprint
+
+    def get_compaction_snapshot(
+        self, session_id: str
+    ) -> Tuple[List[tuple], List[Dict[str, Any]]]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM messages WHERE session_id = ? AND active = 1 ORDER BY id",
+                (session_id,),
+            ).fetchall()
+        return [tuple(row) for row in rows], self._rows_to_conversation(
+            rows,
+            session_id=session_id,
+            include_ancestors=False,
+            repair_alternation=False,
+            preserve_raw=True,
+        )
+
     def archive_and_compact(
         self,
         session_id: str,
         compacted_messages: List[Dict[str, Any]],
         model_config_patch: Optional[Dict[str, Any]] = None,
+        expected_active_fingerprint: Optional[List[tuple]] = None,
     ) -> int:
         """Non-destructive in-place compaction for a single durable session id.
 
@@ -9952,6 +9973,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """
 
         def _do(conn):
+            if expected_active_fingerprint is not None:
+                current_rows = conn.execute(
+                    "SELECT * FROM messages WHERE session_id = ? AND active = 1 ORDER BY id",
+                    (session_id,),
+                ).fetchall()
+                if [tuple(row) for row in current_rows] != expected_active_fingerprint:
+                    raise CompressionSessionBusyError(
+                        f"Durable transcript changed before compaction: {session_id}"
+                    )
             patched_model_config = None
             if model_config_patch is not None:
                 # on_missing="raise": a prune/compaction must not commit
@@ -10428,6 +10458,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         include_ancestors: bool,
         repair_alternation: bool,
         include_row_ids: bool = False,
+        preserve_raw: bool = False,
     ) -> List[Dict[str, Any]]:
         """Decode fetched message rows into the OpenAI conversation format.
 
@@ -10439,7 +10470,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         messages = []
         for row in rows:
             content = self._decode_content(row["content"])
-            if row["role"] in {"user", "assistant"} and isinstance(content, str):
+            if not preserve_raw and row["role"] in {"user", "assistant"} and isinstance(content, str):
                 content = sanitize_context(content).strip()
             msg = {"role": row["role"], "content": content}
             # Durable per-message identity for surfaces that need to address a
@@ -10518,6 +10549,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             if include_ancestors and self._is_duplicate_replayed_user_message(messages, msg):
                 continue
             messages.append(msg)
+        if preserve_raw:
+            return messages
         # DEFENSE-IN-DEPTH against background-review session pollution: a forked
         # skill/memory review that (in older builds, before the _persist_disabled
         # fix) shared the parent's session_id wrote its harness turn into this

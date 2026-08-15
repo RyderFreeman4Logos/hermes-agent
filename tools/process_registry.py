@@ -1356,13 +1356,20 @@ class ProcessRegistry:
 
         safe_command = _rewrite_bg(command)
 
+        started_at = time.time()
         session = ProcessSession(
             id=f"proc_{uuid.uuid4().hex[:12]}",
             command=command,
             task_id=task_id,
             session_key=session_key,
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
-            started_at=time.time(),
+            started_at=started_at,
+            execution_deadline=(
+                started_at + max(0.0, float(execution_timeout))
+                if execution_timeout is not None
+                else None
+            ),
+            **(notification_metadata or {}),
         )
 
         pty_scope_attempted = False
@@ -1417,6 +1424,8 @@ class ProcessRegistry:
                 self._register_local_spawn(
                     session, defer_registration=defer_registration
                 )
+                if not defer_registration:
+                    self._arm_execution_deadline(session)
 
                 # PTY reader thread
                 reader = threading.Thread(
@@ -1534,6 +1543,8 @@ class ProcessRegistry:
             self._register_local_spawn(
                 session, defer_registration=defer_registration
             )
+            if not defer_registration:
+                self._arm_execution_deadline(session)
 
             # Start output reader thread
             reader = threading.Thread(
@@ -2143,6 +2154,9 @@ class ProcessRegistry:
         with self._lock:
             was_running = self._running.pop(session.id, None) is not None
             self._finished[session.id] = session
+        if session._deadline_timer is not None:
+            session._deadline_timer.cancel()
+            session._deadline_timer = None
         if was_running:
             from tools.runtime_heartbeat import runtime_heartbeat
 

@@ -3258,6 +3258,30 @@ def terminal_tool(
                 "EOF."
             )
 
+        # Publish every completion-routing field before a local reader can win
+        # the exit race.  The same snapshot is also used by remote sessions.
+        notification_metadata = None
+        if background:
+            notification_metadata = {
+                "notify_on_complete": bool(notify_on_complete),
+                "watch_patterns": list(watch_patterns or []),
+                "heartbeat_provider": heartbeat_provider,
+            }
+            if notify_on_complete or watch_patterns:
+                from gateway.session_context import get_session_env as _gse
+
+                watcher_platform = _gse("HERMES_SESSION_PLATFORM", "")
+                if watcher_platform:
+                    notification_metadata.update({
+                        "watcher_platform": watcher_platform,
+                        "watcher_chat_id": _gse("HERMES_SESSION_CHAT_ID", ""),
+                        "watcher_user_id": _gse("HERMES_SESSION_USER_ID", ""),
+                        "watcher_user_name": _gse("HERMES_SESSION_USER_NAME", ""),
+                        "watcher_thread_id": _gse("HERMES_SESSION_THREAD_ID", ""),
+                        "watcher_message_id": _gse("HERMES_SESSION_MESSAGE_ID", ""),
+                        "parent_session_id": _gse("HERMES_SESSION_ID", ""),
+                    })
+
         # The session key is already computed above the gateway guard.
         if background:
             # Spawn through the managed process lifecycle.
@@ -3278,6 +3302,8 @@ def terminal_tool(
                         session_key=session_key,
                         env_vars=env.env if hasattr(env, 'env') else None,
                         use_pty=effective_pty,
+                        execution_timeout=execution_timeout,
+                        notification_metadata=notification_metadata,
                     )
                 else:
                     proc_session = process_registry.spawn_via_env(
@@ -3286,6 +3312,8 @@ def terminal_tool(
                         cwd=effective_cwd,
                         task_id=effective_task_id,
                         session_key=session_key,
+                        execution_timeout=execution_timeout,
+                        notification_metadata=notification_metadata,
                     )
 
                 if notify_on_complete:

@@ -47,7 +47,7 @@ def _run_main(monkeypatch, events, *, prewarm=None):
     def _write_json(payload):
         params = payload.get("params") or {}
         events.append(("write", params.get("type") or payload.get("method")))
-        return True
+        return entry.server._stdio_transport.write(payload)
 
     monkeypatch.setattr(entry, "write_json", _write_json)
 

@@ -428,15 +428,19 @@ def main():
 
     try:
         ensure_mcp_discovery_started()
-        if not write_json({
-            "jsonrpc": "2.0",
-            "method": "event",
-            "params": {
-                "type": "gateway.ready",
-                "payload": {"skin": resolve_skin(), "change_events": True},
-            },
-        }):
-            _log_exit("startup write failed (broken stdout pipe)")
+        if (
+            not write_json({
+                "jsonrpc": "2.0",
+                "method": "event",
+                "params": {
+                    "type": "gateway.ready",
+                    "payload": {"skin": resolve_skin(), "change_events": True},
+                },
+            })
+            or not writer.wait_for_first_write()
+        ):
+            writer.raise_if_failed()
+            _log_exit("startup write failed (broken or blocked stdout pipe)")
             return
 
         server._ensure_skin_watcher()
@@ -446,27 +450,38 @@ def main():
         except Exception:
             logger.debug("picker cache prewarm (tui) failed to start", exc_info=True)
 
-        stdin_items: queue.Queue[object] = queue.Queue()
+        stdin_items: queue.Queue[object] = queue.Queue(maxsize=1)
         writer_closed = object()
+
+        def put_stdin(item: object) -> None:
+            while not stdin_stop.is_set():
+                try:
+                    stdin_items.put(item, timeout=0.05)
+                    return
+                except queue.Full:
+                    continue
 
         def read_stdin() -> None:
             while not stdin_stop.is_set():
                 try:
                     raw = sys.stdin.readline()
                 except BaseException as exc:
-                    stdin_items.put(exc)
+                    put_stdin(exc)
                     return
                 if stdin_stop.is_set():
                     return
                 if not raw and handle_spurious_eof(_recovery_times, _log_exit):
                     continue
-                stdin_items.put(raw)
+                put_stdin(raw)
                 if not raw:
                     return
 
         def wake_on_writer_close() -> None:
-            writer._closed.wait()
-            stdin_items.put(writer_closed)
+            writer.wait_closed()
+            try:
+                stdin_items.put_nowait(writer_closed)
+            except queue.Full:
+                pass
 
         threading.Thread(target=read_stdin, name="tui-stdin-reader", daemon=True).start()
         threading.Thread(
@@ -474,6 +489,8 @@ def main():
         ).start()
 
         while True:
+            if writer._closed:
+                break
             item = stdin_items.get()
             if item is writer_closed:
                 break

@@ -759,6 +759,11 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
         try:
             session_row = agent._session_db.get_session(agent.session_id)
             if session_row is not None:
+                from agent.system_prompt import restore_session_skills_catalog_mode
+
+                restore_session_skills_catalog_mode(
+                    agent, session_row.get("model_config")
+                )
                 raw_prompt = session_row.get("system_prompt")
                 if raw_prompt is None:
                     stored_state = "null"
@@ -826,6 +831,9 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     # First turn of a new session (or recovering from a broken stored
     # prompt) — build from scratch.
     agent._cached_system_prompt = agent._build_system_prompt(system_message)
+    from agent.system_prompt import persist_session_skills_catalog_mode
+
+    persist_session_skills_catalog_mode(agent)
 
     # Plugin hook: on_session_start — fired once when a brand-new
     # session is created (not on continuation).  Plugins can use this

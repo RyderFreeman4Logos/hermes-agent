@@ -1736,6 +1736,10 @@ def _current_session_platform_hint() -> str:
         return ""
 
 
+# Cache-key-safe marker for names-only rendering of every category.
+ALL_SKILL_CATEGORIES = frozenset({"*"})
+
+
 def build_skills_system_prompt(
     available_tools: "set[str] | None" = None,
     available_toolsets: "set[str] | None" = None,
@@ -1982,9 +1986,14 @@ def _build_skills_system_prompt_inner(
     # what the index stops showing them. Match on the top-level category
     # segment so nested categories ("social-media/twitter") are demoted with
     # their parent.
-    demoted = frozenset(
-        cat for cat in skills_by_category
-        if cat.split("/", 1)[0] in (compact_categories or frozenset())
+    requested_demotions = compact_categories or frozenset()
+    demoted = (
+        frozenset(skills_by_category)
+        if ALL_SKILL_CATEGORIES.issubset(requested_demotions)
+        else frozenset(
+            cat for cat in skills_by_category
+            if cat.split("/", 1)[0] in requested_demotions
+        )
     )
 
     hidden_note = ""

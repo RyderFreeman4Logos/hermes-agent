@@ -628,7 +628,15 @@ class SessionManager:
         api_mode: str | None = None,
     ):
         if self._agent_factory is not None:
-            return self._agent_factory()
+            agent = self._agent_factory()
+            from agent.system_prompt import hydrate_session_skills_catalog_mode
+
+            hydrate_session_skills_catalog_mode(
+                agent,
+                session_db=self._get_db(),
+                session_id=session_id,
+            )
+            return agent
 
         from run_agent import AIAgent
         from hermes_cli.config import load_config
@@ -703,6 +711,13 @@ class SessionManager:
             logger.debug("ACP: bounded MCP discovery wait failed", exc_info=True)
 
         agent = AIAgent(**kwargs)
+        from agent.system_prompt import hydrate_session_skills_catalog_mode
+
+        hydrate_session_skills_catalog_mode(
+            agent,
+            session_db=kwargs["session_db"],
+            session_id=session_id,
+        )
         # Codex app-server sessions are spawned lazily on the first turn. Stamp
         # the ACP workspace onto the agent so the Codex runtime starts from the
         # editor/session cwd instead of the Hermes daemon's process cwd.

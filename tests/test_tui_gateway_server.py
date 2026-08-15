@@ -15437,6 +15437,53 @@ def test_make_agent_defaults_to_500(monkeypatch):
     assert mock_agent.call_args.kwargs["max_iterations"] == 500
 
 
+def test_make_agent_hydrates_catalog_mode_before_direct_prompt_rebuild(
+    monkeypatch, tmp_path
+):
+    from agent.system_prompt import _session_skills_catalog_mode
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session(
+        "persisted-session",
+        source="tui",
+        model_config={"_skills_catalog_mode": "compact"},
+    )
+    _setup_make_agent_mocks(monkeypatch, {})
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+
+    def fake_agent(**kwargs):
+        return types.SimpleNamespace(
+            model=kwargs.get("model"),
+            session_id=kwargs.get("session_id"),
+            _session_db=kwargs.get("session_db"),
+            _session_init_model_config={},
+            _skills_catalog_mode_config="full",
+            _cached_system_prompt=None,
+            _build_system_prompt=lambda _message: (
+                f"catalog-mode={_session_skills_catalog_mode(agent)}"
+            ),
+        )
+
+    monkeypatch.setattr("run_agent.AIAgent", fake_agent)
+    try:
+        agent = server._make_agent(
+            "sid1",
+            "persisted-session",
+            session_id="persisted-session",
+            session_db=db,
+        )
+        session = {"agent": agent, "session_key": "persisted-session"}
+        server._persist_live_session_system_prompt(session)
+
+        stored = db.get_session("persisted-session")
+        assert agent._skills_catalog_mode == "compact"
+        assert stored["system_prompt"] == "catalog-mode=compact"
+        assert json.loads(stored["model_config"])["_skills_catalog_mode"] == "compact"
+    finally:
+        db.close()
+
+
 def test_make_agent_uses_session_runtime_overrides(monkeypatch):
     _setup_make_agent_mocks(monkeypatch, {})
     resolved = {}

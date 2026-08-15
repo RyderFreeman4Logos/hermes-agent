@@ -89,18 +89,33 @@ class TestBranchCommandCLI:
             parent_id, {"_skills_catalog_mode": "compact"}
         )
 
+        agent = SimpleNamespace(
+            session_id=parent_id,
+            session_start=cli_instance.session_start,
+            _session_init_model_config={"_skills_catalog_mode": "compact"},
+            _skills_catalog_mode="compact",
+            _skills_catalog_mode_config="full",
+            _cached_system_prompt="parent prompt",
+            _flush_messages_to_session_db=lambda *args, **kwargs: None,
+            _invalidate_system_prompt=lambda: None,
+        )
+
+        def reset_session_state():
+            agent._session_init_model_config = {}
+            if hasattr(agent, "_skills_catalog_mode"):
+                del agent._skills_catalog_mode
+
+        agent.reset_session_state = reset_session_state
+        cli_instance.agent = agent
+
         HermesCLI._handle_branch_command(cli_instance, "/branch")
 
         child = session_db.get_session(cli_instance.session_id)
-        fresh_agent = SimpleNamespace(
-            _session_init_model_config={},
-            _skills_catalog_mode_config="full",
-            _cached_system_prompt=None,
-        )
+        assert agent._skills_catalog_mode == "compact"
         assert restore_session_skills_catalog_mode(
-            fresh_agent, child["model_config"]
+            agent, child["model_config"]
         )
-        assert fresh_agent._skills_catalog_mode == "compact"
+        assert agent._skills_catalog_mode == "compact"
 
     def test_branch_copies_history(self, cli_instance, session_db):
         """Branching should copy all messages to the new session."""

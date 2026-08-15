@@ -7000,6 +7000,7 @@ def _make_agent(
                 raise RuntimeError("Auth fallback resolved without a model")
             model = resolution.selected_model
     _pr = _load_provider_routing()
+    agent_db = session_db if session_db is not None else _get_db()
     agent = AIAgent(
         model=model,
         max_iterations=_cfg_max_turns(cfg, 500),
@@ -7038,7 +7039,7 @@ def _make_agent(
         provider_data_collection=_pr.get("data_collection"),
         platform=_resolve_agent_platform(platform_override),
         session_id=session_id or key,
-        session_db=session_db if session_db is not None else _get_db(),
+        session_db=agent_db,
         ephemeral_system_prompt=system_prompt or None,
         checkpoints_enabled=is_truthy_value(os.environ.get("HERMES_TUI_CHECKPOINTS")),
         pass_session_id=is_truthy_value(os.environ.get("HERMES_TUI_PASS_SESSION_ID")),
@@ -7046,6 +7047,13 @@ def _make_agent(
         skip_memory=is_truthy_value(os.environ.get("HERMES_IGNORE_RULES")),
         fallback_model=_load_fallback_model(),
         **_agent_cbs(sid),
+    )
+    from agent.system_prompt import hydrate_session_skills_catalog_mode
+
+    hydrate_session_skills_catalog_mode(
+        agent,
+        session_db=agent_db,
+        session_id=session_id or key,
     )
     return _attach_tui_cache_callback(agent, sid)
 

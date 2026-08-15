@@ -43,6 +43,7 @@ from utils import is_truthy_value
 from tools.environments.local import hermes_subprocess_env
 from agent.replay_cleanup import sanitize_replay_history
 from agent.skill_commands import describe_skill_invocation
+from agent import physical_attempt_diagnostics
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from tui_gateway import git_probe
 from tui_gateway.turn_marker import (
@@ -373,6 +374,11 @@ _stdio_transport = StdioTransport(lambda: _real_stdout, _stdout_lock)
 # the gateway in-process and captures stdout into logs, so stale JSON-RPC frames
 # must not fall through there while the session waits for resume or reap.
 _detached_ws_transport = _DropTransport()
+_TRANSPORT_DIAGNOSTIC_KIND = {
+    "StdioTransport": "stdio",
+    "WSTransport": "websocket",
+    "TeeTransport": "tee",
+}
 
 
 def _prepend_tool_paths(env: dict[str, str]) -> dict[str, str]:
@@ -1633,9 +1639,19 @@ def write_json(obj: dict) -> bool:
     if obj.get("method") == "event":
         sid = ((obj.get("params") or {}).get("session_id")) or ""
         if sid and (t := (_sessions.get(sid) or {}).get("transport")) is not None:
-            return t.write(obj)
+            return _write_transport(t, obj)
 
-    return (current_transport() or _stdio_transport).write(obj)
+    return _write_transport(current_transport() or _stdio_transport, obj)
+
+
+def _write_transport(transport: Transport, obj: dict) -> bool:
+    marker = physical_attempt_diagnostics.begin_transport(
+        _TRANSPORT_DIAGNOSTIC_KIND.get(type(transport).__name__, "other")
+    )
+    try:
+        return transport.write(obj)
+    finally:
+        physical_attempt_diagnostics.end_transport(marker)
 
 
 def _event_frame(event: str, sid: str, payload: dict | None = None) -> dict:
@@ -7897,7 +7913,11 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
                 {"kind": "process", "text": "Resuming interrupted turn…"},
             )
             _emit("message.start", sid)
-            _run_prompt_submit(rid, sid, session, text, display_kind="auto_continue")
+            _run_prompt_submit(
+                rid, sid, session, text,
+                display_kind="auto_continue",
+                turn_origin="background_completion",
+            )
         except Exception as exc:
             print(
                 f"[tui_gateway] auto-continue dispatch failed: "
@@ -9927,7 +9947,10 @@ def _notification_poller_loop(
                     rid = f"__notif__{int(time.time() * 1000)}"
                     try:
                         _emit("message.start", sid)
-                        _run_prompt_submit(rid, sid, session, "\n".join(_batch))
+                        _run_prompt_submit(
+                            rid, sid, session, "\n".join(_batch),
+                            turn_origin="background_completion",
+                        )
                     except Exception as exc:
                         print(
                             f"[tui_gateway] kanban notification dispatch failed: "
@@ -10021,9 +10044,13 @@ def _notification_poller_loop(
                     text,
                     display_kind="async_delegation_complete",
                     display_metadata=_async_delegation_display_metadata(evt),
+                    turn_origin="subagent_result",
                 )
             else:
-                _run_prompt_submit(rid, sid, session, text)
+                _run_prompt_submit(
+                    rid, sid, session, text,
+                    turn_origin="background_completion",
+                )
             complete_event_delivery(evt, _claim)
         except Exception as exc:
             release_event_delivery(evt, _claim)
@@ -10099,9 +10126,13 @@ def _notification_poller_loop(
                     text,
                     display_kind="async_delegation_complete",
                     display_metadata=_async_delegation_display_metadata(evt),
+                    turn_origin="subagent_result",
                 )
             else:
-                _run_prompt_submit(rid, sid, session, text)
+                _run_prompt_submit(
+                    rid, sid, session, text,
+                    turn_origin="background_completion",
+                )
             complete_event_delivery(evt, _claim)
         except Exception as exc:
             release_event_delivery(evt, _claim)
@@ -10439,7 +10470,15 @@ def _run_prompt_submit(
     display_metadata: dict | None = None,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    turn_origin: str | None = None,
 ) -> None:
+    turn_origin = turn_origin or (
+        "subagent_result"
+        if display_kind == "async_delegation_complete"
+        else "background_completion"
+        if display_kind in {"auto_continue", "goal_continuation"}
+        else "user"
+    )
     with session["history_lock"]:
         if (
             queued_prompt_generation is not None
@@ -10458,6 +10497,8 @@ def _run_prompt_submit(
         if not isinstance(inflight, dict) or inflight.get("status") == "error":
             _start_inflight_turn(session, text)
         agent = session["agent"]
+        session.pop("first_provider_response", None)
+        session["provider_response_records"] = []
         if hasattr(agent, "clear_interrupt"):
             try:
                 agent.clear_interrupt()
@@ -10759,6 +10800,8 @@ def _run_prompt_submit(
             if display_kind and "persist_user_display_kind" in _run_params:
                 run_kwargs["persist_user_display_kind"] = display_kind
                 run_kwargs["persist_user_display_metadata"] = display_metadata
+            if "turn_origin" in _run_params:
+                run_kwargs["turn_origin"] = turn_origin
             # Auto-titling now fires inside the turn prologue (shared by every
             # surface). Hand the agent this session's live-rename hook so the
             # sidebar repaints the moment a title lands, rather than waiting
@@ -10959,6 +11002,17 @@ def _run_prompt_submit(
                 status = "complete"
 
             payload = {"text": raw, "usage": _get_usage(agent), "status": status}
+            first_provider_response = getattr(
+                agent, "_first_provider_response", None
+            )
+            if isinstance(first_provider_response, dict):
+                cache_record = dict(first_provider_response)
+                cache_record["owner"] = "tui_gateway"
+                session["first_provider_response"] = cache_record
+                session["provider_response_records"] = list(
+                    getattr(agent, "_provider_response_records", []) or []
+                )
+                payload["cache_record"] = cache_record
             if last_reasoning:
                 payload["reasoning"] = last_reasoning
             if status_note:
@@ -11307,7 +11361,10 @@ def _run_prompt_submit(
                 session["running"] = True
             try:
                 _emit("message.start", sid)
-                _run_prompt_submit(rid, sid, session, goal_followup)
+                _run_prompt_submit(
+                    rid, sid, session, goal_followup,
+                    turn_origin="background_completion",
+                )
             except Exception as _cont_exc:
                 print(
                     f"[tui_gateway] goal continuation dispatch failed: "
@@ -11353,7 +11410,14 @@ def _run_prompt_submit(
                     continue
                 try:
                     _emit("message.start", sid)
-                    _run_prompt_submit(rid, sid, session, synth)
+                    _run_prompt_submit(
+                        rid, sid, session, synth,
+                        turn_origin=(
+                            "subagent_result"
+                            if _evt.get("type") == "async_delegation"
+                            else "background_completion"
+                        ),
+                    )
                     complete_event_delivery(_evt, _claim)
                 except Exception as _n_exc:
                     release_event_delivery(_evt, _claim)

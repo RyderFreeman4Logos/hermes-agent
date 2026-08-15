@@ -770,7 +770,6 @@ def _run_review_in_thread(
             # unmapped except on gpt-5.6/xAI). Let the routed fork use
             # provider defaults — matching the ``not _routed`` gate on
             # _cached_system_prompt below.
-            _fork_kwargs["fast_mode_overrides"] = _rt.get("request_overrides") or {}
             if not _routed:
                 _fork_kwargs["reasoning_config"] = getattr(agent, "reasoning_config", None)
                 # Gateway session context is appended to the parent's cached
@@ -820,9 +819,7 @@ def _run_review_in_thread(
                 base_url=_rt.get("base_url") or None,
                 api_key=_rt.get("api_key") or None,
                 credential_pool=_rt.get("credential_pool"),
-                request_overrides=getattr(
-                    agent, "_caller_request_overrides", {}
-                ) or {},
+                request_overrides=_rt.get("request_overrides") or {},
                 parent_session_id=agent.session_id,
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),

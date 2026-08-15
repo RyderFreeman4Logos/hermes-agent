@@ -28,6 +28,7 @@ from agent.usage_pricing import (
     POST_COMPRESSION_CACHE_NOTE,
     POST_COMPRESSION_CACHE_WARM_NOTE,
     cache_hit_percent,
+    cache_hit_percent_label,
 )
 from hermes_constants import (
     DEFAULT_INDICATOR_STYLE,
@@ -5359,6 +5360,10 @@ def _cache_info_from_usage(usage: Any) -> dict[str, int | str] | None:
         "state": state,
         "level": _cache_level(pct),
     }
+    if state == "hit":
+        cache_info["percent_label"] = cache_hit_percent_label(
+            read_tokens, prompt_tokens
+        )
     if usage.get("cache_attribution") == "post_compression":
         cache_info["attribution"] = "post_compression"
         cache_info["level"] = "info"
@@ -5368,6 +5373,22 @@ def _cache_info_from_usage(usage: Any) -> dict[str, int | str] | None:
             else POST_COMPRESSION_CACHE_NOTE
         )
     return cache_info
+
+
+def _emit_terminal_message_complete(sid: str, payload: dict, agent: Any) -> None:
+    """Emit one terminal frame and retire its cache backstop after delivery."""
+    cache_usage = (
+        getattr(agent, "_first_turn_usage", None) if agent is not None else None
+    )
+    cache_info = _cache_info_from_usage(cache_usage)
+    if cache_info is not None:
+        payload["cache_info"] = cache_info
+    _emit("message.complete", sid, payload)
+    if (
+        cache_usage is not None
+        and getattr(agent, "_first_turn_usage", None) is cache_usage
+    ):
+        agent._first_turn_usage = None
 
 
 def _probe_credentials(agent) -> str:
@@ -6228,7 +6249,7 @@ def _attach_tui_cache_callback(agent, sid: str):
         state = str(cache_info["state"])
         pct = int(cache_info["pct"])
         text = (
-            f"cache {pct}%"
+            f"cache {cache_info.get('percent_label', cache_hit_percent_label(read, prompt))}"
             if state == "hit"
             else "cache unavailable"
             if state == "unavailable"
@@ -8322,7 +8343,7 @@ def _emit_terminal_turn_error(sid: str, session: dict, error: Any) -> None:
     if rendered:
         payload["rendered"] = rendered
     _retire_turn_marker(session)
-    _emit("message.complete", sid, payload)
+    _emit_terminal_message_complete(sid, payload, agent)
 
 
 def _restore_agent_history_after_turn_error(session: dict, agent) -> bool:
@@ -10930,10 +10951,6 @@ def _run_prompt_submit(
                 status = "complete"
 
             payload = {"text": raw, "usage": _get_usage(agent), "status": status}
-            cache_usage = getattr(agent, "_first_turn_usage", None)
-            cache_info = _cache_info_from_usage(cache_usage)
-            if cache_info is not None:
-                payload["cache_info"] = cache_info
             if last_reasoning:
                 payload["reasoning"] = last_reasoning
             if status_note:
@@ -10969,7 +10986,7 @@ def _run_prompt_submit(
                 )
                 payload["recoverable"] = True
             _retire_turn_marker(session, marker_key)
-            _emit("message.complete", sid, payload)
+            _emit_terminal_message_complete(sid, payload, agent)
 
             # ── /goal continuation (Ralph-style loop) ─────────────────
             # After every TUI turn, if a /goal is active, ask the judge

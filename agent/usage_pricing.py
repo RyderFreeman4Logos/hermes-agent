@@ -77,6 +77,13 @@ def cache_hit_percent(cache_read_tokens: int, prompt_tokens: int) -> int:
     return round(100 * cache_read_tokens / prompt_tokens) if prompt_tokens > 0 else 0
 
 
+def cache_hit_percent_label(cache_read_tokens: int, prompt_tokens: int) -> str:
+    """Format a cache-hit percentage without hiding a positive subpercent hit."""
+    if 0 < cache_read_tokens * 100 < prompt_tokens:
+        return "<1%"
+    return f"{cache_hit_percent(cache_read_tokens, prompt_tokens)}%"
+
+
 @dataclass(frozen=True)
 class CanonicalUsage:
     input_tokens: int = 0

@@ -291,6 +291,31 @@ describe('createGatewayEventHandler', () => {
     }
   })
 
+  it('preserves positive subpercent cache hits in the durable footnote', () => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+    onEvent({
+      payload: {
+        cache_info: {
+          level: 'error',
+          pct: 0,
+          percent_label: '<1%',
+          prompt_tokens: 2_000,
+          read_tokens: 1,
+          state: 'hit'
+        },
+        text: 'final answer'
+      },
+      type: 'message.complete'
+    } as any)
+
+    expect(appended).toEqual([
+      { role: 'assistant', text: 'final answer' },
+      { kind: 'event', role: 'system', text: 'cache <1%', tone: 'error' }
+    ])
+  })
+
   it('labels post-compression cache warmup as neutral', () => {
     const appended: Msg[] = []
     const onEvent = createGatewayEventHandler(buildCtx(appended))

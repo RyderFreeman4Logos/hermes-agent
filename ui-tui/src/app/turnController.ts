@@ -34,6 +34,7 @@ type CacheInfo = {
   level: 'error' | 'info'
   note?: string
   pct: number
+  percent_label?: string
   prompt_tokens: number
   read_tokens: number
   state: 'cold_write' | 'hit' | 'miss' | 'unavailable' | 'unknown'
@@ -46,7 +47,7 @@ const cacheFootnote = (cacheInfo?: CacheInfo): Msg | null => {
 
   const cacheText =
     cacheInfo.state === 'hit'
-      ? `cache ${Math.max(0, Math.round(cacheInfo.pct))}%`
+      ? `cache ${cacheInfo.percent_label ?? `${Math.max(0, Math.round(cacheInfo.pct))}%`}`
       : cacheInfo.state === 'cold_write'
         ? 'cache cold-write'
         : `cache ${cacheInfo.state}`

@@ -96,6 +96,7 @@ from agent.usage_pricing import (
     POST_COMPRESSION_CACHE_NOTE,
     POST_COMPRESSION_CACHE_WARM_NOTE,
     cache_hit_percent,
+    cache_hit_percent_label,
     estimate_usage_cost,
     normalize_usage,
 )
@@ -4106,7 +4107,7 @@ def run_conversation(
                     prompt = usage_dict["prompt_tokens"]
                     if (cached or written) and not agent.quiet_mode:
                         hit_pct = cache_hit_percent(cached, prompt)
-                        hit_text = f"{hit_pct}%"
+                        hit_text = cache_hit_percent_label(cached, prompt)
                         if hit_pct < CACHE_HIT_ERROR_THRESHOLD and not post_compression_cache:
                             hit_text = f"{_RED}{hit_text}{_RESET}"
                         cache_note = (

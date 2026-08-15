@@ -769,6 +769,12 @@ class AIAgent:
         instead of a bare reset. Default callers pass nothing and keep the
         existing reset-only behavior.
         """
+        # Session-frozen prompt choices must not bleed across session rotations.
+        self._skills_catalog_mode = None
+        session_model_config = getattr(self, "_session_init_model_config", None)
+        if isinstance(session_model_config, dict):
+            session_model_config.pop("_skills_catalog_mode", None)
+
         # Token usage counters
         self.session_total_tokens = 0
         self.session_input_tokens = 0

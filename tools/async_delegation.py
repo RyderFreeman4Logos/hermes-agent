@@ -894,7 +894,12 @@ def mark_completion_delivery_recovery(
                    delivery_owner_started_at=NULL, updated_at=?
                WHERE delivery_id=? AND delivery_state='effect_started'
                  AND delivery_claim=?""",
-            (f"recovery_{reason}", now, delivery_id, claim_id),
+            (
+                reason if reason == "child_local" else f"recovery_{reason}",
+                now,
+                delivery_id,
+                claim_id,
+            ),
         )
         return cur.rowcount == 1
 

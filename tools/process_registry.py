@@ -407,6 +407,9 @@ class ProcessSession:
     pid_scope: str = "host"                     # "host" for local/PTY PIDs, "sandbox" for env-local PIDs
     systemd_unit: str = ""                      # transient scope unit name when spawned under systemd-run (#70716)
     delegated_child: bool = False                # Spawned while delegate_task child context was active
+    delegated_child_session_id: str = ""
+    delegated_owner_session_id: str = ""
+    delegated_subagent_id: str = ""
     # Watcher/notification metadata (persisted for crash recovery)
     watcher_platform: str = ""
     watcher_chat_id: str = ""
@@ -1566,9 +1569,13 @@ class ProcessRegistry:
         from tools.terminal_tool import _rewrite_compound_background as _rewrite_bg
 
         safe_command = _rewrite_bg(command)
-        from agent.delegation_context import is_delegated_child_process_context
+        from agent.delegation_context import (
+            get_delegated_child_provenance,
+            is_delegated_child_process_context,
+        )
 
         started_at = time.time()
+        delegated_provenance = get_delegated_child_provenance()
         session = ProcessSession(
             id=f"proc_{uuid.uuid4().hex[:12]}",
             command=command,
@@ -1582,6 +1589,9 @@ class ProcessRegistry:
                 else None
             ),
             delegated_child=is_delegated_child_process_context(),
+            delegated_child_session_id=(delegated_provenance or ("", "", ""))[0],
+            delegated_owner_session_id=(delegated_provenance or ("", "", ""))[1],
+            delegated_subagent_id=(delegated_provenance or ("", "", ""))[2],
             **(notification_metadata or {}),
         )
 
@@ -1830,7 +1840,13 @@ class ProcessRegistry:
         ``defer_registration`` leaves the session for the caller to promote or
         discard after an inline wait.
         """
+        from agent.delegation_context import (
+            get_delegated_child_provenance,
+            is_delegated_child_process_context,
+        )
+
         started_at = time.time()
+        delegated_provenance = get_delegated_child_provenance()
         session = ProcessSession(
             id=f"proc_{uuid.uuid4().hex[:12]}",
             command=command,
@@ -1845,6 +1861,10 @@ class ProcessRegistry:
             ),
             env_ref=env,
             pid_scope="sandbox",
+            delegated_child=is_delegated_child_process_context(),
+            delegated_child_session_id=(delegated_provenance or ("", "", ""))[0],
+            delegated_owner_session_id=(delegated_provenance or ("", "", ""))[1],
+            delegated_subagent_id=(delegated_provenance or ("", "", ""))[2],
             **(notification_metadata or {}),
         )
 
@@ -2432,6 +2452,47 @@ class ProcessRegistry:
             self._write_checkpoint()
 
         if event is not None:
+            provenance = (
+                str(event.get("delegated_child_session_id") or ""),
+                str(event.get("delegated_owner_session_id") or ""),
+                str(event.get("delegated_subagent_id") or ""),
+            )
+            if completion_receipt_persisted and all(provenance):
+                from tools.async_delegation import (
+                    claim_event_delivery,
+                    mark_completion_delivery_recovery,
+                    release_event_delivery,
+                )
+                from tools.delegate_tool import deliver_owned_process_completion
+
+                claim_id = claim_event_delivery(event, f"child-owner:{provenance[2]}")
+                if claim_id is None:
+                    return
+                child_event = dict(event)
+                child_event["delegated_child"] = False
+                child_text = format_process_notification(child_event) or ""
+                if child_text and deliver_owned_process_completion(
+                    provenance[2], provenance[0], provenance[1], child_text
+                ):
+                    if mark_completion_delivery_recovery(event, claim_id, "child_local"):
+                        self.complete_completion_delivery(event)
+                    else:
+                        logger.error(
+                            "Delivered process completion %s to delegated child but "
+                            "could not commit its terminal receipt",
+                            session.id,
+                        )
+                    return
+                if self._is_routine_delegated_child_completion(event):
+                    if mark_completion_delivery_recovery(event, claim_id, "child_local"):
+                        self.complete_completion_delivery(event)
+                    return
+                if not release_event_delivery(event, claim_id):
+                    logger.warning(
+                        "Could not release delegated-child completion claim for %s",
+                        session.id,
+                    )
+                    return
             identity = self._completion_identity(event)
             if identity is not None:
                 with self._completion_disposition_lock:
@@ -2469,6 +2530,10 @@ class ProcessRegistry:
             "termination_source": session.termination_source,
             "output": output_tail,
             "delegated_child": session.delegated_child,
+            "delegated_child_session_id": session.delegated_child_session_id,
+            "delegated_owner_session_id": session.delegated_owner_session_id,
+            "delegated_subagent_id": session.delegated_subagent_id,
+            "parent_session_id": session.parent_session_id,
             # Stable across checkpoint recovery and independent of which
             # watcher notices the process exit first.
             "started_at": session.started_at,
@@ -2488,6 +2553,11 @@ class ProcessRegistry:
             "completion_reason": "unknown",
             "termination_source": "checkpoint_recovery",
             "output": "",
+            "delegated_child": entry.get("delegated_child", False),
+            "delegated_child_session_id": entry.get("delegated_child_session_id", ""),
+            "delegated_owner_session_id": entry.get("delegated_owner_session_id", ""),
+            "delegated_subagent_id": entry.get("delegated_subagent_id", ""),
+            "parent_session_id": entry.get("parent_session_id", ""),
             "started_at": entry.get("started_at", time.time()),
         }
 
@@ -3745,6 +3815,9 @@ class ProcessRegistry:
                             "heartbeat_provider": s.heartbeat_provider,
                             "notify_on_complete": s.notify_on_complete,
                             "delegated_child": s.delegated_child,
+                            "delegated_child_session_id": s.delegated_child_session_id,
+                            "delegated_owner_session_id": s.delegated_owner_session_id,
+                            "delegated_subagent_id": s.delegated_subagent_id,
                             "watch_patterns": s.watch_patterns,
                         })
                 entries.extend(
@@ -3889,6 +3962,9 @@ class ProcessRegistry:
                 heartbeat_provider=entry.get("heartbeat_provider", ""),
                 notify_on_complete=entry.get("notify_on_complete", False),
                 delegated_child=entry.get("delegated_child", False),
+                delegated_child_session_id=entry.get("delegated_child_session_id", ""),
+                delegated_owner_session_id=entry.get("delegated_owner_session_id", ""),
+                delegated_subagent_id=entry.get("delegated_subagent_id", ""),
                 watch_patterns=entry.get("watch_patterns", []),
             )
             with self._lock:

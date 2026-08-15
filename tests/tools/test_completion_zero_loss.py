@@ -187,8 +187,8 @@ def test_active_delegated_owner_receives_red_and_green_without_parent_wake(
                 sessions.append(
                     registry.spawn_local(
                         f"{sys.executable} -c 'import sys; sys.exit({code})'",
-                        notify_on_complete=True,
                         session_key="route",
+                        notification_metadata={"notify_on_complete": True},
                     )
                 )
         for session in sessions:
@@ -203,8 +203,7 @@ def test_active_delegated_owner_receives_red_and_green_without_parent_wake(
     assert any("exit code 0" in text for text in received)
     assert registry.completion_queue.empty()
     for session in sessions:
-        event = registry.completion_event(session.id)
-        assert event is not None
+        event = registry._completion_event(session)
         receipt = delivery.get_durable_event_delivery(event)
         assert receipt is not None
         assert receipt["delivery_state"] == "child_local"
@@ -219,8 +218,8 @@ def test_inactive_or_ambiguous_child_failure_fails_open_once(isolated_delivery):
     ):
         session = registry.spawn_local(
             "printf 'pytest: 1 passed\\nPOST_FOREIGN_CWD: refused\\n'; exit 91",
-            notify_on_complete=True,
             session_key="route",
+            notification_metadata={"notify_on_complete": True},
         )
     assert session._reader_thread is not None
     session._reader_thread.join(timeout=5)
@@ -242,15 +241,14 @@ def test_inactive_routine_child_tail_stays_child_local(isolated_delivery):
     ):
         session = registry.spawn_local(
             f"{sys.executable} -c 'print(\"done\")'",
-            notify_on_complete=True,
             session_key="route",
+            notification_metadata={"notify_on_complete": True},
         )
     assert session._reader_thread is not None
     session._reader_thread.join(timeout=5)
     assert not session._reader_thread.is_alive()
 
-    event = registry.completion_event(session.id)
-    assert event is not None
+    event = registry._completion_event(session)
     assert registry.completion_queue.empty()
     receipt = delivery.get_durable_event_delivery(event)
     assert receipt is not None

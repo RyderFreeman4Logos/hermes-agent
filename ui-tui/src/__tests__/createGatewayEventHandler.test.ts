@@ -76,9 +76,10 @@ describe('createGatewayEventHandler', () => {
         cache_info: {
           attribution: 'post_compression',
           cached_tokens: 128,
+          level: 'info',
           prompt_tokens: 165_611,
           state: 'hit',
-          text: 'Cache: 128/165,611 tokens (<1% hit, 0 written)',
+          text: 'Cache: 128/165,611 tokens (<1% hit, 0 written) · post-compression warmup (expected)',
           write_tokens: 0
         },
         text: 'final answer'
@@ -91,8 +92,81 @@ describe('createGatewayEventHandler', () => {
       {
         kind: 'event',
         role: 'system',
-        text: 'Cache: 128/165,611 tokens (<1% hit, 0 written)'
+        text: 'Cache: 128/165,611 tokens (<1% hit, 0 written) · post-compression warmup (expected)'
       }
+    ])
+  })
+
+  it('shows first-response cache status before tool work and keeps one transcript backstop', () => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+    const cacheInfo = {
+      cached_tokens: 0,
+      level: 'error',
+      prompt_tokens: 2_000,
+      state: 'miss',
+      text: 'Cache: 0/2,000 tokens (0% hit, 0 written)',
+      write_tokens: 0
+    } as const
+
+    onEvent({ payload: { kind: 'error', text: cacheInfo.text }, type: 'status.update' } as any)
+    expect(getTurnState().activity.at(-1)).toMatchObject({ text: cacheInfo.text, tone: 'error' })
+
+    onEvent({ payload: { args: {}, name: 'terminal', tool_id: 'tool-1' }, type: 'tool.start' } as any)
+    onEvent({ payload: { cache_info: cacheInfo, text: 'done' }, type: 'message.complete' } as any)
+
+    expect(appended.filter(message => message.text === cacheInfo.text)).toEqual([
+      { kind: 'event', role: 'system', text: cacheInfo.text, tone: 'error' }
+    ])
+  })
+
+  it('keeps post-compression cache attribution visible for an empty final response', () => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+    const text = 'Cache: 0/2,000 tokens (0% hit, 0 written) · post-compression warmup (expected)'
+
+    onEvent({
+      payload: {
+        cache_info: {
+          attribution: 'post_compression',
+          cached_tokens: 0,
+          level: 'info',
+          prompt_tokens: 2_000,
+          state: 'miss',
+          text,
+          write_tokens: 0
+        },
+        text: ''
+      },
+      type: 'message.complete'
+    } as any)
+
+    expect(appended).toEqual([{ kind: 'event', role: 'system', text }])
+  })
+
+  it('keeps an ordinary low-hit cache badge red on an error completion', () => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+    const text = 'Cache: 1,880/2,000 tokens (94% hit, 0 written)'
+
+    onEvent({
+      payload: {
+        cache_info: {
+          cached_tokens: 1_880,
+          level: 'error',
+          prompt_tokens: 2_000,
+          state: 'hit',
+          text,
+          write_tokens: 0
+        },
+        text: 'Error: later provider call failed'
+      },
+      type: 'message.complete'
+    } as any)
+
+    expect(appended).toEqual([
+      { role: 'assistant', text: 'Error: later provider call failed' },
+      { kind: 'event', role: 'system', text, tone: 'error' }
     ])
   })
 

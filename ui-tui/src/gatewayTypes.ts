@@ -10,6 +10,8 @@ export type GatewaySkin = HermesSkin
 export interface CacheInfo {
   attribution?: 'post_compression'
   cached_tokens: number
+  level: 'error' | 'info'
+  note?: string
   prompt_tokens: number
   state: 'cold_write' | 'hit' | 'miss' | 'no_field'
   text: string

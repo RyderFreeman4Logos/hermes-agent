@@ -30,7 +30,14 @@ const ACTIVITY_LIMIT = 8
 const TRAIL_LIMIT = 8
 
 const cacheFootnote = (cacheInfo?: CacheInfo): Msg | null =>
-  cacheInfo?.text ? { kind: 'event', role: 'system', text: cacheInfo.text } : null
+  cacheInfo?.text
+    ? {
+        kind: 'event',
+        role: 'system',
+        text: cacheInfo.text,
+        ...(cacheInfo.level === 'error' && { tone: 'error' as const })
+      }
+    : null
 
 // Extracts the raw patch from a diff-only segment produced by
 // pushInlineDiffSegment. Used at message.complete to dedupe against final
@@ -650,7 +657,7 @@ class TurnController {
 
     const cache = cacheFootnote(payload.cache_info)
 
-    if (cache && finalMessages.some(message => message.role === 'assistant')) {
+    if (cache) {
       finalMessages.push(cache)
     }
 

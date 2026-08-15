@@ -1645,10 +1645,10 @@ def _event_frame(event: str, sid: str, payload: dict | None = None) -> dict:
     return {"jsonrpc": "2.0", "method": "event", "params": params}
 
 
-def _emit(event: str, sid: str, payload: dict | None = None):
+def _emit(event: str, sid: str, payload: dict | None = None) -> bool:
     if event == "message.complete":
         payload = {**(payload or {}), "completed_at": time.time()}
-    write_json(_event_frame(event, sid, payload))
+    return write_json(_event_frame(event, sid, payload))
 
 
 # Live client transports, one per connected WS peer (maintained by tui_gateway.ws).
@@ -5375,20 +5375,23 @@ def _cache_info_from_usage(usage: Any) -> dict[str, int | str] | None:
     return cache_info
 
 
-def _emit_terminal_message_complete(sid: str, payload: dict, agent: Any) -> None:
+def _emit_terminal_message_complete(sid: str, payload: dict, agent: Any) -> bool:
     """Emit one terminal frame and retire its cache backstop after delivery."""
     cache_usage = (
         getattr(agent, "_first_turn_usage", None) if agent is not None else None
     )
     cache_info = _cache_info_from_usage(cache_usage)
+    terminal_payload = dict(payload)
     if cache_info is not None:
-        payload["cache_info"] = cache_info
-    _emit("message.complete", sid, payload)
+        terminal_payload["cache_info"] = cache_info
+    delivered = _emit("message.complete", sid, terminal_payload)
     if (
-        cache_usage is not None
+        delivered
+        and cache_usage is not None
         and getattr(agent, "_first_turn_usage", None) is cache_usage
     ):
         agent._first_turn_usage = None
+    return delivered
 
 
 def _probe_credentials(agent) -> str:
@@ -8315,7 +8318,7 @@ def _inflight_snapshot(session: dict) -> dict | None:
     return snapshot
 
 
-def _emit_terminal_turn_error(sid: str, session: dict, error: Any) -> None:
+def _emit_terminal_turn_error(sid: str, session: dict, error: Any) -> bool:
     """Close a failed turn with a terminal ``message.complete`` frame.
 
     Emits the same ``status: "error"`` frame shape the returned-error path in
@@ -8348,7 +8351,7 @@ def _emit_terminal_turn_error(sid: str, session: dict, error: Any) -> None:
     if rendered:
         payload["rendered"] = rendered
     _retire_turn_marker(session)
-    _emit_terminal_message_complete(sid, payload, agent)
+    return _emit_terminal_message_complete(sid, payload, agent)
 
 
 def _restore_agent_history_after_turn_error(session: dict, agent) -> bool:

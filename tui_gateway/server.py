@@ -8616,6 +8616,7 @@ def _deferred_session_record(
     source: str = "tui",
     close_on_disconnect: bool = False,
     display_history_prefix: list | None = None,
+    display_history_limit: int | None = None,
     profile_home: Path | None = None,
     lazy: bool = False,
     model_override=None,
@@ -8635,6 +8636,7 @@ def _deferred_session_record(
         "created_at": now,
         "cwd": cwd,
         "display_history_prefix": display_history_prefix or [],
+        "display_history_limit": display_history_limit,
         "edit_snapshots": {},
         "explicit_cwd": False,
         "history": history,
@@ -8874,7 +8876,15 @@ def _live_visible_history(session: dict, db, in_memory_fallback: list[dict]) -> 
     key = session.get("session_key")
     if db is not None and key:
         try:
-            display = db.get_messages_as_conversation(key, include_ancestors=True, include_row_ids=True)
+            limit = session.get("display_history_limit")
+            if limit:
+                _, display = db.get_resume_conversations(
+                    key, max_display_messages=limit
+                )
+            else:
+                display = db.get_messages_as_conversation(
+                    key, include_ancestors=True, include_row_ids=True
+                )
             return _reconcile_display_with_live(display, in_memory_fallback)
         except Exception:
             logger.debug("live display projection read failed", exc_info=True)

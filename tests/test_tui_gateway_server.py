@@ -3552,6 +3552,81 @@ def test_session_resume_follows_compression_tip(monkeypatch, tmp_path):
     assert "post-compression reply" in texts
 
 
+def test_session_resume_bounds_compression_display_without_truncating_model_history(
+    monkeypatch, tmp_path
+):
+    """A large old display lineage must not prevent resuming its small tip."""
+    import hermes_state
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("root", source="tui")
+    for index in range(4):
+        db.append_message("root", role="user", content=f"old-{index}")
+    db.end_session("root", "compression")
+    db.create_session("tip", source="tui", parent_session_id="root")
+    db.append_message("tip", role="user", content="tip prompt")
+    db.append_message("tip", role="assistant", content="tip reply")
+    expected_model_history = db.get_messages_as_conversation(
+        "tip", repair_alternation=True, include_row_ids=True
+    )
+    captured = {}
+
+    def fake_make_agent(*_args, **_kwargs):
+        return types.SimpleNamespace(model="test", provider="test")
+
+    def fake_init_session(sid, key, agent, history, **_kwargs):
+        captured["history"] = history
+        server._sessions[sid] = {
+            "agent": agent,
+            "created_at": 1.0,
+            "history": history,
+            "history_lock": threading.Lock(),
+            "session_key": key,
+        }
+
+    monkeypatch.setattr(hermes_state, "resolved_max_resume_messages", lambda: 3)
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_set_session_context", lambda _target: [])
+    monkeypatch.setattr(server, "_clear_session_context", lambda _tokens: None)
+    monkeypatch.setattr(server, "_make_agent", fake_make_agent)
+    monkeypatch.setattr(
+        server, "_session_info", lambda *_args: {"model": "test", "tools": {}, "skills": {}}
+    )
+    monkeypatch.setattr(server, "_init_session", fake_init_session)
+
+    runtime_sid = None
+    try:
+        response = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.resume",
+                "params": {"session_id": "tip", "eager_build": True},
+            }
+        )
+        runtime_sid = response.get("result", {}).get("session_id")
+        if runtime_sid:
+            captured["display_history_prefix"] = server._sessions[runtime_sid][
+                "display_history_prefix"
+            ]
+    finally:
+        if runtime_sid:
+            server._sessions.pop(runtime_sid, None)
+        db.close()
+
+    assert "error" not in response, response
+    assert captured["history"] == expected_model_history
+    assert [message["content"] for message in captured["display_history_prefix"]] == [
+        "old-3"
+    ]
+    assert [message["text"] for message in response["result"]["messages"]] == [
+        "old-3",
+        "tip prompt",
+        "tip reply",
+    ]
+
+
 def test_session_resume_passes_stored_runtime_to_agent(monkeypatch):
     captured = {}
 

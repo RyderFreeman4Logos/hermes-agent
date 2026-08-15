@@ -4370,6 +4370,43 @@ class TestGetMessagesPagination:
         assert exc_info.value.message_count == 5
         assert exc_info.value.limit == 4
 
+    def test_resume_display_can_be_bounded_without_changing_model_tip(self, db):
+        db.create_session(session_id="root", source="cli")
+        db.append_messages_batch(
+            "root",
+            [{"role": "user", "content": f"root-{i}"} for i in range(3)],
+        )
+        db.create_session(
+            session_id="tip",
+            source="compression",
+            parent_session_id="root",
+        )
+        db.append_messages_batch(
+            "tip",
+            [{"role": "assistant", "content": f"tip-{i}"} for i in range(2)],
+        )
+
+        # A compressed session replays only its tip to the model, while the TUI
+        # may show a bounded tail of its larger display lineage.
+        db.assert_resume_segment_safe("tip", max_messages=2)
+        with pytest.raises(hermes_state.SessionResumeTooLargeError):
+            db.assert_resume_segment_safe("tip", max_messages=1)
+        with pytest.raises(hermes_state.SessionResumeTooLargeError):
+            db.assert_resume_safe("tip", max_messages=2)
+
+        model_history, display_history = db.get_resume_conversations(
+            "tip", max_display_messages=3
+        )
+
+        assert model_history == db.get_messages_as_conversation(
+            "tip", repair_alternation=True, include_row_ids=True
+        )
+        assert [message["content"] for message in display_history] == [
+            "root-2",
+            "tip-0",
+            "tip-1",
+        ]
+
     def test_export_safety_is_bounded_to_the_requested_active_segment(self, db):
         db.create_session(session_id="root", source="cli")
         db.append_messages_batch(

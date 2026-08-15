@@ -1534,6 +1534,9 @@ def peel_reference_guidance(
 class MoAChatCompletions:
     """OpenAI-chat-compatible facade where the aggregator is the acting model."""
 
+    heartbeat_warm_output_cap_paths = (("max_tokens",),)
+    heartbeat_warm_stream_cancel = True
+
     def __init__(self, preset_name: str, reference_callback: Any = None, agent: Any = None):
         self.preset_name = preset_name or "default"
         # Optional display hook. Called as reference outputs become available so
@@ -2308,6 +2311,25 @@ class MoAChatCompletions:
         if api_kwargs.pop("_moa_prepare_only", False):
             return prepared_request
         return self._call_prepared_aggregator(prepared_request, api_kwargs)
+
+    def heartbeat_warm_create(self, **api_kwargs: Any) -> Any:
+        """Replay only the prepared acting-model call, without trace mutation."""
+        if not isinstance(api_kwargs.get("_moa_prepared_request"), dict):
+            raise RuntimeError("MoA heartbeat requires a prepared aggregator request")
+        pending_trace = self._pending_trace
+        self._pending_trace = None
+        try:
+            return self.create(**api_kwargs)
+        finally:
+            self._pending_trace = pending_trace
+
+    def heartbeat_warm_claim(self, client: Any) -> Any:
+        """MoA's in-process facade is its immutable physical transport owner."""
+        expected = getattr(getattr(client, "chat", None), "completions", None)
+        return client if expected is self else None
+
+    def heartbeat_warm_release(self, _client: Any, _reusable: bool) -> None:
+        """The in-process facade has no request-local socket lifecycle."""
 
 
 class MoAClient:

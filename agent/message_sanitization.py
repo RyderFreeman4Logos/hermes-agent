@@ -22,6 +22,27 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# Internal flags that mark model-only recovery/prefill scaffolding. These
+# messages may drive an API retry but must never reach a durable transcript.
+_EPHEMERAL_SCAFFOLDING_FLAGS = (
+    "_empty_recovery_synthetic",
+    "_empty_terminal_sentinel",
+    "_thinking_prefill",
+    "_verification_stop_synthetic",
+    "_pre_verify_synthetic",
+    "_kanban_stop_synthetic",
+    "_completion_delivery_synthetic",
+    "_dropped_toolcall_nudge",
+)
+
+
+def _is_ephemeral_scaffolding(msg: Any) -> bool:
+    """Return whether a message is model-only, non-durable scaffolding."""
+    return isinstance(msg, dict) and any(
+        msg.get(flag) for flag in _EPHEMERAL_SCAFFOLDING_FLAGS
+    )
+
+
 # Lone surrogate code points are invalid in UTF-8 and crash json.dumps
 # inside the OpenAI SDK.  Used by every surrogate-sanitization helper
 # below as well as by run_agent and the CLI for paste-from-clipboard

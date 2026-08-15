@@ -124,6 +124,9 @@ FOREGROUND_MAX_TIMEOUT = _safe_parse_import_env(
     "integer",
 )
 
+# Fixed execution budget for model calls promoted off the foreground turn.
+AUTO_BACKGROUND_TIMEOUT = 7200
+
 # Disk usage warning threshold (in GB)
 DISK_USAGE_WARNING_THRESHOLD_GB = _safe_parse_import_env(
     "TERMINAL_DISK_WARNING_GB",
@@ -1080,10 +1083,12 @@ TERMINAL_TOOL_DESCRIPTION = """Execute shell commands on a Linux environment. Fi
 Do NOT use cat/head/tail (use read_file), grep/rg/find/ls (use search_files), sed/awk (use patch), or echo/heredoc file creation (use write_file). Reserve terminal for: builds, installs, git, processes, scripts, network, package managers, and anything that needs a shell.
 Environment state persists: activate a virtualenv or export variables once per session, not before every command.
 
-Foreground (default): returns INSTANTLY when the command finishes, even with a high timeout — set timeout generously for long builds.
-Background: set background=true (returns a session_id). Pair with notify_on_complete=true for bounded tasks; leave silent only for servers/daemons that never exit. Never use nohup/setsid/trailing '&' — use background=true so Hermes tracks the process. After starting a server, verify readiness with a health check, then act in a separate call; no blind sleep loops. Manage with process(action="poll"/"wait").
-Working directory: use 'workdir' for per-command cwd. When a command changes the session cwd (cd, pushd), the result includes a "cwd" field — trust it instead of prefixing every command with 'cd'.
-PTY: set pty=true for interactive CLIs (they hang without it). Pipe git output to cat if it might page.
+Foreground (default): Short commands return INSTANTLY when done. When timeout exceeds terminal.auto_background_timeout_threshold and background/notify_on_complete are omitted, Hermes promotes the call before execution to managed background mode with completion notification and a 7200s budget.
+Background: set background=true and notify_on_complete=true for bounded long work; leave notifications off only for servers, watchers, and daemons. Never use nohup, setsid, disown, or trailing '&' because Hermes must track the process.
+After starting a server, verify readiness with a health check or log signal, then act in a separate call. Avoid blind sleep loops.
+Use process(action="poll") only for occasional progress checks. Keep process(wait) short and bounded; for long work, rely on notify_on_complete instead of blocking the turn.
+Working directory: use 'workdir' for per-command cwd. When a command changes the session cwd, trust the returned "cwd" field.
+PTY: set pty=true for interactive CLIs; they hang without it. Pipe git output to cat if it might page.
 """
 
 # Global state for environment lifecycle management
@@ -1569,10 +1574,25 @@ def _ensure_terminal_env_bridged() -> None:
 
 
 def _get_env_config() -> Dict[str, Any]:
-    """Get terminal environment configuration from environment variables."""
+    """Get resolved terminal configuration from config and bridged environment."""
     # Default image with Python and Node.js for maximum compatibility
     default_image = "nikolaik/python-nodejs:python3.11-nodejs20"
     _ensure_terminal_env_bridged()
+    auto_background_timeout_threshold = 200
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        terminal_config = load_config_readonly().get("terminal") or {}
+        auto_background_timeout_threshold = max(
+            1,
+            int(terminal_config.get("auto_background_timeout_threshold", 200)),
+        )
+    except (AttributeError, TypeError, ValueError):
+        logger.warning(
+            "Invalid terminal.auto_background_timeout_threshold; using 200s"
+        )
+    except Exception:
+        logger.debug("Could not load terminal auto-background threshold", exc_info=True)
     env_type = os.getenv("TERMINAL_ENV", "local")
     
     mount_docker_cwd = os.getenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "false").lower() in {"true", "1", "yes"}
@@ -1656,6 +1676,7 @@ def _get_env_config() -> Dict[str, Any]:
         "host_cwd": host_cwd,
         "docker_mount_cwd_to_workspace": mount_docker_cwd,
         "timeout": _parse_env_var("TERMINAL_TIMEOUT", "180"),
+        "auto_background_timeout_threshold": auto_background_timeout_threshold,
         "lifetime_seconds": _parse_env_var("TERMINAL_LIFETIME_SECONDS", "300"),
         # SSH-specific config
         "ssh_host": os.getenv("TERMINAL_SSH_HOST", ""),
@@ -2490,6 +2511,167 @@ def _resolve_notification_flag_conflict(
     return watch_patterns, ""
 
 
+def _foreground_process_response(
+    result: dict,
+    command: str,
+    env,
+    env_type: str,
+    command_cwd: str,
+    session_key: str,
+    *,
+    workdir: Optional[str],
+    effective_task_id: str,
+    evidence_session_id: str,
+    approval_note: Optional[str] = None,
+    pty_note: Optional[str] = None,
+    interrupted: bool = False,
+) -> str:
+    """Apply the foreground completion contract to any inline result."""
+    if not workdir:
+        record_session_cwd(session_key, getattr(env, "cwd", None))
+
+    output = result.get("output", "")
+    returncode = result.get("returncode", 0)
+    spill_total_chars = result.get("output_total_chars")
+    spill_file_path = result.get("full_output_path")
+
+    output = _handle_sudo_failure(output, env_type)
+    sudo_auth_failed = _sudo_wrong_password_failure(output)
+    sudo_cache_cleared = _invalidate_cached_sudo_on_auth_failure(command, output)
+    if sudo_cache_cleared:
+        has_sudo_prompt_callback = _get_sudo_password_callback() is not None
+        if has_sudo_prompt_callback or env_var_enabled("HERMES_INTERACTIVE"):
+            output += (
+                "\n\n⚠️ Sudo authentication failed — cached password "
+                "cleared. You will be prompted again on the next sudo command."
+            )
+
+    try:
+        from hermes_cli.lifecycle import invoke_hook
+
+        hook_results = invoke_hook(
+            "transform_terminal_output",
+            command=command,
+            output=output,
+            returncode=returncode,
+            task_id=effective_task_id or "",
+            env_type=env_type,
+        )
+        for hook_result in hook_results:
+            if isinstance(hook_result, str):
+                output = hook_result
+                break
+    except Exception:
+        pass
+
+    from tools.tool_output_limits import get_max_bytes
+
+    max_output_chars = get_max_bytes()
+    if len(output) > max_output_chars:
+        head_chars = int(max_output_chars * 0.4)
+        tail_chars = max_output_chars - head_chars
+        omitted = len(output) - head_chars - tail_chars
+        output = (
+            output[:head_chars]
+            + f"\n\n... [OUTPUT TRUNCATED - {omitted} chars omitted "
+            f"out of {len(output)} total] ...\n\n"
+            + output[-tail_chars:]
+        )
+
+    from tools.ansi_strip import strip_ansi
+
+    output = strip_ansi(output)
+    from agent.redact import redact_terminal_output
+
+    output = redact_terminal_output(output.strip(), command) if output else ""
+    exit_note = _interpret_exit_code(command, returncode)
+    failure_hint = None
+    if returncode != 0 and not exit_note:
+        try:
+            from tools.terminal_hints import annotate_failure
+
+            failure_hint = annotate_failure(command, returncode, output)
+        except Exception:
+            pass
+
+    result_dict = {"output": output, "exit_code": returncode, "error": None}
+    try:
+        post_cwd = getattr(env, "cwd", None)
+        if (
+            post_cwd
+            and command_cwd
+            and os.path.realpath(str(post_cwd)) != os.path.realpath(str(command_cwd))
+        ):
+            result_dict["cwd"] = str(post_cwd)
+    except Exception:
+        pass
+
+    if spill_file_path:
+        try:
+            spill_path = Path(spill_file_path)
+            raw_spill = spill_path.read_text(encoding="utf-8", errors="replace")
+            spill_path.write_text(
+                redact_terminal_output(strip_ansi(raw_spill), command),
+                encoding="utf-8",
+                errors="replace",
+            )
+            result_dict["output_total_chars"] = spill_total_chars
+            result_dict["full_output_path"] = spill_file_path
+            result_dict["truncation_note"] = (
+                "Output exceeded the capture window (head+tail shown). "
+                f"Full output ({spill_total_chars:,} chars) saved to "
+                f"{spill_file_path} — search it with search_files or page it "
+                "with read_file instead of re-running the command."
+            )
+        except Exception:
+            logger.debug("spill redaction failed; dropping spill handle", exc_info=True)
+            try:
+                Path(spill_file_path).unlink()
+            except OSError:
+                pass
+
+    try:
+        from agent.verification_evidence import record_terminal_result
+
+        evidence = record_terminal_result(
+            command=command,
+            cwd=command_cwd,
+            session_id=evidence_session_id,
+            exit_code=returncode,
+            output=output,
+        )
+        if evidence:
+            result_dict["verification_evidence"] = {
+                "status": evidence.get("status"),
+                "kind": evidence.get("kind"),
+                "scope": evidence.get("scope"),
+                "canonical_command": evidence.get("canonical_command"),
+            }
+    except Exception:
+        logger.debug("verification evidence recording failed", exc_info=True)
+
+    if approval_note:
+        if interrupted or (
+            returncode == 130 and "[Command interrupted]" in output
+        ):
+            result_dict["approval"] = (
+                approval_note.rstrip(".") + ", then interrupted."
+            )
+        else:
+            result_dict["approval"] = approval_note
+    if pty_note:
+        result_dict["pty_note"] = pty_note
+    if exit_note:
+        result_dict["exit_code_meaning"] = exit_note
+    if failure_hint:
+        result_dict["hint"] = failure_hint
+    if sudo_auth_failed:
+        result_dict["sudo_auth_failed"] = True
+    if sudo_cache_cleared:
+        result_dict["sudo_cache_cleared"] = True
+    return json.dumps(result_dict, ensure_ascii=False)
+
+
 def _resolve_command_cwd(
     *,
     workdir: Optional[str],
@@ -2532,14 +2714,14 @@ def _resolve_command_cwd(
 
 def terminal_tool(
     command: str,
-    background: bool = False,
+    background: Optional[bool] = None,
     timeout: Optional[int] = None,
     task_id: Optional[str] = None,
     session_id: Optional[str] = None,
     force: bool = False,
     workdir: Optional[str] = None,
     pty: bool = False,
-    notify_on_complete: bool = False,
+    notify_on_complete: Optional[bool] = None,
     watch_patterns: Optional[List[str]] = None,
 ) -> str:
     """
@@ -2547,14 +2729,14 @@ def terminal_tool(
 
     Args:
         command: The command to execute
-        background: Whether to run in background (default: False)
+        background: Whether to run in background. None means omitted.
         timeout: Command timeout in seconds (default: from config)
         task_id: Unique identifier for environment isolation (optional)
         session_id: Conversation/session identifier for durable observability
         force: If True, skip dangerous command check (use after user confirms)
         workdir: Working directory for this command (optional, uses session cwd if not set)
         pty: If True, use pseudo-terminal for interactive CLI tools (local backend only)
-        notify_on_complete: If True and background=True, you'll be notified exactly once when the process exits. The right choice for almost every long task. MUTUALLY EXCLUSIVE with watch_patterns.
+        notify_on_complete: If True and background=True, you'll be notified exactly once when the process exits. None means omitted. MUTUALLY EXCLUSIVE with watch_patterns.
         watch_patterns: List of strings to watch for in background output. HARD rate limit: 1 notification per 15s per process. After 3 strike windows in a row, watch_patterns is disabled and the session is auto-promoted to notify_on_complete. Use ONLY for rare, one-shot mid-process signals on long-lived processes (server readiness, migration-done markers). NEVER use in loops/batch jobs — error patterns there will hit the strike limit and get disabled. MUTUALLY EXCLUSIVE with notify_on_complete — set one, not both.
 
     Returns:
@@ -2655,15 +2837,95 @@ def terminal_tool(
                 f"timeout must be a positive number of seconds (got {timeout})."
             )
         effective_timeout = timeout or default_timeout
+        execution_timeout = None
+        async_delivery_verified = False
 
-        # Reject foreground commands where the model explicitly requests
-        # a timeout above FOREGROUND_MAX_TIMEOUT — nudge it toward background.
-        if not background and timeout and timeout > FOREGROUND_MAX_TIMEOUT:
-            return tool_error(
-                f"Foreground timeout {timeout}s exceeds the maximum of "
-                f"{FOREGROUND_MAX_TIMEOUT}s. Use background=true with "
-                f"notify_on_complete=true for long-running commands."
-            )
+        background_was_omitted = background is None
+        notify_was_omitted = notify_on_complete is None
+        background = False if background_was_omitted else bool(background)
+        notify_on_complete = (
+            False if notify_was_omitted else bool(notify_on_complete)
+        )
+
+        auto_background_threshold = int(
+            config.get("auto_background_timeout_threshold", 200)
+        )
+        auto_promoted = (
+            background_was_omitted
+            and notify_was_omitted
+            and not watch_patterns
+            and effective_timeout > auto_background_threshold
+        )
+        if auto_promoted:
+            try:
+                from gateway.session_context import async_delivery_supported
+
+                if not async_delivery_supported():
+                    return tool_error(
+                        "Long terminal command was not started: this session cannot "
+                        "deliver a managed background completion. Use a short bounded "
+                        f"timeout at or below {auto_background_threshold}s."
+                    )
+                async_delivery_verified = True
+            except Exception:
+                return tool_error(
+                    "Long terminal command was not started because async completion "
+                    "delivery could not be verified."
+                )
+
+            background = True
+            notify_on_complete = True
+            effective_timeout = AUTO_BACKGROUND_TIMEOUT
+            execution_timeout = effective_timeout
+
+        notification_requested = bool(notify_on_complete or watch_patterns)
+        notify_unsupported = None
+        watch_patterns, conflict_note = _resolve_notification_flag_conflict(
+            notify_on_complete=notify_on_complete,
+            watch_patterns=watch_patterns,
+            background=background,
+        )
+        if background and notification_requested and not async_delivery_verified:
+            try:
+                from gateway.session_context import async_delivery_supported
+
+                if not async_delivery_supported():
+                    notify_on_complete = False
+                    watch_patterns = None
+                    notify_unsupported = (
+                        "notify_on_complete / watch_patterns are unavailable in "
+                        "this one-shot session; inspect the managed process with "
+                        "process(action='poll')."
+                    )
+            except Exception:
+                notify_on_complete = False
+                watch_patterns = None
+                notify_unsupported = (
+                    "async completion delivery could not be verified; inspect "
+                    "the managed process with process(action='poll')."
+                )
+        heartbeat_interval = None
+        heartbeat_provider = ""
+        if background and notify_on_complete:
+            try:
+                from tools.runtime_heartbeat import (
+                    HeartbeatConfigError,
+                    get_current_provider,
+                    preflight_current_heartbeat,
+                )
+
+                heartbeat_interval = preflight_current_heartbeat()
+                if heartbeat_interval is None:
+                    raise HeartbeatConfigError(
+                        "runtime heartbeat interval is unavailable for "
+                        "notify_on_complete"
+                    )
+                heartbeat_provider = get_current_provider()
+            except Exception as exc:
+                return tool_error(
+                    "Background command was not started because its cache-warm "
+                    f"heartbeat could not be configured: {exc}"
+                )
 
         # Guardrail: long-lived server/watch commands should run as managed
         # background sessions, not foreground shell hacks.
@@ -2676,6 +2938,20 @@ def terminal_tool(
                     "error": guidance,
                     "status": "error",
                 }, ensure_ascii=False)
+
+        if watch_patterns and not background:
+            return tool_error(
+                "watch_patterns requires background=true. Start the server/watcher "
+                "as a managed background process instead of occupying the foreground turn."
+            )
+
+        # Last-resort cap for foreground work that was explicitly kept inline.
+        if not background and effective_timeout > FOREGROUND_MAX_TIMEOUT:
+            return tool_error(
+                f"Foreground timeout {effective_timeout}s exceeds the maximum of "
+                f"{FOREGROUND_MAX_TIMEOUT}s. Use background=true with "
+                f"notify_on_complete=true for long-running commands."
+            )
 
         # Start cleanup thread
         _start_cleanup_thread()
@@ -2984,9 +3260,7 @@ def terminal_tool(
 
         # The session key is already computed above the gateway guard.
         if background:
-            # Spawn a tracked background process via the process registry.
-            # For local backends: uses subprocess.Popen with output buffering.
-            # For non-local backends: runs inside the sandbox via env.execute().
+            # Spawn through the managed process lifecycle.
             from tools.process_registry import process_registry
 
             effective_cwd = _resolve_command_cwd(
@@ -3014,6 +3288,24 @@ def terminal_tool(
                         session_key=session_key,
                     )
 
+                if notify_on_complete:
+                    from tools.process_registry import arm_process_heartbeat
+
+                    proc_session.heartbeat_provider = heartbeat_provider
+                    try:
+                        arm_process_heartbeat(
+                            proc_session,
+                            interval=heartbeat_interval,
+                            caller_id=session_key,
+                        )
+                    except Exception:
+                        process_registry.kill_process(
+                            proc_session.id,
+                            source="heartbeat_arm_failed",
+                            consume_output=False,
+                        )
+                        raise
+
                 result_data = {
                     "output": "Background process started",
                     "session_id": proc_session.id,
@@ -3028,10 +3320,25 @@ def terminal_tool(
                     result_data["approval"] = approval_note
                 if pty_disabled_reason:
                     result_data["pty_note"] = pty_disabled_reason
+                if notify_unsupported:
+                    result_data["notify_on_complete"] = False
+                    result_data["notify_unsupported"] = notify_unsupported
+                    logger.info(
+                        "background proc %s: async delivery unsupported on this "
+                        "session; notify_on_complete/watch_patterns disabled",
+                        proc_session.id,
+                    )
+                if conflict_note:
+                    logger.warning(
+                        "background proc %s: %s",
+                        proc_session.id,
+                        conflict_note,
+                    )
+                    result_data["watch_patterns_ignored"] = conflict_note
 
                 # Nudge: background=True without notify_on_complete=True OR
                 # watch_patterns is a silent process. The agent has NO way to
-                # learn it finished short of calling process(action="poll"/"wait")
+                # learn it finished short of calling process(action="poll")
                 # explicitly. That's correct only for genuine long-lived
                 # processes that never exit (servers, watchers). For every
                 # bounded task (tests, builds, CI pollers, deploys, batch
@@ -3041,7 +3348,7 @@ def terminal_tool(
                 # surface the result. Cheap nudge here costs ~one read for
                 # server cases (false positive) and prevents silent
                 # blindness for bounded-task cases (false negative).
-                if background and not notify_on_complete and not watch_patterns:
+                if background and not notification_requested:
                     result_data["hint"] = (
                         "background=true without notify_on_complete=true means "
                         "this process runs SILENTLY — you will not be told when "
@@ -3050,7 +3357,7 @@ def terminal_tool(
                         "almost certainly wanted notify_on_complete=true so the "
                         "system pings you on exit. Re-launch with "
                         "notify_on_complete=true, or call process(action='poll') "
-                        "/ process(action='wait') yourself to learn the outcome. "
+                        "occasionally to inspect progress. "
                         "Only ignore this hint for genuine long-lived processes "
                         "that never exit (servers, watchers, daemons)."
                     )
@@ -3782,12 +4089,12 @@ TERMINAL_SCHEMA = {
             },
             "background": {
                 "type": "boolean",
-                "description": "Run in the background, returning a session_id. Pair with notify_on_complete=true for anything with a defined end (tests, builds, deploys) — without it the process runs silently. Only servers/watchers/daemons that never exit should stay silent. Short commands: prefer foreground with a generous timeout.",
+                "description": "Run in the background, returning a session_id. When this and notify_on_complete are omitted and timeout exceeds terminal.auto_background_timeout_threshold, Hermes enables both before execution. Explicit values are preserved. Pair background=true with notify_on_complete=true for bounded work; leave notifications off only for servers, watchers, and daemons.",
                 "default": False
             },
             "timeout": {
                 "type": "integer",
-                "description": f"Max seconds to wait (default: 180, foreground max: {FOREGROUND_MAX_TIMEOUT}). Returns INSTANTLY when command finishes — set high for long tasks, you won't wait unnecessarily. Foreground timeout above {FOREGROUND_MAX_TIMEOUT}s is rejected; use background=true for longer commands.",
+                "description": f"Maximum execution budget in seconds (default: 180). When this exceeds terminal.auto_background_timeout_threshold and background/notify_on_complete are omitted, Hermes promotes the call before execution to background=true, notify_on_complete=true and rewrites its managed budget to {AUTO_BACKGROUND_TIMEOUT}s; any remaining foreground budget above {FOREGROUND_MAX_TIMEOUT}s is rejected.",
                 "minimum": 1
             },
             "workdir": {

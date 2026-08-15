@@ -23,6 +23,13 @@ from agent.secret_scope import (
     reset_secret_scope,
     set_secret_scope,
 )
+from agent.usage_pricing import (
+    CACHE_HIT_ERROR_THRESHOLD,
+    POST_COMPRESSION_CACHE_NOTE,
+    POST_COMPRESSION_CACHE_WARM_NOTE,
+    cache_hit_percent,
+    format_cache_hit_percent,
+)
 from hermes_constants import (
     DEFAULT_INDICATOR_STYLE,
     INDICATOR_STYLES,
@@ -700,6 +707,11 @@ _NON_GATEWAY_SOURCES = frozenset({
     "", "tui", "cli", "webui", "desktop", "cron", "kanban", "subagent", "test",
     "local", "acp", "webhook", "api_server", "msgraph_webhook",
 })
+_NOTIFICATION_QUEUE_WAIT_SECONDS = 0.5
+_NOTIFICATION_REQUEUE_BACKOFF_SECONDS = 0.25
+_NOTIFICATION_POLLER_JOIN_TIMEOUT_SECONDS = (
+    _NOTIFICATION_QUEUE_WAIT_SECONDS + _NOTIFICATION_REQUEUE_BACKOFF_SECONDS
+)
 
 
 def _is_gateway_owned_source(source: str) -> bool:
@@ -726,6 +738,15 @@ def _is_gateway_owned_source(source: str) -> bool:
         return False
 
 
+def _join_notification_poller(poller_thread) -> None:
+    if poller_thread is None or poller_thread is threading.current_thread():
+        return
+    try:
+        poller_thread.join(timeout=_NOTIFICATION_POLLER_JOIN_TIMEOUT_SECONDS)
+    except (AttributeError, RuntimeError):
+        pass
+
+
 def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> None:
     """Best-effort finalize hook + memory commit for a session.
 
@@ -735,13 +756,29 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     force-quit (double Ctrl‑C, terminal‑close, SIGHUP) while the agent
     is mid‑turn.
     """
-    if not session or session.get("_finalized"):
+    if not session:
         return
-    session["_finalized"] = True
+    poller_thread = None
+    lifecycle_lock = session.get("_notif_lifecycle_lock")
+    if lifecycle_lock is not None:
+        with lifecycle_lock:
+            if session.get("_finalized"):
+                return
+            session["_finalized"] = True
+            stop_event = session.get("_notif_stop")
+            if stop_event is not None:
+                stop_event.set()
+            poller_thread = session.get("_notif_thread")
+    else:
+        if session.get("_finalized"):
+            return
+        session["_finalized"] = True
+        stop_event = session.get("_notif_stop")
+        if stop_event is not None:
+            stop_event.set()
+        poller_thread = session.get("_notif_thread")
     _release_active_session_slot(session)
-    stop_event = session.get("_notif_stop")
-    if stop_event is not None:
-        stop_event.set()
+    _join_notification_poller(poller_thread)
 
     agent = session.get("agent")
     lock = session.get("history_lock")
@@ -5286,6 +5323,96 @@ def _get_usage(agent) -> dict:
     return usage
 
 
+def _cache_level(pct: int) -> str:
+    return "error" if pct < CACHE_HIT_ERROR_THRESHOLD else "info"
+
+
+def _cache_badge_text(cache_info: dict[str, int | str]) -> str:
+    state = str(cache_info["state"])
+    if state in {"cold_write", "hit", "miss"}:
+        pct = format_cache_hit_percent(
+            int(cache_info["read_tokens"]), int(cache_info["prompt_tokens"])
+        )
+        text = (
+            f"cache {pct} "
+            f"{cache_info['read_tokens']}/{cache_info['prompt_tokens']}"
+        )
+    elif state == "unavailable":
+        text = "cache unavailable"
+    else:
+        text = f"cache {state.upper()}"
+    if cache_info.get("note"):
+        text += f" · {cache_info['note']}"
+    return text
+
+
+def _cache_info_from_usage(usage: Any) -> dict[str, int | str] | None:
+    if not isinstance(usage, dict):
+        return None
+    read_keys = ("cache_read_tokens",)
+    write_keys = (
+        "cache_write_tokens",
+        "cache_creation_tokens",
+        "cache_creation_input_tokens",
+    )
+    telemetry_present = usage.get("cache_telemetry_present")
+    if telemetry_present is not False and not any(
+        key in usage for key in (*read_keys, *write_keys)
+    ):
+        return None
+
+    def tokens(*keys: str) -> int:
+        for key in keys:
+            value = usage.get(key)
+            if value is not None:
+                try:
+                    return max(0, int(float(value)))
+                except (TypeError, ValueError):
+                    pass
+        return 0
+
+    read_tokens = tokens(*read_keys)
+    write_tokens = tokens(*write_keys)
+    prompt_tokens = tokens("prompt_tokens")
+    if telemetry_present is False:
+        cache_info: dict[str, int | str] = {
+            "read_tokens": 0,
+            "prompt_tokens": prompt_tokens,
+            "pct": 0,
+            "state": "unavailable",
+            "level": "info",
+        }
+        if usage.get("cache_attribution") == "post_compression":
+            cache_info.update(
+                attribution="post_compression",
+                note="post-compression cache unavailable",
+            )
+        cache_info["text"] = _cache_badge_text(cache_info)
+        return cache_info
+    pct = cache_hit_percent(read_tokens, prompt_tokens)
+    state = (
+        "hit" if read_tokens else "cold_write" if write_tokens else
+        "miss" if telemetry_present is True else "unknown"
+    )
+    cache_info = {
+        "read_tokens": read_tokens,
+        "prompt_tokens": prompt_tokens,
+        "pct": pct,
+        "state": state,
+        "level": _cache_level(pct),
+    }
+    if usage.get("cache_attribution") == "post_compression":
+        cache_info["attribution"] = "post_compression"
+        cache_info["level"] = "info"
+        cache_info["note"] = (
+            POST_COMPRESSION_CACHE_WARM_NOTE
+            if state == "hit" and pct >= CACHE_HIT_ERROR_THRESHOLD
+            else POST_COMPRESSION_CACHE_NOTE
+        )
+    cache_info["text"] = _cache_badge_text(cache_info)
+    return cache_info
+
+
 def _probe_credentials(agent) -> str:
     """Light credential check at session creation — returns warning or ''.
 
@@ -5364,10 +5491,17 @@ def _session_usage_snapshot(session: dict | None) -> dict:
     agent = (session or {}).get("agent")
     mirror_usage = _metadata_mirror(session).get("usage")
     if (session or {}).get("_compute_host_active") and isinstance(mirror_usage, dict):
-        return dict(mirror_usage)
-    if agent is not None:
-        return _get_usage(agent)
-    return dict(mirror_usage) if isinstance(mirror_usage, dict) else {}
+        usage = dict(mirror_usage)
+    elif agent is not None:
+        usage = _get_usage(agent)
+    else:
+        usage = dict(mirror_usage) if isinstance(mirror_usage, dict) else {}
+    heartbeat = _runtime_heartbeat_status_for_session(
+        _session_lookup_key(session or {}, fallback=""), session or {}
+    )
+    if heartbeat is not None:
+        usage["runtime_heartbeat"] = heartbeat
+    return usage
 
 
 def _project_info_for_cwd(cwd: str) -> dict | None:
@@ -6371,6 +6505,7 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
         "base_url": getattr(agent, "base_url", None) or None,
         "api_key": getattr(agent, "api_key", None) or None,
         "provider": getattr(agent, "provider", None) or None,
+        "requested_provider": getattr(agent, "requested_provider", None) or None,
         "api_mode": getattr(agent, "api_mode", None) or None,
         "acp_command": getattr(agent, "acp_command", None) or None,
         "acp_args": getattr(agent, "acp_args", None) or None,
@@ -6860,6 +6995,7 @@ def _make_agent(
         model=model,
         max_iterations=_cfg_max_turns(cfg, 500),
         provider=runtime.get("provider"),
+        requested_provider=runtime.get("requested_provider") or requested_provider,
         base_url=runtime.get("base_url"),
         api_key=runtime.get("api_key"),
         api_mode=runtime.get("api_mode"),
@@ -7948,21 +8084,19 @@ def _handle_busy_submit(
     unwinding the turn) redirected the live turn with next-turn text — queue
     semantics betrayed by a millisecond race the user can't see.
     """
-    mode = "queue" if queued else _load_busy_input_mode()
     agent = session.get("agent")
     with session["history_lock"]:
         if not session.get("running"):
             # The turn ended between prompt.submit's first busy check and this
             # helper. Let the caller retry and claim the now-idle session.
             return None
-    with session["history_lock"]:
-        if not session.get("running"):
-            return None
+        heartbeat_running = bool(session.get("_heartbeat_running"))
         image_paths = list(session.get("attached_images", []))
         if image_paths:
             # Claim at submission time. A later paste must not be consumed by
             # this prompt after the active turn finally yields.
             session["attached_images"] = []
+    mode = "queue" if queued or heartbeat_running else _load_busy_input_mode()
     text_only = not image_paths and _is_text_only_busy_payload(text)
     plain_text = _coerce_message_text(text).strip() if text_only else ""
     if mode == "steer" and text_only and plain_text and agent is not None and hasattr(agent, "steer"):
@@ -8165,20 +8299,24 @@ def _inflight_snapshot(session: dict) -> dict | None:
     return snapshot
 
 
-def _emit_terminal_turn_error(sid: str, session: dict, error: Any) -> None:
+def _emit_terminal_turn_error(
+    sid: str, session: dict, error: Any, *, retain_inflight: bool = True
+) -> None:
     """Close a failed turn with a terminal ``message.complete`` frame.
 
     Emits the same ``status: "error"`` frame shape the returned-error path in
-    ``_run_prompt_submit`` already produces (so TUI/desktop handling is
-    uniform), and retains the failed turn via ``_fail_inflight_turn`` so a
-    client that missed this frame (disconnect window) can recover it from
-    ``session.resume``'s ``inflight`` payload.
+    ``_run_prompt_submit`` already produces. User turns retain the failure for
+    resume; internal heartbeat failures leave any user-owned snapshot intact.
     """
     with session["history_lock"]:
-        _fail_inflight_turn(session, error)
-        turn = session.get("inflight_turn") or {}
-        message = str(turn.get("error") or "turn failed")
-        partial = str(turn.get("assistant") or "")
+        if retain_inflight:
+            _fail_inflight_turn(session, error)
+            turn = session.get("inflight_turn") or {}
+            message = str(turn.get("error") or "turn failed")
+            partial = str(turn.get("assistant") or "")
+        else:
+            message = str(error or "turn failed")
+            partial = ""
         cols = int(session.get("cols", 80))
     text = partial or f"Error: {message}"
     agent = session.get("agent")
@@ -8197,7 +8335,8 @@ def _emit_terminal_turn_error(sid: str, session: dict, error: Any) -> None:
         rendered = ""
     if rendered:
         payload["rendered"] = rendered
-    _retire_turn_marker(session)
+    if retain_inflight:
+        _retire_turn_marker(session)
     _emit("message.complete", sid, payload)
 
 
@@ -9408,6 +9547,121 @@ def _notification_event_requires_owner(evt: dict) -> bool:
     )
 
 
+def _runtime_heartbeat_status_for_session(
+    sid: str, session: dict
+) -> dict | None:
+    """Build one complete, owner-filtered, nonpersistent TUI snapshot."""
+    try:
+        from tools.runtime_heartbeat import runtime_heartbeat
+
+        snapshots = runtime_heartbeat.active_snapshots()
+    except Exception:
+        logger.debug("Could not snapshot runtime heartbeat targets", exc_info=True)
+        return None
+
+    targets = []
+    for snapshot in snapshots:
+        if not isinstance(snapshot, dict) or not _session_owns_notification_event(
+            sid,
+            session,
+            {
+                "type": "heartbeat",
+                "session_key": snapshot.get("caller_id"),
+            },
+        ):
+            continue
+        target_id = str(snapshot.get("target_id") or "")
+        kind = str(snapshot.get("kind") or "")
+        started_at = snapshot.get("started_at")
+        interval_s = snapshot.get("interval_s")
+        last_success_at = snapshot.get("last_success_at")
+        if (
+            not target_id
+            or kind not in {"delegation", "process"}
+            or not isinstance(started_at, (int, float))
+            or isinstance(started_at, bool)
+            or not isinstance(interval_s, int)
+            or isinstance(interval_s, bool)
+            or interval_s <= 0
+        ):
+            continue
+        if (
+            not isinstance(last_success_at, (int, float))
+            or isinstance(last_success_at, bool)
+            or last_success_at <= 0
+        ):
+            last_success_at = None
+        targets.append(
+            {
+                "kind": kind,
+                "started_at": float(started_at),
+                "interval_s": interval_s,
+                "last_success_at": (
+                    float(last_success_at) if last_success_at is not None else None
+                ),
+            }
+        )
+    return {"active_count": len(targets), "targets": targets}
+
+
+def _runtime_heartbeat_status_key(status: dict) -> tuple:
+    return tuple(
+        (
+            target["kind"],
+            target["started_at"],
+            target["interval_s"],
+            target["last_success_at"],
+        )
+        for target in status["targets"]
+    )
+
+
+def _sync_runtime_heartbeat_status(
+    sid: str,
+    session: dict,
+    *,
+    previous: tuple | None,
+    stop_event: threading.Event | None = None,
+) -> tuple | None:
+    """Emit target or success changes; elapsed ages advance in the TUI."""
+    if not _notification_poller_is_current(session, stop_event):
+        return previous
+    status = _runtime_heartbeat_status_for_session(sid, session)
+    if status is None:
+        return previous
+    if not _notification_poller_is_current(session, stop_event):
+        return previous
+    current = _runtime_heartbeat_status_key(status)
+    if previous is None and not current:
+        return current
+    if previous == current:
+        return previous
+    lifecycle_lock = session.get("_notif_lifecycle_lock")
+    if lifecycle_lock is None:
+        if not _notification_poller_is_current(session, stop_event):
+            return previous
+        _emit("session.usage", sid, {"usage": {"runtime_heartbeat": status}})
+    else:
+        with lifecycle_lock:
+            if not _notification_poller_is_current(session, stop_event):
+                return previous
+            _emit("session.usage", sid, {"usage": {"runtime_heartbeat": status}})
+    return current
+
+
+def _notification_poller_is_current(
+    session: dict, stop_event: threading.Event | None
+) -> bool:
+    if session.get("_finalized") or (stop_event is not None and stop_event.is_set()):
+        return False
+    registered_stop = session.get("_notif_stop")
+    return (
+        stop_event is None
+        or registered_stop is None
+        or registered_stop is stop_event
+    )
+
+
 def _notification_event_dedup_key(evt: dict) -> tuple:
     """Return the UI-emission identity for a process notification event.
 
@@ -9724,7 +9978,11 @@ def _notification_poller_loop(
     same way (status.update + agent turn) — the delivery path
     tools/kanban_tools.py documents for platform="tui" rows (issue #59890).
     """
-    from tools.process_registry import process_registry, format_process_notification
+    from tools.process_registry import (
+        completion_delivery_prompt,
+        format_process_notification,
+        process_registry,
+    )
 
     _emitted = set()  # dedup re-queued events so same completion isn't emitted 50 times while session is busy
     _last_kanban_poll = 0.0
@@ -9784,7 +10042,9 @@ def _notification_poller_loop(
                         with session["history_lock"]:
                             session["running"] = False
         try:
-            evt = process_registry.completion_queue.get(timeout=0.5)
+            evt = process_registry.completion_queue.get(
+                timeout=_NOTIFICATION_QUEUE_WAIT_SECONDS
+            )
         except Exception:
             continue
 
@@ -9820,12 +10080,19 @@ def _notification_poller_loop(
             )
             continue
 
-        _evt_sid = evt.get("session_id", "")
-        if evt.get("type") == "completion" and process_registry.is_completion_consumed(_evt_sid):
+        if not process_registry.completion_event_should_deliver(evt):
+            continue
+
+        if evt.get("type") == "heartbeat":
+            _handle_heartbeat_event(sid, session, evt)
             continue
 
         text = format_process_notification(evt)
         if not text:
+            continue
+        model_text = completion_delivery_prompt(evt, text)
+        if model_text is None:
+            process_registry.complete_completion_delivery(evt)
             continue
 
         # Only emit the same notification identity to TUI once — re-queued
@@ -9848,7 +10115,12 @@ def _notification_poller_loop(
             # Back off before re-polling: the re-queued event keeps the queue
             # non-empty, so without a sleep this loop spins at full speed
             # (100% CPU, GIL churn) for as long as the session stays busy.
-            time.sleep(0.25)
+            time.sleep(_NOTIFICATION_REQUEUE_BACKOFF_SECONDS)
+            continue
+
+        if not process_registry.claim_completion_delivery(evt):
+            with session["history_lock"]:
+                session["running"] = False
             continue
 
         rid = f"__notif__{int(time.time() * 1000)}"
@@ -9857,6 +10129,9 @@ def _notification_poller_loop(
         )
         _claim = claim_event_delivery(evt, "tui-poller")
         if _claim is None:
+            process_registry.release_completion_delivery(evt)
+            with session["history_lock"]:
+                session["running"] = False
             continue
         try:
             _emit("message.start", sid)
@@ -9870,10 +10145,23 @@ def _notification_poller_loop(
                     display_metadata=_async_delegation_display_metadata(evt),
                 )
             else:
-                _run_prompt_submit(rid, sid, session, text)
+                _run_prompt_submit(
+                    rid,
+                    sid,
+                    session,
+                    model_text,
+                    **(
+                        {"completion_delivery": True}
+                        if evt.get("type", "completion") == "completion"
+                        else {}
+                    ),
+                )
             complete_event_delivery(evt, _claim)
+            process_registry.complete_completion_delivery(evt)
         except Exception as exc:
             release_event_delivery(evt, _claim)
+            process_registry.release_completion_delivery(evt)
+            process_registry.completion_queue.put(evt)
             print(
                 f"[tui_gateway] notification poller dispatch failed: "
                 f"{type(exc).__name__}: {exc}",
@@ -9911,11 +10199,17 @@ def _notification_poller_loop(
                     str(evt.get("session_key") or ""),
                 )
             continue
-        _evt_sid = evt.get("session_id", "")
-        if evt.get("type") == "completion" and process_registry.is_completion_consumed(_evt_sid):
+        if not process_registry.completion_event_should_deliver(evt):
+            continue
+        if evt.get("type") == "heartbeat":
+            _handle_heartbeat_event(sid, session, evt)
             continue
         text = format_process_notification(evt)
         if not text:
+            continue
+        model_text = completion_delivery_prompt(evt, text)
+        if model_text is None:
+            process_registry.complete_completion_delivery(evt)
             continue
 
         _dedup_key = _notification_event_dedup_key(evt)
@@ -9929,12 +10223,20 @@ def _notification_poller_loop(
                 break
             session["running"] = True
 
+        if not process_registry.claim_completion_delivery(evt):
+            with session["history_lock"]:
+                session["running"] = False
+            continue
+
         rid = f"__notif__{int(time.time() * 1000)}"
         from tools.async_delegation import (
             claim_event_delivery, complete_event_delivery, release_event_delivery,
         )
         _claim = claim_event_delivery(evt, "tui-poller")
         if _claim is None:
+            process_registry.release_completion_delivery(evt)
+            with session["history_lock"]:
+                session["running"] = False
             continue
         try:
             _emit("message.start", sid)
@@ -9948,10 +10250,23 @@ def _notification_poller_loop(
                     display_metadata=_async_delegation_display_metadata(evt),
                 )
             else:
-                _run_prompt_submit(rid, sid, session, text)
+                _run_prompt_submit(
+                    rid,
+                    sid,
+                    session,
+                    model_text,
+                    **(
+                        {"completion_delivery": True}
+                        if evt.get("type", "completion") == "completion"
+                        else {}
+                    ),
+                )
             complete_event_delivery(evt, _claim)
+            process_registry.complete_completion_delivery(evt)
         except Exception as exc:
             release_event_delivery(evt, _claim)
+            process_registry.release_completion_delivery(evt)
+            process_registry.completion_queue.put(evt)
             print(
                 f"[tui_gateway] notification poller dispatch failed: "
                 f"{type(exc).__name__}: {exc}",
@@ -9963,6 +10278,55 @@ def _notification_poller_loop(
     # Hand any other sessions' events back to the shared queue.
     for evt in deferred:
         process_registry.completion_queue.put(evt)
+
+
+def _handle_heartbeat_event(sid: str, session: dict, evt: dict) -> None:
+    """Surface unhealthy status and warm targets that remain live."""
+    from tools.runtime_heartbeat import DIRECT_HEARTBEAT_STATUSES, runtime_heartbeat
+
+    if not runtime_heartbeat.is_event_current(evt):
+        return
+    event_key = str(evt.get("session_key") or "")
+    if not event_key or (
+        event_key not in {str(sid or ""), str(session.get("session_key") or "")}
+        and not _session_owns_notification_event(sid, session, evt)
+    ):
+        return
+    target = str(evt.get("target_id") or evt.get("session_id") or "unknown")
+    status = str(evt.get("status") or "").upper()
+    evidence = str(evt.get("evidence") or "no evidence available")
+    elapsed = max(0, int(evt.get("elapsed_s") or 0))
+    prompt = (
+        f'[HEARTBEAT] Background target "{target}" is {status}: {evidence}. '
+        f"Elapsed: {elapsed}s. KV cache warm check-in."
+    )
+    if status in DIRECT_HEARTBEAT_STATUSES:
+        if not runtime_heartbeat.is_event_current(evt):
+            return
+        _emit("status.update", sid, {"kind": "process", "text": prompt})
+        return
+    if status != "ALIVE":
+        return
+    if evt.get("heartbeat_warm_owned"):
+        return
+    agent = session.get("agent")
+    if agent is None:
+        return
+
+    def _warm() -> None:
+        try:
+            agent.run_conversation(
+                "",
+                turn_origin="heartbeat_warm",
+                heartbeat_event=evt,
+            )
+        except Exception:
+            logger.debug("TUI heartbeat warm request failed", exc_info=True)
+
+    # The warm path owns no user-turn state and never waits for the foreground
+    # turn. Snapshot single-flight inside AIAgent prevents duplicate provider
+    # calls while preserving the ordinary session/history lifecycle.
+    threading.Thread(target=_warm, daemon=True).start()
 
 
 def _async_delegation_display_metadata(evt: dict) -> dict:
@@ -10286,7 +10650,11 @@ def _run_prompt_submit(
     display_metadata: dict | None = None,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    completion_delivery: bool = False,
+    turn_origin: str | None = None,
+    heartbeat_event: Any = None,
 ) -> None:
+    heartbeat_turn = turn_origin == "heartbeat_warm"
     with session["history_lock"]:
         if (
             queued_prompt_generation is not None
@@ -10294,7 +10662,9 @@ def _run_prompt_submit(
         ):
             session["running"] = False
             return
-        if image_paths is None:
+        if heartbeat_turn:
+            images = []
+        elif image_paths is None:
             images = list(session.get("attached_images", []))
             session["attached_images"] = []
         else:
@@ -10346,7 +10716,7 @@ def _run_prompt_submit(
         result = None  # turn outcome; read after the finally for leftover /steer
         tts_queue = None  # streaming-TTS feed for this turn (voice mode)
         thinking_started = False  # ambient thinking sound armed for this turn
-        one_turn_restore = session.pop("one_turn_model_restore", None)
+        one_turn_restore = None if heartbeat_turn else session.pop("one_turn_model_restore", None)
         # True once a failed turn's snapshot was retained for resume replay —
         # tells the finally below to skip the normal inflight clear.
         turn_error_retained = False
@@ -10358,9 +10728,13 @@ def _run_prompt_submit(
         # session_key mid-turn, so remember the key we wrote under.
         marker_home = _session_home(session)
         marker_key = str(session.get("session_key") or "")
-        marker_attempt = int(session.pop("_auto_continue_attempt", 0) or 0)
-        marker_text = session.pop("_auto_continue_prompt", None) or text
-        if isinstance(marker_text, str) and marker_text.strip():
+        marker_attempt = (
+            0
+            if heartbeat_turn
+            else int(session.pop("_auto_continue_attempt", 0) or 0)
+        )
+        marker_text = text if heartbeat_turn else session.pop("_auto_continue_prompt", None) or text
+        if not heartbeat_turn and isinstance(marker_text, str) and marker_text.strip():
             record_turn_start(marker_home, marker_key, marker_text, attempts=marker_attempt)
         try:
             from tools.approval import (
@@ -10391,7 +10765,7 @@ def _run_prompt_submit(
             # once-override back to the config model before the turn runs
             # (#29923 review defect). Any config.yaml change is adopted on
             # the NEXT turn, after the finally-restore below.
-            if not one_turn_restore:
+            if not heartbeat_turn and not one_turn_restore:
                 # A model picked mid-turn was queued (not applied in-place) —
                 # apply it now, on the turn thread before the first model call,
                 # so this turn runs on the model the user chose. Runs before the
@@ -10504,13 +10878,18 @@ def _run_prompt_submit(
             # begin() first — it cuts any still-speaking previous turn, and
             # that cut IS this turn's barge-in, so it must latch before we
             # consume the latch below.
-            tts_queue = _tts_stream_begin()
+            if not heartbeat_turn:
+                tts_queue = _tts_stream_begin()
 
             # Full-duplex agent-turn listener: armed at utterance-submit so
             # the user can interject DURING generation, not just during
             # playback. _tts_stream_begin arms it too when a pipeline
             # starts; this covers voice mode without working TTS.
-            if _voice_mode_enabled() and _voice_cfg_dict().get("barge_in", True):
+            if (
+                not heartbeat_turn
+                and _voice_mode_enabled()
+                and _voice_cfg_dict().get("barge_in", True)
+            ):
                 _arm_full_duplex_listener()
 
             # Ambient "thinking" sound (voice mode only): calm bubble blips
@@ -10520,7 +10899,7 @@ def _run_prompt_submit(
             # stopped in the finally the instant the turn ends.
             # voice.thinking_sound config-gates it; macOS TCC handled inside.
             thinking_started = False
-            if _voice_mode_enabled():
+            if not heartbeat_turn and _voice_mode_enabled():
                 try:
                     from tools.voice_mode import (
                         is_audio_output_active,
@@ -10551,9 +10930,6 @@ def _run_prompt_submit(
             if take_speech_interrupted():
                 run_message = _prepend_note(run_message, SPEECH_INTERRUPTED_NOTE)
 
-            # Reactions the user added since the last turn.
-            run_message = _prepend_note(run_message, _pending_reaction_notes(session))
-
             # Which window the message was typed into. HUD mode is per-turn
             # state, so it cannot live in the (byte-stable) system prompt.
             run_message = _prepend_note(run_message, _hud_surface_note(session))
@@ -10573,7 +10949,7 @@ def _run_prompt_submit(
             # nudge) so the desktop can seal it as its own segment instead of
             # losing it when message.complete replaces the streaming buffer.
             # Gated on display.interim_assistant_messages (default true).
-            if _load_interim_assistant_messages():
+            if not heartbeat_turn and _load_interim_assistant_messages():
                 def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
                     _emit("message.interim", sid, {
                         "text": text,
@@ -10581,16 +10957,22 @@ def _run_prompt_submit(
                     })
 
                 agent.interim_assistant_callback = _interim_assistant_cb
-            else:
+            elif not heartbeat_turn:
                 agent.interim_assistant_callback = None
 
             run_kwargs = {
                 "conversation_history": list(history),
-                "stream_callback": _stream,
+                "stream_callback": None if heartbeat_turn else _stream,
                 "persist_user_message": (
                     _build_persist_user_message(prompt, images, run_message) if images else prompt
                 ),
             }
+            if completion_delivery:
+                agent._pending_cli_user_message = {
+                    "role": "user",
+                    "content": prompt,
+                    "_completion_delivery_synthetic": True,
+                }
             # Type a synthesized turn at turn START so the crash persist writes
             # its row as a timeline event, instead of leaving a raw user bubble
             # until the turn ends — and forever if it never does, which is
@@ -10603,6 +10985,10 @@ def _run_prompt_submit(
                 _run_params = {}
             if "task_id" in _run_params:
                 run_kwargs["task_id"] = session["session_key"]
+            if turn_origin is not None and "turn_origin" in _run_params:
+                run_kwargs["turn_origin"] = turn_origin
+            if heartbeat_turn and "heartbeat_event" in _run_params:
+                run_kwargs["heartbeat_event"] = heartbeat_event
             if display_kind and "persist_user_display_kind" in _run_params:
                 run_kwargs["persist_user_display_kind"] = display_kind
                 run_kwargs["persist_user_display_metadata"] = display_metadata
@@ -10629,6 +11015,11 @@ def _run_prompt_submit(
                 # message.complete.
                 _usage_stop.set()
                 _usage_thread.join()
+            heartbeat_silent_noop = bool(
+                heartbeat_turn
+                and isinstance(result, dict)
+                and result.get("silent_noop") is True
+            )
             if display_kind and isinstance(text, str):
                 db = getattr(agent, "_session_db", None)
                 current_session_id = getattr(agent, "session_id", None) or session.get("session_key")
@@ -10650,7 +11041,7 @@ def _run_prompt_submit(
                             if display_metadata:
                                 message["display_metadata"] = display_metadata
                             break
-            if "moa_one_shot_restore" in session:
+            if not heartbeat_turn and "moa_one_shot_restore" in session:
                 _restore = session.pop("moa_one_shot_restore", None)
                 # Restore the model the user was on before the /moa one-shot.
                 # The one-shot did a real in-place agent.switch_model() to MoA
@@ -10695,7 +11086,7 @@ def _run_prompt_submit(
             last_reasoning = None
             status_note = None
             if isinstance(result, dict):
-                if isinstance(result.get("messages"), list):
+                if not heartbeat_silent_noop and isinstance(result.get("messages"), list):
                     with session["history_lock"]:
                         current_version = int(session.get("history_version", 0))
                         if current_version == history_version:
@@ -10806,6 +11197,16 @@ def _run_prompt_submit(
                 status = "complete"
 
             payload = {"text": raw, "usage": _get_usage(agent), "status": status}
+            if heartbeat_silent_noop:
+                payload["silent"] = True
+            turn_usage = getattr(agent, "_first_turn_usage", None)
+            if turn_usage is None:
+                turn_usage = result.get("usage") if isinstance(result, dict) else None
+            if turn_usage is None:
+                turn_usage = getattr(agent, "_last_turn_usage", None)
+            cache_info = _cache_info_from_usage(turn_usage)
+            if cache_info is not None:
+                payload["cache_info"] = cache_info
             if last_reasoning:
                 payload["reasoning"] = last_reasoning
             if status_note:
@@ -10823,7 +11224,7 @@ def _run_prompt_submit(
             if rendered:
                 payload["rendered"] = rendered
             with session["history_lock"]:
-                if status == "error":
+                if status == "error" and not heartbeat_turn:
                     # Returned-error result (provider 4xx, budget, etc.): retain
                     # the failed turn for resume replay instead of clearing it.
                     # If this terminal frame is lost to a disconnect, resume's
@@ -10833,15 +11234,17 @@ def _run_prompt_submit(
                         result.get("error") if isinstance(result, dict) else raw,
                     )
                     turn_error_retained = True
-                else:
+                elif not heartbeat_turn:
                     _clear_inflight_turn(session)
             if status == "error":
                 payload["error"] = str(
                     (result.get("error") if isinstance(result, dict) else "") or raw
                 )
                 payload["recoverable"] = True
-            _retire_turn_marker(session, marker_key)
-            _emit("message.complete", sid, payload)
+            if not heartbeat_turn:
+                _retire_turn_marker(session, marker_key)
+            if not heartbeat_silent_noop:
+                _emit("message.complete", sid, payload)
 
             # ── /goal continuation (Ralph-style loop) ─────────────────
             # After every TUI turn, if a /goal is active, ask the judge
@@ -10957,7 +11360,7 @@ def _run_prompt_submit(
             # Apply pending_title now that the DB row exists — in the
             # session-owned profile store (not the launch profile).
             _pending = session.get("pending_title")
-            if _pending and status == "complete":
+            if not heartbeat_turn and _pending and status == "complete":
                 _session_key = session.get("session_key") or sid
                 try:
                     with _session_db(session) as _pdb:
@@ -10980,7 +11383,8 @@ def _run_prompt_submit(
             # final text whole (cli.py:_voice_speak_response parity). The
             # streaming path already spoke everything via tts_queue.
             if (
-                status == "complete"
+                not heartbeat_turn
+                and status == "complete"
                 and tts_queue is None
                 and isinstance(raw, str)
                 and raw.strip()
@@ -11024,8 +11428,11 @@ def _run_prompt_submit(
                 # Close the turn with the same terminal error frame shape as
                 # the returned-error path (uniform client handling), retaining
                 # the failed turn for resume replay.
-                _emit_terminal_turn_error(sid, session, e)
-                turn_error_retained = True
+                _emit_terminal_turn_error(
+                    sid, session, e, retain_inflight=not heartbeat_turn
+                )
+                if not heartbeat_turn:
+                    turn_error_retained = True
             except Exception as emit_exc:
                 print(
                     f"[gateway-turn] terminal error emit failed: "
@@ -11045,12 +11452,13 @@ def _run_prompt_submit(
 
             # Run while any profile-specific HERMES_HOME override is still active
             # so context.memory_trim is resolved from the session's own config.
-            try:
-                from hermes_cli.mem_trim import trim_memory
+            if not heartbeat_turn:
+                try:
+                    from hermes_cli.mem_trim import trim_memory
 
-                trim_memory(reason="tui turn completion")
-            except Exception:
-                logger.debug("post-turn memory trim failed", exc_info=True)
+                    trim_memory(reason="tui turn completion")
+                except Exception:
+                    logger.debug("post-turn memory trim failed", exc_info=True)
 
             if thinking_started:
                 # Kill the ambient thinking sound the moment the turn ends —
@@ -11184,6 +11592,7 @@ def _run_prompt_submit(
                 session_key=session.get("session_key", ""),
                 owns_event=lambda e: _session_owns_notification_event(sid, session, e),
                 skip_poll_observed=False,
+                preserve_event_types={"heartbeat"},
             )
             for index, (_evt, synth) in enumerate(drained):
                 with session["history_lock"]:
@@ -11192,18 +11601,38 @@ def _run_prompt_submit(
                             process_registry.completion_queue.put(pending_evt)
                         break
                     session["running"] = True
+                if not process_registry.claim_completion_delivery(_evt):
+                    with session["history_lock"]:
+                        session["running"] = False
+                    continue
                 from tools.async_delegation import (
                     claim_event_delivery, complete_event_delivery, release_event_delivery,
                 )
                 _claim = claim_event_delivery(_evt, "tui-post-turn")
                 if _claim is None:
+                    process_registry.release_completion_delivery(_evt)
+                    with session["history_lock"]:
+                        session["running"] = False
                     continue
                 try:
                     _emit("message.start", sid)
-                    _run_prompt_submit(rid, sid, session, synth)
+                    _run_prompt_submit(
+                        rid,
+                        sid,
+                        session,
+                        synth,
+                        **(
+                            {"completion_delivery": True}
+                            if _evt.get("type", "completion") == "completion"
+                            else {}
+                        ),
+                    )
                     complete_event_delivery(_evt, _claim)
+                    process_registry.complete_completion_delivery(_evt)
                 except Exception as _n_exc:
                     release_event_delivery(_evt, _claim)
+                    process_registry.release_completion_delivery(_evt)
+                    process_registry.completion_queue.put(_evt)
                     print(
                         f"[tui_gateway] completion notification dispatch failed: "
                         f"{type(_n_exc).__name__}: {_n_exc}",

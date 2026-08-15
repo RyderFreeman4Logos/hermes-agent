@@ -26,6 +26,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
+from agent.chat_completion_helpers import estimate_request_context_tokens
 from agent.conversation_compression import (
     COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
     COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE,
@@ -1332,6 +1333,15 @@ def _rewrite_system_content_blocks(system_message: dict, effective: str) -> bool
     return False
 
 
+def _effective_system_prompt(agent, active_system_prompt):
+    """Return the byte-exact system prefix used for a physical request."""
+    effective = active_system_prompt or ""
+    ephemeral = getattr(agent, "ephemeral_system_prompt", None)
+    if ephemeral:
+        effective = (effective + "\n\n" + ephemeral).strip()
+    return effective
+
+
 def _sync_failover_system_message(agent, api_messages, active_system_prompt):
     """Refresh the in-flight system message after a provider failover.
 
@@ -1351,9 +1361,7 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
     if not isinstance(sp, str) or not sp:
         return active_system_prompt
     if api_messages and api_messages[0].get("role") == "system":
-        effective = sp
-        if agent.ephemeral_system_prompt:
-            effective = (effective + "\n\n" + agent.ephemeral_system_prompt).strip()
+        effective = _effective_system_prompt(agent, sp)
         if not _rewrite_system_content_blocks(api_messages[0], effective):
             api_messages[0]["content"] = effective
     return sp
@@ -1606,6 +1614,286 @@ def _notify_context_engine_turn_complete(
             getattr(agent, "session_id", None) or "-",
             exc_info=True,
         )
+
+
+def _record_runtime_provider_activity(
+    agent,
+    activity_at: float,
+    *,
+    caller_id: str | None = None,
+    provider: str | None = None,
+    cache_context: str | None = None,
+) -> None:
+    """Rearm only the cache group reached by a successful provider call."""
+    try:
+        from tools.approval import get_current_session_key
+        from tools.runtime_heartbeat import (
+            canonical_runtime_cache_context_identity,
+            canonical_runtime_provider_identity,
+            runtime_heartbeat,
+        )
+
+        owner = caller_id or (get_current_session_key(default="") or "")
+        if not owner:
+            return
+        runtime_heartbeat.reset_for_caller(
+            owner,
+            provider=(
+                provider
+                if provider is not None
+                else canonical_runtime_provider_identity(agent)
+            ),
+            cache_context=(
+                cache_context
+                if cache_context is not None
+                else canonical_runtime_cache_context_identity(agent)
+            ),
+            activity_at=activity_at,
+            owner=agent,
+        )
+    except Exception:
+        logger.debug("Could not reset exact heartbeat cache lease", exc_info=True)
+
+
+def run_heartbeat_warm(
+    agent,
+    user_message: Any,
+    system_message: str = None,
+    conversation_history: List[Dict[str, Any]] = None,
+    *,
+    moa_config: Optional[dict[str, Any]] = None,
+    heartbeat_event: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Run one isolated cache-warm attempt without entering the turn lifecycle."""
+    retained_history = list(conversation_history or [])
+    api_calls = 0
+
+    def observe(outcome: str, reason: str) -> None:
+        event = heartbeat_event if isinstance(heartbeat_event, dict) else {}
+        logger.info(
+            "Runtime heartbeat phase=%s outcome=%s target=%s owner=%s "
+            "provider=%s reason=%s",
+            "attempt" if outcome == "attempt" else "checkin",
+            outcome,
+            str(event.get("target_id") or "-")[:500],
+            str(event.get("session_key") or "-")[:500],
+            str(event.get("provider") or "-")[:500],
+            reason,
+        )
+
+    def finish(
+        *,
+        silent: bool,
+        status: str = "",
+        evidence: str = "",
+        warm_status: str = "skipped",
+        warm_reason: str = "",
+        outcome: str | None = None,
+        reason: str = "",
+    ):
+        if outcome:
+            observe(outcome, reason)
+        final = "" if silent else (
+            f"[HEARTBEAT ALERT] {status}: "
+            f"{evidence or 'target liveness is uncertain'}"
+        )
+        return {
+            "final_response": final,
+            "messages": retained_history,
+            "api_calls": api_calls,
+            "completed": True,
+            "failed": False,
+            "error": None,
+            "silent_noop": silent,
+            "turn_exit_reason": (
+                "heartbeat_silent_noop" if silent else "heartbeat_alert"
+            ),
+            "response_previewed": False,
+            "heartbeat_warm_status": warm_status,
+            "heartbeat_warm_reason": warm_reason,
+        }
+
+    from tools.runtime_heartbeat import (
+        DIRECT_HEARTBEAT_STATUSES,
+        claim_warm_snapshot,
+        commit_warm_snapshot_dispatch,
+        dispatch_warm_snapshot_request,
+        release_warm_snapshot,
+        runtime_heartbeat,
+        warm_snapshot_claim_reason,
+        warm_snapshot_is_current,
+    )
+
+    observe("attempt", "due_event")
+    if not isinstance(heartbeat_event, dict):
+        return finish(
+            silent=True,
+            warm_reason="missing_event",
+            outcome="safe-skip",
+            reason="invalid_event",
+        )
+    try:
+        if not runtime_heartbeat.is_event_current(heartbeat_event, agent):
+            return finish(
+                silent=True,
+                warm_reason="stale_event",
+                outcome="safe-skip",
+                reason="stale_event",
+            )
+    except Exception as exc:
+        logger.debug("Heartbeat event validation failed", exc_info=True)
+        return finish(
+            silent=True,
+            warm_status="degraded",
+            warm_reason="event_validation_error",
+            outcome="failure",
+            reason=f"event_validation_exception:{type(exc).__name__}",
+        )
+    status = str(heartbeat_event.get("status") or "").upper()
+    if status in DIRECT_HEARTBEAT_STATUSES:
+        return finish(
+            silent=False,
+            status=status,
+            evidence=str(heartbeat_event.get("evidence") or ""),
+            warm_reason="unhealthy_target",
+            outcome="alert",
+            reason=status.lower(),
+        )
+    if status != "ALIVE":
+        return finish(
+            silent=True,
+            warm_reason="non_alive",
+            outcome="safe-skip",
+            reason="non_alive_event",
+        )
+    if moa_config is not None:
+        return finish(
+            silent=True,
+            warm_status="degraded",
+            warm_reason="moa_forbidden",
+            outcome="safe-skip",
+            reason="unsupported_moa",
+        )
+    try:
+        claim = claim_warm_snapshot(agent)
+    except Exception as exc:
+        logger.debug("Heartbeat snapshot claim failed", exc_info=True)
+        return finish(
+            silent=True,
+            warm_status="degraded",
+            warm_reason="snapshot_claim_error",
+            outcome="failure",
+            reason=f"snapshot_claim_exception:{type(exc).__name__}",
+        )
+    if claim is None:
+        warm_reason = warm_snapshot_claim_reason(agent) or "snapshot_unavailable"
+        degraded = warm_reason in {
+            "physical_client_unavailable",
+            "replay_not_bounded_or_cancellable",
+        }
+        observed_reason = {
+            "normal_request_active": "normal_request_in_flight",
+            "warm_inflight": "checkin_already_in_flight",
+            "snapshot_unavailable": "no_validated_snapshot",
+            "snapshot_identity_changed": "snapshot_stale",
+            "replay_not_bounded_or_cancellable": "no_bounded_output_cap",
+            "physical_client_unavailable": "client_lease_unavailable",
+            "snapshot_stale": "snapshot_stale_after_lease",
+        }.get(warm_reason, warm_reason)
+        return finish(
+            silent=True,
+            warm_status="degraded" if degraded else "skipped",
+            warm_reason=warm_reason,
+            outcome="safe-skip",
+            reason=observed_reason,
+        )
+    epoch, api_kwargs, dispatch = claim
+    physical_client_reusable = True
+    try:
+        configured_limit = int(
+            getattr(
+                getattr(agent, "context_compressor", None),
+                "threshold_tokens",
+                0,
+            )
+            or 0
+        )
+        pressure_limit = min(
+            limit for limit in (configured_limit, 272_000) if limit > 0
+        )
+        if estimate_request_context_tokens(api_kwargs) >= pressure_limit:
+            return finish(
+                silent=True,
+                warm_reason="context_pressure",
+                outcome="safe-skip",
+                reason="context_pressure",
+            )
+        if not commit_warm_snapshot_dispatch(
+            agent,
+            epoch,
+            lambda: runtime_heartbeat.is_event_current(
+                heartbeat_event, agent, consume=True
+            ),
+        ):
+            return finish(
+                silent=True,
+                warm_reason="stale_or_busy",
+                outcome="safe-skip",
+                reason="dispatch_stale",
+            )
+
+        api_calls = 1
+        dispatch_started_at = time.monotonic()
+        physical_client_reusable = False
+        response, response_valid = dispatch_warm_snapshot_request(
+            dispatch, api_kwargs
+        )
+        physical_client_reusable = True
+        if (
+            warm_snapshot_is_current(agent, epoch)
+            and response_valid
+        ):
+            if runtime_heartbeat.record_checkin_success(
+                heartbeat_event, agent=agent
+            ):
+                _record_runtime_provider_activity(
+                    agent,
+                    dispatch_started_at,
+                    caller_id=str(heartbeat_event.get("session_key") or ""),
+                    provider=str(heartbeat_event.get("provider") or ""),
+                    cache_context=str(heartbeat_event.get("cache_context") or ""),
+                )
+                warm_status = "warmed"
+                warm_reason = "physical_success"
+                outcome = "success"
+                observed_reason = "response_validated"
+            else:
+                warm_status = "skipped"
+                warm_reason = "stale_event_after_response"
+                outcome = "safe-skip"
+                observed_reason = "stale_event_after_response"
+        else:
+            warm_status = "degraded"
+            warm_reason = "response_validation_failed"
+            outcome = "failure"
+            observed_reason = "response_invalid"
+    except Exception as exc:
+        logger.debug("Isolated heartbeat warm attempt failed", exc_info=True)
+        warm_status = "degraded"
+        warm_reason = f"provider_error:{type(exc).__name__}"
+        outcome = "failure"
+        observed_reason = f"provider_exception:{type(exc).__name__}"
+    finally:
+        release_warm_snapshot(
+            agent, epoch, reusable=physical_client_reusable
+        )
+    return finish(
+        silent=True,
+        warm_status=warm_status,
+        warm_reason=warm_reason,
+        outcome=outcome,
+        reason=observed_reason,
+    )
 
 
 def run_conversation(
@@ -2075,6 +2363,7 @@ def run_conversation(
                     )
                     if _composed is not None:
                         api_msg["content"] = _composed
+
             elif (
                 isinstance(_api_content, str)
                 and _api_content
@@ -2153,9 +2442,7 @@ def run_conversation(
         # every turn. ``apply_anthropic_cache_control`` may split its stable
         # prefix into content blocks on the wire, but the stored string and
         # its byte-stability remain unchanged.
-        effective_system = active_system_prompt or ""
-        if agent.ephemeral_system_prompt:
-            effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
+        effective_system = _effective_system_prompt(agent, active_system_prompt)
         if effective_system:
             api_messages = [{"role": "system", "content": effective_system}] + api_messages
 
@@ -2903,6 +3190,25 @@ def run_conversation(
                     if isinstance(getattr(agent, "client", None), Mock):
                         _use_streaming = False
 
+                provider_dispatch_started_at = None
+                provider_dispatch_context = None
+
+                def _mark_provider_dispatch(dispatch_started_at):
+                    nonlocal provider_dispatch_started_at, provider_dispatch_context
+                    provider_dispatch_started_at = dispatch_started_at
+                    provider_dispatch_context = None
+                    if dispatch_started_at is None:
+                        return
+                    from tools.runtime_heartbeat import (
+                        canonical_runtime_cache_context_identity,
+                        canonical_runtime_provider_identity,
+                    )
+
+                    provider_dispatch_context = (
+                        canonical_runtime_provider_identity(agent),
+                        canonical_runtime_cache_context_identity(agent),
+                    )
+
                 def _perform_api_call(next_api_kwargs):
                     if agent.api_mode == "codex_responses":
                         next_api_kwargs = agent._get_transport().preflight_kwargs(
@@ -2913,13 +3219,24 @@ def run_conversation(
                         )
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
-                            next_api_kwargs, on_first_delta=_stop_spinner
+                            next_api_kwargs,
+                            on_first_delta=_stop_spinner,
+                            on_provider_dispatch=_mark_provider_dispatch,
                         )
                     from agent import relay_llm
 
+                    def _physical_call(physical_api_kwargs):
+                        dispatch_started_at = time.monotonic()
+                        _mark_provider_dispatch(dispatch_started_at)
+                        try:
+                            return agent._interruptible_api_call(physical_api_kwargs)
+                        except BaseException:
+                            _mark_provider_dispatch(None)
+                            raise
+
                     return relay_llm.execute(
                         next_api_kwargs,
-                        agent._interruptible_api_call,
+                        _physical_call,
                         session_id=str(agent.session_id or ""),
                         name=str(agent.provider or "provider"),
                         model_name=str(agent.model or ""),
@@ -2971,13 +3288,13 @@ def run_conversation(
                         with _redirect_lock:
                             if _model_request_active is not None:
                                 _model_request_active.clear()
-                            _redirect_crossed_response = bool(
-                                agent._pending_redirect
-                            )
+                            _redirect_crossed_response = bool(agent._pending_redirect)
                     else:
                         if _model_request_active is not None:
                             _model_request_active.clear()
-                        _redirect_crossed_response = agent._has_pending_redirect()
+                        _redirect_crossed_response = bool(
+                            agent._has_pending_redirect()
+                        )
                 if _redirect_crossed_response:
                     # The response and redirect can cross on different threads:
                     # redirect() observed the request as active just before this
@@ -3091,6 +3408,14 @@ def run_conversation(
                             error_details.append("response.choices is None")
                         else:
                             error_details.append("response.choices is empty")
+
+                from tools.runtime_heartbeat import (
+                    finish_deferred_normal_warm_snapshot,
+                )
+
+                finish_deferred_normal_warm_snapshot(
+                    agent, response, succeeded=not response_invalid
+                )
 
                 if response_invalid:
                     agent._invoke_api_request_error_hook(
@@ -3268,6 +3593,16 @@ def run_conversation(
                         break  # rebuild this iteration from the correction
                     continue  # Retry the API call
 
+                if (
+                    provider_dispatch_started_at is not None
+                    and provider_dispatch_context is not None
+                ):
+                    _record_runtime_provider_activity(
+                        agent,
+                        provider_dispatch_started_at,
+                        provider=provider_dispatch_context[0],
+                        cache_context=provider_dispatch_context[1],
+                    )
                 agent._turn_received_provider_response = True
 
                 # Check finish_reason before proceeding
@@ -6364,6 +6699,7 @@ def run_conversation(
             agent._ephemeral_max_output_tokens = min(_boost, _boost_cap)
             continue
 
+
         # Guard: if all retries exhausted without a successful response
         # (e.g. repeated context-length errors that exhausted retry_count),
         # the `response` variable is still None. Break out cleanly.
@@ -6402,6 +6738,7 @@ def run_conversation(
                     assistant_message.content = "\n".join(parts)
                 else:
                     assistant_message.content = str(raw)
+
 
             try:
                 from hermes_cli.lifecycle import (

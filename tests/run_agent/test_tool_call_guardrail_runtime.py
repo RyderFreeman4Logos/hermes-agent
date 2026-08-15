@@ -172,6 +172,45 @@ def test_config_enabled_hard_stop_counts_multimodal_success_as_recovery():
     )
 
 
+def test_configured_no_progress_counts_survive_interleaved_real_calls():
+    config = _hard_stop_config(
+        hard_stop_after={
+            "exact_failure": 20,
+            "same_tool_failure": 20,
+            "idempotent_no_progress": 2,
+        }
+    )
+    agent = _make_agent("web_search", config=config)
+    calls = [
+        _mock_tool_call(
+            "web_search",
+            json.dumps({"query": query}),
+            f"c-{index}",
+        )
+        for index, query in enumerate(("alpha", "beta", "alpha", "alpha"))
+    ]
+    messages = []
+
+    with patch(
+        "run_agent.handle_function_call",
+        side_effect=(
+            '{"items":[]}',
+            '{"items":[1]}',
+            '{"items":[]}',
+            '{"items":[]}',
+        ),
+    ) as dispatch:
+        agent._execute_tool_calls_sequential(
+            SimpleNamespace(content="", tool_calls=calls), messages, "task-1"
+        )
+
+    assert dispatch.call_count == 3
+    assert [message["tool_call_id"] for message in messages] == [
+        f"c-{index}" for index in range(4)
+    ]
+    assert "idempotent_no_progress_block" in messages[-1]["content"]
+
+
 def test_config_enabled_hard_stop_counts_sequential_timeouts_as_failures():
     agent = _make_agent("web_search", config=_hard_stop_config())
     args = {"query": "same"}

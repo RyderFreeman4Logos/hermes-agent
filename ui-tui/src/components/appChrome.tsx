@@ -3,7 +3,7 @@ import { useStore } from '@nanostores/react'
 import { type ReactNode, type RefObject, useEffect, useMemo, useRef, useState } from 'react'
 import unicodeSpinners from 'unicode-animations'
 
-import { $delegationState } from '../app/delegationStore.js'
+import { $delegationState, type DelegationState } from '../app/delegationStore.js'
 import type { BatteryInfo, IndicatorStyle, Notice } from '../app/interfaces.js'
 import { $isStatusRuleOccluded } from '../app/overlayStore.js'
 import { useTurnSelector } from '../app/turnStore.js'
@@ -14,9 +14,10 @@ import { fmtDuration } from '../domain/messages.js'
 import { stickyPromptFromViewport } from '../domain/viewport.js'
 import { buildSubagentTree, treeTotals, widthByDepth } from '../lib/subagentTree.js'
 import { fmtK } from '../lib/text.js'
+import { DEFAULT_STATUS_BAR_SEGMENTS, packStatusRows, type StatusBarSegment } from '../lib/statusBar.js'
 import { useScrollbarSnapshot, useViewportSnapshot } from '../lib/viewportStore.js'
 import type { Theme } from '../theme.js'
-import type { Msg, Usage } from '../types.js'
+import type { Msg, SubagentProgress, Usage } from '../types.js'
 
 import { scrollbarColors } from './overlayPrimitives.js'
 
@@ -312,17 +313,12 @@ export function statusBarSegments(cols: number): StatusBarSegments {
   }
 }
 
-function SpawnHud({ t }: { t: Theme }) {
-  // Tight HUD that only appears when the session is actually fanning out.
-  // Colour escalates to warn/error as depth or concurrency approaches the cap.
-  const delegation = useStore($delegationState)
-  const subagents = useTurnSelector(state => state.subagents)
-
-  const tree = useMemo(() => buildSubagentTree(subagents), [subagents])
-  const totals = useMemo(() => treeTotals(tree), [tree])
+function spawnHudLabel(delegation: DelegationState, subagents: readonly SubagentProgress[]) {
+  const tree = buildSubagentTree(subagents)
+  const totals = treeTotals(tree)
 
   if (!totals.descendantCount && !delegation.paused) {
-    return null
+    return { atCap: false, label: '', ratio: 0 }
   }
 
   const maxDepth = delegation.maxSpawnDepth
@@ -339,8 +335,6 @@ function SpawnHud({ t }: { t: Theme }) {
   const depthRatio = maxDepth ? depth / maxDepth : 0
   const concRatio = maxConc ? widestLevel / maxConc : 0
   const ratio = Math.max(depthRatio, concRatio)
-
-  const color = delegation.paused || ratio >= 1 ? t.color.error : ratio >= 0.66 ? t.color.warn : t.color.muted
 
   const pieces: string[] = []
 
@@ -363,13 +357,110 @@ function SpawnHud({ t }: { t: Theme }) {
     }
   }
 
-  const atCap = depthRatio >= 1 || concRatio >= 1
+  return { atCap: depthRatio >= 1 || concRatio >= 1, label: pieces.join(' '), ratio }
+}
+
+function SpawnHud({ t }: { t: Theme }) {
+  const delegation = useStore($delegationState)
+  const subagents = useTurnSelector(state => state.subagents)
+  const { atCap, label, ratio } = useMemo(() => spawnHudLabel(delegation, subagents), [delegation, subagents])
+
+  if (!label) {
+    return null
+  }
 
   return (
-    <Text color={color}>
+    <Text color={delegation.paused || ratio >= 1 ? t.color.error : ratio >= 0.66 ? t.color.warn : t.color.muted}>
       {atCap ? ' │ ⚠ ' : ' │ '}
-      {pieces.join(' ')}
+      {label}
     </Text>
+  )
+}
+
+interface StatusRenderItem {
+  breakBefore?: boolean
+  id: string
+  narrowNode?: (width: number) => ReactNode
+  node: ReactNode
+  width: number
+}
+
+function StatusRows({
+  cols,
+  items,
+  multiline,
+  showSpawnHud,
+  t
+}: {
+  cols: number
+  items: readonly StatusRenderItem[]
+  multiline: boolean
+  showSpawnHud: boolean
+  t: Theme
+}) {
+  const delegation = useStore($delegationState)
+  const subagents = useTurnSelector(state => state.subagents)
+  const spawnHud = useMemo(() => spawnHudLabel(delegation, subagents), [delegation, subagents])
+  const itemWidth = Math.max(1, Math.floor(cols || 1) - stringWidth('─ '))
+  const visibleItems = [...items]
+
+  if (showSpawnHud && spawnHud.label) {
+    const label = `${spawnHud.atCap ? '⚠ ' : ''}${spawnHud.label}`
+    visibleItems.push({
+      id: 'spawn_hud',
+      node: (
+        <Text
+          color={
+            delegation.paused || spawnHud.ratio >= 1
+              ? t.color.error
+              : spawnHud.ratio >= 0.66
+                ? t.color.warn
+                : t.color.muted
+          }
+        >
+          {label}
+        </Text>
+      ),
+      width: stringWidth(label)
+    })
+  }
+
+  const boundedItems = visibleItems.map(item =>
+    multiline && item.width > itemWidth
+      ? {
+          ...item,
+          node: item.narrowNode ? (
+            item.narrowNode(itemWidth)
+          ) : (
+            <Box overflow="hidden" width={itemWidth}>
+              <Text wrap="truncate-end">{item.node}</Text>
+            </Box>
+          ),
+          width: itemWidth
+        }
+      : item
+  )
+
+  if (!boundedItems.length) {
+    return null
+  }
+
+  const rows = multiline ? packStatusRows(boundedItems, cols, stringWidth(' │ '), stringWidth('─ ')) : [boundedItems]
+
+  return (
+    <Box flexDirection="column" flexShrink={0} width={Math.max(1, Math.floor(cols || 1))}>
+      {rows.map((row, rowIndex) => (
+        <Box flexDirection="row" flexShrink={0} height={1} key={row.map(item => item.id).join(':')} overflow="hidden">
+          {rowIndex === 0 ? <Text color={t.color.border}>─ </Text> : null}
+          {row.map((item, itemIndex) => (
+            <Box flexDirection="row" flexShrink={0} key={item.id}>
+              {itemIndex ? <Text color={t.color.muted}> │ </Text> : null}
+              {item.node}
+            </Box>
+          ))}
+        </Box>
+      ))}
+    </Box>
   )
 }
 
@@ -391,7 +482,7 @@ function SessionDuration({ startedAt }: { startedAt: number }) {
     return () => clearInterval(id)
   }, [isOccluded, startedAt])
 
-  return fmtDuration(now - startedAt)
+  return <Text>{fmtDuration(now - startedAt)}</Text>
 }
 
 function IdleSince({ endedAt }: { endedAt: number }) {
@@ -414,7 +505,7 @@ function IdleSince({ endedAt }: { endedAt: number }) {
     return () => clearInterval(id)
   }, [endedAt, isOccluded])
 
-  return `✓ ${fmtDuration(now - endedAt)}`
+  return <Text>{`✓ ${fmtDuration(now - endedAt)}`}</Text>
 }
 
 const effortLabel = (effort?: string) => {
@@ -470,6 +561,7 @@ export function StatusRule({
   cols,
   busy,
   status,
+  statusBarSegments: configuredSegments = DEFAULT_STATUS_BAR_SEGMENTS,
   statusColor,
   model,
   modelFast,
@@ -487,6 +579,16 @@ export function StatusRule({
   onSessionCountClick,
   t
 }: StatusRuleProps) {
+  const enabled = new Set(configuredSegments)
+
+  if (!enabled.size) {
+    return null
+  }
+
+  const shows = (segment: StatusBarSegment) => enabled.has(segment)
+  const customSegments =
+    configuredSegments.length !== DEFAULT_STATUS_BAR_SEGMENTS.length ||
+    configuredSegments.some((segment, index) => segment !== DEFAULT_STATUS_BAR_SEGMENTS[index])
   const pct = usage.context_percent
   const barColor = ctxBarColor(pct, t)
   const segs = statusBarSegments(cols)
@@ -541,7 +643,7 @@ export function StatusRule({
     stringWidth(modelText) +
     (ctxLabel ? stringWidth(' │ ') + stringWidth(ctxLabel) : 0)
 
-  const rightLabel = sessionTitle ? ` ${sessionTitle} ` : cwdLabel
+  const rightLabel = shows('cwd') ? (sessionTitle ? ` ${sessionTitle} ` : cwdLabel) : ''
   const { leftWidth, rightWidth, separatorWidth } = statusRuleWidths(cols, rightLabel, essentialWidth)
 
   // Whole-segment progressive disclosure for the tail: a segment renders only
@@ -621,6 +723,178 @@ export function StatusRule({
   ) : (
     <Text color={t.color.muted}> │ {sessionCountText}</Text>
   )
+
+  if (cols < 72 || customSegments) {
+    const configuredContextTokens = shows('context_tokens')
+      ? usage.context_max
+        ? cols < 72
+          ? `${fmtK(usage.context_used ?? 0)} tok`
+          : `${fmtK(usage.context_used ?? 0)}/${fmtK(usage.context_max)}`
+        : usage.total > 0
+          ? `${fmtK(usage.total)} tok`
+          : ''
+      : ''
+    const configuredContextBar = shows('context_bar') && usage.context_max ? `[${ctxBar(pct)}]` : ''
+    const configuredContextPercent = shows('context_percent') && pct != null ? `${pct}%` : ''
+    const configuredRightLabel = shows('cwd') ? rightLabel : ''
+    const customSessionCountNode = onSessionCountClick ? (
+      <Box flexShrink={0} onClick={handleSessionCountClick}>
+        <Text color={t.color.accent}>{sessionCountText}</Text>
+      </Box>
+    ) : (
+      <Text color={t.color.muted}>{sessionCountText}</Text>
+    )
+
+    const items = [
+      shows('battery') && showBattery
+        ? { id: 'battery', node: <Text color={batteryColorVal}>{batteryText}</Text>, width: stringWidth(batteryText) }
+        : null,
+      shows('indicator') && (busy || showNotice || status)
+        ? {
+            id: 'indicator',
+            node: busy ? (
+              <FaceTicker color={statusColor} startedAt={turnStartedAt} style={indicatorStyle} />
+            ) : showNotice ? (
+              <Box flexShrink={1} overflow="hidden" width={Math.max(1, slotWidth)}>
+                <Text color={noticeColor(notice!.level, t)} wrap="truncate-end">
+                  {notice!.text}
+                </Text>
+              </Box>
+            ) : (
+              <Text color={statusColor} wrap="truncate-end">
+                {status}
+              </Text>
+            ),
+            width: slotWidth
+          }
+        : null,
+      shows('model') && modelText
+        ? {
+            breakBefore: cols < 72,
+            id: 'model',
+            node: <Text color={t.color.muted}>{modelText}</Text>,
+            width: stringWidth(modelText)
+          }
+        : null,
+      configuredContextTokens
+        ? {
+            id: 'context_tokens',
+            node: <Text color={t.color.muted}>{configuredContextTokens}</Text>,
+            width: stringWidth(configuredContextTokens)
+          }
+        : null,
+      configuredContextBar
+        ? {
+            id: 'context_bar',
+            node: <Text color={barColor}>{configuredContextBar}</Text>,
+            width: stringWidth(configuredContextBar)
+          }
+        : null,
+      configuredContextPercent
+        ? {
+            id: 'context_percent',
+            node: <Text color={barColor}>{configuredContextPercent}</Text>,
+            width: stringWidth(configuredContextPercent)
+          }
+        : null,
+      shows('focus') && focusView
+        ? { id: 'focus', node: <Text color={t.color.warn}>◉ focus</Text>, width: stringWidth('◉ focus') }
+        : null,
+      shows('session_duration') && sessionStartedAt
+        ? { id: 'session_duration', node: <SessionDuration startedAt={sessionStartedAt} />, width: MAX_DURATION_WIDTH }
+        : null,
+      shows('idle') && !busy && lastTurnEndedAt != null
+        ? { id: 'idle', node: <IdleSince endedAt={lastTurnEndedAt} />, width: stringWidth('✓ ') + MAX_DURATION_WIDTH }
+        : null,
+      shows('compressions') && compressions > 0
+        ? {
+            id: 'compressions',
+            node: (
+              <Text color={compressions >= 10 ? t.color.error : compressions >= 5 ? t.color.warn : t.color.muted}>
+                cmp {compressions}
+              </Text>
+            ),
+            width: stringWidth(`cmp ${compressions}`)
+          }
+        : null,
+      shows('voice') && voiceLabel
+        ? { id: 'voice', node: <Text color={t.color.muted}>{voiceLabel}</Text>, width: stringWidth(voiceLabel) }
+        : null,
+      shows('sessions') && sessionCountText
+        ? {
+            id: 'sessions',
+            narrowNode: (width: number) => (
+              <Box flexShrink={0} onClick={onSessionCountClick ? handleSessionCountClick : undefined} width={width}>
+                <Text color={onSessionCountClick ? t.color.accent : t.color.muted} wrap="truncate-end">
+                  {sessionCountText}
+                </Text>
+              </Box>
+            ),
+            node: customSessionCountNode,
+            width: stringWidth(sessionCountText)
+          }
+        : null,
+      shows('bg_tasks') && bgCount > 0
+        ? { id: 'bg_tasks', node: <Text color={t.color.muted}>{bgCount} bg</Text>, width: stringWidth(`${bgCount} bg`) }
+        : null,
+      shows('subagents') && subagentCount > 0
+        ? {
+            id: 'subagents',
+            node: <Text color={t.color.muted}>⛓ {subagentCount}</Text>,
+            width: stringWidth(`⛓ ${subagentCount}`)
+          }
+        : null,
+      shows('resume') && !busy && subagentCount > 0
+        ? {
+            id: 'resume',
+            narrowNode: (width: number) => (
+              <Box width={width}>
+                <Text color={t.color.muted} dim wrap="truncate-end">
+                  {resumeHintText}
+                </Text>
+              </Box>
+            ),
+            node: (
+              <Text color={t.color.muted} dim>
+                {resumeHintText}
+              </Text>
+            ),
+            width: stringWidth(resumeHintText)
+          }
+        : null,
+      shows('dev_credits') && devCreditsText
+        ? {
+            id: 'dev_credits',
+            node: <Text color={t.color.accent}>{devCreditsText}</Text>,
+            width: stringWidth(devCreditsText)
+          }
+        : null,
+      configuredRightLabel
+        ? {
+            id: 'cwd',
+            narrowNode: (width: number) => (
+              <Box width={width}>
+                <Text bold={!!sessionTitle} color={sessionTitle ? t.color.accent : t.color.label} wrap="truncate-end">
+                  {configuredRightLabel}
+                </Text>
+              </Box>
+            ),
+            node: (
+              <Text bold={!!sessionTitle} color={sessionTitle ? t.color.accent : t.color.label}>
+                {configuredRightLabel}
+              </Text>
+            ),
+            width: stringWidth(configuredRightLabel)
+          }
+        : null
+    ].filter((item): item is NonNullable<typeof item> => item !== null)
+
+    const visibleItems = customSegments
+      ? (packStatusRows(items, cols, stringWidth(' │ '), stringWidth('─ '))[0] ?? [])
+      : items
+
+    return <StatusRows cols={cols} items={visibleItems} multiline={cols < 72} showSpawnHud={shows('spawn_hud')} t={t} />
+  }
 
   return (
     <Box height={1}>
@@ -872,6 +1146,7 @@ interface StatusRuleProps {
   sessionStartedAt?: null | number
   sessionTitle?: string
   status: string
+  statusBarSegments?: readonly StatusBarSegment[]
   statusColor: string
   t: Theme
   turnStartedAt?: null | number

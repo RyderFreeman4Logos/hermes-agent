@@ -1322,9 +1322,16 @@ class GatewaySlashCommandsMixin:
             session_entry = await self.async_session_store.get_or_create_session(
                 current_session_key
             )
+            parent_session_id = str(session_entry.session_id or "")
+            parent_session_ids = [parent_session_id]
+            if self._session_db is not None and parent_session_id:
+                parent_session_ids = await self._session_db.get_compression_lineage(
+                    parent_session_id
+                )
             delegations = [
                 d for d in list_async_delegations_for_owner(
-                    parent_session_id=str(session_entry.session_id or "")
+                    parent_session_id=parent_session_id,
+                    parent_session_ids=parent_session_ids,
                 )
                 if d.get("status") in ("running", "stalling", "cancelling", "finalizing")
             ]

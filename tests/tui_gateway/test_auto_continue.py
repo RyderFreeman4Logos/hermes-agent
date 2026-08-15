@@ -5,8 +5,8 @@ starts running and cleared when it concludes — success, handled error, or
 interrupt. Only a process death leaves it behind, so a marker found at resume
 time is positive proof the turn never finished. Contract pinned here:
 
-* the marker module round-trips, prunes stale entries, and tolerates a
-  corrupt sidecar;
+* the marker module round-trips, prunes stale ordinary entries, preserves
+  completion backlog receipts, and tolerates a corrupt sidecar;
 * ``_run_prompt_submit`` writes the marker before the turn and clears it in
   the ``finally`` on both the success and exception paths (a handled failure
   is a concluded turn — its terminal frame + retained snapshot own recovery);
@@ -117,6 +117,39 @@ def test_marker_roundtrip(tmp_path):
     assert read_turn_marker(tmp_path, "abc") is None
 
 
+def test_completion_marker_preserves_durable_delivery_identity(tmp_path):
+    assert record_turn_start(
+        tmp_path,
+        "abc",
+        "completion prompt",
+        completion_delivery_id='["completion","proc_1",1.0,"owner"]',
+    )
+
+    marker = read_turn_marker(tmp_path, "abc")
+    assert marker is not None
+    assert marker["completion_delivery_id"] == '["completion","proc_1",1.0,"owner"]'
+
+
+def test_completion_marker_is_not_aged_out_or_overwritten(tmp_path, monkeypatch):
+    from tui_gateway import turn_marker
+
+    delivery_id = '["completion","proc_1",1.0,"owner"]'
+    assert record_turn_start(
+        tmp_path,
+        "abc",
+        "completion prompt",
+        completion_delivery_id=delivery_id,
+    )
+    monkeypatch.setattr(turn_marker, "_MAX_AGE_SECS", -1)
+    assert record_turn_start(tmp_path, "other", "ordinary prompt")
+    assert not record_turn_start(tmp_path, "abc", "unrelated prompt")
+
+    marker = read_turn_marker(tmp_path, "abc")
+    assert marker is not None
+    assert marker["prompt"] == "completion prompt"
+    assert marker["completion_delivery_id"] == delivery_id
+
+
 def test_marker_survives_corrupt_sidecar(tmp_path):
     path = tmp_path / "desktop" / "interrupted_turns.json"
     path.parent.mkdir(parents=True)
@@ -150,6 +183,94 @@ def test_concluded_turn_clears_marker(emits, turn_env, marker_home):
     assert seen_mid_turn[0]["attempts"] == 0
     # … and cleared once the turn concluded.
     assert read_turn_marker(marker_home, "session-key") is None
+
+
+def test_completion_turn_acks_after_durable_marker_before_model(
+    emits, turn_env, marker_home, monkeypatch, tmp_path
+):
+    from tools import async_delegation as delivery
+
+    monkeypatch.setattr(delivery, "_db_path", lambda: tmp_path / "state.db")
+    event = {
+        "type": "completion",
+        "session_id": "proc_marker_ack",
+        "session_key": "session-key",
+        "parent_session_id": "owner-generation",
+        "started_at": 1.0,
+        "command": "pytest -q",
+        "exit_code": 1,
+        "completion_reason": "exited",
+        "termination_source": "",
+        "output": "1 failed",
+    }
+    assert delivery.persist_event_delivery(event)
+    claim = delivery.claim_event_delivery(event, "tui-test")
+    assert claim
+    observed: list[tuple[str, str]] = []
+
+    def _run(message, **kwargs):
+        marker = read_turn_marker(marker_home, "session-key")
+        receipt = delivery.get_durable_event_delivery(event)
+        assert marker is not None
+        assert receipt is not None
+        observed.append((marker["completion_delivery_id"], receipt["delivery_state"]))
+        return {"final_response": "handled"}
+
+    agent = types.SimpleNamespace(
+        session_id="session-key", run_conversation=_run, clear_interrupt=lambda: None
+    )
+    server._run_prompt_submit(
+        "rid",
+        "sid",
+        _session(agent=agent, running=True),
+        "completion prompt",
+        completion_event=event,
+        completion_claim_id=claim,
+    )
+
+    assert observed == [(delivery.event_delivery_id(event), "delivered")]
+    assert read_turn_marker(marker_home, "session-key") is None
+
+
+def test_completion_submit_legacy_signature_keeps_durable_ack(
+    marker_home, monkeypatch, tmp_path
+):
+    from tools import async_delegation as delivery
+
+    monkeypatch.setattr(delivery, "_db_path", lambda: tmp_path / "state.db")
+    event = {
+        "type": "completion",
+        "session_id": "proc_legacy_submit",
+        "session_key": "session-key",
+        "parent_session_id": "owner-generation",
+        "started_at": 1.0,
+        "command": "pytest -q",
+        "exit_code": 1,
+        "output": "1 failed",
+    }
+    assert delivery.persist_event_delivery(event)
+    claim = delivery.claim_event_delivery(event, "tui-test")
+    assert claim
+    observed = []
+
+    def legacy_submit(_rid, _sid, _session, _text):
+        marker = read_turn_marker(marker_home, "session-key")
+        receipt = delivery.get_durable_event_delivery(event)
+        assert marker is not None
+        assert receipt is not None
+        observed.append((marker["completion_delivery_id"], receipt["delivery_state"]))
+
+    monkeypatch.setattr(server, "_run_prompt_submit", legacy_submit)
+    server._submit_completion_turn(
+        "rid",
+        "sid",
+        _session(running=True),
+        "completion prompt",
+        completion_event=event,
+        completion_claim_id=claim,
+    )
+
+    assert observed == [(delivery.event_delivery_id(event), "delivered")]
 
 
 def test_handled_failure_still_clears_marker(emits, turn_env, marker_home):
@@ -301,6 +422,32 @@ def test_exhausted_attempts_break_the_loop(schedule_env, marker_home):
     assert result is None
     assert not schedule_env
     assert read_turn_marker(marker_home, "session-key") is None
+
+
+def test_completion_marker_survives_age_and_attempt_caps(
+    emits, schedule_env, marker_home, monkeypatch
+):
+    record_turn_start(
+        marker_home,
+        "session-key",
+        "completion prompt",
+        attempts=999,
+        completion_delivery_id='["completion","proc_1",1.0,"owner"]',
+    )
+    monkeypatch.setattr(
+        server, "time", types.SimpleNamespace(time=lambda: time.time() + 365 * 86400)
+    )
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {"desktop": {"auto_continue": {"enabled": False}}},
+    )
+
+    result = server._maybe_schedule_auto_continue("sid", _session(), "session-key")
+
+    assert result is not None
+    assert len(schedule_env) == 1
+    assert read_turn_marker(marker_home, "session-key") is not None
 
 
 def test_disabled_by_config(schedule_env, marker_home, monkeypatch):

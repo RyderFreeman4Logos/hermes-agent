@@ -10,12 +10,13 @@ decide whether to auto-continue the interrupted turn (see
 ``_maybe_schedule_auto_continue`` in ``tui_gateway/server.py``).
 
 Markers are stored per ``HERMES_HOME`` (callers pass the session's home so
-profile sessions keep their state in their own profile directory) and the
-file is bounded: writes prune entries older than ``_MAX_AGE_SECS`` and cap
-the total count, so an unlucky streak of crashes can't grow it unboundedly.
+profile sessions keep their state in their own profile directory). Ordinary
+turn markers are age/count bounded. Completion-delivery markers are durable
+backlog receipts and are never pruned until their exact turn retires them.
 
-Every function is best-effort by design — marker bookkeeping must never
-break a turn — so I/O errors degrade to "no marker" instead of raising.
+Marker I/O stays exception-safe. Ordinary turns may ignore a failed write;
+completion consumers use the boolean result to withhold acknowledgement rather
+than lose an event.
 """
 
 from __future__ import annotations
@@ -61,19 +62,27 @@ def _load(path: Path) -> dict[str, dict]:
 
 
 def _prune(entries: dict[str, dict], now: float) -> dict[str, dict]:
+    protected = {
+        key: entry
+        for key, entry in entries.items()
+        if isinstance(entry.get("completion_delivery_id"), str)
+        and entry["completion_delivery_id"]
+    }
     fresh = {
         key: entry
         for key, entry in entries.items()
+        if key not in protected
         if now - float(entry.get("started_at") or 0) <= _MAX_AGE_SECS
     }
-    if len(fresh) <= _MAX_ENTRIES:
-        return fresh
-    newest = sorted(
-        fresh.items(),
-        key=lambda item: float(item[1].get("started_at") or 0),
-        reverse=True,
-    )[:_MAX_ENTRIES]
-    return dict(newest)
+    if len(fresh) > _MAX_ENTRIES:
+        fresh = dict(
+            sorted(
+                fresh.items(),
+                key=lambda item: float(item[1].get("started_at") or 0),
+                reverse=True,
+            )[:_MAX_ENTRIES]
+        )
+    return {**fresh, **protected}
 
 
 def _store(path: Path, entries: dict[str, dict]) -> None:
@@ -95,8 +104,13 @@ def _store(path: Path, entries: dict[str, dict]) -> None:
 
 
 def record_turn_start(
-    home: Path | str, session_key: str, prompt: str, *, attempts: int = 0
-) -> None:
+    home: Path | str,
+    session_key: str,
+    prompt: str,
+    *,
+    attempts: int = 0,
+    completion_delivery_id: str | None = None,
+) -> bool:
     """Persist the marker for a turn that is about to run.
 
     ``attempts`` counts how many auto-continues led to this run: 0 for a
@@ -104,21 +118,30 @@ def record_turn_start(
     breaker reads it back on the next resume.
     """
     if not session_key or not prompt:
-        return
+        return False
     now = time.time()
     entry = {
         "attempts": max(0, int(attempts)),
         "prompt": prompt[:_MAX_PROMPT_CHARS],
         "started_at": now,
     }
+    if completion_delivery_id:
+        entry["completion_delivery_id"] = completion_delivery_id
     try:
         with _lock:
             path = _marker_path(home)
             entries = _prune(_load(path), now)
+            existing_delivery_id = str(
+                (entries.get(session_key) or {}).get("completion_delivery_id") or ""
+            )
+            if existing_delivery_id and existing_delivery_id != completion_delivery_id:
+                return False
             entries[session_key] = entry
             _store(path, entries)
+        return True
     except Exception:
         logger.debug("failed to record turn marker for %s", session_key, exc_info=True)
+        return False
 
 
 def clear_turn_marker(home: Path | str, session_key: str) -> None:
@@ -156,4 +179,8 @@ def read_turn_marker(home: Path | str, session_key: str) -> dict[str, Any] | Non
         attempts = max(0, int(entry.get("attempts") or 0))
     except (TypeError, ValueError):
         return None
-    return {"attempts": attempts, "prompt": prompt, "started_at": started_at}
+    result = {"attempts": attempts, "prompt": prompt, "started_at": started_at}
+    completion_delivery_id = entry.get("completion_delivery_id")
+    if isinstance(completion_delivery_id, str) and completion_delivery_id:
+        result["completion_delivery_id"] = completion_delivery_id
+    return result

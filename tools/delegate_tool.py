@@ -283,6 +283,35 @@ def steer_subagent(
             return False
 
 
+def deliver_owned_process_completion(
+    subagent_id: str,
+    child_session_id: str,
+    owner_session_id: str,
+    text: str,
+) -> bool:
+    """Deliver a process tail only to its exact active child generation."""
+    if not all((subagent_id, child_session_id, owner_session_id, text.strip())):
+        return False
+    with _active_subagents_lock:
+        record = _active_subagents.get(subagent_id)
+        if not record or not record.get("accepting_steer", False):
+            return False
+        agent = record.get("agent")
+        if (
+            agent is None
+            or str(getattr(agent, "session_id", "") or "") != child_session_id
+            or str(getattr(agent, "_parent_session_id", "") or "") != owner_session_id
+        ):
+            return False
+        try:
+            return bool(agent.steer(text))
+        except Exception as exc:
+            logger.debug(
+                "owned completion delivery to %s failed: %s", subagent_id, exc
+            )
+            return False
+
+
 def _capture_gateway_steer_authority(
     owner_session_id: Optional[str],
 ) -> tuple[Any, Any]:
@@ -2686,7 +2715,11 @@ def _run_single_child(
             _worker_thread_holder["t"] = threading.current_thread()
             from agent.delegation_context import delegated_child_context
 
-            with delegated_child_context(str(getattr(child, "session_id", "") or "")):
+            with delegated_child_context(
+                str(getattr(child, "session_id", "") or ""),
+                owner_session_id=str(getattr(child, "_parent_session_id", "") or ""),
+                subagent_id=str(_subagent_id or ""),
+            ):
                 return child.run_conversation(
                     user_message=goal,
                     task_id=child_task_id,

@@ -2027,8 +2027,8 @@ def preflight_db_writability(
     """Refuse-or-repair read-only DB files BEFORE the first connection opens.
 
     Port of Kilo-Org/kilocode#12508's startup preflight. A stray read-only
-    ``state.db`` / ``-wal`` / ``-shm`` (sudo run, restored backup, copied
-    dotfiles) previously surfaced as an opaque
+    ``state.db`` / ``-wal`` / ``-shm`` / ``.write.lock`` (sudo run, restored
+    backup, copied dotfiles) previously surfaced as an opaque
     ``sqlite3.OperationalError: attempt to write a readonly database`` raised
     from deep inside ``_init_schema`` — naming no file and no fix — and the
     obvious wrong "fix" (deleting the ``-wal``) silently loses committed
@@ -2103,7 +2103,7 @@ def preflight_db_writability(
         # SHM sidecars in WAL mode; the rollback journal in DELETE mode).
         _ensure_writable(parent, is_dir=True)
 
-    for suffix in ("", "-wal", "-shm"):
+    for suffix in ("", "-wal", "-shm", ".write.lock"):
         p = db_path.with_name(db_path.name + suffix) if suffix else db_path
         if p.is_file():
             _ensure_writable(p)

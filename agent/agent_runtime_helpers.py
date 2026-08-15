@@ -1349,6 +1349,7 @@ def try_recover_primary_transport(
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent.api_key = rt["api_key"]
+        _rebuild_request_overrides_for_runtime(agent)
 
         if agent.api_mode == "anthropic_messages":
             from agent.anthropic_adapter import build_anthropic_client
@@ -1580,6 +1581,7 @@ def restore_primary_runtime(agent) -> bool:
             agent._transport_cache.clear()
         agent.api_key = rt["api_key"]
         agent._client_kwargs = dict(rt["client_kwargs"])
+        _rebuild_request_overrides_for_runtime(agent)
         agent._use_prompt_caching = rt["use_prompt_caching"]
         # Default to native layout when the restored snapshot predates the
         # native-vs-proxy split (older sessions saved before this PR).
@@ -2374,6 +2376,41 @@ def anthropic_prompt_cache_policy(
 
 
 
+def _rebuild_request_overrides_for_runtime(agent) -> None:
+    """Compose caller-owned and destination-derived request fields."""
+    caller_overrides = getattr(agent, "_caller_request_overrides", {})
+    agent.request_overrides = copy.deepcopy(
+        caller_overrides if isinstance(caller_overrides, dict) else {}
+    )
+
+    try:
+        from hermes_cli.config import (
+            get_compatible_custom_providers,
+            load_config_readonly,
+        )
+        from agent.agent_init import _merge_custom_provider_extra_body
+
+        _merge_custom_provider_extra_body(
+            agent,
+            get_compatible_custom_providers(load_config_readonly()),
+        )
+    except Exception:
+        logger.debug(
+            "custom-provider request override rebuild failed", exc_info=True
+        )
+
+    if getattr(agent, "service_tier", None):
+        try:
+            from hermes_cli.models import resolve_fast_mode_overrides
+
+            for key, value in (
+                resolve_fast_mode_overrides(agent.model) or {}
+            ).items():
+                agent.request_overrides.setdefault(key, value)
+        except Exception:
+            logger.debug("fast-mode request override rebuild failed", exc_info=True)
+
+
 def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: bool) -> Any:
     from agent.auxiliary_client import _validate_base_url, _validate_proxy_env_urls
     from agent.ssl_verify import resolve_httpx_verify
@@ -2576,6 +2613,9 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     # _client_kwargs is a dict — snapshot a shallow copy so mutating the
     # live dict doesn't poison the rollback target.
     _snapshot["_client_kwargs"] = dict(getattr(agent, "_client_kwargs", {}) or {})
+    _snapshot["request_overrides"] = copy.deepcopy(
+        getattr(agent, "request_overrides", {}) or {}
+    )
     # Snapshot the credential pool reference so a failed client rebuild can
     # restore the original pool (issue #52727: pool reload is part of this
     # switch and must be reversible on rollback).
@@ -2629,6 +2669,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
                 "refusing to keep the previous provider's endpoint"
             )
         agent.api_mode = api_mode
+        _rebuild_request_overrides_for_runtime(agent)
         # Invalidate transport cache — new api_mode may need a different transport
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
@@ -2886,6 +2927,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         "api_mode": agent.api_mode,
         "api_key": getattr(agent, "api_key", ""),
         "client_kwargs": dict(agent._client_kwargs),
+        "request_overrides": copy.deepcopy(agent.request_overrides),
         "use_prompt_caching": agent._use_prompt_caching,
         "use_native_cache_layout": agent._use_native_cache_layout,
         "reasoning_config": dict(agent.reasoning_config) if getattr(agent, "reasoning_config", None) else None,

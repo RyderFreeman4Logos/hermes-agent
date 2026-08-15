@@ -2616,6 +2616,11 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         agent.requested_provider = fb_provider
         agent.base_url = fb_base_url
         agent.api_mode = fb_api_mode
+        from agent.agent_runtime_helpers import (
+            _rebuild_request_overrides_for_runtime,
+        )
+
+        _rebuild_request_overrides_for_runtime(agent)
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent._fallback_activated = True

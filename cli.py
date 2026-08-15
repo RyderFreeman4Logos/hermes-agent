@@ -15119,7 +15119,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if not self._init_agent(
             model_override=turn_route["model"],
             runtime_override=turn_route["runtime"],
-            request_overrides=turn_route.get("request_overrides"),
+            fast_mode_overrides=turn_route.get("request_overrides"),
         ):
             return None
         agent = self.agent
@@ -19942,7 +19942,7 @@ def main(
                     if cli._init_agent(
                         model_override=turn_route["model"],
                         runtime_override=turn_route["runtime"],
-                        request_overrides=turn_route.get("request_overrides"),
+                        fast_mode_overrides=turn_route.get("request_overrides"),
                     ):
                         cli.agent.quiet_mode = True
                         cli.agent.suppress_status_output = True

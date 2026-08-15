@@ -3660,11 +3660,17 @@ class APIServerAdapter(BasePlatformAdapter):
         # create a child session that carries the transcript forward. This uses
         # SessionDB's native parent_session_id/end_reason visibility model rather
         # than inventing a parallel fork store.
+        from agent.system_prompt import inherit_session_skills_catalog_mode
+
+        fork_model_config = inherit_session_skills_catalog_mode(
+            source.get("model_config"), {"_branched_from": source_id}
+        )
         await asyncio.to_thread(db.end_session, source_id, "branched")
         await asyncio.to_thread(db.create_session,
             fork_id,
             "api_server",
             model=source.get("model"),
+            model_config=fork_model_config,
             system_prompt=source.get("system_prompt"),
             parent_session_id=source_id,
         )

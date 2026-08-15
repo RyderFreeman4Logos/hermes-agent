@@ -83,6 +83,35 @@ async def test_capabilities_advertises_session_control_surface(adapter):
 
 
 @pytest.mark.asyncio
+async def test_fork_preserves_parent_skills_catalog_mode(adapter, session_db):
+    """An API fork must rebuild with the parent's frozen prompt-catalog mode."""
+    from types import SimpleNamespace
+
+    from agent.system_prompt import restore_session_skills_catalog_mode
+
+    session_db.create_session(
+        "parent",
+        "api_server",
+        model_config={"_skills_catalog_mode": "compact"},
+    )
+    session_db.append_message("parent", role="user", content="hello")
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post("/api/sessions/parent/fork", json={"id": "child"})
+        assert resp.status == 201, await resp.text()
+
+    child = session_db.get_session("child")
+    fresh_agent = SimpleNamespace(
+        _session_init_model_config={},
+        _skills_catalog_mode_config="full",
+        _cached_system_prompt=None,
+    )
+    assert restore_session_skills_catalog_mode(fresh_agent, child["model_config"])
+    assert fresh_agent._skills_catalog_mode == "compact"
+
+
+@pytest.mark.asyncio
 async def test_session_messages_default_to_latest_bounded_page(adapter, session_db):
     session_id = session_db.create_session("bounded-messages", "api_server")
     session_db.replace_messages(

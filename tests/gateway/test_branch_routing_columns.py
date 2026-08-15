@@ -79,6 +79,38 @@ def _make_branch_runner(store: SessionStore):
 
 class TestBranchRoutingColumns:
     @pytest.mark.asyncio
+    async def test_branch_preserves_parent_skills_catalog_mode(self, store):
+        """A fresh child agent must rebuild with the parent's frozen mode."""
+        from types import SimpleNamespace
+
+        from agent.system_prompt import restore_session_skills_catalog_mode
+
+        source = _make_source()
+        parent_entry = store.get_or_create_session(source)
+        store._db.patch_session_model_config(
+            parent_entry.session_id, {"_skills_catalog_mode": "names-only"}
+        )
+        store._db.append_message(
+            parent_entry.session_id, role="user", content="hello"
+        )
+
+        runner = _make_branch_runner(store)
+        result = await runner._handle_branch_command(_make_event("/branch"))
+        assert "branched" in result.lower()
+
+        child_entry = store.get_or_create_session(source)
+        child = store._db.get_session(child_entry.session_id)
+        fresh_agent = SimpleNamespace(
+            _session_init_model_config={},
+            _skills_catalog_mode_config="full",
+            _cached_system_prompt=None,
+        )
+        assert restore_session_skills_catalog_mode(
+            fresh_agent, child["model_config"]
+        )
+        assert fresh_agent._skills_catalog_mode == "names-only"
+
+    @pytest.mark.asyncio
     async def test_branched_session_has_routing_columns_before_switch(self, store):
         """Simulates a crash/kill landing between create_session() and
         switch_session() — the exact gap where the branched child's
@@ -152,4 +184,3 @@ class TestBranchRoutingColumns:
         assert origin.get("thread_id") == "544520"
 
         _ = real_switch_session  # silence unused
-

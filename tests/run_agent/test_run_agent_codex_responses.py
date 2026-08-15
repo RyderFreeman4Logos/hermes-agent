@@ -1831,6 +1831,30 @@ def test_chat_messages_to_responses_input_uses_call_id_for_function_call(monkeyp
 
 
 
+def test_preflight_codex_api_kwargs_strips_internal_hermes_physical_attempt_keys():
+    from agent.codex_responses_adapter import _preflight_codex_api_kwargs
+    from agent.physical_attempt_diagnostics import (
+        _INTERNAL_LIFECYCLE_KEY,
+        _INTERNAL_SCOPE_KEY,
+    )
+
+    normalized = _preflight_codex_api_kwargs(
+        {
+            "model": "gpt-5-codex",
+            "instructions": "You are Hermes.",
+            "input": [{"role": "user", "content": "hi"}],
+            "store": False,
+            _INTERNAL_SCOPE_KEY: {"scope_digest": "scope-hmac", "scope_bytes": 7},
+            _INTERNAL_LIFECYCLE_KEY: {"started": True},
+        }
+    )
+
+    assert _INTERNAL_SCOPE_KEY not in normalized
+    assert _INTERNAL_LIFECYCLE_KEY not in normalized
+    assert not any(str(key).startswith("_hermes_") for key in normalized)
+    assert normalized["store"] is False
+
+
 def test_preflight_codex_api_kwargs_strips_optional_function_call_id(monkeypatch):
     agent = _build_agent(monkeypatch)
     from agent.codex_responses_adapter import _preflight_codex_api_kwargs

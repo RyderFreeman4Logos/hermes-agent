@@ -25111,27 +25111,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Skip if the agent already consumed the result via wait/log.
                 # poll() is read-only and intentionally does NOT mark consumed
                 # (#10156) — a status check must not suppress this delivery turn.
-                from tools.process_registry import format_process_notification, process_registry as _pr_check
+                from tools.ansi_strip import strip_ansi
+                from tools.process_registry import (
+                    _redact_process_result,
+                    format_process_notification,
+                    process_registry as _pr_check,
+                )
+                _process_summary = _redact_process_result({
+                    "command": getattr(session, "command", "") or "",
+                    "output": strip_ansi(session.output_buffer) if session.output_buffer else "",
+                })
+                _summary_command = _process_summary["command"]
+                _summary_output = _process_summary["output"]
                 if agent_notify and not _pr_check.is_completion_consumed(session_id):
-                    from agent.redact import redact_terminal_output
-                    from tools.ansi_strip import strip_ansi
-                    _command = getattr(session, "command", "") or ""
-                    _raw = strip_ansi(session.output_buffer) if session.output_buffer else ""
-                    _raw = redact_terminal_output(_raw, _command)
-                    _command = _redact_gateway_user_facing_secrets(_command)
                     # Truncate at line boundaries so notifications never start
                     # mid-line (fixes #23284). Keep the last ~2000 chars but
                     # snap to the nearest preceding newline, then prepend a
                     # truncation marker when output was cut.
                     _LIMIT = 2000
-                    if len(_raw) > _LIMIT:
-                        _tail = _raw[-_LIMIT:]
+                    if len(_summary_output) > _LIMIT:
+                        _tail = _summary_output[-_LIMIT:]
                         _nl = _tail.find("\n")
                         _tail = _tail[_nl + 1:] if _nl != -1 else _tail
                         _out = f"[… output truncated — showing last {len(_tail)} chars]\n{_tail}"
                     else:
-                        _out = _raw
-                    _out = _redact_gateway_user_facing_secrets(_out)
+                        _out = _summary_output
                     completion_evt = {
                         "type": "completion",
                         "session_id": session_id,
@@ -25144,7 +25148,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "user_name": user_name,
                         "message_id": message_id,
                         "started_at": getattr(session, "started_at", None),
-                        "command": _command,
+                        "command": _summary_command,
                         "exit_code": session.exit_code,
                         "completion_reason": getattr(session, "completion_reason", "exited"),
                         "termination_source": getattr(session, "termination_source", ""),
@@ -25195,28 +25199,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     or (notify_mode == "error" and session.exit_code not in {0, None})
                 )
                 if should_notify:
-                    new_output = session.output_buffer[-1000:] if session.output_buffer else ""
-                    if new_output:
-                        from agent.redact import redact_terminal_output
-                        new_output = redact_terminal_output(
-                            new_output, getattr(session, "command", "") or ""
-                        )
-                        # redact_terminal_output() is unforced, so it returns raw
-                        # text when security.redact_secrets is off.  This send
-                        # goes straight to the platform adapter, so it needs the
-                        # same unconditional floor as the agent-notify path.
-                        new_output = _redact_gateway_user_facing_secrets(new_output)
+                    new_output = _summary_output[-1000:] if _summary_output else ""
                     if notify_mode == "concise":
-                        _cmd_disp = _redact_gateway_user_facing_secrets(
-                            getattr(session, "command", "") or ""
-                        )
                         _started = getattr(session, "started_at", None)
                         _dur = None
                         if isinstance(_started, (int, float)):
                             _dur = max(0.0, time.time() - _started)
                         message_text = _format_concise_process_notification(
                             session_id,
-                            _cmd_disp,
+                            _summary_command,
                             session.exit_code,
                             new_output,
                             duration_seconds=_dur,

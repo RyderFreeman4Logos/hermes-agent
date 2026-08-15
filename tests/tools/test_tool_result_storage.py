@@ -169,6 +169,68 @@ class TestBuildPersistedMessage:
 # ── maybe_persist_tool_result ─────────────────────────────────────────
 
 class TestMaybePersistToolResult:
+    @pytest.mark.parametrize("tool_name", ["terminal", "search_files", "web_extract"])
+    def test_high_volume_results_persist_before_history_append(self, tool_name):
+        env = MagicMock()
+        env.execute.return_value = {"output": "", "returncode": 0}
+        content = "x" * 40_000
+
+        result = maybe_persist_tool_result(
+            content=content,
+            tool_name=tool_name,
+            tool_use_id=f"large-{tool_name}",
+            env=env,
+        )
+
+        assert PERSISTED_OUTPUT_TAG in result
+        assert env.execute.call_args.kwargs["stdin_data"] == content
+
+    def test_large_json_result_persists_for_raw_recovery(self):
+        env = MagicMock()
+        env.execute.return_value = {"output": "", "returncode": 0}
+        content = '{"items":"' + "x" * 40_000 + '"}'
+
+        result = maybe_persist_tool_result(
+            content=content,
+            tool_name="custom_data_tool",
+            tool_use_id="large-json",
+            env=env,
+        )
+
+        assert PERSISTED_OUTPUT_TAG in result
+        assert env.execute.call_args.kwargs["stdin_data"] == content
+
+    def test_insertion_cap_requires_recoverable_storage(self):
+        content = "x" * 40_000
+
+        assert maybe_persist_tool_result(
+            content=content,
+            tool_name="terminal",
+            tool_use_id="no-env",
+            env=None,
+        ) == content
+
+        env = MagicMock()
+        env.execute.return_value = {"output": "", "returncode": 1}
+        assert maybe_persist_tool_result(
+            content=content,
+            tool_name="terminal",
+            tool_use_id="failed-write",
+            env=env,
+        ) == content
+
+    def test_selective_cap_leaves_generic_text_unchanged(self):
+        env = MagicMock()
+        content = "x" * 40_000
+
+        assert maybe_persist_tool_result(
+            content=content,
+            tool_name="custom_text_tool",
+            tool_use_id="generic-text",
+            env=env,
+        ) == content
+        env.execute.assert_not_called()
+
     def test_below_threshold_returns_unchanged(self):
         content = "small result"
         result = maybe_persist_tool_result(

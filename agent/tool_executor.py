@@ -21,7 +21,7 @@ import random
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 from agent.display import (
     KawaiiSpinner,
@@ -1675,22 +1675,23 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         agent._touch_activity(f"tool completed: {name} ({tool_duration:.1f}s){_status_suffix}")
 
         display_function_result = function_result
-        function_result = maybe_persist_tool_result(
-            content=function_result,
-            tool_name=name,
-            tool_use_id=tc.id,
-            env=get_active_env(effective_task_id),
-            config=_tool_budget,
-        ) if not _is_multimodal_tool_result(function_result) else function_result
-
         subdir_hints = agent._subdirectory_hints.check_tool_call(name, args)
-        if subdir_hints:
-            if _is_multimodal_tool_result(function_result):
+        if _is_multimodal_tool_result(function_result):
+            if subdir_hints:
                 # Append the hint to the text summary part so the model
                 # still sees it; don't touch the image blocks.
-                _append_subdir_hint_to_multimodal(function_result, subdir_hints)
-            else:
-                function_result += subdir_hints
+                _append_subdir_hint_to_multimodal(
+                    cast(dict, function_result), subdir_hints
+                )
+        else:
+            function_result = maybe_persist_tool_result(
+                content=function_result,
+                tool_name=name,
+                tool_use_id=tc.id,
+                env=get_active_env(effective_task_id),
+                config=_tool_budget,
+                history_suffix=subdir_hints or "",
+            )
 
         # Unwrap _multimodal dicts to an OpenAI-style content list so any
         # vision-capable provider receives [{type:text},{type:image_url}]
@@ -2488,21 +2489,22 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             logging.debug("Tool result (%d chars): %s", len(_log_result), _log_result)
 
         display_function_result = function_result
-        function_result = maybe_persist_tool_result(
-            content=function_result,
-            tool_name=function_name,
-            tool_use_id=tool_call.id,
-            env=get_active_env(effective_task_id),
-            config=_tool_budget,
-        ) if not _is_multimodal_tool_result(function_result) else function_result
-
         # Discover subdirectory context files from tool arguments
         subdir_hints = agent._subdirectory_hints.check_tool_call(function_name, function_args)
-        if subdir_hints:
-            if _is_multimodal_tool_result(function_result):
-                _append_subdir_hint_to_multimodal(function_result, subdir_hints)
-            else:
-                function_result += subdir_hints
+        if _is_multimodal_tool_result(function_result):
+            if subdir_hints:
+                _append_subdir_hint_to_multimodal(
+                    cast(dict, function_result), subdir_hints
+                )
+        else:
+            function_result = maybe_persist_tool_result(
+                content=function_result,
+                tool_name=function_name,
+                tool_use_id=tool_call.id,
+                env=get_active_env(effective_task_id),
+                config=_tool_budget,
+                history_suffix=subdir_hints or "",
+            )
 
         # Unwrap _multimodal dicts to an OpenAI-style content list
         # (see parallel path for rationale). String results pass through.

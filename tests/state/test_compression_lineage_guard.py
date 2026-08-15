@@ -6,7 +6,7 @@ import time
 
 import pytest
 
-from hermes_state import SessionDB
+from hermes_state import CompressionSessionBusyError, SessionDB
 
 
 @pytest.fixture()
@@ -22,6 +22,32 @@ def _compression_parent(db: SessionDB, session_id: str = "parent") -> None:
     db.create_session(session_id, source="webui")
     db.append_message(session_id, "user", "before split")
     db.end_session(session_id, "compression")
+
+
+def test_compaction_snapshot_preserves_raw_content_and_fingerprint(db: SessionDB) -> None:
+    db.create_session("raw", source="webui")
+    db.append_message("raw", "user", "  spaced content  ", api_content="wire bytes")
+
+    fingerprint, messages = db.get_compaction_snapshot("raw")
+
+    assert len(fingerprint) == 1
+    assert messages[0]["content"] == "  spaced content  "
+    assert messages[0]["api_content"] == "wire bytes"
+    assert "_db_persisted" not in messages[0]
+
+
+def test_archive_and_compact_rejects_sidecar_change_after_capture(db: SessionDB) -> None:
+    db.create_session("raw-cas", source="webui")
+    db.append_message("raw-cas", "user", "same")
+    fingerprint = db.get_compaction_fingerprint("raw-cas")
+    assert db.set_latest_user_api_content("raw-cas", "same", "changed wire") == 1
+
+    with pytest.raises(CompressionSessionBusyError, match="transcript changed"):
+        db.archive_and_compact(
+            "raw-cas",
+            [{"role": "user", "content": "stale"}],
+            expected_active_fingerprint=fingerprint,
+        )
 
 
 def test_find_live_compression_child_returns_unique_direct_child(db: SessionDB) -> None:

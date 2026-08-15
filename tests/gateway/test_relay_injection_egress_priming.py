@@ -14,12 +14,11 @@ The session-store origin carried on the synthetic event already holds
 scope_id/user_id — the fix is priming the adapter's routing caches from the
 synthetic event before dispatching it.
 
-Also pins the replay staleness cap: restored completions older than the cap
-must be terminally dropped, not replayed as full-context turns (one July
-session replayed in August burned a 102K-token context).
+Also pins zero-loss replay: age alone cannot silently discard pending work.
 """
 
 import json
+import queue
 import time
 from types import SimpleNamespace
 
@@ -119,7 +118,7 @@ def test_prime_routing_cache_never_raises_on_malformed_event():
 
 
 # ---------------------------------------------------------------------------
-# Staleness cap on restored completions
+# Zero-loss restore of pending completions
 # ---------------------------------------------------------------------------
 
 @pytest.fixture()
@@ -159,31 +158,26 @@ class _Queue:
         self.items.append(item)
 
 
-def test_restore_drops_completions_older_than_replay_cap(_isolated_delegation_db):
+def test_restore_keeps_old_pending_completions(_isolated_delegation_db):
     ad = _isolated_delegation_db
     now = time.time()
     _insert_pending(ad, "deleg_fresh", now - 3600)
-    # ABSOLUTE age, deliberately NOT derived from the cap constant: a 30-day
-    # old completion must never replay, whatever the cap is tuned to.
     _insert_pending(ad, "deleg_stale", now - 30 * 24 * 3600)
-    assert ad._MAX_COMPLETION_REPLAY_AGE_S <= 7 * 24 * 3600, (
-        "replay cap drifted past a week — the 102K-token stale-replay class "
-        "would return"
-    )
 
     q = _Queue()
     restored = ad.restore_undelivered_completions(q)
 
     ids = [e.get("delegation_id") for e in q.items]
-    assert "deleg_fresh" in ids
-    assert "deleg_stale" not in ids, (
-        "a weeks-old completion was replayed as a fresh full-context turn "
-        "(102K-token replay incident class)"
-    )
-    assert restored == 1
-    # The stale row must converge to a terminal state, not replay forever.
+    assert ids == ["deleg_stale", "deleg_fresh"]
+    assert restored == 2
     with ad._DB_LOCK, ad._transaction() as conn:
         state = conn.execute(
             "SELECT delivery_state FROM async_delegations WHERE delegation_id='deleg_stale'"
         ).fetchone()[0]
-    assert state == "dropped"
+    assert state == "pending"
+
+    wake_queue: queue.Queue = queue.Queue()
+    wake_queue.put(q.items[0])
+    assert ad.restore_undelivered_completions(wake_queue) == 1
+    assert wake_queue.get_nowait()["delegation_id"] == "deleg_stale"
+    assert wake_queue.get_nowait()["delegation_id"] == "deleg_fresh"

@@ -21,6 +21,14 @@ _DELEGATED_CHILD_CONTEXT: ContextVar[bool] = ContextVar(
     "hermes_delegated_child_context",
     default=False,
 )
+_DELEGATED_OWNER_SESSION_ID: ContextVar[str] = ContextVar(
+    "hermes_delegated_owner_session_id",
+    default="",
+)
+_DELEGATED_SUBAGENT_ID: ContextVar[str] = ContextVar(
+    "hermes_delegated_subagent_id",
+    default="",
+)
 
 # Set for any in-process execution that is NOT the dispatcher-owned worker even
 # though the worker's HERMES_KANBAN_* vars are legitimately in os.environ (cron
@@ -46,7 +54,12 @@ KANBAN_ENV_KEYS: tuple[str, ...] = (
 
 
 @contextmanager
-def delegated_child_context(session_id: str | None = None) -> Iterator[None]:
+def delegated_child_context(
+    session_id: str | None = None,
+    *,
+    owner_session_id: str | None = None,
+    subagent_id: str | None = None,
+) -> Iterator[None]:
     """Mark child execution and isolate its task-local session identity.
 
     Child construction calls ``set_current_session_id`` internally, so even a
@@ -54,6 +67,8 @@ def delegated_child_context(session_id: str | None = None) -> Iterator[None]:
     execution passes its explicit id and receives it only for this scope.
     """
     token = _DELEGATED_CHILD_CONTEXT.set(True)
+    owner_token = _DELEGATED_OWNER_SESSION_ID.set(owner_session_id or "")
+    subagent_token = _DELEGATED_SUBAGENT_ID.set(subagent_id or "")
     try:
         # Import lazily: session_context calls is_delegated_child_context() when
         # deciding whether the compatibility os.environ mirror is safe.
@@ -62,12 +77,27 @@ def delegated_child_context(session_id: str | None = None) -> Iterator[None]:
         with scoped_current_session_id(session_id):
             yield
     finally:
+        _DELEGATED_SUBAGENT_ID.reset(subagent_token)
+        _DELEGATED_OWNER_SESSION_ID.reset(owner_token)
         _DELEGATED_CHILD_CONTEXT.reset(token)
 
 
 def is_delegated_child_context() -> bool:
     """Return True while code is running for a delegate_task child."""
     return bool(_DELEGATED_CHILD_CONTEXT.get())
+
+
+def get_delegated_child_provenance() -> tuple[str, str, str] | None:
+    """Return trusted ``(child, owner, subagent)`` lifecycle identity."""
+    if not _DELEGATED_CHILD_CONTEXT.get():
+        return None
+    from gateway.session_context import get_session_env
+
+    return (
+        get_session_env("HERMES_SESSION_ID", ""),
+        _DELEGATED_OWNER_SESSION_ID.get(),
+        _DELEGATED_SUBAGENT_ID.get(),
+    )
 
 
 @contextmanager

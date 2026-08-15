@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from cli import HermesCLI
+from hermes_state import SessionDB
 
 
 def _make_cli():
@@ -101,7 +102,60 @@ class TestCliResumeCommand:
         assert "/resume" in printed
         assert cli_obj.session_id == "current_session"
 
+    def test_resume_replaces_previous_session_catalog_mode(self, tmp_path):
+        from agent.system_prompt import (
+            _session_skills_catalog_mode,
+            restore_session_skills_catalog_mode,
+        )
 
+        db = SessionDB(db_path=tmp_path / "state.db")
+        try:
+            db.create_session(
+                "current_session",
+                "cli",
+                model_config={"_skills_catalog_mode": "compact"},
+            )
+            db.create_session(
+                "target_session",
+                "cli",
+                model_config={"_skills_catalog_mode": "names-only"},
+            )
+            db.append_message("target_session", "user", "hello")
+
+            agent = SimpleNamespace(
+                session_id="current_session",
+                _session_init_model_config={},
+                _skills_catalog_mode_config="full",
+                _flush_messages_to_session_db=MagicMock(),
+                reset_session_state=MagicMock(),
+                _invalidate_system_prompt=MagicMock(),
+            )
+            assert restore_session_skills_catalog_mode(
+                agent, {"_skills_catalog_mode": "compact"}
+            )
+
+            cli_obj = _make_cli()
+            cli_obj.agent = agent
+            cli_obj._session_db = db
+            cli_obj._display_resumed_history = MagicMock()
+            cli_obj._restore_session_cwd = MagicMock()
+            cli_obj._restore_session_yolo = MagicMock()
+            cli_obj._restore_session_model = MagicMock()
+
+            with (
+                patch(
+                    "hermes_cli.main._resolve_session_by_name_or_id",
+                    return_value="target_session",
+                ),
+                patch("cli._cprint"),
+            ):
+                cli_obj._handle_resume_command("/resume target_session")
+
+            assert agent.session_id == "target_session"
+            assert _session_skills_catalog_mode(agent) == "names-only"
+            assert agent._session_init_model_config["_skills_catalog_mode"] == "names-only"
+        finally:
+            db.close()
 
 
 class TestCliResumeRestoresCwd:

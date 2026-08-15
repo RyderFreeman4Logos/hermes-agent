@@ -52,7 +52,7 @@ from agent.prompt_builder import (
 from agent.runtime_cwd import resolve_context_cwd
 from hermes_constants import get_default_hermes_root, get_hermes_home
 from pathlib import Path
-from utils import is_truthy_value
+from utils import is_truthy_value, safe_json_loads
 
 logger = logging.getLogger(__name__)
 _PLUGIN_SECTION_FRAME_RE = re.compile(
@@ -184,6 +184,8 @@ def _remember_skills_catalog_mode(agent: Any, mode: str) -> str:
 
 def restore_session_skills_catalog_mode(agent: Any, model_config: Any) -> bool:
     """Restore the frozen catalog mode from structured session state."""
+    if isinstance(model_config, str):
+        model_config = safe_json_loads(model_config)
     if (
         not isinstance(model_config, dict)
         or _SKILLS_CATALOG_MODE_SESSION_KEY not in model_config

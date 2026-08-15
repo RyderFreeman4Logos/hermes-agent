@@ -146,6 +146,9 @@ DEFAULT_CONFIG = {
         # compounds over a long conversation.  Costs ~70 tokens in the cached
         # system prompt.  Set False to disable globally.
         "parallel_tool_call_guidance": True,
+        # Session-fixed rendering depth for the skills index: "full",
+        # "compact" (non-coding categories names-only), or "names-only".
+        "skills_catalog_mode": "full",
         # Local-environment toolchain probe — surfaces Python/pip/uv/PEP-668
         # state in the system prompt when something non-default is detected
         # (e.g. python3 has no pip module, pip→python version mismatch, PEP

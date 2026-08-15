@@ -692,7 +692,7 @@ class TurnController {
 
     const footnote = cacheFootnote(payload.cache_info)
 
-    if (footnote && finalMessages.some(message => message.role === 'assistant')) {
+    if (footnote) {
       finalMessages.push(footnote)
     }
 

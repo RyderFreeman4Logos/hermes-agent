@@ -2374,10 +2374,9 @@ class SessionSearchMixin:
         """
         optimized = 0
         for tbl in self._FTS_TABLES:
-            with self._lock:
+            with self._write_guard():
                 if not self._fts_table_exists(tbl):
                     continue
-            with self._write_guard():
                 try:
                     # The column name in the INSERT must match the table name
                     # for FTS5 special commands.
@@ -2406,10 +2405,9 @@ class SessionSearchMixin:
         """
         rebuilt = 0
         for tbl in self._FTS_TABLES:
-            with self._lock:
+            with self._write_guard():
                 if not self._fts_table_exists(tbl):
                     continue
-            with self._write_guard():
                 try:
                     self._conn.execute(
                         f"INSERT INTO {tbl}({tbl}) VALUES('rebuild')"
@@ -2469,22 +2467,23 @@ class SessionSearchMixin:
             raise ValueError("max_commands must be greater than zero")
 
         executed = 0
+        apply_usermerge_floor = not getattr(
+            self, "_fts_usermerge_floor_applied", False
+        )
         for tbl in self._FTS_TABLES:
-            with self._lock:
-                if not self._fts_table_exists(tbl):
-                    continue
-            # One-time (per instance) usermerge floor; the value is
-            # persisted in the index's config shadow table so future
-            # connections inherit it. Setting config is a metadata-only
-            # write — it never touches segment data.
-            if not getattr(self, "_fts_usermerge_floor_applied", False):
+            for command_index in range(max_commands):
                 with self._write_guard():
-                    self._conn.execute(
-                        f"INSERT INTO {tbl}({tbl}, rank) "
-                        "VALUES('usermerge', 2)"
-                    )
-            for _ in range(max_commands):
-                with self._write_guard():
+                    if not self._fts_table_exists(tbl):
+                        break
+                    # One-time (per instance and present index) usermerge
+                    # floor. Keep the capability probe and its config write
+                    # in this same writer interval so another process cannot
+                    # drop or recreate the optional table between them.
+                    if apply_usermerge_floor and command_index == 0:
+                        self._conn.execute(
+                            f"INSERT INTO {tbl}({tbl}, rank) "
+                            "VALUES('usermerge', 2)"
+                        )
                     before = self._conn.total_changes
                     self._conn.execute(
                         f"INSERT INTO {tbl}({tbl}, rank) VALUES('merge', ?)",

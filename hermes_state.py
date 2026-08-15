@@ -3865,19 +3865,49 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             deadline = time.monotonic() + patience_s
         if allow_unsupported is None:
             allow_unsupported = not self._wal_active
-        with self._writer_lock:
+        writer_acquired = self._writer_lock.acquire(
+            timeout=max(0.0, deadline - time.monotonic())
+        )
+        if not writer_acquired:
+            raise sqlite3.OperationalError(
+                "database is locked (timed out waiting for in-process "
+                "SessionDB writer)"
+            )
+        try:
+            if patience_s > 0 and time.monotonic() >= deadline:
+                raise sqlite3.OperationalError(
+                    "database is locked (timed out waiting for in-process "
+                    "SessionDB writer)"
+                )
             with _session_db_advisory_write_lock(
                 self.db_path,
                 deadline=deadline,
                 patience_s=patience_s,
                 allow_unsupported=allow_unsupported,
             ) as acquired:
-                with self._lock:
+                connection_acquired = self._lock.acquire(
+                    timeout=max(0.0, deadline - time.monotonic())
+                )
+                if not connection_acquired:
+                    raise sqlite3.OperationalError(
+                        "database is locked (timed out waiting for "
+                        "SessionDB connection)"
+                    )
+                try:
+                    if patience_s > 0 and time.monotonic() >= deadline:
+                        raise sqlite3.OperationalError(
+                            "database is locked (timed out waiting for "
+                            "SessionDB connection)"
+                        )
                     self._write_lock_owner = owner
                     try:
                         yield acquired
                     finally:
                         self._write_lock_owner = None
+                finally:
+                    self._lock.release()
+        finally:
+            self._writer_lock.release()
 
     @staticmethod
     def _is_fts5_unavailable_error(exc: sqlite3.OperationalError) -> bool:
@@ -4226,6 +4256,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             except sqlite3.OperationalError as exc:
                 err_msg = str(exc).lower()
                 if "locked" in err_msg or "busy" in err_msg:
+                    if (
+                        "timed out waiting for in-process sessiondb writer"
+                        in err_msg
+                        or "timed out waiting for sessiondb connection"
+                        in err_msg
+                    ):
+                        # _write_guard already exhausted this same deadline.
+                        # Preserve whether the local writer mutex or shared
+                        # connection mutex was responsible instead of
+                        # misreporting it as a foreign-process sidecar hold.
+                        raise
                     if self._sleep_before_write_retry(deadline, patience_s):
                         continue
                     # Patience exhausted — say what actually happened so the

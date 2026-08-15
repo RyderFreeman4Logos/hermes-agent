@@ -1790,6 +1790,156 @@ class TestRetryAfterCap:
         assert "Waiting 300.0s" in status
 
 
+class TestTerminalQuotaRetryBoundary:
+    class _Clock:
+        def __init__(self):
+            self.now = 1000.0
+            self.sleeps = []
+
+        def time(self):
+            return self.now
+
+        def monotonic(self):
+            return self.now
+
+        def sleep(self, seconds):
+            self.sleeps.append(seconds)
+            self.now += seconds
+
+    class _UsageLimitError(Exception):
+        status_code = 429
+        body = {
+            "error": {
+                "type": "usage_limit_reached",
+                "message": "The usage limit has been reached",
+            }
+        }
+
+        def __init__(self):
+            super().__init__("Error code: 429 - The usage limit has been reached")
+            self.response = SimpleNamespace(headers={"retry-after": "600"})
+
+    class _TransientRateLimitError(Exception):
+        status_code = 429
+        body = {
+            "error": {"type": "rate_limit_error", "message": "Too many requests"}
+        }
+        response = SimpleNamespace(headers={})
+
+    class _Pool:
+        def __init__(self, provider, keys):
+            self.provider = provider
+            self.keys = keys
+            self.failed = []
+            self._entries = [
+                SimpleNamespace(
+                    id=f"cred-{index}", runtime_api_key=key, last_status=None
+                )
+                for index, key in enumerate(keys)
+            ]
+
+        def entries(self):
+            return self._entries
+
+        def current(self):
+            return self._entries[0]
+
+        def mark_exhausted_and_rotate(
+            self,
+            *,
+            status_code,
+            error_context,
+            api_key_hint,
+            failure_reason,
+        ):
+            assert status_code == 429
+            self.failed.append(api_key_hint)
+            index = self.keys.index(api_key_hint)
+            if index + 1 == len(self.keys):
+                return None
+            next_key = self.keys[index + 1]
+            return SimpleNamespace(
+                id=f"cred-{index + 1}", runtime_api_key=next_key
+            )
+
+    def _drive(self, agent, monkeypatch, error_type, *, pool=None):
+        from agent import conversation_loop
+
+        clock = self._Clock()
+        calls = []
+        monkeypatch.setattr(conversation_loop, "time", clock)
+        monkeypatch.setattr(
+            conversation_loop, "jittered_backoff", lambda *args, **kwargs: 0.2
+        )
+        monkeypatch.setattr(
+            conversation_loop,
+            "adaptive_rate_limit_backoff",
+            lambda *args, default_wait, **kwargs: (default_wait, None),
+        )
+        agent._api_max_retries = 4
+        agent._credential_pool = pool
+        agent._credential_pool_entry_id = None
+        agent._persist_session = lambda *args, **kwargs: None
+        agent._save_trajectory = lambda *args, **kwargs: None
+
+        def _swap(entry):
+            agent.api_key = entry.runtime_api_key
+
+        def _fake_api_call(api_kwargs):
+            calls.append(agent.api_key)
+            raise error_type()
+
+        agent._swap_credential = _swap
+        agent._interruptible_api_call = _fake_api_call
+        result = agent.run_conversation("hello")
+        return result, calls, clock
+
+    @pytest.mark.parametrize(
+        ("pool_keys", "expected_calls"),
+        [
+            ([], ["key-A"]),
+            (["key-A"], ["key-A"]),
+            (["key-A", "key-B"], ["key-A", "key-B"]),
+        ],
+    )
+    def test_terminal_quota_rotates_available_credentials_then_returns_immediately(
+        self,
+        agent,
+        monkeypatch,
+        pool_keys,
+        expected_calls,
+    ):
+        agent.api_key = "key-A"
+        pool = self._Pool(agent.provider, pool_keys) if pool_keys else None
+
+        result, calls, clock = self._drive(
+            agent, monkeypatch, self._UsageLimitError, pool=pool
+        )
+
+        assert calls == expected_calls
+        assert clock.sleeps == []
+        assert result["failed"] is True
+        assert result["failure_reason"] == "billing"
+        assert result["final_response"].startswith("Billing or credits exhausted:")
+        if pool is not None:
+            assert pool.failed == calls
+
+    def test_ordinary_transient_429_still_uses_bounded_retries(
+        self,
+        agent,
+        monkeypatch,
+    ):
+        agent.api_key = "key-A"
+
+        result, calls, clock = self._drive(
+            agent, monkeypatch, self._TransientRateLimitError
+        )
+
+        assert calls == ["key-A"] * 4
+        assert len(clock.sleeps) == 3
+        assert result["failure_reason"] == "rate_limit"
+
+
 
 class TestConcurrentToolExecution:
     """Tests for _execute_tool_calls_concurrent and dispatch logic."""

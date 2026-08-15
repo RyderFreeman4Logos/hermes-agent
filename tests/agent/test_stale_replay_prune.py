@@ -7,6 +7,8 @@ compaction checkpoints (type="compaction") are exempt because they carry
 already-pruned history, not per-turn reasoning.
 """
 
+import pytest
+
 from agent.context_compressor import (
     _STALE_REPLAY_PRUNE_KEYS,
     _prune_stale_reasoning_replay,
@@ -63,6 +65,112 @@ def test_multi_message_active_turn_chain_is_never_pruned():
     assert "codex_reasoning_items" not in messages[1]
     for idx in (3, 5, 7):
         assert messages[idx].get("codex_reasoning_items"), f"active-chain msg {idx} lost its items"
+
+
+@pytest.mark.parametrize(
+    ("continuation_kind", "synthetic_flag", "keeps_active_reasoning"),
+    [
+        pytest.param("codex-incomplete", None, True, id="codex-incomplete"),
+        pytest.param("compression-continuation", None, True, id="compression-continuation"),
+        pytest.param("empty-recovery", "_empty_recovery_synthetic", True, id="empty-recovery"),
+        pytest.param("dropped-toolcall", "_dropped_toolcall_nudge", True, id="dropped-toolcall"),
+        pytest.param("verification-stop", "_verification_stop_synthetic", True, id="verification-stop"),
+        pytest.param("pre-verify", "_pre_verify_synthetic", True, id="pre-verify"),
+        pytest.param("intent-ack", None, True, id="intent-ack"),
+        pytest.param("new-human-turn", None, False, id="new-human-turn"),
+    ],
+)
+def test_compress_uses_real_user_boundary_for_synthetic_continuations(
+    continuation_kind, synthetic_flag, keeps_active_reasoning
+):
+    from agent.context_compressor import (
+        COMPRESSION_CONTINUATION_USER_CONTENT,
+        ContextCompressor,
+    )
+    from agent.conversation_loop import _CODEX_INCOMPLETE_NUDGE
+
+    continuation_content = {
+        "codex-incomplete": _CODEX_INCOMPLETE_NUDGE,
+        "compression-continuation": COMPRESSION_CONTINUATION_USER_CONTENT,
+        "empty-recovery": (
+            "You just executed tool calls but returned an empty response. Please "
+            "process the tool results above and continue with the task."
+        ),
+        "dropped-toolcall": (
+            "Your previous turn indicated a tool call but none was included. Do "
+            "not narrate a plan or restate intent — issue the actual tool call now "
+            "to continue the task."
+        ),
+        "verification-stop": "[System: Run the required verification before finishing.]",
+        "pre-verify": "[System: Run the configured pre-verify hook before finishing.]",
+        "intent-ack": (
+            "[System: Continue now. Execute the required tool calls and only send "
+            "your final answer after completing the task.]"
+        ),
+        "new-human-turn": "Please start a genuinely new user task now.",
+    }[continuation_kind]
+    continuation: dict = {"role": "user", "content": continuation_content}
+    if synthetic_flag:
+        continuation[synthetic_flag] = True
+
+    messages: list[dict] = [{"role": "system", "content": "sys"}]
+    for i in range(11):
+        messages.extend([
+            {"role": "user", "content": f"old {i} " + "u" * 500},
+            {
+                "role": "assistant",
+                "content": f"answer {i} " + "a" * 500,
+                "codex_reasoning_items": [_reasoning(f"old{i}")],
+            },
+        ])
+    messages.extend([
+        {"role": "user", "content": "active task"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "active_call",
+                "type": "function",
+                "function": {"name": "terminal", "arguments": "{}"},
+            }],
+            "codex_reasoning_items": [_reasoning("active")],
+        },
+        {"role": "tool", "tool_call_id": "active_call", "content": "tool result"},
+        {
+            "role": "assistant",
+            "content": "",
+            "reasoning": "still thinking",
+            "codex_reasoning_items": [_reasoning("incomplete")],
+        },
+        continuation,
+    ])
+    compressor = ContextCompressor(
+        model="gpt-test",
+        provider="openai-codex",
+        api_mode="codex_responses",
+        quiet_mode=True,
+        config_context_length=100_000,
+        protect_first_n=3,
+        protect_last_n=8,
+    )
+    compressor.tail_token_budget = 500
+    compressor._generate_summary = lambda *args, **kwargs: "summary"
+
+    compressed = compressor.compress(messages, current_tokens=90_000, force=True)
+    active = next(
+        msg
+        for msg in compressed
+        if any(
+            call.get("id") == "active_call"
+            for call in msg.get("tool_calls", [])
+        )
+    )
+
+    if keeps_active_reasoning:
+        assert active["codex_reasoning_items"] == [_reasoning("active")]
+    else:
+        assert "codex_reasoning_items" not in active
+    assert any(msg.get("content") == continuation_content for msg in compressed)
 
 
 def test_native_compaction_checkpoints_survive_pruning():

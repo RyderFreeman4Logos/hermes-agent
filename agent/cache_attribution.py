@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from typing import Any
 
 POST_COMPRESSION_CACHE_PENDING_KEY = "_awaiting_cache_usage_after_compression"
+CACHE_HIT_ERROR_THRESHOLD = 95
 logger = logging.getLogger(__name__)
 
 
@@ -86,14 +87,17 @@ def cache_info_from_usage(
     if not telemetry_present:
         return {
             "cached_tokens": cached,
+            "level": "info",
             "prompt_tokens": prompt,
             "state": "no_field",
             "text": "Cache: unavailable",
             "write_tokens": written,
         }
     state = "hit" if cached else "cold_write" if written else "miss"
+    hit_percent = round(100 * cached / prompt) if prompt > 0 else 0
     return {
         "cached_tokens": cached,
+        "level": "info" if hit_percent >= CACHE_HIT_ERROR_THRESHOLD else "error",
         "prompt_tokens": prompt,
         "state": state,
         "text": (
@@ -119,9 +123,10 @@ def cache_log_suffix(info: Mapping[str, object]) -> str:
 
 def set_post_compression_cache_pending(agent: Any, pending: bool) -> None:
     """Mirror the one-shot post-compression marker in memory and SessionDB."""
-    agent._awaiting_cache_usage_after_compression = bool(pending)
     session_db = getattr(agent, "_session_db", None)
     session_id = getattr(agent, "session_id", None)
+    agent._awaiting_cache_usage_after_compression = bool(pending)
+    agent._awaiting_cache_usage_after_compression_session_id = session_id
     patch = getattr(session_db, "patch_session_model_config", None)
     ensure_session = getattr(agent, "_ensure_db_session", None)
     try:
@@ -136,17 +141,33 @@ def set_post_compression_cache_pending(agent: Any, pending: bool) -> None:
         logger.debug("post-compression cache marker update failed", exc_info=True)
 
 
-def _post_compression_cache_pending(agent: Any) -> bool:
-    marker_loaded = hasattr(agent, "_awaiting_cache_usage_after_compression")
-    if getattr(agent, "_awaiting_cache_usage_after_compression", False) is True:
-        return True
+def _compressor_cache_pending(agent: Any, session_id: object) -> bool:
     compressor = getattr(agent, "context_compressor", None)
-    if getattr(compressor, "awaiting_real_usage_after_compression", False) is True:
-        return True
-    if marker_loaded:
+    bound_session_id = getattr(compressor, "_session_id", None)
+    if bound_session_id not in (None, "", session_id):
         return False
+    return (
+        getattr(compressor, "awaiting_real_usage_after_compression", False) is True
+    )
+
+
+def _post_compression_cache_pending(agent: Any) -> bool:
     session_db = getattr(agent, "_session_db", None)
     session_id = getattr(agent, "session_id", None)
+    marker_loaded = (
+        hasattr(agent, "_awaiting_cache_usage_after_compression")
+        and getattr(
+            agent,
+            "_awaiting_cache_usage_after_compression_session_id",
+            None,
+        )
+        == session_id
+    )
+    if marker_loaded:
+        if getattr(agent, "_awaiting_cache_usage_after_compression", False) is True:
+            return True
+        return _compressor_cache_pending(agent, session_id)
+
     getter = getattr(session_db, "get_session_model_config_value", None)
     if not session_id or not callable(getter):
         return False
@@ -157,7 +178,10 @@ def _post_compression_cache_pending(agent: Any) -> bool:
             False,
         ) is True
         agent._awaiting_cache_usage_after_compression = pending
-        return pending
+        agent._awaiting_cache_usage_after_compression_session_id = session_id
+        if pending:
+            return True
+        return _compressor_cache_pending(agent, session_id)
     except Exception:
         logger.debug("post-compression cache marker lookup failed", exc_info=True)
         return False
@@ -186,7 +210,30 @@ def record_first_turn_cache_info(
     info = cache_info_from_usage(usage, telemetry_present=telemetry_present)
     if post_compression:
         info["attribution"] = "post_compression"
+        info["level"] = "info"
+        if info["state"] == "no_field":
+            note = "post-compression cache unavailable"
+        elif (
+            info["state"] == "hit"
+            and round(
+                100
+                * _token_count(info["cached_tokens"])
+                / max(1, _token_count(info["prompt_tokens"]))
+            )
+            >= CACHE_HIT_ERROR_THRESHOLD
+        ):
+            note = "post-compression cache warm"
+        else:
+            note = "post-compression warmup (expected)"
+        info["note"] = note
+        info["text"] = f"{info['text']} · {note}"
     agent._first_turn_cache_info = info
+    callback = getattr(agent, "_tui_cache_callback", None)
+    if callable(callback):
+        try:
+            callback(dict(info))
+        except Exception:
+            logger.debug("TUI first-response cache callback failed", exc_info=True)
     return info
 
 

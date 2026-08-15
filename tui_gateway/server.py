@@ -6260,17 +6260,28 @@ def _agent_cbs(sid: str) -> dict:
 
 
 def _attach_tui_cache_callback(agent, sid: str):
-    """Attach the inherited-prefix cache signal to one live TUI agent."""
-    def emit_cache_state(state: str, pct: int, read: int, prompt: int) -> None:
-        cache_info = _cache_info_from_usage(
-            getattr(agent, "_first_turn_usage", None)
-        ) or {
-            "read_tokens": read,
-            "prompt_tokens": prompt,
-            "pct": pct,
-            "state": state,
-            "level": _cache_level(pct),
-        }
+    """Attach both cache collectors to one normalized live TUI signal."""
+
+    def emit_cache_state(*args: Any) -> None:
+        if len(args) == 1:
+            cache_info = _cache_info_from_turn_result(args[0])
+            if cache_info is None:
+                return
+            read = int(cache_info.get("read_tokens", 0))
+            prompt = int(cache_info.get("prompt_tokens", 0))
+        elif len(args) == 4:
+            state, pct, read, prompt = args
+            cache_info = _cache_info_from_usage(
+                getattr(agent, "_first_turn_usage", None)
+            ) or {
+                "read_tokens": read,
+                "prompt_tokens": prompt,
+                "pct": pct,
+                "state": state,
+                "level": _cache_level(int(pct)),
+            }
+        else:
+            return
         state = str(cache_info["state"])
         pct = int(cache_info["pct"])
         text = (

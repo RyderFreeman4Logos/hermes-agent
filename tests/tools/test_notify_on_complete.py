@@ -290,16 +290,20 @@ def _silent_bg_base_config(tmp_path):
     }
 
 
-def _silent_bg_harness(monkeypatch, tmp_path):
+def _silent_bg_harness(monkeypatch, tmp_path, *, completed=False):
     """Common test fixture: patch enough of terminal_tool to spawn a fake
     background process and capture the JSON result the agent sees."""
     import tools.terminal_tool as terminal_tool_module
     from tools import process_registry as process_registry_module
     from types import SimpleNamespace
+    import threading
 
     config = _silent_bg_base_config(tmp_path)
     dummy_env = SimpleNamespace(env={})
     spawn_kwargs = {}
+    completion_event = threading.Event()
+    if completed:
+        completion_event.set()
 
     def fake_spawn_local(**kwargs):
         spawn_kwargs.update(kwargs)
@@ -314,6 +318,7 @@ def _silent_bg_harness(monkeypatch, tmp_path):
             watcher_thread_id="",
             watcher_message_id="",
             watcher_interval=0,
+            _completion_event=completion_event,
         )
 
     monkeypatch.setattr(terminal_tool_module, "_get_env_config", lambda: config)
@@ -451,6 +456,41 @@ def test_auto_background_execution_timeout_is_passed_to_local_spawn(
 
     assert result["notify_on_complete"] is True
     assert tt._test_spawn_local_kwargs["execution_timeout"] == 7200
+
+
+def test_fast_completed_background_process_is_not_reported_as_failed_start(
+    monkeypatch, tmp_path
+):
+    from gateway import session_context
+    from tools import process_registry as process_registry_module
+    from tools import runtime_heartbeat
+
+    tt = _silent_bg_harness(monkeypatch, tmp_path, completed=True)
+    monkeypatch.setattr(session_context, "async_delivery_supported", lambda: True)
+    monkeypatch.setattr(runtime_heartbeat, "preflight_current_heartbeat", lambda: 570)
+    monkeypatch.setattr(runtime_heartbeat, "get_current_provider", lambda: "pm")
+    arm = MagicMock(return_value=False)
+    kill = MagicMock()
+    monkeypatch.setattr(runtime_heartbeat.runtime_heartbeat, "arm", arm)
+    monkeypatch.setattr(process_registry_module.process_registry, "kill_process", kill)
+
+    try:
+        result = json.loads(
+            tt.terminal_tool(
+                command="printf done",
+                task_id="session-owner",
+                background=True,
+                notify_on_complete=True,
+            )
+        )
+    finally:
+        tt._active_environments.pop("default", None)
+        tt._last_activity.pop("default", None)
+
+    assert result["session_id"] == "proc_silent_test"
+    assert result["error"] is None
+    arm.assert_called_once()
+    kill.assert_not_called()
 
 
 def test_foreground_command_does_not_emit_hint(monkeypatch, tmp_path):

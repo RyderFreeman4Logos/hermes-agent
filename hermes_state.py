@@ -5836,6 +5836,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         profile_name: str = None,
         compression_lock_holder: str = None,
         require_compression_lease: bool = True,
+        expected_active_fingerprint: Optional[List[tuple]] = None,
     ) -> None:
         """Atomically close a parent and publish its durable compression child.
 
@@ -5857,6 +5858,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 raise CompressionSessionBusyError(
                     f"Compression lease lost before publication: {parent_session_id}"
                 )
+            if expected_active_fingerprint is not None:
+                current_rows = conn.execute(
+                    "SELECT * FROM messages "
+                    "WHERE session_id = ? AND active = 1 ORDER BY id",
+                    (parent_session_id,),
+                ).fetchall()
+                if [tuple(row) for row in current_rows] != expected_active_fingerprint:
+                    raise CompressionSessionBusyError(
+                        "Durable transcript changed before compression child "
+                        f"publication: {parent_session_id}"
+                    )
             parent = conn.execute(
                 """SELECT ended_at, cwd, git_branch, git_repo_root,
                           user_id, session_key, chat_id, chat_type,
@@ -9944,6 +9956,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         session_id: str,
         compacted_messages: List[Dict[str, Any]],
         model_config_patch: Optional[Dict[str, Any]] = None,
+        *,
+        model_config_json: Optional[str] = None,
+        model: Optional[str] = None,
+        system_prompt: Optional[str] = None,
+        billing_provider: Optional[str] = None,
+        billing_base_url: Optional[str] = None,
+        billing_mode: Optional[str] = None,
+        compression_lock_holder: Optional[str] = None,
+        require_compression_lease: bool = False,
         expected_active_fingerprint: Optional[List[tuple]] = None,
     ) -> int:
         """Non-destructive in-place compaction for a single durable session id.
@@ -9972,7 +9993,31 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         value removes that key. Returns the new active count.
         """
 
+        if billing_provider is not None:
+            self.flush_token_counts()
+
         def _do(conn):
+            session = conn.execute(
+                "SELECT ended_at, end_reason FROM sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if session is None:
+                raise ValueError(f"Session not found: {session_id}")
+            if session["ended_at"] is not None and session["end_reason"] == "compression":
+                raise CompressionSessionClosedError(session_id)
+            if require_compression_lease:
+                lock_row = conn.execute(
+                    "SELECT holder, expires_at FROM compression_locks WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                if (
+                    lock_row is None
+                    or not compression_lock_holder
+                    or lock_row["holder"] != compression_lock_holder
+                    or float(lock_row["expires_at"]) <= time.time()
+                ):
+                    raise CompressionSessionBusyError(
+                        f"Compression lease lost before compaction: {session_id}"
+                    )
             if expected_active_fingerprint is not None:
                 current_rows = conn.execute(
                     "SELECT * FROM messages WHERE session_id = ? AND active = 1 ORDER BY id",
@@ -9982,12 +10027,23 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     raise CompressionSessionBusyError(
                         f"Durable transcript changed before compaction: {session_id}"
                     )
+            if model_config_json is not None:
+                system_prompt_hash = self._store_system_prompt(conn, system_prompt)
+                conn.execute(
+                    """UPDATE sessions SET model_config = ?,
+                       model = COALESCE(?, model), system_prompt = NULL,
+                       system_prompt_hash = ?,
+                       billing_provider = COALESCE(?, billing_provider),
+                       billing_base_url = COALESCE(?, billing_base_url),
+                       billing_mode = COALESCE(?, billing_mode) WHERE id = ?""",
+                    (
+                        model_config_json, model, system_prompt_hash,
+                        billing_provider, billing_base_url, billing_mode, session_id,
+                    ),
+                )
+                self._delete_unreferenced_system_prompts(conn)
             patched_model_config = None
             if model_config_patch is not None:
-                # on_missing="raise": a prune/compaction must not commit
-                # against a vanished session row (the compressor's caller
-                # converts the raised error into a safe keep-the-original
-                # no-op), unlike the flag setters which tolerate missing rows.
                 patched_model_config = self._merge_model_config_json(
                     conn, session_id, model_config_patch, on_missing="raise"
                 )

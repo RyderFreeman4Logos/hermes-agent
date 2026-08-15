@@ -9,6 +9,7 @@ gaps, #42228 null cwd). When the flag is False (default), rotation behaves
 exactly as before.
 """
 
+import hashlib
 import os
 import tempfile
 from pathlib import Path

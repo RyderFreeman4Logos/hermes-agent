@@ -254,6 +254,22 @@ class SessionManager:
             cwd=cwd,
             model=original.model or None,
         )
+        from agent.system_prompt import (
+            inherit_session_skills_catalog_mode,
+            restore_session_skills_catalog_mode,
+        )
+
+        parent_row = None
+        db = self._get_db()
+        if db is not None:
+            try:
+                parent_row = db.get_session(session_id)
+            except Exception:
+                logger.debug("Failed to read ACP fork parent state", exc_info=True)
+        child_model_config = inherit_session_skills_catalog_mode(
+            parent_row.get("model_config") if parent_row else None
+        )
+        restore_session_skills_catalog_mode(agent, child_model_config)
         state = SessionState(
             session_id=new_id,
             agent=agent,
@@ -265,7 +281,7 @@ class SessionManager:
         with self._lock:
             self._sessions[new_id] = state
         _register_task_cwd(new_id, cwd)
-        self._persist(state)
+        self._persist(state, initial_model_config=child_model_config)
         logger.info("Forked ACP session %s -> %s", session_id, new_id)
         return state
 
@@ -409,7 +425,12 @@ class SessionManager:
             logger.debug("SessionDB unavailable for ACP persistence", exc_info=True)
             return None
 
-    def _persist(self, state: SessionState) -> None:
+    def _persist(
+        self,
+        state: SessionState,
+        *,
+        initial_model_config: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """Write session state to the database.
 
         Creates the session record if it doesn't exist, then replaces all
@@ -431,22 +452,30 @@ class SessionManager:
             session_meta["base_url"] = base_url.strip()
         if isinstance(api_mode, str) and api_mode.strip():
             session_meta["api_mode"] = api_mode.strip()
-        cwd_json = json.dumps(session_meta)
 
         try:
             # Ensure the session record exists.
             existing = db.get_session(state.session_id)
             if existing is None:
+                create_model_config = dict(initial_model_config or {})
+                create_model_config["cwd"] = state.cwd
                 db.create_session(
                     session_id=state.session_id,
                     source="acp",
                     model=model_str,
-                    model_config={"cwd": state.cwd},
+                    model_config=create_model_config,
                 )
             else:
                 # Update model_config (contains cwd) if changed.
                 try:
-                    db.update_session_meta(state.session_id, cwd_json, model_str)
+                    merged_meta = dict(initial_model_config or {})
+                    merged_meta.update(session_meta)
+                    db.update_session_meta(
+                        state.session_id,
+                        json.dumps(merged_meta),
+                        model_str,
+                        merge_model_config=True,
+                    )
                 except Exception:
                     logger.debug("Failed to update ACP session metadata", exc_info=True)
 

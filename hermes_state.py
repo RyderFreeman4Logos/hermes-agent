@@ -6940,20 +6940,36 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         session_id: str,
         model_config_json: str,
         model: Optional[str] = None,
+        *,
+        merge_model_config: bool = False,
     ) -> None:
         """Update model_config and optionally model for an existing session.
 
         Uses COALESCE so that passing model=None leaves the stored model
         column unchanged.  Routes through _execute_write for the standard
-        BEGIN IMMEDIATE + jitter-retry + lock guarantee.
+        BEGIN IMMEDIATE + jitter-retry + lock guarantee. When
+        ``merge_model_config`` is true, merge the decoded object through the
+        shared model-config helper so unrelated session-owned fields survive.
         """
         # Barrier against queued token deltas — see update_session_model.
         self.flush_token_counts()
 
         def _do(conn):
+            effective_config = model_config_json
+            if merge_model_config:
+                try:
+                    patch = json.loads(model_config_json)
+                except (json.JSONDecodeError, TypeError):
+                    patch = {}
+                if not isinstance(patch, dict):
+                    patch = {}
+                merged = self._merge_model_config_json(conn, session_id, patch)
+                if merged is _MODEL_CONFIG_ROW_MISSING:
+                    return
+                effective_config = merged
             conn.execute(
                 "UPDATE sessions SET model_config = ?, model = COALESCE(?, model) WHERE id = ?",
-                (model_config_json, model, session_id),
+                (effective_config, model, session_id),
             )
         self._execute_write(_do)
 

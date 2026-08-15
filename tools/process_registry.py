@@ -2946,22 +2946,31 @@ def _redact_process_result(result: dict) -> dict:
 
     Mirrors the foreground ``terminal`` redaction (terminal_tool.py) so the
     two surfaces can't diverge — issue #43025 (background output was returned
-    verbatim). Respects ``security.redact_secrets`` (no force): output fields
-    pass through ``redact_terminal_output`` which picks ``code_file`` based on
-    the recorded command (env dumps get the ENV-assignment pass). The command
-    string itself is also redacted in case it carried an inline credential.
+    verbatim). This is a strict summary boundary: all output-bearing fields are
+    forced through config and URL-credential redaction regardless of the user
+    setting. The command string is also strictly redacted because it is
+    display-only here and can carry inline environment/config credentials.
     """
     if not isinstance(result, dict):
         return result
-    from agent.redact import redact_sensitive_text, redact_terminal_output
+    from agent.redact import redact_sensitive_text
 
-    command = result.get("command") or ""
     for field in ("output", "output_preview"):
         value = result.get(field)
         if isinstance(value, str) and value:
-            result[field] = redact_terminal_output(value, command)
+            result[field] = redact_sensitive_text(
+                value,
+                force=True,
+                code_file=False,
+                redact_url_credentials=True,
+            )
     if isinstance(result.get("command"), str) and result["command"]:
-        result["command"] = redact_sensitive_text(result["command"], code_file=True)
+        result["command"] = redact_sensitive_text(
+            result["command"],
+            force=True,
+            code_file=False,
+            redact_url_credentials=True,
+        )
     return result
 
 

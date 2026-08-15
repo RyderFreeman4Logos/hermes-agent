@@ -73,13 +73,15 @@ def start_attempt(
     provider: str,
     model: str,
     retry: int,
-    loop: int | None,
-    correlation: str,
+    loop: int | None = None,
+    correlation: str = "",
     scope: dict[str, str] | None = None,
+    role: str | None = None,
+    continuation: int = 0,
 ) -> Attempt | None:
     """Record an opt-in HMAC-only request identity and adjacent-loop pair."""
-    del api_mode, provider, model
-    if not enabled() or loop is None or loop < 0 or not correlation:
+    del api_mode, provider, model, role, continuation
+    if not enabled() or (loop is not None and loop < 0):
         return None
     try:
         key = _key()
@@ -100,7 +102,7 @@ def start_attempt(
         attempt = Attempt(
             digest=hmac.new(key, b"attempt\0" + secrets.token_bytes(32), hashlib.sha256).hexdigest(),
             route=_label(route),
-            loop=loop,
+            loop=0 if loop is None else loop,
             retry=max(0, int(retry)),
             correlation=correlation,
             components=components,
@@ -113,10 +115,12 @@ def start_attempt(
             "route": attempt.route,
             "loop": attempt.loop,
             "retry": attempt.retry,
+            "prefix_digest": components["prefix"],
             "digests": components,
             "byte_lengths": byte_lengths,
         })
-        _pair(attempt)
+        if loop is not None and correlation:
+            _pair(attempt)
         return attempt
     except Exception:
         return None
@@ -210,7 +214,8 @@ def _key() -> bytes:
     root = _root()
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     info = root.stat(follow_symlinks=False)
-    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+    euid = os.geteuid() if hasattr(os, "geteuid") else None
+    if not stat.S_ISDIR(info.st_mode) or (euid is not None and info.st_uid != euid):
         raise PermissionError("unsafe physical attempt diagnostics directory")
     if stat.S_IMODE(info.st_mode) != 0o700:
         root.chmod(0o700)
@@ -241,7 +246,8 @@ def _key() -> bytes:
 def _private_fd(path: Path, flags: int) -> int:
     fd = os.open(path, flags | getattr(os, "O_NOFOLLOW", 0), 0o600)
     info = os.fstat(fd)
-    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o077:
+    euid = os.geteuid() if hasattr(os, "geteuid") else None
+    if not stat.S_ISREG(info.st_mode) or (euid is not None and info.st_uid != euid) or stat.S_IMODE(info.st_mode) & 0o077:
         os.close(fd)
         raise PermissionError("unsafe physical attempt diagnostics file")
     return fd

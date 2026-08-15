@@ -196,6 +196,9 @@ def maybe_persist_tool_result(
         threshold if threshold is not None else config.resolve_threshold(tool_name)
     )
 
+    if not isinstance(content, str):
+        return content
+
     if configured_threshold == float("inf"):
         return content + history_suffix
 

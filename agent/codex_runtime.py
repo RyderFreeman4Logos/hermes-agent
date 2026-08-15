@@ -1349,8 +1349,8 @@ def _run_codex_stream(
     # Accumulate streamed text so callers / compat shims can read it.
     agent._codex_streamed_text_parts: list = []
 
-    def _stage_callback(callback: Callable[..., Any]) -> Callable[..., Any]:
-        if stage is None:
+    def _stage_callback(callback: Callable[..., Any] | None) -> Callable[..., Any] | None:
+        if stage is None or callback is None:
             return callback
 
         def _wrapped(*args):
@@ -1359,22 +1359,25 @@ def _run_codex_stream(
 
         return _wrapped
 
-    _stream_delta_callback = _stage_callback(agent._fire_stream_delta)
-    _reasoning_delta_callback = _stage_callback(agent._fire_reasoning_delta)
-    _commentary_callback = _stage_callback(agent._fire_streamed_codex_commentary)
+    _stream_delta_callback = _stage_callback(getattr(agent, "_fire_stream_delta", None))
+    _reasoning_delta_callback = _stage_callback(getattr(agent, "_fire_reasoning_delta", None))
+    _commentary_callback = _stage_callback(getattr(agent, "_fire_streamed_codex_commentary", None))
     _first_delta_callback = (
         _stage_callback(on_first_delta) if on_first_delta is not None else None
     )
 
     def _on_text_delta(text: str) -> None:
         agent._codex_streamed_text_parts.append(text)
-        _stream_delta_callback(text)
+        if _stream_delta_callback is not None:
+            _stream_delta_callback(text)
 
     def _on_reasoning_delta(text: str) -> None:
-        _reasoning_delta_callback(text)
+        if _reasoning_delta_callback is not None:
+            _reasoning_delta_callback(text)
 
     def _on_commentary_message(text: str) -> None:
-        _commentary_callback(text)
+        if _commentary_callback is not None:
+            _commentary_callback(text)
 
     def _on_event(event: Any) -> None:
         if stage is not None:

@@ -769,28 +769,6 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     tool_calls = assistant_message.tool_calls
     num_tools = len(tool_calls)
 
-    # Public/internal callers may invoke this entry directly. Re-apply the
-    # planner so identical retries cannot all launch before their results are
-    # available to the no-progress guardrail.
-    if finalize and num_tools > 1:
-        _active_env = get_active_env(effective_task_id)
-        _exec_cwd = (
-            Path(_active_env.cwd)
-            if _active_env is not None and _active_env.cwd
-            else None
-        )
-        segments = _plan_tool_batch_segments(tool_calls, execution_cwd=_exec_cwd)
-        if len(segments) != 1 or segments[0][0] != "parallel":
-            execute_tool_calls_segmented(
-                agent,
-                assistant_message,
-                messages,
-                effective_task_id,
-                api_call_count,
-                segments=segments,
-            )
-            return
-
     # Resolve the context-scaled tool-output budget once per turn (cheap, but
     # avoids rebuilding it per result inside the loop below).
     _tool_budget = _budget_for_agent(agent)
@@ -1992,7 +1970,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     spinner.stop(cute_msg)
                 elif agent._should_emit_quiet_tool_messages():
                     agent._vprint(f"  {cute_msg}")
-        elif agent._context_engine_tool_names and function_name in agent._context_engine_tool_names:
+        elif getattr(agent, "_context_engine_tool_names", None) and function_name in agent._context_engine_tool_names:
             # Context engine tools (lcm_grep, lcm_describe, lcm_expand, etc.)
             spinner = None
             if agent._should_emit_quiet_tool_messages():

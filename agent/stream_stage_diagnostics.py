@@ -137,7 +137,8 @@ def _append(record: dict[str, object]) -> None:
     root = _root()
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     info = root.stat(follow_symlinks=False)
-    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid():
+    euid = os.geteuid() if hasattr(os, "geteuid") else None
+    if not stat.S_ISDIR(info.st_mode) or (euid is not None and info.st_uid != euid):
         raise PermissionError("unsafe stream stage diagnostics directory")
     if stat.S_IMODE(info.st_mode) != 0o700:
         root.chmod(0o700)
@@ -147,9 +148,10 @@ def _append(record: dict[str, object]) -> None:
     fd = os.open(path, flags, 0o600)
     try:
         info = os.fstat(fd)
+        euid = os.geteuid() if hasattr(os, "geteuid") else None
         if (
             not stat.S_ISREG(info.st_mode)
-            or info.st_uid != os.geteuid()
+            or (euid is not None and info.st_uid != euid)
             or stat.S_IMODE(info.st_mode) & 0o077
         ):
             raise PermissionError("unsafe stream stage diagnostics file")

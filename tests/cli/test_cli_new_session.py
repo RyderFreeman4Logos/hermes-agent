@@ -175,12 +175,21 @@ def test_new_command_creates_real_fresh_session_and_resets_agent_state(tmp_path)
     cli.agent._invalidate_system_prompt.assert_called_once()
 
 
-def test_new_command_drops_previous_session_catalog_mode(tmp_path):
+def test_new_command_uses_current_catalog_mode_config(tmp_path, monkeypatch):
     from agent.system_prompt import (
         _session_skills_catalog_mode,
         restore_session_skills_catalog_mode,
     )
+    from hermes_cli.config import load_config_readonly
     from run_agent import AIAgent
+
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    config_path = hermes_home / "config.yaml"
+    config_path.write_text(
+        "agent:\n  skills_catalog_mode: compact\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
 
     cli = _prepare_cli_with_active_session(tmp_path)
     agent = cli.agent
@@ -189,11 +198,16 @@ def test_new_command_drops_previous_session_catalog_mode(tmp_path):
         AIAgent._transition_context_engine_session.__get__(agent)
     )
     agent._session_init_model_config = {}
-    agent._skills_catalog_mode_config = "full"
+    agent._skills_catalog_mode_config = load_config_readonly()["agent"][
+        "skills_catalog_mode"
+    ]
     assert restore_session_skills_catalog_mode(
         agent, {"_skills_catalog_mode": "compact"}
     )
     assert _session_skills_catalog_mode(agent) == "compact"
+
+    config_path.write_text("agent:\n  skills_catalog_mode: full\n", encoding="utf-8")
+    assert load_config_readonly()["agent"]["skills_catalog_mode"] == "full"
 
     cli.process_command("/new")
 

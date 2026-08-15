@@ -499,13 +499,18 @@ def _seed_hygiene_system_prompt(
     The hygiene helper intentionally skips memory-provider initialization.
     Compression is allowed to persist a system prompt, so letting that helper
     rebuild one would strip external provider blocks from the live session.
-    Seed the exact persisted prompt instead.  When no usable prompt can be
-    restored, seed an empty cache entry.  Compression either preserves that
-    unusable value or rebuilds with the hygiene-only platform marker; the real
-    turn will rebuild either form with its fully initialized providers.
+    Seed the exact persisted prompt instead, along with the session-frozen skills
+    catalog mode that a rotation child publishes as structured model config.
+    When no usable prompt can be restored, seed an empty cache entry. Compression
+    either preserves that unusable value or rebuilds with the hygiene-only
+    platform marker; the real turn will rebuild either form with its fully
+    initialized providers.
     """
     stored_prompt = ""
     if isinstance(session_row, dict):
+        from agent.system_prompt import restore_session_skills_catalog_mode
+
+        restore_session_skills_catalog_mode(agent, session_row.get("model_config"))
         raw_prompt = session_row.get("system_prompt")
         if isinstance(raw_prompt, str) and raw_prompt.strip():
             stored_prompt = raw_prompt

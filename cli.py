@@ -9112,6 +9112,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self.agent.session_id = self.session_id
             self.agent.session_start = self.session_start
             self.agent.reasoning_config = self.reasoning_config
+            try:
+                from hermes_cli.config import load_config_readonly
+
+                live_agent_config = load_config_readonly().get("agent", {})
+                self.agent._skills_catalog_mode_config = (
+                    live_agent_config.get("skills_catalog_mode", "full")
+                    if isinstance(live_agent_config, dict)
+                    else "full"
+                )
+            except Exception:
+                self.agent._skills_catalog_mode_config = "full"
+                logger.debug("/new catalog mode refresh failed", exc_info=True)
             self.agent.reset_session_state()
             if hasattr(self.agent, "_last_flushed_db_idx"):
                 self.agent._last_flushed_db_idx = 0

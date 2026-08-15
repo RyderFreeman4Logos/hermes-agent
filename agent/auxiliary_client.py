@@ -4462,6 +4462,7 @@ def _evict_cached_client_instance(target: Any) -> bool:
     """
     if target is None:
         return False
+    target = getattr(target, "_real_client", target)
     evicted = False
     with _client_cache_lock:
         for key in list(_client_cache.keys()):
@@ -4683,6 +4684,7 @@ async def _retry_same_provider_async(
     resolved_base_url: Optional[str],
     resolved_api_key: Optional[str],
     resolved_api_mode: Optional[str],
+    main_runtime: Optional[Dict[str, Any]],
     final_model: Optional[str],
     messages: list,
     temperature: Optional[float],
@@ -4700,6 +4702,7 @@ async def _retry_same_provider_async(
             base_url=resolved_base_url,
             api_key=resolved_api_key,
             async_mode=True,
+            main_runtime=main_runtime,
         )
     else:
         retry_client, retry_model = _get_cached_client(
@@ -4709,6 +4712,7 @@ async def _retry_same_provider_async(
             base_url=resolved_base_url,
             api_key=resolved_api_key,
             api_mode=resolved_api_mode,
+            main_runtime=main_runtime,
         )
         effective_provider = _effective_provider_for_client(
             retry_client, resolved_provider,
@@ -5029,6 +5033,7 @@ def _call_fallback_candidate_sync(
     effective_timeout: float,
     effective_extra_body: dict,
     reasoning_config: Optional[dict],
+    refresh_auth: bool = True,
 ) -> Optional[Any]:
     """Call one fallback candidate with stale-credential recovery.
 
@@ -5081,7 +5086,7 @@ def _call_fallback_candidate_sync(
             task,
         )
     except Exception as fb_err:
-        if not _is_auth_error(fb_err):
+        if not _is_auth_error(fb_err) or not refresh_auth:
             raise
         fb_provider = _auth_refresh_provider_for_route(
             destination.provider, destination.base_url
@@ -5154,6 +5159,7 @@ async def _call_fallback_candidate_async(
     effective_timeout: float,
     effective_extra_body: dict,
     reasoning_config: Optional[dict],
+    refresh_auth: bool = True,
 ) -> Optional[Any]:
     """Async mirror of :func:`_call_fallback_candidate_sync`."""
     fb_timeout = _fallback_entry_timeout(task, fb_label)
@@ -5187,7 +5193,7 @@ async def _call_fallback_candidate_async(
             task,
         )
     except Exception as fb_err:
-        if not _is_auth_error(fb_err):
+        if not _is_auth_error(fb_err) or not refresh_auth:
             raise
         fb_provider = _auth_refresh_provider_for_route(
             destination.provider, destination.base_url
@@ -5468,6 +5474,7 @@ def _try_configured_fallback_chain(
     failed_provider: str,
     reason: str = "error",
     failed_model: Optional[str] = None,
+    start_index: int = 0,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Try user-configured fallback_chain for a specific auxiliary task.
 
@@ -5526,7 +5533,7 @@ def _try_configured_fallback_chain(
     tried = []
     min_ctx = _task_minimum_context_length(task)
 
-    for i, entry in enumerate(chain):
+    for i, entry in enumerate(chain[start_index:], start=start_index):
         if not isinstance(entry, dict):
             continue
         fb_provider = str(entry.get("provider", "")).strip()
@@ -5580,6 +5587,192 @@ def _try_configured_fallback_chain(
             task, ", ".join(tried),
         )
     return None, None, ""
+
+
+def _configured_fallback_allows(task_config: Dict[str, Any], exc: Exception) -> bool:
+    fallback_on = task_config.get("fallback_on")
+    if fallback_on is None:
+        return True
+    body = getattr(exc, "body", None)
+    layers = (body, body.get("error")) if isinstance(body, dict) else ()
+    return "quota_exhausted" in fallback_on and any(
+        isinstance(layer, dict)
+        and any(
+            str(layer.get(field, "")).lower()
+            in {"insufficient_quota", "quota_exhausted", "usage_limit_reached"}
+            for field in ("code", "type", "reason")
+        )
+        for layer in layers
+    )
+
+
+def _recover_configured_hop(
+    provider: str,
+    client: Any,
+    exc: Exception,
+    *,
+    main_runtime: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Reuse the existing auth refresh and credential-pool rotation paths."""
+    if _is_auth_error(exc):
+        auth_provider = _auth_refresh_provider_for_route(
+            provider, str(getattr(client, "base_url", "") or "")
+        )
+        if (
+            auth_provider not in {"auto", "", None}
+            and _refresh_provider_credentials(auth_provider)
+        ):
+            if auth_provider != _normalize_aux_provider(provider):
+                _evict_cached_clients(provider)
+            return auth_provider
+    pool_provider = _recoverable_pool_provider(
+        provider, client, main_runtime=main_runtime
+    )
+    if pool_provider and _recover_provider_pool(
+        pool_provider,
+        exc,
+        failed_api_key=str(getattr(client, "api_key", "") or ""),
+    ):
+        return provider
+    return None
+
+
+def _try_configured_fallbacks_sync(
+    task: Optional[str],
+    *,
+    messages: list,
+    temperature: Optional[float],
+    max_tokens: Optional[int],
+    tools: Optional[list],
+    effective_timeout: float,
+    effective_extra_body: dict,
+    reasoning_config: Optional[dict],
+) -> Optional[Any]:
+    start_index = 0
+    chain = _get_auxiliary_task_config(task).get("fallback_chain") or []
+    while True:
+        client, model, label = _try_configured_fallback_chain(
+            task, "", reason="request failure", start_index=start_index
+        )
+        if client is None:
+            return None
+        match = re.match(r"fallback_chain\[(\d+)\]", label)
+        if match is None:
+            return None
+        entry_index = int(match.group(1))
+        start_index = entry_index + 1
+        entry = chain[entry_index]
+        recovery_attempted = False
+        for attempt in range(3):
+            try:
+                response = _call_fallback_candidate_sync(
+                    client,
+                    model,
+                    label,
+                    task=task,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    tools=tools,
+                    effective_timeout=effective_timeout,
+                    effective_extra_body=effective_extra_body,
+                    reasoning_config=reasoning_config,
+                    refresh_auth=False,
+                )
+                if response is not None:
+                    return response
+                break
+            except Exception as exc:
+                if attempt == 2:
+                    continue
+                should_recover = (
+                    _is_auth_error(exc)
+                    or _is_payment_error(exc)
+                    or (_is_rate_limit_error(exc) and attempt > 0)
+                )
+                retry_provider = None
+                if should_recover and not recovery_attempted:
+                    recovery_attempted = True
+                    retry_provider = _recover_configured_hop(
+                        str(entry.get("provider") or "").strip(), client, exc
+                    )
+                if retry_provider:
+                    client, model = _resolve_fallback_entry(entry)
+                    if client is None:
+                        break
+        _evict_cached_client_instance(client)
+
+
+async def _try_configured_fallbacks_async(
+    task: Optional[str],
+    *,
+    messages: list,
+    temperature: Optional[float],
+    max_tokens: Optional[int],
+    tools: Optional[list],
+    effective_timeout: float,
+    effective_extra_body: dict,
+    reasoning_config: Optional[dict],
+) -> Optional[Any]:
+    start_index = 0
+    chain = _get_auxiliary_task_config(task).get("fallback_chain") or []
+    while True:
+        client, model, label = _try_configured_fallback_chain(
+            task, "", reason="request failure", start_index=start_index
+        )
+        if client is None:
+            return None
+        match = re.match(r"fallback_chain\[(\d+)\]", label)
+        if match is None:
+            return None
+        entry_index = int(match.group(1))
+        start_index = entry_index + 1
+        entry = chain[entry_index]
+        client, model = _to_async_client(
+            client, model or "", is_vision=(task == "vision")
+        )
+        recovery_attempted = False
+        for attempt in range(3):
+            try:
+                response = await _call_fallback_candidate_async(
+                    client,
+                    model,
+                    label,
+                    task=task,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    tools=tools,
+                    effective_timeout=effective_timeout,
+                    effective_extra_body=effective_extra_body,
+                    reasoning_config=reasoning_config,
+                    refresh_auth=False,
+                )
+                if response is not None:
+                    return response
+                break
+            except Exception as exc:
+                if attempt == 2:
+                    continue
+                should_recover = (
+                    _is_auth_error(exc)
+                    or _is_payment_error(exc)
+                    or (_is_rate_limit_error(exc) and attempt > 0)
+                )
+                retry_provider = None
+                if should_recover and not recovery_attempted:
+                    recovery_attempted = True
+                    retry_provider = _recover_configured_hop(
+                        str(entry.get("provider") or "").strip(), client, exc
+                    )
+                if retry_provider:
+                    client, model = _resolve_fallback_entry(entry)
+                    if client is None:
+                        break
+                    client, model = _to_async_client(
+                        client, model or "", is_vision=(task == "vision")
+                    )
+        _evict_cached_client_instance(client)
 
 
 def _try_configured_fallback_for_unavailable_client(
@@ -9214,6 +9407,8 @@ def _call_llm_impl(
     # concurrent /model switch produce a key for one runtime and a client for
     # another.
     main_runtime = _normalize_main_runtime(main_runtime)
+    task_config = _get_auxiliary_task_config(task or "")
+    configured_chain = task_config.get("fallback_chain")
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
     if api_mode:
@@ -9367,6 +9562,7 @@ def _call_llm_impl(
 
     # Handle unsupported temperature, max_tokens vs max_completion_tokens retry,
     # then payment fallback.
+    original_primary_err = None
     try:
         # Retry on the same provider for a transient transport blip
         # (connection reset / streaming-close / incomplete chunked read / 5xx /
@@ -9403,6 +9599,76 @@ def _call_llm_impl(
                 task,
                 provider=request_provider, base_url=_base_info)
         except Exception as transient_err:
+            if configured_chain:
+                original_primary_err = transient_err
+                last_configured_err = transient_err
+                configured_retry_provider = None
+                recovery_attempted = False
+                if _is_auth_error(transient_err) or _is_payment_error(transient_err):
+                    recovery_attempted = True
+                    configured_retry_provider = _recover_configured_hop(
+                        resolved_provider,
+                        client,
+                        transient_err,
+                        main_runtime=main_runtime,
+                    )
+                for _attempt in range(2):
+                    try:
+                        if configured_retry_provider:
+                            return _retry_same_provider_sync(
+                                task=task,
+                                resolved_provider=configured_retry_provider,
+                                resolved_model=resolved_model or final_model,
+                                resolved_base_url=resolved_base_url,
+                                resolved_api_key=resolved_api_key,
+                                resolved_api_mode=resolved_api_mode,
+                                main_runtime=main_runtime,
+                                final_model=final_model,
+                                messages=messages,
+                                temperature=temperature,
+                                max_tokens=max_tokens,
+                                tools=tools,
+                                effective_timeout=effective_timeout,
+                                effective_extra_body=effective_extra_body,
+                                reasoning_config=reasoning_config,
+                                extra_headers=extra_headers,
+                            )
+                        return _validate_llm_response(
+                            _relay_sync_completion(
+                                client,
+                                kwargs,
+                                provider=request_provider,
+                                api_mode=resolved_api_mode,
+                                create=lambda request: _create_with_progress(
+                                    client,
+                                    request,
+                                    task,
+                                    force_stream=_provider_requires_stream(
+                                        request_provider,
+                                        _base_info or resolved_base_url,
+                                    ),
+                                ),
+                            ),
+                            task,
+                        )
+                    except Exception as retry_err:
+                        last_configured_err = retry_err
+                        if (
+                            not recovery_attempted
+                            and (
+                                _is_auth_error(retry_err)
+                                or _is_payment_error(retry_err)
+                                or _is_rate_limit_error(retry_err)
+                            )
+                        ):
+                            recovery_attempted = True
+                            configured_retry_provider = _recover_configured_hop(
+                                resolved_provider,
+                                client,
+                                retry_err,
+                                main_runtime=main_runtime,
+                            )
+                raise last_configured_err
             if not _is_transient_transport_error(transient_err):
                 raise
             # Compression is on the critical preflight path: a user cannot
@@ -9456,6 +9722,31 @@ def _call_llm_impl(
             # Retries exhausted — fall through to first_err fallback handling.
             raise _last_transient
     except Exception as first_err:
+        if configured_chain:
+            original_primary_err = original_primary_err or first_err
+            if (
+                _is_connection_error(original_primary_err)
+                or _is_payment_error(original_primary_err)
+                or _is_rate_limit_error(original_primary_err)
+                or _is_connection_error(first_err)
+                or _is_payment_error(first_err)
+                or _is_rate_limit_error(first_err)
+            ):
+                _evict_cached_client_instance(client)
+            if _configured_fallback_allows(task_config, original_primary_err):
+                response = _try_configured_fallbacks_sync(
+                    task,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    tools=tools,
+                    effective_timeout=effective_timeout,
+                    effective_extra_body=effective_extra_body,
+                    reasoning_config=reasoning_config,
+                )
+                if response is not None:
+                    return response
+            raise original_primary_err
         if "temperature" in kwargs and _is_unsupported_temperature_error(first_err):
             retry_kwargs = dict(kwargs)
             retry_kwargs.pop("temperature", None)
@@ -10006,6 +10297,8 @@ async def _async_call_llm_impl(
     # Keep every async phase on the same runtime identity, even if another
     # session switches models while this task is awaiting network I/O.
     main_runtime = _normalize_main_runtime(main_runtime)
+    task_config = _get_auxiliary_task_config(task or "")
+    configured_chain = task_config.get("fallback_chain")
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
     effective_extra_body = _get_task_extra_body(task)
@@ -10113,6 +10406,7 @@ async def _async_call_llm_impl(
     if _is_anthropic_compat_endpoint(request_provider, _client_base):
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
 
+    original_primary_err = None
     try:
         # Retry ONCE on the same provider for a transient transport blip
         # before the except-chain escalates to fallback — see call_llm()
@@ -10145,6 +10439,67 @@ async def _async_call_llm_impl(
                 task,
                 provider=request_provider, base_url=_client_base)
         except Exception as transient_err:
+            if configured_chain:
+                original_primary_err = transient_err
+                last_configured_err = transient_err
+                configured_retry_provider = None
+                recovery_attempted = False
+                if _is_auth_error(transient_err) or _is_payment_error(transient_err):
+                    recovery_attempted = True
+                    configured_retry_provider = _recover_configured_hop(
+                        resolved_provider,
+                        client,
+                        transient_err,
+                        main_runtime=main_runtime,
+                    )
+                for _attempt in range(2):
+                    try:
+                        if configured_retry_provider:
+                            return await _retry_same_provider_async(
+                                task=task,
+                                resolved_provider=configured_retry_provider,
+                                resolved_model=resolved_model or final_model,
+                                resolved_base_url=resolved_base_url,
+                                resolved_api_key=resolved_api_key,
+                                resolved_api_mode=resolved_api_mode,
+                                main_runtime=main_runtime,
+                                final_model=final_model,
+                                messages=messages,
+                                temperature=temperature,
+                                max_tokens=max_tokens,
+                                tools=tools,
+                                effective_timeout=effective_timeout,
+                                effective_extra_body=effective_extra_body,
+                                reasoning_config=reasoning_config,
+                            )
+                        return _validate_llm_response(
+                            await _relay_async_completion(
+                                client,
+                                kwargs,
+                                provider=request_provider,
+                                api_mode=resolved_api_mode,
+                                create=_acreate,
+                            ),
+                            task,
+                        )
+                    except Exception as retry_err:
+                        last_configured_err = retry_err
+                        if (
+                            not recovery_attempted
+                            and (
+                                _is_auth_error(retry_err)
+                                or _is_payment_error(retry_err)
+                                or _is_rate_limit_error(retry_err)
+                            )
+                        ):
+                            recovery_attempted = True
+                            configured_retry_provider = _recover_configured_hop(
+                                resolved_provider,
+                                client,
+                                retry_err,
+                                main_runtime=main_runtime,
+                            )
+                raise last_configured_err
             if not _is_transient_transport_error(transient_err):
                 raise
             # See call_llm(): compression is on the critical preflight path,
@@ -10172,6 +10527,31 @@ async def _async_call_llm_impl(
                 ),
                 task)
     except Exception as first_err:
+        if configured_chain:
+            original_primary_err = original_primary_err or first_err
+            if (
+                _is_connection_error(original_primary_err)
+                or _is_payment_error(original_primary_err)
+                or _is_rate_limit_error(original_primary_err)
+                or _is_connection_error(first_err)
+                or _is_payment_error(first_err)
+                or _is_rate_limit_error(first_err)
+            ):
+                _evict_cached_client_instance(client)
+            if _configured_fallback_allows(task_config, original_primary_err):
+                response = await _try_configured_fallbacks_async(
+                    task,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    tools=tools,
+                    effective_timeout=effective_timeout,
+                    effective_extra_body=effective_extra_body,
+                    reasoning_config=reasoning_config,
+                )
+                if response is not None:
+                    return response
+            raise original_primary_err
         if "temperature" in kwargs and _is_unsupported_temperature_error(first_err):
             retry_kwargs = dict(kwargs)
             retry_kwargs.pop("temperature", None)
@@ -10352,6 +10732,7 @@ async def _async_call_llm_impl(
                     resolved_base_url=resolved_base_url,
                     resolved_api_key=resolved_api_key,
                     resolved_api_mode=resolved_api_mode,
+                    main_runtime=main_runtime,
                     final_model=final_model,
                     messages=messages,
                     temperature=temperature,
@@ -10395,6 +10776,7 @@ async def _async_call_llm_impl(
                         resolved_base_url=resolved_base_url,
                         resolved_api_key=resolved_api_key,
                         resolved_api_mode=resolved_api_mode,
+                        main_runtime=main_runtime,
                         final_model=final_model,
                         messages=messages,
                         temperature=temperature,

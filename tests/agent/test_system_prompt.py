@@ -403,3 +403,26 @@ class TestSkillsInVolatileBand:
         full = _build(build_system_prompt)
         assert full.index(_CONTEXT) < full.index(_SKILLS)
         assert full.index(_SKILLS) < full.index("Conversation started:")
+
+
+class TestSkillsCatalogMode:
+    def test_catalog_mode_freezes_after_first_resolution(self):
+        from agent.system_prompt import _session_skills_catalog_mode
+        from hermes_cli.config import DEFAULT_CONFIG, _validate_config_key
+
+        assert DEFAULT_CONFIG["agent"]["skills_catalog_mode"] == "full"
+        assert _validate_config_key("agent.skills_catalog_mode") == (True, None)
+        agent = _make_agent(_skills_catalog_mode_config="compact")
+        assert _session_skills_catalog_mode(agent) == "compact"
+        agent._skills_catalog_mode_config = "full"
+        assert _session_skills_catalog_mode(agent) == "compact"
+
+    def test_invalid_structured_catalog_mode_fails_closed(self):
+        from agent.system_prompt import restore_session_skills_catalog_mode
+
+        agent = _make_agent(_session_init_model_config={})
+        assert restore_session_skills_catalog_mode(
+            agent, {"_skills_catalog_mode": "forged"}
+        )
+        assert agent._skills_catalog_mode == "full"
+        assert agent._session_init_model_config["_skills_catalog_mode"] == "full"

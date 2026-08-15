@@ -1699,6 +1699,12 @@ def init_agent(
         _agent_cfg = _load_agent_config()
     except Exception:
         _agent_cfg = {}
+    _agent_section = _agent_cfg.get("agent") if isinstance(_agent_cfg, dict) else None
+    agent._skills_catalog_mode_config = (
+        _agent_section.get("skills_catalog_mode", "full")
+        if isinstance(_agent_section, dict)
+        else "full"
+    )
 
     # Codex commentary visibility (display.show_commentary, default true).
     # When true, completed Codex phase=commentary messages are delivered as

@@ -429,21 +429,6 @@ def _(rid, params: dict) -> dict:
                     raise
                 return read(target)
 
-        def _bounded_ancestor_display_prefix(display_history, raw_history):
-            """Keep the bounded display-only ancestor tail for later /branch."""
-            tip_row_ids = {
-                message.get("_row_id")
-                for message in raw_history
-                if isinstance(message, dict) and message.get("_row_id") is not None
-            }
-            if not tip_row_ids:
-                return []
-            return [
-                message
-                for message in display_history
-                if message.get("_row_id") not in tip_row_ids
-            ]
-
         profile_resume_cwd = str(found.get("cwd") or "").strip() or _profile_configured_cwd(
             profile_home
         )
@@ -598,9 +583,6 @@ def _(rid, params: dict) -> dict:
             # dangling/interrupted tool-call tail so a session killed mid-loop does
             # not replay the unanswered call forever (#29086).
             history = sanitize_replay_history(raw_history)
-            display_history_prefix = _bounded_ancestor_display_prefix(
-                display_history, raw_history
-            )
             # Restore the model/provider/reasoning/tier this chat last used so the
             # deferred build (and the info below) match the eager path — without them
             # the build drops the provider ("No LLM provider configured").
@@ -615,7 +597,7 @@ def _(rid, params: dict) -> dict:
                 lease=lease,
                 source=source,
                 close_on_disconnect=is_truthy_value(params.get("close_on_disconnect", False)),
-                display_history_prefix=display_history_prefix,
+                display_history=display_history,
                 display_history_limit=resume_limit or None,
                 profile_home=profile_home,
                 model_override=overrides.get("model_override"),
@@ -692,9 +674,6 @@ def _(rid, params: dict) -> dict:
             # session in #29086.  The messaging gateway already strips this; this is
             # the WebUI/TUI resume path picking up the same cleanup.
             history = sanitize_replay_history(raw_history)
-            display_history_prefix = _bounded_ancestor_display_prefix(
-                display_history, raw_history
-            )
             messages = [] if omit_messages else _history_to_messages(display_history)
             tokens = _set_session_context(target)
             try:
@@ -804,7 +783,7 @@ def _(rid, params: dict) -> dict:
                             "model_override"
                         ]
                     _sessions[sid]["display_history_limit"] = resume_limit or None
-                    _sessions[sid]["display_history_prefix"] = display_history_prefix
+                    _sessions[sid]["display_history"] = display_history
                     # Remember the profile home so each turn re-binds HERMES_HOME (the
                     # agent persists to its own db, but mid-turn home reads — memory,
                     # skills — must resolve to the resumed profile too).
@@ -2878,11 +2857,10 @@ def _(rid, params: dict) -> dict:
             return _db_unavailable_error(rid, code=5008)
         old_key = session["session_key"]
         with session["history_lock"]:
-            in_memory_history = [
-                dict(msg)
-                for msg in list(session.get("display_history_prefix") or []) + list(session.get("history", []))
-                if isinstance(msg, dict)
-            ]
+            in_memory_history = _reconcile_display_with_live(
+                list(session.get("display_history") or []),
+                list(session.get("history") or []),
+            )
 
         def _visible_branch_history(messages):
             visible = []
@@ -2906,7 +2884,13 @@ def _(rid, params: dict) -> dict:
         get_resume_conversations = getattr(db, "get_resume_conversations", None)
         if callable(get_resume_conversations):
             try:
-                _, display_history = get_resume_conversations(old_key)
+                display_limit = session.get("display_history_limit")
+                if display_limit:
+                    _, display_history = get_resume_conversations(
+                        old_key, max_display_messages=display_limit
+                    )
+                else:
+                    _, display_history = get_resume_conversations(old_key)
                 display_history = _reconcile_display_with_live(display_history, in_memory_history)
                 history = _visible_branch_history(display_history)
             except Exception:

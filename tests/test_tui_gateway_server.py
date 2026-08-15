@@ -3566,6 +3566,12 @@ def test_session_resume_bounds_compression_display_without_truncating_model_hist
     db.end_session("root", "compression")
     db.create_session("tip", source="tui", parent_session_id="root")
     db.append_message("tip", role="user", content="tip prompt")
+    db.append_message(
+        "tip",
+        role="assistant",
+        content="verification candidate",
+        finish_reason="verification_required",
+    )
     db.append_message("tip", role="assistant", content="tip reply")
     expected_model_history = db.get_messages_as_conversation(
         "tip", repair_alternation=True, include_row_ids=True
@@ -3607,9 +3613,7 @@ def test_session_resume_bounds_compression_display_without_truncating_model_hist
         )
         runtime_sid = response.get("result", {}).get("session_id")
         if runtime_sid:
-            captured["display_history_prefix"] = server._sessions[runtime_sid][
-                "display_history_prefix"
-            ]
+            captured["display_history"] = server._sessions[runtime_sid]["display_history"]
     finally:
         if runtime_sid:
             server._sessions.pop(runtime_sid, None)
@@ -3617,12 +3621,14 @@ def test_session_resume_bounds_compression_display_without_truncating_model_hist
 
     assert "error" not in response, response
     assert captured["history"] == expected_model_history
-    assert [message["content"] for message in captured["display_history_prefix"]] == [
-        "old-3"
+    assert [message["content"] for message in captured["display_history"]] == [
+        "tip prompt",
+        "verification candidate",
+        "tip reply",
     ]
     assert [message["text"] for message in response["result"]["messages"]] == [
-        "old-3",
         "tip prompt",
+        "verification candidate",
         "tip reply",
     ]
 
@@ -13700,8 +13706,9 @@ def test_session_branch_uses_persisted_display_history_after_compaction(monkeypa
         def get_next_title_in_lineage(self, current):
             return f"{current} (branch)"
 
-        def get_resume_conversations(self, key):
+        def get_resume_conversations(self, key, *, max_display_messages=None):
             assert key == "parent-key"
+            seen["branch_display_limit"] = max_display_messages
             # The model projection has already been compacted to a summary + tail;
             # the display projection still contains every visible turn.
             return (
@@ -13745,6 +13752,7 @@ def test_session_branch_uses_persisted_display_history_after_compaction(monkeypa
             {"role": "user", "content": "second question"},
             {"role": "assistant", "content": "second answer"},
         ],
+        "display_history_limit": 4,
         "history_lock": threading.Lock(),
         "running": False,
         "cols": 80,
@@ -13789,6 +13797,7 @@ def test_session_branch_uses_persisted_display_history_after_compaction(monkeypa
             "second question",
             "second answer",
         ]
+        assert seen["branch_display_limit"] == 4
     finally:
         for key in list(server._sessions):
             server._sessions.pop(key, None)

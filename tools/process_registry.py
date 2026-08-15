@@ -2394,6 +2394,17 @@ class ProcessRegistry:
         """
         return not self.completion_event_should_deliver(evt)
 
+    @staticmethod
+    def _is_routine_delegated_child_completion(evt: dict) -> bool:
+        """Whether a completed native-child command needs no parent turn."""
+        return (
+            evt.get("type") == "completion"
+            and evt.get("delegated_child") is True
+            and evt.get("exit_code") == 0
+            and evt.get("completion_reason", "exited") == "exited"
+            and not evt.get("termination_source")
+        )
+
     def drain_notifications(
         self,
         session_key: str = "",
@@ -3650,6 +3661,9 @@ def format_process_notification(evt: dict) -> "str | None":
 
     if evt_type == "async_delegation":
         return _format_async_delegation(evt)
+
+    if ProcessRegistry._is_routine_delegated_child_completion(evt):
+        return None
 
     _exit = evt.get("exit_code", "?")
     _out = evt.get("output", "")

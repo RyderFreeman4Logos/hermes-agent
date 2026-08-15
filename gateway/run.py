@@ -25301,6 +25301,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "completion_reason": getattr(session, "completion_reason", "exited"),
                         "termination_source": getattr(session, "termination_source", ""),
                         "output": _out,
+                        "delegated_child": getattr(session, "delegated_child", False),
                         # Spawning conversation's session-db id (stamped at
                         # spawn time in terminal_tool). Lets the delivery
                         # pre-flight drop this completion when the user closed

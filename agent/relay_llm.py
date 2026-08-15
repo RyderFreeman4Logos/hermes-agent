@@ -8,6 +8,7 @@ import inspect
 import json
 import logging
 from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import Any
 
@@ -36,11 +37,12 @@ def _attempt_loop(metadata: dict[str, Any] | None) -> tuple[int | None, str]:
 
 
 def _record_attempt(
-    request: dict[str, Any], *, name: str, model_name: str, metadata: dict[str, Any] | None
-) -> None:
+    request: dict[str, Any], *, name: str, model_name: str,
+    metadata: dict[str, Any] | None, streamed: bool = False,
+):
     scope = physical_attempt_diagnostics.take_cache_scope(request)
     loop, correlation = _attempt_loop(metadata)
-    physical_attempt_diagnostics.start_attempt(
+    return physical_attempt_diagnostics.start_attempt(
         request,
         api_mode=str((metadata or {}).get("api_mode") or "unknown"),
         route=str((metadata or {}).get("api_mode") or "unknown"),
@@ -50,23 +52,144 @@ def _record_attempt(
         loop=loop,
         correlation=correlation,
         scope=scope,
+        streamed=streamed,
     )
+
+
+def _field(value: Any, name: str) -> Any:
+    try:
+        return value.get(name) if isinstance(value, dict) else getattr(value, name, None)
+    except Exception:
+        return None
+
+
+def _response_usage(response: Any) -> Any:
+    return _field(response, "usage")
+
+
+def _stream_usage(current: Any, chunk: Any) -> Any:
+    try:
+        usage = _response_usage(chunk)
+        if usage is None:
+            usage = _field(_field(chunk, "message"), "usage")
+        if usage is None:
+            bedrock = _field(_field(chunk, "metadata"), "usage")
+            if isinstance(bedrock, dict):
+                from agent.bedrock_adapter import _normalize_converse_usage
+
+                usage = _normalize_converse_usage(bedrock)
+        return usage if usage is not None else current
+    except Exception:
+        return current
+
+
+def _attempt_tracker(
+    request: dict[str, Any], *, name: str, model_name: str,
+    metadata: dict[str, Any] | None, streamed: bool = False,
+) -> dict[str, Any]:
+    return {
+        "attempt": _record_attempt(
+            request,
+            name=name,
+            model_name=model_name,
+            metadata=metadata,
+            streamed=streamed,
+        ),
+        "usage": None,
+        "name": name,
+        "metadata": metadata,
+        "finished": False,
+    }
+
+
+def _ambiguity_class(error: BaseException) -> str | None:
+    value = str(getattr(error, "timeout_class", "") or "").lower()
+    if value in {
+        "ttfb_timeout", "sse_idle_timeout", "no_progress_timeout",
+        "total_request_timeout", "missing_terminal",
+    }:
+        return value
+    text = str(error).lower()
+    if "ttfb" in text or "no bytes" in text:
+        return "ttfb_timeout"
+    if "sse" in text and ("idle" in text or "stale" in text):
+        return "sse_idle_timeout"
+    if "missing terminal" in text or "incomplete" in text:
+        return "missing_terminal"
+    if isinstance(error, (TimeoutError, ConnectionError)):
+        return "transport"
+    return None
+
+
+def _finish_tracker(
+    tracker: dict[str, Any], outcome: str, *, response: Any = None,
+    error: BaseException | None = None,
+) -> None:
+    if tracker["finished"]:
+        return
+    tracker["finished"] = True
+    try:
+        attempt = tracker["attempt"]
+        if error is not None and (failure_class := _ambiguity_class(error)) is not None:
+            physical_attempt_diagnostics.record_ambiguity(
+                attempt, failure_class=failure_class
+            )
+            physical_attempt_diagnostics.record_reconciliation(attempt, action="halt")
+        physical_attempt_diagnostics.finish_attempt(
+            attempt,
+            usage=tracker["usage"] if tracker["usage"] is not None else _response_usage(response),
+            outcome=outcome,
+            api_mode=str((tracker["metadata"] or {}).get("api_mode") or "unknown"),
+            provider=tracker["name"],
+        )
+    except Exception:
+        return
+
+
+@contextmanager
+def _physical_attempt_context(tracker: dict[str, Any]) -> Iterator[None]:
+    physical_attempt_diagnostics.mark_dispatch(tracker["attempt"])
+    physical_attempt_diagnostics.record_checkpoint(
+        tracker["attempt"], checkpoint="dispatch"
+    )
+    try:
+        yield
+    finally:
+        pass
 
 
 def _execute_attempt(
     request: dict[str, Any], callback: Callable[[dict[str, Any]], Any], *, name: str,
     model_name: str, metadata: dict[str, Any] | None,
 ) -> Any:
-    _record_attempt(request, name=name, model_name=model_name, metadata=metadata)
-    return callback(request)
+    tracker = _attempt_tracker(
+        request, name=name, model_name=model_name, metadata=metadata
+    )
+    try:
+        with _physical_attempt_context(tracker):
+            response = callback(request)
+    except BaseException as exc:
+        _finish_tracker(tracker, "error", error=exc)
+        raise
+    _finish_tracker(tracker, "completed", response=response)
+    return response
 
 
 async def _execute_attempt_async(
     request: dict[str, Any], callback: Callable[[dict[str, Any]], Any], *, name: str,
     model_name: str, metadata: dict[str, Any] | None,
 ) -> Any:
-    _record_attempt(request, name=name, model_name=model_name, metadata=metadata)
-    return await callback(request)
+    tracker = _attempt_tracker(
+        request, name=name, model_name=model_name, metadata=metadata
+    )
+    try:
+        with _physical_attempt_context(tracker):
+            response = await callback(request)
+    except BaseException as exc:
+        _finish_tracker(tracker, "error", error=exc)
+        raise
+    _finish_tracker(tracker, "completed", response=response)
+    return response
 
 
 def _request_with_cache_scope(request: dict[str, Any], session_id: str) -> dict[str, Any]:
@@ -483,6 +606,14 @@ class ManagedLlmStream(Iterator[Any]):
         self._provider_completed = False
         self._raw_chunks: list[tuple[Any, Any]] = []
         self.output_modified = False
+        self._pending_diagnostics: list[dict[str, Any]] = []
+        self._diagnostic = {
+            "attempt": None,
+            "usage": None,
+            "name": name,
+            "metadata": metadata,
+            "finished": True,
+        }
         callback_context = contextvars.copy_context()
 
         def run_callback(callback: Callable[..., Any], *args: Any) -> Any:
@@ -503,12 +634,24 @@ class ManagedLlmStream(Iterator[Any]):
             or session is None
             or not runtime.managed_execution_enabled()
         ):
-            _record_attempt(request, name=name, model_name=model_name, metadata=metadata)
-            raw_stream = stream_factory(request)
+            self._diagnostic = _attempt_tracker(
+                request,
+                name=name,
+                model_name=model_name,
+                metadata=metadata,
+                streamed=True,
+            )
+            try:
+                with _physical_attempt_context(self._diagnostic):
+                    raw_stream = stream_factory(request)
+            except BaseException as exc:
+                _finish_tracker(self._diagnostic, "error", error=exc)
+                raise
             if completed_response_predicate is not None and completed_response_predicate(
                 raw_stream
             ):
                 self.final_response = raw_stream
+                _finish_tracker(self._diagnostic, "completed", response=raw_stream)
                 self._stream = iter(())
             else:
                 self._raw_stream_resource = raw_stream
@@ -531,6 +674,7 @@ class ManagedLlmStream(Iterator[Any]):
 
         async def provider_stream(next_request: Any):
             raw_stream = None
+            tracker = None
             try:
                 final_request = _provider_request(
                     request,
@@ -539,10 +683,20 @@ class ManagedLlmStream(Iterator[Any]):
                     codec_baseline_body=codec_baseline_body,
                     metadata=metadata,
                 )
-                _record_attempt(
-                    final_request, name=name, model_name=model_name, metadata=metadata
+                tracker = _attempt_tracker(
+                    final_request,
+                    name=name,
+                    model_name=model_name,
+                    metadata=metadata,
+                    streamed=True,
                 )
-                raw_stream = run_callback(stream_factory, final_request)
+                self._diagnostic = tracker
+
+                def open_stream() -> Any:
+                    with _physical_attempt_context(tracker):
+                        return stream_factory(final_request)
+
+                raw_stream = run_callback(open_stream)
                 if (
                     completed_response_predicate is not None
                     and run_callback(
@@ -551,6 +705,8 @@ class ManagedLlmStream(Iterator[Any]):
                     )
                 ):
                     self.final_response = raw_stream
+                    tracker["usage"] = _response_usage(raw_stream)
+                    _finish_tracker(tracker, "completed", response=raw_stream)
                     self._provider_completed = True
                     return
                 if on_stream_created is not None:
@@ -561,16 +717,24 @@ class ManagedLlmStream(Iterator[Any]):
                         chunk = run_callback(next, raw_iterator)
                     except StopIteration:
                         break
+                    physical_attempt_diagnostics.mark_wire_event(tracker["attempt"])
+                    physical_attempt_diagnostics.record_checkpoint(
+                        tracker["attempt"], checkpoint="wire"
+                    )
                     if self._accept_chunk is not None and not run_callback(
                         self._accept_chunk,
                         chunk,
                     ):
                         break
+                    tracker["usage"] = _stream_usage(tracker["usage"], chunk)
                     encoded_chunk = _jsonable(chunk)
                     self._raw_chunks.append((encoded_chunk, chunk))
                     yield encoded_chunk
                 self._provider_completed = True
+                self._pending_diagnostics.append(tracker)
             except BaseException as exc:
+                if tracker is not None:
+                    _finish_tracker(tracker, "error", error=exc)
                 self._callback_error = exc
                 raise
             finally:
@@ -637,6 +801,7 @@ class ManagedLlmStream(Iterator[Any]):
                 )
                 self._preserve_pending_provider_chunks()
                 return
+            self._finish_diagnostics("error", error=exc)
             if not self._defer_logical_completion:
                 _complete_logical(
                     self._logical,
@@ -660,8 +825,22 @@ class ManagedLlmStream(Iterator[Any]):
             try:
                 chunk = next(self._stream)
             except StopIteration:
+                _finish_tracker(self._diagnostic, "completed")
                 self._close(logical_outcome="cancelled")
                 raise
+            except BaseException as exc:
+                self._finish_diagnostics("error", error=exc)
+                self._close(logical_outcome="failed")
+                raise
+            physical_attempt_diagnostics.mark_wire_event(
+                self._diagnostic["attempt"]
+            )
+            physical_attempt_diagnostics.record_checkpoint(
+                self._diagnostic["attempt"], checkpoint="wire"
+            )
+            self._diagnostic["usage"] = _stream_usage(
+                self._diagnostic["usage"], chunk
+            )
             if self._accept_chunk is not None and not self._accept_chunk(chunk):
                 self._close(logical_outcome="cancelled")
                 raise StopIteration
@@ -673,6 +852,7 @@ class ManagedLlmStream(Iterator[Any]):
         try:
             chunk = self._loop.run_until_complete(next_chunk())
         except StopAsyncIteration:
+            self._finish_diagnostics("completed")
             if self._raw_chunks:
                 self.output_modified = True
             if not self._defer_logical_completion:
@@ -687,6 +867,7 @@ class ManagedLlmStream(Iterator[Any]):
             self._close(logical_outcome="cancelled")
             raise StopIteration from None
         except BaseException as exc:
+            self._finish_diagnostics("error", error=exc)
             callback_error = self._callback_error
             if (
                 callback_error is not None
@@ -710,6 +891,12 @@ class ManagedLlmStream(Iterator[Any]):
                 logical_outcome="cancelled" if _is_cancellation(exc) else "failed"
             )
             raise
+        physical_attempt_diagnostics.mark_wire_event(
+            self._diagnostic["attempt"]
+        )
+        physical_attempt_diagnostics.record_checkpoint(
+            self._diagnostic["attempt"], checkpoint="wire"
+        )
         if not self._relay_observes_chunks and self._on_chunk is not None:
             self._on_chunk(chunk)
         for index, (encoded, raw) in enumerate(self._raw_chunks):
@@ -723,11 +910,20 @@ class ManagedLlmStream(Iterator[Any]):
 
     def close(self) -> None:
         """Close an explicitly abandoned stream and cancel its logical call."""
+        self._finish_diagnostics("cancelled")
         self._close(logical_outcome="cancelled")
         close_error = self._close_error
         self._close_error = None
         if close_error is not None:
             raise close_error
+
+    def _finish_diagnostics(
+        self, outcome: str, *, error: BaseException | None = None
+    ) -> None:
+        trackers = [*self._pending_diagnostics, self._diagnostic]
+        self._pending_diagnostics.clear()
+        for tracker in trackers:
+            _finish_tracker(tracker, outcome, error=error)
 
     def _preserve_pending_provider_chunks(self) -> None:
         """Switch a failed Relay stream to its undelivered provider chunks."""

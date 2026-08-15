@@ -175,7 +175,30 @@ def test_new_command_creates_real_fresh_session_and_resets_agent_state(tmp_path)
     cli.agent._invalidate_system_prompt.assert_called_once()
 
 
+def test_new_command_drops_previous_session_catalog_mode(tmp_path):
+    from agent.system_prompt import (
+        _session_skills_catalog_mode,
+        restore_session_skills_catalog_mode,
+    )
+    from run_agent import AIAgent
 
+    cli = _prepare_cli_with_active_session(tmp_path)
+    agent = cli.agent
+    agent.reset_session_state = AIAgent.reset_session_state.__get__(agent)
+    agent._transition_context_engine_session = (
+        AIAgent._transition_context_engine_session.__get__(agent)
+    )
+    agent._session_init_model_config = {}
+    agent._skills_catalog_mode_config = "full"
+    assert restore_session_skills_catalog_mode(
+        agent, {"_skills_catalog_mode": "compact"}
+    )
+    assert _session_skills_catalog_mode(agent) == "compact"
+
+    cli.process_command("/new")
+
+    assert _session_skills_catalog_mode(agent) == "full"
+    assert agent._session_init_model_config["_skills_catalog_mode"] == "full"
 
 
 

@@ -1082,6 +1082,11 @@ class CLICommandsMixin:
         if self.agent:
             self.agent.session_id = target_id
             self.agent.reset_session_state()
+            from agent.system_prompt import restore_session_skills_catalog_mode
+
+            restore_session_skills_catalog_mode(
+                self.agent, session_meta.get("model_config")
+            )
             if hasattr(self.agent, "_last_flushed_db_idx"):
                 self.agent._last_flushed_db_idx = len(self.conversation_history)
             if hasattr(self.agent, "_todo_store"):

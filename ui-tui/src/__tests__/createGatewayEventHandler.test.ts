@@ -237,6 +237,29 @@ describe('createGatewayEventHandler', () => {
     expect(getUiState().status).toBe('⏸ goal paused')
   })
 
+  it('keeps replaceable wait snapshots out of reasoning and clears them on continuation', () => {
+    vi.useFakeTimers()
+    const onEvent = createGatewayEventHandler(buildCtx([]))
+
+    try {
+      onEvent({ payload: {}, type: 'message.start' } as any)
+      onEvent({ payload: { kind: 'wait', text: '⏳ waiting — 30s' }, type: 'status.update' } as any)
+      onEvent({ payload: { kind: 'wait', text: '⏳ waiting — 60s' }, type: 'status.update' } as any)
+
+      expect(getUiState().status).toBe('⏳ waiting — 60s')
+      expect(getTurnState().reasoning).toBe('')
+      expect(getTurnState().reasoningTokens).toBe(0)
+
+      vi.advanceTimersByTime(4001)
+      expect(getUiState().status).toBe('⏳ waiting — 60s')
+
+      onEvent({ payload: {}, type: 'message.start' } as any)
+      expect(getUiState().status).toBe('running…')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('surfaces self-improvement review summaries as a persistent system line', () => {
     const appended: Msg[] = []
     const ctx = buildCtx(appended)

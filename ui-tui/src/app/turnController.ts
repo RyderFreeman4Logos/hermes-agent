@@ -1010,7 +1010,11 @@ class TurnController {
       this.clearNotice(yieldingNoticeKey)
     }
 
-    patchUiState({ busy: true })
+    patchUiState(state => ({
+      ...state,
+      busy: true,
+      status: state.status.startsWith('⏳ waiting') ? 'running…' : state.status
+    }))
     patchTurnState({ activity: [], outcome: '', subagents: [], toolTokens: 0, tools: [], turnTrail: [] })
   }
 

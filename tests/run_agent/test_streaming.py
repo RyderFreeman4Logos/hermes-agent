@@ -586,15 +586,8 @@ class TestCodexStreamCallbacks:
         assert "Hello from Codex!" in deltas
 
 
-    def test_codex_remote_protocol_error_retries_then_raises(self):
-        """Transport errors from ``responses.create`` retry once then re-raise.
-
-        With the migration from ``responses.stream(...)`` to
-        ``responses.create(stream=True)``, there is no longer a separate
-        fallback function — the same call IS the streaming path.  When it
-        raises ``httpx.RemoteProtocolError``, we retry once (matching the
-        old behavior on the helper) and re-raise on the second failure.
-        """
+    def test_codex_remote_protocol_error_after_dispatch_is_not_replayed(self):
+        """An accepted request must not be replayed after a transport drop."""
         from run_agent import AIAgent
         import httpx
 
@@ -623,8 +616,9 @@ class TestCodexStreamCallbacks:
         with pytest.raises(httpx.RemoteProtocolError):
             agent._run_codex_stream({}, client=mock_client)
 
-        # 1 initial + 1 retry = 2 calls
-        assert call_count["n"] == 2
+        # The provider may have accepted the first request before the wire
+        # failed. A second request could duplicate billed work.
+        assert call_count["n"] == 1
 
     def test_codex_create_stream_fallback_refreshes_activity_on_every_event(self):
         from run_agent import AIAgent
@@ -1634,4 +1628,3 @@ class TestBedrockReasoningStaleFloor:
         from agent.chat_completion_helpers import _bedrock_reasoning_stale_floor
 
         assert _bedrock_reasoning_stale_floor(model_id) == expected
-

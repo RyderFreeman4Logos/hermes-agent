@@ -260,6 +260,63 @@ describe('createGatewayEventHandler', () => {
     }
   })
 
+  it('adds cache truth and gateway-local completion time after the assistant response', () => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+    const formatTime = vi.spyOn(Date.prototype, 'toLocaleTimeString').mockReturnValue('14:23:05')
+
+    try {
+      onEvent({
+        payload: {
+          cache_info: {
+            level: 'error',
+            pct: 94,
+            prompt_tokens: 2_000,
+            read_tokens: 1_880,
+            state: 'hit'
+          },
+          completed_at: 1_700_000_000.25,
+          text: 'final answer'
+        },
+        type: 'message.complete'
+      } as any)
+
+      expect(appended).toEqual([
+        { role: 'assistant', text: 'final answer' },
+        { kind: 'event', role: 'system', text: 'cache 94%', tone: 'error' },
+        { kind: 'event', role: 'system', text: '完成 14:23:05' }
+      ])
+    } finally {
+      formatTime.mockRestore()
+    }
+  })
+
+  it('labels post-compression cache warmup as neutral', () => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+    onEvent({
+      payload: {
+        cache_info: {
+          attribution: 'post_compression',
+          level: 'info',
+          note: 'post-compression warmup (expected)',
+          pct: 0,
+          prompt_tokens: 2_000,
+          read_tokens: 0,
+          state: 'miss'
+        },
+        text: 'final answer'
+      },
+      type: 'message.complete'
+    } as any)
+
+    expect(appended).toEqual([
+      { role: 'assistant', text: 'final answer' },
+      { kind: 'event', role: 'system', text: 'cache miss · post-compression warmup (expected)' }
+    ])
+  })
+
   it('surfaces self-improvement review summaries as a persistent system line', () => {
     const appended: Msg[] = []
     const ctx = buildCtx(appended)

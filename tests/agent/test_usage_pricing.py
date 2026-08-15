@@ -11,6 +11,27 @@ from agent.usage_pricing import (
 from decimal import Decimal
 
 
+def test_normalize_usage_distinguishes_reported_zero_from_omitted_cache_fields():
+    reported_zero = normalize_usage(
+        SimpleNamespace(
+            prompt_tokens=2_000,
+            completion_tokens=10,
+            prompt_tokens_details=SimpleNamespace(cached_tokens=0),
+        ),
+        provider="openai",
+        api_mode="chat_completions",
+    )
+    omitted = normalize_usage(
+        SimpleNamespace(prompt_tokens=2_000, completion_tokens=10),
+        provider="openai",
+        api_mode="chat_completions",
+    )
+
+    assert reported_zero.cache_read_tokens == omitted.cache_read_tokens == 0
+    assert reported_zero.cache_telemetry_present is True
+    assert omitted.cache_telemetry_present is False
+
+
 
 
 

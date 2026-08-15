@@ -23,6 +23,12 @@ from agent.secret_scope import (
     reset_secret_scope,
     set_secret_scope,
 )
+from agent.usage_pricing import (
+    CACHE_HIT_ERROR_THRESHOLD,
+    POST_COMPRESSION_CACHE_NOTE,
+    POST_COMPRESSION_CACHE_WARM_NOTE,
+    cache_hit_percent,
+)
 from hermes_constants import (
     DEFAULT_INDICATOR_STYLE,
     INDICATOR_STYLES,
@@ -1639,6 +1645,8 @@ def _event_frame(event: str, sid: str, payload: dict | None = None) -> dict:
 
 
 def _emit(event: str, sid: str, payload: dict | None = None):
+    if event == "message.complete":
+        payload = {**(payload or {}), "completed_at": time.time()}
     write_json(_event_frame(event, sid, payload))
 
 
@@ -5286,6 +5294,82 @@ def _get_usage(agent) -> dict:
     return usage
 
 
+def _cache_level(pct: int) -> str:
+    return "error" if pct < CACHE_HIT_ERROR_THRESHOLD else "info"
+
+
+def _cache_info_from_usage(usage: Any) -> dict[str, int | str] | None:
+    if not isinstance(usage, dict):
+        return None
+
+    read_keys = ("cache_read_tokens",)
+    write_keys = (
+        "cache_write_tokens",
+        "cache_creation_tokens",
+        "cache_creation_input_tokens",
+    )
+    telemetry_present = usage.get("cache_telemetry_present")
+    if telemetry_present is not False and not any(
+        key in usage for key in (*read_keys, *write_keys)
+    ):
+        return None
+
+    def tokens(*keys: str) -> int:
+        for key in keys:
+            value = usage.get(key)
+            if value is not None:
+                try:
+                    return max(0, int(float(value)))
+                except (TypeError, ValueError):
+                    pass
+        return 0
+
+    read_tokens = tokens(*read_keys)
+    write_tokens = tokens(*write_keys)
+    prompt_tokens = tokens("prompt_tokens")
+    if telemetry_present is False:
+        cache_info: dict[str, int | str] = {
+            "read_tokens": 0,
+            "prompt_tokens": prompt_tokens,
+            "pct": 0,
+            "state": "unavailable",
+            "level": "info",
+        }
+        if usage.get("cache_attribution") == "post_compression":
+            cache_info.update(
+                attribution="post_compression",
+                note="post-compression cache unavailable",
+            )
+        return cache_info
+
+    pct = cache_hit_percent(read_tokens, prompt_tokens)
+    state = (
+        "hit"
+        if read_tokens
+        else "cold_write"
+        if write_tokens
+        else "unknown"
+        if prompt_tokens < 1024
+        else "miss"
+    )
+    cache_info = {
+        "read_tokens": read_tokens,
+        "prompt_tokens": prompt_tokens,
+        "pct": pct,
+        "state": state,
+        "level": _cache_level(pct),
+    }
+    if usage.get("cache_attribution") == "post_compression":
+        cache_info["attribution"] = "post_compression"
+        cache_info["level"] = "info"
+        cache_info["note"] = (
+            POST_COMPRESSION_CACHE_WARM_NOTE
+            if state == "hit" and pct >= CACHE_HIT_ERROR_THRESHOLD
+            else POST_COMPRESSION_CACHE_NOTE
+        )
+    return cache_info
+
+
 def _probe_credentials(agent) -> str:
     """Light credential check at session creation — returns warning or ''.
 
@@ -6129,6 +6213,36 @@ def _agent_cbs(sid: str) -> dict:
     return callbacks
 
 
+def _attach_tui_cache_callback(agent, sid: str):
+    """Attach the inherited-prefix cache signal to one live TUI agent."""
+    def emit_cache_state(state: str, pct: int, read: int, prompt: int) -> None:
+        cache_info = _cache_info_from_usage(
+            getattr(agent, "_first_turn_usage", None)
+        ) or {
+            "read_tokens": read,
+            "prompt_tokens": prompt,
+            "pct": pct,
+            "state": state,
+            "level": _cache_level(pct),
+        }
+        state = str(cache_info["state"])
+        pct = int(cache_info["pct"])
+        text = (
+            f"cache {pct}%"
+            if state == "hit"
+            else "cache unavailable"
+            if state == "unavailable"
+            else f"cache {state.upper()}"
+        )
+        if cache_info.get("note"):
+            text += f" · {cache_info['note']}"
+        kind = "error" if cache_info["level"] == "error" else "cache_hit"
+        _emit("status.update", sid, {"kind": kind, "text": text})
+
+    agent._tui_cache_callback = emit_cache_state
+    return agent
+
+
 def _apply_project_workspace(task_id: str, path: str, _name: str = "") -> None:
     """Intentional workspace move from the project_* tools: re-anchor the live
     session's cwd to the chosen project's folder and push session.info so the
@@ -6735,7 +6849,7 @@ def _make_agent(
 
     synthetic = maybe_build_synthetic_agent(session_id or key, model_override)
     if synthetic is not None:
-        return synthetic
+        return _attach_tui_cache_callback(synthetic, sid)
 
     from run_agent import AIAgent
 
@@ -6856,7 +6970,7 @@ def _make_agent(
                 raise RuntimeError("Auth fallback resolved without a model")
             model = resolution.selected_model
     _pr = _load_provider_routing()
-    return AIAgent(
+    agent = AIAgent(
         model=model,
         max_iterations=_cfg_max_turns(cfg, 500),
         provider=runtime.get("provider"),
@@ -6903,6 +7017,7 @@ def _make_agent(
         fallback_model=_load_fallback_model(),
         **_agent_cbs(sid),
     )
+    return _attach_tui_cache_callback(agent, sid)
 
 
 def _init_session(
@@ -10820,6 +10935,10 @@ def _run_prompt_submit(
                 status = "complete"
 
             payload = {"text": raw, "usage": _get_usage(agent), "status": status}
+            cache_usage = getattr(agent, "_first_turn_usage", None)
+            cache_info = _cache_info_from_usage(cache_usage)
+            if cache_info is not None:
+                payload["cache_info"] = cache_info
             if last_reasoning:
                 payload["reasoning"] = last_reasoning
             if status_note:

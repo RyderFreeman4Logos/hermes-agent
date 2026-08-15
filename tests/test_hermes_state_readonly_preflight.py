@@ -95,6 +95,18 @@ class TestRepairScope:
         assert os.access(db, os.W_OK)
         assert os.access(wal, os.W_OK)
 
+    def test_repairs_readonly_write_lock_sidecar(self, hermes_home):
+        db_path = hermes_home / "state.db"
+        first = SessionDB(db_path)
+        first.close()
+        write_lock = db_path.with_name(db_path.name + ".write.lock")
+        os.chmod(write_lock, 0o400)
+
+        reopened = SessionDB(db_path)
+        try:
+            assert os.access(write_lock, os.W_OK)
+        finally:
+            reopened.close()
 
     def test_repairs_readonly_parent_directory(self, hermes_home):
         sub = hermes_home / "kanban"
@@ -142,6 +154,36 @@ class TestRefusalOutsideScope:
             assert "Do NOT delete" in msg
         finally:
             os.chmod(wal, 0o644)
+
+    def test_write_lock_owner_mismatch_has_actionable_error(
+        self, hermes_home, monkeypatch
+    ):
+        db = hermes_home / "state.db"
+        _make_db(db)
+        write_lock = db.with_name(db.name + ".write.lock")
+        write_lock.touch()
+        real_access = os.access
+        real_chmod = os.chmod
+
+        def deny_write(path, mode):
+            if Path(path) == write_lock:
+                return False
+            return real_access(path, mode)
+
+        def deny_repair(path, mode):
+            if Path(path) == write_lock:
+                raise PermissionError("owned by another user")
+            return real_chmod(path, mode)
+
+        monkeypatch.setattr(os, "access", deny_write)
+        monkeypatch.setattr(os, "chmod", deny_repair)
+
+        with pytest.raises(sqlite3.OperationalError) as exc_info:
+            preflight_db_writability(db, db_label="state.db")
+        msg = str(exc_info.value)
+        assert str(write_lock) in msg
+        assert "chmod u+rw" in msg
+        assert "sudo/chown" in msg
 
 
 class TestSkips:

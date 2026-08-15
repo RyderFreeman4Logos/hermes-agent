@@ -406,6 +406,34 @@ def test_fatal_advisory_lock_error_propagates_without_contention_wait(
     assert db.get_meta("fatal-lock") is None
 
 
+def test_post_commit_fts_maintenance_oserror_does_not_fail_committed_write(
+    db,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    db._fts_enabled = True
+    db._write_count = db._FTS_MERGE_EVERY_N_WRITES - 1
+    monkeypatch.setattr(
+        db, "_CHECKPOINT_EVERY_N_WRITES", db._FTS_MERGE_EVERY_N_WRITES + 1
+    )
+
+    def fail_merge(*, max_pages: int) -> None:
+        assert max_pages == db._FTS_MERGE_MAX_PAGES_PER_INDEX
+        raise OSError(errno.EIO, "advisory lock I/O failure")
+
+    monkeypatch.setattr(db, "_merge_fts_incrementally", fail_merge)
+
+    error = None
+    try:
+        db.set_meta("committed-before-maintenance", "value")
+    except OSError as exc:
+        error = exc
+
+    assert db.get_meta("committed-before-maintenance") == "value"
+    assert error is None, "best-effort maintenance leaked after durable commit"
+    assert "FTS incremental merge failed" in caplog.text
+
+
 def test_automatic_fts_merge_waits_for_advisory_lock(db, process_ctx) -> None:
     if not db._fts_enabled:
         pytest.skip("FTS5 unavailable in this build")

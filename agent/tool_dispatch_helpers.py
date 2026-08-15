@@ -531,6 +531,30 @@ def _trajectory_normalize_msg(msg: Dict[str, Any]) -> Dict[str, Any]:
     return msg
 
 
+def tool_content_for_session_persistence(content: Any) -> Any:
+    """Project a live tool result to the content stored in ``state.db``.
+
+    Tool results can stay multimodal in the hot conversation, but session
+    persistence intentionally keeps only their text projection.  Content
+    updates made after the initial append (for example a late ``/steer``)
+    must use the identical projection when compare-and-setting the durable
+    row, or the hot transcript and a cold resume diverge.
+    """
+    if _is_multimodal_tool_result(content):
+        return _multimodal_text_summary(content)
+    if not isinstance(content, list):
+        return content
+    text_parts = []
+    for part in content:
+        if isinstance(part, dict) and part.get("type") == "text":
+            text_parts.append(str(part.get("text", "")))
+        elif isinstance(part, dict) and part.get("type") in {
+            "image", "image_url", "input_image",
+        }:
+            text_parts.append("[screenshot]")
+    return "\n".join(text_parts) if text_parts else None
+
+
 def make_tool_result_message(
     name: str,
     content: Any,

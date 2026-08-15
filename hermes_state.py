@@ -10491,6 +10491,72 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         chain = self._session_lineage_root_to_tip(session_id)
         return (chain[0] if chain and chain[0] else session_id)
 
+    def get_compression_lineage_root(self, session_id: str) -> Optional[str]:
+        """Return a proven compression-only ancestor, or ``None`` on doubt.
+
+        Delegate, branch, and tool sessions also have parent links. Follow-up
+        authority therefore accepts only edges whose parent ended by
+        compression and whose child has no branch/delegate marker.
+        """
+        if not isinstance(session_id, str) or not session_id.strip():
+            return None
+        current = session_id.strip()
+        seen: set[str] = set()
+        try:
+            with self._read_ctx() as conn:
+                for _ in range(100):
+                    if current in seen:
+                        return None
+                    seen.add(current)
+                    child = conn.execute(
+                        """SELECT id, parent_session_id, source, model_config
+                           FROM sessions WHERE id = ?""",
+                        (current,),
+                    ).fetchone()
+                    if child is None:
+                        return None
+                    source = str(child["source"] or "").strip().lower()
+                    if source in {"delegate", "subagent", "tool"}:
+                        return None
+                    try:
+                        config = json.loads(child["model_config"] or "{}")
+                    except (TypeError, ValueError):
+                        return None
+                    if not isinstance(config, dict) or any(
+                        marker in config
+                        for marker in ("_branched_from", "_delegate_from")
+                    ):
+                        return None
+                    parent_id = child["parent_session_id"]
+                    if not parent_id:
+                        return current
+                    parent = conn.execute(
+                        """SELECT ended_at, end_reason FROM sessions
+                           WHERE id = ?""",
+                        (parent_id,),
+                    ).fetchone()
+                    if (
+                        parent is None
+                        or parent["ended_at"] is None
+                        or parent["end_reason"] != "compression"
+                    ):
+                        return None
+                    siblings = conn.execute(
+                        """SELECT id FROM sessions
+                           WHERE parent_session_id = ?
+                             AND json_extract(COALESCE(model_config, '{}'), '$._branched_from') IS NULL
+                             AND json_extract(COALESCE(model_config, '{}'), '$._delegate_from') IS NULL
+                             AND COALESCE(source, '') NOT IN ('tool', 'delegate', 'subagent')
+                           LIMIT 2""",
+                        (parent_id,),
+                    ).fetchall()
+                    if len(siblings) != 1 or siblings[0]["id"] != current:
+                        return None
+                    current = str(parent_id)
+        except Exception:
+            return None
+        return None
+
     def _session_lineage_root_to_tip(self, session_id: str) -> List[str]:
         if not session_id:
             return [session_id]

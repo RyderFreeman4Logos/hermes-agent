@@ -162,6 +162,19 @@ class TestEstimateMessagesTokensRough:
         # Raw base64 would be ~100K tokens; the flat per-image model is ~1.5K.
         assert estimate_messages_tokens_rough([msg]) < 5_000
 
+    def test_reasoning_aliases_are_counted_once_and_persistence_fields_stay_excluded(self):
+        """Wire aliases are alternatives; durable-only fields never reach provider."""
+        prose = "private reasoning " * 4000
+        baseline = {"role": "assistant", "content": "done", "reasoning_content": prose}
+        persisted = {
+            **baseline,
+            "reasoning": prose,
+            "timestamp": 1_781_976_577.123456,
+        }
+
+        assert estimate_messages_tokens_rough([persisted]) == \
+            estimate_messages_tokens_rough([baseline])
+
 
 
 class TestEstimateRequestTokensRough:

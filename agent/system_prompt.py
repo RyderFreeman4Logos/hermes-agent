@@ -60,6 +60,19 @@ _PLUGIN_SECTION_FRAME_RE = re.compile(
     r"<!-- hermes-plugin-section-chars:(?P<chars>[0-9]{1,4}) -->\n\n",
     re.MULTILINE,
 )
+_SKILLS_CATALOG_MODE_MARKER = "<!-- hermes-skills-catalog-mode:{} -->"
+_SKILLS_CATALOG_MODE_FRAME = (
+    "<!-- hermes-skills-catalog-frame:start -->\n"
+    "{}\n"
+    "<!-- hermes-skills-catalog-frame:end -->"
+)
+_SKILLS_CATALOG_MODE_RE = re.compile(
+    _SKILLS_CATALOG_MODE_FRAME.format(
+        r"<!-- hermes-skills-catalog-mode:(?P<mode>full|compact|names-only) -->"
+    )
+)
+_SKILLS_CATALOG_MODES = frozenset({"full", "compact", "names-only"})
+_SKILLS_CATALOG_MODE_SESSION_KEY = "_skills_catalog_mode"
 
 
 def _ra():
@@ -154,6 +167,78 @@ def _tui_embedded_pane_clarifier(hint: str) -> str:
     if not is_truthy_value(os.getenv("HERMES_DESKTOP_TERMINAL")):
         return hint
     return hint + _TUI_EMBEDDED_PANE_CLARIFIER
+
+
+def _normalize_skills_catalog_mode(raw: Any) -> Optional[str]:
+    mode = str(raw or "").strip().lower()
+    return mode if mode in _SKILLS_CATALOG_MODES else None
+
+
+def _remember_skills_catalog_mode(agent: Any, mode: str) -> str:
+    agent._skills_catalog_mode = mode
+    state = getattr(agent, "_session_init_model_config", None)
+    if isinstance(state, dict):
+        state[_SKILLS_CATALOG_MODE_SESSION_KEY] = mode
+    return mode
+
+
+def restore_session_skills_catalog_mode(agent: Any, model_config: Any) -> bool:
+    """Restore the frozen catalog mode from structured session state."""
+    if (
+        not isinstance(model_config, dict)
+        or _SKILLS_CATALOG_MODE_SESSION_KEY not in model_config
+    ):
+        return False
+    mode = _normalize_skills_catalog_mode(
+        model_config.get(_SKILLS_CATALOG_MODE_SESSION_KEY)
+    ) or "full"
+    _remember_skills_catalog_mode(agent, mode)
+    return True
+
+
+def persist_session_skills_catalog_mode(agent: Any) -> None:
+    """Persist the frozen catalog mode through the existing session state patch."""
+    mode = _normalize_skills_catalog_mode(getattr(agent, "_skills_catalog_mode", None))
+    if mode is None:
+        return
+    _remember_skills_catalog_mode(agent, mode)
+    db = getattr(agent, "_session_db", None)
+    session_id = str(getattr(agent, "session_id", None) or "").strip()
+    patcher = getattr(db, "patch_session_model_config", None)
+    if session_id and callable(patcher):
+        try:
+            patcher(session_id, {_SKILLS_CATALOG_MODE_SESSION_KEY: mode})
+        except Exception:
+            logger.debug("failed to persist skills catalog mode", exc_info=True)
+
+
+def _session_skills_catalog_mode(agent: Any) -> str:
+    """Resolve and freeze one skills catalog mode for an agent session."""
+    cached = getattr(agent, "_skills_catalog_mode", None)
+    if cached is not None:
+        return _remember_skills_catalog_mode(
+            agent, _normalize_skills_catalog_mode(cached) or "full"
+        )
+
+    state = getattr(agent, "_session_init_model_config", None)
+    if isinstance(state, dict) and _SKILLS_CATALOG_MODE_SESSION_KEY in state:
+        return _remember_skills_catalog_mode(
+            agent,
+            _normalize_skills_catalog_mode(
+                state.get(_SKILLS_CATALOG_MODE_SESSION_KEY)
+            ) or "full",
+        )
+
+    stored_prompt = getattr(agent, "_cached_system_prompt", None)
+    if isinstance(stored_prompt, str) and _SKILLS_CATALOG_MODE_RE.search(stored_prompt):
+        return _remember_skills_catalog_mode(agent, "full")
+
+    return _remember_skills_catalog_mode(
+        agent,
+        _normalize_skills_catalog_mode(
+            getattr(agent, "_skills_catalog_mode_config", "full")
+        ) or "full",
+    )
 
 
 def _plugin_session_info(agent: Any) -> Dict[str, str]:
@@ -507,11 +592,25 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             )
         except Exception:
             _compact_cats = frozenset()
+        catalog_mode = _session_skills_catalog_mode(agent)
+        if catalog_mode == "compact":
+            from agent.coding_context import _NON_CODING_SKILL_CATEGORIES
+
+            _compact_cats |= frozenset(_NON_CODING_SKILL_CATEGORIES)
+        elif catalog_mode == "names-only":
+            from agent.prompt_builder import ALL_SKILL_CATEGORIES
+
+            _compact_cats = ALL_SKILL_CATEGORIES
         skills_prompt = _r.build_skills_system_prompt(
             available_tools=agent.valid_tool_names,
             available_toolsets=avail_toolsets,
             compact_categories=_compact_cats or None,
             skills_dir_override=_agent_skills_dir(agent),
+        )
+        skills_prompt = (
+            f"{skills_prompt}\n\n" if skills_prompt else ""
+        ) + _SKILLS_CATALOG_MODE_FRAME.format(
+            _SKILLS_CATALOG_MODE_MARKER.format(catalog_mode)
         )
     else:
         skills_prompt = ""
@@ -918,6 +1017,8 @@ __all__ = [
     "build_system_prompt_parts",
     "build_system_prompt",
     "invalidate_system_prompt",
+    "persist_session_skills_catalog_mode",
+    "restore_session_skills_catalog_mode",
     "restore_plugin_prompt_sections",
     "format_tools_for_system_message",
 ]

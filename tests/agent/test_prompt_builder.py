@@ -315,6 +315,29 @@ class TestBuildSkillsSystemPrompt:
         full = build_skills_system_prompt()
         assert "Write threads" in full
 
+    def test_all_categories_render_names_only(self, monkeypatch, tmp_path):
+        from agent.prompt_builder import ALL_SKILL_CATEGORIES
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        for category, name, description in (
+            ("coding", "test-driven-development", "Write tests first"),
+            ("research", "web-search", "Search the web"),
+        ):
+            skill_dir = tmp_path / "skills" / category / name
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text(
+                f"---\nname: {name}\ndescription: {description}\n---\n"
+            )
+
+        prompt = build_skills_system_prompt(
+            compact_categories=ALL_SKILL_CATEGORIES
+        )
+
+        assert "test-driven-development" in prompt
+        assert "web-search" in prompt
+        assert "Write tests first" not in prompt
+        assert "Search the web" not in prompt
+
 
 
     def test_excludes_disabled_skills(self, monkeypatch, tmp_path):

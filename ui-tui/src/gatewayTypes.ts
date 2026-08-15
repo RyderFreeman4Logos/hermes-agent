@@ -752,6 +752,18 @@ export type GatewayEvent =
         billing?: BillingBlock
         cache_info?: CacheInfo
         completed_at?: number
+        cache_record?: {
+          cache_read_tokens: number
+          cache_write_tokens: number
+          owner: 'tui_gateway'
+          pct: number
+          prompt_tokens: number
+          request_index: number
+          session: string
+          state: 'hit' | 'miss' | 'unknown'
+          timestamp: number
+          turn_origin: 'user' | 'background_completion' | 'subagent_result' | 'heartbeat_warm'
+        }
         failure_reason?: string
         reasoning?: string
         rendered?: string

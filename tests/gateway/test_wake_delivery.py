@@ -125,3 +125,35 @@ def test_deliver_wake_retries_429_then_succeeds(monkeypatch):
     assert calls["n"] == 2
 
 
+def test_completion_self_post_http_200_pending_suffix_is_retryable():
+    """Usable partial text is not proof that the completion suffix committed."""
+    from aiohttp import web
+
+    async def handler(_request):
+        return web.json_response({
+            "choices": [{"message": {"content": "partial result"}}],
+            "hermes": {
+                "completed": False,
+                "partial": True,
+                "failed": True,
+                "completion_delivery_status": "pending",
+            },
+        })
+
+    async def run():
+        runner, port = await _serve(handler)
+        try:
+            adapter = ApiServerLikeAdapter(port=port)
+            adapter._completion_delivery_token = "internal-token"
+            with pytest.raises(RuntimeError, match="status=pending"):
+                await deliver_wake(
+                    adapter,
+                    text="completion batch",
+                    session_id="raw-sid-pending",
+                    completion_delivery=True,
+                )
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(run())
+

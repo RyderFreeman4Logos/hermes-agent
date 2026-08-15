@@ -61,7 +61,7 @@ async def deliver_wake(
     session_id: str = "",
     source: Any = None,
     completion_delivery: bool = False,
-) -> None:
+) -> Optional[str]:
     """Deliver a wake turn to the session behind ``adapter``.
 
     ``session_id`` is the RAW session id (the ``X-Hermes-Session-Id`` value /
@@ -70,7 +70,8 @@ async def deliver_wake(
     push-capable adapters.
 
     Raises on failure (bad arguments, exhausted retries, HTTP error) so the
-    caller can rewind/retry instead of treating the wake as delivered.
+    caller can rewind/retry instead of treating the wake as delivered. A
+    completion self-post returns its proven terminal durable status.
     """
     if adapter_supports_push(adapter):
         if source is None:
@@ -86,14 +87,14 @@ async def deliver_wake(
             internal=True,
         )
         await adapter.handle_message(synth_event)
-        return
+        return None
 
     if not session_id:
         raise ValueError(
             "deliver_wake: non-push adapter (supports_async_delivery=False) "
             "requires the raw session id to self-post the wake turn"
         )
-    await _self_post_chat_completion(
+    return await _self_post_chat_completion(
         adapter,
         text=text,
         session_id=session_id,
@@ -103,7 +104,7 @@ async def deliver_wake(
 
 async def _self_post_chat_completion(
     adapter: Any, *, text: str, session_id: str, completion_delivery: bool = False
-) -> None:
+) -> Optional[str]:
     """POST the wake text to the in-pod API server as a normal session turn.
 
     Uses the adapter's own bind host/port/key (``ApiServerAdapter.__init__``).
@@ -172,13 +173,28 @@ async def _self_post_chat_completion(
                             f"wake self-post failed for session {session_id}: "
                             f"HTTP {resp.status}: {body}"
                         )
-                    await resp.read()
+                    completion_status = None
+                    if completion_delivery:
+                        body = await resp.json(content_type=None)
+                        hermes = body.get("hermes") if isinstance(body, dict) else None
+                        if isinstance(hermes, dict):
+                            completion_status = str(
+                                hermes.get("completion_delivery_status") or ""
+                            )
+                        if completion_status not in {"committed", "dropped"}:
+                            raise RuntimeError(
+                                "wake self-post completion was not durably "
+                                f"committed for session {session_id}: "
+                                f"status={completion_status or 'missing'}"
+                            )
+                    else:
+                        await resp.read()
                     logger.info(
                         "wake self-post delivered for session %s (attempt %d)",
                         session_id,
                         attempt + 1,
                     )
-                    return
+                    return completion_status
         except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
             last_err = exc
             logger.warning(

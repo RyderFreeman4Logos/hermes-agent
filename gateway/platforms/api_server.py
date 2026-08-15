@@ -4494,6 +4494,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 "total_tokens": usage.get("total_tokens", 0),
             },
         }
+        completion_delivery_status = (
+            str(result.get("completion_delivery_status") or "")
+            if internal_completion_delivery
+            else ""
+        )
         if is_partial or is_failed or not completed:
             response_data["hermes"] = {
                 "completed": completed,
@@ -4501,11 +4506,21 @@ class APIServerAdapter(BasePlatformAdapter):
                 "failed": is_failed,
                 "error": err_msg,
                 "error_code": "output_truncated" if finish_reason == "length" else "agent_error",
+                **(
+                    {"completion_delivery_status": completion_delivery_status}
+                    if completion_delivery_status
+                    else {}
+                ),
             }
             response_headers["X-Hermes-Completed"] = "false"
             response_headers["X-Hermes-Partial"] = "true" if is_partial else "false"
             if err_msg:
                 response_headers["X-Hermes-Error"] = _redact_api_error_text(err_msg, limit=200)
+        elif completion_delivery_status:
+            response_data["hermes"] = {
+                "completed": completed,
+                "completion_delivery_status": completion_delivery_status,
+            }
 
         return web.json_response(response_data, headers=response_headers)
 

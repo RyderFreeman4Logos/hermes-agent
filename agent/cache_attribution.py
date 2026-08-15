@@ -242,3 +242,22 @@ def consume_turn_cache_info(agent: Any) -> dict[str, int | str] | None:
     info = getattr(agent, "_first_turn_cache_info", None)
     agent._first_turn_cache_info = None
     return dict(info) if isinstance(info, dict) else None
+
+
+def settle_returned_turn_cache_info(agent: Any, result: Any) -> Any:
+    """Attach and consume cache evidence at the public returned-turn boundary.
+
+    ``finalize_turn`` normally owns this settlement.  Some terminal error
+    branches return before reaching it, so the outer AIAgent boundary must
+    provide the same one-shot guarantee without replacing an already-finalized
+    result.  Raised exceptions deliberately remain unsettled here: their
+    caller-specific terminal backstop consumes the sample instead.
+    """
+    retained = consume_turn_cache_info(agent)
+    if (
+        isinstance(result, dict)
+        and not isinstance(result.get("cache_info"), dict)
+        and retained is not None
+    ):
+        result["cache_info"] = retained
+    return result

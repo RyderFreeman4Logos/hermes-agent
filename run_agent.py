@@ -46,6 +46,7 @@ import time
 import threading
 import uuid
 import warnings
+from functools import wraps
 from typing import List, Dict, Any, Optional, Callable
 # NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
 # SDK pulls ~240 ms of imports. We expose `OpenAI` as a thin proxy object
@@ -64,6 +65,19 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from hermes_constants import get_hermes_home
+
+
+def _settle_cache_info_on_return(method):
+    """Give every normal AIAgent return the same one-shot cache settlement."""
+
+    @wraps(method)
+    def settled(agent, *args, **kwargs):
+        result = method(agent, *args, **kwargs)
+        from agent.cache_attribution import settle_returned_turn_cache_info
+
+        return settle_returned_turn_cache_info(agent, result)
+
+    return settled
 
 
 def _launch_cwd_for_session(source: str) -> Optional[str]:
@@ -8307,6 +8321,7 @@ class AIAgent:
                 logger.debug("Conversation root lineage walk failed", exc_info=True)
         return start
 
+    @_settle_cache_info_on_return
     def run_conversation(
         self,
         user_message: Any,

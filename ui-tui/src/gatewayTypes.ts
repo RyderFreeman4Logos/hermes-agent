@@ -738,6 +738,16 @@ export type GatewayEvent =
   | {
       payload?: {
         billing?: BillingBlock
+        cache_info?: {
+          attribution?: 'post_compression'
+          level: 'error' | 'info'
+          note?: string
+          pct: number
+          prompt_tokens: number
+          read_tokens: number
+          state: 'cold_write' | 'hit' | 'miss' | 'unavailable' | 'unknown'
+        }
+        completed_at?: number
         failure_reason?: string
         reasoning?: string
         rendered?: string

@@ -59,6 +59,31 @@ def _make_agent(max_iterations: int = 10, config: dict | None = None) -> AIAgent
     return agent
 
 
+def test_first_api_call_reports_cache_hit_to_tui_callback():
+    agent = _make_agent(max_iterations=10)
+    response = _mock_response(content="Done.", finish_reason="stop")
+    response.usage = SimpleNamespace(
+        prompt_tokens=2_000,
+        completion_tokens=10,
+        total_tokens=2_010,
+        prompt_tokens_details=SimpleNamespace(cached_tokens=1_880),
+    )
+    agent.client.chat.completions.create.side_effect = [response]
+    cache_events = []
+    agent._tui_cache_callback = lambda *args: cache_events.append(args)
+
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("do something")
+
+    assert result["final_response"] == "Done."
+    assert cache_events == [("hit", 94, 1_880, 2_000)]
+    assert agent._first_turn_usage["cache_telemetry_present"] is True
+
+
 # --------------------------------------------------------------------------
 # 1. Pure formatter
 # --------------------------------------------------------------------------
@@ -385,5 +410,3 @@ def test_run_conversation_partial_stream_recovery_surfaces_explanation():
     assert result["final_response"].startswith(recovered)
     assert "No reply:" in result["final_response"]
     assert result["response_previewed"] is False
-
-

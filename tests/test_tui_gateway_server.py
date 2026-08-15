@@ -19,6 +19,40 @@ from tui_gateway import server
 from tui_gateway.transport import bind_transport, reset_transport
 
 
+def test_message_complete_event_includes_completion_timestamp(monkeypatch):
+    emitted = []
+    payload = {"text": "done"}
+    monkeypatch.setattr(server, "write_json", emitted.append)
+    monkeypatch.setattr(server.time, "time", lambda: 1_700_000_000.25)
+
+    server._emit("message.complete", "sid", payload)
+
+    assert emitted[0]["params"]["payload"] == {
+        "completed_at": 1_700_000_000.25,
+        "text": "done",
+    }
+    assert payload == {"text": "done"}
+
+
+def test_cache_info_distinguishes_reported_zero_from_omitted_telemetry():
+    base = {"prompt_tokens": 2_000, "cache_read_tokens": 0, "cache_write_tokens": 0}
+
+    assert server._cache_info_from_usage({**base, "cache_telemetry_present": False}) == {
+        "level": "info",
+        "pct": 0,
+        "prompt_tokens": 2_000,
+        "read_tokens": 0,
+        "state": "unavailable",
+    }
+    assert server._cache_info_from_usage({**base, "cache_telemetry_present": True}) == {
+        "level": "error",
+        "pct": 0,
+        "prompt_tokens": 2_000,
+        "read_tokens": 0,
+        "state": "miss",
+    }
+
+
 def _dispatch_sync(req: dict, transport=None) -> dict | None:
     """Run one RPC to completion synchronously, regardless of pool routing.
 

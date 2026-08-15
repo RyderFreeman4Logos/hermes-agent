@@ -77,6 +77,31 @@ class TestBranchCommandCLI:
         new_session = session_db.get_session(cli_instance.session_id)
         assert new_session is not None
 
+    def test_branch_preserves_parent_skills_catalog_mode(self, cli_instance, session_db):
+        """A branch must inherit the parent's frozen prompt-catalog mode."""
+        from types import SimpleNamespace
+
+        from agent.system_prompt import restore_session_skills_catalog_mode
+        from cli import HermesCLI
+
+        parent_id = cli_instance.session_id
+        session_db.patch_session_model_config(
+            parent_id, {"_skills_catalog_mode": "compact"}
+        )
+
+        HermesCLI._handle_branch_command(cli_instance, "/branch")
+
+        child = session_db.get_session(cli_instance.session_id)
+        fresh_agent = SimpleNamespace(
+            _session_init_model_config={},
+            _skills_catalog_mode_config="full",
+            _cached_system_prompt=None,
+        )
+        assert restore_session_skills_catalog_mode(
+            fresh_agent, child["model_config"]
+        )
+        assert fresh_agent._skills_catalog_mode == "compact"
+
     def test_branch_copies_history(self, cli_instance, session_db):
         """Branching should copy all messages to the new session."""
         from cli import HermesCLI

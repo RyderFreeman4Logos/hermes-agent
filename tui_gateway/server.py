@@ -2958,7 +2958,13 @@ def _ensure_session_db_row(session: dict) -> None:
     # can nest it under its parent.
     parent_session_id = session.get("parent_session_id") or None
     if parent_session_id:
-        model_config["_branched_from"] = parent_session_id
+        from agent.system_prompt import inherit_session_skills_catalog_mode
+
+        parent_row = db.get_session(parent_session_id)
+        model_config = inherit_session_skills_catalog_mode(
+            parent_row.get("model_config") if parent_row else None,
+            {**model_config, "_branched_from": parent_session_id},
+        )
     try:
         db.create_session(
             key,

@@ -4981,11 +4981,18 @@ class GatewaySlashCommandsMixin:
         # /sessions even after the parent is reopened and re-ended with a
         # different end_reason (e.g. tui_shutdown overwriting 'branched').
         try:
+            from agent.system_prompt import inherit_session_skills_catalog_mode
+
+            parent_row = await self._session_db.get_session(parent_session_id)
+            branch_model_config = inherit_session_skills_catalog_mode(
+                parent_row.get("model_config") if parent_row else None,
+                {"_branched_from": parent_session_id},
+            )
             await self._session_db.create_session(
                 session_id=new_session_id,
                 source=source.platform.value if source.platform else "gateway",
                 model=(self.config.get("model", {}) or {}).get("default") if isinstance(self.config, dict) else None,
-                model_config={"_branched_from": parent_session_id},
+                model_config=branch_model_config,
                 parent_session_id=parent_session_id,
                 # Gateway routing columns — forward ALL of them at CREATE time,
                 # same fix as the compression-rotation bug in

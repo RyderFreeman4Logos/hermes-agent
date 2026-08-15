@@ -17,6 +17,7 @@ resolved through :func:`_ra` so those patches keep working.
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 import random
@@ -26,6 +27,41 @@ import time
 from typing import Any, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
+from agent import physical_attempt_diagnostics
+
+
+def _record_successful_provider_response(
+    agent: Any, canonical_usage: Any, request_index: int
+) -> dict[str, Any]:
+    """Capture the content-free cache result for one successful physical call."""
+    if not physical_attempt_diagnostics.enabled():
+        return {}
+    prompt = max(0, int(getattr(canonical_usage, "prompt_tokens", 0) or 0))
+    cache_read = max(0, int(getattr(canonical_usage, "cache_read_tokens", 0) or 0))
+    cache_write = max(0, int(getattr(canonical_usage, "cache_write_tokens", 0) or 0))
+    present = bool(getattr(canonical_usage, "cache_telemetry_present", False))
+    record = {
+        "owner": "agent_loop",
+        "session": hashlib.sha256(
+            str(getattr(agent, "session_id", "") or "").encode()
+        ).hexdigest(),
+        "timestamp": time.time(),
+        "turn_origin": str(getattr(agent, "_cache_turn_origin", "user")),
+        "request_index": max(1, int(request_index)),
+        "state": "unknown" if not present else "hit" if cache_read else "miss",
+        "prompt_tokens": prompt,
+        "cache_read_tokens": cache_read,
+        "cache_write_tokens": cache_write,
+        "pct": round(cache_read * 100 / prompt, 3) if prompt else 0.0,
+    }
+    records = getattr(agent, "_provider_response_records", None)
+    if not isinstance(records, list):
+        records = []
+        agent._provider_response_records = records
+    records.append(record)
+    if getattr(agent, "_first_provider_response", None) is None:
+        agent._first_provider_response = record
+    return record
 from agent.conversation_compression import (
     COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
     COMPRESSION_RETRY_MESSAGES_STATUS_TEMPLATE,
@@ -1620,6 +1656,7 @@ def run_conversation(
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    turn_origin: str = "user",
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -1668,6 +1705,9 @@ def run_conversation(
     agent._last_compaction_in_place = False
     agent._last_compression_attempt_recorded = False
     agent._last_compression_attempt_in_place = None
+    agent._first_provider_response = None
+    agent._provider_response_records = []
+    agent._cache_turn_origin = turn_origin
 
     # If a background memory/skill review spawned at the end of a PRIOR turn
     # (agent/background_review.py) is still running its own run_conversation()
@@ -3847,6 +3887,9 @@ def run_conversation(
                         "cache_write_tokens": canonical_usage.cache_write_tokens,
                         "reasoning_tokens": canonical_usage.reasoning_tokens,
                     }
+                    _record_successful_provider_response(
+                        agent, canonical_usage, api_call_count
+                    )
                     # Capture the boundary latch before update_from_response()
                     # consumes it. Only a real provider prompt count for the
                     # request immediately following a completed compaction can

@@ -148,6 +148,7 @@ from tools.browser_tool import cleanup_browser
 
 # Agent internals extracted to agent/ package for modularity
 from agent.memory_manager import sanitize_context
+from agent import physical_attempt_diagnostics
 from agent.memory_provider import is_trivial_prompt
 from agent.error_classifier import FailoverReason
 from agent.redact import redact_sensitive_text
@@ -6624,11 +6625,14 @@ class AIAgent:
             visible = redact_sensitive_text(visible)
         if not visible or visible == "(empty)" or self._interim_text_was_delivered(visible):
             return
+        marker = physical_attempt_diagnostics.begin_callback("text")
         try:
             cb(visible, already_streamed=False)
             self._record_delivered_interim_text(visible)
         except Exception:
             logger.debug("interim_assistant_callback error", exc_info=True)
+        finally:
+            physical_attempt_diagnostics.end_callback(marker)
 
     def _emit_interim_assistant_message(
         self, assistant_msg: Dict[str, Any]
@@ -6855,12 +6859,16 @@ class AIAgent:
             return
         callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
         delivered = False
-        for cb in callbacks:
-            try:
-                cb(text)
-                delivered = True
-            except Exception:
-                pass
+        marker = physical_attempt_diagnostics.begin_callback("text") if callbacks else None
+        try:
+            for cb in callbacks:
+                try:
+                    cb(text)
+                    delivered = True
+                except Exception:
+                    pass
+        finally:
+            physical_attempt_diagnostics.end_callback(marker)
         try:
             from agent.plugin_stream_hooks import enqueue_plugin_stream_hook
 
@@ -6884,10 +6892,13 @@ class AIAgent:
             return
         cb = self.reasoning_callback
         if cb is not None:
+            marker = physical_attempt_diagnostics.begin_callback("reasoning")
             try:
                 cb(text)
             except Exception:
                 pass
+            finally:
+                physical_attempt_diagnostics.end_callback(marker)
         try:
             from agent.plugin_stream_hooks import enqueue_plugin_stream_hook, stream_reasoning_deltas_enabled
 
@@ -6911,10 +6922,13 @@ class AIAgent:
         """
         cb = self.tool_gen_callback
         if cb is not None:
+            marker = physical_attempt_diagnostics.begin_callback("tool")
             try:
                 cb(tool_name)
             except Exception:
                 pass
+            finally:
+                physical_attempt_diagnostics.end_callback(marker)
 
     def _has_stream_consumers(self) -> bool:
         """Return True if any streaming consumer is registered."""
@@ -8301,6 +8315,7 @@ class AIAgent:
         persist_user_display_kind: Optional[str] = None,
         persist_user_display_metadata: Optional[Dict[str, Any]] = None,
         moa_config: Optional[dict[str, Any]] = None,
+        turn_origin: str = "user",
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         from agent.aux_accounting import (
@@ -8665,6 +8680,7 @@ class AIAgent:
                         persist_user_display_kind=persist_user_display_kind,
                         persist_user_display_metadata=persist_user_display_metadata,
                         moa_config=moa_config,
+                        turn_origin=turn_origin,
                     )
                 finally:
                     # The lease remains held through relay/task finalization, but

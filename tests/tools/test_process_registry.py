@@ -1584,7 +1584,7 @@ class TestHandleProcessRedaction:
         assert "sk-proj-AAAABBBBCCCCDDDDEEEEFFFFGGGG" not in entry["output_preview"]
         assert "curl" in entry["command"]
 
-    def test_disabled_passes_through(self, monkeypatch):
+    def test_process_summary_redacts_when_disabled(self, monkeypatch):
         import agent.redact as _r
         monkeypatch.setattr(_r, "_REDACT_ENABLED", False)
         from tools import process_registry as pr
@@ -1596,7 +1596,75 @@ class TestHandleProcessRedaction:
         reg._running[sess.id] = sess
         monkeypatch.setattr(pr, "process_registry", reg)
         out = json.loads(pr._handle_process({"action": "log", "session_id": sess.id}))
-        assert "zzzopaque1234567890abcdef" in out["output"]
+        assert "zzzopaque1234567890abcdef" not in out["output"]
+
+    @pytest.mark.parametrize(
+        ("action", "registry_method"),
+        [
+            ("list", "list_sessions"),
+            ("poll", "poll"),
+            ("log", "read_log"),
+            ("wait", "wait"),
+            ("kill", "kill_process"),
+        ],
+    )
+    def test_all_process_summary_surfaces_force_strict_redaction(
+        self, monkeypatch, action, registry_method
+    ):
+        import agent.redact as _r
+        from tools import process_registry as pr
+
+        monkeypatch.setattr(_r, "_REDACT_ENABLED", False)
+        yaml_secret = "SYNTHETIC_PROCESS_YAML_1a2b"
+        dotted_secret = "SYNTHETIC_PROCESS_DOTTED_3c4d"
+        opaque_secret = "SYNTHETIC_PROCESS_OPAQUE_5e6f"
+        url_secret = "SYNTHETIC_PROCESS_URL_7a8b"
+        command_opaque_secret = "SYNTHETIC_PROCESS_COMMAND_OPAQUE_9c0d"
+        command_config_secret = "SYNTHETIC_PROCESS_COMMAND_CONFIG_2e4f"
+        command_url_secret = "SYNTHETIC_PROCESS_COMMAND_URL_6a8c"
+        output = "\n".join(
+            (
+                f"api_key: {yaml_secret} see https://example.invalid/docs",
+                f"service.auth.token={dotted_secret}",
+                f"CUSTOM_TOKEN={opaque_secret}",
+                (
+                    "https://example.invalid/result"
+                    f"?access_token={url_secret}&state=keep"
+                ),
+            )
+        )
+        process_result = {
+            "command": (
+                f"CUSTOM_TOKEN={command_opaque_secret} python app.py "
+                f"--set service.auth.token={command_config_secret} "
+                "--callback https://example.invalid/run"
+                f"?access_token={command_url_secret}&mode=inspect"
+            ),
+            "output": output,
+            "output_preview": output,
+        }
+        reg = ProcessRegistry()
+        returned = [dict(process_result)] if action == "list" else dict(process_result)
+        monkeypatch.setattr(reg, registry_method, MagicMock(return_value=returned))
+        monkeypatch.setattr(pr, "process_registry", reg)
+
+        args = {"action": action}
+        if action != "list":
+            args["session_id"] = "proc_strict_summary"
+        parsed = json.loads(pr._handle_process(args))
+        redacted = parsed["processes"][0] if action == "list" else parsed
+
+        assert command_opaque_secret not in redacted["command"]
+        assert command_config_secret not in redacted["command"]
+        assert command_url_secret not in redacted["command"]
+        assert "mode=inspect" in redacted["command"]
+        for field in ("output", "output_preview"):
+            assert yaml_secret not in redacted[field]
+            assert dotted_secret not in redacted[field]
+            assert opaque_secret not in redacted[field]
+            assert url_secret not in redacted[field]
+            assert "state=keep" in redacted[field]
+            assert "example.invalid" in redacted[field]
 
 
 # =========================================================================
@@ -2350,3 +2418,48 @@ class TestNotificationRedaction:
         _evt, text = results[0]
         assert "ghp_abc123def456" not in text
         assert "ghp_" not in text or "REDACTED" in text
+
+    @pytest.mark.parametrize("notification_kind", ["completion", "watch_match"])
+    def test_notifications_force_strict_redaction_when_disabled(
+        self, monkeypatch, notification_kind
+    ):
+        import agent.redact as _r
+
+        monkeypatch.setattr(_r, "_REDACT_ENABLED", False)
+        config_secret = "SYNTHETIC_NOTIFICATION_CONFIG_2b4d"
+        url_secret = "SYNTHETIC_NOTIFICATION_URL_6f8a"
+        command_secret = "SYNTHETIC_NOTIFICATION_COMMAND_1c3e"
+        output = (
+            f"service.auth.token={config_secret} READY "
+            "https://example.invalid/result"
+            f"?access_token={url_secret}&state=keep"
+        )
+        sess = _make_session(
+            sid=f"proc_{notification_kind}",
+            command=(
+                "python app.py --callback "
+                "https://example.invalid/callback"
+                f"?access_token={command_secret}&mode=inspect"
+            ),
+        )
+        reg = ProcessRegistry()
+
+        if notification_kind == "completion":
+            sess.output_buffer = output
+            sess.notify_on_complete = True
+            sess.exited = True
+            sess.exit_code = 0
+            reg._running[sess.id] = sess
+            monkeypatch.setattr(reg, "_write_checkpoint", MagicMock())
+            reg._move_to_finished(sess)
+        else:
+            sess.watch_patterns = ["READY"]
+            reg._running[sess.id] = sess
+            reg._check_watch_patterns(sess, output)
+
+        notification = reg.completion_queue.get_nowait()
+        assert config_secret not in notification["output"]
+        assert url_secret not in notification["output"]
+        assert command_secret not in notification["command"]
+        assert "state=keep" in notification["output"]
+        assert "mode=inspect" in notification["command"]

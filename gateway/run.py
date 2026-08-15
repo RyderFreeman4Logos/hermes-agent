@@ -25436,6 +25436,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 ) -> None:
                     restore = retry_events or [events[event_index]]
                     for later_index in range(event_index + 1, len(events)):
+                        if later_index in restored_indexes:
+                            continue
                         if owner_key(events[later_index]) == owner:
                             restore.append(events[later_index])
                             restored_indexes.add(later_index)
@@ -25455,10 +25457,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         finally:
                             _pr.consume_completion_event(evt)
                         continue
+                    if evt.get("type") == "async_delegation":
+                        self._enrich_async_delegation_routing(evt)
+                        group_key = self._async_delegation_group_key(evt)
+                        group_indexes = [
+                            index
+                            for index in range(event_index, len(events))
+                            if index not in restored_indexes
+                            and events[index].get("type") == "async_delegation"
+                            and self._async_delegation_group_key(events[index])
+                            == group_key
+                        ]
+                        group = [events[index] for index in group_indexes]
+                        restored_indexes.update(group_indexes[1:])
+                        try:
+                            delivered = await self._deliver_async_delegation_group(group)
+                        except Exception as e:
+                            restore_owner_tail(event_index, owner, group)
+                            logger.error("Async delegation injection error: %s", e)
+                            continue
+                        if delivered is False:
+                            restore_owner_tail(event_index, owner, group)
+                        continue
                     retry_events: list[dict] = []
                     try:
-                        if evt.get("type") == "async_delegation":
-                            self._enrich_async_delegation_routing(evt)
                         synth_text = _format_gateway_process_notification(evt)
                         if not synth_text:
                             _pr.consume_completion_event(evt)

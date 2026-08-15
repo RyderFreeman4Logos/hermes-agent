@@ -3,6 +3,7 @@
 import asyncio
 import threading
 from datetime import datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -58,6 +59,44 @@ def _make_runner(history: list[dict[str, str]]):
     runner.session_store._save = MagicMock()
     runner._session_db = None
     return runner
+
+
+def test_manual_compress_seed_carries_catalog_mode_to_rotation_child(tmp_path):
+    from agent.system_prompt import restore_session_skills_catalog_mode
+    from gateway.run import _seed_hygiene_system_prompt
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session(
+            "parent",
+            "telegram",
+            model_config={"_skills_catalog_mode": "compact"},
+            system_prompt="stored prompt",
+        )
+        agent = SimpleNamespace(_session_init_model_config={"max_iterations": 4})
+
+        assert _seed_hygiene_system_prompt(agent, db.get_session("parent"))
+        assert agent._session_init_model_config["_skills_catalog_mode"] == "compact"
+
+        db.publish_compression_child(
+            parent_session_id="parent",
+            child_session_id="child",
+            source="telegram",
+            model_config=agent._session_init_model_config,
+            system_prompt=agent._cached_system_prompt,
+            messages=[{"role": "user", "content": "compressed handoff"}],
+            require_compression_lease=False,
+        )
+        child = db.get_session("child")
+        assert child is not None
+        fresh_agent = SimpleNamespace(_session_init_model_config={})
+        assert restore_session_skills_catalog_mode(
+            fresh_agent, child["model_config"]
+        )
+        assert fresh_agent._skills_catalog_mode == "compact"
+    finally:
+        db.close()
 
 
 @pytest.mark.asyncio

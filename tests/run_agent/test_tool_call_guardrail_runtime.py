@@ -1,6 +1,7 @@
 """Runtime tests for tool-call loop guardrails."""
 
 import json
+import threading
 import uuid
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -151,6 +152,93 @@ def test_sequential_after_call_appends_guidance_to_tool_result_without_extra_mes
     assert messages[0]["tool_call_id"] == "c-warn"
     assert "Tool loop warning" in messages[0]["content"]
     assert "repeated_exact_failure_warning" in messages[0]["content"]
+
+
+def test_sequential_batch_skips_calls_after_no_progress_halt():
+    agent = _make_agent("terminal", "browser_scroll")
+    calls = [
+        _mock_tool_call("terminal", '{"command":"false"}', f"c-{index}")
+        for index in range(5)
+    ]
+    calls.extend(
+        (
+            _mock_tool_call("browser_scroll", '{"direction":"down"}', "c-5"),
+            _mock_tool_call("terminal", '{"command":"echo skipped"}', "c-6"),
+        )
+    )
+    msg = SimpleNamespace(content="", tool_calls=calls)
+    messages = []
+
+    with patch(
+        "run_agent.handle_function_call",
+        return_value=json.dumps({"exit_code": 1}),
+    ) as dispatch:
+        agent._execute_tool_calls_sequential(msg, messages, "task-1")
+
+    assert dispatch.call_count == 5
+    assert [message["tool_call_id"] for message in messages] == [
+        f"c-{index}" for index in range(7)
+    ]
+    assert all(
+        "guardrail_turn_halted" in message["content"] for message in messages[-2:]
+    )
+    assert agent._tool_guardrail_halt_decision.code == "no_progress_loop"
+
+
+def test_concurrent_entry_orders_identical_calls_and_skips_after_no_progress_halt():
+    agent = _make_agent("web_search")
+    calls = [
+        _mock_tool_call("web_search", '{"query":"same"}', f"c-{index}")
+        for index in range(7)
+    ]
+    msg = SimpleNamespace(content="", tool_calls=calls)
+    messages = []
+
+    with patch(
+        "run_agent.handle_function_call", return_value=json.dumps({"error": "same"})
+    ) as dispatch:
+        agent._execute_tool_calls_concurrent(msg, messages, "task-1")
+
+    assert dispatch.call_count == 5
+    assert [message["tool_call_id"] for message in messages] == [
+        f"c-{index}" for index in range(7)
+    ]
+    assert all(
+        "guardrail_turn_halted" in message["content"] for message in messages[-2:]
+    )
+
+
+def test_concurrent_missing_result_breaks_no_progress_observation_streak():
+    agent = _make_agent("web_search")
+    args = {"query": "same"}
+    _seed_exact_failures(agent, "web_search", args, count=4)
+    release = threading.Event()
+    timed_out = SimpleNamespace(
+        content="",
+        tool_calls=[_mock_tool_call("web_search", json.dumps(args), "c-timeout")],
+    )
+
+    with (
+        patch("agent.tool_executor._resolve_concurrent_tool_timeout", return_value=0.01),
+        patch(
+            "run_agent.handle_function_call",
+            side_effect=lambda *_args, **_kwargs: release.wait(timeout=1) or "late",
+        ),
+    ):
+        agent._execute_tool_calls_concurrent(timed_out, [], "task-1")
+    release.set()
+
+    real = SimpleNamespace(
+        content="",
+        tool_calls=[_mock_tool_call("web_search", json.dumps(args), "c-real")],
+    )
+    with patch(
+        "run_agent.handle_function_call", return_value=json.dumps({"error": "boom"})
+    ) as dispatch:
+        agent._execute_tool_calls_sequential(real, [], "task-1")
+
+    dispatch.assert_called_once()
+    assert agent._tool_guardrail_halt_decision is None
 
 
 def test_same_tool_failure_warning_tells_model_to_recover_with_tools():
@@ -339,6 +427,32 @@ def test_plugin_pre_tool_block_wins_without_counting_as_toolguard_block():
     mock_hfc.assert_not_called()
     assert "plugin policy" in messages[0]["content"]
     assert agent._tool_guardrails.before_call("web_search", args).action == "allow"
+
+
+def test_default_run_conversation_halts_repeated_no_progress_tool_loop():
+    agent = _make_agent("web_search", max_iterations=10)
+    same_args = {"query": "same"}
+    responses = [
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call("web_search", json.dumps(same_args), f"c{i}")],
+        )
+        for i in range(1, 10)
+    ]
+    agent.client.chat.completions.create.side_effect = responses
+
+    with (
+        patch("run_agent.handle_function_call", return_value=json.dumps({"error": "boom"})) as mock_hfc,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("search repeatedly")
+
+    assert mock_hfc.call_count == 5
+    assert result["turn_exit_reason"] == "guardrail_halt"
+    assert result["guardrail"]["code"] == "no_progress_loop"
 
 
 def test_default_run_conversation_warns_without_guardrail_halt():

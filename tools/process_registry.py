@@ -494,13 +494,19 @@ def arm_process_heartbeat(
         interval=interval,
         inspect=lambda _id=session.id: inspect_process(_id),
     )
+    completion_event = getattr(session, "_completion_event", None)
     if not armed:
+        # A local pipe/PTY reader may finish after publication but before the
+        # heartbeat's baseline inspection.  That is a successful accepted
+        # execution, not an arm/start failure: its completion was already
+        # published through the registry's exactly-once path.
+        if completion_event is not None and completion_event.is_set():
+            return interval
         raise RuntimeError(
             f"runtime heartbeat did not arm for managed process {session.id}"
         )
 
     # Completion may have won before the heartbeat was armed.
-    completion_event = getattr(session, "_completion_event", None)
     if completion_event is not None and completion_event.is_set():
         runtime_heartbeat.cancel(session.id)
     return interval

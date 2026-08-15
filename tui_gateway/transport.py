@@ -27,7 +27,10 @@ import errno
 import json
 import logging
 import os
+import queue
 import threading
+import time
+from collections import deque
 from typing import Any, Callable, Optional, Protocol, runtime_checkable
 
 # Errno values that mean "the peer is gone" rather than "the host has a
@@ -43,6 +46,14 @@ _PEER_GONE_ERRNOS = frozenset({
 } - {-1})
 
 logger = logging.getLogger(__name__)
+
+
+def _is_peer_gone(exc: BaseException) -> bool:
+    if isinstance(exc, BrokenPipeError):
+        return True
+    if isinstance(exc, ValueError):
+        return not isinstance(exc, UnicodeEncodeError) and "closed file" in str(exc)
+    return isinstance(exc, OSError) and exc.errno in _PEER_GONE_ERRNOS
 
 # Optional knob: when true, StdioTransport does not call ``stream.flush``
 # after writing.  Use this on environments where a half-closed pipe (TUI
@@ -181,6 +192,149 @@ class StdioTransport:
 
     def close(self) -> None:
         return None
+
+
+_STREAMING_EVENT_TYPES = frozenset({
+    "message.delta",
+    "reasoning.delta",
+    "thinking.delta",
+})
+
+
+class BufferedStreamWriter:
+    """Keep streaming producers off a blocking transport sink."""
+
+    def __init__(
+        self,
+        inner: Transport,
+        *,
+        queue_maxsize: int = 256,
+        max_pending_deltas: int = 512,
+        control_push_timeout_s: float = 0.1,
+        coalesce_s: float = 0.033,
+        close_timeout_s: float = 1.0,
+    ) -> None:
+        self._inner = inner
+        self._queue: queue.Queue[list[dict]] = queue.Queue(maxsize=queue_maxsize)
+        self._pending: deque[dict] = deque(maxlen=max_pending_deltas)
+        self._pending_lock = threading.Lock()
+        self._control_lock = threading.Lock()
+        self._control_claimed = 0
+        self._closed = threading.Event()
+        self._failure: BaseException | None = None
+        self._coalesce_s = coalesce_s
+        self._control_push_timeout_s = control_push_timeout_s
+        self._close_timeout_s = close_timeout_s
+        self._thread = threading.Thread(
+            target=self._drain, name="tui-stdio-writer", daemon=True
+        )
+        self._thread.start()
+
+    @staticmethod
+    def _is_streaming_frame(obj: dict) -> bool:
+        params = obj.get("params") if isinstance(obj, dict) else None
+        return isinstance(params, dict) and params.get("type") in _STREAMING_EVENT_TYPES
+
+    @property
+    def failure(self) -> BaseException | None:
+        with self._pending_lock:
+            return self._failure
+
+    def raise_if_failed(self) -> None:
+        failure = self.failure
+        if failure is not None and not _is_peer_gone(failure):
+            raise failure
+
+    def _close(self, failure: BaseException | None = None) -> None:
+        with self._pending_lock:
+            if failure is not None and self._failure is None:
+                self._failure = failure
+            self._closed.set()
+
+    def write(self, obj: dict) -> bool:
+        if self._closed.is_set():
+            self.raise_if_failed()
+            return False
+        if self._is_streaming_frame(obj):
+            with self._pending_lock:
+                if self._closed.is_set():
+                    closed = True
+                else:
+                    self._pending.append(obj)
+                    return True
+            if closed:
+                self.raise_if_failed()
+                return False
+
+        deadline = time.monotonic() + self._control_push_timeout_s
+        if not self._control_lock.acquire(timeout=self._control_push_timeout_s):
+            self._close(TimeoutError("control queue lock timed out"))
+            return False
+        try:
+            batch: list[dict] = []
+            with self._pending_lock:
+                if self._closed.is_set():
+                    closed = True
+                else:
+                    closed = False
+                    batch = list(self._pending)
+                    self._pending.clear()
+                    batch.append(obj)
+                    self._control_claimed += 1
+            if closed:
+                self.raise_if_failed()
+                return False
+            try:
+                self._queue.put(batch, timeout=max(0.0, deadline - time.monotonic()))
+            except queue.Full:
+                with self._pending_lock:
+                    self._control_claimed -= 1
+                self._close(TimeoutError("control queue remained full"))
+                return False
+            return True
+        finally:
+            self._control_lock.release()
+
+    def _write_batch(self, batch: list[dict]) -> bool:
+        for obj in batch:
+            try:
+                if self._inner.write(obj):
+                    continue
+            except BaseException as exc:
+                self._close(exc)
+                return False
+            self._close(BrokenPipeError("inner transport closed"))
+            return False
+        return True
+
+    def _drain(self) -> None:
+        try:
+            while True:
+                try:
+                    batch = self._queue.get(timeout=self._coalesce_s)
+                except queue.Empty:
+                    batch = None
+                if batch is not None:
+                    if not self._write_batch(batch):
+                        return
+                    with self._pending_lock:
+                        self._control_claimed -= 1
+
+                with self._pending_lock:
+                    pending = [] if self._control_claimed else list(self._pending)
+                    if pending:
+                        self._pending.clear()
+                    done = self._closed.is_set() and not self._control_claimed and self._queue.empty() and not pending
+                if pending and not self._write_batch(pending):
+                    return
+                if done:
+                    return
+        finally:
+            self._close()
+
+    def close(self) -> None:
+        self._close()
+        self._thread.join(timeout=self._close_timeout_s)
 
 
 class TeeTransport:

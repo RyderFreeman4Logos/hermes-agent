@@ -232,6 +232,69 @@ def test_advisory_lock_timeout_is_bounded(db, process_ctx) -> None:
     assert 0.15 <= elapsed < 1.0
 
 
+@pytest.mark.parametrize("lock_name", ["_writer_lock", "_lock"])
+@pytest.mark.parametrize("patience_s", [0.0, 0.1])
+def test_process_local_lock_timeout_uses_write_deadline(
+    db, lock_name: str, patience_s: float
+) -> None:
+    ready = threading.Event()
+    release = threading.Event()
+
+    def hold_local_lock() -> None:
+        with getattr(db, lock_name):
+            ready.set()
+            release.wait(2.0)
+
+    holder = threading.Thread(target=hold_local_lock)
+    holder.start()
+    assert ready.wait(1.0)
+    release_timer = threading.Timer(0.8, release.set)
+    release_timer.start()
+    started = time.monotonic()
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+            with db._write_guard(patience_s=patience_s):
+                pass
+    finally:
+        release.set()
+        release_timer.cancel()
+        release_timer.join()
+        holder.join(2.0)
+
+    assert not holder.is_alive()
+    assert time.monotonic() - started < 0.5
+
+
+@pytest.mark.parametrize(
+    ("lock_name", "source"),
+    [
+        ("_writer_lock", "in-process SessionDB writer"),
+        ("_lock", "SessionDB connection"),
+    ],
+)
+def test_execute_write_preserves_process_local_timeout_source(
+    db, lock_name: str, source: str
+) -> None:
+    ready = threading.Event()
+    release = threading.Event()
+
+    def hold_local_lock() -> None:
+        with getattr(db, lock_name):
+            ready.set()
+            release.wait(2.0)
+
+    holder = threading.Thread(target=hold_local_lock)
+    holder.start()
+    assert ready.wait(1.0)
+    try:
+        with pytest.raises(sqlite3.OperationalError, match=source):
+            db._execute_write(lambda _conn: None, patience_s=0.0)
+    finally:
+        release.set()
+        holder.join(2.0)
+    assert not holder.is_alive()
+
+
 def test_waiting_writer_does_not_block_same_instance_public_readers(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -365,6 +428,92 @@ def test_automatic_fts_merge_waits_for_advisory_lock(db, process_ctx) -> None:
     assert holder.exitcode == 0
     assert time.monotonic() - started >= 0.2
     assert db._fts_usermerge_floor_applied
+
+
+def test_fts_probe_and_merge_share_one_writer_interval(
+    db, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if not db._fts_enabled:
+        pytest.skip("FTS5 unavailable in this build")
+
+    peer = SessionDB(db_path=db.db_path)
+    probe_paused = threading.Event()
+    resume_probe = threading.Event()
+    peer_contended = threading.Event()
+    peer_finished = threading.Event()
+    peer_thread_id = {}
+    outcomes = {}
+
+    original_exists = db._fts_table_exists
+    original_try_lock = hermes_state._try_acquire_exclusive_file_lock
+
+    def pause_after_positive_probe(name: str) -> bool:
+        exists = original_exists(name)
+        if name == "messages_fts" and exists:
+            probe_paused.set()
+            assert resume_probe.wait(5.0)
+        return exists
+
+    def observe_peer_contention(handle) -> bool:
+        acquired = original_try_lock(handle)
+        if (
+            threading.get_ident() == peer_thread_id.get("value")
+            and not acquired
+        ):
+            peer_contended.set()
+        return acquired
+
+    monkeypatch.setattr(db, "_fts_table_exists", pause_after_positive_probe)
+    monkeypatch.setattr(
+        hermes_state, "_try_acquire_exclusive_file_lock", observe_peer_contention
+    )
+
+    def merge() -> None:
+        try:
+            outcomes["merge"] = db._merge_fts_incrementally(
+                max_pages=1, max_commands=1
+            )
+        except BaseException as exc:
+            outcomes["merge_error"] = exc
+
+    def drop_table() -> None:
+        peer_thread_id["value"] = threading.get_ident()
+        try:
+            with peer._write_guard(patience_s=2.0):
+                peer._conn.execute("DROP TABLE messages_fts")
+                peer._conn.commit()
+        except BaseException as exc:
+            outcomes["peer_error"] = exc
+        finally:
+            peer_finished.set()
+
+    merge_thread = threading.Thread(target=merge)
+    peer_thread = threading.Thread(target=drop_table)
+    merge_thread.start()
+    serialized = False
+    try:
+        assert probe_paused.wait(2.0)
+        peer_thread.start()
+        deadline = time.monotonic() + 2.0
+        while (
+            not peer_contended.is_set()
+            and not peer_finished.is_set()
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+        serialized = peer_contended.is_set() and not peer_finished.is_set()
+    finally:
+        resume_probe.set()
+        merge_thread.join(5.0)
+        if peer_thread.ident is not None:
+            peer_thread.join(5.0)
+        peer.close()
+
+    assert serialized, "peer schema mutation entered after probe but before merge"
+    assert not merge_thread.is_alive()
+    assert not peer_thread.is_alive()
+    assert "merge_error" not in outcomes
+    assert "peer_error" not in outcomes
 
 
 def test_schema_open_waits_for_advisory_lock(db, process_ctx) -> None:

@@ -1267,6 +1267,16 @@ class ProcessRegistry:
 
     # ----- Spawn -----
 
+    def _register_local_spawn(
+        self, session: ProcessSession, *, defer_registration: bool
+    ) -> None:
+        """Publish a local child before any reader can report its completion."""
+        if defer_registration:
+            return
+        with self._lock:
+            self._prune_if_needed()
+            self._running[session.id] = session
+
     def _contain_failed_spawn(
         self, session: ProcessSession, *, source: str = "failed_start"
     ) -> bool:
@@ -1356,6 +1366,7 @@ class ProcessRegistry:
         )
 
         pty_scope_attempted = False
+        pty_proc = None
         if use_pty:
             # Try PTY mode for interactive CLI tools
             try:
@@ -1403,6 +1414,10 @@ class ProcessRegistry:
                 session.pid = pty_proc.pid
                 session.host_start_time = self._safe_host_start_time(session.pid)
 
+                self._register_local_spawn(
+                    session, defer_registration=defer_registration
+                )
+
                 # PTY reader thread
                 reader = threading.Thread(
                     target=self._pty_reader_loop,
@@ -1419,6 +1434,13 @@ class ProcessRegistry:
             except ImportError:
                 logger.warning("ptyprocess not installed, falling back to pipe mode")
             except Exception as e:
+                if pty_proc is not None:
+                    logger.warning("PTY setup failed after process spawn: %s", e)
+                    if not self._contain_failed_spawn(session):
+                        raise RuntimeError(
+                            "PTY setup failed and the spawned process could not be reaped"
+                        ) from e
+                    raise RuntimeError("PTY setup failed after process spawn") from e
                 logger.warning("PTY spawn failed (%s), falling back to pipe mode", e)
                 if pty_scope_attempted and session.systemd_unit:
                     if not _stop_systemd_unit(session.systemd_unit):
@@ -1508,6 +1530,10 @@ class ProcessRegistry:
                 session.process_group_id = proc.pid  # start_new_session=True makes pid == pgid
                 session._subreaper_managed = sys.platform.startswith("linux")
             session.host_start_time = self._safe_host_start_time(session.pid)
+
+            self._register_local_spawn(
+                session, defer_registration=defer_registration
+            )
 
             # Start output reader thread
             reader = threading.Thread(

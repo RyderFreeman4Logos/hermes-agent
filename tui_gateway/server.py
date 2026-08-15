@@ -8615,7 +8615,7 @@ def _deferred_session_record(
     lease,
     source: str = "tui",
     close_on_disconnect: bool = False,
-    display_history_prefix: list | None = None,
+    display_history: list | None = None,
     display_history_limit: int | None = None,
     profile_home: Path | None = None,
     lazy: bool = False,
@@ -8635,7 +8635,7 @@ def _deferred_session_record(
         "cols": cols,
         "created_at": now,
         "cwd": cwd,
-        "display_history_prefix": display_history_prefix or [],
+        "display_history": display_history or [],
         "display_history_limit": display_history_limit,
         "edit_snapshots": {},
         "explicit_cwd": False,
@@ -8825,9 +8825,9 @@ def _reconcile_display_with_live(
       ``verification_required`` / ``verify_hook_continue``) that the in-memory
       model history collapses out via ``repair_message_sequence`` (#65919), but
       it can lag the newest turn by a flush.
-    - ``in_memory`` — ``display_history_prefix + session["history"]``. It is the
-      freshest recency authority (a just-appended turn may not be flushed yet)
-      but it is the collapsed *model* projection, so it is missing candidates.
+    - ``in_memory`` — the ordered display sidecar plus any unflushed model tail.
+      It is the freshest recency authority (a just-appended turn may not be
+      flushed yet) while retaining model-invisible candidates.
 
     The merge keeps the DB display (candidate-inclusive) as the base and appends
     only the in-memory tail that the DB does not yet cover, anchored on the last
@@ -8907,8 +8907,9 @@ def _live_session_payload(
             session["transport"] = transport
         if touch:
             session["last_active"] = time.time()
-        in_memory_history = list(session.get("display_history_prefix") or []) + list(
-            session.get("history") or []
+        in_memory_history = _reconcile_display_with_live(
+            list(session.get("display_history") or []),
+            list(session.get("history") or []),
         )
         inflight = _inflight_snapshot(session)
         queued = _queued_prompt_snapshot(session)

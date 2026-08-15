@@ -25,6 +25,7 @@ import ssl
 import time
 from typing import Any, Dict, List, Optional
 
+from agent.chat_completion_helpers import codex_pre_dispatch_watchdog_allowance
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.conversation_compression import (
     COMPRESSION_RETRY_CONTEXT_REDUCED_STATUS_TEMPLATE,
@@ -1671,6 +1672,7 @@ def run_conversation(
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    turn_deadline: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -1696,6 +1698,9 @@ def run_conversation(
         persist_user_display_metadata: Optional payload for that event
             (e.g. a delegation's task count).
                 or queuing follow-up prefetch work.
+        turn_deadline: Optional absolute ``time.monotonic()`` deadline for
+            this turn. Codex requests are not dispatched without watchdog
+            headroom.
 
     Returns:
         Dict: Complete conversation result with final response and message history
@@ -1812,6 +1817,7 @@ def run_conversation(
 
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = 0
+    logical_iteration_count = 0
     final_response = None
     interrupted = False
     failed = False
@@ -1878,7 +1884,14 @@ def run_conversation(
             should_review_memory=_should_review_memory,
         )
 
-    while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
+    while (
+        (
+            logical_iteration_count < agent.max_iterations
+            and agent.iteration_budget.remaining > 0
+        )
+        or agent._budget_grace_call
+        or getattr(agent, "_codex_incomplete_retries", 0)
+    ):
         _redirect_text = agent._drain_pending_redirect()
         if _redirect_text:
             _apply_active_turn_redirect(agent, messages, _redirect_text)
@@ -1907,13 +1920,37 @@ def run_conversation(
         # Grace call: the budget is exhausted but we gave the model one
         # more chance.  Consume the grace flag so the loop exits after
         # this iteration regardless of outcome.
+        codex_continuation = bool(getattr(agent, "_codex_incomplete_retries", 0))
+        logical_slot_consumed = False
+        shared_iteration_consumed = False
         if agent._budget_grace_call:
             agent._budget_grace_call = False
-        elif not agent.iteration_budget.consume():
-            _turn_exit_reason = "budget_exhausted"
-            if not agent.quiet_mode:
-                agent._safe_print(f"\n⚠️  Iteration budget exhausted ({agent.iteration_budget.used}/{agent.iteration_budget.max_total} iterations used)")
-            break
+            logical_iteration_count += 1
+            logical_slot_consumed = True
+        elif not codex_continuation:
+            if not agent.iteration_budget.consume():
+                _turn_exit_reason = "budget_exhausted"
+                api_call_count -= 1
+                agent._api_call_count = api_call_count
+                if not agent.quiet_mode:
+                    agent._safe_print(f"\n⚠️  Iteration budget exhausted ({agent.iteration_budget.used}/{agent.iteration_budget.max_total} iterations used)")
+                break
+            logical_iteration_count += 1
+            logical_slot_consumed = True
+            shared_iteration_consumed = True
+
+        def _refund_current_logical_iteration():
+            nonlocal logical_iteration_count, logical_slot_consumed
+            nonlocal shared_iteration_consumed
+            if logical_slot_consumed:
+                logical_iteration_count = max(0, logical_iteration_count - 1)
+                logical_slot_consumed = False
+            if shared_iteration_consumed:
+                try:
+                    agent.iteration_budget.refund()
+                except Exception:
+                    pass
+                shared_iteration_consumed = False
 
         # Fire step_callback for gateway hooks (agent:step event)
         if agent.step_callback is not None:
@@ -1946,7 +1983,8 @@ def run_conversation(
         # Track tool-calling iterations for skill nudge.
         # Counter resets whenever skill_manage is actually used.
         if (agent._skill_nudge_interval > 0
-                and "skill_manage" in agent.valid_tool_names):
+                and "skill_manage" in agent.valid_tool_names
+                and not codex_continuation):
             agent._iters_since_skill += 1
         
         # ── Pre-API-call /steer drain ──────────────────────────────────
@@ -2432,10 +2470,7 @@ def run_conversation(
             agent._emit_status("❌ Ollama runtime context is too small for Hermes tool use")
             api_call_count -= 1
             agent._api_call_count = api_call_count
-            try:
-                agent.iteration_budget.refund()
-            except Exception:
-                pass
+            _refund_current_logical_iteration()
             break
 
         # Pre-API pressure check. The turn-prologue preflight only saw the
@@ -2596,7 +2631,7 @@ def run_conversation(
                 # was never made.
                 api_call_count -= 1
                 agent._api_call_count = api_call_count
-                agent.iteration_budget.refund()
+                _refund_current_logical_iteration()
                 if _should_skip_model_call_for_reference_handoff(
                     messages, user_message
                 ):
@@ -2963,6 +2998,22 @@ def run_conversation(
                             is_github_responses=agent._is_copilot_url(),
                             sanitize_harmony_tokens=agent._is_codex_backend(),
                         )
+                        if turn_deadline is not None:
+                            remaining = turn_deadline - time.monotonic()
+                            allowance = codex_pre_dispatch_watchdog_allowance(
+                                agent, next_api_kwargs
+                            )
+                            if remaining <= 0 or remaining < allowance:
+                                error = TimeoutError(
+                                    "Codex request skipped: turn deadline does not "
+                                    "cover the response watchdog window"
+                                )
+                                setattr(
+                                    error,
+                                    "_hermes_pre_dispatch_turn_deadline",
+                                    True,
+                                )
+                                raise error
                     if _use_streaming:
                         return agent._interruptible_streaming_api_call(
                             next_api_kwargs, on_first_delta=_stop_spinner
@@ -3001,6 +3052,7 @@ def run_conversation(
                 elif _model_request_active is not None:
                     _model_request_active.set()
                 _redirect_crossed_response = False
+                _pre_dispatch_deadline_exhausted = False
                 try:
                     response = run_llm_execution_middleware(
                         api_kwargs,
@@ -4192,6 +4244,42 @@ def run_conversation(
                     thinking_spinner = None
                 if agent.thinking_callback:
                     agent.thinking_callback("")
+
+                if getattr(api_error, "_hermes_pre_dispatch_turn_deadline", False):
+                    api_call_count -= 1
+                    agent._api_call_count = api_call_count
+                    _refund_current_logical_iteration()
+                    final_response = (
+                        "I did not start another Codex request because the "
+                        "turn deadline was too close to the response watchdog."
+                    )
+                    failed = True
+                    _turn_exit_reason = "codex_pre_dispatch_deadline"
+                    messages.append({"role": "assistant", "content": final_response})
+                    _pre_dispatch_deadline_exhausted = True
+                    break
+
+                if getattr(api_error, "_hermes_ambiguous_provider_acceptance", False):
+                    _partial = agent._strip_think_blocks(
+                        getattr(agent, "_current_streamed_assistant_text", "") or ""
+                    ).strip()
+                    final_response = (
+                        _partial
+                        or "The Codex request may have been accepted, but its "
+                        "response was interrupted; I did not replay it."
+                    )
+                    failed = True
+                    _turn_exit_reason = "ambiguous_provider_acceptance"
+                    messages.append({"role": "assistant", "content": final_response})
+                    agent._persist_session(messages, conversation_history)
+                    return {
+                        "final_response": final_response,
+                        "messages": messages,
+                        "api_calls": api_call_count,
+                        "completed": False,
+                        "failed": True,
+                        "ambiguous_provider_attempt": True,
+                    }
 
                 # -----------------------------------------------------------
                 # UnicodeEncodeError recovery.  Two common causes:
@@ -6343,13 +6431,16 @@ def run_conversation(
                     # iteration from the correction instead of re-firing the
                     # stale request.
                     break
-        
+
+        if _pre_dispatch_deadline_exhausted:
+            break
+
         if _retry.restart_with_redirected_messages:
             # The cancelled request produced no valid assistant item. Reuse the
             # same logical iteration after the outer loop appends the displayed
             # partial context and correction to ``messages``.
             api_call_count -= 1
-            agent.iteration_budget.refund()
+            _refund_current_logical_iteration()
             _retry.restart_with_redirected_messages = False
             continue
 
@@ -6360,7 +6451,7 @@ def run_conversation(
 
         if _retry.restart_with_compressed_messages:
             api_call_count -= 1
-            agent.iteration_budget.refund()
+            _refund_current_logical_iteration()
             # Count compression restarts toward the retry limit to prevent
             # infinite loops when compression reduces messages but not enough
             # to fit the context window.
@@ -6399,7 +6490,7 @@ def run_conversation(
             # now-active fallback provider.  Refund the budget/count for the
             # stalled attempt so the fallback gets a fair turn.
             api_call_count -= 1
-            agent.iteration_budget.refund()
+            _refund_current_logical_iteration()
             _retry.restart_with_rebuilt_messages = False
             # Failover shrank the compressor's context window to the
             # fallback's; clear the preflight block so the pre-API preflight
@@ -6578,6 +6669,7 @@ def run_conversation(
                 interim_has_reasoning = bool(interim_msg.get("reasoning", "").strip()) if isinstance(interim_msg.get("reasoning"), str) else False
                 interim_has_codex_reasoning = bool(interim_msg.get("codex_reasoning_items"))
                 interim_has_codex_message_items = bool(interim_msg.get("codex_message_items"))
+                replayable_no_progress = False
 
                 if (
                     interim_has_content
@@ -6613,6 +6705,33 @@ def run_conversation(
                         and last_msg.get("finish_reason") == "incomplete"
                         and same_visible_output
                     )
+                    replayable_no_progress = False
+                    if visible_duplicate:
+                        try:
+                            _transport = agent._get_transport()
+                            _projection_kwargs = {
+                                "is_xai_responses": agent.provider in {
+                                    "xai",
+                                    "xai-oauth",
+                                },
+                                "is_github_responses": agent._is_copilot_url(),
+                                "replay_encrypted_reasoning": getattr(
+                                    agent, "_codex_replay_encrypted_reasoning", True
+                                ),
+                            }
+                            replayable_no_progress = (
+                                _transport.convert_messages(
+                                    [last_msg], **_projection_kwargs
+                                )
+                                == _transport.convert_messages(
+                                    [interim_msg], **_projection_kwargs
+                                )
+                            )
+                        except Exception:
+                            # A converter failure must not turn recovery into a
+                            # hard abort; the next continuation is still useful
+                            # when the provider returned new replay state.
+                            replayable_no_progress = False
                     if visible_duplicate:
                         # Update replay state in-place so the latest provider
                         # payload is preserved without re-emitting identical
@@ -6641,73 +6760,75 @@ def run_conversation(
                                 else:
                                     last_msg[_key] = interim_msg[_key]
                     else:
-                        append_message(messages, interim_msg)
+                        messages.append(interim_msg)
                         agent._emit_interim_assistant_message(interim_msg)
 
-                if agent._codex_incomplete_retries < 3:
-                    # When the interim message has nothing the Responses
-                    # input converter will replay (no visible content, no
-                    # encrypted reasoning items, no replayable message
-                    # items — plain-text reasoning only), a bare retry is
-                    # byte-identical to the request that just came back
-                    # incomplete and fails the same way every time
-                    # (observed with grok-4.20 on xai-oauth, whose
-                    # reasoning items lack encrypted_content).  Append a
-                    # user-role nudge so the retry actually differs and
-                    # explicitly asks for the final answer.
-                    interim_replayable = (
-                        interim_has_content
-                        or interim_has_codex_reasoning
-                        or interim_has_codex_message_items
+                # When the interim message has nothing the Responses input
+                # converter will replay (no visible content, no encrypted
+                # reasoning items, no replayable message items — plain-text
+                # reasoning only), a bare retry is byte-identical to the
+                # request that just came back incomplete. Append a user-role
+                # nudge so that retry actually differs.
+                interim_replayable = (
+                    interim_has_content
+                    or interim_has_codex_reasoning
+                    or interim_has_codex_message_items
+                )
+                if not interim_replayable:
+                    _last_msg = messages[-1] if messages else None
+                    _already_nudged = (
+                        isinstance(_last_msg, dict)
+                        and _last_msg.get("role") == "user"
+                        and _last_msg.get("content") == _CODEX_INCOMPLETE_NUDGE
                     )
-                    if not interim_replayable:
-                        _last_msg = messages[-1] if messages else None
-                        _already_nudged = (
-                            isinstance(_last_msg, dict)
-                            and _last_msg.get("role") == "user"
-                            and _last_msg.get("content") == _CODEX_INCOMPLETE_NUDGE
-                        )
-                        # Alternation guard: the nudge is a user-role message,
-                        # so it may only follow an assistant message. When the
-                        # interim was too empty to append (no content AND no
-                        # reasoning), the last message is still the prior
-                        # user/tool turn — appending the nudge there would
-                        # create a user→user / tool→user sequence that strict
-                        # providers reject.
-                        _last_is_assistant = (
-                            isinstance(_last_msg, dict)
-                            and _last_msg.get("role") == "assistant"
-                        )
-                        if not _already_nudged and _last_is_assistant:
-                            append_message(messages, {
-                                "role": "user",
-                                "content": _CODEX_INCOMPLETE_NUDGE,
-                            })
-                    if not agent.quiet_mode:
-                        agent._vprint(f"{agent.log_prefix}↻ Codex response incomplete; continuing turn ({agent._codex_incomplete_retries}/3)")
-                    # Surface the continuation on the live spinner/status line
-                    # (CLI/TUI/Desktop) and gateway heartbeat: each of these
-                    # retries can spend minutes waiting on the provider, and
-                    # without a distinct notice the user only sees a generic
-                    # thinking spinner ("infinite thinking", #64434).
-                    agent._emit_wait_notice(
-                        f"↻ model returned reasoning with no final answer — "
-                        f"asking it to continue "
-                        f"({agent._codex_incomplete_retries}/3)"
+                    _last_is_assistant = (
+                        isinstance(_last_msg, dict)
+                        and _last_msg.get("role") == "assistant"
                     )
-                    agent._session_messages = messages
-                    continue
+                    if not _already_nudged and _last_is_assistant:
+                        messages.append({
+                            "role": "user",
+                            "content": _CODEX_INCOMPLETE_NUDGE,
+                        })
 
-                agent._codex_incomplete_retries = 0
-                agent._persist_session(messages, conversation_history)
-                return {
-                    "final_response": "Codex response remained incomplete after 3 continuation attempts",
-                    "messages": messages,
-                    "api_calls": api_call_count,
-                    "completed": False,
-                    "partial": True,
-                    "error": "Codex response remained incomplete after 3 continuation attempts",
-                }
+                if not interim_replayable or replayable_no_progress:
+                    wait_time = jittered_backoff(
+                        agent._codex_incomplete_retries,
+                        base_delay=1.0,
+                        max_delay=15.0,
+                    )
+                    if wait_time > 0:
+                        agent._emit_wait_notice(
+                            (
+                                "↻ identical Codex continuation state; waiting "
+                                if replayable_no_progress
+                                else "↻ no replayable continuation state; waiting "
+                            )
+                            + f"{wait_time:.1f}s before another billed request"
+                        )
+                        sleep_end = time.time() + wait_time
+                        while time.time() < sleep_end:
+                            if agent._interrupt_requested:
+                                interrupted = True
+                                _turn_exit_reason = (
+                                    "interrupted_during_codex_replay_backoff"
+                                )
+                                break
+                            time.sleep(min(0.2, sleep_end - time.time()))
+                        if interrupted:
+                            break
+
+                if not agent.quiet_mode:
+                    agent._vprint(
+                        f"{agent.log_prefix}↻ Codex response incomplete; "
+                        f"continuing turn ({agent._codex_incomplete_retries})"
+                    )
+                agent._emit_wait_notice(
+                    "↻ model returned reasoning with no final answer — "
+                    f"asking it to continue ({agent._codex_incomplete_retries})"
+                )
+                agent._session_messages = messages
+                continue
             elif hasattr(agent, "_codex_incomplete_retries"):
                 agent._codex_incomplete_retries = 0
             
@@ -7181,7 +7302,7 @@ def run_conversation(
                 # cheap RPC-style calls that shouldn't eat the budget.
                 _tc_names = {tc.function.name for tc in assistant_message.tool_calls}
                 if _tc_names == {"execute_code"}:
-                    agent.iteration_budget.refund()
+                    _refund_current_logical_iteration()
                 
                 # Use real token counts from the API response to decide
                 # compression.  prompt_tokens + completion_tokens is the
@@ -8093,7 +8214,7 @@ def run_conversation(
             # rather than retrying until the budget is exhausted.
             if (
                 _is_local_processing_error
-                or api_call_count >= agent.max_iterations - 1
+                or logical_iteration_count >= agent.max_iterations - 1
             ):
                 if _is_local_processing_error:
                     _turn_exit_reason = f"local_processing_error({error_msg[:80]})"
@@ -8113,6 +8234,7 @@ def run_conversation(
         agent,
         final_response=final_response,
         api_call_count=api_call_count,
+        logical_iteration_count=logical_iteration_count,
         interrupted=interrupted,
         failed=failed,
         messages=messages,

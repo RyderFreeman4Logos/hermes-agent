@@ -1347,6 +1347,11 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             "directly or through _real_client"
         )
     max_stream_retries = 1
+    # TransportError includes TimeoutException (including WriteTimeout) and
+    # the full HTTPX read/write/close/protocol family. Transport failures are
+    # ambiguous once dispatched; only a ConnectError before writer claim is
+    # still safe to retry.
+    _ambiguous_transport_errors = (_httpx.TransportError, ConnectionError)
     # Accumulate streamed text so callers / compat shims can read it.
     agent._codex_streamed_text_parts: list = []
 
@@ -1429,22 +1434,22 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 },
                 defer_logical_completion=True,
             )
-        except (
-            _httpx.RemoteProtocolError,
-            _httpx.ReadTimeout,
-            _httpx.ConnectError,
-            ConnectionError,
-        ) as exc:
-            if attempt < max_stream_retries:
+        except _ambiguous_transport_errors as exc:
+            if (
+                attempt < max_stream_retries
+                and isinstance(exc, _httpx.ConnectError)
+                and writer_token["value"] is None
+            ):
                 logger.debug(
-                    "Codex Responses stream connect failed (attempt %s/%s); "
-                    "retrying. %s error=%s",
+                    "Codex Responses connect failed before acceptance "
+                    "(attempt %s/%s); retrying. %s error=%s",
                     attempt + 1,
                     max_stream_retries + 1,
                     agent._client_log_context(),
                     exc,
                 )
                 continue
+            setattr(exc, "_hermes_ambiguous_provider_acceptance", True)
             _log_codex_request_failure(
                 agent,
                 exc,
@@ -1452,6 +1457,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             )
             raise
         except _APIConnectionError as exc:
+            setattr(exc, "_hermes_ambiguous_provider_acceptance", True)
             _log_codex_request_failure(
                 agent,
                 exc,
@@ -1481,26 +1487,33 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     on_event=_on_event,
                     interrupt_check=_interrupt_or_superseded,
                 )
-            except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
-                if attempt < max_stream_retries:
+            except _ambiguous_transport_errors as exc:
+                if (
+                    attempt < max_stream_retries
+                    and isinstance(exc, _httpx.ConnectError)
+                    and writer_token["value"] is None
+                ):
                     logger.debug(
-                        "Codex Responses stream transport failed mid-iteration "
+                        "Codex Responses connect failed before stream acceptance "
                         "(attempt %s/%s); retrying. %s error=%s",
                         attempt + 1, max_stream_retries + 1,
                         agent._client_log_context(), exc,
                     )
                     continue
+                setattr(exc, "_hermes_ambiguous_provider_acceptance", True)
                 _log_codex_request_failure(
                     agent,
                     exc,
                     stream_opened=writer_token["value"] is not None,
                 )
                 raise
-            except RuntimeError:
+            except RuntimeError as exc:
                 if event_stream.final_response is not None:
                     return event_stream.final_response
+                setattr(exc, "_hermes_ambiguous_provider_acceptance", True)
                 raise
             except _APIConnectionError as exc:
+                setattr(exc, "_hermes_ambiguous_provider_acceptance", True)
                 _log_codex_request_failure(
                     agent,
                     exc,
@@ -1518,12 +1531,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 try:
                     for _ignored in event_stream:
                         pass
-                except (
-                    _httpx.RemoteProtocolError,
-                    _httpx.ReadTimeout,
-                    _httpx.ConnectError,
-                    ConnectionError,
-                ) as exc:
+                except _ambiguous_transport_errors as exc:
                     logger.warning(
                         "Codex Responses stream transport finalization failed "
                         "after a terminal response was already received; "

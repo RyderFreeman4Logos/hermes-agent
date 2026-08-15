@@ -885,9 +885,11 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
                             break
             except Exception:
                 _own_sid = ""
+        parent_session_id = str(
+            getattr(session.get("agent"), "session_id", "") or ""
+        )
         interrupt_for_session(
-            session_key=str(session_key or "") if _tui_owns_lifecycle else "",
-            origin_ui_session_id=_own_sid,
+            parent_session_id=parent_session_id if _tui_owns_lifecycle else "",
             reason=end_reason,
         )
     except Exception:
@@ -1095,9 +1097,10 @@ def _session_async_delegation_selectors(
             own_sid = ""
     agent = session.get("agent")
     session_key = str(session.get("session_key") or "")
-    session_id = getattr(agent, "session_id", None) or session_key
-    owned_session_key = session_key if _session_owns_durable_lifecycle(session_id) else ""
-    return own_sid, owned_session_key
+    parent_session_id = str(getattr(agent, "session_id", "") or "")
+    if not _session_owns_durable_lifecycle(parent_session_id or session_key):
+        parent_session_id = ""
+    return own_sid, parent_session_id
 
 
 def _session_has_active_delegations(sid: str, session: dict | None = None) -> bool:
@@ -1111,18 +1114,15 @@ def _session_has_active_delegations(sid: str, session: dict | None = None) -> bo
     if session is None:
         with _sessions_lock:
             session = _sessions.get(sid)
-    own_sid, owned_session_key = _session_async_delegation_selectors(
+    _own_sid, parent_session_id = _session_async_delegation_selectors(
         session, sid_hint=sid
     )
-    if not own_sid and not owned_session_key:
+    if not parent_session_id:
         return False
     try:
         from tools.async_delegation import has_live_for_session
 
-        return has_live_for_session(
-            session_key=owned_session_key,
-            origin_ui_session_id=own_sid,
-        )
+        return has_live_for_session(parent_session_id=parent_session_id)
     except Exception:
         logger.debug(
             "Failed to query active delegations for UI session %s",

@@ -732,6 +732,27 @@ def _normalize_role(r: Optional[str]) -> str:
     return "leaf"
 
 
+def _resolve_command_policy(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate the explicit terminal policy inherited by delegate children."""
+    raw = cfg.get("command_policy", {})
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("Invalid delegation.command_policy: expected an object.")
+    policy = {}
+    for key in ("read_only", "just_only_cargo"):
+        value = raw.get(key, False)
+        if not isinstance(value, bool):
+            raise ValueError(
+                f"Invalid delegation.command_policy.{key}: expected a boolean."
+            )
+        if value:
+            policy[key] = True
+    if policy:
+        policy["source"] = "delegation.command_policy"
+    return policy
+
+
 def _get_max_concurrent_children() -> int:
     """Read delegation.max_concurrent_children from config, falling back to
     DELEGATION_MAX_CONCURRENT_CHILDREN env var, then the default (10).
@@ -1137,14 +1158,190 @@ def _build_child_system_prompt(
     return "\n".join(parts)
 
 
-def _resolve_workspace_hint(parent_agent) -> Optional[str]:
-    """Best-effort local workspace hint for child prompts.
+_TASK_WORKSPACE_DECLARATION_RE = re.compile(
+    r"^\s*(?:repo|repository|workspace|worktree|checkout)\s*:\s*(/.*)\s*$",
+    re.IGNORECASE,
+)
+_MARKDOWN_FENCE_RE = re.compile(r"^\s*(`{3,}|~{3,})(.*)$")
+_MARKDOWN_FENCE_CLOSE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})[ \t]*$")
+_MARKDOWN_CONTAINER_RE = re.compile(
+    r"^( {0,3})(?:(>)|([-+*]|\d{1,9}[.)])([ \t]+|$))"
+)
+_MARKDOWN_HTML_OPEN_RE = re.compile(
+    r"^ {0,3}<([A-Za-z][A-Za-z0-9-]*)(?=[\s/>]|$)", re.IGNORECASE
+)
+_MARKDOWN_HTML_CLOSE_RE = re.compile(
+    r"^ {0,3}</[A-Za-z][A-Za-z0-9-]*\s*>", re.IGNORECASE
+)
+_MARKDOWN_HTML_SPECIAL_RE = re.compile(r"^ {0,3}(<\?|<!\[CDATA\[|<![A-Z])")
+_MARKDOWN_RAW_HTML_TAGS = frozenset({"code", "pre", "script", "style", "textarea"})
 
-    We only inject a path when we have a concrete absolute directory. This avoids
-    teaching subagents a fake container path while still helping them avoid
-    guessing `/workspace/...` for local repo tasks.
-    """
+
+def _existing_workspace_directory(
+    candidate: Any, *, container_paths: bool = False
+) -> Optional[str]:
+    if not isinstance(candidate, str):
+        return None
+    candidate = candidate.strip()
+    if not candidate or candidate.startswith("//") or not os.path.isabs(candidate):
+        return None
+    from tools.terminal_tool import _is_unusable_container_cwd
+
+    if container_paths and _is_unusable_container_cwd(os.path.normpath(candidate)):
+        return None
+    try:
+        path = os.path.realpath(os.path.expanduser(candidate))
+    except (OSError, TypeError, ValueError):
+        return None
+    if container_paths and _is_unusable_container_cwd(path):
+        return None
+    return path if os.path.isdir(path) else None
+
+
+def _resolve_workspace_hint(
+    parent_agent, goal: Optional[str] = None, context: Optional[str] = None
+) -> Optional[str]:
+    """Resolve a trusted task workspace before falling back to parent cwd."""
+    parent_task_id = getattr(parent_agent, "_current_task_id", None)
+    from tools.file_tools import _uses_container_paths
+
+    container_paths = _uses_container_paths(
+        parent_task_id
+        if isinstance(parent_task_id, str) and parent_task_id
+        else "default"
+    )
+    for task_text in (goal, context):
+        if not isinstance(task_text, str):
+            continue
+        task_text = task_text.removeprefix("\ufeff")
+        fence: Optional[tuple[str, int]] = None
+        html_comment = False
+        html_block: Optional[str] = None
+        html_block_raw = False
+        html_special_end: Optional[str] = None
+        markdown_container = False
+        container_indent = 0
+        container_break = False
+        markdown_paragraph = False
+        for line in task_text.splitlines():
+            fence_match = _MARKDOWN_FENCE_RE.match(line)
+            if fence is not None:
+                fence_close = _MARKDOWN_FENCE_CLOSE_RE.match(line)
+                if fence_close:
+                    marker = fence_close.group(1)
+                    if marker[0] == fence[0] and len(marker) >= fence[1]:
+                        fence = None
+                continue
+            if html_special_end is not None:
+                if html_special_end in line:
+                    html_special_end = None
+                continue
+            if html_block is not None:
+                if html_block_raw and re.search(
+                    rf"</{re.escape(html_block)}\s*>", line, re.IGNORECASE
+                ):
+                    html_block = None
+                    html_block_raw = False
+                elif not html_block_raw and not line.strip():
+                    html_block = None
+                continue
+            if html_comment:
+                if "-->" in line:
+                    html_comment = False
+                continue
+            if not line.strip():
+                markdown_paragraph = False
+                if markdown_container:
+                    container_break = True
+                continue
+            container_match = _MARKDOWN_CONTAINER_RE.match(line)
+            if container_match:
+                if not markdown_container:
+                    leading, quote, marker, spacing = container_match.groups()
+                    if quote:
+                        container_indent = 4
+                    else:
+                        prefix_width = len(leading) + len(marker or "")
+                        spacing_width = (
+                            len((" " * prefix_width + (spacing or "")).expandtabs(4))
+                            - prefix_width
+                        )
+                        if not 1 <= spacing_width <= 4:
+                            spacing_width = 1
+                        container_indent = prefix_width + spacing_width
+                markdown_container = True
+                container_break = False
+                continue
+            if markdown_container:
+                line_indent = len(line) - len(line.lstrip(" "))
+                if (
+                    container_break
+                    and not line.startswith("\t")
+                    and line_indent < container_indent
+                ):
+                    markdown_container = False
+                    container_indent = 0
+                    container_break = False
+                else:
+                    container_break = False
+                    continue
+            if fence_match:
+                marker = fence_match.group(1)
+                fence = (marker[0], len(marker))
+                markdown_paragraph = False
+                continue
+            if "<!--" in line:
+                html_comment = "-->" not in line.split("<!--", 1)[1]
+                markdown_paragraph = False
+                continue
+            html_special = _MARKDOWN_HTML_SPECIAL_RE.match(line)
+            if html_special:
+                opener = html_special.group(1)
+                terminator = {"<?": "?>", "<![CDATA[": "]]>",}.get(opener, ">")
+                if terminator not in line[html_special.end() :]:
+                    html_special_end = terminator
+                markdown_paragraph = False
+                continue
+            if _MARKDOWN_HTML_CLOSE_RE.match(line):
+                html_block = ""
+                markdown_paragraph = False
+                continue
+            html_match = _MARKDOWN_HTML_OPEN_RE.match(line)
+            if html_match:
+                tag = html_match.group(1).lower()
+                html_block = tag
+                html_block_raw = tag in _MARKDOWN_RAW_HTML_TAGS
+                if html_block_raw and re.search(
+                    rf"</{re.escape(tag)}\s*>",
+                    line[html_match.end() :],
+                    re.IGNORECASE,
+                ):
+                    html_block = None
+                    html_block_raw = False
+                markdown_paragraph = False
+                continue
+            if line.startswith("\t") or len(line) - len(line.lstrip(" ")) >= 4:
+                markdown_paragraph = True
+                continue
+            declaration = _TASK_WORKSPACE_DECLARATION_RE.fullmatch(line)
+            workspace = _existing_workspace_directory(
+                declaration.group(1) if declaration else line.strip(),
+                container_paths=container_paths,
+            )
+            if workspace and not markdown_paragraph:
+                return workspace
+            markdown_paragraph = True
+
+    live_parent_cwd = None
+    if isinstance(parent_task_id, str) and parent_task_id:
+        try:
+            from tools.terminal_tool import get_session_cwd
+
+            live_parent_cwd = get_session_cwd(parent_task_id)
+        except Exception:
+            pass
     candidates = [
+        live_parent_cwd,
         os.getenv("TERMINAL_CWD"),
         getattr(
             getattr(parent_agent, "_subdirectory_hints", None), "working_dir", None
@@ -1153,14 +1350,11 @@ def _resolve_workspace_hint(parent_agent) -> Optional[str]:
         getattr(parent_agent, "cwd", None),
     ]
     for candidate in candidates:
-        if not candidate:
-            continue
-        try:
-            text = os.path.abspath(os.path.expanduser(str(candidate)))
-        except Exception:
-            continue
-        if os.path.isabs(text) and os.path.isdir(text):
-            return text
+        workspace = _existing_workspace_directory(
+            candidate, container_paths=container_paths
+        )
+        if workspace:
+            return workspace
     return None
 
 
@@ -1490,6 +1684,7 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    command_policy: Optional[Dict[str, Any]] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1591,7 +1786,7 @@ def _build_child_agent(
     if effective_role == "orchestrator" and "delegation" not in child_toolsets:
         child_toolsets.append("delegation")
 
-    workspace_hint = _resolve_workspace_hint(parent_agent)
+    workspace_hint = _resolve_workspace_hint(parent_agent, goal, context)
     child_prompt = _build_child_system_prompt(
         goal,
         context,
@@ -1942,11 +2137,13 @@ def _build_child_agent(
     # Stash the post-degrade role for introspection (leaf if the
     # kill switch or depth bounded the caller's requested role).
     child._delegate_role = effective_role
+    child._delegate_command_policy = dict(command_policy or {})
     # Stash subagent identity for nested-delegation event propagation and
     # for _run_single_child / interrupt_subagent to look up by id.
     child._subagent_id = subagent_id
     child._parent_subagent_id = parent_subagent_id
     child._subagent_goal = goal
+    child._delegate_workspace_path = workspace_hint
     child._parent_turn_id = getattr(parent_agent, "_current_turn_id", "") or ""
     # Ownership chain for the model-facing control plane (action=list/steer/
     # stop): a parent may only control agents whose weakref chain reaches it.
@@ -2382,6 +2579,8 @@ def _run_single_child(
     Returns a structured result dict.
     """
     child_start = time.monotonic()
+    child_task_id = None
+    child_command_policy_registered = False
 
     # Get the progress callback from the child agent
     child_progress_cb = getattr(child, "tool_progress_callback", None)
@@ -2593,14 +2792,27 @@ def _run_single_child(
                 get_session_cwd,
                 record_session_cwd,
                 register_container_alias,
+                register_task_env_overrides,
             )
 
-            record_session_cwd(child_task_id, get_session_cwd(parent_task_id))
+            workspace_path = getattr(child, "_delegate_workspace_path", None)
+            record_session_cwd(
+                child_task_id,
+                workspace_path
+                if isinstance(workspace_path, str) and workspace_path
+                else get_session_cwd(parent_task_id),
+            )
             # Per-session container isolation (docker + container_persistent:
             # false) keys containers by session task_id. The child must share
             # the PARENT's container — register the alias so the child's
             # task_id resolves to the parent's container key.
             register_container_alias(child_task_id, parent_task_id)
+            command_policy = getattr(child, "_delegate_command_policy", {})
+            if command_policy:
+                register_task_env_overrides(
+                    child_task_id, {"command_policy": dict(command_policy)}
+                )
+                child_command_policy_registered = True
         except Exception as e:
             logger.debug("Child cwd seed failed: %s", e)
 
@@ -3199,6 +3411,13 @@ def _run_single_child(
         # exhaustion) the thread was never started and Thread.join() would
         # raise RuntimeError.  ident is None until start() succeeds.
         _heartbeat_stop.set()
+        if child_command_policy_registered and child_task_id:
+            try:
+                from tools.terminal_tool import clear_task_env_overrides
+
+                clear_task_env_overrides(child_task_id)
+            except Exception:
+                logger.debug("Child command-policy cleanup failed", exc_info=True)
         if _heartbeat_thread.ident is not None:
             _heartbeat_thread.join(timeout=5)
 
@@ -3642,6 +3861,10 @@ def delegate_task(
 
     # Load config
     cfg = _load_config()
+    try:
+        command_policy = _resolve_command_policy(cfg)
+    except ValueError as exc:
+        return tool_error(str(exc))
     default_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
     # Model-supplied max_iterations is ignored — the config value is authoritative
     # so users get predictable budgets. The kwarg is retained for internal callers
@@ -3853,6 +4076,7 @@ def delegate_task(
             override_acp_command=creds.get("command"),
             override_acp_args=creds.get("args"),
             role=effective_role,
+            command_policy=command_policy,
         )
         # Attach the validated schema for the completion-side validation
         # hook in _run_single_child. Absent (None) on schema-less tasks.
@@ -4226,6 +4450,17 @@ def delegate_task(
                 except ValueError:
                     pass
 
+        _not_started_lock = threading.Lock()
+        _not_started_finalized = False
+
+        def _finalize_not_started(status: str) -> None:
+            nonlocal _not_started_finalized
+            with _not_started_lock:
+                if _not_started_finalized:
+                    return
+                _not_started_finalized = True
+            _finalize_unstarted_children(children, parent_agent, status)
+
         def _batch_runner():
             # This batch is detached from the foreground turn. Its lifecycle is
             # owned by the async registry and cancelled only via _batch_interrupt.
@@ -4288,6 +4523,7 @@ def delegate_task(
             parent_session_id=_parent_session_id,
             runner=_batch_runner,
             interrupt_fn=_batch_interrupt,
+            on_not_started=_finalize_not_started,
             max_async_children=_get_max_async_children(),
             # Reuse the live-transcript directory's id (when created) so the
             # returned delegation_id matches cache/delegation/live/<id>/.
@@ -4339,24 +4575,10 @@ def delegate_task(
                 )
             return json.dumps(payload, ensure_ascii=False)
 
-        # Pool at capacity / schedule failure — children are still attached
-        # (we detach above only on the parent list, but the async unit was
-        # never accepted, so re-attaching isn't needed: we just run inline).
-        logger.info(
-            "delegate_task: async pool at capacity (%s); running the whole "
-            "batch synchronously instead.",
-            dispatch.get("error", "rejected"),
-        )
-        _cap_result = _execute_and_aggregate()
-        if isinstance(_cap_result, dict):
-            _cap_result["note"] = (
-                "The background delegation pool was at capacity "
-                "(delegation.max_concurrent_children), so the subagent(s) ran "
-                "SYNCHRONOUSLY and the result is included above. Raise "
-                "delegation.max_concurrent_children in config.yaml to allow "
-                "more concurrent background delegations."
-            )
-        return json.dumps(_cap_result, ensure_ascii=False)
+        _finalize_not_started("error")
+        if live_deleg_id:
+            shutil.rmtree(live_transcript_root() / live_deleg_id, ignore_errors=True)
+        return tool_error(dispatch.get("error", "Failed to schedule delegation."))
 
     # ----- Synchronous path -----
     return json.dumps(_execute_and_aggregate(), ensure_ascii=False)

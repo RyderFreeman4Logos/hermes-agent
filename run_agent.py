@@ -1087,6 +1087,14 @@ class AIAgent:
         Never raises — a wait notice must not break the API-call wait loop.
         """
         self._touch_activity(text)
+        _status_cb = getattr(self, "status_callback", None)
+        if _status_cb:
+            try:
+                _status_cb("wait", text)
+                return
+            except Exception:
+                logger.debug("status_callback error in _emit_wait_notice", exc_info=True)
+
         _thinking_cb = getattr(self, "thinking_callback", None)
         if _thinking_cb:
             try:

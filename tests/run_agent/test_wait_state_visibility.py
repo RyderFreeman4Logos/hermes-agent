@@ -41,14 +41,21 @@ def _make_agent(tmp_path, monkeypatch, **kwargs):
     )
 
 
-def test_emit_wait_notice_updates_spinner_and_activity(tmp_path, monkeypatch):
-    """The notice reaches the live display callback AND the activity tracker."""
-    seen: list = []
-    agent = _make_agent(tmp_path, monkeypatch, thinking_callback=seen.append)
+def test_emit_wait_notice_uses_replaceable_status_and_activity(tmp_path, monkeypatch):
+    """Gateway wait snapshots use status, never the reasoning transcript."""
+    status: list = []
+    thinking: list = []
+    agent = _make_agent(
+        tmp_path,
+        monkeypatch,
+        status_callback=lambda kind, text: status.append((kind, text)),
+        thinking_callback=thinking.append,
+    )
 
     agent._emit_wait_notice("⏳ waiting on test-model — 30s with no response yet")
 
-    assert seen == ["⏳ waiting on test-model — 30s with no response yet"]
+    assert status == [("wait", "⏳ waiting on test-model — 30s with no response yet")]
+    assert thinking == []
     summary = agent.get_activity_summary()
     assert "waiting on test-model" in summary["last_activity_desc"]
 

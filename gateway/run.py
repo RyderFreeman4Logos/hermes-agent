@@ -24484,7 +24484,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             process_registry.consume_completion_event(evt)
 
     async def _inject_watch_notification(
-        self, synth_text: str, evt: dict,
+        self,
+        synth_text: str,
+        evt: dict,
+        *,
+        additional_delivery_receipts: Optional[list[tuple[dict, str]]] = None,
     ) -> Optional[bool]:
         """Inject a watch/completion notification as a synthetic message event.
 
@@ -24624,6 +24628,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     },
                     "claim_id": delivery_claim_id,
                 }
+            if additional_delivery_receipts:
+                metadata["_completion_delivery_receipts"] = [
+                    {
+                        "event": {
+                            key: value
+                            for key, value in delivery_event.items()
+                            if not key.startswith("_completion_delivery_")
+                        },
+                        "claim_id": claim_id,
+                    }
+                    for delivery_event, claim_id in additional_delivery_receipts
+                    if claim_id
+                ]
             synth_event = MessageEvent(
                 text=synth_text,
                 message_type=MessageType.TEXT,
@@ -24826,6 +24843,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         evt: dict,
         *,
         retry_queue: Optional[list[dict]] = None,
+        preclaimed_ordinary_claim_id: str = "",
+        additional_delivery_receipts: Optional[list[tuple[dict, str]]] = None,
     ) -> Optional[bool]:
         """Deliver once per live gateway, or return False for a retry.
 
@@ -24845,11 +24864,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         process_claimed = False
         ordinary_claim_id = ""
         if evt.get("type", "completion") == "completion":
-            ordinary_claim = claim_completion_event_delivery(
-                evt, "gateway", retry_queue=retry_queue
-            )
-            if ordinary_claim is None:
-                return None
+            ordinary_claim = preclaimed_ordinary_claim_id
+            if not ordinary_claim:
+                ordinary_claim = claim_completion_event_delivery(
+                    evt, "gateway", retry_queue=retry_queue
+                )
+                if ordinary_claim is None:
+                    return None
             process_claimed = True
             ordinary_claim_id = ordinary_claim or "gateway-local"
 
@@ -24979,10 +25000,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             evt["_completion_delivery_claim_id"] = delivery_claim_id
         accepted = False
         try:
-            injection_result = await self._inject_watch_notification(synth_text, evt)
+            injection_result = await self._inject_watch_notification(
+                synth_text,
+                evt,
+                additional_delivery_receipts=additional_delivery_receipts,
+            )
             if injection_result is not True:
                 return injection_result
             if evt.pop("_completion_delivery_deferred", False):
+                if additional_delivery_receipts is not None:
+                    # The synthetic MessageEvent now owns these receipts.
+                    # Clearing the caller's list prevents its failure cleanup
+                    # from releasing claims that the terminal callback owns.
+                    additional_delivery_receipts.clear()
                 accepted = True
                 return True
             accepted = True
@@ -25002,6 +25032,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "committed",
                     retry_queue=retry_queue,
                 )
+            for sibling_evt, sibling_claim_id in additional_delivery_receipts or []:
+                sibling_terminal = finish_completion_event_delivery(
+                    sibling_evt,
+                    sibling_claim_id,
+                    "committed",
+                    retry_queue=retry_queue,
+                )
+                sibling_identity = self._completion_delivery_identity(sibling_evt)
+                if sibling_identity is not None:
+                    with self._completion_delivery_lock:
+                        self._completion_deliveries_inflight.discard(sibling_identity)
+                        if sibling_terminal:
+                            self._completion_deliveries_delivered[
+                                sibling_identity
+                            ] = None
+                terminal = sibling_terminal and terminal
+            if additional_delivery_receipts is not None:
+                additional_delivery_receipts.clear()
             if not terminal:
                 return None
             if identity is not None:
@@ -25087,21 +25135,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         return "\n".join(lines)
 
-    def _record_coalesced_completion_siblings(self, events: list[dict]) -> None:
-        """Extend a successful primary delivery claim to its batched siblings."""
-        with self._completion_delivery_lock:
-            for evt in events:
-                identity = self._completion_delivery_identity(evt)
-                if identity is None:
-                    continue
-                self._completion_deliveries_inflight.discard(identity)
-                self._completion_deliveries_delivered[identity] = None
-            while (
-                len(self._completion_deliveries_delivered)
-                > self._completion_delivery_retention
-            ):
-                self._completion_deliveries_delivered.popitem(last=False)
-
     async def _flush_process_completion_batch(self, key: tuple[str, ...]) -> None:
         """Deliver one short-window completion batch and resolve its waiters."""
         current_task = asyncio.current_task()
@@ -25116,25 +25149,68 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._completion_notification_batch_tasks.pop(key, None)
             if not entries:
                 return
-            if len(entries) == 1:
-                synth_text = entries[0][0]
-            else:
-                synth_text = self._format_coalesced_process_completions(entries)
+            from tools.process_registry import (
+                claim_completion_event_delivery,
+                finish_completion_event_delivery,
+                process_registry,
+            )
 
-            # A duplicate primary can legitimately return None from the
-            # lifecycle dedupe seam.  Try the next batch identity so a
-            # fresh sibling is never discarded with that duplicate.
-            delivered = None
-            for _text, candidate_evt, _future in entries:
+            claimed: list[tuple[str, dict, asyncio.Future, str]] = []
+            for text, event, future in entries:
+                claim_id = claim_completion_event_delivery(
+                    event, f"gateway-batch:{id(self)}"
+                )
+                if claim_id is not None:
+                    claimed.append(
+                        (text, event, future, claim_id or "gateway-local")
+                    )
+            if not claimed:
+                delivered = None
+                return
+
+            _primary_text, primary_evt, _primary_future, primary_claim_id = claimed[0]
+            sibling_receipts = [
+                (event, claim_id)
+                for _text, event, _future, claim_id in claimed[1:]
+            ]
+            retry_events: list[dict] = []
+            primary_handed_off = False
+            try:
+                claimed_entries = [
+                    (text, event, future)
+                    for text, event, future, _claim_id in claimed
+                ]
+                synth_text = (
+                    claimed_entries[0][0]
+                    if len(claimed_entries) == 1
+                    else self._format_coalesced_process_completions(claimed_entries)
+                )
+                primary_handed_off = True
                 delivered = await self._deliver_completion_notification(
-                    synth_text, candidate_evt,
+                    synth_text,
+                    primary_evt,
+                    retry_queue=retry_events,
+                    preclaimed_ordinary_claim_id=primary_claim_id,
+                    additional_delivery_receipts=sibling_receipts,
                 )
-                if delivered is not None:
-                    break
-            if delivered is True and len(entries) > 1:
-                self._record_coalesced_completion_siblings(
-                    [evt for _text, evt, _future in entries]
-                )
+            finally:
+                if not primary_handed_off:
+                    finish_completion_event_delivery(
+                        primary_evt,
+                        primary_claim_id,
+                        "provider_failed",
+                        retry_queue=retry_events,
+                    )
+                if delivered is not True:
+                    for sibling_evt, sibling_claim_id in sibling_receipts:
+                        finish_completion_event_delivery(
+                            sibling_evt,
+                            sibling_claim_id,
+                            "provider_failed",
+                            retry_queue=retry_events,
+                        )
+                if retry_events:
+                    process_registry.requeue_completions_front(retry_events)
         except asyncio.CancelledError:
             # Shutdown may cancel us either during the fan-in window or while
             # adapter delivery is blocked.  Recover entries that have not yet
@@ -25321,11 +25397,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             evt, synth_text = deliverable[0]
             return await self._deliver_completion_notification(synth_text, evt)
 
-        from tools.async_delegation import (
-            claim_event_delivery,
-            complete_event_delivery,
-            release_event_delivery,
-        )
+        from tools.async_delegation import claim_event_delivery, release_event_delivery
 
         primary_evt, primary_text = deliverable[0]
         blocks = [primary_text]
@@ -25337,6 +25409,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # out of our consolidated text so it is never double-injected.
                 continue
             siblings.append((evt, claim_id))
+            identity = self._completion_delivery_identity(evt)
+            if identity is not None:
+                with self._completion_delivery_lock:
+                    self._completion_deliveries_inflight.add(identity)
             blocks.append(synth_text)
 
         if not siblings:
@@ -25346,28 +25422,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         consolidated = self._format_coalesced_async_delegations(blocks)
         delivered: Optional[bool] = False
+        receipt_handoff = list(siblings)
         try:
             delivered = await self._deliver_completion_notification(
-                consolidated, primary_evt,
+                consolidated,
+                primary_evt,
+                additional_delivery_receipts=receipt_handoff,
             )
         finally:
-            if delivered is True:
-                for evt, claim_id in siblings:
-                    try:
-                        complete_event_delivery(evt, claim_id)
-                    except Exception:
-                        logger.debug(
-                            "Could not acknowledge coalesced durable completion",
-                            exc_info=True,
-                        )
-                self._record_coalesced_completion_siblings(
-                    [evt for evt, _claim_id in siblings]
-                )
-            else:
+            if delivered is not True:
                 # Not delivered — release every sibling claim so a retry (or
                 # another consumer) can claim it, honestly leaving the durable
                 # rows pending.
-                for evt, claim_id in siblings:
+                for evt, claim_id in receipt_handoff:
                     try:
                         release_event_delivery(evt, claim_id)
                     except Exception:
@@ -25375,10 +25442,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "Could not release coalesced durable claim",
                             exc_info=True,
                         )
+                for evt, _claim_id in siblings:
+                    identity = self._completion_delivery_identity(evt)
+                    if identity is not None:
+                        with self._completion_delivery_lock:
+                            self._completion_deliveries_inflight.discard(identity)
                 if delivered is None:
                     # The primary was dropped/owned elsewhere but the siblings
                     # still need delivery — requeue just them for the next tick.
-                    for evt, _claim_id in siblings:
+                    for evt, _claim_id in receipt_handoff:
                         _pr.completion_queue.put(evt)
         return delivered
 

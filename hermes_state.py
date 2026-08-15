@@ -10841,17 +10841,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         active_clause = "" if include_inactive else " AND active = 1"
         with self._read_ctx() as conn:
             placeholders = ",".join("?" for _ in session_ids)
+            # Order by AUTOINCREMENT id (true insertion order), NOT timestamp:
+            # append_message stamps rows with time.time(), which is not
+            # monotonic (WSL2, NTP steps, VM/laptop sleep resume). A later
+            # row can carry an earlier timestamp than its predecessor, and
+            # ORDER BY timestamp would then sort an assistant tool_calls row
+            # after its tool response, breaking tool-call/response adjacency
+            # and triggering an HTTP 400 on replay. This matches get_messages
+            # — see c03acca50 for the original fix.
             rows = conn.execute(
                 f"SELECT {self._CONVERSATION_ROW_COLUMNS} "
                 f"FROM messages WHERE session_id IN ({placeholders})"
-                # Order by AUTOINCREMENT id (true insertion order), NOT timestamp:
-                # append_message stamps rows with time.time(), which is not
-                # monotonic (WSL2, NTP steps, VM/laptop sleep resume). A later
-                # row can carry an earlier timestamp than its predecessor, and
-                # ORDER BY timestamp would then sort an assistant tool_calls row
-                # after its tool response, breaking tool-call/response adjacency
-                # and triggering an HTTP 400 on replay. This matches get_messages
-                # — see c03acca50 for the original fix.
                 f"{active_clause} ORDER BY id",
                 tuple(session_ids),
             ).fetchall()
@@ -11018,7 +11018,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         return messages
 
     def get_resume_conversations(
-        self, session_id: str
+        self, session_id: str, *, max_display_messages: Optional[int] = None
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """Return ``(model_history, display_history)`` for a session resume in ONE SELECT.
 
@@ -11033,31 +11033,42 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
           copied transcript; including the live parent's rows would let messages
           written to the original after the fork leak into the branch.
 
-        The display fetch already reads a superset of the model fetch (the tip
-        rows are part of the lineage), so serving both from one lineage SELECT
-        halves the resume's DB work versus two separate calls, with byte-identical
-        output (see test_get_resume_conversations_matches_separate_reads).
+        ``max_display_messages`` returns only the most recent display rows.  It
+        never changes ``model_history``: compressed resumes must replay their
+        complete tip exactly, while a UI can bound old display-only ancestors.
+        ``None`` retains the historic full-display behavior.
         """
         session_ids = (
             [session_id]
             if self._is_explicit_branch_session(session_id)
             else self._session_lineage_root_to_tip(session_id)
         )
+        if max_display_messages is not None and max_display_messages < 0:
+            raise ValueError("max_display_messages must be non-negative")
         with self._read_ctx() as conn:
             placeholders = ",".join("?" for _ in session_ids)
-            rows = conn.execute(
+            query = (
                 f"SELECT session_id, {self._CONVERSATION_ROW_COLUMNS} "
                 f"FROM messages WHERE session_id IN ({placeholders}) AND active = 1 "
-                # ORDER BY id (insertion order) — see get_messages_as_conversation
-                # for why timestamp ordering is unsafe.
-                "ORDER BY id",
-                tuple(session_ids),
-            ).fetchall()
+            )
+            if max_display_messages is None:
+                rows = conn.execute(f"{query} ORDER BY id", tuple(session_ids)).fetchall()
+                tip_rows = [r for r in rows if r["session_id"] == session_id]
+            else:
+                tip_rows = conn.execute(
+                    f"SELECT session_id, {self._CONVERSATION_ROW_COLUMNS} "
+                    "FROM messages WHERE session_id = ? AND active = 1 ORDER BY id",
+                    (session_id,),
+                ).fetchall()
+                rows = conn.execute(
+                    f"SELECT session_id, {self._CONVERSATION_ROW_COLUMNS} FROM ({query} ORDER BY id DESC LIMIT ?) "
+                    "ORDER BY id",
+                    (*session_ids, max_display_messages),
+                ).fetchall()
 
         # Tip rows are exactly the model-fed set (get_messages_as_conversation
         # with session_ids=[session_id]); filtering the lineage fetch preserves
         # their relative id order.
-        tip_rows = [r for r in rows if r["session_id"] == session_id]
         model_history = self._rows_to_conversation(
             tip_rows,
             session_id=session_id,
@@ -11091,7 +11102,29 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         session_id: str,
         max_messages: Optional[int] = None,
     ) -> int:
-        """Return resume row count or reject a transcript too large to load.
+        """Return full-lineage resume row count or reject an unsafe transcript."""
+        return self._assert_resume_safe(
+            session_id, max_messages=max_messages, include_ancestors=True
+        )
+
+    def assert_resume_segment_safe(
+        self,
+        session_id: str,
+        max_messages: Optional[int] = None,
+    ) -> int:
+        """Return the model-replayed tip count or reject an unsafe resume."""
+        return self._assert_resume_safe(
+            session_id, max_messages=max_messages, include_ancestors=False
+        )
+
+    def _assert_resume_safe(
+        self,
+        session_id: str,
+        *,
+        max_messages: Optional[int],
+        include_ancestors: bool,
+    ) -> int:
+        """Apply the shared guard to either a display lineage or model tip.
 
         ``max_messages=None`` resolves the limit from config
         (``sessions.max_resume_messages``); 0 disables the guard and returns
@@ -11107,7 +11140,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # return value, and an unbounded lineage COUNT here would do the
             # exact pathological work the disable exists to avoid.
             return 0
-        session_ids = self._session_lineage_root_to_tip(session_id)
+        session_ids = self._session_lineage_root_to_tip(session_id) if include_ancestors else [session_id]
         placeholders = ",".join("?" for _ in session_ids)
         with self._read_ctx() as conn:
             row = conn.execute(

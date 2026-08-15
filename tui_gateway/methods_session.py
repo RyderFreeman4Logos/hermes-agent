@@ -387,23 +387,21 @@ def _(rid, params: dict) -> dict:
                 target = tip
                 found = db.get_session(target) or found
 
-        # Every interactive resume path materializes the model history, even when
-        # omit_messages suppresses the response copy. Count the complete lineage
-        # before any reopen/history read so a runaway transcript cannot exhaust
-        # the dashboard. The metadata fallback keeps lightweight test/adaptor DBs
-        # that predate the shared SessionDB guard compatible. The limit resolves
-        # from config (sessions.max_resume_messages, 0 disables).
+        # The model replays the compressed tip; display-only ancestors are
+        # bounded separately below.  Rejecting a safe tip because an old display
+        # lineage is large makes a compressed conversation impossible to reopen.
+        # The metadata fallback keeps lightweight test/adaptor DBs compatible.
         from hermes_state import (
             SessionResumeTooLargeError,
             resolved_max_resume_messages,
         )
 
-        safety_check = getattr(db, "assert_resume_safe", None)
+        resume_limit = resolved_max_resume_messages()
+        safety_check = getattr(db, "assert_resume_segment_safe", None)
         try:
             if callable(safety_check):
                 safety_check(target)
             else:
-                resume_limit = resolved_max_resume_messages()
                 stored_message_count = int(found.get("message_count") or 0)
                 if resume_limit and stored_message_count > resume_limit:
                     raise SessionResumeTooLargeError(stored_message_count, resume_limit)
@@ -417,6 +415,34 @@ def _(rid, params: dict) -> dict:
                 "resume safety check failed for %s (proceeding without guard): %s",
                 target, exc,
             )
+
+        def _read_resume_histories():
+            read = db.get_resume_conversations
+            if not resume_limit:
+                return read(target)
+            try:
+                return read(target, max_display_messages=resume_limit)
+            except TypeError as exc:
+                # Older adapter stores expose the pre-bounded method shape.
+                # Keep them resumable; SessionDB itself always uses the bound.
+                if "max_display_messages" not in str(exc):
+                    raise
+                return read(target)
+
+        def _bounded_ancestor_display_prefix(display_history, raw_history):
+            """Keep the bounded display-only ancestor tail for later /branch."""
+            tip_row_ids = {
+                message.get("_row_id")
+                for message in raw_history
+                if isinstance(message, dict) and message.get("_row_id") is not None
+            }
+            if not tip_row_ids:
+                return []
+            return [
+                message
+                for message in display_history
+                if message.get("_row_id") not in tip_row_ids
+            ]
 
         profile_resume_cwd = str(found.get("cwd") or "").strip() or _profile_configured_cwd(
             profile_home
@@ -563,16 +589,18 @@ def _(rid, params: dict) -> dict:
                     )
                     display_history = []
                 else:
-                    raw_history, display_history = db.get_resume_conversations(target)
+                    raw_history, display_history = _read_resume_histories()
             except Exception as e:
                 if lease is not None:
                     lease.release()
                 return _err(rid, 5000, f"resume failed: {e}")
-            # Display keeps the full transcript; the model-fed history drops a
+            # Display keeps a bounded recent transcript; the model-fed history drops a
             # dangling/interrupted tool-call tail so a session killed mid-loop does
             # not replay the unanswered call forever (#29086).
-            prefix = [] if omit_messages else db.get_ancestor_display_prefix(target)
             history = sanitize_replay_history(raw_history)
+            display_history_prefix = _bounded_ancestor_display_prefix(
+                display_history, raw_history
+            )
             # Restore the model/provider/reasoning/tier this chat last used so the
             # deferred build (and the info below) match the eager path — without them
             # the build drops the provider ("No LLM provider configured").
@@ -587,7 +615,8 @@ def _(rid, params: dict) -> dict:
                 lease=lease,
                 source=source,
                 close_on_disconnect=is_truthy_value(params.get("close_on_disconnect", False)),
-                display_history_prefix=prefix,
+                display_history_prefix=display_history_prefix,
+                display_history_limit=resume_limit or None,
                 profile_home=profile_home,
                 model_override=overrides.get("model_override"),
                 resume_runtime_overrides=overrides or None,
@@ -654,18 +683,18 @@ def _(rid, params: dict) -> dict:
                 )
                 display_history = []
             else:
-                raw_history, display_history = db.get_resume_conversations(target)
-            # The display transcript keeps every row so the user still sees their
-            # full history.  The model-fed history is sanitized: a session whose
+                raw_history, display_history = _read_resume_histories()
+            # The display transcript keeps a bounded recent tail. The model-fed history
+            # is sanitized: a session whose
             # last turn died mid-tool-loop persists a dangling assistant(tool_calls)
             # (or interrupted assistant→tool) tail; replaying it makes the model
             # re-issue the unanswered call forever — the permanent-"thinking" stuck
             # session in #29086.  The messaging gateway already strips this; this is
             # the WebUI/TUI resume path picking up the same cleanup.
-            display_history_prefix = (
-                [] if omit_messages else db.get_ancestor_display_prefix(target)
-            )
             history = sanitize_replay_history(raw_history)
+            display_history_prefix = _bounded_ancestor_display_prefix(
+                display_history, raw_history
+            )
             messages = [] if omit_messages else _history_to_messages(display_history)
             tokens = _set_session_context(target)
             try:
@@ -774,6 +803,7 @@ def _(rid, params: dict) -> dict:
                         _sessions[sid]["model_override"] = stored_runtime_overrides[
                             "model_override"
                         ]
+                    _sessions[sid]["display_history_limit"] = resume_limit or None
                     _sessions[sid]["display_history_prefix"] = display_history_prefix
                     # Remember the profile home so each turn re-binds HERMES_HOME (the
                     # agent persists to its own db, but mid-turn home reads — memory,

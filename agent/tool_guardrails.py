@@ -392,8 +392,6 @@ class ToolCallGuardrailController:
                 else 1
             )
             self._last_observation = (signature, result_hash, failed, repeat_count)
-            if repeat_count == 1:
-                self._no_progress.clear()
             if repeat_count >= NO_PROGRESS_LOOP_HALT_AFTER:
                 decision = ToolGuardrailDecision(
                     action="halt",

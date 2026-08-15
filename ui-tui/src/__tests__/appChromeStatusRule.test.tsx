@@ -105,6 +105,46 @@ const baseProps = {
 }
 
 describe('StatusRule session title', () => {
+  it('honors configured segment visibility without losing the upstream session title', () => {
+    const element = StatusRule({
+      ...baseProps,
+      sessionTitle: 'weekly-digest',
+      statusBarSegments: ['model', 'cwd']
+    })
+
+    const rendered = (element as React.ReactElement<{ items: Array<{ node: React.ReactNode }> }>).props.items
+      .map(item => textContent(item.node))
+      .join(' ')
+
+    expect(rendered).toContain('opus 4.8')
+    expect(rendered).toContain('weekly-digest')
+    expect(rendered).not.toContain('ready')
+    expect(rendered).not.toContain('50k')
+  })
+
+  it('keeps all present narrow status fields instead of dropping the tail', () => {
+    const element = StatusRule({
+      ...baseProps,
+      bgCount: 2,
+      cols: 44,
+      liveSessionCount: 3,
+      usage: { ...baseProps.usage, active_subagents: 2, compressions: 3 },
+      voiceLabel: 'voice off'
+    })
+
+    const rendered = (element as React.ReactElement<{ items: Array<{ node: React.ReactNode }> }>).props.items
+      .map(item => textContent(item.node))
+      .join(' ')
+
+    expect(rendered).toContain('ready')
+    expect(rendered).toContain('opus 4.8')
+    expect(rendered).toContain('cmp 3')
+    expect(rendered).toContain('voice off')
+    expect(rendered).toContain('3 sessions')
+    expect(rendered).toContain('2 bg')
+    expect(rendered).toContain('⛓ 2')
+  })
+
   it('pins the named session at the far-right edge instead of the cwd label', () => {
     const element = StatusRule({
       ...baseProps,
@@ -231,7 +271,7 @@ describe('StatusRule session count click target', () => {
     expect(openSwitcher).toHaveBeenCalledOnce()
   })
 
-  it('keeps status + model and drops the low-value tail on a narrow terminal', () => {
+  it('keeps status + model and reflows the tail on a narrow terminal', () => {
     const element = StatusRule({
       bgCount: 0,
       busy: false,
@@ -257,13 +297,15 @@ describe('StatusRule session count click target', () => {
       voiceLabel: 'voice off'
     })
 
-    const rendered = textContent(element)
+    const rendered = (element as React.ReactElement<{ items: Array<{ node: React.ReactNode }> }>).props.items
+      .map(item => textContent(item.node))
+      .join(' ')
 
     // Must-keep essentials survive intact …
     expect(rendered).toContain('ready')
     expect(rendered).toContain('opus 4.8')
-    // … while the low-value tail (session count) is dropped, not truncated.
-    expect(rendered).not.toContain('3 sessions')
+    // … while the tail moves to natural-height rows instead of disappearing.
+    expect(rendered).toContain('3 sessions')
   })
 })
 
@@ -338,9 +380,11 @@ describe('StatusRule credits notice render priority', () => {
       cols: 50,
       notice: { key: 'credits.90', kind: 'sticky', level: 'warn', text: longText }
     })
+    const items = (element as React.ReactElement<{ items: Array<{ id: string; node: React.ReactNode }> }>).props.items
+    const indicator = items.find(item => item.id === 'indicator')!.node
 
     // The leaf <Text> truncates rather than wrapping/clipping the pinned tail.
-    const noticeText = findElementWithText(element, 'xxxxx')
+    const noticeText = findElementWithText(indicator, 'xxxxx')
     expect(noticeText?.props.wrap).toBe('truncate-end')
 
     // Its container box yields first (flexShrink=1) so model stays visible.
@@ -369,11 +413,11 @@ describe('StatusRule credits notice render priority', () => {
       return findShrinkBoxContaining(node.props.children)
     }
 
-    const shrinkBox = findShrinkBoxContaining(element)
+    const shrinkBox = findShrinkBoxContaining(indicator)
     expect(shrinkBox).not.toBeNull()
 
     // Model survives on a narrow terminal because the notice yields.
-    expect(textContent(element)).toContain('opus 4.8')
+    expect(items.map(item => textContent(item.node)).join(' ')).toContain('opus 4.8')
   })
 })
 

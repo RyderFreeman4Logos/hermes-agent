@@ -299,8 +299,10 @@ def _silent_bg_harness(monkeypatch, tmp_path):
 
     config = _silent_bg_base_config(tmp_path)
     dummy_env = SimpleNamespace(env={})
+    spawn_kwargs = {}
 
     def fake_spawn_local(**kwargs):
+        spawn_kwargs.update(kwargs)
         return SimpleNamespace(
             id="proc_silent_test",
             pid=4242,
@@ -320,6 +322,7 @@ def _silent_bg_harness(monkeypatch, tmp_path):
     monkeypatch.setattr(process_registry_module.process_registry, "spawn_local", fake_spawn_local)
     monkeypatch.setitem(terminal_tool_module._active_environments, "default", dummy_env)
     monkeypatch.setitem(terminal_tool_module._last_activity, "default", 0.0)
+    terminal_tool_module._test_spawn_local_kwargs = spawn_kwargs
     return terminal_tool_module
 
 
@@ -368,6 +371,86 @@ def test_background_with_notify_does_not_emit_hint(monkeypatch, tmp_path):
         f"Correct usage must not emit a hint, got: {result.get('hint')!r}"
     )
     assert result.get("notify_on_complete") is True
+
+
+def test_background_notify_metadata_is_published_with_local_spawn(
+    monkeypatch, tmp_path
+):
+    from gateway import session_context
+    from tools import runtime_heartbeat
+
+    tt = _silent_bg_harness(monkeypatch, tmp_path)
+    routing = {
+        "HERMES_SESSION_PLATFORM": "tui",
+        "HERMES_SESSION_CHAT_ID": "chat-1",
+        "HERMES_SESSION_USER_ID": "user-1",
+        "HERMES_SESSION_USER_NAME": "name-1",
+        "HERMES_SESSION_THREAD_ID": "thread-1",
+        "HERMES_SESSION_MESSAGE_ID": "message-1",
+        "HERMES_SESSION_ID": "session-1",
+    }
+    monkeypatch.setattr(session_context, "async_delivery_supported", lambda: True)
+    monkeypatch.setattr(
+        session_context,
+        "get_session_env",
+        lambda key, default="": routing.get(key, default),
+    )
+    monkeypatch.setattr(runtime_heartbeat, "preflight_current_heartbeat", lambda: 570)
+    monkeypatch.setattr(runtime_heartbeat, "get_current_provider", lambda: "pm")
+    monkeypatch.setattr(
+        "tools.process_registry.arm_process_heartbeat", lambda *_a, **_kw: 570
+    )
+    try:
+        result = json.loads(
+            tt.terminal_tool(
+                command="pytest tests/",
+                background=True,
+                notify_on_complete=True,
+            )
+        )
+    finally:
+        tt._active_environments.pop("default", None)
+        tt._last_activity.pop("default", None)
+
+    assert result["notify_on_complete"] is True
+    metadata = tt._test_spawn_local_kwargs["notification_metadata"]
+    assert metadata == {
+        "notify_on_complete": True,
+        "watch_patterns": [],
+        "heartbeat_provider": "pm",
+        "watcher_platform": "tui",
+        "watcher_chat_id": "chat-1",
+        "watcher_user_id": "user-1",
+        "watcher_user_name": "name-1",
+        "watcher_thread_id": "thread-1",
+        "watcher_message_id": "message-1",
+        "parent_session_id": "session-1",
+    }
+
+
+def test_auto_background_execution_timeout_is_passed_to_local_spawn(
+    monkeypatch, tmp_path
+):
+    from gateway import session_context
+    from tools import runtime_heartbeat
+
+    tt = _silent_bg_harness(monkeypatch, tmp_path)
+    monkeypatch.setattr(session_context, "async_delivery_supported", lambda: True)
+    monkeypatch.setattr(runtime_heartbeat, "preflight_current_heartbeat", lambda: 570)
+    monkeypatch.setattr(runtime_heartbeat, "get_current_provider", lambda: "pm")
+    monkeypatch.setattr(
+        "tools.process_registry.arm_process_heartbeat", lambda *_a, **_kw: 570
+    )
+    try:
+        result = json.loads(
+            tt.terminal_tool(command="pytest tests/", timeout=201)
+        )
+    finally:
+        tt._active_environments.pop("default", None)
+        tt._last_activity.pop("default", None)
+
+    assert result["notify_on_complete"] is True
+    assert tt._test_spawn_local_kwargs["execution_timeout"] == 7200
 
 
 def test_foreground_command_does_not_emit_hint(monkeypatch, tmp_path):

@@ -6615,6 +6615,43 @@ def test_ensure_session_db_row_persists_session_model_override(monkeypatch):
     assert row["model_config"]["service_tier"] == "priority"
 
 
+def test_ensure_branch_row_preserves_parent_skills_catalog_mode(monkeypatch, tmp_path):
+    """A deferred desktop branch row inherits its parent's frozen prompt mode."""
+    from agent.system_prompt import restore_session_skills_catalog_mode
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session(
+            "parent-key",
+            source="desktop",
+            model_config={"_skills_catalog_mode": "compact"},
+        )
+        monkeypatch.setattr(server, "_get_db", lambda: db)
+        monkeypatch.setattr(server, "_resolve_model", lambda: "test-model")
+
+        server._ensure_session_db_row(
+            {
+                "session_key": "branch-key",
+                "source": "desktop",
+                "parent_session_id": "parent-key",
+            }
+        )
+
+        child = db.get_session("branch-key")
+        fresh_agent = types.SimpleNamespace(
+            _session_init_model_config={},
+            _skills_catalog_mode_config="full",
+            _cached_system_prompt=None,
+        )
+        assert restore_session_skills_catalog_mode(
+            fresh_agent, child["model_config"]
+        )
+        assert fresh_agent._skills_catalog_mode == "compact"
+    finally:
+        db.close()
+
+
 def test_ensure_session_db_row_no_override_uses_global(monkeypatch):
     """A chat that made no explicit pick falls back to the global model and
     writes no model_config (so it tracks the profile default)."""
@@ -18239,7 +18276,11 @@ def test_session_branch_keeps_reasoning_fields(monkeypatch, tmp_path):
     db = SessionDB(db_path=tmp_path / "state.db")
     server._sessions["sid"] = _session(history=_branch_history())
     try:
-        db.create_session("session-key", source="tui")
+        db.create_session(
+            "session-key",
+            source="tui",
+            model_config={"_skills_catalog_mode": "names-only"},
+        )
         monkeypatch.setattr(server, "_get_db", lambda: db)
         monkeypatch.setattr(server, "_new_session_key", lambda: "branch-key")
         monkeypatch.setattr(server, "_start_agent_build", lambda sid, session: None)
@@ -18270,6 +18311,18 @@ def test_session_branch_keeps_reasoning_fields(monkeypatch, tmp_path):
             "session.branch dropped display_kind: the marker re-entered the "
             "truncate ordinal address space as a phantom user turn (#82756)"
         )
+        from agent.system_prompt import restore_session_skills_catalog_mode
+
+        child = db.get_session("branch-key")
+        fresh_agent = types.SimpleNamespace(
+            _session_init_model_config={},
+            _skills_catalog_mode_config="full",
+            _cached_system_prompt=None,
+        )
+        assert restore_session_skills_catalog_mode(
+            fresh_agent, child["model_config"]
+        )
+        assert fresh_agent._skills_catalog_mode == "names-only"
     finally:
         server._sessions.pop("sid", None)
         db.close()

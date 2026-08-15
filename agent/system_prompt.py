@@ -198,6 +198,27 @@ def restore_session_skills_catalog_mode(agent: Any, model_config: Any) -> bool:
     return True
 
 
+def inherit_session_skills_catalog_mode(
+    parent_model_config: Any, child_model_config: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """Copy the parent's frozen catalog mode into a branch's session state."""
+    inherited = dict(child_model_config or {})
+    if isinstance(parent_model_config, str):
+        parent_model_config = safe_json_loads(parent_model_config)
+    if (
+        not isinstance(parent_model_config, dict)
+        or _SKILLS_CATALOG_MODE_SESSION_KEY not in parent_model_config
+    ):
+        return inherited
+    inherited[_SKILLS_CATALOG_MODE_SESSION_KEY] = (
+        _normalize_skills_catalog_mode(
+            parent_model_config.get(_SKILLS_CATALOG_MODE_SESSION_KEY)
+        )
+        or "full"
+    )
+    return inherited
+
+
 def persist_session_skills_catalog_mode(agent: Any) -> None:
     """Persist the frozen catalog mode through the existing session state patch."""
     mode = _normalize_skills_catalog_mode(getattr(agent, "_skills_catalog_mode", None))
@@ -1018,6 +1039,7 @@ def format_tools_for_system_message(agent: Any) -> str:
 __all__ = [
     "build_system_prompt_parts",
     "build_system_prompt",
+    "inherit_session_skills_catalog_mode",
     "invalidate_system_prompt",
     "persist_session_skills_catalog_mode",
     "restore_session_skills_catalog_mode",

@@ -2868,6 +2868,13 @@ def _(rid, params: dict) -> dict:
                     if hasattr(db, "get_next_title_in_lineage")
                     else f"{current} (branch)"
                 )
+            from agent.system_prompt import inherit_session_skills_catalog_mode
+
+            parent_row = db.get_session(old_key)
+            branch_model_config = inherit_session_skills_catalog_mode(
+                parent_row.get("model_config") if parent_row else None,
+                {"_branched_from": old_key},
+            )
             db.create_session(
                 new_key,
                 source=source,
@@ -2877,7 +2884,7 @@ def _(rid, params: dict) -> dict:
                 # the parent live (no end_reason='branched'), so the legacy
                 # end_reason heuristic never matches it — the marker is the only
                 # thing that surfaces TUI branches. See issue #20856.
-                model_config={"_branched_from": old_key},
+                model_config=branch_model_config,
                 parent_session_id=old_key,
                 cwd=_session_cwd(session),
                 # The branch stays on its parent's profile. Explicit stamp (not

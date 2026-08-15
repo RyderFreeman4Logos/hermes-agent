@@ -106,7 +106,7 @@ def test_terminal_turn_error_consumes_cache_backstop_once(
     if partial:
         server._append_inflight_delta(session, partial)
     emitted = []
-    monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+    monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args) or True)
     monkeypatch.setattr(server, "_retire_turn_marker", lambda *_args: None)
     monkeypatch.setattr(server, "render_message", lambda *_args: "")
 
@@ -151,6 +151,7 @@ def test_terminal_turn_error_preserves_cache_backstop_until_emit_succeeds(
             emitted.append(None)
             raise RuntimeError("transport unavailable")
         emitted.append(args)
+        return True
 
     monkeypatch.setattr(server, "_emit", flaky_emit)
     monkeypatch.setattr(server, "_retire_turn_marker", lambda *_args: None)
@@ -169,6 +170,59 @@ def test_terminal_turn_error_preserves_cache_backstop_until_emit_succeeds(
 
     assert emitted[1][2]["cache_info"]["percent_label"] == "<1%"
     assert agent._first_turn_usage is None
+
+
+def test_terminal_cache_backstop_retries_after_drop_transport():
+    usage = {
+        "prompt_tokens": 2_000,
+        "cache_read_tokens": 1,
+        "cache_write_tokens": 0,
+        "cache_telemetry_present": True,
+    }
+    agent = types.SimpleNamespace(_first_turn_usage=usage)
+    payload = {"text": "done", "usage": {}, "status": "complete"}
+
+    class RecordingTransport:
+        def __init__(self):
+            self.frames = []
+
+        def write(self, frame):
+            self.frames.append(frame)
+            return True
+
+        def close(self):
+            return None
+
+    delivered = RecordingTransport()
+    server._sessions["sid-drop-retry"] = {
+        "transport": server._detached_ws_transport,
+    }
+    try:
+        assert (
+            server._emit_terminal_message_complete(
+                "sid-drop-retry", payload, agent
+            )
+            is False
+        )
+        assert agent._first_turn_usage is usage
+        assert delivered.frames == []
+        assert payload == {"text": "done", "usage": {}, "status": "complete"}
+
+        server._sessions["sid-drop-retry"]["transport"] = delivered
+        assert (
+            server._emit_terminal_message_complete(
+                "sid-drop-retry", payload, agent
+            )
+            is True
+        )
+    finally:
+        server._sessions.pop("sid-drop-retry", None)
+
+    assert agent._first_turn_usage is None
+    assert len(delivered.frames) == 1
+    terminal_payload = delivered.frames[0]["params"]["payload"]
+    assert terminal_payload["cache_info"]["percent_label"] == "<1%"
+    assert payload == {"text": "done", "usage": {}, "status": "complete"}
 
 
 def _dispatch_sync(req: dict, transport=None) -> dict | None:
@@ -6063,8 +6117,9 @@ class _RecordingAgent:
 
 
 @pytest.mark.parametrize("outcome", ["complete", "returned-error", "raised-error"])
-def test_run_prompt_submit_terminal_paths_consume_cache_backstop_once(
-    monkeypatch, tmp_path, outcome
+@pytest.mark.parametrize("transport_delivers", [True, False])
+def test_run_prompt_submit_terminal_paths_follow_cache_delivery(
+    monkeypatch, tmp_path, outcome, transport_delivers
 ):
     class _TerminalAgent(_RecordingAgent):
         def run_conversation(self, prompt, **kwargs):
@@ -6093,9 +6148,17 @@ def test_run_prompt_submit_terminal_paths_consume_cache_backstop_once(
 
     _configure_immediate_prompt_run(monkeypatch, tmp_path)
     emitted = []
-    monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+    if transport_delivers:
+        monkeypatch.setattr(
+            server, "_emit", lambda *args: emitted.append(args) or True
+        )
     agent = _TerminalAgent([])
-    session = _session(agent=agent, running=True, profile_home=str(tmp_path))
+    session = _session(
+        agent=agent,
+        running=True,
+        profile_home=str(tmp_path),
+        transport=(server._detached_ws_transport if not transport_delivers else None),
+    )
     server._sessions["sid-terminal"] = session
     try:
         server._run_prompt_submit(
@@ -6104,12 +6167,16 @@ def test_run_prompt_submit_terminal_paths_consume_cache_backstop_once(
     finally:
         server._sessions.pop("sid-terminal", None)
 
-    completion_payloads = [
-        args[2] for args in emitted if args[0] == "message.complete"
-    ]
-    assert len(completion_payloads) == 1
-    assert completion_payloads[0]["cache_info"]["percent_label"] == "<1%"
-    assert agent._first_turn_usage is None
+    if transport_delivers:
+        completion_payloads = [
+            args[2] for args in emitted if args[0] == "message.complete"
+        ]
+        assert len(completion_payloads) == 1
+        assert completion_payloads[0]["cache_info"]["percent_label"] == "<1%"
+        assert agent._first_turn_usage is None
+    else:
+        assert emitted == []
+        assert agent._first_turn_usage["cache_read_tokens"] == 1
 
 
 @pytest.mark.parametrize("exit_code", [0, 7])

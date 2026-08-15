@@ -14127,6 +14127,79 @@ def test_prompt_submit_emits_first_cache_status_before_later_tool_work(monkeypat
     }
 
 
+def test_prompt_submit_exception_retains_first_cache_sample_in_terminal_backstop(
+    monkeypatch,
+):
+    class _Agent:
+        session_id = "session-key"
+        _session_db = None
+
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None, **_kwargs
+        ):
+            from agent.cache_attribution import record_first_turn_cache_info
+
+            info = record_first_turn_cache_info(
+                self,
+                {
+                    "cache_read_tokens": 0,
+                    "cache_write_tokens": 0,
+                    "prompt_tokens": 2_000,
+                },
+                telemetry_present=True,
+            )
+            assert info is not None
+            raise RuntimeError("later turn failure")
+
+    agent = _Agent()
+    server._attach_tui_cache_callback(agent, "sid")
+    server._sessions["sid"] = _session(agent=agent)
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    emitted: list[tuple[str, str, dict]] = []
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event, sid, payload=None: emitted.append((event, sid, payload or {})),
+    )
+    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
+    monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(server, "_CRASH_LOG", os.devnull)
+
+    server.handle_request(
+        {
+            "id": "1",
+            "method": "prompt.submit",
+            "params": {"session_id": "sid", "text": "hello"},
+        }
+    )
+
+    cache_statuses = [
+        payload
+        for event, _, payload in emitted
+        if event == "status.update" and payload.get("text", "").startswith("Cache:")
+    ]
+    complete_payload = next(
+        payload for event, _, payload in emitted if event == "message.complete"
+    )
+    assert cache_statuses == [
+        {
+            "kind": "error",
+            "text": "Cache: 0/2,000 tokens (0% hit, 0 written)",
+        }
+    ]
+    assert complete_payload["status"] == "error"
+    assert complete_payload["cache_info"] == {
+        "cached_tokens": 0,
+        "level": "error",
+        "prompt_tokens": 2_000,
+        "state": "miss",
+        "text": "Cache: 0/2,000 tokens (0% hit, 0 written)",
+        "write_tokens": 0,
+    }
+    assert agent._first_turn_cache_info is None
+
+
 def test_prompt_submit_preserves_empty_response_without_error(monkeypatch):
     """An empty final_response with NO backend error must stay empty — do not
     synthesize an error string. Preserves the existing None/empty-sentinel

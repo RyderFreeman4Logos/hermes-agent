@@ -2,6 +2,7 @@ import { atom, computed } from 'nanostores'
 
 import { MOUSE_TRACKING } from '../config/env.js'
 import { ZERO } from '../domain/usage.js'
+import { DEFAULT_STATUS_BAR_SEGMENTS } from '../lib/statusBar.js'
 import { bootTheme } from '../lib/themeBoot.js'
 import { DEFAULT_THEME } from '../theme.js'
 
@@ -32,6 +33,7 @@ const buildUiState = (): UiState => ({
   sid: null,
   status: 'summoning hermes…',
   statusBar: 'top',
+  statusBarSegments: [...DEFAULT_STATUS_BAR_SEGMENTS],
   streaming: true,
   timestamps: false,
   // Last session's resolved theme paints frame one (flash-free boot, like

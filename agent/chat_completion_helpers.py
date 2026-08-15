@@ -64,6 +64,29 @@ _PROVIDER_STREAM_ERROR_TEXT_LIMIT = 4096
 # billing reasons keep their own 60s cooldown (set above); this is the
 # narrower non-rate-limit case.  See issue #24996.
 _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
+_CODEX_REQUEST_OWNER_LOCK = threading.Lock()
+
+
+def _fence_retained_codex_request_owner(agent) -> None:
+    """Reject overlap while a retained Codex worker still owns dispatch."""
+    with _CODEX_REQUEST_OWNER_LOCK:
+        previous = getattr(agent, "_codex_request_owner", None)
+        if not isinstance(previous, dict):
+            return
+        thread = previous.get("thread")
+        if (
+            thread is None
+            or previous.get("started") is False
+            or thread.is_alive()
+        ):
+            error = TimeoutError(
+                "A prior Codex request still owns its physical worker; "
+                "Hermes did not dispatch another request."
+            )
+            setattr(error, "_hermes_ambiguous_provider_acceptance", True)
+            setattr(error, "_hermes_pre_dispatch_retained_owner", True)
+            raise error
+        setattr(agent, "_codex_request_owner", None)
 
 
 def _context_thread_target(callback):
@@ -1244,6 +1267,7 @@ def direct_api_call(agent, api_kwargs: dict):
     outer retry loop reconnects with backoff / credential rotation /
     provider fallback.
     """
+    _fence_retained_codex_request_owner(agent)
     from tools.runtime_heartbeat import (
         begin_normal_warm_snapshot,
         bind_normal_warm_snapshot_client,
@@ -1467,6 +1491,8 @@ def interruptible_api_call(agent, api_kwargs: dict):
     the main retry loop can try again with backoff / credential rotation /
     provider fallback.
     """
+    _fence_retained_codex_request_owner(agent)
+
     # Cron and other non-interactive, nested-pool contexts must not spawn the
     # interrupt worker — it wedges before the socket opens on the 2nd+ call
     # (#62151). Run inline instead. See should_use_direct_api_call.
@@ -3451,6 +3477,7 @@ def interruptible_streaming_api_call(
     """
     if agent._interrupt_requested:
         raise InterruptedError("Agent interrupted before streaming API call")
+    _fence_retained_codex_request_owner(agent)
 
     def _stream_final_text(response) -> str:
         try:

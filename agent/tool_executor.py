@@ -41,6 +41,7 @@ from agent.tool_dispatch_helpers import (
     _plan_tool_batch_segments,
     make_tool_result_message,
 )
+from agent.tool_guardrails import NO_PROGRESS_LOOP_HALT_AFTER
 from tools.terminal_tool import (
     get_active_env,
 )
@@ -390,6 +391,32 @@ class _ManagedToolResult:
 
 class _ToolTimeoutResult(str):
     """Marker for a synthesized sequential-tool timeout result."""
+
+
+def _record_guardrail_result(
+    agent,
+    function_name: str,
+    function_args: dict,
+    function_result: Any,
+    *,
+    failed: bool,
+    synthetic: bool,
+    update_configured_state: bool,
+) -> Any:
+    """Keep streak and configured accounting semantics independent."""
+    breaks_streak = synthetic or not isinstance(function_result, str)
+    if breaks_streak:
+        agent._tool_guardrails.break_observation_streak()
+    if update_configured_state:
+        function_result = agent._append_guardrail_observation(
+            function_name,
+            function_args,
+            function_result,
+            failed=failed,
+        )
+        if breaks_streak:
+            agent._tool_guardrails.break_observation_streak()
+    return function_result
 
 
 class _ConcurrentToolAuthorizationGate:
@@ -975,6 +1002,50 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     """
     tool_calls = assistant_message.tool_calls
     num_tools = len(tool_calls)
+
+    # Public/internal callers may invoke this entry directly. Re-apply the
+    # planner so identical retries cannot all launch before their results are
+    # available to the no-progress guardrail.
+    if finalize and num_tools >= NO_PROGRESS_LOOP_HALT_AFTER:
+        signature_counts: dict[tuple[str, str], int] = {}
+        for tool_call in tool_calls:
+            function_args, parse_error = _parse_tool_arguments(
+                tool_call.function.arguments
+            )
+            if parse_error is None:
+                signature = (
+                    tool_call.function.name,
+                    json.dumps(
+                        function_args,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                )
+                signature_counts[signature] = signature_counts.get(signature, 0) + 1
+        if max(signature_counts.values(), default=0) < NO_PROGRESS_LOOP_HALT_AFTER:
+            signature_counts = {}
+    else:
+        signature_counts = {}
+
+    if signature_counts:
+        _active_env = get_active_env(effective_task_id)
+        _exec_cwd = (
+            Path(_active_env.cwd)
+            if _active_env is not None and _active_env.cwd
+            else None
+        )
+        segments = _plan_tool_batch_segments(tool_calls, execution_cwd=_exec_cwd)
+        if len(segments) != 1 or segments[0][0] != "parallel":
+            execute_tool_calls_segmented(
+                agent,
+                assistant_message,
+                messages,
+                effective_task_id,
+                api_call_count,
+                segments=segments,
+            )
+            return
 
     # Resolve the context-scaled tool-output budget once per turn (cheap, but
     # avoids rebuilding it per result inside the loop below).
@@ -1566,13 +1637,17 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         r = results[i]
         blocked = False
         is_error = True
+        function_name = name
+        function_args = args
         progress_function_name = name
+        synthetic_result = False
         # A worker can finish and write results[i] in the window between the
         # deadline snapshot (timed_out_indices, taken from not_done) and this
         # loop. Prefer that real result over a fabricated timeout message — the
         # tool genuinely succeeded, just slightly late.
         effect_disposition = None
         if i in timed_out_indices and r is None:
+            synthetic_result = True
             suffix = f"{timeout_s:.1f}s" if timeout_s is not None else "the configured timeout"
             function_result = f"Error executing tool '{name}': timed out after {suffix}"
             effect_disposition = "unknown"
@@ -1591,6 +1666,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             )
             tool_duration = float(timeout_s or 0.0)
         elif r is None:
+            synthetic_result = True
             # Tool was cancelled (interrupt) or thread didn't return
             if agent._interrupt_requested:
                 function_result = f"[Tool execution cancelled — {name} was skipped due to user interrupt]"
@@ -1641,15 +1717,18 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 )
             if blocked:
                 effect_disposition = "none"
+                synthetic_result = True
 
-            if not blocked:
-                function_result = agent._append_guardrail_observation(
-                    function_name,
-                    function_args,
-                    function_result,
-                    failed=is_error,
-                )
-
+        function_result = _record_guardrail_result(
+            agent,
+            function_name,
+            function_args,
+            function_result,
+            failed=is_error,
+            synthetic=synthetic_result,
+            update_configured_state=r is not None and not blocked,
+        )
+        if r is not None:
             if is_error:
                 _err_text = _multimodal_text_summary(function_result)
                 result_preview = _err_text[:200] if len(_err_text) > 200 else _err_text
@@ -1870,6 +1949,15 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             tool_call.function.arguments
         )
         if malformed_args_result is not None:
+            malformed_args_result = _record_guardrail_result(
+                agent,
+                function_name,
+                function_args,
+                malformed_args_result,
+                failed=True,
+                synthetic=True,
+                update_configured_state=False,
+            )
             _emit_terminal_post_tool_call(
                 agent,
                 function_name=function_name,
@@ -2451,13 +2539,16 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 duration_ms=int(tool_duration * 1000),
                 middleware_trace=list(middleware_trace),
             )
-        if not _execution_blocked:
-            function_result = agent._append_guardrail_observation(
-                function_name,
-                function_args,
-                function_result,
-                failed=_is_error_result,
-            )
+        function_result = _record_guardrail_result(
+            agent,
+            function_name,
+            function_args,
+            function_result,
+            failed=_is_error_result,
+            synthetic=_execution_blocked or _execution_timed_out,
+            update_configured_state=not _execution_blocked,
+        )
+        if isinstance(function_result, str):
             result_preview = function_result if agent.verbose_logging else (
                 function_result[:200] if len(function_result) > 200 else function_result
             )

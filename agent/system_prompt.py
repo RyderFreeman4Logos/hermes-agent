@@ -198,6 +198,35 @@ def restore_session_skills_catalog_mode(agent: Any, model_config: Any) -> bool:
     return True
 
 
+def hydrate_session_skills_catalog_mode(
+    agent: Any,
+    *,
+    session_db: Any = None,
+    session_id: Optional[str] = None,
+    model_config: Any = None,
+) -> bool:
+    """Hydrate the frozen catalog mode before any pre-turn prompt rebuild."""
+    if model_config is None:
+        db = session_db if session_db is not None else getattr(agent, "_session_db", None)
+        target_id = str(
+            session_id if session_id is not None else getattr(agent, "session_id", "")
+        ).strip()
+        getter = getattr(db, "get_session", None)
+        if not target_id or not callable(getter):
+            return False
+        try:
+            row = getter(target_id)
+        except Exception:
+            logger.debug(
+                "failed to hydrate skills catalog mode for session %s",
+                target_id,
+                exc_info=True,
+            )
+            return False
+        model_config = row.get("model_config") if isinstance(row, dict) else None
+    return restore_session_skills_catalog_mode(agent, model_config)
+
+
 def inherit_session_skills_catalog_mode(
     parent_model_config: Any, child_model_config: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
@@ -1039,6 +1068,7 @@ def format_tools_for_system_message(agent: Any) -> str:
 __all__ = [
     "build_system_prompt_parts",
     "build_system_prompt",
+    "hydrate_session_skills_catalog_mode",
     "inherit_session_skills_catalog_mode",
     "invalidate_system_prompt",
     "persist_session_skills_catalog_mode",

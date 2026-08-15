@@ -1858,6 +1858,9 @@ DEFAULT_CONFIG = {
         # Flip to true only if you trust delegated work to run dangerous cmds
         # without human review (cron pipelines, batch automation, etc.).
         "subagent_auto_approve": False,
+        # Explicit, inherited terminal admission policy for delegate children.
+        # Supported flags: read_only and just_only_cargo.
+        "command_policy": {},
         # Optional named per-child route profiles. model_profile is resolved at
         # delegate execution time; the tool schema stays static so config edits
         # cannot churn an active conversation's cached prefix.

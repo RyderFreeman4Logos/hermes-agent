@@ -1413,6 +1413,84 @@ def resolve_task_overrides(task_id: Optional[str]) -> Dict[str, Any]:
     )
 
 
+_CARGO_WRITE_SUBCOMMANDS = frozenset(
+    {
+        "bench", "build", "check", "clean", "clippy", "doc", "fix",
+        "fmt", "install", "package", "publish", "run", "test",
+    }
+)
+
+
+def _delegate_cargo_subcommands(command: str) -> List[str]:
+    """Return bare Cargo subcommands at shell command boundaries."""
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except ValueError:
+        return []
+    subcommands = []
+    index = 0
+    at_command_start = True
+    while index < len(tokens):
+        token = tokens[index]
+        if token and set(token) <= {";", "&", "|"}:
+            at_command_start = True
+            index += 1
+            continue
+        if not at_command_start:
+            index += 1
+            continue
+        while index < len(tokens) and re.match(
+            r"^[A-Za-z_][A-Za-z0-9_]*=", tokens[index]
+        ):
+            index += 1
+        if index < len(tokens) and tokens[index] == "env":
+            index += 1
+            while index < len(tokens) and (
+                tokens[index].startswith("-")
+                or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", tokens[index])
+            ):
+                index += 1
+        if index < len(tokens) and tokens[index] == "cargo":
+            subcommands.append(tokens[index + 1] if index + 1 < len(tokens) else "")
+        at_command_start = False
+        index += 1
+    return subcommands
+
+
+def _delegate_command_policy_violation(
+    task_id: Optional[str], command: str
+) -> Optional[Dict[str, str]]:
+    policy = resolve_task_overrides(task_id).get("command_policy")
+    if not isinstance(policy, dict):
+        return None
+    cargo_subcommands = _delegate_cargo_subcommands(command)
+    source = "delegation.command_policy"
+    if policy.get("just_only_cargo") is True and cargo_subcommands:
+        return {
+            "error": (
+                "Blocked by delegation.command_policy: bare Cargo is prohibited; "
+                "use the repository Just recipe."
+            ),
+            "rule": "just_only_cargo",
+            "policy_source": source,
+        }
+    if policy.get("read_only") is True and any(
+        subcommand in _CARGO_WRITE_SUBCOMMANDS for subcommand in cargo_subcommands
+    ):
+        return {
+            "error": (
+                "Blocked by delegation.command_policy: write-capable Cargo is "
+                "prohibited for a read-only delegate."
+            ),
+            "rule": "read_only",
+            "policy_source": source,
+        }
+    return None
+
+
 def _resolve_task_host_cwd(config: Dict[str, Any], task_id: Optional[str]) -> Optional[str]:
     """Host directory to bind-mount at ``/workspace`` for *task_id*'s container.
 
@@ -2778,6 +2856,17 @@ def terminal_tool(
                 "exit_code": -1,
                 "error": "Command was not executed because the payload appears truncated by the UI. Resend the complete command.",
                 "status": "error",
+            }, ensure_ascii=False)
+
+        policy_violation = _delegate_command_policy_violation(task_id, command)
+        if policy_violation:
+            return json.dumps({
+                "output": "",
+                "exit_code": 1,
+                "status": "blocked",
+                "task_id": task_id or "",
+                "command": command,
+                **policy_violation,
             }, ensure_ascii=False)
 
         # Get configuration

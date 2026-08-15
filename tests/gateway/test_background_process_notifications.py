@@ -180,6 +180,121 @@ async def test_consumed_completion_skips_raw_notification_without_agent_notify(
 
 
 @pytest.mark.asyncio
+async def test_agent_completion_uses_strict_process_summary_redaction(
+    monkeypatch, tmp_path
+):
+    """Gateway-built completion events share the strict process boundary."""
+    import agent.redact as redact_module
+    import tools.process_registry as pr_module
+
+    monkeypatch.setattr(redact_module, "_REDACT_ENABLED", False)
+    dotted_secret = "SYNTHETIC_GATEWAY_DOTTED_1a2b"
+    opaque_secret = "SYNTHETIC_GATEWAY_OPAQUE_3c4d"
+    output_url_secret = "SYNTHETIC_GATEWAY_URL_5e6f"
+    command_url_secret = "SYNTHETIC_GATEWAY_COMMAND_URL_7a8b"
+    sessions = [SimpleNamespace(
+        output_buffer="\n".join((
+            f"service.auth.token={dotted_secret}",
+            f"CUSTOM_TOKEN={opaque_secret}",
+            (
+                "https://example.invalid/result"
+                f"?access_token={output_url_secret}&state=keep"
+            ),
+        )),
+        exited=True,
+        exit_code=0,
+        command=(
+            "python app.py --callback https://example.invalid/run"
+            f"?access_token={command_url_secret}&mode=inspect"
+        ),
+        started_at=1.0,
+        completion_reason="exited",
+        termination_source="",
+        parent_session_id="",
+    )]
+    monkeypatch.setattr(
+        pr_module, "process_registry", _FakeRegistry(sessions, consumed=False)
+    )
+
+    async def _instant_sleep(*_args, **_kwargs):
+        pass
+
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    captured = []
+
+    async def _capture(text, event):
+        captured.append((text, event))
+        return True
+
+    monkeypatch.setattr(runner, "_enqueue_process_completion_notification", _capture)
+    watcher = _watcher_dict()
+    watcher["notify_on_complete"] = True
+
+    await runner._run_process_watcher(watcher)
+
+    assert len(captured) == 1
+    text, event = captured[0]
+    for secret in (
+        dotted_secret,
+        opaque_secret,
+        output_url_secret,
+        command_url_secret,
+    ):
+        assert secret not in text
+    assert output_url_secret not in event["output"]
+    assert command_url_secret not in event["command"]
+    assert "example.invalid" in text
+    assert "state=keep" in text
+    assert "mode=inspect" in text
+
+
+@pytest.mark.asyncio
+async def test_user_completion_uses_strict_process_summary_redaction(
+    monkeypatch, tmp_path
+):
+    """Direct gateway completion messages use the same strict boundary."""
+    import agent.redact as redact_module
+    import tools.process_registry as pr_module
+
+    monkeypatch.setattr(redact_module, "_REDACT_ENABLED", False)
+    output_url_secret = "SYNTHETIC_GATEWAY_DIRECT_URL_1a2b"
+    command_url_secret = "SYNTHETIC_GATEWAY_DIRECT_COMMAND_URL_3c4d"
+    sessions = [SimpleNamespace(
+        output_buffer=(
+            "https://example.invalid/result"
+            f"?access_token={output_url_secret}&state=keep"
+        ),
+        exited=True,
+        exit_code=1,
+        command=(
+            "python app.py --callback https://example.invalid/run"
+            f"?access_token={command_url_secret}&mode=inspect"
+        ),
+        started_at=1.0,
+    )]
+    monkeypatch.setattr(
+        pr_module, "process_registry", _FakeRegistry(sessions, consumed=False)
+    )
+
+    async def _instant_sleep(*_args, **_kwargs):
+        pass
+
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+    runner = _build_runner(monkeypatch, tmp_path, "concise")
+    adapter = runner.adapters[Platform.TELEGRAM]
+
+    await runner._run_process_watcher(_watcher_dict())
+
+    adapter.send.assert_awaited_once()
+    sent_text = adapter.send.await_args.args[1]
+    assert output_url_secret not in sent_text
+    assert command_url_secret not in sent_text
+    assert "example.invalid" in sent_text
+    assert "state=keep" in sent_text
+
+
+@pytest.mark.asyncio
 async def test_inject_watch_notification_routes_from_session_store_origin(monkeypatch, tmp_path):
     from gateway.session import SessionSource
 

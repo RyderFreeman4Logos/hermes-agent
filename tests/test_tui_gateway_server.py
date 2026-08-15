@@ -14109,6 +14109,14 @@ def test_prompt_submit_emits_first_cache_status_before_later_tool_work(monkeypat
         def run_conversation(
             self, prompt, conversation_history=None, stream_callback=None, **_kwargs
         ):
+            self._tui_cache_turn_serial = 1
+            self._first_turn_usage = {
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+                "cache_telemetry_present": True,
+                "prompt_tokens": 2_000,
+            }
+            self._tui_cache_callback("miss", 0, 0, 2_000)
             self._tui_cache_callback(cache_info)
             server._emit(
                 "tool.start",
@@ -14145,6 +14153,7 @@ def test_prompt_submit_emits_first_cache_status_before_later_tool_work(monkeypat
     )
 
     events = [event for event, _, _ in emitted]
+    assert events.count("status.update") == 1
     assert events.index("status.update") < events.index("tool.start")
     assert events.index("tool.start") < events.index("message.complete")
     status_payload = next(payload for event, _, payload in emitted if event == "status.update")

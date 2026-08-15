@@ -413,6 +413,49 @@ def test_api_call_cache_log_preserves_canonical_states_and_scalars(
     assert agent._first_turn_cache_info is None
 
 
+def test_direct_returned_error_settles_first_provider_cache_sample_once():
+    """Pre-finalizer partial returns must not leak cache data to another turn."""
+    agent = _make_agent()
+    invalid_tool_call = SimpleNamespace(
+        id="call-1",
+        type="function",
+        function=SimpleNamespace(name="definitely_unknown_tool", arguments="{}"),
+    )
+    responses = []
+    for _ in range(3):
+        response = _mock_response(
+            content="", finish_reason="tool_calls", tool_calls=[invalid_tool_call]
+        )
+        response.usage = SimpleNamespace(
+            prompt_tokens=2_000,
+            completion_tokens=10,
+            total_tokens=2_010,
+            prompt_tokens_details=SimpleNamespace(
+                cached_tokens=0,
+                cache_write_tokens=0,
+            ),
+        )
+        responses.append(response)
+    agent.client.chat.completions.create.side_effect = responses
+    observed = []
+    agent._tui_cache_callback = lambda info: observed.append(dict(info))
+
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("private request")
+
+    assert result["partial"] is True
+    assert agent.client.chat.completions.create.call_count == 3
+    assert len(observed) == 1
+    assert result["cache_info"] == observed[0]
+    from agent.cache_attribution import consume_turn_cache_info
+
+    assert consume_turn_cache_info(agent) is None
+
+
 def test_run_conversation_partial_stream_recovery_surfaces_explanation():
     """A long recovered partial stream still needs the visible footer.
 

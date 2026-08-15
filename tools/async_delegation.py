@@ -51,6 +51,7 @@ from tools.daemon_pool import DaemonThreadPoolExecutor
 from tools.thread_context import propagate_context_to_thread
 
 logger = logging.getLogger(__name__)
+_CONTROL_PROCESS_TOKEN = uuid.uuid4().hex
 
 # Back-compat alias — the daemon executor now lives in tools.daemon_pool so
 # other subsystems (tool_executor, memory_manager, delegate_tool, skills_hub)
@@ -174,7 +175,17 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             task_json TEXT,
             delivery_claim TEXT,
             delivery_claimed_at REAL,
-            origin_session_id TEXT NOT NULL DEFAULT ''
+            origin_session_id TEXT NOT NULL DEFAULT '',
+            child_session_id TEXT,
+            children_json TEXT,
+            retained INTEGER NOT NULL DEFAULT 0,
+            retained_at REAL,
+            tombstoned_at REAL,
+            owner_profile TEXT,
+            usage_json TEXT,
+            resume_claim TEXT,
+            resume_claimed_at REAL,
+            child_control_json TEXT
         )"""
     )
     columns = {row[1] for row in conn.execute("PRAGMA table_info(async_delegations)")}
@@ -189,6 +200,16 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         # completions recovered after a process restart are unroutable on
         # api_server (the in-memory record that carried it is gone).
         ("origin_session_id", "TEXT"),
+        ("child_session_id", "TEXT"),
+        ("children_json", "TEXT"),
+        ("retained", "INTEGER NOT NULL DEFAULT 0"),
+        ("retained_at", "REAL"),
+        ("tombstoned_at", "REAL"),
+        ("owner_profile", "TEXT"),
+        ("usage_json", "TEXT"),
+        ("resume_claim", "TEXT"),
+        ("resume_claimed_at", "REAL"),
+        ("child_control_json", "TEXT"),
     ):
         if name not in columns:
             conn.execute(f"ALTER TABLE async_delegations ADD COLUMN {name} {sql_type}")
@@ -290,18 +311,18 @@ def _prune_durable_records() -> None:
     cutoff = now - _DURABLE_RETENTION_SECONDS
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
-            "DELETE FROM async_delegations WHERE delivery_state='delivered' AND updated_at < ?",
+            "DELETE FROM async_delegations WHERE delivery_state='delivered' AND COALESCE(retained, 0)=0 AND updated_at < ?",
             (cutoff,),
         )
         terminal_count = conn.execute(
-            "SELECT COUNT(*) FROM async_delegations WHERE state NOT IN ('running','finalizing')"
+            "SELECT COUNT(*) FROM async_delegations WHERE state NOT IN ('running','finalizing') AND COALESCE(retained, 0)=0"
         ).fetchone()[0]
         excess = max(0, terminal_count - _MAX_RETAINED_COMPLETED)
         if excess:
             conn.execute(
                 """DELETE FROM async_delegations WHERE delegation_id IN (
                      SELECT delegation_id FROM async_delegations
-                     WHERE state NOT IN ('running','finalizing')
+                     WHERE state NOT IN ('running','finalizing') AND COALESCE(retained, 0)=0
                      ORDER BY CASE delivery_state WHEN 'delivered' THEN 0 ELSE 1 END,
                               updated_at ASC LIMIT ?
                    )""",
@@ -309,14 +330,14 @@ def _prune_durable_records() -> None:
             )
         pending_count = conn.execute(
             """SELECT COUNT(*) FROM async_delegations
-               WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'"""
+               WHERE state NOT IN ('running','finalizing') AND delivery_state='pending' AND COALESCE(retained, 0)=0"""
         ).fetchone()[0]
         overflow = max(0, pending_count - _MAX_DURABLE_PENDING)
         if overflow:
             conn.execute(
                 """DELETE FROM async_delegations WHERE delegation_id IN (
                      SELECT delegation_id FROM async_delegations
-                     WHERE state NOT IN ('running','finalizing') AND delivery_state='pending'
+                     WHERE state NOT IN ('running','finalizing') AND delivery_state='pending' AND COALESCE(retained, 0)=0
                      ORDER BY updated_at ASC LIMIT ?
                    )""",
                 (overflow,),
@@ -333,6 +354,13 @@ def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
             (event.get("status", "completed"), event.get("completed_at", now), now,
              json.dumps(event), json.dumps(result), event["delegation_id"]),
         )
+    try:
+        retain_completed_delegation(
+            event["delegation_id"],
+            result.get("usage") if isinstance(result, dict) else None,
+        )
+    except Exception:
+        logger.debug("retaining completed delegation failed", exc_info=True)
 
 
 def _note_delivery_attempt(delegation_id: str) -> None:
@@ -355,12 +383,13 @@ def recover_abandoned_delegations() -> int:
         rows = conn.execute(
             """SELECT delegation_id, origin_session, origin_ui_session_id,
                       parent_session_id, dispatched_at, owner_pid,
-                      owner_started_at, task_json, origin_session_id
+                      owner_started_at, task_json, origin_session_id,
+                      child_control_json
                FROM async_delegations WHERE state IN ('running','finalizing')"""
         ).fetchall()
         for row in rows:
             (delegation_id, session_key, origin_ui, parent_id, dispatched_at,
-             pid, started, task_json, origin_session_id) = row
+             pid, started, task_json, origin_session_id, control_json) = row
             live = False
             if pid:
                 live = _pid_exists(int(pid))
@@ -390,13 +419,27 @@ def recover_abandoned_delegations() -> int:
                 if task.get(_k):
                     event[_k] = task[_k]
             result = {"status": "unknown", "summary": None, "error": event["error"]}
+            has_pending_control = any(
+                str(control.get("state") or "") in {"accepted", "running"}
+                for control in _decode_child_controls(control_json).values()
+            )
             conn.execute(
                 """UPDATE async_delegations SET state='unknown', completed_at=?,
-                   updated_at=?, event_json=?, result_json=?, delivery_state='pending'
+                   updated_at=?, event_json=?, result_json=?, delivery_state='pending',
+                   retained = CASE WHEN ? THEN 1 ELSE retained END,
+                   retained_at = CASE WHEN ? THEN ? ELSE retained_at END
                    WHERE delegation_id=?""",
-                (now, now, json.dumps(event), json.dumps(result), delegation_id),
+                (
+                    now, now, json.dumps(event), json.dumps(result),
+                    int(has_pending_control), int(has_pending_control), now,
+                    delegation_id,
+                ),
             )
             recovered += 1
+    try:
+        rehydrate_retained_children()
+    except Exception:
+        logger.debug("retained-child rehydration failed", exc_info=True)
     return recovered
 
 
@@ -1776,6 +1819,535 @@ def interrupt_for_session(
             count, reason,
         )
     return count
+
+
+# Durable retained-child registry
+# ---------------------------------------------------------------------------
+
+_DEFAULT_MAX_RETAINED = 10
+_DEFAULT_RETAINED_TTL_HOURS = 72.0
+_FOLLOW_UP_UNAVAILABLE = "Retained child is unavailable for this session."
+
+
+def _retention_limits() -> tuple[int, float]:
+    """Read bounded retained-child limits without making config mandatory."""
+    max_retained = _DEFAULT_MAX_RETAINED
+    ttl_hours = _DEFAULT_RETAINED_TTL_HOURS
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly().get("delegation") or {}
+        if isinstance(config, dict):
+            max_retained = max(1, int(config.get("max_retained", max_retained)))
+            ttl_hours = max(1.0, float(config.get("retained_ttl_hours", ttl_hours)))
+    except Exception:
+        pass
+    return max_retained, ttl_hours
+
+
+def _current_owner_profile() -> str:
+    try:
+        from agent.relay_runtime import current_profile_key
+
+        profile = current_profile_key()
+        return profile.strip() if isinstance(profile, str) else ""
+    except Exception:
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+
+            profile = get_active_profile_name()
+            return profile.strip() if isinstance(profile, str) else ""
+        except Exception:
+            return ""
+
+
+def _open_session_db_readonly():
+    from hermes_state import SessionDB
+
+    return SessionDB(get_hermes_home() / "state.db", read_only=True)
+
+
+def _lineage_root(session_id: Optional[str]) -> Optional[str]:
+    """Return a proven compression-only owner root, or ``None`` on doubt."""
+    if not isinstance(session_id, str) or not session_id.strip():
+        return None
+    db = None
+    try:
+        db = _open_session_db_readonly()
+        return db.get_compression_lineage_root(session_id.strip())
+    except Exception:
+        return None
+    finally:
+        if db is not None:
+            db.close()
+
+
+def _decode_child_controls(raw: Optional[str]) -> Dict[str, Dict[str, Any]]:
+    try:
+        decoded = json.loads(raw or "{}")
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(decoded, dict):
+        return {}
+    return {
+        str(child_id): dict(control)
+        for child_id, control in decoded.items()
+        if isinstance(control, dict)
+    }
+
+
+def _child_manifest_ids(raw: Optional[str]) -> set[str]:
+    try:
+        manifest = json.loads(raw or "[]")
+    except (TypeError, ValueError):
+        return set()
+    if not isinstance(manifest, list):
+        return set()
+    ids: set[str] = set()
+    for child in manifest:
+        if not isinstance(child, dict):
+            continue
+        for key in ("subagent_id", "session_id"):
+            value = str(child.get(key) or "").strip()
+            if value:
+                ids.add(value)
+    return ids
+
+
+def reserve_child_control(
+    delegation_id: str, child_id: str, action: str, message: str
+) -> Dict[str, Any]:
+    """Durably reserve one running-child delivery mode.
+
+    The row is the cross-process fence: a retry for the same operation returns
+    its existing receipt, while a different queue/interrupt operation cannot
+    also report acceptance for the same child generation.
+    """
+    delegation_id = str(delegation_id or "").strip()
+    child_id = str(child_id or "").strip()
+    action = str(action or "").strip().lower()
+    message = str(message or "").strip()
+    if not delegation_id or not child_id or action not in {"queue", "interrupt"} or not message:
+        return {"status": "terminal", "reason": "invalid child control"}
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        row = conn.execute(
+            """SELECT state, children_json, child_control_json
+               FROM async_delegations WHERE delegation_id=?""",
+            (delegation_id,),
+        ).fetchone()
+        if row is None or child_id not in _child_manifest_ids(row[1]):
+            return {"status": "terminal", "reason": "child is unavailable"}
+        controls = _decode_child_controls(row[2])
+        current = controls.get(child_id)
+        if current is not None:
+            current_action = str(current.get("action") or "")
+            current_message = str(current.get("message") or "")
+            current_state = str(current.get("state") or "")
+            if current_action == action and current_message == message:
+                receipt = dict(current)
+                receipt.setdefault("status", "pending" if current_state == "running" else current_state)
+                return receipt
+            if current_state in {"accepted", "running", "indeterminate"}:
+                return {
+                    "status": "pending",
+                    "reason": "another child control is already pending",
+                    "generation": current.get("generation"),
+                }
+        if row[0] not in {"running", "finalizing"}:
+            return {"status": "terminal", "reason": "child task is already terminal"}
+        generation = int(current.get("generation") or 0) + 1 if current else 1
+        control = {
+            "action": action,
+            "message": message,
+            "generation": generation,
+            "state": "accepted",
+            "status": "accepted",
+            "accepted_at": now,
+        }
+        controls[child_id] = control
+        cursor = conn.execute(
+            """UPDATE async_delegations SET child_control_json=?, updated_at=?
+               WHERE delegation_id=? AND state IN ('running','finalizing')
+                 AND child_control_json IS ?""",
+            (json.dumps(controls, ensure_ascii=False), now, delegation_id, row[2]),
+        )
+        if cursor.rowcount != 1:
+            # A concurrent process (a separate SQLite connection that already
+            # passed the in-process lock) reserved this child between our read
+            # and write. The mutually-exclusive acceptance belongs to the
+            # winner; we must NOT also report accepted. _DB_LOCK only
+            # serializes threads inside one process, so the CAS on the
+            # previously-read control blob is the cross-process fence.
+            return {
+                "status": "pending",
+                "reason": "another child control is already pending",
+                "generation": generation,
+            }
+        return dict(control)
+
+
+def claim_child_control(
+    delegation_id: str, child_id: str, *, stale_after: float = 300.0
+) -> Optional[Dict[str, Any]]:
+    """Claim an accepted child control exactly once, with restart recovery.
+
+    The delegation row's outcome state does not gate claiming: an accepted
+    control is still pending delivery even after the owner died and recovery
+    classified the row ``unknown``. A ``running`` control claimed by a
+    different process is re-claimed ONLY on a dead-owner signal: recovery
+    flips the delegation row ``unknown`` only after confirming the owning
+    process PID is gone. A live foreign claimer (its own
+    ``_CONTROL_PROCESS_TOKEN``) must not be treated as "restarted", or two
+    live processes would both deliver a turn. Reclaim therefore fails closed
+    unless the recovered-dead ``unknown`` mark is present.
+    """
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        row = conn.execute(
+            "SELECT state, child_control_json FROM async_delegations WHERE delegation_id=?",
+            (delegation_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        controls = _decode_child_controls(row[1])
+        control = controls.get(str(child_id or "").strip())
+        if control is None:
+            return None
+        state = str(control.get("state") or "")
+        if state == "running":
+            if control.get("claimed_by") == _CONTROL_PROCESS_TOKEN:
+                return None
+            # A running control claimed by a DIFFERENT process must only be
+            # reclaimed once its owner is provably dead. recover_abandoned_
+            # delegations flips the delegation row to 'unknown' only after it
+            # confirms the owning process PID is gone. Without that mark a live
+            # foreign process (with its own _CONTROL_PROCESS_TOKEN) would treat
+            # the claimer as "restarted" and both processes would deliver a
+            # turn. Fail closed: do not steal a live foreign claim.
+            if str(row[0] or "") != "unknown":
+                return None
+        elif state != "accepted":
+            return None
+        control = dict(control)
+        control["state"] = "running"
+        control["status"] = "pending"
+        control["claimed_at"] = now
+        control["claimed_by"] = _CONTROL_PROCESS_TOKEN
+        controls[str(child_id).strip()] = control
+        cursor = conn.execute(
+            """UPDATE async_delegations SET child_control_json=?, updated_at=?
+               WHERE delegation_id=? AND child_control_json IS ?""",
+            (
+                json.dumps(controls, ensure_ascii=False),
+                now,
+                delegation_id,
+                row[1],
+            ),
+        )
+        if cursor.rowcount != 1:
+            # A concurrent process (a separate SQLite connection that already
+            # passed the in-process lock) claimed this control between our read
+            # and write. Mutually-exclusive delivery belongs to the winner; the
+            # loser must NOT also start a turn. _DB_LOCK only serializes threads
+            # inside one process, so the CAS on the previously-read blob is the
+            # cross-process fence (same shape as reserve_child_control).
+            return None
+        return control
+
+
+def list_pending_child_controls(*, stale_after: float = 300.0) -> List[tuple]:
+    """Return (delegation_id, child_id) pairs with a deliverable control.
+
+    Restart delivery discovery: after the owner died, recovery classifies
+    the delegation row ``unknown`` but an ``accepted`` control is still
+    pending. A control already claimed --state=``running`` by a live process
+    (this process) is excluded; one claimed by any other (now restarted)
+    process is included so a fresh process can reclaim and deliver it.
+    Exactly-once delivery is guaranteed by ``claim_child_control`` itself,
+    so this scan may run concurrently without double delivery.
+    """
+    out: List[tuple] = []
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(
+            """SELECT delegation_id, child_control_json
+               FROM async_delegations
+               WHERE child_control_json IS NOT NULL
+                 AND lower(child_control_json) != '{}'
+                 AND state != 'dropped'"""
+        ).fetchall()
+        for delegation_id, blob in rows:
+            for child_id, control in _decode_child_controls(blob).items():
+                state = str(control.get("state") or "")
+                if state == "accepted":
+                    out.append((delegation_id, child_id))
+                elif state == "running":
+                    if str(control.get("claimed_by") or "") != _CONTROL_PROCESS_TOKEN:
+                        out.append((delegation_id, child_id))
+    return out
+
+
+def finish_child_control(
+    delegation_id: str,
+    child_id: str,
+    generation: int,
+    *,
+    state: str = "delivered",
+    error: Optional[str] = None,
+) -> bool:
+    """Record the terminal receipt for one claimed replacement turn."""
+    if state not in {"delivered", "indeterminate", "terminal"}:
+        state = "indeterminate"
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        row = conn.execute(
+            "SELECT child_control_json FROM async_delegations WHERE delegation_id=?",
+            (delegation_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        controls = _decode_child_controls(row[0])
+        control = controls.get(str(child_id or "").strip())
+        if control is None or int(control.get("generation") or 0) != int(generation):
+            return False
+        if str(control.get("state") or "") not in {"running", "indeterminate"}:
+            return False
+        if control.get("claimed_by") != _CONTROL_PROCESS_TOKEN:
+            return False
+        control = dict(control)
+        control["state"] = state
+        control["status"] = state
+        control["finished_at"] = now
+        if error:
+            control["error"] = str(error)
+        controls[str(child_id).strip()] = control
+        cursor = conn.execute(
+            """UPDATE async_delegations SET child_control_json=?, updated_at=?
+               WHERE delegation_id=?""",
+            (json.dumps(controls, ensure_ascii=False), now, delegation_id),
+        )
+        return cursor.rowcount == 1
+
+
+def record_dispatched_children(
+    delegation_id: str, children: List[Dict[str, Any]]
+) -> None:
+    """Persist stable child handles captured at async admission."""
+    if not delegation_id:
+        return
+    manifest = [child for child in children if isinstance(child, dict)]
+    child_session_id = (
+        str(manifest[0].get("session_id") or "") if len(manifest) == 1 else None
+    )
+    with _DB_LOCK, _transaction() as conn:
+        conn.execute(
+            """UPDATE async_delegations
+               SET children_json=?, child_session_id=?, owner_profile=?, updated_at=?
+               WHERE delegation_id=?""",
+            (
+                json.dumps(manifest, ensure_ascii=False),
+                child_session_id,
+                _current_owner_profile(),
+                time.time(),
+                delegation_id,
+            ),
+        )
+
+
+def retain_completed_delegation(
+    delegation_id: str, usage: Optional[Dict[str, Any]] = None
+) -> None:
+    """Make a completed async unit's child sessions follow-up addressable."""
+    if not delegation_id:
+        return
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        conn.execute(
+            """UPDATE async_delegations
+               SET retained=1, retained_at=?, usage_json=?, updated_at=?
+               WHERE delegation_id=? AND tombstoned_at IS NULL""",
+            (
+                now,
+                json.dumps(usage, ensure_ascii=False) if usage is not None else None,
+                now,
+                delegation_id,
+            ),
+        )
+    prune_retained_children()
+
+
+def _row_children(row) -> List[Dict[str, Any]]:
+    try:
+        children = json.loads(row[5] or "[]")
+    except (TypeError, ValueError):
+        children = []
+    if not children and row[6]:
+        children = [{"session_id": row[6]}]
+    return [child for child in children if isinstance(child, dict)]
+
+
+def _retained_rows() -> List[Any]:
+    with _DB_LOCK, _transaction() as conn:
+        return conn.execute(
+            """SELECT delegation_id, parent_session_id, owner_profile, state,
+                      retained_at, children_json, child_session_id, completed_at
+               FROM async_delegations
+               WHERE retained=1 AND tombstoned_at IS NULL
+               ORDER BY retained_at DESC"""
+        ).fetchall()
+
+
+def _owner_can_access(entry: Dict[str, Any], requester_session_id: Optional[str]) -> bool:
+    """Require profile equality and a compression-only parent lineage."""
+    owner_profile = str(entry.get("owner_profile") or "")
+    requester_profile = _current_owner_profile()
+    if not owner_profile or not requester_profile or owner_profile != requester_profile:
+        return False
+    child_session_id = str(entry.get("child_session_id") or "")
+    if not requester_session_id or requester_session_id == child_session_id:
+        return False
+    owner_root = _lineage_root(entry.get("parent_session_id"))
+    requester_root = _lineage_root(requester_session_id)
+    return owner_root is not None and owner_root == requester_root
+
+
+def list_retained_children(
+    owner_session_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """List retained children, optionally restricted to one proven owner."""
+    prune_retained_children()
+    out: List[Dict[str, Any]] = []
+    for row in _retained_rows():
+        children = _row_children(row)
+        for child in children:
+            entry = {
+                "delegation_id": row[0],
+                "parent_session_id": row[1],
+                "owner_profile": row[2] or "",
+                "state": row[3],
+                "retained_at": row[4],
+                "completed_at": row[7],
+                "child_id": child.get("subagent_id") or child.get("session_id") or "",
+                "child_session_id": child.get("session_id") or "",
+                "model": child.get("model"),
+                "provider": child.get("provider"),
+                "base_url": child.get("base_url"),
+                "api_mode": child.get("api_mode"),
+                "role": child.get("role"),
+                "goal": child.get("goal"),
+            }
+            if owner_session_id is None or _owner_can_access(entry, owner_session_id):
+                out.append(entry)
+    return out
+
+
+def find_retained_child(
+    child_id: str, owner_session_id: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
+    """Resolve a handle without revealing a foreign retained record."""
+    if not isinstance(child_id, str) or not child_id.strip():
+        return None
+    needle = child_id.strip()
+    for entry in list_retained_children():
+        if needle not in {
+            entry.get("child_id"),
+            entry.get("child_session_id"),
+            entry.get("delegation_id"),
+        }:
+            continue
+        if owner_session_id is not None and not _owner_can_access(entry, owner_session_id):
+            return None
+        return entry
+    return None
+
+
+def check_follow_up_authority(
+    entry: Dict[str, Any], requester_session_id: Optional[str]
+) -> Optional[str]:
+    if _owner_can_access(entry, requester_session_id):
+        return None
+    return _FOLLOW_UP_UNAVAILABLE
+
+
+def claim_retained_child(entry: Dict[str, Any]) -> Optional[str]:
+    """CAS-claim one follow-up so concurrent callers cannot fork history."""
+    claim = uuid.uuid4().hex
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        current = now - 300.0
+        cursor = conn.execute(
+            """UPDATE async_delegations
+               SET resume_claim=?, resume_claimed_at=?
+               WHERE delegation_id=? AND retained=1 AND tombstoned_at IS NULL
+                 AND (resume_claim IS NULL OR resume_claimed_at < ?)""",
+            (claim, now, entry.get("delegation_id"), current),
+        )
+        return claim if cursor.rowcount == 1 else None
+
+
+def release_retained_child(entry: Dict[str, Any], claim: str) -> None:
+    if not claim:
+        return
+    with _DB_LOCK, _transaction() as conn:
+        conn.execute(
+            """UPDATE async_delegations SET resume_claim=NULL, resume_claimed_at=NULL
+               WHERE delegation_id=? AND resume_claim=?""",
+            (entry.get("delegation_id"), claim),
+        )
+
+
+def tombstone_retained_child(
+    child_id: str, owner_session_id: Optional[str] = None
+) -> bool:
+    entry = find_retained_child(child_id, owner_session_id=owner_session_id)
+    if entry is None:
+        return False
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        cursor = conn.execute(
+            """UPDATE async_delegations SET tombstoned_at=?, updated_at=?
+               WHERE delegation_id=? AND retained=1 AND tombstoned_at IS NULL""",
+            (now, now, entry["delegation_id"]),
+        )
+    return cursor.rowcount == 1
+
+
+def prune_retained_children(
+    max_retained: Optional[int] = None, ttl_hours: Optional[float] = None
+) -> int:
+    """Tombstone expired/excess records without deleting transcripts."""
+    configured_max, configured_ttl = _retention_limits()
+    max_retained = configured_max if max_retained is None else max(1, int(max_retained))
+    ttl_hours = configured_ttl if ttl_hours is None else max(0.0, float(ttl_hours))
+    now = time.time()
+    cutoff = now - ttl_hours * 3600.0
+    pruned = 0
+    with _DB_LOCK, _transaction() as conn:
+        cursor = conn.execute(
+            """UPDATE async_delegations SET tombstoned_at=?, updated_at=?
+               WHERE retained=1 AND tombstoned_at IS NULL AND retained_at < ?""",
+            (now, now, cutoff),
+        )
+        pruned += cursor.rowcount
+        rows = conn.execute(
+            """SELECT delegation_id FROM async_delegations
+               WHERE retained=1 AND tombstoned_at IS NULL
+               ORDER BY retained_at DESC"""
+        ).fetchall()
+        for row in rows[max_retained:]:
+            cursor = conn.execute(
+                """UPDATE async_delegations SET tombstoned_at=?, updated_at=?
+                   WHERE delegation_id=? AND tombstoned_at IS NULL""",
+                (now, now, row[0]),
+            )
+            pruned += cursor.rowcount
+    return pruned
+
+
+def rehydrate_retained_children() -> int:
+    prune_retained_children()
+    return len(_retained_rows())
+
 
 
 def _reset_for_tests() -> None:

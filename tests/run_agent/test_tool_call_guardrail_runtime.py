@@ -6,6 +6,8 @@ import uuid
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from run_agent import AIAgent
 
 
@@ -235,6 +237,91 @@ def test_concurrent_missing_result_breaks_no_progress_observation_streak():
     with patch(
         "run_agent.handle_function_call", return_value=json.dumps({"error": "boom"})
     ) as dispatch:
+        agent._execute_tool_calls_sequential(real, [], "task-1")
+
+    dispatch.assert_called_once()
+    assert agent._tool_guardrail_halt_decision is None
+
+
+@pytest.mark.parametrize("separator", ["plugin-block", "malformed-arguments"])
+def test_sequential_synthetic_result_breaks_no_progress_observation_streak(separator):
+    agent = _make_agent("web_search")
+    args = {"query": "same"}
+    calls = [
+        _mock_tool_call(
+            "web_search",
+            "not-json" if separator == "malformed-arguments" and index == 4 else json.dumps(args),
+            f"c-{index}",
+        )
+        for index in range(10)
+    ]
+    messages = []
+    plugin_call_count = 0
+
+    def block_fifth_call(*_args, **_kwargs):
+        nonlocal plugin_call_count
+        plugin_call_count += 1
+        if separator == "plugin-block" and plugin_call_count == 5:
+            return "plugin policy"
+        return None
+
+    with (
+        patch(
+            "hermes_cli.plugins.resolve_pre_tool_block",
+            side_effect=block_fifth_call,
+        ),
+        patch(
+            "run_agent.handle_function_call",
+            return_value=json.dumps({"error": "boom"}),
+        ) as dispatch,
+    ):
+        agent._execute_tool_calls_sequential(
+            SimpleNamespace(content="", tool_calls=calls), messages, "task-1"
+        )
+
+    assert "no_progress_loop" not in messages[5]["content"]
+    assert dispatch.call_count == 9
+    assert "no_progress_loop" in messages[9]["content"]
+    assert agent._tool_guardrail_halt_decision.code == "no_progress_loop"
+    assert agent._tool_guardrail_halt_decision.count == 5
+
+
+def test_sequential_timeout_breaks_no_progress_observation_streak():
+    agent = _make_agent("web_search")
+    args = {"query": "same"}
+    timeout_result = "Error executing tool 'web_search': timed out after 0.1s"
+    for _ in range(4):
+        agent._tool_guardrails.after_call(
+            "web_search", args, timeout_result, failed=True
+        )
+
+    release = threading.Event()
+    timed_out = SimpleNamespace(
+        content="",
+        tool_calls=[_mock_tool_call("web_search", json.dumps(args), "c-timeout")],
+    )
+    try:
+        with (
+            patch(
+                "agent.tool_executor._resolve_sequential_tool_timeout",
+                return_value=0.05,
+            ),
+            patch(
+                "run_agent.handle_function_call",
+                side_effect=lambda *_args, **_kwargs: release.wait(timeout=1) or "late",
+            ),
+        ):
+            agent._execute_tool_calls_sequential(timed_out, [], "task-1")
+    finally:
+        release.set()
+
+    assert agent._tool_guardrail_halt_decision is None
+
+    real = SimpleNamespace(
+        content="",
+        tool_calls=[_mock_tool_call("web_search", json.dumps(args), "c-real")],
+    )
+    with patch("run_agent.handle_function_call", return_value=timeout_result) as dispatch:
         agent._execute_tool_calls_sequential(real, [], "task-1")
 
     dispatch.assert_called_once()

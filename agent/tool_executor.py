@@ -393,6 +393,27 @@ class _ToolTimeoutResult(str):
     """Marker for a synthesized sequential-tool timeout result."""
 
 
+def _record_guardrail_result(
+    agent,
+    function_name: str,
+    function_args: dict,
+    function_result: Any,
+    *,
+    failed: bool,
+    synthetic: bool,
+) -> Any:
+    """Record one real observation, or break the streak for a synthetic result."""
+    if synthetic or not isinstance(function_result, str):
+        agent._tool_guardrails.break_observation_streak()
+        return function_result
+    return agent._append_guardrail_observation(
+        function_name,
+        function_args,
+        function_result,
+        failed=failed,
+    )
+
+
 class _ConcurrentToolAuthorizationGate:
     """Serialize policy prompts and exclude human approval waits from batch deadlines.
 
@@ -1611,14 +1632,17 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         r = results[i]
         blocked = False
         is_error = True
+        function_name = name
+        function_args = args
         progress_function_name = name
+        synthetic_result = False
         # A worker can finish and write results[i] in the window between the
         # deadline snapshot (timed_out_indices, taken from not_done) and this
         # loop. Prefer that real result over a fabricated timeout message — the
         # tool genuinely succeeded, just slightly late.
         effect_disposition = None
         if i in timed_out_indices and r is None:
-            agent._tool_guardrails.break_observation_streak()
+            synthetic_result = True
             suffix = f"{timeout_s:.1f}s" if timeout_s is not None else "the configured timeout"
             function_result = f"Error executing tool '{name}': timed out after {suffix}"
             effect_disposition = "unknown"
@@ -1637,7 +1661,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             )
             tool_duration = float(timeout_s or 0.0)
         elif r is None:
-            agent._tool_guardrails.break_observation_streak()
+            synthetic_result = True
             # Tool was cancelled (interrupt) or thread didn't return
             if agent._interrupt_requested:
                 function_result = f"[Tool execution cancelled — {name} was skipped due to user interrupt]"
@@ -1688,17 +1712,17 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 )
             if blocked:
                 effect_disposition = "none"
+                synthetic_result = True
 
-            if not blocked:
-                function_result = agent._append_guardrail_observation(
-                    function_name,
-                    function_args,
-                    function_result,
-                    failed=is_error,
-                )
-            else:
-                agent._tool_guardrails.break_observation_streak()
-
+        function_result = _record_guardrail_result(
+            agent,
+            function_name,
+            function_args,
+            function_result,
+            failed=is_error,
+            synthetic=synthetic_result,
+        )
+        if r is not None:
             if is_error:
                 _err_text = _multimodal_text_summary(function_result)
                 result_preview = _err_text[:200] if len(_err_text) > 200 else _err_text
@@ -1919,6 +1943,14 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             tool_call.function.arguments
         )
         if malformed_args_result is not None:
+            malformed_args_result = _record_guardrail_result(
+                agent,
+                function_name,
+                function_args,
+                malformed_args_result,
+                failed=True,
+                synthetic=True,
+            )
             _emit_terminal_post_tool_call(
                 agent,
                 function_name=function_name,
@@ -2474,7 +2506,6 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             # Multimodal dict result (_multimodal=True) — not sliceable as string
             result_preview = function_result
             _result_len = len(str(function_result))
-            agent._tool_guardrails.break_observation_streak()
 
         # Log tool errors to the persistent error log so [error] tags
         # in the UI always have a corresponding detailed entry on disk.
@@ -2501,13 +2532,15 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 duration_ms=int(tool_duration * 1000),
                 middleware_trace=list(middleware_trace),
             )
-        if not _execution_blocked:
-            function_result = agent._append_guardrail_observation(
-                function_name,
-                function_args,
-                function_result,
-                failed=_is_error_result,
-            )
+        function_result = _record_guardrail_result(
+            agent,
+            function_name,
+            function_args,
+            function_result,
+            failed=_is_error_result,
+            synthetic=_execution_blocked or _execution_timed_out,
+        )
+        if isinstance(function_result, str):
             result_preview = function_result if agent.verbose_logging else (
                 function_result[:200] if len(function_result) > 200 else function_result
             )

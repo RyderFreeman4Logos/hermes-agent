@@ -53,6 +53,124 @@ def test_cache_info_distinguishes_reported_zero_from_omitted_telemetry():
     }
 
 
+def test_cache_info_and_live_status_preserve_positive_subpercent_hits(monkeypatch):
+    usage = {
+        "prompt_tokens": 2_000,
+        "cache_read_tokens": 1,
+        "cache_write_tokens": 0,
+        "cache_telemetry_present": True,
+    }
+    cache_info = server._cache_info_from_usage(usage)
+
+    assert cache_info == {
+        "level": "error",
+        "pct": 0,
+        "percent_label": "<1%",
+        "prompt_tokens": 2_000,
+        "read_tokens": 1,
+        "state": "hit",
+    }
+
+    emitted = []
+    agent = types.SimpleNamespace(_first_turn_usage=usage)
+    monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+    server._attach_tui_cache_callback(agent, "sid")
+
+    agent._tui_cache_callback("hit", 0, 1, 2_000)
+
+    assert emitted == [
+        ("status.update", "sid", {"kind": "error", "text": "cache <1%"})
+    ]
+
+
+@pytest.mark.parametrize(
+    ("partial", "expected_text", "expected_partial"),
+    [
+        ("", "Error: provider exploded", False),
+        ("partial answer", "partial answer", True),
+    ],
+)
+def test_terminal_turn_error_consumes_cache_backstop_once(
+    monkeypatch, partial, expected_text, expected_partial
+):
+    agent = types.SimpleNamespace(
+        _first_turn_usage={
+            "prompt_tokens": 2_000,
+            "cache_read_tokens": 1,
+            "cache_write_tokens": 0,
+            "cache_telemetry_present": True,
+        }
+    )
+    session = _session(agent=agent)
+    server._start_inflight_turn(session, "question")
+    if partial:
+        server._append_inflight_delta(session, partial)
+    emitted = []
+    monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+    monkeypatch.setattr(server, "_retire_turn_marker", lambda *_args: None)
+    monkeypatch.setattr(server, "render_message", lambda *_args: "")
+
+    server._emit_terminal_turn_error(
+        "sid", session, RuntimeError("provider exploded")
+    )
+    server._emit_terminal_turn_error(
+        "sid", session, RuntimeError("provider exploded")
+    )
+
+    first_payload = emitted[0][2]
+    assert first_payload["text"] == expected_text
+    assert first_payload.get("partial", False) is expected_partial
+    assert first_payload["cache_info"] == {
+        "level": "error",
+        "pct": 0,
+        "percent_label": "<1%",
+        "prompt_tokens": 2_000,
+        "read_tokens": 1,
+        "state": "hit",
+    }
+    assert "cache_info" not in emitted[1][2]
+    assert agent._first_turn_usage is None
+
+
+def test_terminal_turn_error_preserves_cache_backstop_until_emit_succeeds(
+    monkeypatch,
+):
+    usage = {
+        "prompt_tokens": 2_000,
+        "cache_read_tokens": 1,
+        "cache_write_tokens": 0,
+        "cache_telemetry_present": True,
+    }
+    agent = types.SimpleNamespace(_first_turn_usage=usage)
+    session = _session(agent=agent)
+    server._start_inflight_turn(session, "question")
+    emitted = []
+
+    def flaky_emit(*args):
+        if not emitted:
+            emitted.append(None)
+            raise RuntimeError("transport unavailable")
+        emitted.append(args)
+
+    monkeypatch.setattr(server, "_emit", flaky_emit)
+    monkeypatch.setattr(server, "_retire_turn_marker", lambda *_args: None)
+    monkeypatch.setattr(server, "render_message", lambda *_args: "")
+
+    with pytest.raises(RuntimeError, match="transport unavailable"):
+        server._emit_terminal_turn_error(
+            "sid", session, RuntimeError("provider exploded")
+        )
+
+    assert agent._first_turn_usage is usage
+
+    server._emit_terminal_turn_error(
+        "sid", session, RuntimeError("provider exploded")
+    )
+
+    assert emitted[1][2]["cache_info"]["percent_label"] == "<1%"
+    assert agent._first_turn_usage is None
+
+
 def _dispatch_sync(req: dict, transport=None) -> dict | None:
     """Run one RPC to completion synchronously, regardless of pool routing.
 
@@ -5942,6 +6060,56 @@ class _RecordingAgent:
     def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
         self._turns.append(prompt)
         return {"final_response": "", "messages": []}
+
+
+@pytest.mark.parametrize("outcome", ["complete", "returned-error", "raised-error"])
+def test_run_prompt_submit_terminal_paths_consume_cache_backstop_once(
+    monkeypatch, tmp_path, outcome
+):
+    class _TerminalAgent(_RecordingAgent):
+        def run_conversation(self, prompt, **kwargs):
+            self._first_turn_usage = {
+                "prompt_tokens": 2_000,
+                "cache_read_tokens": 1,
+                "cache_write_tokens": 0,
+                "cache_telemetry_present": True,
+            }
+            if outcome == "raised-error":
+                raise RuntimeError("raised provider error")
+            if outcome == "returned-error":
+                return {
+                    "error": "returned provider error",
+                    "failed": True,
+                    "final_response": "",
+                    "messages": [],
+                }
+            return {
+                "final_response": "done",
+                "messages": [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": "done"},
+                ],
+            }
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    emitted = []
+    monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+    agent = _TerminalAgent([])
+    session = _session(agent=agent, running=True, profile_home=str(tmp_path))
+    server._sessions["sid-terminal"] = session
+    try:
+        server._run_prompt_submit(
+            "rid-terminal", "sid-terminal", session, "question"
+        )
+    finally:
+        server._sessions.pop("sid-terminal", None)
+
+    completion_payloads = [
+        args[2] for args in emitted if args[0] == "message.complete"
+    ]
+    assert len(completion_payloads) == 1
+    assert completion_payloads[0]["cache_info"]["percent_label"] == "<1%"
+    assert agent._first_turn_usage is None
 
 
 @pytest.mark.parametrize("exit_code", [0, 7])

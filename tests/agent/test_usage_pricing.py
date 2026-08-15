@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+from agent import usage_pricing
 from agent.usage_pricing import (
     CanonicalUsage,
     format_cost_label,
@@ -9,6 +10,13 @@ from agent.usage_pricing import (
     resolve_billing_route,
 )
 from decimal import Decimal
+
+
+def test_cache_hit_percent_label_preserves_positive_subpercent_hits():
+    assert usage_pricing.cache_hit_percent_label(1, 2_000) == "<1%"
+    assert usage_pricing.cache_hit_percent_label(9, 1_000) == "<1%"
+    assert usage_pricing.cache_hit_percent_label(0, 2_000) == "0%"
+    assert usage_pricing.cache_hit_percent_label(1_880, 2_000) == "94%"
 
 
 def test_normalize_usage_distinguishes_reported_zero_from_omitted_cache_fields():

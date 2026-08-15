@@ -1203,7 +1203,15 @@ def _preflight_codex_api_kwargs(
         except Exception:
             pass  # Best-effort — the caller-level sanitization should have handled it
 
-    unexpected = sorted(key for key in api_kwargs if key not in allowed_keys)
+    # Internal physical-attempt diagnostics share the request envelope until
+    # the stream boundary consumes them. They are neither unsupported user
+    # fields nor wire fields, so ignore them during preflight without adding
+    # them to the allowlist/normalized request.
+    unexpected = sorted(
+        key
+        for key in api_kwargs
+        if key not in allowed_keys and not str(key).startswith("_hermes_")
+    )
     if unexpected:
         raise ValueError(
             f"Codex Responses request has unsupported field(s): {', '.join(unexpected)}."

@@ -702,6 +702,11 @@ def finalize_turn(
         ).get("service_tier"),
         "session_id": agent.session_id,
     }
+    from agent.cache_attribution import consume_turn_cache_info
+
+    cache_info = consume_turn_cache_info(agent)
+    if cache_info is not None:
+        result["cache_info"] = cache_info
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     # Persistence failures already set failed=True + an explanation in
@@ -806,6 +811,13 @@ def finalize_turn(
     except Exception as exc:
         logger.warning("on_session_end hook failed: %s", exc)
 
+    if (
+        getattr(agent, "_turn_received_provider_response", False) is True
+        and getattr(agent, "_last_turn_usage", None) is None
+    ):
+        from agent.cache_attribution import clear_post_compression_cache_pending
+
+        clear_post_compression_cache_pending(agent)
     agent._turn_preflight_display_snapshot = None
     agent._turn_received_provider_response = False
 

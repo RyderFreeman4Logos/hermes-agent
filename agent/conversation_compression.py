@@ -3432,6 +3432,9 @@ def compress_context(
                     from agent.context_compressor import (
                         PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY,
                     )
+                    from agent.cache_attribution import (
+                        POST_COMPRESSION_CACHE_PENDING_KEY,
+                    )
 
                     agent._session_db.archive_and_compact(
                         agent.session_id,
@@ -3441,6 +3444,7 @@ def compress_context(
                         system_prompt=new_system_prompt,
                         model_config_patch={
                             PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None,
+                            POST_COMPRESSION_CACHE_PENDING_KEY: True,
                         },
                         compression_lock_holder=_lock_holder,
                         require_compression_lease=_lock_holder is not None,
@@ -3482,6 +3486,13 @@ def compress_context(
                         f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_"
                         f"{uuid.uuid4().hex[:6]}"
                     )
+                    from agent.cache_attribution import (
+                        POST_COMPRESSION_CACHE_PENDING_KEY,
+                    )
+
+                    # Keep PRU-05's one-snapshot route/prompt publication while
+                    # carrying PRU-11's cache-attribution marker into the child.
+                    published_config[POST_COMPRESSION_CACHE_PENDING_KEY] = True
                     agent._session_db.publish_compression_child(
                         parent_session_id=old_session_id,
                         child_session_id=new_session_id,
@@ -3683,6 +3694,8 @@ def compress_context(
             bool(_old_sid) or compacted_in_place
         )
         _boundary_parent = _old_sid or agent.session_id or ""
+        if _context_engine_boundary_committed:
+            agent._awaiting_cache_usage_after_compression = True
 
         # Round-2 #4: the activity heartbeat's terminal "context compression
         # completed" stamp landed on the PARENT row (force-persisted before

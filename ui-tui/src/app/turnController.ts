@@ -5,7 +5,7 @@ import {
   STREAM_SCROLL_BATCH_MS,
   STREAM_TYPING_BATCH_MS
 } from '../config/timing.js'
-import type { SessionInterruptResponse, SubagentEventPayload } from '../gatewayTypes.js'
+import type { CacheInfo, SessionInterruptResponse, SubagentEventPayload } from '../gatewayTypes.js'
 import { appendToolShelfMessage, isToolShelfMessage } from '../lib/liveProgress.js'
 import { hasReasoningTag, splitReasoning } from '../lib/reasoning.js'
 import {
@@ -28,17 +28,6 @@ import { getUiState, patchUiState } from './uiStore.js'
 const INTERRUPT_COOLDOWN_MS = 1500
 const ACTIVITY_LIMIT = 8
 const TRAIL_LIMIT = 8
-
-type CacheInfo = {
-  attribution?: 'post_compression'
-  level: 'error' | 'info'
-  note?: string
-  pct: number
-  percent_label?: string
-  prompt_tokens: number
-  read_tokens: number
-  state: 'cold_write' | 'hit' | 'miss' | 'unavailable' | 'unknown'
-}
 
 const cacheFootnote = (cacheInfo?: CacheInfo): Msg | null => {
   if (!cacheInfo) {

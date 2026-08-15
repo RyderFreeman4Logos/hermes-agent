@@ -17,10 +17,13 @@ suite (we patch ``run_agent.OpenAI`` and drive ``agent.client``), so they
 pass identically in CI and locally.
 """
 
+import logging
 import os
 import uuid
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from run_agent import AIAgent
 
@@ -379,6 +382,60 @@ def test_run_conversation_empty_exhausted_surfaces_explanation():
     assert result["final_response"] != "(empty)"
     assert result["final_response"].strip() != ""
     assert "No reply:" in result["final_response"]
+
+
+@pytest.mark.parametrize(
+    ("cache_details", "expected_state", "expected_suffix"),
+    [
+        (
+            SimpleNamespace(cached_tokens=128, cache_write_tokens=0),
+            "hit",
+            "cache=128/2000 (6%) cache_state=hit "
+            "cache_read=128 cache_write=0 cache_prompt=2000",
+        ),
+        (
+            SimpleNamespace(cached_tokens=0, cache_write_tokens=0),
+            "miss",
+            "cache_state=miss cache_read=0 cache_write=0 cache_prompt=2000",
+        ),
+        (
+            SimpleNamespace(cached_tokens=0, cache_write_tokens=2_000),
+            "cold_write",
+            "cache_state=cold_write cache_read=0 cache_write=2000 cache_prompt=2000",
+        ),
+        (None, "no_field", "cache_state=no_field cache_prompt=2000"),
+    ],
+)
+def test_api_call_cache_log_preserves_canonical_states_and_scalars(
+    caplog, cache_details, expected_state, expected_suffix
+):
+    agent = _make_agent()
+    response = _mock_response(content="done")
+    response.usage = SimpleNamespace(
+        prompt_tokens=2_000,
+        completion_tokens=10,
+        total_tokens=2_010,
+        prompt_tokens_details=cache_details,
+    )
+    agent.client.chat.completions.create.return_value = response
+
+    with (
+        caplog.at_level(logging.INFO, logger="agent.conversation_loop"),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("private request")
+
+    cache_log = next(
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "agent.conversation_loop" and "API call #" in record.getMessage()
+    )
+    assert cache_log.endswith(expected_suffix)
+    assert "private request" not in cache_log
+    assert result["cache_info"]["state"] == expected_state
+    assert agent._first_turn_cache_info is None
 
 
 def test_run_conversation_partial_stream_recovery_surfaces_explanation():

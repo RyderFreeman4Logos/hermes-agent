@@ -124,6 +124,9 @@ def _record_codex_app_server_usage(
 
     usage = getattr(turn, "token_usage_last", None)
     if not isinstance(usage, dict) or not usage:
+        from agent.cache_attribution import clear_post_compression_cache_pending
+
+        clear_post_compression_cache_pending(agent)
         compressor = getattr(agent, "context_compressor", None)
         if (
             compressor is not None
@@ -193,6 +196,16 @@ def _record_codex_app_server_usage(
     compressor = getattr(agent, "context_compressor", None)
     if compressor is not None:
         try:
+            from agent.cache_attribution import (
+                cache_telemetry_present,
+                record_first_turn_cache_info,
+            )
+
+            record_first_turn_cache_info(
+                agent,
+                usage_dict,
+                telemetry_present=cache_telemetry_present(usage),
+            )
             compressor.update_from_response(usage_dict)
             context_window = getattr(turn, "model_context_window", None)
             if isinstance(context_window, int) and context_window > 0:
@@ -324,6 +337,10 @@ def _record_codex_app_server_compaction(
             compressor.last_completion_tokens = 0
             if hasattr(compressor, "awaiting_real_usage_after_compression"):
                 compressor.awaiting_real_usage_after_compression = True
+
+    from agent.cache_attribution import set_post_compression_cache_pending
+
+    set_post_compression_cache_pending(agent, True)
 
     agent._last_compaction_in_place = False
     try:

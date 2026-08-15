@@ -28,6 +28,9 @@ import json
 import logging
 import os
 import threading
+import time
+from collections.abc import Iterator
+from collections import deque
 from typing import Any, Callable, Optional, Protocol, runtime_checkable
 
 # Errno values that mean "the peer is gone" rather than "the host has a
@@ -43,6 +46,14 @@ _PEER_GONE_ERRNOS = frozenset({
 } - {-1})
 
 logger = logging.getLogger(__name__)
+
+
+def _is_peer_gone(exc: BaseException) -> bool:
+    if isinstance(exc, BrokenPipeError):
+        return True
+    if isinstance(exc, ValueError):
+        return not isinstance(exc, UnicodeEncodeError) and "closed file" in str(exc)
+    return isinstance(exc, OSError) and exc.errno in _PEER_GONE_ERRNOS
 
 # Optional knob: when true, StdioTransport does not call ``stream.flush``
 # after writing.  Use this on environments where a half-closed pipe (TUI
@@ -181,6 +192,357 @@ class StdioTransport:
 
     def close(self) -> None:
         return None
+
+
+_STREAMING_EVENT_TYPES = frozenset({
+    "message.delta",
+    "reasoning.delta",
+    "thinking.delta",
+})
+# The queue owns at most this many serialized UTF-8 bytes, including the frame
+# currently blocked in the physical sink. Controls and streamed deltas share it.
+_STREAM_PENDING_BYTES_MAX = 8 * 1024 * 1024
+_STREAM_CONTROL_PUSH_TIMEOUT_S = 0.1
+
+
+class ControlQueueTimeoutError(TimeoutError):
+    """A canonical frame could not enter the bounded writer before its deadline."""
+
+
+class BufferedStreamWriter:
+    """Serialize stdio writes behind bounded, lossless reasoning backpressure."""
+
+    def __init__(
+        self,
+        inner: Transport,
+        *,
+        queue_maxsize: int = 256,
+        max_pending_deltas: int = 512,
+        max_pending_bytes: int = _STREAM_PENDING_BYTES_MAX,
+        control_push_timeout_s: float = _STREAM_CONTROL_PUSH_TIMEOUT_S,
+        coalesce_s: float = 0.033,
+        close_timeout_s: float = 1.0,
+    ) -> None:
+        if queue_maxsize < 1 or max_pending_deltas < 1 or max_pending_bytes < 1:
+            raise ValueError("stdio writer bounds must be positive")
+        self._inner = inner
+        self._pending: deque[tuple[dict, int]] = deque()
+        self._pending_lock = threading.Condition()
+        self._control_lock = threading.Lock()
+        self._queued_controls = 0
+        self._queued_deltas = 0
+        self._control_waiting = False
+        self._pending_bytes = 0
+        self._closed = False
+        self._closed_event = threading.Event()
+        self._first_write_done = threading.Event()
+        self._first_write_succeeded = False
+        self._failure: BaseException | None = None
+        self._max_pending_controls = queue_maxsize
+        self._max_pending_deltas = max_pending_deltas
+        self._max_pending_bytes = max_pending_bytes
+        self._control_push_timeout_s = max(0.0, control_push_timeout_s)
+        self._coalesce_s = max(0.0, coalesce_s)
+        self._close_timeout_s = max(0.0, close_timeout_s)
+        self._thread = threading.Thread(
+            target=self._drain, name="tui-stdio-writer", daemon=True
+        )
+        self._thread.start()
+
+    @staticmethod
+    def _is_streaming_frame(obj: dict) -> bool:
+        params = obj.get("params") if isinstance(obj, dict) else None
+        return isinstance(params, dict) and params.get("type") in _STREAMING_EVENT_TYPES
+
+    @staticmethod
+    def _is_droppable_frame(obj: dict) -> bool:
+        params = obj.get("params") if isinstance(obj, dict) else None
+        return isinstance(params, dict) and params.get("type") == "message.delta"
+
+    @staticmethod
+    def _frame_bytes(obj: dict) -> int:
+        line = json.dumps(obj, ensure_ascii=False) + "\n"
+        return len(line.encode("utf-8", errors="surrogatepass"))
+
+    def _bounded_streaming_frames(
+        self, obj: dict
+    ) -> Iterator[tuple[dict, int]]:
+        """Split an oversized reasoning delta without dropping UTF-8 text."""
+        stack = [obj]
+        while stack:
+            frame = stack.pop()
+            frame_bytes = self._frame_bytes(frame)
+            if frame_bytes <= self._max_pending_bytes:
+                yield frame, frame_bytes
+                continue
+
+            params = frame.get("params") if isinstance(frame, dict) else None
+            payload = params.get("payload") if isinstance(params, dict) else None
+            if not isinstance(params, dict) or not isinstance(payload, dict):
+                raise ValueError("stream frame has no splittable text payload")
+            text = str(payload.get("text") or "")
+            if len(text) < 2:
+                raise ValueError(
+                    "stream frame metadata exceeds the pending-byte limit"
+                )
+            middle = len(text) // 2
+            for part in (text[middle:], text[:middle]):
+                split = dict(frame)
+                split_params = dict(params)
+                split_payload = dict(payload)
+                split_payload["text"] = part
+                split_params["payload"] = split_payload
+                split["params"] = split_params
+                stack.append(split)
+
+    @property
+    def pending_bytes(self) -> int:
+        with self._pending_lock:
+            return self._pending_bytes
+
+    @property
+    def failure(self) -> BaseException | None:
+        with self._pending_lock:
+            return self._failure
+
+    def wait_closed(self, timeout: float | None = None) -> bool:
+        return self._closed_event.wait(timeout)
+
+    def wait_for_first_write(self, timeout: float | None = None) -> bool:
+        timeout = self._control_push_timeout_s if timeout is None else max(0.0, timeout)
+        if self._first_write_done.wait(timeout):
+            with self._pending_lock:
+                return self._first_write_succeeded
+
+        failure = ControlQueueTimeoutError(
+            f"initial control frame was not written within {timeout:.3f}s"
+        )
+        with self._pending_lock:
+            if self._first_write_done.is_set():
+                return self._first_write_succeeded
+            if self._failure is None:
+                self._failure = failure
+            self._closed = True
+            self._first_write_done.set()
+            self._pending_lock.notify_all()
+        self._closed_event.set()
+        logger.warning("stdio stream writer wedged: %s", failure)
+        return False
+
+    def raise_if_failed(self) -> None:
+        failure = self.failure
+        if (
+            failure is not None
+            and not isinstance(failure, ControlQueueTimeoutError)
+            and not _is_peer_gone(failure)
+        ):
+            raise failure
+
+    def _discard_queued_locked(self) -> None:
+        discarded = sum(frame_bytes for _frame, frame_bytes in self._pending)
+        self._pending.clear()
+        self._queued_controls = 0
+        self._queued_deltas = 0
+        self._pending_bytes = max(0, self._pending_bytes - discarded)
+
+    def _latch_closed(
+        self,
+        failure: BaseException | None = None,
+        *,
+        discarded_bytes: int = 0,
+    ) -> None:
+        with self._pending_lock:
+            if failure is not None and self._failure is None:
+                self._failure = failure
+            if failure is not None:
+                self._discard_queued_locked()
+            if discarded_bytes:
+                self._pending_bytes = max(
+                    0, self._pending_bytes - discarded_bytes
+                )
+            self._closed = True
+            if not self._first_write_done.is_set():
+                self._first_write_done.set()
+            self._pending_lock.notify_all()
+        self._closed_event.set()
+
+    def _expire_control_push(self, reason: str) -> bool:
+        timeout = ControlQueueTimeoutError(
+            f"{reason} after {self._control_push_timeout_s:.3f}s"
+        )
+        self._latch_closed(timeout)
+        if self.failure is timeout:
+            logger.warning("stdio stream writer wedged: %s", timeout)
+        self.raise_if_failed()
+        return False
+
+    def _drop_oldest_message_delta_locked(self) -> bool:
+        for index, (frame, frame_bytes) in enumerate(self._pending):
+            if self._is_droppable_frame(frame):
+                del self._pending[index]
+                self._queued_deltas -= 1
+                self._pending_bytes -= frame_bytes
+                return True
+        return False
+
+    def _stream_has_capacity_locked(self, frame_bytes: int) -> bool:
+        return (
+            self._queued_deltas < self._max_pending_deltas
+            and self._pending_bytes + frame_bytes <= self._max_pending_bytes
+        )
+
+    def _write_streaming_frame(self, obj: dict, frame_bytes: int) -> bool:
+        droppable = self._is_droppable_frame(obj)
+        with self._pending_lock:
+            while not self._closed:
+                if self._control_waiting:
+                    if droppable:
+                        return True
+                    self._pending_lock.wait()
+                    continue
+                while (
+                    not self._stream_has_capacity_locked(frame_bytes)
+                    and self._drop_oldest_message_delta_locked()
+                ):
+                    pass
+                if self._stream_has_capacity_locked(frame_bytes):
+                    was_empty = not self._pending
+                    self._pending.append((obj, frame_bytes))
+                    self._queued_deltas += 1
+                    self._pending_bytes += frame_bytes
+                    if was_empty:
+                        self._pending_lock.notify()
+                    return True
+                if droppable:
+                    return True
+                self._pending_lock.wait()
+        self.raise_if_failed()
+        return False
+
+    def _write_control(self, obj: dict, frame_bytes: int) -> bool:
+        if frame_bytes > self._max_pending_bytes:
+            failure = ValueError(
+                "control frame exceeds the stdio pending-byte limit"
+            )
+            self._latch_closed(failure)
+            raise failure
+
+        deadline = time.monotonic() + self._control_push_timeout_s
+        if not self._control_lock.acquire(timeout=self._control_push_timeout_s):
+            return self._expire_control_push("control queue lock timed out")
+        try:
+            with self._pending_lock:
+                self._control_waiting = True
+                self._pending_lock.notify_all()
+                while not self._closed:
+                    while (
+                        self._pending_bytes + frame_bytes > self._max_pending_bytes
+                        and self._drop_oldest_message_delta_locked()
+                    ):
+                        pass
+                    if (
+                        self._queued_controls < self._max_pending_controls
+                        and self._pending_bytes + frame_bytes
+                        <= self._max_pending_bytes
+                    ):
+                        self._pending.append((obj, frame_bytes))
+                        self._queued_controls += 1
+                        self._pending_bytes += frame_bytes
+                        self._control_waiting = False
+                        self._pending_lock.notify_all()
+                        return True
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    self._pending_lock.wait(remaining)
+                closed = self._closed
+                self._control_waiting = False
+                self._pending_lock.notify_all()
+            if closed:
+                self.raise_if_failed()
+                return False
+            return self._expire_control_push("control queue remained full")
+        finally:
+            self._control_lock.release()
+
+    def write(self, obj: dict) -> bool:
+        if self._closed:
+            self.raise_if_failed()
+            return False
+        if not self._is_streaming_frame(obj):
+            return self._write_control(obj, self._frame_bytes(obj))
+
+        frame_bytes = self._frame_bytes(obj)
+        if self._is_droppable_frame(obj) and frame_bytes > self._max_pending_bytes:
+            return True
+        for frame, bounded_bytes in self._bounded_streaming_frames(obj):
+            if not self._write_streaming_frame(frame, bounded_bytes):
+                return False
+        return True
+
+    def _record_first_write(self) -> None:
+        with self._pending_lock:
+            if not self._first_write_done.is_set():
+                self._first_write_succeeded = True
+                self._first_write_done.set()
+
+    def _release_pending_bytes(self, frame_bytes: int) -> None:
+        with self._pending_lock:
+            self._pending_bytes = max(0, self._pending_bytes - frame_bytes)
+            self._pending_lock.notify_all()
+
+    def _write_batch(self, batch: list[tuple[dict, int]]) -> bool:
+        for index, (obj, frame_bytes) in enumerate(batch):
+            try:
+                if not self._inner.write(obj):
+                    remaining = sum(size for _frame, size in batch[index:])
+                    self._latch_closed(
+                        BrokenPipeError("inner transport closed"),
+                        discarded_bytes=remaining,
+                    )
+                    return False
+            except BaseException as exc:
+                remaining = sum(size for _frame, size in batch[index:])
+                self._latch_closed(exc, discarded_bytes=remaining)
+                return False
+            self._record_first_write()
+            self._release_pending_bytes(frame_bytes)
+            if self.failure is not None:
+                remaining = sum(size for _frame, size in batch[index + 1 :])
+                self._latch_closed(discarded_bytes=remaining)
+                return False
+        return True
+
+    def _drain(self) -> None:
+        try:
+            while True:
+                with self._pending_lock:
+                    while not self._pending and not self._closed:
+                        self._pending_lock.wait()
+                    if not self._pending:
+                        return
+                    if (
+                        not self._closed
+                        and self._coalesce_s
+                        and all(
+                            self._is_streaming_frame(frame)
+                            for frame, _frame_bytes in self._pending
+                        )
+                    ):
+                        self._pending_lock.wait(self._coalesce_s)
+                    batch = list(self._pending)
+                    self._pending.clear()
+                    self._queued_controls = 0
+                    self._queued_deltas = 0
+                    self._pending_lock.notify_all()
+                if not self._write_batch(batch):
+                    return
+        finally:
+            self._latch_closed()
+
+    def close(self) -> None:
+        self._latch_closed()
+        self._thread.join(timeout=self._close_timeout_s)
 
 
 class TeeTransport:

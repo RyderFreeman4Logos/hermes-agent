@@ -25129,6 +25129,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     else:
                         _out = _raw
                     _out = _redact_gateway_user_facing_secrets(_out)
+                    _producer_evt = _pr_check.completion_event(session_id) or {}
                     completion_evt = {
                         "type": "completion",
                         "session_id": session_id,
@@ -25152,16 +25153,48 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # that session (/new) before the process finished.
                         "parent_session_id": (
                             watcher.get("parent_session_id")
+                            or _producer_evt.get("parent_session_id")
                             or getattr(session, "parent_session_id", "")
                             or ""
+                        ),
+                        "delegated_child": bool(
+                            _producer_evt.get("delegated_child")
+                        ),
+                        "delegated_child_session_id": str(
+                            _producer_evt.get("delegated_child_session_id") or ""
+                        ),
+                        "delegated_subagent_id": str(
+                            _producer_evt.get("delegated_subagent_id") or ""
                         ),
                     }
                     synth_text = format_process_notification(completion_evt)
                     if not synth_text:
                         break
-                    delivered = await self._enqueue_process_completion_notification(
-                        synth_text, completion_evt,
+                    from tools.async_delegation import (
+                        claim_event_delivery,
+                        complete_event_delivery,
+                        drop_event_delivery,
+                        release_event_delivery,
                     )
+
+                    claim_id = claim_event_delivery(
+                        completion_evt, f"gateway-process:{id(self)}"
+                    )
+                    if claim_id is None:
+                        break
+                    try:
+                        delivered = await self._enqueue_process_completion_notification(
+                            synth_text, completion_evt,
+                        )
+                    except BaseException:
+                        release_event_delivery(completion_evt, claim_id)
+                        raise
+                    if delivered is True:
+                        complete_event_delivery(completion_evt, claim_id)
+                    elif delivered is None:
+                        drop_event_delivery(completion_evt, claim_id)
+                    else:
+                        release_event_delivery(completion_evt, claim_id)
                     if delivered is False:
                         # The process remains terminal; retry after failed
                         # adapter injection instead of suppressing the result.

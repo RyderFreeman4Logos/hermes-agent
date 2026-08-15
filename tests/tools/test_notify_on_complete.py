@@ -370,6 +370,66 @@ def test_background_with_notify_does_not_emit_hint(monkeypatch, tmp_path):
     assert result.get("notify_on_complete") is True
 
 
+def test_notify_metadata_is_stamped_before_spawn_and_owner_is_not_overwritten(
+    monkeypatch, tmp_path
+):
+    from types import SimpleNamespace
+
+    import gateway.session_context as session_context
+    from tools import process_registry as process_registry_module
+
+    tt = _silent_bg_harness(monkeypatch, tmp_path)
+    registry = process_registry_module.process_registry
+    captured: dict = {}
+    session = SimpleNamespace(
+        id="proc_delegated",
+        pid=4242,
+        notify_on_complete=True,
+        parent_session_id="parent-generation",
+        watcher_platform="",
+        watcher_chat_id="",
+        watcher_user_id="",
+        watcher_user_name="",
+        watcher_thread_id="",
+        watcher_message_id="",
+        watcher_interval=0,
+    )
+
+    def fake_spawn_local(**kwargs):
+        captured.update(kwargs)
+        return session
+
+    routing = {
+        "HERMES_SESSION_PLATFORM": "telegram",
+        "HERMES_SESSION_CHAT_ID": "123",
+        "HERMES_SESSION_ID": "child-generation",
+    }
+    monkeypatch.setattr(registry, "spawn_local", fake_spawn_local)
+    monkeypatch.setattr(session_context, "async_delivery_supported", lambda: True)
+    monkeypatch.setattr(
+        session_context,
+        "get_session_env",
+        lambda key, default="": routing.get(key, default),
+    )
+    watcher_count = len(registry.pending_watchers)
+    try:
+        result = json.loads(
+            tt.terminal_tool(
+                command="pytest tests/",
+                background=True,
+                notify_on_complete=True,
+            )
+        )
+    finally:
+        del registry.pending_watchers[watcher_count:]
+        tt._active_environments.pop("default", None)
+        tt._last_activity.pop("default", None)
+
+    assert result["notify_on_complete"] is True
+    assert captured["notify_on_complete"] is True
+    assert session.parent_session_id == "parent-generation"
+
+
 def test_foreground_command_does_not_emit_hint(monkeypatch, tmp_path):
     """Hint only applies to background processes — foreground returns its
     result synchronously and the agent always sees the outcome."""

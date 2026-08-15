@@ -2989,6 +2989,11 @@ def terminal_tool(
             # For non-local backends: runs inside the sandbox via env.execute().
             from tools.process_registry import process_registry
 
+            spawn_notify_on_complete = False
+            if notify_on_complete:
+                from gateway.session_context import async_delivery_supported
+
+                spawn_notify_on_complete = async_delivery_supported()
             effective_cwd = _resolve_command_cwd(
                 workdir=workdir,
                 default_cwd=cwd,
@@ -3004,6 +3009,7 @@ def terminal_tool(
                         session_key=session_key,
                         env_vars=env.env if hasattr(env, 'env') else None,
                         use_pty=effective_pty,
+                        notify_on_complete=spawn_notify_on_complete,
                     )
                 else:
                     proc_session = process_registry.spawn_via_env(
@@ -3012,6 +3018,7 @@ def terminal_tool(
                         cwd=effective_cwd,
                         task_id=effective_task_id,
                         session_key=session_key,
+                        notify_on_complete=spawn_notify_on_complete,
                     )
 
                 result_data = {
@@ -3185,8 +3192,9 @@ def terminal_tool(
                             # notification when the user closes this session
                             # (/new) before the process finishes, instead of
                             # injecting it into the chat's NEW session.
-                            proc_session.parent_session_id = _gse(
-                                "HERMES_SESSION_ID", ""
+                            proc_session.parent_session_id = (
+                                proc_session.parent_session_id
+                                or _gse("HERMES_SESSION_ID", "")
                             )
 
                 # Mutual exclusion: if both notify_on_complete and watch_patterns

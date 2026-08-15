@@ -399,6 +399,9 @@ class ProcessSession:
     # boundary (/new), instead of injecting them into the chat's NEW session.
     parent_session_id: str = ""
     notify_on_complete: bool = False             # Queue agent notification on exit
+    delegated_child: bool = False                # Native delegation owned this spawn
+    delegated_child_session_id: str = ""          # Exact child session generation
+    delegated_subagent_id: str = ""               # Exact live subagent registry identity
     # Watch patterns — trigger agent notification when output matches any pattern
     watch_patterns: List[str] = field(default_factory=list)
     _watch_hits: int = field(default=0, repr=False)          # total matches delivered
@@ -453,13 +456,18 @@ class ProcessRegistry:
         # gateway drain this after each agent turn to auto-trigger new turns.
         import queue as _queue_mod
         self.completion_queue: _queue_mod.Queue = _queue_mod.Queue()
-        # Rehydrate durable delegation completions only at registry startup.
-        # Consumers still inject them as fresh turns through this existing rail.
+        # Rehydrate a bounded wake batch of durable completion deliveries at
+        # registry startup. Overflow remains pending for a later wake.
         try:
-            from tools.async_delegation import restore_undelivered_completions
-            restore_undelivered_completions(self.completion_queue)
+            from tools.async_delegation import (
+                _MAX_DURABLE_PENDING,
+                restore_undelivered_completions,
+            )
+            restore_undelivered_completions(
+                self.completion_queue, limit=_MAX_DURABLE_PENDING
+            )
         except Exception as exc:
-            logger.warning("Could not restore async delegation completions: %s", exc)
+            logger.warning("Could not restore completion deliveries: %s", exc)
 
         # Track sessions whose completion was already consumed by the agent
         # via wait/log.  Drain loops AND gateway/tui watchers skip notifications
@@ -958,6 +966,38 @@ class ProcessRegistry:
     # ----- Spawn -----
 
     @staticmethod
+    def _completion_spawn_metadata(
+        notify_on_complete: bool,
+        parent_session_id: str,
+    ) -> dict:
+        """Capture immutable completion ownership before a reader can exit."""
+        from agent.delegation_context import get_delegated_child_provenance
+
+        provenance = get_delegated_child_provenance()
+        if provenance is not None:
+            child_session_id, owner_session_id, subagent_id = provenance
+            return {
+                "notify_on_complete": bool(notify_on_complete),
+                "delegated_child": True,
+                "delegated_child_session_id": child_session_id,
+                "delegated_subagent_id": subagent_id,
+                # Never substitute the child's own session id for an absent
+                # owner generation: incomplete provenance must fail open.
+                "parent_session_id": owner_session_id,
+            }
+        if not parent_session_id:
+            try:
+                from gateway.session_context import get_session_env
+
+                parent_session_id = get_session_env("HERMES_SESSION_ID", "")
+            except Exception:
+                parent_session_id = ""
+        return {
+            "notify_on_complete": bool(notify_on_complete),
+            "parent_session_id": parent_session_id,
+        }
+
+    @staticmethod
     def _env_temp_dir(env: Any) -> str:
         """Return the writable sandbox temp dir for env-backed background tasks."""
         get_temp_dir = getattr(env, "get_temp_dir", None)
@@ -978,6 +1018,8 @@ class ProcessRegistry:
         session_key: str = "",
         env_vars: dict = None,
         use_pty: bool = False,
+        notify_on_complete: bool = False,
+        parent_session_id: str = "",
     ) -> ProcessSession:
         """
         Spawn a background process locally.
@@ -1005,6 +1047,9 @@ class ProcessRegistry:
             session_key=session_key,
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
             started_at=time.time(),
+            **self._completion_spawn_metadata(
+                notify_on_complete, parent_session_id
+            ),
         )
 
         pty_scope_attempted = False
@@ -1063,13 +1108,15 @@ class ProcessRegistry:
                     name=f"proc-pty-reader-{session.id}",
                 )
                 session._reader_thread = reader
-                reader.start()
 
+                # Publish ownership and the checkpoint before the reader can
+                # observe an ultra-fast exit.
                 with self._lock:
                     self._prune_if_needed()
                     self._running[session.id] = session
 
                 self._write_checkpoint()
+                reader.start()
                 return session
 
             except ImportError:
@@ -1169,13 +1216,15 @@ class ProcessRegistry:
                 name=f"proc-reader-{session.id}",
             )
             session._reader_thread = reader
-            reader.start()
 
+            # Register before reader.start(): a short command may already have
+            # exited, but its durable completion still has one producer owner.
             with self._lock:
                 self._prune_if_needed()
                 self._running[session.id] = session
 
             self._write_checkpoint()
+            reader.start()
         except Exception:
             # Post-Popen setup failed — kill the orphaned subprocess (and any
             # descendants spawned via setsid) before re-raising so they do not
@@ -1216,6 +1265,8 @@ class ProcessRegistry:
         task_id: str = "",
         session_key: str = "",
         timeout: int = 10,
+        notify_on_complete: bool = False,
+        parent_session_id: str = "",
     ) -> ProcessSession:
         """
         Spawn a background process through a non-local environment backend.
@@ -1237,6 +1288,9 @@ class ProcessRegistry:
             started_at=time.time(),
             env_ref=env,
             pid_scope="sandbox",
+            **self._completion_spawn_metadata(
+                notify_on_complete, parent_session_id
+            ),
         )
 
         # Run the command in the sandbox with output capture
@@ -1551,6 +1605,53 @@ class ProcessRegistry:
             session.completion_reason = "exited"
         self._move_to_finished(session)
 
+    @staticmethod
+    def _completion_event_for_session(session: ProcessSession) -> dict:
+        from tools.ansi_strip import strip_ansi
+
+        output_tail = (
+            strip_ansi(session.output_buffer[-2000:])
+            if session.output_buffer
+            else ""
+        )
+        return _redact_process_result({
+            "type": "completion",
+            "session_id": session.id,
+            "session_key": session.session_key,
+            "platform": session.watcher_platform,
+            "chat_id": session.watcher_chat_id,
+            "thread_id": session.watcher_thread_id,
+            "user_id": session.watcher_user_id,
+            "user_name": session.watcher_user_name,
+            "message_id": session.watcher_message_id,
+            "command": session.command,
+            "exit_code": session.exit_code,
+            "completion_reason": session.completion_reason,
+            "termination_source": session.termination_source,
+            "output": output_tail,
+            "started_at": session.started_at,
+            "parent_session_id": session.parent_session_id,
+            "delegated_child": session.delegated_child,
+            "delegated_child_session_id": session.delegated_child_session_id,
+            "delegated_subagent_id": session.delegated_subagent_id,
+        })
+
+    def completion_event(self, session_id: str) -> Optional[dict]:
+        """Return the canonical producer event for one known process."""
+        with self._lock:
+            session = self._running.get(session_id) or self._finished.get(session_id)
+        if session is None:
+            return None
+        return self._completion_event_for_session(session)
+
+    @staticmethod
+    def _is_routine_child_completion(event: dict) -> bool:
+        return (
+            event.get("exit_code") == 0
+            and (event.get("completion_reason") or "exited") == "exited"
+            and not event.get("termination_source")
+        )
+
     def _move_to_finished(self, session: ProcessSession):
         """Move a session from running to finished.
 
@@ -1562,36 +1663,88 @@ class ProcessRegistry:
             was_running = self._running.pop(session.id, None) is not None
             self._finished[session.id] = session
         session._completion_event.set()
-        self._write_checkpoint()
 
         # Only enqueue completion notification on the FIRST move.  Without
         # this guard, kill_process() and the reader thread can both call
         # _move_to_finished(), producing duplicate [IMPORTANT: ...] messages.
-        if was_running and session.notify_on_complete:
-            from tools.ansi_strip import strip_ansi
-            output_tail = strip_ansi(session.output_buffer[-2000:]) if session.output_buffer else ""
-            notification = {
-                "type": "completion",
-                "session_id": session.id,
-                "session_key": session.session_key,
-                "command": session.command,
-                "exit_code": session.exit_code,
-                "completion_reason": session.completion_reason,
-                "termination_source": session.termination_source,
-                "output": output_tail,
-                # Stable producer identity across checkpoint recovery; unlike
-                # a consumer-observed completion timestamp, this does not vary
-                # based on which watcher notices exit first.
-                "started_at": session.started_at,
-            }
-            _redact_process_result(notification)
-            self.completion_queue.put(notification)
+        if not (was_running and session.notify_on_complete):
+            self._write_checkpoint()
+            return
+
+        notification = self._completion_event_for_session(session)
+        durable = False
+        try:
+            from tools.async_delegation import persist_event_delivery
+
+            durable = persist_event_delivery(notification)
+        except Exception:
+            logger.exception(
+                "Could not durably publish process completion %s", session.id
+            )
+
+        if durable and session.id in self._completion_consumed:
+            from tools.async_delegation import (
+                acknowledge_event_delivery_id,
+                event_delivery_id,
+            )
+
+            delivery_id = event_delivery_id(notification)
+            if delivery_id:
+                acknowledge_event_delivery_id(delivery_id)
+            self._write_checkpoint()
+            return
+
+        if durable and session.delegated_child:
+            complete_provenance = all((
+                session.parent_session_id,
+                session.delegated_child_session_id,
+                session.delegated_subagent_id,
+            ))
+            if complete_provenance:
+                from tools.async_delegation import mark_event_child_local
+                from tools.delegate_tool import deliver_owned_process_completion
+
+                text = format_process_notification(notification)
+                accepted = bool(text) and deliver_owned_process_completion(
+                    child_session_id=session.delegated_child_session_id,
+                    owner_session_id=session.parent_session_id,
+                    subagent_id=session.delegated_subagent_id,
+                    text=text,
+                )
+                if accepted or self._is_routine_child_completion(notification):
+                    if mark_event_child_local(notification):
+                        self._write_checkpoint()
+                        return
+
+        # Durable publication happens before the volatile wake. If child
+        # ownership is absent/ambiguous, failures fail open to the parent.
+        self.completion_queue.put(notification)
+        self._write_checkpoint()
 
     # ----- Query Methods -----
 
     def is_completion_consumed(self, session_id: str) -> bool:
         """Check if a completion notification was already consumed via wait/log."""
         return session_id in self._completion_consumed
+
+    def _mark_completion_consumed(self, session: ProcessSession) -> None:
+        """Record inline consumption and settle an already-published wake."""
+        self._completion_consumed.add(session.id)
+        if not session.exited:
+            return
+        try:
+            from tools.async_delegation import (
+                acknowledge_event_delivery_id,
+                event_delivery_id,
+            )
+
+            delivery_id = event_delivery_id(self._completion_event_for_session(session))
+            if delivery_id:
+                acknowledge_event_delivery_id(delivery_id)
+        except Exception:
+            logger.debug(
+                "Could not settle consumed completion %s", session.id, exc_info=True
+            )
 
     def is_session_waiting(self, session_id: str) -> bool:
         """Whether a goal loop parked on this session should still be parked.
@@ -1644,6 +1797,19 @@ class ProcessRegistry:
         """
         return session_id in self._completion_consumed or (
             skip_poll_observed and session_id in self._poll_observed
+        )
+
+    def restore_completion_notifications(self) -> int:
+        """Wake pending durable deliveries without duplicating queued events."""
+        from tools.async_delegation import (
+            _MAX_DURABLE_PENDING,
+            restore_undelivered_completions,
+        )
+
+        return restore_undelivered_completions(
+            self.completion_queue,
+            limit=_MAX_DURABLE_PENDING,
+            recover_abandoned=False,
         )
 
     def drain_notifications(
@@ -1724,6 +1890,21 @@ class ProcessRegistry:
             if evt.get("type") == "completion" and self._drain_should_skip(
                 _evt_sid, skip_poll_observed=skip_poll_observed
             ):
+                try:
+                    from tools.async_delegation import (
+                        acknowledge_event_delivery_id,
+                        event_delivery_id,
+                    )
+
+                    delivery_id = event_delivery_id(evt)
+                    if delivery_id:
+                        acknowledge_event_delivery_id(delivery_id)
+                except Exception:
+                    logger.debug(
+                        "Could not settle inline-observed completion %s",
+                        _evt_sid,
+                        exc_info=True,
+                    )
                 continue
 
             text = format_process_notification(evt)
@@ -1895,7 +2076,7 @@ class ProcessRegistry:
             "showing": f"{len(selected)} lines",
         }
         if session.exited and observed_completion_output:
-            self._completion_consumed.add(session_id)
+            self._mark_completion_consumed(session)
         return result
 
     def wait(self, session_id: str, timeout: int = None) -> dict:
@@ -1956,7 +2137,7 @@ class ProcessRegistry:
             # child has already exited (issue #17327).
             self._reconcile_local_exit(session)
             if session.exited:
-                self._completion_consumed.add(session_id)
+                self._mark_completion_consumed(session)
                 result = {
                     "status": "exited",
                     "command": session.command,
@@ -2059,7 +2240,7 @@ class ProcessRegistry:
             # Only suppress the autonomous turn after its output is present in
             # the explicit kill result, matching wait/log consumption.
             if consume_output:
-                self._completion_consumed.add(session_id)
+                self._mark_completion_consumed(session)
             return result
 
         # Kill via PTY, Popen (local), or env execute (non-local)
@@ -2095,7 +2276,7 @@ class ProcessRegistry:
                         session.exit_code = None
                         output = strip_ansi(session.output_buffer[-2000:])
                     if consume_output:
-                        self._completion_consumed.add(session_id)
+                        self._mark_completion_consumed(session)
                     self._move_to_finished(session)
                     return {
                         "status": "already_exited",
@@ -2127,7 +2308,7 @@ class ProcessRegistry:
             with session._lock:
                 output = strip_ansi(session.output_buffer[-2000:])
                 if consume_output:
-                    self._completion_consumed.add(session_id)
+                    self._mark_completion_consumed(session)
                 session.exited = True
                 session.exit_code = -15  # SIGTERM
                 session.completion_reason = "killed"
@@ -2528,6 +2709,9 @@ class ProcessRegistry:
                             "watcher_interval": s.watcher_interval,
                             "parent_session_id": s.parent_session_id,
                             "notify_on_complete": s.notify_on_complete,
+                            "delegated_child": s.delegated_child,
+                            "delegated_child_session_id": s.delegated_child_session_id,
+                            "delegated_subagent_id": s.delegated_subagent_id,
                             "watch_patterns": s.watch_patterns,
                         })
                 if extra_entries:
@@ -2625,6 +2809,11 @@ class ProcessRegistry:
                 watcher_interval=entry.get("watcher_interval", 0),
                 parent_session_id=entry.get("parent_session_id", ""),
                 notify_on_complete=entry.get("notify_on_complete", False),
+                delegated_child=entry.get("delegated_child", False),
+                delegated_child_session_id=entry.get(
+                    "delegated_child_session_id", ""
+                ),
+                delegated_subagent_id=entry.get("delegated_subagent_id", ""),
                 watch_patterns=entry.get("watch_patterns", []),
             )
             with self._lock:

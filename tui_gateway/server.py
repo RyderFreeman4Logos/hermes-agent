@@ -1063,7 +1063,12 @@ def _session_async_delegation_selectors(
     return own_sid, owned_session_key
 
 
-def _session_has_active_delegations(sid: str, session: dict | None = None) -> bool:
+def _session_has_active_delegations(
+    sid: str,
+    session: dict | None = None,
+    *,
+    selectors: tuple[str, str] | None = None,
+) -> bool:
     """True when UI session ``sid`` still owns live background work.
 
     Matches by the live UI sid AND — when the TUI owns the durable lifecycle
@@ -1074,9 +1079,9 @@ def _session_has_active_delegations(sid: str, session: dict | None = None) -> bo
     if session is None:
         with _sessions_lock:
             session = _sessions.get(sid)
-    own_sid, owned_session_key = _session_async_delegation_selectors(
-        session, sid_hint=sid
-    )
+    if selectors is None:
+        selectors = _session_async_delegation_selectors(session, sid_hint=sid)
+    own_sid, owned_session_key = selectors
     if not own_sid and not owned_session_key:
         return False
     try:
@@ -1108,6 +1113,12 @@ def _schedule_ws_orphan_reap(sid: str) -> None:
     if _WS_ORPHAN_REAP_GRACE_S <= 0:
         return
 
+    # Resolve the durable ownership selector before the timer callback takes
+    # the global resume lock; opening a cold SessionDB can be slow.
+    with _sessions_lock:
+        candidate = _sessions.get(sid)
+    selectors = _session_async_delegation_selectors(candidate, sid_hint=sid)
+
     def _reap() -> None:
         # Serialize the orphan re-check against session.resume (which re-binds a
         # live transport under _session_resume_lock and would make this session
@@ -1123,9 +1134,11 @@ def _schedule_ws_orphan_reap(sid: str) -> None:
         session = None
         with _session_resume_lock:
             current = _sessions.get(sid)
-            if not _ws_session_is_orphaned(current):
+            if current is not candidate or not _ws_session_is_orphaned(current):
                 return
-            if _session_has_active_delegations(sid, current):
+            if _session_has_active_delegations(
+                sid, current, selectors=selectors
+            ):
                 reschedule = True
             else:
                 session = _pop_session_by_id(sid)
@@ -7644,7 +7657,11 @@ def _session_home(session: dict) -> Path:
     return Path(profile_home) if profile_home else Path(_hermes_home)
 
 
-def _retire_turn_marker(session: dict, *keys: str) -> None:
+def _retire_turn_marker(
+    session: dict,
+    *keys: str,
+    completion_delivery_id: str | None = None,
+) -> None:
     """Drop the crash marker for a turn whose outcome is about to reach the client.
 
     Called immediately before the terminal frame rather than at the end of the
@@ -7657,6 +7674,12 @@ def _retire_turn_marker(session: dict, *keys: str) -> None:
     home = _session_home(session)
     for key in dict.fromkeys((*keys, str(session.get("session_key") or ""))):
         if key:
+            marker = read_turn_marker(home, key)
+            marker_delivery_id = (
+                str((marker or {}).get("completion_delivery_id") or "")
+            )
+            if marker_delivery_id and marker_delivery_id != completion_delivery_id:
+                continue
             clear_turn_marker(home, key)
 
 
@@ -7688,9 +7711,23 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
     marker = read_turn_marker(home, session_key)
     if marker is None:
         return None
+    completion_delivery_id = str(marker.get("completion_delivery_id") or "")
     enabled, freshness_secs, max_attempts = _auto_continue_config()
     age = time.time() - marker["started_at"]
-    if not enabled or age > freshness_secs or marker["attempts"] >= max_attempts:
+    if completion_delivery_id:
+        # The marker is already the durable parent-backlog insertion. Reconcile
+        # the ledger before replay; age/config/display policy cannot drop it.
+        try:
+            from tools.async_delegation import acknowledge_event_delivery_id
+
+            acknowledge_event_delivery_id(completion_delivery_id)
+        except Exception:
+            logger.warning(
+                "Could not reconcile completion marker %s",
+                completion_delivery_id,
+                exc_info=True,
+            )
+    elif not enabled or age > freshness_secs or marker["attempts"] >= max_attempts:
         # Stale, disabled, or crash-looping: stop trying. The journal/partial
         # transcript still shows what happened; a manual message continues it.
         clear_turn_marker(home, session_key)
@@ -7715,8 +7752,8 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
             return
         with session["history_lock"]:
             if session.get("running") or session.get("_turn_cancel_requested") or session.get("_finalized"):
-                # A real user prompt beat us to it — their turn wins, and its
-                # own conclusion clears the marker.
+                # A real user prompt beat us to it. Ordinary continuation work
+                # yields; a protected completion marker remains for next wake.
                 session["_auto_continue_scheduled"] = False
                 return
             session["running"] = True
@@ -7729,6 +7766,10 @@ def _maybe_schedule_auto_continue(sid: str, session: dict, session_key: str) -> 
             # behind for a racing user turn to inherit.
             session["_auto_continue_attempt"] = attempt
             session["_auto_continue_prompt"] = marker["prompt"]
+            if completion_delivery_id:
+                session["_auto_continue_completion_delivery_id"] = (
+                    completion_delivery_id
+                )
         try:
             _emit(
                 "status.update",
@@ -9803,8 +9844,8 @@ def _notification_poller_loop(
                 else logger.debug
             )
             log(
-                "Dropping unowned %s notification (origin=%r key=%r) instead "
-                "of delivering to session %s",
+                "Parking unowned %s notification (origin=%r key=%r) in its "
+                "durable ledger instead of delivering to session %s",
                 evt.get("type", "completion"),
                 str(evt.get("origin_ui_session_id") or ""),
                 str(evt.get("session_key") or ""),
@@ -9845,25 +9886,35 @@ def _notification_poller_loop(
 
         rid = f"__notif__{int(time.time() * 1000)}"
         from tools.async_delegation import (
-            claim_event_delivery, complete_event_delivery, release_event_delivery,
+            claim_event_delivery, release_event_delivery,
         )
         _claim = claim_event_delivery(evt, "tui-poller")
         if _claim is None:
+            with session["history_lock"]:
+                session["running"] = False
             continue
         try:
             _emit("message.start", sid)
             if evt.get("type") == "async_delegation":
-                _run_prompt_submit(
+                _submit_completion_turn(
                     rid,
                     sid,
                     session,
                     text,
                     display_kind="async_delegation_complete",
                     display_metadata=_async_delegation_display_metadata(evt),
+                    completion_event=evt if _claim else None,
+                    completion_claim_id=_claim or None,
                 )
             else:
-                _run_prompt_submit(rid, sid, session, text)
-            complete_event_delivery(evt, _claim)
+                _submit_completion_turn(
+                    rid,
+                    sid,
+                    session,
+                    text,
+                    completion_event=evt if _claim else None,
+                    completion_claim_id=_claim or None,
+                )
         except Exception as exc:
             release_event_delivery(evt, _claim)
             print(
@@ -9877,7 +9928,7 @@ def _notification_poller_loop(
     # Drain any remaining events after stop signal (process all pending
     # before exiting so nothing is lost on shutdown). Events owned by other
     # live sessions are set aside and re-queued so their poller still sees them.
-    # Orphaned events (owner gone) are dropped — same guard as the main loop.
+    # Orphaned volatile wakes are parked; their durable rows remain pending.
     deferred: list = []
     while not process_registry.completion_queue.empty():
         try:
@@ -9889,15 +9940,15 @@ def _notification_poller_loop(
             continue
         # Same positive-proof rule as the live loop. Preserve the existing
         # shutdown behavior for orphaned delegation payloads by deferring them
-        # for a later resume; ordinary addressed orphans are dropped.
+        # for a later resume; ordinary addressed orphans remain durable too.
         requires_owner = _notification_event_requires_owner(evt)
         if requires_owner and not _session_owns_notification_event(sid, session, evt):
             if evt.get("type") == "async_delegation":
                 deferred.append(evt)
             else:
                 logger.debug(
-                    "Dropping unowned %s notification during shutdown drain "
-                    "(origin=%r key=%r)",
+                    "Parking unowned %s notification during shutdown drain "
+                    "(origin=%r key=%r); durable delivery remains pending",
                     evt.get("type", "completion"),
                     str(evt.get("origin_ui_session_id") or ""),
                     str(evt.get("session_key") or ""),
@@ -9923,25 +9974,35 @@ def _notification_poller_loop(
 
         rid = f"__notif__{int(time.time() * 1000)}"
         from tools.async_delegation import (
-            claim_event_delivery, complete_event_delivery, release_event_delivery,
+            claim_event_delivery, release_event_delivery,
         )
         _claim = claim_event_delivery(evt, "tui-poller")
         if _claim is None:
+            with session["history_lock"]:
+                session["running"] = False
             continue
         try:
             _emit("message.start", sid)
             if evt.get("type") == "async_delegation":
-                _run_prompt_submit(
+                _submit_completion_turn(
                     rid,
                     sid,
                     session,
                     text,
                     display_kind="async_delegation_complete",
                     display_metadata=_async_delegation_display_metadata(evt),
+                    completion_event=evt if _claim else None,
+                    completion_claim_id=_claim or None,
                 )
             else:
-                _run_prompt_submit(rid, sid, session, text)
-            complete_event_delivery(evt, _claim)
+                _submit_completion_turn(
+                    rid,
+                    sid,
+                    session,
+                    text,
+                    completion_event=evt if _claim else None,
+                    completion_claim_id=_claim or None,
+                )
         except Exception as exc:
             release_event_delivery(evt, _claim)
             print(
@@ -10061,6 +10122,12 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
     """Start the background notification poller for a TUI session."""
     _wire_agent_terminal_output()
     _wire_desktop_ui()
+    try:
+        from tools.process_registry import process_registry
+
+        process_registry.restore_completion_notifications()
+    except Exception:
+        logger.warning("Could not restore pending desktop completions", exc_info=True)
     stop = threading.Event()
     t = threading.Thread(
         target=_notification_poller_loop,
@@ -10268,6 +10335,105 @@ def _start_usage_ticker(
     return stop, thread
 
 
+def _record_prompt_turn_start(
+    session: dict,
+    text: Any,
+    *,
+    completion_event: dict | None = None,
+    completion_claim_id: str | None = None,
+) -> tuple[Path, str, str]:
+    """Durably record a turn and settle its completion claim, in that order."""
+    marker_home = _session_home(session)
+    marker_key = str(session.get("session_key") or "")
+    marker_attempt = int(session.pop("_auto_continue_attempt", 0) or 0)
+    marker_text = session.pop("_auto_continue_prompt", None) or text
+    marker_delivery_id = str(
+        session.pop("_auto_continue_completion_delivery_id", "") or ""
+    )
+    if completion_event is not None:
+        from tools.async_delegation import event_delivery_id
+
+        marker_delivery_id = str(event_delivery_id(completion_event) or "")
+    marker_recorded = False
+    if isinstance(marker_text, str) and marker_text.strip():
+        marker_recorded = record_turn_start(
+            marker_home,
+            marker_key,
+            marker_text,
+            attempts=marker_attempt,
+            completion_delivery_id=marker_delivery_id or None,
+        )
+    if completion_event is not None:
+        if not marker_delivery_id or not completion_claim_id or not marker_recorded:
+            raise RuntimeError("completion backlog was not durably recorded")
+        from tools.async_delegation import complete_event_delivery
+
+        if not complete_event_delivery(completion_event, completion_claim_id):
+            raise RuntimeError("completion delivery claim could not be acknowledged")
+    return marker_home, marker_key, marker_delivery_id
+
+
+def _submit_completion_turn(
+    rid,
+    sid: str,
+    session: dict,
+    text: Any,
+    *,
+    completion_event: dict | None,
+    completion_claim_id: str | None,
+    **kwargs: Any,
+) -> None:
+    """Submit a completion through current or strict legacy call boundaries."""
+    try:
+        parameters = inspect.signature(_run_prompt_submit).parameters
+    except (TypeError, ValueError):
+        parameters = {}
+    accepts_kwargs = any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+    if parameters and not accepts_kwargs:
+        kwargs = {
+            name: value
+            for name, value in kwargs.items()
+            if name in parameters
+            and parameters[name].kind
+            in {
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            }
+        }
+    if completion_event is None or not completion_claim_id:
+        _run_prompt_submit(rid, sid, session, text, **kwargs)
+        return
+
+    accepts_delivery = accepts_kwargs or all(
+        name in parameters
+        for name in ("completion_event", "completion_claim_id")
+    )
+    if accepts_delivery:
+        _run_prompt_submit(
+            rid,
+            sid,
+            session,
+            text,
+            completion_event=completion_event,
+            completion_claim_id=completion_claim_id,
+            **kwargs,
+        )
+        return
+
+    # A strict legacy/mock callback cannot own the additive kwargs, so preserve
+    # the same marker-before-ACK transaction before invoking it once.
+    _record_prompt_turn_start(
+        session,
+        text,
+        completion_event=completion_event,
+        completion_claim_id=completion_claim_id,
+    )
+    _run_prompt_submit(rid, sid, session, text, **kwargs)
+
+
 def _run_prompt_submit(
     rid,
     sid: str,
@@ -10278,6 +10444,8 @@ def _run_prompt_submit(
     display_metadata: dict | None = None,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    completion_event: dict | None = None,
+    completion_claim_id: str | None = None,
 ) -> None:
     with session["history_lock"]:
         if (
@@ -10302,6 +10470,14 @@ def _run_prompt_submit(
                 agent.clear_interrupt()
             except Exception:
                 pass
+    # Persist the parent backlog insertion before acknowledging its durable
+    # queue row. A crash after this point replays the exact marker on resume.
+    marker_home, marker_key, marker_delivery_id = _record_prompt_turn_start(
+        session,
+        text,
+        completion_event=completion_event,
+        completion_claim_id=completion_claim_id,
+    )
     _emit("message.start", sid)
 
     def run():
@@ -10323,18 +10499,6 @@ def _run_prompt_submit(
         # True once a failed turn's snapshot was retained for resume replay —
         # tells the finally below to skip the normal inflight clear.
         turn_error_retained = False
-        # Durable crash marker: written before the turn runs, retired the
-        # moment its outcome reaches the client (see _retire_turn_marker).
-        # Any concluded turn — success, handled error, interrupt — retires
-        # it, so a marker that survives means the process died mid-turn;
-        # session.resume auto-continues from it. Compression can rotate
-        # session_key mid-turn, so remember the key we wrote under.
-        marker_home = _session_home(session)
-        marker_key = str(session.get("session_key") or "")
-        marker_attempt = int(session.pop("_auto_continue_attempt", 0) or 0)
-        marker_text = session.pop("_auto_continue_prompt", None) or text
-        if isinstance(marker_text, str) and marker_text.strip():
-            record_turn_start(marker_home, marker_key, marker_text, attempts=marker_attempt)
         try:
             from tools.approval import (
                 reset_current_session_key,
@@ -10811,7 +10975,11 @@ def _run_prompt_submit(
                     (result.get("error") if isinstance(result, dict) else "") or raw
                 )
                 payload["recoverable"] = True
-            _retire_turn_marker(session, marker_key)
+            _retire_turn_marker(
+                session,
+                marker_key,
+                completion_delivery_id=marker_delivery_id or None,
+            )
             _emit("message.complete", sid, payload)
 
             # ── /goal continuation (Ralph-style loop) ─────────────────
@@ -11064,7 +11232,11 @@ def _run_prompt_submit(
                     _clear_inflight_turn(session)
             # Backstop for turns that never reached a terminal frame (the
             # frame paths retire the marker as they emit).
-            _retire_turn_marker(session, marker_key)
+            _retire_turn_marker(
+                session,
+                marker_key,
+                completion_delivery_id=marker_delivery_id or None,
+            )
             session.pop("_auto_continue_scheduled", None)
             _emit_settled_session_info(sid, session, agent)
 
@@ -11120,6 +11292,7 @@ def _run_prompt_submit(
         try:
             from tools.process_registry import process_registry
 
+            process_registry.restore_completion_notifications()
             # Positive-proof ownership (compression-chain aware) — the same
             # fail-closed gate the poller uses, so the post-turn drain can't
             # adopt another session's addressed notification while a
@@ -11138,15 +11311,23 @@ def _run_prompt_submit(
                         break
                     session["running"] = True
                 from tools.async_delegation import (
-                    claim_event_delivery, complete_event_delivery, release_event_delivery,
+                    claim_event_delivery, release_event_delivery,
                 )
                 _claim = claim_event_delivery(_evt, "tui-post-turn")
                 if _claim is None:
+                    with session["history_lock"]:
+                        session["running"] = False
                     continue
                 try:
                     _emit("message.start", sid)
-                    _run_prompt_submit(rid, sid, session, synth)
-                    complete_event_delivery(_evt, _claim)
+                    _submit_completion_turn(
+                        rid,
+                        sid,
+                        session,
+                        synth,
+                        completion_event=_evt if _claim else None,
+                        completion_claim_id=_claim or None,
+                    )
                 except Exception as _n_exc:
                     release_event_delivery(_evt, _claim)
                     print(

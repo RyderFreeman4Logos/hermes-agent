@@ -17,6 +17,37 @@ def _mock_agent():
     return MagicMock(name="MockAIAgent")
 
 
+def _catalog_prompt_agent():
+    return SimpleNamespace(
+        model="test-model",
+        provider="openrouter",
+        base_url=None,
+        api_mode="chat_completions",
+        platform="acp",
+        session_id=None,
+        _session_db=None,
+        _session_db_created=False,
+        _session_init_model_config={},
+        _skills_catalog_mode_config="full",
+        _cached_system_prompt=None,
+        _use_prompt_caching=False,
+    )
+
+
+def _rebuild_catalog_mode(agent, db, session_id, history):
+    from agent.conversation_loop import _restore_or_build_system_prompt
+    from agent.system_prompt import _session_skills_catalog_mode
+
+    observed = []
+    agent.session_id = session_id
+    agent._session_db = db
+    agent._build_system_prompt = lambda _message: (
+        observed.append(_session_skills_catalog_mode(agent)) or "BUILT_PROMPT"
+    )
+    _restore_or_build_system_prompt(agent, None, history)
+    return observed
+
+
 @pytest.fixture()
 def manager():
     """SessionManager with a mock agent factory (avoids needing API keys)."""
@@ -240,6 +271,90 @@ class TestPersistence:
         db.create_session(session_id="cli-session-123", source="cli", model="test")
         # Should not be found via ACP SessionManager.
         assert manager.get_session("cli-session-123") is None
+
+    def test_save_preserves_catalog_mode_and_unknown_model_config_fields(self, tmp_path):
+        """ACP metadata saves must merge, not replace session-owned state."""
+        db = SessionDB(tmp_path / "state.db")
+        manager = SessionManager(agent_factory=_catalog_prompt_agent, db=db)
+        try:
+            state = manager.create_session(cwd="/original")
+            db.patch_session_model_config(
+                state.session_id,
+                {
+                    "_skills_catalog_mode": "names-only",
+                    "future_session_field": {"keep": True},
+                },
+            )
+
+            state.cwd = "/updated"
+            manager.save_session(state.session_id)
+
+            stored = json.loads(db.get_session(state.session_id)["model_config"])
+            assert stored["cwd"] == "/updated"
+            assert stored["_skills_catalog_mode"] == "names-only"
+            assert stored["future_session_field"] == {"keep": True}
+        finally:
+            db.close()
+
+    def test_restart_rebuild_uses_catalog_mode_after_post_turn_save(self, tmp_path):
+        """A post-turn ACP save must not erase mode before restart/resume."""
+        db = SessionDB(tmp_path / "state.db")
+        manager = SessionManager(agent_factory=_catalog_prompt_agent, db=db)
+        try:
+            state = manager.create_session(cwd="/work")
+            state.history.extend(
+                [
+                    {"role": "user", "content": "hello"},
+                    {"role": "assistant", "content": "hi"},
+                ]
+            )
+            manager.save_session(state.session_id)
+            db.patch_session_model_config(
+                state.session_id, {"_skills_catalog_mode": "names-only"}
+            )
+
+            # Mirrors HermesACPAgent.prompt(): AIAgent persists its frozen mode,
+            # then SessionManager saves the returned transcript.
+            manager.save_session(state.session_id)
+
+            restarted = SessionManager(agent_factory=_catalog_prompt_agent, db=db)
+            restored = restarted.get_session(state.session_id)
+            assert restored is not None
+            assert _rebuild_catalog_mode(
+                restored.agent, db, restored.session_id, restored.history
+            ) == ["names-only"]
+        finally:
+            db.close()
+
+    def test_fork_inherits_catalog_mode_before_prompt_rebuild(self, tmp_path):
+        """ACP forks copy the parent's frozen mode with the transcript."""
+        db = SessionDB(tmp_path / "state.db")
+        manager = SessionManager(agent_factory=_catalog_prompt_agent, db=db)
+        try:
+            parent = manager.create_session(cwd="/parent")
+            parent.history.extend(
+                [
+                    {"role": "user", "content": "keep this prefix"},
+                    {"role": "assistant", "content": "kept"},
+                ]
+            )
+            manager.save_session(parent.session_id)
+            db.patch_session_model_config(
+                parent.session_id, {"_skills_catalog_mode": "compact"}
+            )
+
+            child = manager.fork_session(parent.session_id, cwd="/child")
+            assert child is not None
+            assert child.agent._skills_catalog_mode == "compact"
+            assert _rebuild_catalog_mode(
+                child.agent, db, child.session_id, child.history
+            ) == ["compact"]
+            child_config = json.loads(
+                db.get_session(child.session_id)["model_config"]
+            )
+            assert child_config["_skills_catalog_mode"] == "compact"
+        finally:
+            db.close()
 
     def test_sessions_searchable_via_fts(self, manager):
         """ACP sessions stored in SessionDB are searchable via FTS5."""

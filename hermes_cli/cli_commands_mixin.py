@@ -1315,6 +1315,12 @@ class CLICommandsMixin:
             self.agent.session_id = new_session_id
             self.agent.session_start = now
             self.agent.reset_session_state()
+            from agent.system_prompt import hydrate_session_skills_catalog_mode
+
+            hydrate_session_skills_catalog_mode(
+                self.agent,
+                model_config=branch_model_config,
+            )
             if hasattr(self.agent, "_last_flushed_db_idx"):
                 self.agent._last_flushed_db_idx = len(self.conversation_history)
             if hasattr(self.agent, "_todo_store"):

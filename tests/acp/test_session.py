@@ -320,6 +320,7 @@ class TestPersistence:
             restarted = SessionManager(agent_factory=_catalog_prompt_agent, db=db)
             restored = restarted.get_session(state.session_id)
             assert restored is not None
+            assert restored.agent._skills_catalog_mode == "names-only"
             assert _rebuild_catalog_mode(
                 restored.agent, db, restored.session_id, restored.history
             ) == ["names-only"]

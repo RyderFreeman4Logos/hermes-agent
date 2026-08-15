@@ -519,6 +519,38 @@ class TestStrictUrlCredentialRedaction:
         assert redact_sensitive_text(text, redact_url_credentials=True) == text
 
 
+class TestMultilineConfigUrlRedaction:
+    def test_strict_redaction_masks_config_secrets_beside_urls(self):
+        yaml_secret = "SYNTHETIC_YAML_8a1d"
+        dotted_secret = "SYNTHETIC_DOTTED_4b2e"
+        text = "\n".join(
+            (
+                f"api_key: {yaml_secret} see https://example.invalid/docs",
+                f"service.auth.token={dotted_secret} url=https://example.invalid/result",
+            )
+        )
+
+        result = redact_sensitive_text(text, redact_url_credentials=True)
+
+        assert yaml_secret not in result
+        assert dotted_secret not in result
+
+    def test_url_line_does_not_suppress_adjacent_config_redaction(self):
+        config_secret = "SYNTHETIC_CONFIG_SECRET_3d7a"
+        query_secret = "SYNTHETIC_QUERY_SECRET_9c2d"
+        text = "\n".join(
+            (
+                f"service.auth.token={config_secret}",
+                f"https://example.invalid/result?token={query_secret}",
+            )
+        )
+
+        result = redact_sensitive_text(text)
+
+        assert config_secret not in result
+        assert query_secret in result
+
+
 class TestBareTokenUserinfoRedaction:
     """Regression tests for #6396 — a bare credential in URL userinfo
     (``scheme://TOKEN@host``, no ``user:pass`` colon) is redacted. This is the

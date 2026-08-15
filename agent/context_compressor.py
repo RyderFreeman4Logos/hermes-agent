@@ -283,10 +283,11 @@ def _prune_stale_reasoning_replay(messages: List[Dict[str, Any]]) -> int:
     # Find the last real user message — everything after it is the active
     # turn.  Synthetic continuation rows and tool results never mark a turn
     # boundary.
+    from agent.conversation_compression import _is_real_user_message
+
     last_user_idx = -1
     for i in range(len(messages) - 1, -1, -1):
-        msg = messages[i]
-        if isinstance(msg, dict) and msg.get("role") == "user":
+        if _is_real_user_message(messages[i]):
             last_user_idx = i
             break
     if last_user_idx < 0:

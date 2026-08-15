@@ -86,6 +86,18 @@ def compose_user_api_content(
     return content + "\n\n" + "\n\n".join(injections)
 
 
+def api_content_for_wire(msg: Dict[str, Any]) -> Optional[str]:
+    """Return the persisted sidecar only when the provider would use it."""
+    sidecar = msg.get("api_content")
+    if (
+        isinstance(sidecar, str)
+        and sidecar
+        and msg.get("role") in ("user", "assistant")
+    ):
+        return sidecar
+    return None
+
+
 def substitute_api_content(api_msg: Dict[str, Any]) -> Optional[str]:
     """Pop the ``api_content`` sidecar and substitute it into ``content``.
 
@@ -99,12 +111,9 @@ def substitute_api_content(api_msg: Dict[str, Any]) -> Optional[str]:
     Returns the popped sidecar string (for callers that need the value for
     current-turn composition logic) or ``None`` when absent.
     """
-    sidecar = api_msg.pop("api_content", None)
-    if (
-        isinstance(sidecar, str)
-        and sidecar
-        and api_msg.get("role") in ("user", "assistant")
-    ):
+    sidecar = api_content_for_wire(api_msg)
+    api_msg.pop("api_content", None)
+    if sidecar is not None:
         api_msg["content"] = sidecar
     return sidecar
 

@@ -15,12 +15,14 @@ instead of rebuilding).  Covers:
 
 from __future__ import annotations
 
+import json
 import logging
 from unittest.mock import MagicMock
 
 import pytest
 
 from agent.conversation_loop import _restore_or_build_system_prompt
+from hermes_state import SessionDB
 
 
 def _make_agent(session_db=None, prebuilt_prompt: str = "BUILT_PROMPT"):
@@ -144,30 +146,41 @@ class TestLegitimateFreshBuild:
         assert agent._cached_system_prompt == "BUILT_PROMPT"
 
 
-def test_structured_catalog_mode_restores_before_prompt_rebuild():
+def test_structured_catalog_mode_restores_before_prompt_rebuild(tmp_path):
     """A resumed session keeps its first catalog choice despite later config."""
     from agent.system_prompt import _session_skills_catalog_mode
 
-    db = MagicMock()
-    db.get_session.return_value = {
-        "system_prompt": None,
-        "model_config": {"_skills_catalog_mode": "compact"},
-    }
-    agent = _make_agent(session_db=db)
-    agent._session_init_model_config = {}
-    agent._skills_catalog_mode_config = "full"
-    observed_modes = []
-    agent._build_system_prompt.side_effect = lambda _message: (
-        observed_modes.append(_session_skills_catalog_mode(agent)) or "BUILT_PROMPT"
-    )
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session(
+            session_id="test-session-id",
+            source="cli",
+            model_config={"_skills_catalog_mode": "compact"},
+            system_prompt=None,
+        )
+        initial = db.get_session("test-session-id")
+        assert initial is not None
+        assert isinstance(initial["model_config"], str)
 
-    _restore_or_build_system_prompt(agent, None, [{"role": "user", "content": "hi"}])
+        agent = _make_agent(session_db=db)
+        agent._session_init_model_config = {}
+        agent._skills_catalog_mode_config = "full"
+        observed_modes = []
+        agent._build_system_prompt.side_effect = lambda _message: (
+            observed_modes.append(_session_skills_catalog_mode(agent)) or "BUILT_PROMPT"
+        )
 
-    assert observed_modes == ["compact"]
-    assert agent._session_init_model_config["_skills_catalog_mode"] == "compact"
-    db.patch_session_model_config.assert_called_once_with(
-        agent.session_id, {"_skills_catalog_mode": "compact"}
-    )
+        _restore_or_build_system_prompt(
+            agent, None, [{"role": "user", "content": "hi"}]
+        )
+
+        assert observed_modes == ["compact"]
+        assert agent._session_init_model_config["_skills_catalog_mode"] == "compact"
+        stored = db.get_session(agent.session_id)
+        assert stored is not None
+        assert json.loads(stored["model_config"])["_skills_catalog_mode"] == "compact"
+    finally:
+        db.close()
 
 
 # ---------------------------------------------------------------------------

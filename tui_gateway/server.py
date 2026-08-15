@@ -8202,6 +8202,12 @@ def _emit_terminal_turn_error(sid: str, session: dict, error: Any) -> None:
         "error": message,
         "recoverable": True,
     }
+    if agent is not None:
+        from agent.cache_attribution import consume_turn_cache_info
+
+        cache_info = consume_turn_cache_info(agent)
+        if cache_info:
+            payload["cache_info"] = cache_info
     if partial:
         payload["partial"] = True
     try:

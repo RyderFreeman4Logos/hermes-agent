@@ -161,3 +161,46 @@ def test_stall_grace_does_not_free_capacity_before_worker_returns():
     assert evt["status"] == "stalled"
     assert evt["exit_reason"] == "stalled"
     assert ad.active_count() == 0
+
+
+def test_compression_rotation_preserves_parent_owned_lifecycle():
+    interrupted = threading.Event()
+    delegation_id = "delegate-before-compression"
+    with ad._records_lock:
+        ad._records[delegation_id] = {
+            "delegation_id": delegation_id,
+            "status": "running",
+            "parent_session_id": "session-before-compression",
+            "origin_ui_session_id": "stable-ui-owner",
+            "interrupt_fn": interrupted.set,
+        }
+
+    owner_lineage = {
+        "session-before-compression",
+        "session-after-compression",
+    }
+    assert ad.has_live_for_session(
+        parent_session_id="session-after-compression",
+        parent_session_ids=owner_lineage,
+    )
+    assert ad.has_live_for_session(
+        origin_ui_session_id="stable-ui-owner",
+        parent_session_id="session-after-compression",
+    )
+    visible = ad.list_async_delegations_for_owner(
+        parent_session_id="session-after-compression",
+        parent_session_ids=owner_lineage,
+    )
+    assert [item["delegation_id"] for item in visible] == [delegation_id]
+    assert ad.interrupt_for_session(
+        parent_session_id="session-after-compression",
+        parent_session_ids=owner_lineage,
+        reason="compression-owner-close",
+    ) == 1
+    assert interrupted.is_set()
+
+    assert not ad.has_live_for_session(
+        origin_ui_session_id="unrelated-ui-owner",
+        parent_session_id="unrelated-session",
+        parent_session_ids={"unrelated-session"},
+    )

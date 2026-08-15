@@ -491,8 +491,21 @@ class CLICommandsMixin:
         # Background (async) delegations — delegate_task(background=true)
         try:
             from tools.async_delegation import list_async_delegations_for_owner
+            parent_session_id = str(getattr(self, "session_id", "") or "")
+            parent_session_ids = [parent_session_id]
+            if parent_session_id:
+                from hermes_state import SessionDB
+
+                _delegation_db = SessionDB()
+                try:
+                    parent_session_ids = _delegation_db.get_compression_lineage(
+                        parent_session_id
+                    )
+                finally:
+                    _delegation_db.close()
             delegations = list_async_delegations_for_owner(
-                parent_session_id=str(getattr(self, "session_id", "") or "")
+                parent_session_id=parent_session_id,
+                parent_session_ids=parent_session_ids,
             )
         except Exception:
             delegations = []

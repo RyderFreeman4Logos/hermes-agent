@@ -44,7 +44,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from typing import Any, Callable, Dict, Iterator, List, Optional
+from typing import Any, Callable, Collection, Dict, Iterator, List, Optional
 
 from hermes_constants import get_hermes_home
 from tools.daemon_pool import DaemonThreadPoolExecutor
@@ -734,17 +734,29 @@ def _matches_session_selectors(
     session_key: str = "",
     origin_ui_session_id: str = "",
     parent_session_id: str = "",
+    parent_session_ids: Optional[Collection[str]] = None,
 ) -> bool:
-    """Authorize lifecycle control only by the spawning parent principal."""
-    del session_key, origin_ui_session_id
+    """Authorize only the spawning UI principal or compression lineage."""
+    del session_key
+    record_ui_owner = str(record.get("origin_ui_session_id") or "")
+    if origin_ui_session_id and record_ui_owner == str(origin_ui_session_id):
+        return True
+    allowed_parent_ids = {
+        str(owner_id)
+        for owner_id in (parent_session_ids or ())
+        if owner_id
+    }
+    if parent_session_id:
+        allowed_parent_ids.add(str(parent_session_id))
     record_parent = str(record.get("parent_session_id") or "")
-    return bool(parent_session_id and record_parent == str(parent_session_id))
+    return bool(record_parent and record_parent in allowed_parent_ids)
 
 
 def has_live_for_session(
     session_key: str = "",
     origin_ui_session_id: str = "",
     parent_session_id: str = "",
+    parent_session_ids: Optional[Collection[str]] = None,
 ) -> bool:
     """Whether a session still owns any live async delegation.
 
@@ -752,7 +764,7 @@ def has_live_for_session(
     reapers' keepalive contract.
     keepalive treats as active work.
     """
-    if not parent_session_id:
+    if not parent_session_id and not parent_session_ids and not origin_ui_session_id:
         return False
     with _records_lock:
         return any(
@@ -762,6 +774,7 @@ def has_live_for_session(
                 session_key=session_key,
                 origin_ui_session_id=origin_ui_session_id,
                 parent_session_id=parent_session_id,
+                parent_session_ids=parent_session_ids,
             )
             for r in _records.values()
         )
@@ -1606,9 +1619,14 @@ def list_async_delegations() -> List[Dict[str, Any]]:
     return items
 
 
-def list_async_delegations_for_owner(*, parent_session_id: str) -> List[Dict[str, Any]]:
+def list_async_delegations_for_owner(
+    *,
+    parent_session_id: str,
+    parent_session_ids: Optional[Collection[str]] = None,
+    origin_ui_session_id: str = "",
+) -> List[Dict[str, Any]]:
     """Return the calling parent's delegation status without task payloads."""
-    if not parent_session_id:
+    if not parent_session_id and not parent_session_ids and not origin_ui_session_id:
         return []
     allowed = {
         "delegation_id", "status", "dispatched_at", "completed_at", "is_batch",
@@ -1618,7 +1636,12 @@ def list_async_delegations_for_owner(*, parent_session_id: str) -> List[Dict[str
     return [
         {key: value for key, value in item.items() if key in allowed}
         for item in list_async_delegations()
-        if _matches_session_selectors(item, parent_session_id=parent_session_id)
+        if _matches_session_selectors(
+            item,
+            parent_session_id=parent_session_id,
+            parent_session_ids=parent_session_ids,
+            origin_ui_session_id=origin_ui_session_id,
+        )
     ]
 
 
@@ -1705,6 +1728,7 @@ def interrupt_for_session(
     session_key: str = "",
     origin_ui_session_id: str = "",
     parent_session_id: str = "",
+    parent_session_ids: Optional[Collection[str]] = None,
     reason: str = "session_end",
 ) -> int:
     """Cancel queued or running async delegations owned by one session.
@@ -1715,17 +1739,17 @@ def interrupt_for_session(
     with no live owner, either leaking into another chat or burning tokens
     with no one listening (#55578).
 
-    Selectors (any matching field claims the record):
-    - ``origin_ui_session_id``: the live TUI tab/window that commissioned it.
-    - ``session_key``: the durable routing key captured at dispatch.
-    - ``parent_session_id``: the spawning agent's durable session-db id —
-      the right selector for gateway chats, whose ``session_key`` (the
-      platform conversation key) SURVIVES a ``/new`` reset while the
-      session id rotates.
+    Authorized selectors:
+    - ``origin_ui_session_id``: the stable live TUI principal that commissioned it.
+    - ``parent_session_id`` / ``parent_session_ids``: the spawning agent's
+      durable session id and a caller-proven canonical compression lineage.
+
+    ``session_key`` remains accepted for call compatibility but never grants
+    ownership because a platform routing key can survive an unrelated ``/new``.
 
     Returns how many were interrupted.
     """
-    if not parent_session_id:
+    if not parent_session_id and not parent_session_ids and not origin_ui_session_id:
         return 0
     count = 0
     with _records_lock:
@@ -1738,6 +1762,7 @@ def interrupt_for_session(
                 session_key=session_key,
                 origin_ui_session_id=origin_ui_session_id,
                 parent_session_id=parent_session_id,
+                parent_session_ids=parent_session_ids,
             )
         ]
         targets.sort(

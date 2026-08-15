@@ -895,8 +895,14 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
         parent_session_id = str(
             getattr(session.get("agent"), "session_id", "") or ""
         )
+        parent_session_ids = (
+            _compression_delegation_owner_ids(parent_session_id)
+            if _tui_owns_lifecycle else ()
+        )
         interrupt_for_session(
+            origin_ui_session_id=_own_sid if _tui_owns_lifecycle else "",
             parent_session_id=parent_session_id if _tui_owns_lifecycle else "",
+            parent_session_ids=parent_session_ids,
             reason=end_reason,
         )
     except Exception:
@@ -1110,13 +1116,26 @@ def _session_async_delegation_selectors(
     return own_sid, parent_session_id
 
 
+def _compression_delegation_owner_ids(session_id: str) -> tuple[str, ...]:
+    """Return the canonical compression lineage for one durable owner."""
+    if not session_id:
+        return ()
+    try:
+        db = _get_db()
+        lineage = db.get_compression_lineage(session_id) if db is not None else []
+    except Exception:
+        lineage = []
+    return tuple(dict.fromkeys([session_id, *lineage]))
+
+
 def _session_has_active_delegations(sid: str, session: dict | None = None) -> bool:
     """True when UI session ``sid`` still owns live background work.
 
-    Matches by the live UI sid AND — when the TUI owns the durable lifecycle
-    (never for gateway-viewer tabs, #60609) — by the durable session_key, so a
-    delegation dispatched from an earlier tab of the same resumed session still
-    keeps it alive.
+    Matches by the live UI principal and, when the TUI owns the durable
+    lifecycle (never for gateway-viewer tabs, #60609), by the canonical
+    compression lineage. A pre-compression dispatch therefore remains live
+    after ``agent.session_id`` rotates without broadening ownership to a reused
+    routing key.
     """
     if session is None:
         with _sessions_lock:
@@ -1129,7 +1148,11 @@ def _session_has_active_delegations(sid: str, session: dict | None = None) -> bo
     try:
         from tools.async_delegation import has_live_for_session
 
-        return has_live_for_session(parent_session_id=parent_session_id)
+        return has_live_for_session(
+            origin_ui_session_id=_own_sid,
+            parent_session_id=parent_session_id,
+            parent_session_ids=_compression_delegation_owner_ids(parent_session_id),
+        )
     except Exception:
         logger.debug(
             "Failed to query active delegations for UI session %s",

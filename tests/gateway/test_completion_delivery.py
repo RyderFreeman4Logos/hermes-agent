@@ -459,10 +459,14 @@ def test_coalesced_success_records_every_completion_identity():
     ]
 
     async def _exercise():
-        return await asyncio.gather(*(
+        accepted = await asyncio.gather(*(
             runner._enqueue_process_completion_notification(f"event-{index}", event)
             for index, event in enumerate(events)
         ))
+        await runner._finish_completion_delivery_receipt(
+            adapter.handle_message.await_args.args[0], "committed"
+        )
+        return accepted
 
     assert asyncio.run(_exercise()) == [True, True, True]
     for event in events:
@@ -551,15 +555,60 @@ def test_duplicate_primary_does_not_discard_fresh_batch_sibling():
     runner._completion_deliveries_delivered[duplicate_identity] = None
 
     async def _exercise():
-        return await asyncio.gather(
+        accepted = await asyncio.gather(
             runner._enqueue_process_completion_notification("duplicate", duplicate),
             runner._enqueue_process_completion_notification("fresh", fresh),
         )
+        await runner._finish_completion_delivery_receipt(
+            adapter.handle_message.await_args.args[0], "committed"
+        )
+        return accepted
 
     assert asyncio.run(_exercise()) == [True, True]
     adapter.handle_message.assert_awaited_once()
     fresh_identity = runner._completion_delivery_identity(fresh)
     assert fresh_identity in runner._completion_deliveries_delivered
+
+
+def test_accepted_process_batch_releases_all_receipts_after_provider_failure(
+    isolated_registry,
+):
+    """Adapter acceptance cannot acknowledge any member before turn commit."""
+    from tools import async_delegation
+
+    events = [
+        _completion_event(started_at=float(index + 1), session_id=f"proc_fenced_{index}")
+        for index in range(2)
+    ]
+    for event in events:
+        assert async_delegation.persist_event_delivery(event)
+
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+
+    async def _exercise():
+        accepted = await asyncio.gather(*(
+            runner._enqueue_process_completion_notification(f"event-{index}", event)
+            for index, event in enumerate(events)
+        ))
+        assert accepted == [True, True]
+        synthetic = adapter.handle_message.await_args.args[0]
+        assert isinstance(synthetic.metadata.get("_completion_delivery_receipt"), dict)
+        assert len(synthetic.metadata.get("_completion_delivery_receipts", [])) == 1
+        await runner._finish_completion_delivery_receipt(
+            synthetic, "provider_failed"
+        )
+
+    asyncio.run(_exercise())
+
+    assert [
+        async_delegation.get_durable_event_delivery(event)["delivery_state"]
+        for event in events
+    ] == ["pending", "pending"]
+    assert [
+        event["session_id"]
+        for event in list(isolated_registry.completion_queue.queue)
+    ] == ["proc_fenced_0", "proc_fenced_1"]
 
 
 def test_batch_format_failure_resolves_waiters_for_retry(monkeypatch):
@@ -768,7 +817,13 @@ def test_same_tick_async_batch_coalesces_into_one_turn_and_acks_all_rows(
     runner = _runner(adapter)
     _stop_after_sleeps(monkeypatch, runner, count=2)
 
-    asyncio.run(runner._async_delegation_watcher(interval=0))
+    async def _exercise():
+        await runner._async_delegation_watcher(interval=0)
+        await runner._finish_completion_delivery_receipt(
+            adapter.handle_message.await_args.args[0], "committed"
+        )
+
+    asyncio.run(_exercise())
 
     adapter.handle_message.assert_awaited_once()
     delivered = adapter.handle_message.await_args.args[0]
@@ -780,6 +835,42 @@ def test_same_tick_async_batch_coalesces_into_one_turn_and_acks_all_rows(
         assert row is not None
         assert row["delivery_state"] == "delivered"
     assert isolated.empty()
+
+
+def test_accepted_async_batch_releases_all_receipts_after_suffix_failure(
+    isolated_registry,
+):
+    """A failed completion suffix leaves every coalesced delegation retryable."""
+    from tools import async_delegation
+
+    events = [_distinct_async_event(f"deleg_fenced_{index}") for index in range(2)]
+    for event in events:
+        _persist_pending_completion(event)
+
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+
+    async def _exercise():
+        assert await runner._deliver_async_delegation_group(events) is True
+        synthetic = adapter.handle_message.await_args.args[0]
+        assert isinstance(synthetic.metadata.get("_completion_delivery_receipt"), dict)
+        assert len(synthetic.metadata.get("_completion_delivery_receipts", [])) == 1
+        await runner._finish_completion_delivery_receipt(
+            synthetic, "provider_failed"
+        )
+
+    asyncio.run(_exercise())
+
+    assert [
+        async_delegation.get_durable_delegation(event["delegation_id"])[
+            "delivery_state"
+        ]
+        for event in events
+    ] == ["pending", "pending"]
+    assert [
+        event["delegation_id"]
+        for event in list(isolated_registry.completion_queue.queue)
+    ] == ["deleg_fenced_0", "deleg_fenced_1"]
 
 
 def test_same_tick_async_events_for_different_sessions_do_not_coalesce(
@@ -844,7 +935,13 @@ def test_failed_coalesced_async_batch_releases_claims_and_retries(
     runner = _runner(adapter)
     _stop_after_sleeps(monkeypatch, runner, count=3)
 
-    asyncio.run(runner._async_delegation_watcher(interval=0))
+    async def _exercise():
+        await runner._async_delegation_watcher(interval=0)
+        await runner._finish_completion_delivery_receipt(
+            adapter.handle_message.await_args_list[-1].args[0], "committed"
+        )
+
+    asyncio.run(_exercise())
 
     # First tick fails as one batch, second tick delivers the same batch.
     assert adapter.handle_message.await_count == 2

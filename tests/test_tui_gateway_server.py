@@ -13735,6 +13735,51 @@ def test_prompt_submit_surfaces_backend_error_as_visible_text(monkeypatch):
     assert "kimi-k2.6" in payload.get("text", "")
 
 
+def test_prompt_submit_forwards_gateway_owned_cache_info(monkeypatch):
+    cache_info = {
+        "attribution": "post_compression",
+        "cached_tokens": 128,
+        "prompt_tokens": 165_611,
+        "state": "hit",
+        "text": "Cache: 128/165,611 tokens (<1% hit, 0 written)",
+        "write_tokens": 0,
+    }
+
+    class _Agent:
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None, **_kwargs
+        ):
+            return {
+                "cache_info": cache_info,
+                "completed": True,
+                "final_response": "done",
+                "messages": [],
+            }
+
+    server._sessions["sid"] = _session(agent=_Agent())
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    emitted: list[tuple[str, str, dict]] = []
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event, sid, payload=None: emitted.append((event, sid, payload or {})),
+    )
+    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
+    monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+
+    server.handle_request(
+        {
+            "id": "1",
+            "method": "prompt.submit",
+            "params": {"session_id": "sid", "text": "hello"},
+        }
+    )
+
+    complete = [payload for event, _, payload in emitted if event == "message.complete"]
+    assert complete[-1]["cache_info"] == cache_info
+
+
 def test_prompt_submit_preserves_empty_response_without_error(monkeypatch):
     """An empty final_response with NO backend error must stay empty — do not
     synthesize an error string. Preserves the existing None/empty-sentinel

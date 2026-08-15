@@ -10777,6 +10777,8 @@ def _run_prompt_submit(
                 status = "complete"
 
             payload = {"text": raw, "usage": _get_usage(agent), "status": status}
+            if isinstance(result, dict) and result.get("cache_info"):
+                payload["cache_info"] = result["cache_info"]
             if last_reasoning:
                 payload["reasoning"] = last_reasoning
             if status_note:

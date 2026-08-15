@@ -1808,6 +1808,7 @@ def run_conversation(
     # (early failure / interrupt) so the hook receives None rather than a
     # stale prior turn's usage.
     agent._last_turn_usage = None
+    agent._first_turn_cache_info = None
 
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
     # turn to the codex app-server subprocess (terminal/file ops/patching
@@ -3855,6 +3856,26 @@ def run_conversation(
                             False,
                         )
                     )
+                    from agent.cache_attribution import (
+                        cache_info_from_usage,
+                        cache_log_suffix,
+                        cache_telemetry_present,
+                        format_cache_hit_percent,
+                        record_first_turn_cache_info,
+                    )
+
+                    _cache_telemetry_present = cache_telemetry_present(
+                        getattr(response, "usage", None)
+                    )
+                    _call_cache_info = cache_info_from_usage(
+                        usage_dict,
+                        telemetry_present=_cache_telemetry_present,
+                    )
+                    record_first_turn_cache_info(
+                        agent,
+                        usage_dict,
+                        telemetry_present=_cache_telemetry_present,
+                    )
                     agent.context_compressor.update_from_response(usage_dict)
                     _compression_threshold = int(
                         getattr(agent.context_compressor, "threshold_tokens", 0)
@@ -3931,14 +3952,18 @@ def run_conversation(
                     agent.session_reasoning_tokens += canonical_usage.reasoning_tokens
 
                     # Log API call details for debugging/observability
-                    _cache_pct = ""
+                    _cache_suffix = ""
                     if canonical_usage.cache_read_tokens and prompt_tokens:
-                        _cache_pct = f" cache={canonical_usage.cache_read_tokens}/{prompt_tokens} ({100*canonical_usage.cache_read_tokens/prompt_tokens:.0f}%)"
+                        _cache_suffix = (
+                            f" cache={canonical_usage.cache_read_tokens}/{prompt_tokens} "
+                            f"({100 * canonical_usage.cache_read_tokens / prompt_tokens:.0f}%)"
+                        )
+                    _cache_suffix += f" {cache_log_suffix(_call_cache_info)}"
                     logger.info(
                         "API call #%d: model=%s provider=%s in=%d out=%d total=%d latency=%.1fs%s",
                         agent.session_api_calls, agent.model, agent.provider or "unknown",
                         prompt_tokens, completion_tokens, total_tokens,
-                        api_duration, _cache_pct,
+                        api_duration, _cache_suffix,
                     )
 
                     # On the MoA path, agent.model/provider are the virtual
@@ -4054,11 +4079,10 @@ def run_conversation(
                     written = canonical_usage.cache_write_tokens
                     prompt = usage_dict["prompt_tokens"]
                     if (cached or written) and not agent.quiet_mode:
-                        hit_pct = (cached / prompt * 100) if prompt > 0 else 0
                         agent._vprint(
                             f"{agent.log_prefix}   💾 Cache: "
                             f"{cached:,}/{prompt:,} tokens "
-                            f"({hit_pct:.0f}% hit, {written:,} written)"
+                            f"({format_cache_hit_percent(cached, prompt)} hit, {written:,} written)"
                         )
                 
                 _retry.has_retried_429 = False  # Reset on success

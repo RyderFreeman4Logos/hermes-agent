@@ -1864,6 +1864,7 @@ def run_conversation(
     agent._last_turn_usage = None
     agent._first_turn_usage = None
     agent._first_turn_cache_info = None
+    agent._tui_cache_turn_serial = getattr(agent, "_tui_cache_turn_serial", 0) + 1
 
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
     # turn to the codex app-server subprocess (terminal/file ops/patching

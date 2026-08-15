@@ -6261,8 +6261,10 @@ def _agent_cbs(sid: str) -> dict:
 
 def _attach_tui_cache_callback(agent, sid: str):
     """Attach both cache collectors to one normalized live TUI signal."""
+    last_signal: tuple[Any, ...] | None = None
 
     def emit_cache_state(*args: Any) -> None:
+        nonlocal last_signal
         if len(args) == 1:
             cache_info = _cache_info_from_turn_result(args[0])
             if cache_info is None:
@@ -6284,6 +6286,19 @@ def _attach_tui_cache_callback(agent, sid: str):
             return
         state = str(cache_info["state"])
         pct = int(cache_info["pct"])
+        signal = (
+            getattr(agent, "_tui_cache_turn_serial", None),
+            state,
+            pct,
+            int(cache_info.get("read_tokens", 0)),
+            int(cache_info.get("prompt_tokens", 0)),
+            cache_info.get("attribution"),
+            cache_info.get("note"),
+            cache_info.get("level"),
+        )
+        if signal == last_signal:
+            return
+        last_signal = signal
         text = (
             f"cache {cache_info.get('percent_label', cache_hit_percent_label(read, prompt))}"
             if state == "hit"

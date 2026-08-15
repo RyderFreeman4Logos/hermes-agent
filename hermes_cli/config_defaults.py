@@ -24,6 +24,10 @@ DEFAULT_CONFIG = {
     # Clamped to the OS hard limit; 0/false/null disables the adjustment.
     "runtime": {
         "nofile_soft_limit": 4096,
+        # Exact route mappings are deliberately opt-in: a family fallback could
+        # send a warm request to a different provider-side prompt cache.
+        "warm_kv_timeout": {"providers": {}},
+        "heartbeat": {"enabled": False},
     },
     # Global active chat session cap across CLI, TUI/dashboard, and messaging.
     # None/0 = unbounded.
@@ -327,6 +331,11 @@ DEFAULT_CONFIG = {
         # it here without patching the built desktop app.
         "font_family": "",
         "timeout": 180,
+        "process_poll_strike_limit": 3,
+        "process_poll_strike_window_s": 120,
+        # Foreground calls whose real execution budget exceeds this are
+        # promoted to managed background execution so the turn stays steerable.
+        "auto_background_timeout_threshold": 200,
         # Bounded grace period (seconds) between SIGTERM and an escalated
         # SIGKILL when terminating a host process tree (browser daemons, etc.).
         # A daemon that stalls in its SIGTERM handler is force-killed after this
@@ -993,6 +1002,16 @@ DEFAULT_CONFIG = {
             "timeout": 30,
             "extra_body": {},
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
+        },
+        # Optional fail-open gate for routine successful background-process
+        # completions. Disabled until the configured route is smoke-proven.
+        "completion_visibility": {
+            "enabled": False,
+            "provider": "pm",
+            "model": "gpt-5.6-luna",
+            "timeout": 20,  # total single-request budget; no retry or fallback
+            "extra_body": {},
+            "reasoning_effort": "max",
         },
         "mcp": {
             "provider": "auto",

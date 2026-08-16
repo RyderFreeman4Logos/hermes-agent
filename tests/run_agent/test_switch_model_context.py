@@ -23,6 +23,10 @@ class _StubStartupCompressor:
     def on_session_start(self, *args, **kwargs):
         return None
 
+    def update_model(self, **kwargs):
+        self.model = kwargs["model"]
+        self.context_length = kwargs["context_length"]
+
 
 def test_route_url_normalization_preserves_path_slash_before_query():
     """A path slash before a query changes OpenAI SDK URL joining."""
@@ -284,3 +288,50 @@ def test_lmstudio_switch_uses_destination_context_and_verified_runtime(monkeypat
     assert call_kwargs.get("config_context_length") == 100_000
     assert agent._config_context_length == 120_000
     assert agent.context_compressor.context_length == 100_000
+
+
+def test_switch_model_drops_previous_profile_request_overrides():
+    """A destination request must not carry the prior profile's extra body."""
+    source_url = "https://source.example/v1"
+    destination_url = "https://destination.example/v1"
+    cfg = {
+        "custom_providers": [
+            {
+                "name": "source",
+                "base_url": source_url,
+                "model": "source-model",
+                "extra_body": {"source_only": True},
+            },
+            {
+                "name": "destination",
+                "base_url": destination_url,
+                "model": "destination-model",
+                "extra_body": {"destination_only": True},
+            },
+        ]
+    }
+    agent = _make_direct_start_agent(
+        cfg,
+        model="source-model",
+        provider="custom:source",
+        base_url=source_url,
+    )
+
+    assert agent._build_api_kwargs([{"role": "user", "content": "before"}])["extra_body"] == {
+        "source_only": True
+    }
+
+    with (
+        patch("agent.model_metadata.get_model_context_length", return_value=128_000),
+        patch("hermes_cli.config.load_config", return_value=cfg),
+    ):
+        agent.switch_model(
+            "destination-model",
+            "custom:destination",
+            api_key="destination-key",
+            base_url=destination_url,
+        )
+
+    assert agent._build_api_kwargs(
+        [{"role": "user", "content": "after"}]
+    )["extra_body"] == {"destination_only": True}

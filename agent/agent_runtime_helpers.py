@@ -2657,6 +2657,9 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     # _client_kwargs is a dict — snapshot a shallow copy so mutating the
     # live dict doesn't poison the rollback target.
     _snapshot["_client_kwargs"] = dict(getattr(agent, "_client_kwargs", {}) or {})
+    _snapshot["request_overrides"] = copy.deepcopy(
+        getattr(agent, "request_overrides", {}) or {}
+    )
     # Snapshot the credential pool reference so a failed client rebuild can
     # restore the original pool (issue #52727: pool reload is part of this
     # switch and must be reversible on rollback).
@@ -2710,6 +2713,16 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
                 "refusing to keep the previous provider's endpoint"
             )
         agent.api_mode = api_mode
+        agent.request_overrides = {}
+        try:
+            from agent.agent_init import _merge_custom_provider_extra_body
+            from hermes_cli.config import get_compatible_custom_providers, load_config
+
+            _merge_custom_provider_extra_body(
+                agent, get_compatible_custom_providers(load_config())
+            )
+        except Exception:
+            logger.debug("request override reset failed on model switch", exc_info=True)
         # Invalidate transport cache — new api_mode may need a different transport
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()

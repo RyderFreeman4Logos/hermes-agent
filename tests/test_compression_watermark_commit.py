@@ -60,6 +60,40 @@ class TestWatermarkCommit:
         ], "tail must follow the summary, in arrival order"
         assert count == 4
 
+    def test_source_guard_allows_append_only_foreign_tail(self, db: SessionDB) -> None:
+        _seed(db)
+        watermark = db.get_active_message_watermark("sess1")
+        source_ids = [int(row["id"]) for row in db.get_messages("sess1")]
+        db.append_message("sess1", role="user", content="mid-compression steer")
+
+        db.archive_and_compact(
+            "sess1", SUMMARY, watermark=watermark, source_ids=source_ids
+        )
+
+        assert [row["content"] for row in db.get_messages("sess1")] == [
+            SUMMARY[0]["content"],
+            SUMMARY[1]["content"],
+            "mid-compression steer",
+        ]
+
+    def test_source_guard_rejects_pre_watermark_source_mutation(
+        self, db: SessionDB
+    ) -> None:
+        _seed(db)
+        watermark = db.get_active_message_watermark("sess1")
+        source_ids = [int(row["id"]) for row in db.get_messages("sess1")]
+        db._conn.execute("UPDATE messages SET active = 0 WHERE id = ?", (source_ids[0],))
+        db._conn.commit()
+
+        with pytest.raises(SessionCompressionInProgressError, match="source changed"):
+            db.archive_and_compact(
+                "sess1", SUMMARY, watermark=watermark, source_ids=source_ids
+            )
+
+        assert [row["content"] for row in db.get_messages("sess1")] == [
+            f"turn {i}" for i in range(1, 6)
+        ]
+
     def test_tail_clone_preserves_every_column(self, db: SessionDB) -> None:
         """The pure-SQL clone must carry sidecar fields byte-exact."""
         _seed(db, 2)
@@ -264,6 +298,31 @@ class TestRotationPathWatermark:
         # Parent keeps its copy for lineage recovery; parent is closed.
         parent_info = db.get_session("sess1")
         assert parent_info["end_reason"] == "compression"
+
+    def test_rotation_source_guard_rejects_pre_watermark_mutation(
+        self, db: SessionDB
+    ) -> None:
+        _seed(db)
+        watermark = db.get_active_message_watermark("sess1")
+        source_ids = [int(row["id"]) for row in db.get_messages("sess1")]
+        assert db.try_acquire_compression_lock("sess1", "rotator") is True
+        db._conn.execute("DELETE FROM messages WHERE id = ?", (source_ids[0],))
+        db._conn.commit()
+
+        with pytest.raises(SessionCompressionInProgressError, match="source changed"):
+            db.publish_compression_child(
+                parent_session_id="sess1",
+                child_session_id="child1",
+                source="test",
+                messages=SUMMARY,
+                compression_lock_holder="rotator",
+                require_compression_lease=True,
+                watermark=watermark,
+                source_ids=source_ids,
+            )
+
+        assert db.get_session("child1") is None
+        assert db.get_session("sess1")["ended_at"] is None
 
     def test_ceiling_excludes_the_rotators_own_flush(self, db: SessionDB) -> None:
         """Rows the rotation path flushes AFTER the ceiling (its own input

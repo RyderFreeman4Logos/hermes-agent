@@ -978,6 +978,7 @@ class ProcessRegistry:
         session_key: str = "",
         env_vars: dict = None,
         use_pty: bool = False,
+        notify_on_complete: bool = False,
     ) -> ProcessSession:
         """
         Spawn a background process locally.
@@ -1005,6 +1006,7 @@ class ProcessRegistry:
             session_key=session_key,
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
             started_at=time.time(),
+            notify_on_complete=notify_on_complete,
         )
 
         pty_scope_attempted = False
@@ -1055,6 +1057,10 @@ class ProcessRegistry:
                 # Store the pty handle on the session for read/write
                 session._pty = pty_proc
 
+                with self._lock:
+                    self._prune_if_needed()
+                    self._running[session.id] = session
+
                 # PTY reader thread
                 reader = threading.Thread(
                     target=self._pty_reader_loop,
@@ -1064,10 +1070,6 @@ class ProcessRegistry:
                 )
                 session._reader_thread = reader
                 reader.start()
-
-                with self._lock:
-                    self._prune_if_needed()
-                    self._running[session.id] = session
 
                 self._write_checkpoint()
                 return session
@@ -1161,6 +1163,10 @@ class ProcessRegistry:
         session.host_start_time = self._safe_host_start_time(session.pid)
 
         try:
+            with self._lock:
+                self._prune_if_needed()
+                self._running[session.id] = session
+
             # Start output reader thread
             reader = threading.Thread(
                 target=self._reader_loop,
@@ -1170,10 +1176,6 @@ class ProcessRegistry:
             )
             session._reader_thread = reader
             reader.start()
-
-            with self._lock:
-                self._prune_if_needed()
-                self._running[session.id] = session
 
             self._write_checkpoint()
         except Exception:
@@ -1216,6 +1218,7 @@ class ProcessRegistry:
         task_id: str = "",
         session_key: str = "",
         timeout: int = 10,
+        notify_on_complete: bool = False,
     ) -> ProcessSession:
         """
         Spawn a background process through a non-local environment backend.
@@ -1237,6 +1240,7 @@ class ProcessRegistry:
             started_at=time.time(),
             env_ref=env,
             pid_scope="sandbox",
+            notify_on_complete=notify_on_complete,
         )
 
         # Run the command in the sandbox with output capture
@@ -1288,6 +1292,10 @@ class ProcessRegistry:
             session.output_buffer = f"Failed to start: {e}"
 
         if not session.exited:
+            with self._lock:
+                self._prune_if_needed()
+                self._running[session.id] = session
+
             # Start a poller thread that periodically reads the log file
             reader = threading.Thread(
                 target=self._env_poller_loop,
@@ -1297,11 +1305,6 @@ class ProcessRegistry:
             )
             session._reader_thread = reader
             reader.start()
-
-        with self._lock:
-            self._prune_if_needed()
-            if not session.exited:
-                self._running[session.id] = session
 
         if not session.exited:
             self._write_checkpoint()

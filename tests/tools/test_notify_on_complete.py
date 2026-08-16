@@ -130,6 +130,36 @@ class TestCompletionQueue:
         ids = {c["session_id"] for c in completions}
         assert ids == {"proc_0", "proc_1", "proc_2"}
 
+    def test_spawn_local_queues_notify_when_reader_finishes_immediately(
+        self, registry, monkeypatch
+    ):
+        """A spawn-advertised notification survives an immediate reader exit."""
+        import tools.process_registry as pr
+
+        class ImmediateThread:
+            def __init__(self, *, target, args, **_kwargs):
+                self.target = target
+                self.args = args
+
+            def start(self):
+                self.target(*self.args)
+
+        def finish(session):
+            session.exited = True
+            session.exit_code = 0
+            session.completion_reason = "exited"
+            registry._move_to_finished(session)
+
+        monkeypatch.setattr(pr.subprocess, "Popen", lambda *_args, **_kwargs: MagicMock(pid=123))
+        monkeypatch.setattr(pr.threading, "Thread", ImmediateThread)
+        monkeypatch.setattr(registry, "_reader_loop", finish)
+        monkeypatch.setattr(registry, "_safe_host_start_time", lambda _pid: None)
+        monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+
+        session = registry.spawn_local("true", cwd="/tmp", notify_on_complete=True)
+
+        assert registry.completion_queue.get_nowait()["session_id"] == session.id
+
 
 # =========================================================================
 # Checkpoint persistence
@@ -299,6 +329,7 @@ def _silent_bg_harness(monkeypatch, tmp_path):
     from types import SimpleNamespace
 
     config = _silent_bg_base_config(tmp_path)
+    spawn_kwargs = []
     dummy_env = SimpleNamespace(
         env={},
         execute=MagicMock(
@@ -306,6 +337,7 @@ def _silent_bg_harness(monkeypatch, tmp_path):
         ),
     )
     def fake_spawn_local(**kwargs):
+        spawn_kwargs.append(kwargs)
         return SimpleNamespace(
             id="proc_silent_test",
             pid=4242,
@@ -326,6 +358,7 @@ def _silent_bg_harness(monkeypatch, tmp_path):
     monkeypatch.setitem(terminal_tool_module._active_environments, "default", dummy_env)
     monkeypatch.setitem(terminal_tool_module._last_activity, "default", 0.0)
     terminal_tool_module._test_env = dummy_env
+    setattr(terminal_tool_module, "_test_spawn_kwargs", spawn_kwargs)
     return terminal_tool_module
 
 
@@ -347,6 +380,16 @@ def test_omitted_background_and_timeout_auto_promote_with_notify(monkeypatch, tm
 
     assert result["session_id"] == "proc_silent_test"
     assert result["notify_on_complete"] is True
+
+
+@pytest.mark.parametrize(
+    "args",
+    [{}, {"background": True, "notify_on_complete": True}],
+)
+def test_notify_is_armed_at_spawn(monkeypatch, tmp_path, args):
+    tt, _result = _call_terminal_handler(monkeypatch, tmp_path, **args)
+
+    assert getattr(tt, "_test_spawn_kwargs")[-1]["notify_on_complete"] is True
 
 
 def test_omitted_background_long_timeout_auto_promotes_before_cap(monkeypatch, tmp_path):

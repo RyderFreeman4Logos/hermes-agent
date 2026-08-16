@@ -455,7 +455,7 @@ def _(rid, params: dict) -> dict:
         with _session_resume_lock:
             live = _find_live_session_by_key(target)
             if live is not None:
-                return _ok(rid, _reuse_live_payload(*live))
+                return _bounded_display_control_response(rid, _reuse_live_payload(*live))
 
         # Lazy/watch resume: register the live session WITHOUT building an agent.
         # Used by the desktop's subagent windows — the child runs inside the
@@ -501,7 +501,7 @@ def _(rid, params: dict) -> dict:
                 lazy=True,
             )
             if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
-                return _ok(rid, _reuse_live_payload(*live))
+                return _bounded_display_control_response(rid, _reuse_live_payload(*live))
             # A delegated child mid-run emits no session events of its own — report
             # its liveness from the relay registry so the window shows a busy turn.
             child_running = _child_run_active(target)
@@ -519,7 +519,7 @@ def _(rid, params: dict) -> dict:
                 logger.debug("child-watch display projection read failed", exc_info=True)
                 display_history = history
             messages = [] if omit_messages else _bounded_display_messages(display_history)
-            return _ok(
+            return _bounded_display_control_response(
                 rid,
                 {
                     "session_id": sid,
@@ -604,7 +604,7 @@ def _(rid, params: dict) -> dict:
                 resume_runtime_overrides=overrides or None,
             )
             if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
-                return _ok(rid, _reuse_live_payload(*live))
+                return _bounded_display_control_response(rid, _reuse_live_payload(*live))
 
             _schedule_agent_build(sid)
             _schedule_session_cap_enforcement()  # trim detached idle sessions over the cap
@@ -631,7 +631,7 @@ def _(rid, params: dict) -> dict:
             }
             if auto_continue is not None:
                 payload["auto_continue"] = auto_continue
-            return _ok(rid, payload)
+            return _bounded_display_control_response(rid, payload)
 
         # Build the agent OUTSIDE the lock — _make_agent can block for seconds
         # (MCP discovery, prompt/skill build, AIAgent construction). Holding
@@ -726,7 +726,7 @@ def _(rid, params: dict) -> dict:
                     omit_messages=omit_messages,
                 )
                 payload["resumed"] = target
-                return _ok(rid, payload)
+                return _bounded_display_control_response(rid, payload)
             try:
                 init_home_token = (
                     set_hermes_home_override(str(profile_home))
@@ -839,7 +839,7 @@ def _(rid, params: dict) -> dict:
     }
     if auto_continue is not None:
         payload["auto_continue"] = auto_continue
-    return _ok(rid, payload)
+    return _bounded_display_control_response(rid, payload)
 
 
 @method("session.cwd.set")
@@ -2530,7 +2530,7 @@ def _(rid, params: dict) -> dict:
                     )
                 except Exception:
                     pass
-    return _ok(
+    return _bounded_display_control_response(
         rid,
         {
             "count": len(history),
@@ -3038,7 +3038,7 @@ def _(rid, params: dict) -> dict:
             with contextlib.suppress(Exception):
                 branch_db.close()
     branched_session = _sessions.get(new_sid)
-    return _ok(
+    return _bounded_display_control_response(
         rid,
         {
             "session_id": new_sid,

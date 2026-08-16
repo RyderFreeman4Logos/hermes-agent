@@ -356,7 +356,7 @@ def recover_abandoned_delegations() -> int:
 
 
 def restore_undelivered_completions(target_queue) -> int:
-    """Enqueue durable pending completions as fresh turns after process start.
+    """Enqueue durable retryable completions as fresh turns after process start.
 
     Every restored event is stamped ``restored=True`` (in-memory only — the
     stamp is added after the durable payload is deserialized and is never

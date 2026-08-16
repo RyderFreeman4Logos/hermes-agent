@@ -116,6 +116,26 @@ def test_parking_is_idempotent_across_repeated_restarts(delegation_db):
     assert second.items == []
 
 
+def test_effect_started_completion_is_retryable_after_restart(delegation_db):
+    """A crash before the durable ACK returns an in-flight effect to pending."""
+    ad = delegation_db
+    _insert_pending(ad, "d-effect-started", attempts=0)
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute(
+            """UPDATE async_delegations SET delivery_state='effect_started',
+                      delivery_claim='crashed-claim', delivery_claimed_at=?
+               WHERE delegation_id=?""",
+            (time.time(), "d-effect-started"),
+        )
+
+    queue = _Queue()
+    assert ad.restore_undelivered_completions(queue) == 1
+    assert [event["delegation_id"] for event in queue.items] == ["d-effect-started"]
+    assert ad.claim_completion_delivery("d-effect-started", "retry-claim")
+    assert ad.complete_completion_delivery("d-effect-started", "retry-claim")
+    assert _delivery_row(ad, "d-effect-started")[0] == "delivered"
+
+
 def test_healthy_completion_is_still_restored(delegation_db):
     """Control: restart survival itself must not regress.
 

@@ -1083,7 +1083,7 @@ TERMINAL_TOOL_DESCRIPTION = """Execute shell commands on a Linux environment. Fi
 Do NOT use cat/head/tail (use read_file), grep/rg/find/ls (use search_files), sed/awk (use patch), or echo/heredoc file creation (use write_file). Reserve terminal for: builds, installs, git, processes, scripts, network, package managers, and anything that needs a shell.
 Environment state persists: activate a virtualenv or export variables once per session, not before every command.
 
-Foreground (default): Short commands return INSTANTLY when done. When timeout exceeds terminal.auto_background_timeout_threshold and background/notify_on_complete are omitted, Hermes promotes the call before execution to managed background mode with completion notification and a 7200s budget.
+Foreground: Set background=false explicitly. Otherwise, an omitted timeout or a timeout above terminal.auto_background_timeout_threshold is promoted before execution to managed background mode with completion notification and a 7200s budget.
 Background: set background=true and notify_on_complete=true for bounded long work; leave notifications off only for servers, watchers, and daemons. Never use nohup, setsid, disown, or trailing '&' because Hermes must track the process.
 After starting a server, verify readiness with a health check or log signal, then act in a separate call. Avoid blind sleep loops.
 Use process(action="poll") only for occasional progress checks. Keep process(wait) short and bounded; for long work, rely on notify_on_complete instead of blocking the turn.
@@ -2937,6 +2937,7 @@ def terminal_tool(
             return tool_error(
                 f"timeout must be a positive number of seconds (got {timeout})."
             )
+        timeout_was_omitted = timeout is None
         effective_timeout = timeout or default_timeout
         execution_timeout = None
         async_delivery_verified = False
@@ -2953,9 +2954,10 @@ def terminal_tool(
         )
         auto_promoted = (
             background_was_omitted
-            and notify_was_omitted
-            and not watch_patterns
-            and effective_timeout > auto_background_threshold
+            and (
+                timeout_was_omitted
+                or effective_timeout > auto_background_threshold
+            )
         )
         if auto_promoted:
             try:
@@ -4220,12 +4222,11 @@ TERMINAL_SCHEMA = {
             },
             "background": {
                 "type": "boolean",
-                "description": "Run in the background, returning a session_id. When this and notify_on_complete are omitted and timeout exceeds terminal.auto_background_timeout_threshold, Hermes enables both before execution. Explicit values are preserved. Pair background=true with notify_on_complete=true for bounded work; leave notifications off only for servers, watchers, and daemons.",
-                "default": False
+                "description": "Run in the background, returning a session_id. When omitted, Hermes enables background and completion notification if timeout is omitted or exceeds terminal.auto_background_timeout_threshold. Explicit background=false is the only auto-promotion opt-out. Pair background=true with notify_on_complete=true for bounded work; leave notifications off only for servers, watchers, and daemons."
             },
             "timeout": {
                 "type": "integer",
-                "description": f"Maximum execution budget in seconds (default: 180). When this exceeds terminal.auto_background_timeout_threshold and background/notify_on_complete are omitted, Hermes promotes the call before execution to background=true, notify_on_complete=true and rewrites its managed budget to {AUTO_BACKGROUND_TIMEOUT}s; any remaining foreground budget above {FOREGROUND_MAX_TIMEOUT}s is rejected.",
+                "description": f"Maximum execution budget in seconds (default: 180). When timeout is omitted, or when it exceeds terminal.auto_background_timeout_threshold while background is omitted, Hermes promotes the call before execution to background=true, notify_on_complete=true and rewrites its managed budget to {AUTO_BACKGROUND_TIMEOUT}s; any remaining foreground budget above {FOREGROUND_MAX_TIMEOUT}s is rejected.",
                 "minimum": 1
             },
             "workdir": {
@@ -4239,8 +4240,7 @@ TERMINAL_SCHEMA = {
             },
             "notify_on_complete": {
                 "type": "boolean",
-                "description": "With background=true: get exactly one notification when the process exits. The right choice for nearly every bounded long task — set it and keep working. MUTUALLY EXCLUSIVE with watch_patterns (watch_patterns is dropped when both are set).",
-                "default": False
+                "description": "With background=true: get exactly one notification when the process exits. Auto-promotion forces this on even when false was explicit. The right choice for nearly every bounded long task — set it and keep working. MUTUALLY EXCLUSIVE with watch_patterns (watch_patterns is dropped when both are set)."
             },
             "watch_patterns": {
                 "type": "array",
@@ -4267,13 +4267,13 @@ def _handle_terminal(args, **kw):
         )
     return terminal_tool(
         command=args.get("command"),
-        background=args.get("background", False),
+        background=args.get("background"),
         timeout=args.get("timeout"),
         task_id=kw.get("task_id"),
         session_id=kw.get("session_id"),
         workdir=args.get("workdir"),
         pty=args.get("pty", False),
-        notify_on_complete=args.get("notify_on_complete", False),
+        notify_on_complete=args.get("notify_on_complete"),
         watch_patterns=args.get("watch_patterns"),
     )
 

@@ -173,7 +173,8 @@ class TestTerminalSchema:
         props = TERMINAL_SCHEMA["parameters"]["properties"]
         assert "notify_on_complete" in props
         assert props["notify_on_complete"]["type"] == "boolean"
-        assert props["notify_on_complete"]["default"] is False
+        assert "default" not in props["background"]
+        assert "default" not in props["notify_on_complete"]
 
     def test_handler_passes_notify(self):
         """_handle_terminal passes notify_on_complete to terminal_tool."""
@@ -301,7 +302,10 @@ def _silent_bg_harness(
     import threading
 
     config = _silent_bg_base_config(tmp_path)
-    dummy_env = SimpleNamespace(env={})
+    dummy_env = SimpleNamespace(
+        env={},
+        execute=lambda *_a, **_kw: {"output": "done", "exit_code": 0, "error": None},
+    )
     spawn_kwargs = {}
     completion_event = threading.Event()
     if completed:
@@ -332,6 +336,77 @@ def _silent_bg_harness(
     monkeypatch.setitem(terminal_tool_module._last_activity, "default", 0.0)
     terminal_tool_module._test_spawn_local_kwargs = spawn_kwargs
     return terminal_tool_module
+
+
+def _call_terminal_handler(monkeypatch, tmp_path, **args):
+    from gateway import session_context
+    from tools import runtime_heartbeat
+
+    tt = _silent_bg_harness(monkeypatch, tmp_path)
+    config = _silent_bg_base_config(tmp_path)
+    config["auto_background_timeout_threshold"] = 7200
+    monkeypatch.setattr(tt, "_get_env_config", lambda: config)
+    monkeypatch.setattr(session_context, "async_delivery_supported", lambda: True)
+    monkeypatch.setattr(runtime_heartbeat, "preflight_current_heartbeat", lambda: None)
+    try:
+        result = json.loads(tt._handle_terminal({"command": "printf done", **args}))
+    finally:
+        tt._active_environments.pop("default", None)
+        tt._last_activity.pop("default", None)
+    return tt, result
+
+
+def test_omitted_background_and_timeout_auto_promote_with_notify(monkeypatch, tmp_path):
+    tt, result = _call_terminal_handler(monkeypatch, tmp_path)
+
+    assert result["notify_on_complete"] is True
+    assert tt._test_spawn_local_kwargs["execution_timeout"] == 7200
+
+
+def test_omitted_background_long_timeout_auto_promotes_before_cap(monkeypatch, tmp_path):
+    tt, result = _call_terminal_handler(monkeypatch, tmp_path, timeout=7201)
+
+    assert result["notify_on_complete"] is True
+    assert "Foreground timeout" not in str(result.get("error"))
+    assert tt._test_spawn_local_kwargs["execution_timeout"] == 7200
+
+
+def test_auto_promotion_forces_explicit_notify_false_to_true(monkeypatch, tmp_path):
+    tt, result = _call_terminal_handler(
+        monkeypatch, tmp_path, timeout=7201, notify_on_complete=False
+    )
+
+    assert result["notify_on_complete"] is True
+    assert tt._test_spawn_local_kwargs["notification_metadata"]["notify_on_complete"] is True
+
+
+def test_timeout_equal_to_threshold_is_not_auto_promoted(monkeypatch, tmp_path):
+    _tt, result = _call_terminal_handler(monkeypatch, tmp_path, timeout=7200)
+
+    assert "Foreground timeout 7200s exceeds the maximum" in result["error"]
+
+
+def test_explicit_background_false_long_timeout_still_rejected(monkeypatch, tmp_path):
+    _tt, result = _call_terminal_handler(
+        monkeypatch, tmp_path, timeout=7200, background=False
+    )
+
+    assert "Foreground timeout 7200s exceeds the maximum" in result["error"]
+
+
+def test_omitted_background_short_explicit_timeout_stays_foreground(monkeypatch, tmp_path):
+    tt = _silent_bg_harness(monkeypatch, tmp_path)
+    env = MagicMock()
+    env.execute.return_value = {"output": "done", "exit_code": 0, "error": None}
+    monkeypatch.setitem(tt._active_environments, "default", env)
+    try:
+        result = json.loads(tt._handle_terminal({"command": "printf done", "timeout": 30}))
+    finally:
+        tt._active_environments.pop("default", None)
+        tt._last_activity.pop("default", None)
+
+    assert result["error"] is None
+    env.execute.assert_called_once()
 
 
 def test_background_without_notify_emits_silent_process_hint(monkeypatch, tmp_path):

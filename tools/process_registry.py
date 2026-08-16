@@ -2842,13 +2842,21 @@ def format_process_notification(evt: dict) -> "str | None":
     _cmd = evt.get("command", "unknown")
 
     if evt_type == "watch_disabled":
-        return f"[IMPORTANT: {evt.get('message', '')}]"
+        return redact_sensitive_text(
+            f"[IMPORTANT: {evt.get('message', '')}]",
+            force=True,
+            redact_url_credentials=True,
+        )
 
     # Overflow events carry their human-readable summary in `message` —
     # without this case they fall through to the completion formatter and
     # surface as a phantom "process exited (exit code ?)" notification.
     if evt_type in ("watch_overflow_tripped", "watch_overflow_released"):
-        return f"[IMPORTANT: {evt.get('message', '')}]"
+        return redact_sensitive_text(
+            f"[IMPORTANT: {evt.get('message', '')}]",
+            force=True,
+            redact_url_credentials=True,
+        )
 
     if evt_type == "watch_match":
         _pat = evt.get("pattern", "?")
@@ -2863,10 +2871,12 @@ def format_process_notification(evt: dict) -> "str | None":
         if _sup:
             text += f"\n({_sup} earlier matches were suppressed by rate limit)"
         text += "]"
-        return text
+        return redact_sensitive_text(text, force=True, redact_url_credentials=True)
 
     if evt_type == "async_delegation":
-        return _format_async_delegation(evt)
+        return redact_sensitive_text(
+            _format_async_delegation(evt), force=True, redact_url_credentials=True
+        )
 
     _exit = evt.get("exit_code", "?")
     _out = evt.get("output", "")
@@ -2885,11 +2895,13 @@ def format_process_notification(evt: dict) -> "str | None":
         _status = "completed normally"
     else:
         _status = "exited"
-    return (
+    return redact_sensitive_text(
         f"[IMPORTANT: Background process {_sid} {_status} "
         f"(exit code {_exit}{_signal}).\n"
         f"Command: {_cmd}\n"
-        f"Output:\n{_out}]"
+        f"Output:\n{_out}]",
+        force=True,
+        redact_url_credentials=True,
     )
 
 

@@ -79,6 +79,25 @@ def _watch_event(session_id="proc_watch", thread_id="42"):
     }
 
 
+def test_gateway_watch_display_uses_official_redactor():
+    """Gateway watch injection redacts raw queue payloads before display."""
+    from gateway.run import _format_gateway_process_notification
+
+    secret = "SYNTHETIC_GATEWAY_EVENT_1a2b"
+    event = _watch_event()
+    event["output"] = "\n".join(
+        (
+            f"service.auth.token={secret}",
+            "See https://example.invalid/config for remediation.",
+        )
+    )
+
+    displayed = _format_gateway_process_notification(event)
+
+    assert displayed is not None
+    assert secret not in displayed
+
+
 # ---------------------------------------------------------------------------
 # _load_background_notifications_mode unit tests
 # ---------------------------------------------------------------------------

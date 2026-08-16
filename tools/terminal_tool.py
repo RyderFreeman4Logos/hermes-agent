@@ -3007,25 +3007,25 @@ def terminal_tool(
                 )
         heartbeat_interval = None
         heartbeat_provider = ""
+        heartbeat_not_armed = ""
         if background and notify_on_complete:
             try:
                 from tools.runtime_heartbeat import (
-                    HeartbeatConfigError,
                     get_current_provider,
                     preflight_current_heartbeat,
                 )
 
                 heartbeat_interval = preflight_current_heartbeat()
-                if heartbeat_interval is None:
-                    raise HeartbeatConfigError(
-                        "runtime heartbeat interval is unavailable for "
-                        "notify_on_complete"
+                if heartbeat_interval is not None:
+                    heartbeat_provider = get_current_provider()
+                else:
+                    heartbeat_not_armed = (
+                        "Runtime heartbeat is disabled; use the manual WD skill."
                     )
-                heartbeat_provider = get_current_provider()
             except Exception as exc:
-                return tool_error(
-                    "Background command was not started because its cache-warm "
-                    f"heartbeat could not be configured: {exc}"
+                heartbeat_not_armed = (
+                    "Runtime heartbeat was not armed; use the manual WD skill: "
+                    f"{exc}"
                 )
 
         # Guardrail: long-lived server/watch commands should run as managed
@@ -3417,7 +3417,7 @@ def terminal_tool(
                         notification_metadata=notification_metadata,
                     )
 
-                if notify_on_complete:
+                if notify_on_complete and heartbeat_interval is not None:
                     from tools.process_registry import arm_process_heartbeat
 
                     proc_session.heartbeat_provider = heartbeat_provider
@@ -3445,6 +3445,8 @@ def terminal_tool(
                 # Background spawns detached and returns exit_code 0 immediately;
                 # it never inline-polls is_interrupted(), so the stale-bit kill
                 # cannot occur here and this note never co-occurs with rc=130.
+                if heartbeat_not_armed:
+                    result_data["heartbeat_not_armed"] = heartbeat_not_armed
                 if approval_note:
                     result_data["approval"] = approval_note
                 if pty_disabled_reason:

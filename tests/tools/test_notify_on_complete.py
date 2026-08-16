@@ -379,6 +379,9 @@ def test_background_with_notify_does_not_emit_hint(monkeypatch, tmp_path):
         f"Correct usage must not emit a hint, got: {result.get('hint')!r}"
     )
     assert result.get("notify_on_complete") is True
+    assert result["heartbeat_not_armed"] == (
+        "Runtime heartbeat is disabled; use the manual WD skill."
+    )
 
 
 def test_background_notify_metadata_is_published_with_local_spawn(

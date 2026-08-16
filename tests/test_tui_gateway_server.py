@@ -3700,10 +3700,87 @@ def test_session_resume_byte_bounds_display_without_truncating_model_history(
         db.close()
 
     assert "error" not in response, response
-    assert len(json.dumps(response, ensure_ascii=False).encode("utf-8")) < _STREAM_PENDING_BYTES_MAX
+    assert len(json.dumps(response, ensure_ascii=False).encode("utf-8")) + 1 <= _STREAM_PENDING_BYTES_MAX
     assert captured["history"] == expected_model_history
     messages = response["result"]["messages"]
     assert [message["text"] for message in messages] == ["later prompt", "latest reply"]
+
+
+def test_session_resume_bounds_full_control_envelope_with_cached_system_prompt(
+    monkeypatch, tmp_path
+):
+    """A cached prompt must not make the resume control frame exceed stdio's cap."""
+    import hermes_state
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("tip", source="tui")
+    db.append_messages_batch(
+        "tip",
+        [
+            {"role": "user", "content": "tip prompt"},
+            {"role": "assistant", "content": "visible reply"},
+        ],
+    )
+    expected_model_history = db.get_messages_as_conversation(
+        "tip", repair_alternation=True, include_row_ids=True
+    )
+    captured = {}
+
+    class FakeAgent:
+        model = "test"
+        provider = "test"
+        _cached_system_prompt = "x" * (_STREAM_PENDING_BYTES_MAX + 1024)
+
+    def fake_init_session(sid, key, agent, history, **_kwargs):
+        captured["history"] = history
+        server._sessions[sid] = {
+            "agent": agent,
+            "created_at": 1.0,
+            "history": history,
+            "history_lock": threading.Lock(),
+            "session_key": key,
+        }
+
+    monkeypatch.setattr(hermes_state, "resolved_max_resume_messages", lambda: 4)
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_set_session_context", lambda _target: [])
+    monkeypatch.setattr(server, "_clear_session_context", lambda _tokens: None)
+    monkeypatch.setattr(server, "_make_agent", lambda *_args, **_kwargs: FakeAgent())
+    monkeypatch.setattr(
+        server,
+        "_session_info",
+        lambda agent, *_args: {
+            "model": agent.model,
+            "system_prompt": agent._cached_system_prompt,
+        },
+    )
+    monkeypatch.setattr(server, "_init_session", fake_init_session)
+
+    runtime_sid = None
+    try:
+        response = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.resume",
+                "params": {"session_id": "tip", "eager_build": True},
+            }
+        )
+        runtime_sid = response.get("result", {}).get("session_id")
+    finally:
+        if runtime_sid:
+            server._sessions.pop(runtime_sid, None)
+        db.close()
+
+    assert "error" not in response, response
+    assert len(json.dumps(response, ensure_ascii=False).encode("utf-8")) < _STREAM_PENDING_BYTES_MAX
+    assert captured["history"] == expected_model_history
+    assert [message["text"] for message in response["result"]["messages"]] == [
+        "tip prompt",
+        "visible reply",
+    ]
+    assert "system_prompt" not in response["result"]["info"]
 
 
 def test_session_resume_passes_stored_runtime_to_agent(monkeypatch):

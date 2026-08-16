@@ -7810,6 +7810,47 @@ def _bounded_display_messages(history: list[dict]) -> list[dict]:
     return list(reversed(tail))
 
 
+def _bounded_display_control_response(rid: object, payload: dict) -> dict:
+    """Return a resume/history/branch response that fits one stdio control frame."""
+    result = dict(payload)
+
+    def fits() -> bool:
+        return _json_utf8_bytes(_ok(rid, result)) + 1 <= _STREAM_PENDING_BYTES_MAX
+
+    if fits():
+        return _ok(rid, result)
+
+    info = result.get("info")
+    if isinstance(info, dict) and "system_prompt" in info:
+        result["info"] = {key: value for key, value in info.items() if key != "system_prompt"}
+        if fits():
+            return _ok(rid, result)
+
+    messages = result.get("messages")
+    if isinstance(messages, list):
+        # Keep the newest complete display suffix. Binary search avoids repeatedly
+        # serializing every prefix of a long resumed transcript.
+        lo, hi = 0, len(messages)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            result["messages"] = messages[mid:]
+            if fits():
+                hi = mid
+            else:
+                lo = mid + 1
+        result["messages"] = messages[lo:]
+        if fits():
+            return _ok(rid, result)
+
+    # Session info is display metadata; do not truncate security-sensitive
+    # approval/inflight state just to make a reconnect control frame fit.
+    if "info" in result:
+        result["info"] = {}
+    if fits():
+        return _ok(rid, result)
+    return _err(rid, 4131, "session display response exceeds transport limit")
+
+
 def _coerce_seed_history(value: Any) -> list[dict]:
     if not isinstance(value, list):
         return []

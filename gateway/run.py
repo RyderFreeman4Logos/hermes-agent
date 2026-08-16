@@ -3672,35 +3672,13 @@ def _format_concise_process_notification(
 def _format_gateway_process_notification(evt: dict) -> "str | None":
     """Format a watch pattern event from completion_queue into a [IMPORTANT:] message."""
     evt_type = evt.get("type", "completion")
-    _sid = evt.get("session_id", "unknown")
-    _cmd = evt.get("command", "unknown")
-
-    if evt_type == "watch_disabled":
-        return f"[IMPORTANT: {evt.get('message', '')}]"
-
-    # Overflow events carry their human-readable summary in `message`,
-    # like watch_disabled — see the shared formatter in
-    # tools/process_registry.py.
-    if evt_type in ("watch_overflow_tripped", "watch_overflow_released"):
-        return f"[IMPORTANT: {evt.get('message', '')}]"
-
-    if evt_type == "watch_match":
-        _pat = evt.get("pattern", "?")
-        _out = evt.get("output", "")
-        _sup = evt.get("suppressed", 0)
-        text = (
-            f"[IMPORTANT: Background process {_sid} matched "
-            f"watch pattern \"{_pat}\".\n"
-            f"Command: {_cmd}\n"
-            f"Matched output:\n{_out}"
-        )
-        if _sup:
-            text += f"\n({_sup} earlier matches were suppressed by rate limit)"
-        text += "]"
-        return text
-
-    if evt_type == "async_delegation":
-        # Reuse the shared rich formatter (self-contained task-source block).
+    if evt_type in {
+        "watch_disabled",
+        "watch_overflow_tripped",
+        "watch_overflow_released",
+        "watch_match",
+        "async_delegation",
+    }:
         from tools.process_registry import format_process_notification
         return format_process_notification(evt)
 

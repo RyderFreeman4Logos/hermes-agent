@@ -18,6 +18,7 @@ import asyncio
 import atexit
 import contextlib
 import errno
+import fcntl
 import hashlib
 import json
 import logging
@@ -3089,6 +3090,36 @@ def classify_session_status(
     return SESSION_STATUS_COMPLETE
 
 
+@contextmanager
+def _session_db_advisory_write_lock(
+    db_path: Path, *, deadline: float, patience_s: float
+):
+    """Serialize SessionDB writers across processes with a sidecar flock."""
+    lock_path = Path(str(db_path) + ".write.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as handle:
+        acquired = False
+        try:
+            while not acquired:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
+                except OSError as exc:
+                    if exc.errno not in {errno.EACCES, errno.EAGAIN, errno.EDEADLK}:
+                        raise
+                    remaining_s = deadline - time.monotonic()
+                    if remaining_s <= 0:
+                        raise sqlite3.OperationalError(
+                            "database is locked (another Hermes process held the "
+                            f"state.db write lock for over {patience_s:.0f}s)"
+                        ) from exc
+                    time.sleep(min(0.02, remaining_s))
+            yield
+        finally:
+            if acquired:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin):
     """
     SQLite-backed session storage with FTS5 search.
@@ -4006,17 +4037,20 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         while True:
             try:
-                with self._lock:
-                    self._conn.execute("BEGIN IMMEDIATE")
-                    try:
-                        result = fn(self._conn)
-                        self._conn.commit()
-                    except BaseException:
+                with _session_db_advisory_write_lock(
+                    self.db_path, deadline=deadline, patience_s=patience_s
+                ):
+                    with self._lock:
+                        self._conn.execute("BEGIN IMMEDIATE")
                         try:
-                            self._conn.rollback()
-                        except Exception:
-                            pass
-                        raise
+                            result = fn(self._conn)
+                            self._conn.commit()
+                        except BaseException:
+                            try:
+                                self._conn.rollback()
+                            except Exception:
+                                pass
+                            raise
                 # Success — periodic best-effort checkpoint + FTS merge.
                 self._write_count += 1
                 if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:

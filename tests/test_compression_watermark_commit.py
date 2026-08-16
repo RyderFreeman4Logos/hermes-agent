@@ -94,6 +94,25 @@ class TestWatermarkCommit:
             f"turn {i}" for i in range(1, 6)
         ]
 
+    def test_source_guard_rejects_in_place_pre_watermark_sidecar_mutation(
+        self, db: SessionDB
+    ) -> None:
+        _seed(db)
+        watermark, source_signature = db.get_active_message_source_snapshot("sess1")
+        assert db.set_latest_user_api_content("sess1", "turn 4", "stamped sidecar") == 1
+
+        with pytest.raises(SessionCompressionInProgressError, match="source changed"):
+            db.archive_and_compact(
+                "sess1",
+                SUMMARY,
+                watermark=watermark,
+                source_signature=source_signature,
+            )
+
+        assert [row["content"] for row in db.get_messages("sess1")] == [
+            f"turn {i}" for i in range(6)
+        ]
+
     def test_tail_clone_preserves_every_column(self, db: SessionDB) -> None:
         """The pure-SQL clone must carry sidecar fields byte-exact."""
         _seed(db, 2)

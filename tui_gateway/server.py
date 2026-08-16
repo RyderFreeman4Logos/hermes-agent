@@ -2055,6 +2055,53 @@ def _normalize_request(req: Any) -> tuple[Any, str, dict] | dict:
     return rid, method, params
 
 
+def _resume_frame_size(response: dict) -> int:
+    return len(json.dumps(response, ensure_ascii=False).encode("utf-8")) + 1
+
+
+_RESUME_CONTROL_FRAME_BYTES_MAX = 8 * 1024 * 1024
+
+
+def _bound_session_resume_response(response: dict) -> dict:
+    """Keep a session.resume JSON-RPC response within one stdio frame."""
+    result = response.get("result")
+    if not isinstance(result, dict) or _resume_frame_size(response) <= _RESUME_CONTROL_FRAME_BYTES_MAX:
+        return response
+
+    bounded = dict(response)
+    bounded_result = dict(result)
+    bounded["result"] = bounded_result
+    info = bounded_result.get("info")
+    if isinstance(info, dict) and "system_prompt" in info:
+        bounded_result["info"] = {
+            key: value for key, value in info.items() if key != "system_prompt"
+        }
+    if _resume_frame_size(bounded) <= _RESUME_CONTROL_FRAME_BYTES_MAX:
+        return bounded
+
+    messages = bounded_result.get("messages")
+    if isinstance(messages, list):
+        bounded_result["messages"] = []
+        if _resume_frame_size(bounded) <= _RESUME_CONTROL_FRAME_BYTES_MAX:
+            first = 0
+            last = len(messages)
+            while first < last:
+                candidate = (first + last) // 2
+                bounded_result["messages"] = messages[candidate:]
+                if _resume_frame_size(bounded) <= _RESUME_CONTROL_FRAME_BYTES_MAX:
+                    last = candidate
+                else:
+                    first = candidate + 1
+            bounded_result["messages"] = messages[first:]
+            return bounded
+
+    return _err(
+        response.get("id"),
+        4131,
+        "session resume control frame exceeds 8 MiB without display history",
+    )
+
+
 def handle_request(req: dict) -> dict | None:
     normalized = _normalize_request(req)
     if isinstance(normalized, dict):
@@ -2064,7 +2111,8 @@ def handle_request(req: dict) -> dict | None:
     fn = _methods.get(method)
     if not fn:
         return _err(rid, -32601, f"unknown method: {method}")
-    return fn(rid, params)
+    response = fn(rid, params)
+    return _bound_session_resume_response(response) if method == "session.resume" else response
 
 
 def _current_session_steer_authority(

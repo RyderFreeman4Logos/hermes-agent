@@ -467,9 +467,10 @@ class SessionSearchMixin:
             # uses executescript(), which implicitly commits any pending
             # transaction and must not run inside _execute_write's BEGIN
             # IMMEDIATE. Sets fresh backfill markers on a populated DB.
-            with self._lock:
-                self._ensure_fts_cjk_schema(self._conn)
-                self._conn.commit()
+            with self._advisory_write_lock():
+                with self._lock:
+                    self._ensure_fts_cjk_schema(self._conn)
+                    self._conn.commit()
 
     def _fts_external_index_empty_with_messages(self, conn) -> bool:
         """True when the base FTS table exists but indexes nothing while
@@ -731,17 +732,18 @@ class SessionSearchMixin:
         # commits any pending transaction and must not run inside
         # ``_execute_write``'s BEGIN IMMEDIATE (same rule as the CJK recreate
         # path above). Markers are already durable.
-        with self._lock:
-            base_ok = self._ensure_fts_schema(self._conn, "messages_fts", FTS_SQL)
-            trigram_ok = self._ensure_fts_schema(
-                self._conn, "messages_fts_trigram", FTS_TRIGRAM_SQL
-            )
-            self._trigram_available = bool(trigram_ok)
-            if not base_ok:
-                raise sqlite3.OperationalError(
-                    "failed to create v23 messages_fts during optimize-storage demote"
+        with self._advisory_write_lock():
+            with self._lock:
+                base_ok = self._ensure_fts_schema(self._conn, "messages_fts", FTS_SQL)
+                trigram_ok = self._ensure_fts_schema(
+                    self._conn, "messages_fts_trigram", FTS_TRIGRAM_SQL
                 )
-            self._conn.commit()
+                self._trigram_available = bool(trigram_ok)
+                if not base_ok:
+                    raise sqlite3.OperationalError(
+                        "failed to create v23 messages_fts during optimize-storage demote"
+                    )
+                self._conn.commit()
         return hw
 
     def optimize_fts_storage(
@@ -784,22 +786,23 @@ class SessionSearchMixin:
             # Resume mid-demote: markers exist, empty v23 tables may still be
             # missing if the process died between the staged demote commit and
             # schema ensure. Re-ensure is IF NOT EXISTS and cheap.
-            with self._lock:
-                base_ok = self._ensure_fts_schema(
-                    self._conn, "messages_fts", FTS_SQL
-                )
-                trigram_ok = self._ensure_fts_schema(
-                    self._conn, "messages_fts_trigram", FTS_TRIGRAM_SQL
-                )
-                self._trigram_available = bool(trigram_ok)
-                if not base_ok:
-                    # Fail fast: without the base table the backfill loop
-                    # below would retry "no such table" errors forever.
-                    raise sqlite3.OperationalError(
-                        "failed to re-create v23 messages_fts "
-                        "on optimize-storage resume"
+            with self._advisory_write_lock():
+                with self._lock:
+                    base_ok = self._ensure_fts_schema(
+                        self._conn, "messages_fts", FTS_SQL
                     )
-                self._conn.commit()
+                    trigram_ok = self._ensure_fts_schema(
+                        self._conn, "messages_fts_trigram", FTS_TRIGRAM_SQL
+                    )
+                    self._trigram_available = bool(trigram_ok)
+                    if not base_ok:
+                        # Fail fast: without the base table the backfill loop
+                        # below would retry "no such table" errors forever.
+                        raise sqlite3.OperationalError(
+                            "failed to re-create v23 messages_fts "
+                            "on optimize-storage resume"
+                        )
+                    self._conn.commit()
 
         # A stale CJK index (triggers dropped by a tokenizer-less process)
         # can only be recovered from scratch — reset it now so the cjk
@@ -809,9 +812,10 @@ class SessionSearchMixin:
         # legacy work left, tokenizer newly installed): ensure the table +
         # markers exist so the backfill phase has work to claim.
         if self._fts_cjk_loaded:
-            with self._lock:
-                self._ensure_fts_cjk_schema(self._conn)
-                self._conn.commit()
+            with self._advisory_write_lock():
+                with self._lock:
+                    self._ensure_fts_cjk_schema(self._conn)
+                    self._conn.commit()
 
         def _emit(phase: str) -> None:
             if progress_cb is None:
@@ -897,8 +901,9 @@ class SessionSearchMixin:
         if vacuum:
             _emit("vacuum")
             try:
-                with self._lock:
-                    self._conn.execute("VACUUM")
+                with self._advisory_write_lock():
+                    with self._lock:
+                        self._conn.execute("VACUUM")
                 vacuum_ok = True
             except sqlite3.OperationalError as exc:
                 # Most common cause: not enough free disk for VACUUM's temp
@@ -919,8 +924,9 @@ class SessionSearchMixin:
             # SQLITE_BUSY while the gateway holds a read-mark, per the note
             # above; PASSIVE removes the reset attempt entirely.)
             try:
-                with self._lock:
-                    self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                with self._advisory_write_lock():
+                    with self._lock:
+                        self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
             except Exception as exc:
                 logger.debug(
                     "WAL checkpoint (PASSIVE) after optimize VACUUM failed: %s",
@@ -2373,21 +2379,22 @@ class SessionSearchMixin:
         Returns the number of FTS indexes that were optimized.
         """
         optimized = 0
-        with self._lock:
-            for tbl in self._FTS_TABLES:
-                if not self._fts_table_exists(tbl):
-                    continue
-                try:
-                    # The column name in the INSERT must match the table name
-                    # for FTS5 special commands.
-                    self._conn.execute(
-                        f"INSERT INTO {tbl}({tbl}) VALUES('optimize')"
-                    )
-                    optimized += 1
-                except sqlite3.OperationalError as exc:
-                    logger.warning(
-                        "FTS optimize failed for %s: %s", tbl, exc
-                    )
+        with self._advisory_write_lock():
+            with self._lock:
+                for tbl in self._FTS_TABLES:
+                    if not self._fts_table_exists(tbl):
+                        continue
+                    try:
+                        # The column name in the INSERT must match the table name
+                        # for FTS5 special commands.
+                        self._conn.execute(
+                            f"INSERT INTO {tbl}({tbl}) VALUES('optimize')"
+                        )
+                        optimized += 1
+                    except sqlite3.OperationalError as exc:
+                        logger.warning(
+                            "FTS optimize failed for %s: %s", tbl, exc
+                        )
         return optimized
 
     def rebuild_fts(self) -> int:
@@ -2404,21 +2411,22 @@ class SessionSearchMixin:
         Returns the number of FTS indexes that were rebuilt.
         """
         rebuilt = 0
-        with self._lock:
-            for tbl in self._FTS_TABLES:
-                if not self._fts_table_exists(tbl):
-                    continue
-                try:
-                    self._conn.execute(
-                        f"INSERT INTO {tbl}({tbl}) VALUES('rebuild')"
-                    )
-                    self._conn.commit()
-                    rebuilt += 1
-                except sqlite3.OperationalError as exc:
-                    self._conn.rollback()
-                    logger.warning(
-                        "FTS rebuild failed for %s: %s", tbl, exc
-                    )
+        with self._advisory_write_lock():
+            with self._lock:
+                for tbl in self._FTS_TABLES:
+                    if not self._fts_table_exists(tbl):
+                        continue
+                    try:
+                        self._conn.execute(
+                            f"INSERT INTO {tbl}({tbl}) VALUES('rebuild')"
+                        )
+                        self._conn.commit()
+                        rebuilt += 1
+                    except sqlite3.OperationalError as exc:
+                        self._conn.rollback()
+                        logger.warning(
+                            "FTS rebuild failed for %s: %s", tbl, exc
+                        )
         return rebuilt
 
     def _merge_fts_incrementally(
@@ -2467,27 +2475,28 @@ class SessionSearchMixin:
             raise ValueError("max_commands must be greater than zero")
 
         executed = 0
-        with self._lock:
-            for tbl in self._FTS_TABLES:
-                if not self._fts_table_exists(tbl):
-                    continue
-                # One-time (per instance) usermerge floor; the value is
-                # persisted in the index's config shadow table so future
-                # connections inherit it. Setting config is a metadata-only
-                # write — it never touches segment data.
-                if not getattr(self, "_fts_usermerge_floor_applied", False):
-                    self._conn.execute(
-                        f"INSERT INTO {tbl}({tbl}, rank) "
-                        "VALUES('usermerge', 2)"
-                    )
-                for _ in range(max_commands):
-                    before = self._conn.total_changes
-                    self._conn.execute(
-                        f"INSERT INTO {tbl}({tbl}, rank) VALUES('merge', ?)",
-                        (max_pages,),
-                    )
-                    executed += 1
-                    if self._conn.total_changes - before < 2:
-                        break
-            self._fts_usermerge_floor_applied = True
+        with self._advisory_write_lock():
+            with self._lock:
+                for tbl in self._FTS_TABLES:
+                    if not self._fts_table_exists(tbl):
+                        continue
+                    # One-time (per instance) usermerge floor; the value is
+                    # persisted in the index's config shadow table so future
+                    # connections inherit it. Setting config is a metadata-only
+                    # write — it never touches segment data.
+                    if not getattr(self, "_fts_usermerge_floor_applied", False):
+                        self._conn.execute(
+                            f"INSERT INTO {tbl}({tbl}, rank) "
+                            "VALUES('usermerge', 2)"
+                        )
+                    for _ in range(max_commands):
+                        before = self._conn.total_changes
+                        self._conn.execute(
+                            f"INSERT INTO {tbl}({tbl}, rank) VALUES('merge', ?)",
+                            (max_pages,),
+                        )
+                        executed += 1
+                        if self._conn.total_changes - before < 2:
+                            break
+                self._fts_usermerge_floor_applied = True
         return executed

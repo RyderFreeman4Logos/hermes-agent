@@ -61,6 +61,52 @@ def test_advisory_lock_excludes_other_process(db, process_ctx) -> None:
     assert holder.exitcode == 0
 
 
+def test_fts_fail_open_waits_for_advisory_lock(db, process_ctx) -> None:
+    ready, release = process_ctx.Event(), process_ctx.Event()
+    holder = process_ctx.Process(
+        target=_hold_advisory_lock,
+        args=(f"{db.db_path}.write.lock", ready, release),
+    )
+    holder.start()
+    assert ready.wait(10)
+    release_timer = threading.Timer(0.3, release.set)
+    release_timer.start()
+    try:
+        assert db._enter_fts_fail_open(sqlite3.DatabaseError("fts5 corrupt"))
+        assert release.is_set(), "FTS fail-open committed while another process held its lock"
+    finally:
+        release.set()
+        release_timer.join()
+        holder.join(10)
+    assert holder.exitcode == 0
+
+
+def test_schema_initialization_waits_for_advisory_lock(tmp_path, process_ctx) -> None:
+    db_path = tmp_path / "state.db"
+    initial = SessionDB(db_path=db_path)
+    initial.close()
+    ready, release = process_ctx.Event(), process_ctx.Event()
+    holder = process_ctx.Process(
+        target=_hold_advisory_lock,
+        args=(f"{db_path}.write.lock", ready, release),
+    )
+    holder.start()
+    assert ready.wait(10)
+    release_timer = threading.Timer(0.3, release.set)
+    release_timer.start()
+    database = None
+    try:
+        database = SessionDB(db_path=db_path)
+        assert release.is_set(), "schema initialization ran while another process held its lock"
+    finally:
+        if database is not None:
+            database.close()
+        release.set()
+        release_timer.join()
+        holder.join(10)
+    assert holder.exitcode == 0
+
+
 def test_advisory_lock_failure_is_bounded(db, process_ctx) -> None:
     ready, release = process_ctx.Event(), process_ctx.Event()
     holder = process_ctx.Process(

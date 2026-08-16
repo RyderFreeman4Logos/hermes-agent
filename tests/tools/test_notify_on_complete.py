@@ -287,6 +287,7 @@ def _silent_bg_base_config(tmp_path):
         "daytona_image": "",
         "cwd": str(tmp_path),
         "timeout": 30,
+        "auto_background_timeout_threshold": 200,
     }
 
 
@@ -298,8 +299,12 @@ def _silent_bg_harness(monkeypatch, tmp_path):
     from types import SimpleNamespace
 
     config = _silent_bg_base_config(tmp_path)
-    dummy_env = SimpleNamespace(env={})
-
+    dummy_env = SimpleNamespace(
+        env={},
+        execute=MagicMock(
+            return_value={"output": "done", "exit_code": 0, "error": None}
+        ),
+    )
     def fake_spawn_local(**kwargs):
         return SimpleNamespace(
             id="proc_silent_test",
@@ -320,7 +325,60 @@ def _silent_bg_harness(monkeypatch, tmp_path):
     monkeypatch.setattr(process_registry_module.process_registry, "spawn_local", fake_spawn_local)
     monkeypatch.setitem(terminal_tool_module._active_environments, "default", dummy_env)
     monkeypatch.setitem(terminal_tool_module._last_activity, "default", 0.0)
+    terminal_tool_module._test_env = dummy_env
     return terminal_tool_module
+
+
+def _call_terminal_handler(monkeypatch, tmp_path, **args):
+    from gateway import session_context
+
+    tt = _silent_bg_harness(monkeypatch, tmp_path)
+    monkeypatch.setattr(session_context, "async_delivery_supported", lambda: True)
+    try:
+        result = json.loads(tt._handle_terminal({"command": "printf done", **args}))
+    finally:
+        tt._active_environments.pop("default", None)
+        tt._last_activity.pop("default", None)
+    return tt, result
+
+
+def test_omitted_background_and_timeout_auto_promote_with_notify(monkeypatch, tmp_path):
+    _tt, result = _call_terminal_handler(monkeypatch, tmp_path)
+
+    assert result["session_id"] == "proc_silent_test"
+    assert result["notify_on_complete"] is True
+
+
+def test_omitted_background_long_timeout_auto_promotes_before_cap(monkeypatch, tmp_path):
+    _tt, result = _call_terminal_handler(monkeypatch, tmp_path, timeout=7200)
+
+    assert result["session_id"] == "proc_silent_test"
+    assert result["notify_on_complete"] is True
+    assert "Foreground timeout" not in str(result.get("error"))
+
+
+def test_auto_promotion_forces_explicit_notify_false_to_true(monkeypatch, tmp_path):
+    _tt, result = _call_terminal_handler(
+        monkeypatch, tmp_path, timeout=7200, notify_on_complete=False
+    )
+
+    assert result["session_id"] == "proc_silent_test"
+    assert result["notify_on_complete"] is True
+
+
+def test_explicit_background_false_long_timeout_still_rejected(monkeypatch, tmp_path):
+    _tt, result = _call_terminal_handler(
+        monkeypatch, tmp_path, timeout=7200, background=False
+    )
+
+    assert "Foreground timeout 7200s exceeds the maximum" in result["error"]
+
+
+def test_omitted_background_short_explicit_timeout_stays_foreground(monkeypatch, tmp_path):
+    tt, result = _call_terminal_handler(monkeypatch, tmp_path, timeout=30)
+
+    assert result["error"] is None
+    tt._test_env.execute.assert_called_once()
 
 
 def test_background_without_notify_emits_silent_process_hint(monkeypatch, tmp_path):
@@ -349,8 +407,8 @@ def test_background_without_notify_emits_silent_process_hint(monkeypatch, tmp_pa
     )
 
 
-def test_background_with_notify_does_not_emit_hint(monkeypatch, tmp_path):
-    """The correct shape — bg+notify together — must not nag."""
+def test_background_notify_works_without_runtime_heartbeat_or_hint(monkeypatch, tmp_path):
+    """Completion notification does not depend on runtime-heartbeat setup."""
     tt = _silent_bg_harness(monkeypatch, tmp_path)
     try:
         result = json.loads(

@@ -3570,6 +3570,104 @@ def test_session_resume_follows_compression_tip(monkeypatch, tmp_path):
     assert "post-compression reply" in texts
 
 
+def test_session_resume_byte_bounds_display_without_truncating_model_history(
+    monkeypatch, tmp_path
+):
+    """Resume bounds only its display frame, retaining model replay history."""
+    import hermes_state
+    from hermes_state import SessionDB
+
+    resume_frame_limit = 8 * 1024 * 1024
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("root", source="tui")
+    db.append_message("root", role="user", content="old display")
+    db.end_session("root", "compression")
+    db.create_session("tip", source="tui", parent_session_id="root")
+    db.append_messages_batch(
+        "tip",
+        [
+            {"role": "user", "content": "tip prompt"},
+            {"role": "assistant", "content": "x" * (resume_frame_limit + 1024)},
+            {"role": "user", "content": "later prompt"},
+            {"role": "assistant", "content": "latest reply"},
+        ],
+    )
+    expected_model_history = db.get_messages_as_conversation(
+        "tip", repair_alternation=True, include_row_ids=True
+    )
+    captured = {}
+
+    def fake_init_session(sid, key, agent, history, **_kwargs):
+        captured["history"] = history
+        server._sessions[sid] = {
+            "agent": agent,
+            "created_at": 1.0,
+            "history": history,
+            "history_lock": threading.Lock(),
+            "session_key": key,
+        }
+
+    monkeypatch.setattr(hermes_state, "resolved_max_resume_messages", lambda: 0)
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_set_session_context", lambda _target: [])
+    monkeypatch.setattr(server, "_clear_session_context", lambda _tokens: None)
+    monkeypatch.setattr(
+        server,
+        "_make_agent",
+        lambda *_args, **_kwargs: types.SimpleNamespace(model="test", provider="test"),
+    )
+    monkeypatch.setattr(
+        server,
+        "_session_info",
+        lambda *_args: {
+            "model": "test",
+            "system_prompt": "system" * resume_frame_limit,
+            "tools": {},
+            "skills": {},
+        },
+    )
+    monkeypatch.setattr(server, "_init_session", fake_init_session)
+
+    runtime_sid = None
+    try:
+        response = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.resume",
+                "params": {"session_id": "tip", "eager_build": True},
+            }
+        )
+        runtime_sid = response.get("result", {}).get("session_id")
+
+        assert "error" not in response, response
+        assert len(json.dumps(response, ensure_ascii=False).encode("utf-8")) + 1 <= resume_frame_limit
+        assert "system_prompt" not in response["result"]["info"]
+        assert captured["history"] == expected_model_history
+        assert [message["text"] for message in response["result"]["messages"]] == [
+            "later prompt",
+            "latest reply",
+        ]
+
+        server._sessions[runtime_sid]["inflight_turn"] = {
+            "assistant": "",
+            "streaming": True,
+            "user": "x" * resume_frame_limit,
+        }
+        overflow = server.handle_request(
+            {
+                "id": "2",
+                "method": "session.resume",
+                "params": {"session_id": "tip"},
+            }
+        )
+        assert overflow["error"]["code"] == 4131
+    finally:
+        if runtime_sid:
+            server._sessions.pop(runtime_sid, None)
+        db.close()
+
+
 def test_session_resume_passes_stored_runtime_to_agent(monkeypatch):
     captured = {}
 

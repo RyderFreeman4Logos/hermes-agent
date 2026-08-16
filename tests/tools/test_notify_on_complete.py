@@ -392,6 +392,46 @@ def test_notify_is_armed_at_spawn(monkeypatch, tmp_path, args):
     assert getattr(tt, "_test_spawn_kwargs")[-1]["notify_on_complete"] is True
 
 
+def test_unsupported_immediate_exit_does_not_enqueue_completion(monkeypatch, tmp_path):
+    """A refused async promise must not leak an already-completed event."""
+    from gateway import session_context
+    from tools import process_registry as process_registry_module
+
+    tt = _silent_bg_harness(monkeypatch, tmp_path)
+    registry = ProcessRegistry()
+    monkeypatch.setattr(process_registry_module, "process_registry", registry)
+    monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+    monkeypatch.setattr(session_context, "async_delivery_supported", lambda: False)
+
+    def finish_immediately(**kwargs):
+        session = ProcessSession(
+            id="proc_unsupported_immediate",
+            command=kwargs["command"],
+            notify_on_complete=kwargs["notify_on_complete"],
+        )
+        registry._running[session.id] = session
+        session.exited = True
+        session.exit_code = 0
+        session.completion_reason = "exited"
+        registry._move_to_finished(session)
+        return session
+
+    monkeypatch.setattr(registry, "spawn_local", finish_immediately)
+    try:
+        result = json.loads(
+            tt.terminal_tool(
+                command="printf done", background=True, notify_on_complete=True
+            )
+        )
+    finally:
+        tt._active_environments.pop("default", None)
+        tt._last_activity.pop("default", None)
+
+    assert result["notify_on_complete"] is False
+    assert result["notify_unsupported"]
+    assert registry.completion_queue.empty()
+
+
 def test_omitted_background_long_timeout_auto_promotes_before_cap(monkeypatch, tmp_path):
     _tt, result = _call_terminal_handler(monkeypatch, tmp_path, timeout=7200)
 

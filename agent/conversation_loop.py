@@ -7028,8 +7028,20 @@ def run_conversation(
                     _prune = getattr(_compressor, "prune_tool_results_only", None)
                     if callable(_prune):
                         try:
+                            # ``_real_tokens`` is the previous provider
+                            # response's prompt usage.  A tool result has just
+                            # been appended, so that value is stale for this
+                            # prune boundary.  Rebuild the same full request
+                            # estimate used by the turn preflight, including
+                            # the stable system prompt and tool schemas.
+                            _prune_tokens = estimate_request_tokens_rough(
+                                messages,
+                                system_prompt=active_system_prompt or "",
+                                tools=agent.tools or None,
+                                api_mode=getattr(agent, "api_mode", None),
+                            )
                             _pruned_msgs, _pruned_n = _prune(
-                                messages, current_tokens=_real_tokens
+                                messages, current_tokens=_prune_tokens
                             )
                         except Exception:
                             logger.debug(

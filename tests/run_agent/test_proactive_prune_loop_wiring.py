@@ -24,6 +24,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from run_agent import AIAgent
+from agent.model_metadata import estimate_request_tokens_rough
 
 
 def _tool_call(i: int):
@@ -159,14 +160,24 @@ class TestProactivePruneLoopWiring:
         calls = []
 
         def _prune(messages, current_tokens=None):
-            calls.append(current_tokens)
+            calls.append(
+                (
+                    current_tokens,
+                    estimate_request_tokens_rough(
+                        messages,
+                        system_prompt=agent._cached_system_prompt or "",
+                        tools=agent.tools or None,
+                        api_mode=getattr(agent, "api_mode", None),
+                    ),
+                )
+            )
             return messages, 0  # no-op contract: input object back
 
         agent.context_compressor.prune_tool_results_only = _prune
         result = _run_tool_loop(agent, n_tool_iterations=3)
         assert result["completed"] is True
         assert len(calls) == 3  # one shot per tool iteration
-        assert all(t == 120_000 for t in calls)  # fed the real usage reading
+        assert [actual for actual, _ in calls] == [expected for _, expected in calls]
 
     def test_committed_prune_replaces_messages(self, agent):
         marker = "[old tool output pruned]"

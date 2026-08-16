@@ -88,6 +88,24 @@ def test_prunes_below_compression_threshold():
         assert m["content"] != _PRUNED_TOOL_PLACEHOLDER       # informative, not a blank placeholder
 
 
+def test_short_messages_still_use_provider_trigger_for_static_overhead():
+    """The engine preserves provider usage for static prompt/schema overhead.
+
+    Direct engine callers may still use a provider reading to account for
+    static request overhead; the conversation-loop caller now supplies a full
+    current-request estimate instead.
+    """
+    c = _compressor(
+        proactive_prune_tokens=48_000,
+        proactive_prune_min_result_chars=8_000,
+    )
+    msgs = _build(8, big_indices={0, 1, 2})
+    result, pruned = c.prune_tool_results_only(msgs, current_tokens=120_000)
+
+    assert result is not msgs
+    assert pruned >= 3
+
+
 
 
 

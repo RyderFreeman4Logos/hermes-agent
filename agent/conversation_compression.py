@@ -2454,6 +2454,7 @@ def compress_context(
     # Watermark captured at compression start (#75316); None = fall back to
     # archive-everything (no concurrent-tail preservation this cycle).
     _commit_watermark: Optional[int] = None
+    _commit_source_ids: Optional[list[int]] = None
     # Probe whether the lock subsystem is actually available on this
     # SessionDB instance. A process running mismatched module versions can have
     # this call site while its long-lived SessionDB instance predates the lock
@@ -2568,6 +2569,12 @@ def compress_context(
                         _commit_watermark = _lock_db.get_active_message_watermark(
                             _lock_sid
                         )
+                        if _commit_watermark is not None:
+                            _commit_source_ids = [
+                                int(row["id"])
+                                for row in _lock_db.get_messages(_lock_sid)
+                                if int(row["id"]) <= _commit_watermark
+                            ]
                     except Exception as _wm_err:
                         # Watermark capture is safety-additive: without it the
                         # commit falls back to archive-everything (historical
@@ -2579,6 +2586,7 @@ def compress_context(
                             _lock_sid, _wm_err,
                         )
                         _commit_watermark = None
+                        _commit_source_ids = None
             except Exception as _lock_err:
                 # The method exists and entered its implementation but failed.
                 # Do not mistake an internal AttributeError or TypeError for
@@ -3448,6 +3456,7 @@ def compress_context(
                         },
                         watermark=_commit_watermark,
                         lock_holder=_lock_holder,
+                        source_ids=_commit_source_ids,
                     )
                     split_status = "in_place_committed"
                     # Reset the flush identity set so the next turn's appends are
@@ -3547,6 +3556,7 @@ def compress_context(
                             else None
                         ),
                         watermark_ceiling=_foreign_tail_ceiling,
+                        source_ids=_commit_source_ids,
                     )
                     agent.session_id = new_session_id
                     try:

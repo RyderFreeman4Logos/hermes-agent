@@ -5669,6 +5669,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         require_compression_lease: bool = True,
         watermark: Optional[int] = None,
         watermark_ceiling: Optional[int] = None,
+        source_ids: Optional[List[int]] = None,
     ) -> None:
         """Atomically close a parent and publish its durable compression child.
 
@@ -5691,6 +5692,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         The caller captures ``MAX(id)`` immediately BEFORE that flush; only
         rows in ``(watermark, watermark_ceiling]`` are foreign concurrent
         tail. ``None`` = unbounded (no internal flush happened).
+
+        When *source_ids* is supplied, it must still be the active source set
+        at or below *watermark*; source rewrites reject publication, while
+        appends above the watermark still pass through as the foreign tail.
         """
         def _do(conn):
             lock_row = conn.execute(
@@ -5706,6 +5711,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 raise CompressionSessionBusyError(
                     f"Compression lease lost before publication: {parent_session_id}"
                 )
+            self._assert_pre_watermark_source_unchanged(
+                conn, parent_session_id, watermark, source_ids
+            )
             parent = conn.execute(
                 """SELECT ended_at, cwd, git_branch, git_repo_root,
                           user_id, session_key, chat_id, chat_type,
@@ -9949,6 +9957,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         model_config_patch: Optional[Dict[str, Any]] = None,
         watermark: Optional[int] = None,
         lock_holder: Optional[str] = None,
+        source_ids: Optional[List[int]] = None,
     ) -> int:
         """Non-destructive in-place compaction for a single durable session id.
 
@@ -9982,6 +9991,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         ``watermark=None`` preserves the historical archive-everything
         behavior.
 
+        When *source_ids* is supplied, it must still be the active source set
+        at or below *watermark*; a rewritten source aborts instead of letting a
+        stale summary publish over it.
+
         Commit-fence safety: when *lock_holder* is provided, the commit
         verifies INSIDE the transaction that the compression lock is still
         held by that holder and unexpired — a compression whose lease was
@@ -10010,6 +10023,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         f"Compression lease for {session_id!r} lost before "
                         "commit; refusing to publish a stale compaction"
                     )
+
+            self._assert_pre_watermark_source_unchanged(
+                conn, session_id, watermark, source_ids
+            )
 
             patched_model_config = None
             if model_config_patch is not None:
@@ -10093,6 +10110,25 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return inserted
 
         return self._execute_write(_do)
+
+    @staticmethod
+    def _assert_pre_watermark_source_unchanged(
+        conn, session_id: str, watermark: Optional[int], source_ids: Optional[List[int]]
+    ) -> None:
+        if watermark is None or source_ids is None:
+            return
+        current_ids = [
+            int(row[0])
+            for row in conn.execute(
+                "SELECT id FROM messages WHERE session_id = ? AND active = 1 "
+                "AND id <= ? ORDER BY id",
+                (session_id, int(watermark)),
+            ).fetchall()
+        ]
+        if current_ids != source_ids:
+            raise SessionCompressionInProgressError(
+                f"Compression source changed before publication: {session_id}"
+            )
 
     def _message_column_names(self, conn) -> List[str]:
         """Column names of the messages table, cached per-connection era."""

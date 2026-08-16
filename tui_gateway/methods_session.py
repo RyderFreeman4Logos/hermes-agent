@@ -518,7 +518,7 @@ def _(rid, params: dict) -> dict:
             except Exception:
                 logger.debug("child-watch display projection read failed", exc_info=True)
                 display_history = history
-            messages = [] if omit_messages else _history_to_messages(display_history)
+            messages = [] if omit_messages else _bounded_display_messages(display_history)
             return _ok(
                 rid,
                 {
@@ -610,7 +610,7 @@ def _(rid, params: dict) -> dict:
             _schedule_session_cap_enforcement()  # trim detached idle sessions over the cap
             auto_continue = _maybe_schedule_auto_continue(sid, record, target)
 
-            messages = [] if omit_messages else _history_to_messages(display_history)
+            messages = [] if omit_messages else _bounded_display_messages(display_history)
             payload = {
                 "session_id": sid,
                 "resumed": target,
@@ -674,7 +674,7 @@ def _(rid, params: dict) -> dict:
             # session in #29086.  The messaging gateway already strips this; this is
             # the WebUI/TUI resume path picking up the same cleanup.
             history = sanitize_replay_history(raw_history)
-            messages = [] if omit_messages else _history_to_messages(display_history)
+            messages = [] if omit_messages else _bounded_display_messages(display_history)
             tokens = _set_session_context(target)
             try:
                 # Pass the profile's db so the agent persists turns to the right
@@ -2534,7 +2534,7 @@ def _(rid, params: dict) -> dict:
         rid,
         {
             "count": len(history),
-            "messages": _history_to_messages(history),
+            "messages": _bounded_display_messages(history),
         },
     )
 
@@ -3046,7 +3046,7 @@ def _(rid, params: dict) -> dict:
             "title": title,
             "parent": old_key,
             "message_count": len(history),
-            "messages": _history_to_messages(history),
+            "messages": _bounded_display_messages(history),
             "info": _session_info(agent, branched_session),
         },
     )

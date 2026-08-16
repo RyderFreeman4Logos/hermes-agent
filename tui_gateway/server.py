@@ -53,6 +53,7 @@ from tui_gateway.turn_marker import (
     record_turn_start,
 )
 from tui_gateway.transport import (
+    _STREAM_PENDING_BYTES_MAX,
     StdioTransport,
     Transport,
     bind_transport,
@@ -7784,6 +7785,31 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
     return messages
 
 
+# Keep history-bearing control responses below BufferedStreamWriter's 8 MiB
+# ceiling.  The fixed margin covers the JSON-RPC envelope and small metadata.
+_DISPLAY_RESPONSE_BYTES_MAX = _STREAM_PENDING_BYTES_MAX - 64 * 1024
+
+
+def _json_utf8_bytes(value: object) -> int:
+    return len(json.dumps(value, ensure_ascii=False).encode("utf-8", "surrogatepass"))
+
+
+def _bounded_display_messages(history: list[dict]) -> list[dict]:
+    """Return the newest complete display tail that fits one stdio response."""
+    tail: list[dict] = []
+    used = 2  # JSON list delimiters
+    for message in reversed(_history_to_messages(history)):
+        message_bytes = _json_utf8_bytes(message)
+        separator = 1 if tail else 0
+        remaining = _DISPLAY_RESPONSE_BYTES_MAX - used - separator
+        if message_bytes <= remaining:
+            tail.append(message)
+            used += separator + message_bytes
+            continue
+        break
+    return list(reversed(tail))
+
+
 def _coerce_seed_history(value: Any) -> list[dict]:
     if not isinstance(value, list):
         return []
@@ -8927,10 +8953,11 @@ def _live_session_payload(
     else:
         with _session_db(session) as db:
             history = _live_visible_history(session, db, in_memory_history)
+    messages = [] if omit_messages else _bounded_display_messages(history)
     payload = {
         "info": _fallback_session_info(session),
-        "message_count": len(history),
-        "messages": [] if omit_messages else _history_to_messages(history),
+        "message_count": len(history) if omit_messages else len(messages),
+        "messages": messages,
         "messages_omitted": omit_messages,
         "running": running,
         "session_id": sid,

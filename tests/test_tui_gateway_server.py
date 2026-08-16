@@ -16,7 +16,7 @@ from hermes_cli.active_sessions import active_session_registry_snapshot
 from hermes_cli.browser_connect import ChromeDebugLaunch
 from tools import async_delegation as ad
 from tui_gateway import server
-from tui_gateway.transport import bind_transport, reset_transport
+from tui_gateway.transport import _STREAM_PENDING_BYTES_MAX, bind_transport, reset_transport
 
 
 def test_message_complete_event_includes_completion_timestamp(monkeypatch):
@@ -3631,6 +3631,79 @@ def test_session_resume_bounds_compression_display_without_truncating_model_hist
         "verification candidate",
         "tip reply",
     ]
+
+
+def test_session_resume_byte_bounds_display_without_truncating_model_history(
+    monkeypatch, tmp_path
+):
+    """A single display row must not exceed the stdio control-frame ceiling."""
+    import hermes_state
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("root", source="tui")
+    db.append_message("root", role="user", content="old display")
+    db.end_session("root", "compression")
+    db.create_session("tip", source="tui", parent_session_id="root")
+    oversized = "x" * (_STREAM_PENDING_BYTES_MAX + 1024)
+    db.append_messages_batch(
+        "tip",
+        [
+            {"role": "user", "content": "tip prompt"},
+            {"role": "assistant", "content": oversized},
+            {"role": "user", "content": "later prompt"},
+            {"role": "assistant", "content": "latest reply"},
+        ],
+    )
+    expected_model_history = db.get_messages_as_conversation(
+        "tip", repair_alternation=True, include_row_ids=True
+    )
+    captured = {}
+
+    def fake_make_agent(*_args, **_kwargs):
+        return types.SimpleNamespace(model="test", provider="test")
+
+    def fake_init_session(sid, key, agent, history, **_kwargs):
+        captured["history"] = history
+        server._sessions[sid] = {
+            "agent": agent,
+            "created_at": 1.0,
+            "history": history,
+            "history_lock": threading.Lock(),
+            "session_key": key,
+        }
+
+    monkeypatch.setattr(hermes_state, "resolved_max_resume_messages", lambda: 4)
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_set_session_context", lambda _target: [])
+    monkeypatch.setattr(server, "_clear_session_context", lambda _tokens: None)
+    monkeypatch.setattr(server, "_make_agent", fake_make_agent)
+    monkeypatch.setattr(
+        server, "_session_info", lambda *_args: {"model": "test", "tools": {}, "skills": {}}
+    )
+    monkeypatch.setattr(server, "_init_session", fake_init_session)
+
+    runtime_sid = None
+    try:
+        response = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.resume",
+                "params": {"session_id": "tip", "eager_build": True},
+            }
+        )
+        runtime_sid = response.get("result", {}).get("session_id")
+    finally:
+        if runtime_sid:
+            server._sessions.pop(runtime_sid, None)
+        db.close()
+
+    assert "error" not in response, response
+    assert len(json.dumps(response, ensure_ascii=False).encode("utf-8")) < _STREAM_PENDING_BYTES_MAX
+    assert captured["history"] == expected_model_history
+    messages = response["result"]["messages"]
+    assert [message["text"] for message in messages] == ["later prompt", "latest reply"]
 
 
 def test_session_resume_passes_stored_runtime_to_agent(monkeypatch):

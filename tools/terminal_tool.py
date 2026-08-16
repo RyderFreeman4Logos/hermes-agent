@@ -3040,6 +3040,15 @@ def terminal_tool(
                 env_type=env_type,
             )
             try:
+                notify_unsupported = False
+                if notify_on_complete or watch_patterns:
+                    from gateway.session_context import async_delivery_supported
+
+                    if not async_delivery_supported():
+                        notify_on_complete = False
+                        watch_patterns = None
+                        notify_unsupported = True
+
                 if env_type == "local":
                     proc_session = process_registry.spawn_local(
                         command=command,
@@ -3074,6 +3083,21 @@ def terminal_tool(
                     result_data["approval"] = approval_note
                 if pty_disabled_reason:
                     result_data["pty_note"] = pty_disabled_reason
+                if notify_unsupported:
+                    result_data["notify_on_complete"] = False
+                    result_data["notify_unsupported"] = (
+                        "notify_on_complete / watch_patterns are not available in "
+                        "this session — it cannot receive an async completion after "
+                        "the turn ends (a one-shot runner such as `hermes -z`, a "
+                        "cron job, a Kanban worker, or a stateless HTTP endpoint). "
+                        "The process is running in the background; retrieve its result "
+                        "with process(action='poll') or process(action='wait')."
+                    )
+                    logger.info(
+                        "background proc %s: async delivery unsupported on this "
+                        "session; notify_on_complete/watch_patterns disabled",
+                        proc_session.id,
+                    )
 
                 # Nudge: background=True without notify_on_complete=True OR
                 # watch_patterns is a silent process. The agent has NO way to

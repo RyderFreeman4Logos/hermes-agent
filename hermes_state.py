@@ -3235,6 +3235,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 data["system_prompt"] = resolved
         return data
 
+    @contextmanager
+    def _advisory_write_lock(self, deadline: Optional[float] = None):
+        """Use the shared sidecar lock for a SessionDB write outside _execute_write."""
+        patience_s = self._WRITE_PATIENCE_S
+        with _session_db_advisory_write_lock(
+            self.db_path,
+            deadline=deadline if deadline is not None else time.monotonic() + patience_s,
+            patience_s=patience_s,
+        ):
+            yield
+
     @staticmethod
     def _close_connection_quietly(conn: Optional[sqlite3.Connection]) -> None:
         """Close a partially initialized connection without masking its error."""
@@ -3434,27 +3445,28 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 if qpath is None and self.db_path.exists() and is_zeroed_state_db(self.db_path):
                     raise sqlite3.DatabaseError(msg)
 
-            def _connect_and_init():
-                self._conn = _connect_tracked_db(
-                    str(self.db_path),
-                    check_same_thread=False,
-                    # Short timeout — application-level retry with random
-                    # jitter handles contention instead of sitting in
-                    # SQLite's internal busy handler for up to 30s.
-                    timeout=1.0,
-                    # auto-starts transactions on DML, which conflicts with
-                    # our explicit BEGIN IMMEDIATE.  None = we manage
-                    # transactions ourselves.
-                    isolation_level=None,
-                )
-                self._conn.row_factory = sqlite3.Row
-                self._wal_active = (
-                    apply_wal_with_fallback(self._conn, db_label="state.db") == "wal"
-                )
-                apply_database_pragmas(self._conn, db_label="state.db")
-                self._conn.execute("PRAGMA foreign_keys=ON")
-                self._fts_cjk_loaded = load_fts5_cjk_extension(self._conn)
-                self._init_schema()
+            def _connect_and_init(deadline: float):
+                with self._advisory_write_lock(deadline):
+                    self._conn = _connect_tracked_db(
+                        str(self.db_path),
+                        check_same_thread=False,
+                        # Short timeout — application-level retry with random
+                        # jitter handles contention instead of sitting in
+                        # SQLite's internal busy handler for up to 30s.
+                        timeout=1.0,
+                        # auto-starts transactions on DML, which conflicts with
+                        # our explicit BEGIN IMMEDIATE.  None = we manage
+                        # transactions ourselves.
+                        isolation_level=None,
+                    )
+                    self._conn.row_factory = sqlite3.Row
+                    self._wal_active = (
+                        apply_wal_with_fallback(self._conn, db_label="state.db") == "wal"
+                    )
+                    apply_database_pragmas(self._conn, db_label="state.db")
+                    self._conn.execute("PRAGMA foreign_keys=ON")
+                    self._fts_cjk_loaded = load_fts5_cjk_extension(self._conn)
+                    self._init_schema()
 
             def _connect_and_init_with_lock_patience():
                 # Lock contention during open: _init_schema's DDL/reconcile
@@ -3470,7 +3482,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 deadline = time.monotonic() + self._WRITE_PATIENCE_S
                 while True:
                     try:
-                        _connect_and_init()
+                        _connect_and_init(deadline)
                         return
                     except sqlite3.OperationalError as exc:
                         err = str(exc).lower()
@@ -4299,31 +4311,32 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return False
 
         try:
-            with self._lock:
-                self._conn.execute("BEGIN IMMEDIATE")
-                try:
-                    self._conn.execute(
-                        "INSERT INTO state_meta (key, value) VALUES (?, '1') "
-                        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                        (FTS_STALE_KEY,),
-                    )
-                    cjk_triggers_present = self._conn.execute(
-                        "SELECT 1 FROM sqlite_master WHERE type = 'trigger' "
-                        f"AND name IN ({','.join('?' for _ in _FTS_CJK_TRIGGERS)}) "
-                        "LIMIT 1",
-                        _FTS_CJK_TRIGGERS,
-                    ).fetchone()
-                    if cjk_triggers_present:
+            with self._advisory_write_lock():
+                with self._lock:
+                    self._conn.execute("BEGIN IMMEDIATE")
+                    try:
                         self._conn.execute(
                             "INSERT INTO state_meta (key, value) VALUES (?, '1') "
                             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                            (FTS_CJK_STALE_KEY,),
+                            (FTS_STALE_KEY,),
                         )
-                    self._drop_all_fts_triggers(self._conn.cursor())
-                    self._conn.commit()
-                except BaseException:
-                    self._conn.rollback()
-                    raise
+                        cjk_triggers_present = self._conn.execute(
+                            "SELECT 1 FROM sqlite_master WHERE type = 'trigger' "
+                            f"AND name IN ({','.join('?' for _ in _FTS_CJK_TRIGGERS)}) "
+                            "LIMIT 1",
+                            _FTS_CJK_TRIGGERS,
+                        ).fetchone()
+                        if cjk_triggers_present:
+                            self._conn.execute(
+                                "INSERT INTO state_meta (key, value) VALUES (?, '1') "
+                                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                                (FTS_CJK_STALE_KEY,),
+                            )
+                        self._drop_all_fts_triggers(self._conn.cursor())
+                        self._conn.commit()
+                    except BaseException:
+                        self._conn.rollback()
+                        raise
         except sqlite3.Error as detach_exc:
             logger.error(
                 "Could not detach corrupt FTS indexes; canonical write still "
@@ -4363,15 +4376,16 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         from checkpointing thousands of frames at once (issue #45383).
         """
         try:
-            with self._lock:
-                result = self._conn.execute(
-                    "PRAGMA wal_checkpoint(PASSIVE)"
-                ).fetchone()
-                if result and result[1] > 0:
-                    logger.debug(
-                        "WAL checkpoint: %d/%d pages checkpointed",
-                        result[2], result[1],
-                    )
+            with self._advisory_write_lock():
+                with self._lock:
+                    result = self._conn.execute(
+                        "PRAGMA wal_checkpoint(PASSIVE)"
+                    ).fetchone()
+                    if result and result[1] > 0:
+                        logger.debug(
+                            "WAL checkpoint: %d/%d pages checkpointed",
+                            result[2], result[1],
+                        )
         except Exception as exc:
             logger.warning("WAL checkpoint (PASSIVE) failed: %s", exc)
 
@@ -4404,25 +4418,27 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             except queue.Empty:
                 break
             self._close_read_conn(conn)
-        with self._lock:
-            if self._conn:
-                if not self.read_only:
-                    # PASSIVE, not TRUNCATE. Every cron run_agent opens+closes a
-                    # transient SessionDB, so a TRUNCATE here fires a full WAL
-                    # reset many times/hour, racing the gateway's long-lived
-                    # writer on large WAL databases and tearing hot B-tree
-                    # pages -- the #45383 corruption this class's own periodic
-                    # checkpoint was already made PASSIVE to avoid. TRUNCATE
-                    # belongs only on a sole-opener/quiescent connection.
-                    try:
-                        self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-                    except Exception as exc:
-                        logger.debug(
-                            "WAL checkpoint (PASSIVE) at close failed: %s",
-                            exc,
-                        )
-                conn, self._conn = self._conn, None
-                self._close_connection_quietly(conn)
+        lock = self._advisory_write_lock() if not self.read_only else contextlib.nullcontext()
+        with lock:
+            with self._lock:
+                if self._conn:
+                    if not self.read_only:
+                        # PASSIVE, not TRUNCATE. Every cron run_agent opens+closes a
+                        # transient SessionDB, so a TRUNCATE here fires a full WAL
+                        # reset many times/hour, racing the gateway's long-lived
+                        # writer on large WAL databases and tearing hot B-tree
+                        # pages -- the #45383 corruption this class's own periodic
+                        # checkpoint was already made PASSIVE to avoid. TRUNCATE
+                        # belongs only on a sole-opener/quiescent connection.
+                        try:
+                            self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                        except Exception as exc:
+                            logger.debug(
+                                "WAL checkpoint (PASSIVE) at close failed: %s",
+                                exc,
+                            )
+                    conn, self._conn = self._conn, None
+                    self._close_connection_quietly(conn)
 
     def __del__(self) -> None:
         """Safety net: close the connection if the caller forgot.
@@ -12781,21 +12797,22 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         except Exception as exc:
             logger.warning("FTS optimize before VACUUM failed: %s", exc)
         # VACUUM cannot be executed inside a transaction.
-        with self._lock:
-            # Best-effort WAL checkpoint first, then VACUUM. PASSIVE, not
-            # TRUNCATE: a manual `hermes sessions vacuum` runs in a transient
-            # CLI process, and a TRUNCATE reset here would race a live gateway
-            # writer and tear B-tree pages (#45383). VACUUM folds the WAL back
-            # itself; journal_size_limit bounds the file.
-            try:
-                self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-            except Exception as exc:
-                logger.debug("WAL checkpoint (PASSIVE) before VACUUM failed: %s", exc)
-            self._conn.execute("VACUUM")
-            # ...and again afterwards. VACUUM rewrites every page THROUGH the
-            # WAL, so the pre-VACUUM checkpoint above does nothing for the
-            # slack VACUUM itself creates: on a 3.0 GB database it left a
-            # 3.07 GB state.db-wal behind, so `sessions optimize` reported
+        with self._advisory_write_lock():
+            with self._lock:
+                # Best-effort WAL checkpoint first, then VACUUM. PASSIVE, not
+                # TRUNCATE: a manual `hermes sessions vacuum` runs in a transient
+                # CLI process, and a TRUNCATE reset here would race a live gateway
+                # writer and tear B-tree pages (#45383). VACUUM folds the WAL back
+                # itself; journal_size_limit bounds the file.
+                try:
+                    self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                except Exception as exc:
+                    logger.debug("WAL checkpoint (PASSIVE) before VACUUM failed: %s", exc)
+                self._conn.execute("VACUUM")
+                # ...and again afterwards. VACUUM rewrites every page THROUGH the
+                # WAL, so the pre-VACUUM checkpoint above does nothing for the
+                # slack VACUUM itself creates: on a 3.0 GB database it left a
+                # 3.07 GB state.db-wal behind, so `sessions optimize` reported
             # "reclaimed -11.2 MB" while actually consuming 3 GB of disk and
             # filling the host to 100%. Truncating here is what makes the
             # command a net win instead of a net loss on large databases.

@@ -4196,32 +4196,33 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             "and reopening the connection to self-heal (one-shot)."
         )
         try:
-            with self._lock:
-                if self._conn is not None:
-                    try:
-                        self._conn.close()
-                    except Exception:
-                        pass
-                    self._conn = None
-                new_conn = _connect_tracked_db(
-                    str(self.db_path),
-                    tracking_path=self.db_path,
-                    check_same_thread=False,
-                    timeout=1.0,
-                    isolation_level=None,
-                )
-                new_conn.row_factory = sqlite3.Row
-                # Publish BEFORE schema init: _init_schema/_reconcile_columns
-                # operate on self._conn, not on the local variable.
-                self._conn = new_conn
-                self._wal_active = (
-                    apply_wal_with_fallback(new_conn, db_label="state.db")
-                    == "wal"
-                )
-                apply_database_pragmas(new_conn, db_label="state.db")
-                new_conn.execute("PRAGMA foreign_keys=ON")
-                self._fts_cjk_loaded = load_fts5_cjk_extension(new_conn)
-                self._init_schema()
+            with self._advisory_write_lock():
+                with self._lock:
+                    if self._conn is not None:
+                        try:
+                            self._conn.close()
+                        except Exception:
+                            pass
+                        self._conn = None
+                    new_conn = _connect_tracked_db(
+                        str(self.db_path),
+                        tracking_path=self.db_path,
+                        check_same_thread=False,
+                        timeout=1.0,
+                        isolation_level=None,
+                    )
+                    new_conn.row_factory = sqlite3.Row
+                    # Publish BEFORE schema init: _init_schema/_reconcile_columns
+                    # operate on self._conn, not on the local variable.
+                    self._conn = new_conn
+                    self._wal_active = (
+                        apply_wal_with_fallback(new_conn, db_label="state.db")
+                        == "wal"
+                    )
+                    apply_database_pragmas(new_conn, db_label="state.db")
+                    new_conn.execute("PRAGMA foreign_keys=ON")
+                    self._fts_cjk_loaded = load_fts5_cjk_extension(new_conn)
+                    self._init_schema()
         except Exception as exc:
             logger.error(
                 "state.db reconnect after 'file is not a database' failed (%s); "

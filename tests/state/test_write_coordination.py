@@ -81,6 +81,26 @@ def test_fts_fail_open_waits_for_advisory_lock(db, process_ctx) -> None:
     assert holder.exitcode == 0
 
 
+def test_reconnect_after_notadb_waits_for_advisory_lock(db, process_ctx) -> None:
+    ready, release = process_ctx.Event(), process_ctx.Event()
+    holder = process_ctx.Process(
+        target=_hold_advisory_lock,
+        args=(f"{db.db_path}.write.lock", ready, release),
+    )
+    holder.start()
+    assert ready.wait(10)
+    release_timer = threading.Timer(0.3, release.set)
+    release_timer.start()
+    try:
+        assert db._reconnect_after_notadb()
+        assert release.is_set(), "reconnect completed while another process held its lock"
+    finally:
+        release.set()
+        release_timer.join()
+        holder.join(10)
+    assert holder.exitcode == 0
+
+
 def test_schema_initialization_waits_for_advisory_lock(tmp_path, process_ctx) -> None:
     db_path = tmp_path / "state.db"
     initial = SessionDB(db_path=db_path)

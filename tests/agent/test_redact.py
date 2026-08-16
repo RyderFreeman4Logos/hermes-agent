@@ -1051,3 +1051,21 @@ class TestMaskSecretControlStripping:
     def test_all_control_value_returns_empty_fallback(self):
         assert mask_secret("\n\x85\u200b") == ""
         assert mask_secret("\n\x85\u200b", empty="(not set)") == "(not set)"
+
+
+class TestMultilineConfigErrorRedaction:
+    def test_redacts_config_error_beside_url(self):
+        secret = "SYNTHETIC_CONFIG_ERROR_1a2b"
+        payload = "\n".join(
+            (
+                f"service.auth.token={secret}",
+                "See https://example.invalid/config for remediation.",
+            )
+        )
+
+        displayed = redact_sensitive_text(
+            payload, force=True, redact_url_credentials=True
+        )
+
+        assert secret not in displayed
+        assert "example.invalid/config" in displayed

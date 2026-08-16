@@ -2350,3 +2350,37 @@ class TestNotificationRedaction:
         _evt, text = results[0]
         assert "ghp_abc123def456" not in text
         assert "ghp_" not in text or "REDACTED" in text
+
+    @pytest.mark.parametrize("event_type", ["completion", "watch_match"])
+    def test_process_event_display_uses_official_redactor(self, monkeypatch, event_type):
+        """Completion and watch payloads are redacted before TUI/gateway display."""
+        from tools import process_registry as pr
+
+        secret = "SYNTHETIC_PROCESS_EVENT_1a2b"
+        calls = []
+        original = pr.redact_sensitive_text
+
+        def track_redactor(text, **kwargs):
+            calls.append((text, kwargs))
+            return original(text, **kwargs)
+
+        monkeypatch.setattr(pr, "redact_sensitive_text", track_redactor)
+        event = {
+            "type": event_type,
+            "session_id": "proc_display",
+            "command": "python worker.py",
+            "output": "\n".join(
+                (
+                    f"service.auth.token={secret}",
+                    "See https://example.invalid/config for remediation.",
+                )
+            ),
+            "exit_code": 1,
+            "pattern": "READY",
+        }
+
+        displayed = pr.format_process_notification(event)
+
+        assert displayed is not None
+        assert secret not in displayed
+        assert calls

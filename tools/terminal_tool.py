@@ -1574,6 +1574,21 @@ def _get_env_config() -> Dict[str, Any]:
     # Default image with Python and Node.js for maximum compatibility
     default_image = "nikolaik/python-nodejs:python3.11-nodejs20"
     _ensure_terminal_env_bridged()
+    auto_background_timeout_threshold = 200
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        terminal_config = load_config_readonly().get("terminal") or {}
+        auto_background_timeout_threshold = max(
+            1,
+            int(terminal_config.get("auto_background_timeout_threshold", 200)),
+        )
+    except (AttributeError, TypeError, ValueError):
+        logger.warning(
+            "Invalid terminal.auto_background_timeout_threshold; using 200s"
+        )
+    except Exception:
+        logger.debug("Could not load terminal auto-background threshold", exc_info=True)
     env_type = os.getenv("TERMINAL_ENV", "local")
     
     mount_docker_cwd = os.getenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "false").lower() in {"true", "1", "yes"}
@@ -1657,6 +1672,7 @@ def _get_env_config() -> Dict[str, Any]:
         "host_cwd": host_cwd,
         "docker_mount_cwd_to_workspace": mount_docker_cwd,
         "timeout": _parse_env_var("TERMINAL_TIMEOUT", "180"),
+        "auto_background_timeout_threshold": auto_background_timeout_threshold,
         "lifetime_seconds": _parse_env_var("TERMINAL_LIFETIME_SECONDS", "300"),
         # SSH-specific config
         "ssh_host": os.getenv("TERMINAL_SSH_HOST", ""),
@@ -2533,7 +2549,7 @@ def _resolve_command_cwd(
 
 def terminal_tool(
     command: str,
-    background: bool = False,
+    background: Optional[bool] = False,
     timeout: Optional[int] = None,
     task_id: Optional[str] = None,
     session_id: Optional[str] = None,
@@ -2548,7 +2564,7 @@ def terminal_tool(
 
     Args:
         command: The command to execute
-        background: Whether to run in background (default: False)
+        background: Whether to run in background. None means omitted.
         timeout: Command timeout in seconds (default: from config)
         task_id: Unique identifier for environment isolation (optional)
         session_id: Conversation/session identifier for durable observability
@@ -2655,7 +2671,34 @@ def terminal_tool(
             return tool_error(
                 f"timeout must be a positive number of seconds (got {timeout})."
             )
+        timeout_was_omitted = timeout is None
         effective_timeout = timeout or default_timeout
+
+        background_was_omitted = background is None
+        background = False if background_was_omitted else bool(background)
+        auto_background_threshold = int(
+            config.get("auto_background_timeout_threshold", 200)
+        )
+        auto_promoted = background_was_omitted and (
+            timeout_was_omitted or effective_timeout > auto_background_threshold
+        )
+        if auto_promoted:
+            try:
+                from gateway.session_context import async_delivery_supported
+
+                if not async_delivery_supported():
+                    return tool_error(
+                        "Long terminal command was not started: this session cannot "
+                        "deliver a managed background completion. Use a short bounded "
+                        f"timeout at or below {auto_background_threshold}s."
+                    )
+            except Exception:
+                return tool_error(
+                    "Long terminal command was not started because async completion "
+                    "delivery could not be verified."
+                )
+            background = True
+            notify_on_complete = True
 
         # Reject foreground commands where the model explicitly requests
         # a timeout above FOREGROUND_MAX_TIMEOUT — nudge it toward background.
@@ -3796,12 +3839,11 @@ TERMINAL_SCHEMA = {
             },
             "background": {
                 "type": "boolean",
-                "description": "Run in the background, returning a session_id. Pair with notify_on_complete=true for anything with a defined end (tests, builds, deploys) — without it the process runs silently. Only servers/watchers/daemons that never exit should stay silent. Short commands: prefer foreground with a generous timeout.",
-                "default": False
+                "description": "Run in the background, returning a session_id. When omitted, Hermes enables background and completion notification if timeout is omitted or exceeds terminal.auto_background_timeout_threshold. Explicit background=false is the only auto-promotion opt-out. Pair background=true with notify_on_complete=true for bounded work; leave notifications off only for servers, watchers, and daemons."
             },
             "timeout": {
                 "type": "integer",
-                "description": f"Max seconds to wait (default: 180, foreground max: {FOREGROUND_MAX_TIMEOUT}). Returns INSTANTLY when command finishes — set high for long tasks, you won't wait unnecessarily. Foreground timeout above {FOREGROUND_MAX_TIMEOUT}s is rejected; use background=true for longer commands.",
+                "description": f"Max seconds to wait (default: 180, foreground max: {FOREGROUND_MAX_TIMEOUT}). When omitted, or when it exceeds terminal.auto_background_timeout_threshold while background is omitted, Hermes promotes the call to managed background execution with completion notification. Foreground timeout above {FOREGROUND_MAX_TIMEOUT}s is rejected; use background=true for longer commands.",
                 "minimum": 1
             },
             "workdir": {
@@ -3843,7 +3885,7 @@ def _handle_terminal(args, **kw):
         )
     return terminal_tool(
         command=args.get("command"),
-        background=args.get("background", False),
+        background=args.get("background"),
         timeout=args.get("timeout"),
         task_id=kw.get("task_id"),
         session_id=kw.get("session_id"),

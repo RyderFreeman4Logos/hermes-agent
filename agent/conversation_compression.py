@@ -2451,10 +2451,10 @@ def compress_context(
     _lock_db = getattr(agent, "_session_db", None)
     _lock_sid = agent.session_id or ""
     _lock_holder: Optional[str] = None
-    # Watermark captured at compression start (#75316); None = fall back to
-    # archive-everything (no concurrent-tail preservation this cycle).
+    # Watermark + durable source digest captured atomically at compression start
+    # (#75316); None falls back to archive-everything this cycle.
     _commit_watermark: Optional[int] = None
-    _commit_source_ids: Optional[list[int]] = None
+    _commit_source_signature: Optional[str] = None
     # Probe whether the lock subsystem is actually available on this
     # SessionDB instance. A process running mismatched module versions can have
     # this call site while its long-lived SessionDB instance predates the lock
@@ -2560,21 +2560,15 @@ def compress_context(
                     _lock_sid, _lock_holder, ttl_seconds=_lock_ttl
                 )
                 if _lock_acquired:
-                    # Watermark (#75316): MAX(id) of active rows at compression
-                    # START. Appends are NOT blocked while the slow provider
-                    # summary runs — any row landing after this point is
-                    # concurrent tail, and archive_and_compact() re-sequences
-                    # it after the compacted set instead of archiving it.
+                    # Capture the complete durable pre-watermark source in the
+                    # same SQLite snapshot as its tail boundary. Appends after
+                    # that watermark remain a foreign tail; an in-place rewrite
+                    # of an existing durable row rejects stale publication.
                     try:
-                        _commit_watermark = _lock_db.get_active_message_watermark(
-                            _lock_sid
-                        )
-                        if _commit_watermark is not None:
-                            _commit_source_ids = [
-                                int(row["id"])
-                                for row in _lock_db.get_messages(_lock_sid)
-                                if int(row["id"]) <= _commit_watermark
-                            ]
+                        (
+                            _commit_watermark,
+                            _commit_source_signature,
+                        ) = _lock_db.get_active_message_source_snapshot(_lock_sid)
                     except Exception as _wm_err:
                         # Watermark capture is safety-additive: without it the
                         # commit falls back to archive-everything (historical
@@ -2586,7 +2580,7 @@ def compress_context(
                             _lock_sid, _wm_err,
                         )
                         _commit_watermark = None
-                        _commit_source_ids = None
+                        _commit_source_signature = None
             except Exception as _lock_err:
                 # The method exists and entered its implementation but failed.
                 # Do not mistake an internal AttributeError or TypeError for
@@ -3456,7 +3450,7 @@ def compress_context(
                         },
                         watermark=_commit_watermark,
                         lock_holder=_lock_holder,
-                        source_ids=_commit_source_ids,
+                        source_signature=_commit_source_signature,
                     )
                     split_status = "in_place_committed"
                     # Reset the flush identity set so the next turn's appends are
@@ -3556,7 +3550,7 @@ def compress_context(
                             else None
                         ),
                         watermark_ceiling=_foreign_tail_ceiling,
-                        source_ids=_commit_source_ids,
+                        source_signature=_commit_source_signature,
                     )
                     agent.session_id = new_session_id
                     try:

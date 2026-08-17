@@ -20005,6 +20005,90 @@ def test_workspace_move_rehomes_running_session(monkeypatch, tmp_path):
     assert live.get("explicit_cwd") is True
 
 
+def test_tui_cache_warm_due_makes_one_bodyless_provider_request(monkeypatch):
+    from hermes_cli import heartbeat
+
+    class _Due:
+        def due_prompt(self):
+            return ""
+
+    class _Agent:
+        provider = "openai"
+        model = "test-model"
+
+        def __init__(self):
+            self.requests = []
+
+        def _interruptible_api_call(self, request):
+            self.requests.append(request)
+
+    agent = _Agent()
+    session = _session(agent=agent, _cache_warm_route="openai:test-model")
+    monkeypatch.setattr(heartbeat, "HeartbeatManager", lambda *_args, **_kwargs: _Due())
+
+    server._tui_cache_warm_due("cache-warm-sid", session, agent, "openai:test-model")
+
+    assert agent.requests == [{"model": "test-model", "messages": []}]
+    assert session["history"] == []
+
+
+def test_tui_cache_warm_interval_uses_effective_qwen_ttl(monkeypatch):
+    agent = types.SimpleNamespace(provider="alibaba", model="qwen-max", _cache_ttl="1h")
+
+    monkeypatch.setattr(server, "_load_cfg", lambda: {})
+
+    assert server._tui_cache_warm_interval_seconds(agent) == 300
+
+
+def test_tui_cache_warm_user_turn_retains_arm_until_first_provider_response(monkeypatch, tmp_path):
+    class _Timer:
+        cancelled = False
+
+        def cancel(self):
+            self.cancelled = True
+
+    class _Agent:
+        provider = "openai"
+        model = "test-model"
+
+        def __init__(self):
+            self._tui_cache_callback = lambda *_args: None
+
+        def clear_interrupt(self):
+            pass
+
+        def run_conversation(self, _prompt, **_kwargs):
+            self._tui_cache_callback(
+                "no_field", 0, 0, 2_000, {"state": "no_field", "pct": 0}
+            )
+            return {"final_response": "reply", "messages": []}
+
+    agent = _Agent()
+    emitted = []
+    timer = _Timer()
+    session = _session(
+        agent=agent,
+        _cache_warm_timer=timer,
+        _cache_warm_route="openai:test-model",
+        _cache_warm_armed_at=time.monotonic(),
+        _cache_warm_interval=300,
+    )
+    server._sessions["cache-warm-sid"] = session
+    try:
+        _configure_immediate_prompt_run(monkeypatch, tmp_path)
+        monkeypatch.setattr(server, "_emit", lambda *event: emitted.append(event))
+        server._attach_tui_cache_callback(agent, "cache-warm-sid")
+
+        server._run_prompt_submit("rid", "cache-warm-sid", session, "user turn")
+    finally:
+        server._sessions.pop("cache-warm-sid", None)
+
+    assert timer.cancelled is True
+    assert "_cache_warm_previous_arm" not in session
+    cache_updates = [event[2] for event in emitted if event[0] == "status.update"]
+    assert cache_updates[0]["cache_record"]["classification"] == "cache_cold_idle_under_ttl"
+
+
 def test_tui_session_warm_arms_once_and_classifies_idle_miss(monkeypatch):
     from hermes_cli import heartbeat
 

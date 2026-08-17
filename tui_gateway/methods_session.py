@@ -394,7 +394,7 @@ def _(rid, params: dict) -> dict:
         safety_check = getattr(db, "assert_resume_safe", None)
         try:
             if callable(safety_check):
-                safety_check(target)
+                safety_check(target, include_ancestors=False)
             else:
                 resume_limit = resolved_max_resume_messages()
                 stored_message_count = int(found.get("message_count") or 0)

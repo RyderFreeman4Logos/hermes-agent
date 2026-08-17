@@ -3570,6 +3570,79 @@ def test_session_resume_follows_compression_tip(monkeypatch, tmp_path):
     assert "post-compression reply" in texts
 
 
+def test_session_resume_allows_large_compression_display_lineage(monkeypatch, tmp_path):
+    """The TUI guard applies to replay, not archived display ancestors."""
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("root", source="tui")
+    db.append_messages_batch(
+        "root", [{"role": "user", "content": f"archived-{i}"} for i in range(20_000)]
+    )
+    db.end_session("root", "compression")
+    db.create_session("tip", source="tui", parent_session_id="root")
+    db.append_message("tip", role="assistant", content="current reply")
+    expected_model_history = db.get_messages_as_conversation(
+        "tip", repair_alternation=True, include_row_ids=True
+    )
+    captured = {}
+
+    def fake_init_session(_sid, _key, _agent, history, **_kwargs):
+        captured["history"] = history
+
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_set_session_context", lambda _target: [])
+    monkeypatch.setattr(server, "_clear_session_context", lambda _tokens: None)
+    monkeypatch.setattr(
+        server,
+        "_make_agent",
+        lambda *_args, **_kwargs: types.SimpleNamespace(model="test", provider="test"),
+    )
+    monkeypatch.setattr(server, "_session_info", lambda *_args: {"model": "test"})
+    monkeypatch.setattr(server, "_init_session", fake_init_session)
+
+    try:
+        response = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.resume",
+                "params": {"session_id": "tip", "eager_build": True},
+            }
+        )
+    finally:
+        db.close()
+
+    assert "error" not in response, response
+    assert captured["history"] == expected_model_history
+    assert len(response["result"]["messages"]) == 20_001
+
+
+def test_session_resume_rejects_large_model_tip(monkeypatch, tmp_path):
+    """The TUI guard still rejects a model replay that exceeds the limit."""
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("tip", source="tui")
+    db.append_messages_batch(
+        "tip", [{"role": "user", "content": "model replay"}] * 20_001
+    )
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+
+    try:
+        response = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.resume",
+                "params": {"session_id": "tip", "eager_build": True},
+            }
+        )
+    finally:
+        db.close()
+
+    assert response["error"]["code"] == 4130
+
+
 def test_session_resume_byte_bounds_display_without_truncating_model_history(
     monkeypatch, tmp_path
 ):

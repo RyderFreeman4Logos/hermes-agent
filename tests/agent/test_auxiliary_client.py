@@ -1850,6 +1850,82 @@ class TestAuxiliaryFallbackLayering:
         )
 
 
+    @pytest.mark.parametrize("auth_error", [False, True])
+    def test_configured_chain_advances_after_candidate_request_error(self, auth_error):
+        """Configured candidates continue in declaration order after request errors."""
+        primary = MagicMock()
+        primary.base_url = "https://api.openai.com/v1"
+        primary_error = Exception("rate limited")
+        primary_error.status_code = 429
+        primary.chat.completions.create.side_effect = primary_error
+
+        failed_candidate = MagicMock()
+        failed_candidate.base_url = "https://fallback.example/v1"
+        candidate_error = Exception("unauthorized" if auth_error else "request failed")
+        if auth_error:
+            candidate_error.status_code = 401
+        failed_candidate.chat.completions.create.side_effect = candidate_error
+
+        succeeding_candidate = MagicMock()
+        succeeding_candidate.base_url = "https://fallback.example/v1"
+        succeeding_candidate.chat.completions.create.return_value = MagicMock(choices=[
+            MagicMock(message=MagicMock(content="from second configured fallback"))
+        ])
+
+        with patch("agent.auxiliary_client._get_cached_client", return_value=(primary, "gpt-5.5")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("openai-codex", "gpt-5.5", None, None, None)), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain", side_effect=[
+                 (failed_candidate, "first", "fallback_chain[0](first-provider)"),
+                 (succeeding_candidate, "second", "fallback_chain[1](second-provider)"),
+             ]) as configured_chain, \
+             patch("agent.auxiliary_client._try_main_agent_model_fallback") as main_fallback, \
+             patch("agent.auxiliary_client._refresh_provider_credentials", return_value=False):
+            result = call_llm(task="compression", messages=[{"role": "user", "content": "hello"}])
+
+        assert result.choices[0].message.content == "from second configured fallback"
+        assert configured_chain.call_args_list[1].kwargs["start_index"] == 1
+        main_fallback.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("auth_error", [False, True])
+    async def test_async_configured_chain_advances_after_candidate_request_error(self, auth_error):
+        """Async configured candidates continue in declaration order after request errors."""
+        primary = MagicMock()
+        primary.base_url = "https://api.openai.com/v1"
+        primary_error = Exception("rate limited")
+        primary_error.status_code = 429
+        primary.chat.completions.create = AsyncMock(side_effect=primary_error)
+
+        failed_candidate = MagicMock()
+        failed_candidate.base_url = "https://fallback.example/v1"
+        candidate_error = Exception("unauthorized" if auth_error else "request failed")
+        if auth_error:
+            candidate_error.status_code = 401
+        failed_candidate.chat.completions.create = AsyncMock(side_effect=candidate_error)
+
+        succeeding_candidate = MagicMock()
+        succeeding_candidate.base_url = "https://fallback.example/v1"
+        succeeding_candidate.chat.completions.create = AsyncMock(return_value=MagicMock(choices=[
+            MagicMock(message=MagicMock(content="from second configured fallback"))
+        ]))
+
+        with patch("agent.auxiliary_client._get_cached_client", return_value=(primary, "gpt-5.5")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("openai-codex", "gpt-5.5", None, None, None)), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain", side_effect=[
+                 (failed_candidate, "first", "fallback_chain[0](first-provider)"),
+                 (succeeding_candidate, "second", "fallback_chain[1](second-provider)"),
+             ]) as configured_chain, \
+             patch("agent.auxiliary_client._try_main_agent_model_fallback") as main_fallback, \
+             patch("agent.auxiliary_client._refresh_provider_credentials", return_value=False), \
+             patch("agent.auxiliary_client._to_async_client", side_effect=lambda client, model, **_: (client, model)):
+            result = await async_call_llm(task="compression", messages=[{"role": "user", "content": "hello"}])
+
+        assert result.choices[0].message.content == "from second configured fallback"
+        assert configured_chain.call_args_list[1].kwargs["start_index"] == 1
+        main_fallback.assert_not_called()
+
     def test_fallback_entry_openai_codex_uses_oauth_pool_without_inline_key(self):
         """Configured Codex fallback resolves through Hermes auth / credential pool."""
         from agent.auxiliary_client import _resolve_fallback_entry

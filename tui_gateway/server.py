@@ -5641,6 +5641,7 @@ def _tui_cache_warm_route(agent) -> str:
 
 
 def _tui_cache_warm_interval_seconds(agent) -> int | None:
+    from agent.prompt_caching import effective_cache_ttl
     from hermes_cli.heartbeat import parse_interval
 
     ttl = getattr(agent, "_cache_ttl", None)
@@ -5648,14 +5649,31 @@ def _tui_cache_warm_interval_seconds(agent) -> int | None:
         ttl = ((_load_cfg().get("prompt_caching") or {}).get("cache_ttl"))
     if isinstance(ttl, (int, float)):
         ttl = f"{int(ttl)}s"
-    interval = parse_interval(str(ttl or ""))
+    ttl = effective_cache_ttl(
+        str(ttl) if ttl is not None else None,
+        provider=str(getattr(agent, "provider", "") or ""),
+        model=str(getattr(agent, "model", "") or ""),
+    )
+    interval = parse_interval(ttl)
     return interval if interval and interval > 0 else None
 
 
-def _cancel_tui_cache_warm(session: dict) -> None:
+def _cancel_tui_cache_warm(session: dict, *, retain_arm: bool = False) -> None:
     timer = session.pop("_cache_warm_timer", None)
     if timer is not None:
         timer.cancel()
+    if retain_arm:
+        route = session.get("_cache_warm_route")
+        armed_at = session.get("_cache_warm_armed_at")
+        interval = session.get("_cache_warm_interval")
+        if (
+            isinstance(route, str)
+            and isinstance(armed_at, (int, float))
+            and isinstance(interval, int)
+        ):
+            session["_cache_warm_previous_arm"] = (route, armed_at, interval)
+    else:
+        session.pop("_cache_warm_previous_arm", None)
     session.pop("_cache_warm_route", None)
     session.pop("_cache_warm_armed_at", None)
     session.pop("_cache_warm_due_at", None)
@@ -5682,6 +5700,10 @@ def _tui_cache_warm_due(sid: str, session: dict, agent, route: str) -> None:
 
     if HeartbeatManager(session_key, purpose="cache_warm").due_prompt() is not None:
         session["_cache_warm_due_at"] = time.monotonic()
+        try:
+            agent._interruptible_api_call({"model": agent.model, "messages": []})
+        except Exception:
+            logger.debug("bodyless TUI cache warm failed", exc_info=True)
 
 
 def _arm_tui_cache_warm(sid: str, session: dict, agent, record: dict) -> None:
@@ -5715,11 +5737,17 @@ def _tui_cache_warm_miss_classification(session: dict, agent, record: dict) -> s
     if record.get("state") == "hit":
         return None
     route = _tui_cache_warm_route(agent)
-    armed_at = session.get("_cache_warm_armed_at")
-    interval = session.get("_cache_warm_interval")
+    arm = session.get("_cache_warm_previous_arm")
+    if not isinstance(arm, tuple):
+        arm = (
+            session.get("_cache_warm_route"),
+            session.get("_cache_warm_armed_at"),
+            session.get("_cache_warm_interval"),
+        )
+    armed_route, armed_at, interval = arm
     if (
         route
-        and route == session.get("_cache_warm_route")
+        and route == armed_route
         and isinstance(armed_at, (int, float))
         and isinstance(interval, int)
         and 0 <= time.monotonic() - armed_at < interval
@@ -5758,6 +5786,7 @@ def _attach_tui_cache_callback(agent, sid: str):
                 ).hexdigest(),
             )
             classification = _tui_cache_warm_miss_classification(session, agent, cache_record)
+            session.pop("_cache_warm_previous_arm", None)
             if classification:
                 cache_record["classification"] = classification
             session["first_provider_response"] = cache_record
@@ -10948,7 +10977,7 @@ def _run_prompt_submit(
             _start_inflight_turn(session, text)
         agent = session["agent"]
         if turn_origin == "user":
-            _cancel_tui_cache_warm(session)
+            _cancel_tui_cache_warm(session, retain_arm=True)
         agent._tui_first_provider_response_record_enabled = True
         agent._tui_first_provider_response_recorded = False
         if hasattr(agent, "clear_interrupt"):

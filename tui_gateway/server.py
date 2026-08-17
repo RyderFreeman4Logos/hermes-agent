@@ -11441,6 +11441,8 @@ def _run_prompt_submit(
             with session["history_lock"]:
                 session["running"] = False
                 session["last_active"] = time.time()
+                if turn_origin == "user" and not agent._tui_first_provider_response_recorded:
+                    session.pop("_cache_warm_previous_arm", None)
                 if not turn_error_retained:
                     _clear_inflight_turn(session)
             # Closing bookend of the "tui prompt accepted" record above —

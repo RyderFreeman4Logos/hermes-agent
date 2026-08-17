@@ -20089,6 +20089,55 @@ def test_tui_cache_warm_user_turn_retains_arm_until_first_provider_response(monk
     assert cache_updates[0]["cache_record"]["classification"] == "cache_cold_idle_under_ttl"
 
 
+def test_tui_cache_warm_failed_user_turn_does_not_classify_next_turn(monkeypatch, tmp_path):
+    class _Timer:
+        def cancel(self):
+            pass
+
+    class _Agent:
+        provider = "openai"
+        model = "test-model"
+
+        def __init__(self):
+            self.turns = 0
+            self._tui_cache_callback = lambda *_args: None
+
+        def clear_interrupt(self):
+            pass
+
+        def run_conversation(self, _prompt, **_kwargs):
+            self.turns += 1
+            if self.turns == 1:
+                raise RuntimeError("provider failed")
+            self._tui_cache_callback(
+                "no_field", 0, 0, 2_000, {"state": "no_field", "pct": 0}
+            )
+            return {"final_response": "reply", "messages": []}
+
+    agent = _Agent()
+    emitted = []
+    session = _session(
+        agent=agent,
+        _cache_warm_timer=_Timer(),
+        _cache_warm_route="openai:test-model",
+        _cache_warm_armed_at=time.monotonic(),
+        _cache_warm_interval=300,
+    )
+    server._sessions["cache-warm-sid"] = session
+    try:
+        _configure_immediate_prompt_run(monkeypatch, tmp_path)
+        monkeypatch.setattr(server, "_emit", lambda *event: emitted.append(event))
+        server._attach_tui_cache_callback(agent, "cache-warm-sid")
+
+        server._run_prompt_submit("rid-1", "cache-warm-sid", session, "failed turn")
+        server._run_prompt_submit("rid-2", "cache-warm-sid", session, "next turn")
+    finally:
+        server._sessions.pop("cache-warm-sid", None)
+
+    cache_updates = [event[2] for event in emitted if event[0] == "status.update"]
+    assert "classification" not in cache_updates[0]["cache_record"]
+
+
 def test_tui_session_warm_arms_once_and_classifies_idle_miss(monkeypatch):
     from hermes_cli import heartbeat
 

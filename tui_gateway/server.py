@@ -5370,6 +5370,43 @@ def _get_usage(agent) -> dict:
     return usage
 
 
+def _attach_tui_cache_callback(agent, sid: str):
+    """Publish the first provider cache response for each TUI wake."""
+    agent._tui_cache_owner_session = sid
+
+    def emit_cache_state(
+        state: str, pct: int, _read: int, _prompt: int, record: dict | None = None
+    ) -> None:
+        if not getattr(agent, "_tui_first_provider_response_record_enabled", False):
+            return
+        if getattr(agent, "_tui_first_provider_response_recorded", False):
+            return
+        agent._tui_first_provider_response_recorded = True
+        text = (
+            f"cache {pct}%"
+            if state == "hit"
+            else "cache unavailable"
+            if state == "no_field"
+            else f"cache {state.upper()}"
+        )
+        payload: dict[str, Any] = {"kind": "cache_hit", "text": text}
+        session = _sessions.get(sid)
+        if isinstance(record, dict) and isinstance(session, dict) and session.get("agent") is agent:
+            cache_record = {key: value for key, value in record.items() if value is not None}
+            cache_record.update(
+                owner="tui_gateway",
+                session=hashlib.sha256(
+                    f"{sid}:{getattr(agent, 'session_id', '')}".encode()
+                ).hexdigest(),
+            )
+            session["first_provider_response"] = cache_record
+            payload["cache_record"] = cache_record
+        _emit("status.update", sid, payload)
+
+    agent._tui_cache_callback = emit_cache_state
+    return agent
+
+
 def _probe_credentials(agent) -> str:
     """Light credential check at session creation — returns warning or ''.
 
@@ -6825,7 +6862,7 @@ def _make_agent(
 
     synthetic = maybe_build_synthetic_agent(session_id or key, model_override)
     if synthetic is not None:
-        return synthetic
+        return _attach_tui_cache_callback(synthetic, sid)
 
     from run_agent import AIAgent
 
@@ -6946,7 +6983,7 @@ def _make_agent(
                 raise RuntimeError("Auth fallback resolved without a model")
             model = resolution.selected_model
     _pr = _load_provider_routing()
-    return AIAgent(
+    agent = AIAgent(
         model=model,
         max_iterations=_cfg_max_turns(cfg, 500),
         provider=runtime.get("provider"),
@@ -6993,6 +7030,7 @@ def _make_agent(
         fallback_model=_load_fallback_model(),
         **_agent_cbs(sid),
     )
+    return _attach_tui_cache_callback(agent, sid)
 
 
 def _init_session(
@@ -10036,9 +10074,12 @@ def _notification_poller_loop(
                     text,
                     display_kind="async_delegation_complete",
                     display_metadata=_async_delegation_display_metadata(evt),
+                    turn_origin="subagent_result",
                 )
             else:
-                _run_prompt_submit(rid, sid, session, text)
+                _run_prompt_submit(
+                    rid, sid, session, text, turn_origin="background_completion"
+                )
             complete_event_delivery(evt, _claim)
         except Exception as exc:
             release_event_delivery(evt, _claim)
@@ -10114,9 +10155,12 @@ def _notification_poller_loop(
                     text,
                     display_kind="async_delegation_complete",
                     display_metadata=_async_delegation_display_metadata(evt),
+                    turn_origin="subagent_result",
                 )
             else:
-                _run_prompt_submit(rid, sid, session, text)
+                _run_prompt_submit(
+                    rid, sid, session, text, turn_origin="background_completion"
+                )
             complete_event_delivery(evt, _claim)
         except Exception as exc:
             release_event_delivery(evt, _claim)
@@ -10454,6 +10498,7 @@ def _run_prompt_submit(
     display_metadata: dict | None = None,
     image_paths: list[str] | None = None,
     queued_prompt_generation: int | None = None,
+    turn_origin: str = "user",
 ) -> bool:
     with session["history_lock"]:
         if session.get("_closing"):
@@ -10476,6 +10521,8 @@ def _run_prompt_submit(
         if not isinstance(inflight, dict) or inflight.get("status") == "error":
             _start_inflight_turn(session, text)
         agent = session["agent"]
+        agent._tui_first_provider_response_record_enabled = True
+        agent._tui_first_provider_response_recorded = False
         if hasattr(agent, "clear_interrupt"):
             try:
                 agent.clear_interrupt()
@@ -10774,6 +10821,8 @@ def _run_prompt_submit(
                 _run_params = {}
             if "task_id" in _run_params:
                 run_kwargs["task_id"] = session["session_key"]
+            if "turn_origin" in _run_params:
+                run_kwargs["turn_origin"] = turn_origin
             if display_kind and "persist_user_display_kind" in _run_params:
                 run_kwargs["persist_user_display_kind"] = display_kind
                 run_kwargs["persist_user_display_metadata"] = display_metadata

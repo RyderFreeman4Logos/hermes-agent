@@ -103,6 +103,7 @@ class HeartbeatState:
 
     prompt: str
     interval_seconds: int
+    route: str = ""
     status: str = "active"          # active | paused | cleared
     created_at: float = 0.0
     last_fired_at: float = 0.0
@@ -117,6 +118,7 @@ class HeartbeatState:
         return cls(
             prompt=str(data.get("prompt") or ""),
             interval_seconds=int(data.get("interval_seconds", 0) or 0),
+            route=str(data.get("route") or ""),
             status=str(data.get("status") or "active"),
             created_at=float(data.get("created_at", 0.0) or 0.0),
             last_fired_at=float(data.get("last_fired_at", 0.0) or 0.0),
@@ -124,7 +126,11 @@ class HeartbeatState:
         )
 
     def is_due(self, now: Optional[float] = None) -> bool:
-        if self.status != "active" or not self.prompt or self.interval_seconds <= 0:
+        if (
+            self.status != "active"
+            or self.interval_seconds <= 0
+            or (not self.prompt and not self.route)
+        ):
             return False
         now = now if now is not None else time.time()
         anchor = self.last_fired_at or self.created_at
@@ -142,8 +148,8 @@ class HeartbeatState:
 # ──────────────────────────────────────────────────────────────────────
 
 
-def _meta_key(session_id: str) -> str:
-    return f"heartbeat:{session_id}"
+def _meta_key(session_id: str, purpose: str = "heartbeat") -> str:
+    return f"{purpose}:{session_id}"
 
 
 def _get_session_db() -> Optional[Any]:
@@ -158,14 +164,14 @@ def _get_session_db() -> Optional[Any]:
         return None
 
 
-def load_heartbeat(session_id: str) -> Optional[HeartbeatState]:
+def load_heartbeat(session_id: str, *, purpose: str = "heartbeat") -> Optional[HeartbeatState]:
     if not session_id:
         return None
     db = _get_session_db()
     if db is None:
         return None
     try:
-        raw = db.get_meta(_meta_key(session_id))
+        raw = db.get_meta(_meta_key(session_id, purpose))
     except Exception as exc:
         logger.debug("HeartbeatManager: get_meta failed: %s", exc)
         return None
@@ -179,14 +185,16 @@ def load_heartbeat(session_id: str) -> Optional[HeartbeatState]:
     return None if state.status == "cleared" else state
 
 
-def save_heartbeat(session_id: str, state: HeartbeatState) -> None:
+def save_heartbeat(
+    session_id: str, state: HeartbeatState, *, purpose: str = "heartbeat"
+) -> None:
     if not session_id:
         return
     db = _get_session_db()
     if db is None:
         return
     try:
-        db.set_meta(_meta_key(session_id), state.to_json())
+        db.set_meta(_meta_key(session_id, purpose), state.to_json())
     except Exception as exc:
         logger.debug("HeartbeatManager: set_meta failed: %s", exc)
 
@@ -205,9 +213,14 @@ class HeartbeatManager:
     double-fire.
     """
 
-    def __init__(self, session_id: str):
+    def __init__(self, session_id: str, *, purpose: str = "heartbeat"):
+        if purpose not in {"heartbeat", "cache_warm"}:
+            raise ValueError(f"unsupported heartbeat purpose: {purpose}")
         self.session_id = session_id
-        self._state: Optional[HeartbeatState] = load_heartbeat(session_id)
+        self._purpose = purpose
+        self._state: Optional[HeartbeatState] = load_heartbeat(
+            session_id, purpose=purpose
+        )
 
     @property
     def state(self) -> Optional[HeartbeatState]:
@@ -249,14 +262,37 @@ class HeartbeatManager:
             created_at=time.time(),
         )
         self._state = state
-        save_heartbeat(self.session_id, state)
+        save_heartbeat(self.session_id, state, purpose=self._purpose)
+        return state
+
+    def arm_cache_warm(
+        self, route: str, interval_seconds: int, *, now: Optional[float] = None
+    ) -> HeartbeatState:
+        """Arm one bodyless internal cache warm for this session."""
+        if self._purpose != "cache_warm":
+            raise ValueError("cache warm requires purpose='cache_warm'")
+        route = str(route or "").strip()
+        if not route:
+            raise ValueError("cache warm route is empty")
+        interval_seconds = int(interval_seconds)
+        if interval_seconds < MIN_INTERVAL_SECONDS:
+            raise ValueError(f"interval must be at least {MIN_INTERVAL_SECONDS}s")
+        state = HeartbeatState(
+            prompt="",
+            route=route,
+            interval_seconds=interval_seconds,
+            status="active",
+            created_at=time.time() if now is None else now,
+        )
+        self._state = state
+        save_heartbeat(self.session_id, state, purpose=self._purpose)
         return state
 
     def pause(self) -> Optional[HeartbeatState]:
         if not self._state:
             return None
         self._state.status = "paused"
-        save_heartbeat(self.session_id, self._state)
+        save_heartbeat(self.session_id, self._state, purpose=self._purpose)
         return self._state
 
     def resume(self) -> Optional[HeartbeatState]:
@@ -265,14 +301,14 @@ class HeartbeatManager:
         self._state.status = "active"
         # Re-anchor so resuming doesn't instantly fire a stale tick.
         self._state.last_fired_at = time.time()
-        save_heartbeat(self.session_id, self._state)
+        save_heartbeat(self.session_id, self._state, purpose=self._purpose)
         return self._state
 
     def clear(self) -> bool:
         if self._state is None:
             return False
         self._state.status = "cleared"
-        save_heartbeat(self.session_id, self._state)
+        save_heartbeat(self.session_id, self._state, purpose=self._purpose)
         self._state = None
         return True
 
@@ -291,8 +327,8 @@ class HeartbeatManager:
             return None
         s.last_fired_at = now if now is not None else time.time()
         s.fire_count += 1
-        save_heartbeat(self.session_id, s)
-        return s.render_prompt()
+        save_heartbeat(self.session_id, s, purpose=self._purpose)
+        return "" if self._purpose == "cache_warm" else s.render_prompt()
 
 
 def migrate_heartbeat_to_session(old_session_id: str, new_session_id: str) -> bool:

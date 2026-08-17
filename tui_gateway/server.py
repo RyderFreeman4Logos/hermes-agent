@@ -5370,6 +5370,103 @@ def _get_usage(agent) -> dict:
     return usage
 
 
+_CACHE_WARM_MIN_HIT_PCT = 80
+
+
+def _tui_cache_warm_route(agent) -> str:
+    provider = str(getattr(agent, "provider", "") or "").strip()
+    model = str(getattr(agent, "model", "") or "").strip()
+    return f"{provider}:{model}" if provider and model else ""
+
+
+def _tui_cache_warm_interval_seconds(agent) -> int | None:
+    from hermes_cli.heartbeat import parse_interval
+
+    ttl = getattr(agent, "_cache_ttl", None)
+    if ttl is None:
+        ttl = ((_load_cfg().get("prompt_caching") or {}).get("cache_ttl"))
+    if isinstance(ttl, (int, float)):
+        ttl = f"{int(ttl)}s"
+    interval = parse_interval(str(ttl or ""))
+    return interval if interval and interval > 0 else None
+
+
+def _cancel_tui_cache_warm(session: dict) -> None:
+    timer = session.pop("_cache_warm_timer", None)
+    if timer is not None:
+        timer.cancel()
+    session.pop("_cache_warm_route", None)
+    session.pop("_cache_warm_armed_at", None)
+    session.pop("_cache_warm_due_at", None)
+    session.pop("_cache_warm_interval", None)
+    session_key = str(session.get("session_key") or "")
+    if session_key:
+        from hermes_cli.heartbeat import HeartbeatManager
+
+        HeartbeatManager(session_key, purpose="cache_warm").clear()
+
+
+def _tui_cache_warm_due(sid: str, session: dict, agent, route: str) -> None:
+    if (
+        session.get("agent") is not agent
+        or session.get("running")
+        or session.get("_cache_warm_route") != route
+        or _tui_cache_warm_route(agent) != route
+    ):
+        return
+    session_key = str(session.get("session_key") or "")
+    if not session_key:
+        return
+    from hermes_cli.heartbeat import HeartbeatManager
+
+    if HeartbeatManager(session_key, purpose="cache_warm").due_prompt() is not None:
+        session["_cache_warm_due_at"] = time.monotonic()
+
+
+def _arm_tui_cache_warm(sid: str, session: dict, agent, record: dict) -> None:
+    if record.get("state") != "hit" or int(record.get("pct") or 0) < _CACHE_WARM_MIN_HIT_PCT:
+        return
+    route = _tui_cache_warm_route(agent)
+    interval = _tui_cache_warm_interval_seconds(agent)
+    session_key = str(session.get("session_key") or "")
+    if not route or interval is None or not session_key:
+        return
+    from hermes_cli.heartbeat import HeartbeatManager
+
+    manager = HeartbeatManager(session_key, purpose="cache_warm")
+    if manager.state is not None and manager.state.route != route:
+        _cancel_tui_cache_warm(session)
+        return
+    old_timer = session.pop("_cache_warm_timer", None)
+    if old_timer is not None:
+        old_timer.cancel()
+    manager.arm_cache_warm(route, interval)
+    session["_cache_warm_route"] = route
+    session["_cache_warm_armed_at"] = time.monotonic()
+    session["_cache_warm_interval"] = interval
+    timer = threading.Timer(interval, _tui_cache_warm_due, args=(sid, session, agent, route))
+    timer.daemon = True
+    session["_cache_warm_timer"] = timer
+    timer.start()
+
+
+def _tui_cache_warm_miss_classification(session: dict, agent, record: dict) -> str | None:
+    if record.get("state") == "hit":
+        return None
+    route = _tui_cache_warm_route(agent)
+    armed_at = session.get("_cache_warm_armed_at")
+    interval = session.get("_cache_warm_interval")
+    if (
+        route
+        and route == session.get("_cache_warm_route")
+        and isinstance(armed_at, (int, float))
+        and isinstance(interval, int)
+        and 0 <= time.monotonic() - armed_at < interval
+    ):
+        return "cache_cold_idle_under_ttl"
+    return None
+
+
 def _attach_tui_cache_callback(agent, sid: str):
     """Publish the first provider cache response for each TUI wake."""
     agent._tui_cache_owner_session = sid
@@ -5399,8 +5496,12 @@ def _attach_tui_cache_callback(agent, sid: str):
                     f"{sid}:{getattr(agent, 'session_id', '')}".encode()
                 ).hexdigest(),
             )
+            classification = _tui_cache_warm_miss_classification(session, agent, cache_record)
+            if classification:
+                cache_record["classification"] = classification
             session["first_provider_response"] = cache_record
             payload["cache_record"] = cache_record
+            _arm_tui_cache_warm(sid, session, agent, cache_record)
         _emit("status.update", sid, payload)
 
     agent._tui_cache_callback = emit_cache_state
@@ -10521,6 +10622,8 @@ def _run_prompt_submit(
         if not isinstance(inflight, dict) or inflight.get("status") == "error":
             _start_inflight_turn(session, text)
         agent = session["agent"]
+        if turn_origin == "user":
+            _cancel_tui_cache_warm(session)
         agent._tui_first_provider_response_record_enabled = True
         agent._tui_first_provider_response_recorded = False
         if hasattr(agent, "clear_interrupt"):

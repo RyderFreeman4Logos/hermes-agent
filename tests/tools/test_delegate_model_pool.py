@@ -17,6 +17,7 @@ from tools.delegate_tool import (
     _build_dynamic_schema_overrides,
     delegate_task,
 )
+from tools.registry import registry
 
 
 STANDARD_POOL = {
@@ -210,3 +211,173 @@ class TestBuildChildOverrideChain:
         _, kwargs = mock_agent.call_args
         assert kwargs["fallback_model"] == profile_chain
         assert kwargs["model"] == "deepseek-v4-flash"
+
+
+_BANNED_SCHEMA_WORDS = (
+    "provider",
+    "model",
+    "fallback_chain",
+    "fallback",
+    "primary",
+)
+
+
+def _profile_schema_texts(fn):
+    props = fn.get("parameters", {}).get("properties", {})
+    texts = [props.get("model_profile", {}).get("description") or ""]
+    nested = (
+        (props.get("tasks") or {})
+        .get("items", {})
+        .get("properties", {})
+        .get("model_profile", {})
+    )
+    texts.append(nested.get("description") or "")
+    return "\n".join(texts).lower().replace("model_profile", "")
+
+
+class TestOmittedProfileUsesPoolDefault:
+    def test_omitted_profile_uses_standard_not_global_pin(self):
+        payload, kwargs = _child_kwargs()
+        assert "error" not in payload
+        assert kwargs["model"] == "deepseek-v4-flash"
+        assert kwargs["provider"] == "opencode-go"
+        assert [e["model"] for e in kwargs["fallback_model"]] == [
+            "fb-one",
+            "fb-two",
+            "fb-three",
+            "fb-four",
+        ]
+
+    def test_omitted_profile_uses_first_pool_key_when_no_standard(self):
+        cfg = {
+            "max_iterations": 10,
+            "model": "gpt-5.6-terra",
+            "provider": "openai-codex",
+            "model_pool": {
+                "test": STANDARD_POOL["test"],
+                "fast": STANDARD_POOL["standard"],
+            },
+        }
+        parent = _parent()
+        captured = {}
+
+        def _capture(**kwargs):
+            captured.update(kwargs)
+            child = MagicMock()
+            child.run_conversation.return_value = {
+                "final_response": "ok",
+                "completed": True,
+                "api_calls": 1,
+            }
+            child.close = MagicMock()
+            return child
+
+        with patch("tools.delegate_tool._load_config", return_value=cfg), patch(
+            "run_agent.AIAgent", side_effect=_capture
+        ):
+            raw = delegate_task(goal="do work", parent_agent=parent)
+        payload = json.loads(raw)
+        assert "error" not in payload
+        assert captured["model"] == "tiny-test"
+        assert captured["provider"] == "custom"
+
+
+class TestSchemaIsTierNamesOnly:
+    def test_static_and_dynamic_schema_omit_model_provider_fallback(self):
+        static = _profile_schema_texts(DELEGATE_TASK_SCHEMA)
+        with patch("tools.delegate_tool._load_config", return_value=PINNED_CFG):
+            overrides = _build_dynamic_schema_overrides()
+        dynamic = _profile_schema_texts(overrides)
+        for blob in (static, dynamic):
+            for banned in _BANNED_SCHEMA_WORDS:
+                assert banned not in blob, banned
+
+    def test_unknown_profile_error_lists_tier_names_only(self):
+        payload, _ = _child_kwargs(model_profile="does-not-exist")
+        err = payload["error"].lower().replace("model_profile", "")
+        assert "does-not-exist" in err
+        assert "standard" in err
+        assert "test" in err
+        for banned in ("provider", "model", "fallback", "gpt-5.6", "deepseek"):
+            assert banned not in err, banned
+
+
+class _LiveCfg:
+    def __init__(self, data):
+        self.data = data
+
+    def __call__(self):
+        return self.data
+
+
+class TestLiveConfigReread:
+    def test_get_definitions_sees_mutated_pool_keys(self):
+        loader = _LiveCfg(dict(PINNED_CFG))
+        with patch("tools.delegate_tool._load_config", side_effect=loader):
+            a = registry.get_definitions({"delegate_task"}, quiet=True)
+            loader.data = {
+                "max_iterations": 10,
+                "model": "gpt-5.6-terra",
+                "provider": "openai-codex",
+                "model_pool": {
+                    "fast": {
+                        "provider": "custom",
+                        "model": "fast-model",
+                        "fallback_chain": [
+                            {"provider": "custom", "model": "fast-fb"}
+                        ],
+                    },
+                    "standard": STANDARD_POOL["standard"],
+                },
+            }
+            b = registry.get_definitions({"delegate_task"}, quiet=True)
+        enum_a = a[0]["function"]["parameters"]["properties"]["model_profile"]["enum"]
+        enum_b = b[0]["function"]["parameters"]["properties"]["model_profile"]["enum"]
+        assert set(enum_a) == {"standard", "test"}
+        assert set(enum_b) == {"fast", "standard"}
+
+    def test_second_spawn_sees_mutated_pool_chain(self):
+        loader = _LiveCfg(dict(PINNED_CFG))
+        parent = _parent()
+        seen = []
+
+        def _capture(**kwargs):
+            seen.append(kwargs)
+            child = MagicMock()
+            child.run_conversation.return_value = {
+                "final_response": "ok",
+                "completed": True,
+                "api_calls": 1,
+            }
+            child.close = MagicMock()
+            return child
+
+        with patch("tools.delegate_tool._load_config", side_effect=loader), patch(
+            "run_agent.AIAgent", side_effect=_capture
+        ):
+            r1 = json.loads(delegate_task(goal="first", parent_agent=parent))
+            loader.data = {
+                "max_iterations": 10,
+                "model": "gpt-5.6-terra",
+                "provider": "openai-codex",
+                "model_pool": {
+                    "standard": {
+                        "provider": "opencode-go",
+                        "model": "deepseek-v4-flash",
+                        "base_url": "http://127.0.0.1:9/v1",
+                        "api_key": "profile-key",
+                        "fallback_chain": [
+                            {"provider": "openrouter", "model": "new-fb"}
+                        ],
+                    }
+                },
+            }
+            r2 = json.loads(delegate_task(goal="second", parent_agent=parent))
+        assert "error" not in r1 and "error" not in r2
+        assert [e["model"] for e in seen[0]["fallback_model"]] == [
+            "fb-one",
+            "fb-two",
+            "fb-three",
+            "fb-four",
+        ]
+        assert [e["model"] for e in seen[1]["fallback_model"]] == ["new-fb"]

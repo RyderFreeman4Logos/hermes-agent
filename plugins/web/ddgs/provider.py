@@ -58,21 +58,27 @@ def _run_ddgs_search(query: str, safe_limit: int) -> list[dict[str, Any]]:
     the parent via process timeout (#68096).
     """
     from ddgs import DDGS  # type: ignore
+    from ddgs.exceptions import DDGSException  # type: ignore
 
     results: list[dict[str, Any]] = []
-    with DDGS(timeout=10) as client:
-        for i, hit in enumerate(client.text(query, max_results=safe_limit)):
-            if i >= safe_limit:
-                break
-            url = str(hit.get("href") or hit.get("url") or "")
-            results.append(
-                {
-                    "title": str(hit.get("title", "")),
-                    "url": url,
-                    "description": str(hit.get("body", "")),
-                    "position": i + 1,
-                }
-            )
+    try:
+        with DDGS(timeout=10) as client:
+            for i, hit in enumerate(client.text(query, max_results=safe_limit)):
+                if i >= safe_limit:
+                    break
+                url = str(hit.get("href") or hit.get("url") or "")
+                results.append(
+                    {
+                        "title": str(hit.get("title", "")),
+                        "url": url,
+                        "description": str(hit.get("body", "")),
+                        "position": i + 1,
+                    }
+                )
+    except DDGSException as exc:
+        if str(exc) != "No results found.":
+            raise
+        return []
     return results
 
 

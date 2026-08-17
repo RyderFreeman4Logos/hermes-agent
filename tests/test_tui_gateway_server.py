@@ -20005,6 +20005,84 @@ def test_workspace_move_rehomes_running_session(monkeypatch, tmp_path):
     assert live.get("explicit_cwd") is True
 
 
+def test_tui_session_warm_arms_once_and_classifies_idle_miss(monkeypatch):
+    from hermes_cli import heartbeat
+
+    class _DB:
+        values = {}
+
+        def get_meta(self, key):
+            return self.values.get(key)
+
+        def set_meta(self, key, value):
+            self.values[key] = value
+
+    class _Timer:
+        timers = []
+
+        def __init__(self, interval, callback, args=()):
+            self.interval = interval
+            self.callback = callback
+            self.args = args
+            self.cancelled = False
+            self.started = False
+            self.timers.append(self)
+
+        def start(self):
+            self.started = True
+
+        def cancel(self):
+            self.cancelled = True
+
+    class _Agent:
+        provider = "openai"
+        model = "test-model"
+
+        def __init__(self):
+            self._tui_first_provider_response_record_enabled = False
+            self._tui_first_provider_response_recorded = False
+            self._tui_cache_callback = None
+
+    agent = _Agent()
+    emitted = []
+    session = _session(agent=agent)
+    server._sessions["cache-warm-sid"] = session
+    monkeypatch.setattr(heartbeat, "_get_session_db", lambda: _DB())
+    monkeypatch.setattr(server.threading, "Timer", _Timer)
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"prompt_caching": {"cache_ttl": "5m"}})
+    monkeypatch.setattr(server, "_emit", lambda *event: emitted.append(event))
+    try:
+        server._attach_tui_cache_callback(agent, "cache-warm-sid")
+        callback = agent._tui_cache_callback
+        assert callable(callback)
+        agent._tui_first_provider_response_record_enabled = True
+        agent._tui_first_provider_response_recorded = False
+        callback("hit", 95, 1_900, 2_000, {"state": "hit", "pct": 95})
+
+        assert len(_Timer.timers) == 1
+        assert _Timer.timers[0].interval == 300
+        assert _Timer.timers[0].started is True
+        assert session["_cache_warm_route"] == "openai:test-model"
+
+        agent._tui_first_provider_response_recorded = False
+        callback("no_field", 0, 0, 2_000, {"state": "no_field"})
+        agent.model = "other-model"
+        agent._tui_first_provider_response_recorded = False
+        callback("hit", 95, 1_900, 2_000, {"state": "hit", "pct": 95})
+        assert _Timer.timers[0].cancelled is True
+        assert len(_Timer.timers) == 1
+        server._cancel_tui_cache_warm(session)
+        assert "_cache_warm_route" not in session
+    finally:
+        server._sessions.pop("cache-warm-sid", None)
+
+    cache_updates = [event[2] for event in emitted if event[0] == "status.update"]
+    assert any(
+        payload["cache_record"].get("classification") == "cache_cold_idle_under_ttl"
+        for payload in cache_updates
+    )
+
+
 @pytest.mark.parametrize(
     ("origin", "state", "pct", "text"),
     [

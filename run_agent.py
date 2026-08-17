@@ -3880,6 +3880,13 @@ class AIAgent:
                 + "the request was interrupted mid-call before a reply was "
                 "received. Send `continue` to retry."
             )
+        if reason == "stream_payload_bound_exceeded":
+            return (
+                prefix
+                + "the streamed assistant payload exceeded the declared size "
+                "bound. The turn was aborted. Send `continue` or start a new "
+                "turn rather than waiting on a silent think."
+            )
         if reason == "budget_exhausted":
             return (
                 prefix
@@ -6604,6 +6611,7 @@ class AIAgent:
                         pass
                 self._record_streamed_assistant_text(tail)
         self._current_streamed_assistant_text = ""
+        self._current_streamed_payload_bytes = 0
 
     def _record_streamed_assistant_text(self, text: str) -> None:
         """Accumulate visible assistant text emitted through stream callbacks."""
@@ -6614,8 +6622,14 @@ class AIAgent:
         if self._stream_writer_superseded():
             return
         if isinstance(text, str) and text:
-            self._current_streamed_assistant_text = (
-                getattr(self, "_current_streamed_assistant_text", "") + text
+            from agent.stream_payload_bound import accumulate_stream_text
+
+            self._current_streamed_assistant_text = accumulate_stream_text(
+                getattr(self, "_current_streamed_assistant_text", "") or "",
+                text,
+            )
+            self._current_streamed_payload_bytes = len(
+                (self._current_streamed_assistant_text or "").encode("utf-8")
             )
 
     @staticmethod
@@ -6970,12 +6984,11 @@ class AIAgent:
                 text = text.lstrip("\n")
         if not text:
             return
+        self._record_streamed_assistant_text(text)
         callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
-        delivered = False
         for cb in callbacks:
             try:
                 cb(text)
-                delivered = True
             except Exception:
                 pass
         try:
@@ -6989,8 +7002,6 @@ class AIAgent:
             )
         except Exception:
             logger.debug("on_stream_delta plugin hook enqueue failed", exc_info=True)
-        if delivered:
-            self._record_streamed_assistant_text(text)
 
     def _fire_reasoning_delta(self, text: str) -> None:
         """Fire reasoning callback if registered."""
@@ -6999,6 +7010,18 @@ class AIAgent:
         if self._stream_writer_superseded():
             self._note_dropped_stream_writer("_fire_reasoning_delta")
             return
+        if isinstance(text, str) and text:
+            from agent.stream_payload_bound import (
+                DEFAULT_STREAM_PAYLOAD_BOUND_BYTES,
+                StreamPayloadBoundExceeded,
+                streamed_payload_bytes,
+            )
+
+            nxt = int(getattr(self, "_current_streamed_payload_bytes", 0) or 0)
+            nxt += streamed_payload_bytes(text)
+            if nxt > DEFAULT_STREAM_PAYLOAD_BOUND_BYTES:
+                raise StreamPayloadBoundExceeded(nxt)
+            self._current_streamed_payload_bytes = nxt
         cb = self.reasoning_callback
         if cb is not None:
             try:

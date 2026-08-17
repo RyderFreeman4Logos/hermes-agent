@@ -3843,10 +3843,33 @@ def run_conversation(
                             "error": "First response truncated due to output length limit"
                         }
                 
-                # Track actual token usage from response for context management
-                if hasattr(response, 'usage') and response.usage:
+                # Track actual token usage from response for context management.
+                # A successful provider response owns a request index even when
+                # its transport cannot report usage (for example Codex).
+                response_usage = getattr(response, "usage", None)
+                cache_callback = getattr(agent, "_tui_cache_callback", None)
+                response_index = int(getattr(agent, "_tui_provider_response_index", 0)) + 1
+                agent._tui_provider_response_index = response_index
+                if response_usage is None and callable(cache_callback):
+                    try:
+                        cache_callback(
+                            "no_field",
+                            0,
+                            0,
+                            0,
+                            {
+                                "request_index": response_index,
+                                "state": "no_field",
+                                "pct": None,
+                                "timestamp": time.monotonic(),
+                                "turn_origin": agent._cache_turn_origin,
+                            },
+                        )
+                    except Exception:
+                        logger.debug("TUI provider-response cache callback failed", exc_info=True)
+                if response_usage:
                     canonical_usage = normalize_usage(
-                        response.usage,
+                        response_usage,
                         provider=agent.provider,
                         api_mode=agent.api_mode,
                     )
@@ -3905,7 +3928,6 @@ def run_conversation(
                         "cache_write_tokens": canonical_usage.cache_write_tokens,
                         "reasoning_tokens": canonical_usage.reasoning_tokens,
                     }
-                    cache_callback = getattr(agent, "_tui_cache_callback", None)
                     if callable(cache_callback):
                         cache_read = canonical_usage.cache_read_tokens
                         cache_write = canonical_usage.cache_write_tokens
@@ -3916,10 +3938,6 @@ def run_conversation(
                             cache_state, cache_pct = "cold_write", 0
                         else:
                             cache_state, cache_pct = "no_field", 0
-                        response_index = int(
-                            getattr(agent, "_tui_provider_response_index", 0)
-                        ) + 1
-                        agent._tui_provider_response_index = response_index
                         try:
                             cache_callback(
                                 cache_state,

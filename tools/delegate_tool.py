@@ -4271,6 +4271,13 @@ def _available_model_profile_names(cfg: Optional[dict] = None) -> List[str]:
     return [str(name) for name in _model_pool(cfg) if str(name).strip()]
 
 
+def _default_model_profile_name(cfg: dict) -> Optional[str]:
+    names = _available_model_profile_names(cfg)
+    if not names:
+        return None
+    return "standard" if "standard" in names else names[0]
+
+
 def _normalize_profile_fallback_chain(raw: Any) -> List[Dict[str, Any]]:
     if not isinstance(raw, list):
         return []
@@ -4294,20 +4301,23 @@ def _credentials_for_model_profile(
 ) -> dict:
     """Resolve child creds; an explicit unknown profile fails closed."""
     name = str(profile_name or "").strip() or None
-    if name is None:
-        creds = _resolve_delegation_credentials(cfg, parent_agent)
-        creds.setdefault("fallback_chain", None)
-        return creds
-
     pool = _model_pool(cfg)
+    if name is None:
+        if pool:
+            name = _default_model_profile_name(cfg)
+        if name is None:
+            creds = _resolve_delegation_credentials(cfg, parent_agent)
+            creds.setdefault("fallback_chain", None)
+            return creds
+
     if name not in pool:
         available = ", ".join(_available_model_profile_names(cfg)) or "(none)"
         raise ValueError(
-            f"Unknown model_profile {name!r}. Configured profiles: {available}."
+            f"Unknown {name!r}. Configured: {available}."
         )
     profile = pool[name]
     if not isinstance(profile, dict):
-        raise ValueError(f"model_profile {name!r} is not a mapping.")
+        raise ValueError(f"{name!r} is not a mapping.")
 
     overlay = {
         "model": str(profile.get("model") or "").strip() or None,
@@ -4316,9 +4326,10 @@ def _credentials_for_model_profile(
         "api_key": str(profile.get("api_key") or "").strip() or None,
         "api_mode": str(profile.get("api_mode") or "").strip().lower() or None,
     }
-    # Empty profile fields keep global delegation.* so a profile can
-    # override only model/provider without wiping a shared base_url.
-    merged = dict(cfg)
+    # A non-empty pool is the only routing source; ignore global
+    # delegation.model / provider / base_url / api_key / api_mode.
+    _GLOBAL_ROUTE_KEYS = ("model", "provider", "base_url", "api_key", "api_mode")
+    merged = {k: v for k, v in cfg.items() if k not in _GLOBAL_ROUTE_KEYS}
     for key, value in overlay.items():
         if value:
             merged[key] = value
@@ -4553,8 +4564,8 @@ def _build_top_level_description() -> str:
         "- Leaf children (the default) cannot call delegate_task, clarify, "
         "memory, send_message, or cronjob; orchestrators regain only "
         "delegate_task.\n"
-        "- Children inherit the parent model and fallback chain unless pinned "
-        "globally via delegation.provider / delegation.model in config.yaml. "
+        "- Children inherit the parent route unless a named model_profile "
+        "tier is selected from the configured pool. "
         "Results are returned as an array, one entry per task."
     )
 
@@ -4629,9 +4640,8 @@ def _build_dynamic_schema_overrides() -> dict:
     profile_names = _available_model_profile_names()
     profile_prop = dict(overrides_params["properties"].get("model_profile") or {})
     profile_prop["description"] = (
-        "Named entry from delegation.model_pool. Child uses that profile's "
-        "primary provider/model and its fallback_chain. An unknown name fails "
-        "closed. Per-task model_profile overrides this top-level value."
+        "Named pool tier. Omitted uses standard if present, else the first "
+        "tier. Unknown names fail closed. Per-task value overrides this."
     )
     if profile_names:
         profile_prop["enum"] = profile_names
@@ -4643,7 +4653,7 @@ def _build_dynamic_schema_overrides() -> dict:
     tasks_item_props = dict(tasks_items.get("properties") or {})
     task_profile_prop = dict(tasks_item_props.get("model_profile") or {})
     task_profile_prop["description"] = (
-        "Per-task model_profile. Overrides the top-level model_profile."
+        "Per-task pool tier. Overrides the top-level model_profile."
     )
     if profile_names:
         task_profile_prop["enum"] = profile_names
@@ -4725,8 +4735,7 @@ DELEGATE_TASK_SCHEMA = {
                         "model_profile": {
                             "type": "string",
                             "description": (
-                                "Per-task model_profile from "
-                                "delegation.model_pool. Overrides the "
+                                "Per-task pool tier. Overrides the "
                                 "top-level model_profile."
                             ),
                         },
@@ -4754,9 +4763,9 @@ DELEGATE_TASK_SCHEMA = {
             "model_profile": {
                 "type": "string",
                 "description": (
-                    "Named delegation.model_pool entry. Child uses that "
-                    "profile's primary + fallback_chain. Unknown names "
-                    "fail closed. Per-task value overrides this."
+                    "Named pool tier. Omitted uses standard if present, "
+                    "else the first tier. Unknown names fail closed. "
+                    "Per-task value overrides this."
                 ),
             },
             "background": {

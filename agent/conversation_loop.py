@@ -1775,6 +1775,7 @@ def run_conversation(
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    turn_origin: str = "user",
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -1941,6 +1942,8 @@ def run_conversation(
     # (early failure / interrupt) so the hook receives None rather than a
     # stale prior turn's usage.
     agent._last_turn_usage = None
+    agent._tui_provider_response_index = 0
+    agent._cache_turn_origin = turn_origin
 
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
     # turn to the codex app-server subprocess (terminal/file ops/patching
@@ -4087,6 +4090,37 @@ def run_conversation(
                         "cache_write_tokens": canonical_usage.cache_write_tokens,
                         "reasoning_tokens": canonical_usage.reasoning_tokens,
                     }
+                    cache_callback = getattr(agent, "_tui_cache_callback", None)
+                    if callable(cache_callback):
+                        cache_read = canonical_usage.cache_read_tokens
+                        cache_write = canonical_usage.cache_write_tokens
+                        if cache_read:
+                            cache_state = "hit"
+                            cache_pct = round(100 * cache_read / prompt_tokens) if prompt_tokens else 0
+                        elif cache_write:
+                            cache_state, cache_pct = "cold_write", 0
+                        else:
+                            cache_state, cache_pct = "no_field", 0
+                        response_index = int(
+                            getattr(agent, "_tui_provider_response_index", 0)
+                        ) + 1
+                        agent._tui_provider_response_index = response_index
+                        try:
+                            cache_callback(
+                                cache_state,
+                                cache_pct,
+                                cache_read,
+                                prompt_tokens,
+                                {
+                                    "request_index": response_index,
+                                    "state": cache_state,
+                                    "pct": cache_pct if cache_state == "hit" else None,
+                                    "timestamp": time.monotonic(),
+                                    "turn_origin": agent._cache_turn_origin,
+                                },
+                            )
+                        except Exception:
+                            logger.debug("TUI provider-response cache callback failed", exc_info=True)
                     # Capture the boundary latch before update_from_response()
                     # consumes it. Only a real provider prompt count for the
                     # request immediately following a completed compaction can

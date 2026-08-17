@@ -6045,7 +6045,7 @@ def test_notification_poller_live_loop_requeues_foreign_completion_for_owner(
 
     from tools.process_registry import process_registry
 
-    delivered = {"a": [], "b": []}
+    delivered = {"a": [], "b": [], "kwargs": []}
     emitted = []
     session_a = _session(session_key="session-a-live-handoff")
     session_b = _session(session_key="session-b-live-handoff")
@@ -6063,8 +6063,9 @@ def test_notification_poller_live_loop_requeues_foreign_completion_for_owner(
     monkeypatch.setattr(server, "_get_db", lambda: None)
     monkeypatch.setattr(server, "_emit", lambda *args, **_kwargs: emitted.append(args))
 
-    def _deliver(_rid, sid, session, text):
+    def _deliver(_rid, sid, session, text, **kwargs):
         delivered["a" if sid == "sid-a-live-handoff" else "b"].append(text)
+        delivered["kwargs"].append(kwargs)
         session["running"] = False
 
     monkeypatch.setattr(server, "_run_prompt_submit", _deliver)
@@ -6091,6 +6092,7 @@ def test_notification_poller_live_loop_requeues_foreign_completion_for_owner(
         )
 
         assert len(delivered["a"]) == 1
+        assert delivered["kwargs"] == [{"turn_origin": "background_completion"}]
         assert "proc-live-handoff completed normally" in delivered["a"][0]
         assert delivered["b"] == []
         assert isolated_queue.empty()
@@ -6172,7 +6174,7 @@ def test_notification_poller_live_loop_drops_addressed_orphan(
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda _rid, _sid, _session, text: delivered.append(text),
+        lambda _rid, _sid, _session, text, **_kwargs: delivered.append(text),
     )
     server._sessions["sid-live-orphan"] = session
     process_registry._completion_consumed.discard(event["session_id"])
@@ -6213,7 +6215,7 @@ def test_notification_poller_drops_orphaned_events(monkeypatch, routing):
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda _rid, _sid, _session, text: delivered.append(text),
+        lambda _rid, _sid, _session, text, **_kwargs: delivered.append(text),
     )
     monkeypatch.setattr(server, "_get_db", lambda: None)
 
@@ -6279,7 +6281,7 @@ def test_notification_poller_delivers_owned_events(
     monkeypatch.setattr(
         server,
         "_run_prompt_submit",
-        lambda _rid, _sid, _session, text: delivered.append(text),
+        lambda _rid, _sid, _session, text, **_kwargs: delivered.append(text),
     )
     monkeypatch.setattr(server, "_get_db", lambda: _CompressionDB())
 
@@ -16374,7 +16376,7 @@ def test_notification_poller_emits_distinct_watch_matches_once(monkeypatch):
     turns = []
     emitted = []
 
-    def _fake_run_prompt_submit(rid, sid, session, text):
+    def _fake_run_prompt_submit(rid, sid, session, text, **_kwargs):
         turns.append(text)
         with session["history_lock"]:
             session["running"] = False
@@ -20005,3 +20007,57 @@ def test_workspace_move_rehomes_running_session(monkeypatch, tmp_path):
     assert captured["row_update"] == (target, str(new_cwd))
     assert live["cwd"] == str(new_cwd)
     assert live.get("explicit_cwd") is True
+
+
+@pytest.mark.parametrize(
+    ("origin", "state", "pct", "text"),
+    [
+        ("user", "hit", 95, "cache 95%"),
+        ("background_completion", "no_field", 0, "cache unavailable"),
+        ("subagent_result", "hit", 95, "cache 95%"),
+    ],
+)
+def test_tui_cache_status_uses_first_provider_response_per_wake(
+    monkeypatch, origin, state, pct, text
+):
+    class _Agent:
+        def run_conversation(self, _prompt, *, turn_origin="user", **_kwargs):
+            record = {
+                "request_index": 1,
+                "state": state,
+                "pct": pct,
+                "timestamp": 1.0,
+                "turn_origin": turn_origin,
+            }
+            callback = getattr(self, "_tui_cache_callback")
+            callback(state, pct, 1_900, 2_000, record)
+            callback("hit", 99, 1_980, 2_000, {**record, "request_index": 2})
+            return {"final_response": "reply", "messages": []}
+
+    class _StoppedTicker:
+        def join(self):
+            pass
+
+    agent = _Agent()
+    emitted = []
+    session = _session(agent=agent)
+    server._sessions["cache-sid"] = session
+    try:
+        monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+        monkeypatch.setattr(server, "_get_usage", lambda _agent: {})
+        monkeypatch.setattr(server, "_get_db", lambda: None)
+        monkeypatch.setattr(
+            server, "_start_usage_ticker", lambda *_args: (threading.Event(), _StoppedTicker())
+        )
+        monkeypatch.setattr(server, "render_message", lambda *_args: "")
+        monkeypatch.setattr(server, "_drain_queued_prompt", lambda *_args: False)
+        monkeypatch.setattr(server, "_emit", lambda *event: emitted.append(event))
+        server._attach_tui_cache_callback(agent, "cache-sid")
+        server._run_prompt_submit("rid", "cache-sid", session, "wake", turn_origin=origin)
+    finally:
+        server._sessions.pop("cache-sid", None)
+
+    cache_updates = [event[2] for event in emitted if event[0] == "status.update"]
+    assert [payload["text"] for payload in cache_updates] == [text]
+    assert cache_updates[0]["cache_record"]["turn_origin"] == origin
+    assert session["first_provider_response"] == cache_updates[0]["cache_record"]

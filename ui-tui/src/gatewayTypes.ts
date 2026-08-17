@@ -617,7 +617,23 @@ export type GatewayEvent =
   | { payload?: { text?: string }; session_id?: string; type: 'thinking.delta' }
   | { payload?: { kind?: string }; session_id?: string; type: 'reaction' }
   | { payload?: undefined; session_id?: string; type: 'message.start' }
-  | { payload?: { kind?: string; text?: string }; session_id?: string; type: 'status.update' }
+  | {
+      payload?: {
+        cache_record?: {
+          owner: 'tui_gateway'
+          pct?: number
+          request_index: number
+          session: string
+          state: 'hit' | 'no_field' | 'cold_write'
+          timestamp: number
+          turn_origin: 'user' | 'background_completion' | 'subagent_result'
+        }
+        kind?: string
+        text?: string
+      }
+      session_id?: string
+      type: 'status.update'
+    }
   | {
       payload?: {
         id?: string

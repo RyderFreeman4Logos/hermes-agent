@@ -10851,12 +10851,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self,
         session_id: str,
         max_messages: Optional[int] = None,
+        include_ancestors: bool = True,
     ) -> int:
-        """Return resume row count or reject a transcript too large to load.
+        """Return replay row count or reject a transcript too large to load.
 
         ``max_messages=None`` resolves the limit from config
-        (``sessions.max_resume_messages``); 0 disables the guard and returns
-        the (bounded) count without raising.
+        (``sessions.max_resume_messages``). ``include_ancestors=False`` counts
+        only the model-replayed tip. 0 disables the guard.
         """
         if max_messages is None:
             max_messages = resolved_max_resume_messages()
@@ -10868,7 +10869,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # return value, and an unbounded lineage COUNT here would do the
             # exact pathological work the disable exists to avoid.
             return 0
-        session_ids = self._session_lineage_root_to_tip(session_id)
+        session_ids = (
+            self._session_lineage_root_to_tip(session_id)
+            if include_ancestors
+            else [session_id]
+        )
         placeholders = ",".join("?" for _ in session_ids)
         with self._read_ctx() as conn:
             row = conn.execute(

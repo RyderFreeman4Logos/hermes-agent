@@ -193,6 +193,58 @@ describe('createGatewayEventHandler', () => {
     expect(getUiState().status).toBe('cache 95%')
   })
 
+  it('keeps cache_hit status through restore, complete, and waiting-for-input', () => {
+    const onEvent = createGatewayEventHandler(buildCtx([]))
+
+    vi.useFakeTimers()
+
+    try {
+      onEvent({ payload: {}, type: 'message.start' } as any)
+      onEvent({ payload: { kind: 'cache_hit', text: 'cache 95%' }, type: 'status.update' } as any)
+      expect(getUiState().status).toBe('cache 95%')
+
+      vi.advanceTimersByTime(4000)
+      expect(getUiState().status).toBe('cache 95%')
+
+      onEvent({ payload: { text: 'done' }, type: 'message.complete' } as any)
+      expect(getUiState().status).toBe('cache 95%')
+
+      onEvent({
+        payload: { choices: ['a'], question: 'pick', request_id: 'q1' },
+        type: 'clarify.request'
+      } as any)
+      expect(getUiState().status).toBe('cache 95%')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('keeps cache unavailable status through restore, complete, and waiting-for-input', () => {
+    const onEvent = createGatewayEventHandler(buildCtx([]))
+
+    vi.useFakeTimers()
+
+    try {
+      onEvent({ payload: {}, type: 'message.start' } as any)
+      onEvent({ payload: { kind: 'cache_hit', text: 'cache unavailable' }, type: 'status.update' } as any)
+      expect(getUiState().status).toBe('cache unavailable')
+
+      vi.advanceTimersByTime(4000)
+      expect(getUiState().status).toBe('cache unavailable')
+
+      onEvent({ payload: { text: 'done' }, type: 'message.complete' } as any)
+      expect(getUiState().status).toBe('cache unavailable')
+
+      onEvent({
+        payload: { choices: ['a'], question: 'pick', request_id: 'q1' },
+        type: 'clarify.request'
+      } as any)
+      expect(getUiState().status).toBe('cache unavailable')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('prints compaction progress status into the transcript', () => {
     const appended: Msg[] = []
     const ctx = buildCtx(appended)

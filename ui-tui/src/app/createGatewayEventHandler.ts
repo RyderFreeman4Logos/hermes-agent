@@ -585,6 +585,10 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
       thinkingStatusTimer = null
     }
 
+    if (getUiState().status.startsWith('cache ') && !status.startsWith('cache ')) {
+      return
+    }
+
     patchUiState({ status })
   }
 
@@ -597,7 +601,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
 
     thinkingStatusTimer = setTimeout(() => {
       thinkingStatusTimer = null
-      patchUiState({ status: pendingThinkingStatus || statusFromBusy() })
+      setStatus(pendingThinkingStatus || statusFromBusy())
     }, STREAM_BATCH_MS)
   }
 
@@ -605,7 +609,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
     turnController.clearStatusTimer()
     turnController.statusTimer = setTimeout(() => {
       turnController.statusTimer = null
-      patchUiState({ status: statusFromBusy() })
+      setStatus(statusFromBusy())
     }, ms)
   }
 
@@ -848,6 +852,10 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         }
 
         setStatus(p.text)
+
+        if (p.kind === 'cache_hit') {
+          return
+        }
 
         if (p.kind === 'compressing') {
           sys(p.text)

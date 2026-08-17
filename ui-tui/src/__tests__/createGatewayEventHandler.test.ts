@@ -183,6 +183,16 @@ describe('createGatewayEventHandler', () => {
     expect(getTurnState().todos).toEqual(todos)
   })
 
+  it('keeps cache status visible after message.complete', () => {
+    const onEvent = createGatewayEventHandler(buildCtx([]))
+
+    onEvent({ payload: {}, type: 'message.start' } as any)
+    onEvent({ payload: { text: 'cache 95%' }, type: 'status.update' } as any)
+    onEvent({ payload: { text: 'done' }, type: 'message.complete' } as any)
+
+    expect(getUiState().status).toBe('cache 95%')
+  })
+
   it('prints compaction progress status into the transcript', () => {
     const appended: Msg[] = []
     const ctx = buildCtx(appended)

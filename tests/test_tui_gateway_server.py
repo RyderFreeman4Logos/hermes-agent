@@ -20061,3 +20061,105 @@ def test_tui_cache_status_uses_first_provider_response_per_wake(
     assert [payload["text"] for payload in cache_updates] == [text]
     assert cache_updates[0]["cache_record"]["turn_origin"] == origin
     assert session["first_provider_response"] == cache_updates[0]["cache_record"]
+
+
+def test_tui_cache_status_records_no_usage_before_later_usage(monkeypatch, tmp_path):
+    """The first successful response is visible even when it has no usage."""
+    from types import SimpleNamespace
+
+    from run_agent import AIAgent
+
+    def response(content, finish_reason, tool_calls, usage):
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=content,
+                        tool_calls=tool_calls,
+                        reasoning=None,
+                        reasoning_content=None,
+                        reasoning_details=None,
+                    ),
+                    finish_reason=finish_reason,
+                )
+            ],
+            model="test/model",
+            usage=usage,
+        )
+
+    tool = SimpleNamespace(
+        id="call-1",
+        type="function",
+        function=SimpleNamespace(name="todo", arguments="{}"),
+    )
+    no_usage = response("", "tool_calls", [tool], None)
+    with_usage = response(
+        "done",
+        "stop",
+        None,
+        SimpleNamespace(prompt_tokens=2_000, completion_tokens=10, total_tokens=2_010),
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    with (
+        patch(
+            "run_agent.get_tool_definitions",
+            return_value=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "todo",
+                        "description": "test tool",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ],
+        ),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://example.invalid/v1",
+            provider="openai-compat",
+            model="test/model",
+            max_iterations=2,
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+    agent._cached_system_prompt = "test prompt"
+    agent._session_db = None
+    agent._session_json_enabled = False
+    agent.save_trajectories = False
+    agent.compression_enabled = False
+    agent._disable_streaming = True
+    agent._cleanup_task_resources = lambda *_args, **_kwargs: None
+    agent._save_trajectory = lambda *_args, **_kwargs: None
+    agent._execute_tool_calls = lambda *_args, **_kwargs: None
+    responses = iter([no_usage, with_usage])
+    agent._interruptible_api_call = lambda api_kwargs: next(responses)
+
+    emitted = []
+    records = []
+    session = _session(agent=agent)
+    server._sessions["cache-no-usage-sid"] = session
+    try:
+        _configure_immediate_prompt_run(monkeypatch, tmp_path)
+        monkeypatch.setattr(server, "_emit", lambda *event: emitted.append(event))
+        server._attach_tui_cache_callback(agent, "cache-no-usage-sid")
+        emit_cache_state = agent._tui_cache_callback
+
+        def capture_cache_state(*args):
+            records.append(args[-1])
+            emit_cache_state(*args)
+
+        agent._tui_cache_callback = capture_cache_state
+        server._run_prompt_submit("rid", "cache-no-usage-sid", session, "wake")
+    finally:
+        server._sessions.pop("cache-no-usage-sid", None)
+
+    assert [record["request_index"] for record in records] == [1, 2]
+    cache_updates = [event[2] for event in emitted if event[0] == "status.update"]
+    assert [payload["text"] for payload in cache_updates] == ["cache unavailable"]
+    assert cache_updates[0]["cache_record"]["request_index"] == 1
+    assert session["first_provider_response"]["request_index"] == 1

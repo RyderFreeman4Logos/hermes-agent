@@ -1436,7 +1436,9 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
           }
         }
 
-        setStatus('ready')
+        if (!getUiState().status.startsWith('cache ')) {
+          setStatus('ready')
+        }
 
         if (ev.payload?.usage) {
           patchUiState(state => ({ ...state, usage: mergeUsageStable(state.usage, ev.payload!.usage) }))

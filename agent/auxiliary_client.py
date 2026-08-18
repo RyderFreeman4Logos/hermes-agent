@@ -470,6 +470,76 @@ def aux_progress_hook(hook):
         _aux_progress.hook = prev
 
 
+@contextlib.contextmanager
+def aux_host_candidate_deadline(seconds):
+    """Bound the current aux attempt to a host-owned candidate deadline.
+
+    ``seconds`` may be a positive number or a zero-arg callable that
+    returns the remaining host budget. Nested scopes restore.
+    """
+    prev = getattr(_aux_progress, "candidate_deadline", None)
+    _aux_progress.candidate_deadline = seconds
+    try:
+        yield
+    finally:
+        _aux_progress.candidate_deadline = prev
+
+
+def resolve_aux_attempt_deadline(
+    aux_timeout: Optional[float],
+    host_candidate_deadline: Optional[float] = None,
+) -> float:
+    """One finite attempt budget for host + aux + fallback progression.
+
+    Without a host bound this is the historical generous stream ceiling
+    (idle-per-chunk timeout, 600s floor). A positive host candidate
+    deadline is the remaining host budget for this attempt and wins when
+    shorter, so a still-open first route cannot outlive the host and
+    skip ``fallback_chain`` (#128).
+    """
+    try:
+        timeout = float(aux_timeout) if aux_timeout is not None else 0.0
+    except (TypeError, ValueError):
+        timeout = 0.0
+    generous = max(
+        _AUX_STREAM_CEILING_FLOOR_SECONDS,
+        _AUX_STREAM_CEILING_MULTIPLIER * timeout,
+    )
+    if host_candidate_deadline is None:
+        host_candidate_deadline = getattr(_aux_progress, "candidate_deadline", None)
+    if callable(host_candidate_deadline):
+        try:
+            host_candidate_deadline = host_candidate_deadline()
+        except Exception:
+            host_candidate_deadline = None
+    try:
+        host = float(host_candidate_deadline) if host_candidate_deadline is not None else 0.0
+    except (TypeError, ValueError):
+        host = 0.0
+    if host > 0 and timeout > 0:
+        return min(generous, host, timeout)
+    if host > 0:
+        return min(generous, host)
+    return generous
+
+
+def classify_compression_watchdog(
+    idle: float,
+    waited: float,
+    ceiling: float,
+    since_progress: float,
+    had_meaningful_progress: bool,
+) -> str:
+    """Distinguish idle, total-ceiling, and candidate-fallback aborts."""
+    if waited >= ceiling and had_meaningful_progress:
+        return "total_ceiling"
+    if not had_meaningful_progress and since_progress >= idle:
+        return "idle"
+    if had_meaningful_progress:
+        return "candidate_fallback"
+    return "idle"
+
+
 def _run_protected_sync_provider_call(
     callback: Callable[[dict[str, Any]], Any],
     kwargs: dict[str, Any],
@@ -501,13 +571,16 @@ def _run_protected_sync_provider_call(
         raise AuxiliaryExplicitCancellation()
 
     progress_hook = getattr(_aux_progress, "hook", None)
+    candidate_deadline = getattr(_aux_progress, "candidate_deadline", None)
     provider_context = contextvars.copy_context()
     done = threading.Event()
     outcome: dict[str, Any] = {}
 
     def _provider_worker() -> None:
         try:
-            with aux_progress_hook(progress_hook), aux_interrupt_protection(
+            with aux_progress_hook(progress_hook), aux_host_candidate_deadline(
+                candidate_deadline
+            ), aux_interrupt_protection(
                 cancel_check=cancel_check
             ):
                 outcome["result"] = callback(kwargs)
@@ -4595,6 +4668,17 @@ def _is_invalid_aux_response_error(exc: Exception) -> bool:
     )
 
 
+def _should_advance_compression_fallback(task: Optional[str], exc: Exception) -> bool:
+    """Compression request failures walk fallback_chain even on explicit routes.
+
+    The host cannot treat a 401 / policy refusal as “compression done”:
+    the transcript is still oversized. Any remaining configured candidate
+    must run (#129). Other auxiliary tasks keep the historical
+    auto-or-capacity gate.
+    """
+    return task == "compression" and isinstance(exc, Exception)
+
+
 def _evict_cached_clients(provider: str) -> None:
     """Drop cached auxiliary clients for a provider so fresh creds are used."""
     normalized = _normalize_aux_provider(provider)
@@ -5244,6 +5328,9 @@ def _call_fallback_candidate_sync(
                 fb_kwargs,
                 provider=destination.provider,
                 api_mode=destination.api_mode,
+                create=lambda request: _create_with_progress(
+                    fb_client, request, task,
+                ),
             ),
             task,
         )
@@ -5343,6 +5430,11 @@ async def _call_fallback_candidate_async(
         tools=fallback_tools, timeout=effective_timeout,
         extra_body=effective_extra_body, reasoning_config=reasoning_config,
         base_url=destination.base_url, task=task)
+    async def _fb_acreate(request: Dict[str, Any]) -> Any:
+        if _aux_progress_active():
+            return await _acreate_with_stream(fb_client, request, task)
+        return await fb_client.chat.completions.create(**request)
+
     try:
         return _validate_llm_response(
             await _relay_async_completion(
@@ -5350,6 +5442,7 @@ async def _call_fallback_candidate_async(
                 fb_kwargs,
                 provider=destination.provider,
                 api_mode=destination.api_mode,
+                create=_fb_acreate,
             ),
             task,
         )
@@ -8985,15 +9078,12 @@ _AUX_STREAM_CEILING_MULTIPLIER = 4.0
 def _aux_stream_total_ceiling(effective_timeout: Optional[float]) -> float:
     """Absolute wall-clock bound for a progress-hooked streamed aux call.
 
-    Generous by design — the idle timeout is the real guard; this only stops
-    a degenerate stream that trickles one token per idle window forever.
+    Generous by design when no host is supervising — the idle timeout is
+    the real guard; this only stops a degenerate trickle. Under a host
+    candidate deadline the attempt is capped so expiry stays inside
+    ``call_llm`` and ``fallback_chain`` can advance (#128).
     """
-    try:
-        timeout = float(effective_timeout) if effective_timeout is not None else 0.0
-    except (TypeError, ValueError):
-        timeout = 0.0
-    return max(_AUX_STREAM_CEILING_FLOOR_SECONDS,
-               _AUX_STREAM_CEILING_MULTIPLIER * timeout)
+    return resolve_aux_attempt_deadline(effective_timeout)
 
 
 def _client_streams_internally(client: Any) -> bool:
@@ -9172,7 +9262,6 @@ class _ChatStreamAccumulator:
         self.resp_model = model or ""
 
     def feed(self, chunk: Any) -> None:
-        _notify_aux_progress()
         if (
             self._total_ceiling is not None
             and (time.monotonic() - self._started) >= self._total_ceiling
@@ -9203,7 +9292,8 @@ class _ChatStreamAccumulator:
         )
         if reasoning_piece and isinstance(reasoning_piece, str):
             self.reasoning_parts.append(reasoning_piece)
-        for tc in (getattr(delta, "tool_calls", None) or []):
+        tool_deltas = getattr(delta, "tool_calls", None) or []
+        for tc in tool_deltas:
             idx = getattr(tc, "index", 0) or 0
             acc = self.tool_calls_acc.setdefault(
                 idx, {"id": "", "name": "", "arguments": []}
@@ -9216,6 +9306,9 @@ class _ChatStreamAccumulator:
                     acc["name"] = fn.name
                 if getattr(fn, "arguments", None):
                     acc["arguments"].append(fn.arguments)
+        # Keepalive / empty frames must not reset idle (#128).
+        if piece or (reasoning_piece and isinstance(reasoning_piece, str)) or tool_deltas:
+            _notify_aux_progress()
 
     def finish(self) -> Any:
         tool_calls = None
@@ -10006,6 +10099,7 @@ def _call_llm_impl(
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
+            or _should_advance_compression_fallback(task, first_err)
         )
         # Respect explicit provider choice for transient errors (auth, request
         # validation, etc.) but allow fallback when the provider clearly cannot
@@ -10030,7 +10124,11 @@ def _call_llm_impl(
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
         )
-        if should_fallback and (is_auto or is_capacity_error):
+        if should_fallback and (
+            is_auto
+            or is_capacity_error
+            or _should_advance_compression_fallback(task, first_err)
+        ):
             if _is_auth_error(first_err):
                 reason = "auth error"
             elif _is_payment_error(first_err):
@@ -10048,6 +10146,8 @@ def _call_llm_impl(
                 reason = "model incompatible with route"
             elif _is_invalid_aux_response_error(first_err):
                 reason = "invalid provider response"
+            elif _should_advance_compression_fallback(task, first_err):
+                reason = "request error"
             else:
                 reason = "connection error"
             logger.info("Auxiliary %s: %s on %s (%s), trying fallback",
@@ -10733,6 +10833,7 @@ async def _async_call_llm_impl(
             or _is_rate_limit_error(first_err)
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
+            or _should_advance_compression_fallback(task, first_err)
         )
         # Capacity errors (payment/quota/connection/rate-limit) bypass the
         # explicit-provider gate — the provider cannot serve the request
@@ -10749,7 +10850,11 @@ async def _async_call_llm_impl(
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
         )
-        if should_fallback and (is_auto or is_capacity_error):
+        if should_fallback and (
+            is_auto
+            or is_capacity_error
+            or _should_advance_compression_fallback(task, first_err)
+        ):
             if _is_auth_error(first_err):
                 reason = "auth error"
             elif _is_payment_error(first_err):
@@ -10763,6 +10868,8 @@ async def _async_call_llm_impl(
                 reason = "model incompatible with route"
             elif _is_invalid_aux_response_error(first_err):
                 reason = "invalid provider response"
+            elif _should_advance_compression_fallback(task, first_err):
+                reason = "request error"
             else:
                 reason = "connection error"
             logger.info("Auxiliary %s (async): %s on %s (%s), trying fallback",

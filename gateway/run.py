@@ -19709,6 +19709,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                                     loop = asyncio.get_running_loop()
                                     _hyg_commit_fence = CompressionCommitFence()
+                                    _hyg_commit_fence.configure_host_budget(
+                                        idle_timeout_seconds=_hyg_timeout_seconds,
+                                        total_ceiling_seconds=_hyg_total_ceiling_seconds,
+                                    )
                                     _hyg_future = loop.run_in_executor(
                                         None,
                                         lambda: _hyg_agent._compress_context(

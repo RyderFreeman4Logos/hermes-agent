@@ -755,6 +755,13 @@ export type GatewayEvent =
   | {
       payload?: {
         billing?: BillingBlock
+        cache_info?: {
+          pct?: number
+          prompt_tokens?: number
+          read_tokens?: number
+          state: 'cold_write' | 'hit' | 'miss' | 'unavailable' | 'unknown'
+        }
+        completed_at?: number
         failure_reason?: string
         reasoning?: string
         rendered?: string

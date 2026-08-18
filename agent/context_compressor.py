@@ -4371,8 +4371,8 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         ``_LEAN_DIGEST_MAX_CHUNKS`` — beyond that, earliest chunks are merged
         coarser) and digests each with the compression LLM. Any chunk failure
         degrades to a placeholder naming the message range; the whole call
-        never raises. Chunks run sequentially on the same transport as the
-        main summary.
+        never raises. Chunks run concurrently on the same transport as the
+        main summary; concatenated output stays in original segment order.
         """
         text = _serialize_turns_for_digest(
             turns, getattr(self, "_lean_pristine_tools", None),
@@ -4384,11 +4384,16 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         if n_chunks > _LEAN_DIGEST_MAX_CHUNKS:
             chunk_size = (len(text) + _LEAN_DIGEST_MAX_CHUNKS - 1) // _LEAN_DIGEST_MAX_CHUNKS
             n_chunks = _LEAN_DIGEST_MAX_CHUNKS
-        digests: list[str] = []
+
+        jobs: list[tuple[int, str]] = []
         for ci in range(n_chunks):
             segment = text[ci * chunk_size:(ci + 1) * chunk_size]
-            if not segment.strip():
-                continue
+            if segment.strip():
+                jobs.append((ci, segment))
+        if not jobs:
+            return ""
+
+        def _digest_one(ci: int, segment: str) -> str:
             try:
                 from agent.auxiliary_client import call_llm
 
@@ -4409,10 +4414,30 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
                 body = strip_think_blocks(None, body).strip()
             except Exception as exc:
                 logger.warning("lean chunk digest %d/%d failed: %s", ci + 1, n_chunks, exc)
-                body = f"[digest unavailable for segment {ci + 1}/{n_chunks} — recover via session_search]"
-            digests.append(f"### Segment {ci + 1}/{n_chunks}\n{body}")
-        if not digests:
-            return ""
+                body = (
+                    f"[digest unavailable for segment {ci + 1}/{n_chunks} "
+                    "— recover via session_search]"
+                )
+            return f"### Segment {ci + 1}/{n_chunks}\n{body}"
+
+        from concurrent.futures import ThreadPoolExecutor
+        from agent.auxiliary_client import _get_task_max_concurrency
+        from tools.thread_context import propagate_context_to_thread
+
+        configured = _get_task_max_concurrency("compression")
+        workers = len(jobs) if configured is None else min(configured, len(jobs))
+        # ponytail: pool size capped at _LEAN_DIGEST_MAX_CHUNKS; raise only if
+        # the chunk ceiling itself is lifted.
+        workers = max(1, min(workers, _LEAN_DIGEST_MAX_CHUNKS))
+        if workers == 1 or len(jobs) == 1:
+            digests = [_digest_one(ci, segment) for ci, segment in jobs]
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = [
+                    pool.submit(propagate_context_to_thread(_digest_one), ci, segment)
+                    for ci, segment in jobs
+                ]
+                digests = [fut.result() for fut in futures]
         return (
             "\n\n" + _LEAN_DIGESTS_HEADING + "\n"
             + "\n\n".join(digests)

@@ -236,6 +236,27 @@ def _profile_schema_texts(fn):
 
 
 class TestOmittedProfileUsesPoolDefault:
+    def test_advertised_schema_agrees_with_omit_resolution(self):
+        with patch("tools.delegate_tool._load_config", return_value=PINNED_CFG):
+            overrides = _build_dynamic_schema_overrides()
+        advertised = "\n".join(
+            [
+                overrides.get("description") or "",
+                overrides["parameters"]["properties"]["model_profile"]["description"],
+                overrides["parameters"]["properties"]["tasks"]["items"]["properties"][
+                    "model_profile"
+                ]["description"],
+            ]
+        ).lower()
+        assert "inherit" not in advertised
+        assert "standard" in advertised
+        assert "fail closed" in advertised.replace("-", " ")
+
+        payload, kwargs = _child_kwargs()
+        assert "error" not in payload
+        assert kwargs["model"] == "deepseek-v4-flash"
+        assert kwargs["provider"] == "opencode-go"
+
     def test_omitted_profile_uses_standard_not_global_pin(self):
         payload, kwargs = _child_kwargs()
         assert "error" not in payload

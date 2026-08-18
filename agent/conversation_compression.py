@@ -505,9 +505,12 @@ class CompressionCommitFence:
         """Publish the host's finite idle + ceiling so attempts can expire first."""
         self._host_idle = float(idle_timeout_seconds)
         self._host_ceiling = float(total_ceiling_seconds)
-        self._wait_started = (
+        started = (
             float(wait_started) if wait_started is not None else time.monotonic()
         )
+        self._wait_started = started
+        # Idle starts with THIS wait, not fence construction / a prior waiter (#128 B1).
+        self._last_progress = started
 
     def remaining_candidate_deadline(self) -> Optional[float]:
         """Seconds left for the active aux attempt before the host would abort.
@@ -912,9 +915,6 @@ def run_compress_context_with_progress_timeout(
     fence = fence if fence is not None else CompressionCommitFence()
     ceiling = max(float(total_ceiling_seconds), float(idle_timeout_seconds))
     idle = float(idle_timeout_seconds)
-    fence.configure_host_budget(
-        idle_timeout_seconds=idle, total_ceiling_seconds=ceiling,
-    )
     # Sync mirror of gateway session-hygiene's run_in_executor(None, ...) +
     # wait_for loop (gateway/run.py): offload compress_context onto the shared
     # daemon pool, poll with an inactivity budget + total ceiling, then
@@ -963,6 +963,14 @@ def run_compress_context_with_progress_timeout(
 
     # Bare pool workers start with an empty ContextVar map; propagate the
     # parent conversation/approval context into the worker.
+    # Idle / leftover start when THIS wait begins — after admit, at submit
+    # (configure-before-admit ages leftover through pool admission; #128 B1).
+    wait_started = time.monotonic()
+    fence.configure_host_budget(
+        idle_timeout_seconds=idle,
+        total_ceiling_seconds=ceiling,
+        wait_started=wait_started,
+    )
     try:
         future = executor.submit(
             propagate_context_to_thread(_fence_gated_worker), fence
@@ -971,8 +979,7 @@ def run_compress_context_with_progress_timeout(
         _release_compression_admission()
         raise
     future.add_done_callback(_release_compression_admission)
-    wait_started = time.monotonic()
-    # F2: EVERY host unwind (KeyboardInterrupt, task cancellation, unexpected
+    # F2: EVERY host unwind (KeyboardInterrupt, task cancellation, unexpected)
     # exception while waiting) must revoke future commit admission before the
     # host resumes, or a detached worker could later commit and mutate durable
     # state behind the caller's back. ``handled_exit`` marks the paths that

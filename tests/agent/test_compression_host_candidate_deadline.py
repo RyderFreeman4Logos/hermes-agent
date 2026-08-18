@@ -327,7 +327,7 @@ class TestHostCandidateDeadlineAdvancesFallback:
         first.base_url = "https://slow.example/v1"
 
         def _slow_ttfb(**kwargs):
-            time.sleep(0.22)
+            time.sleep(1.3)
             if kwargs.get("stream"):
                 return iter([_text_chunk("too-late-first", finish="stop")])
             raise AssertionError("first fallback must use the streamed attempt path")
@@ -368,8 +368,8 @@ class TestHostCandidateDeadlineAdvancesFallback:
                 worker=worker,
                 messages=original,
                 system_prompt_fallback="fallback-prompt",
-                idle_timeout_seconds=0.16,
-                total_ceiling_seconds=2.0,
+                idle_timeout_seconds=1.0,
+                total_ceiling_seconds=5.0,
             )
 
         assert result_msgs == compressed

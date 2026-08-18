@@ -903,6 +903,45 @@ class TestAuthFailureAborts:
         assert c._last_compress_aborted is False
         assert c._last_summary_fallback_used is True
 
+    def test_statusless_usage_limit_aborts_instead_of_dropping_context(self):
+        """#125: exhausted chain / classified billing must fail closed."""
+        err = StubProviderError("usage limit reached")
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=2,
+                protect_last_n=2,
+                abort_on_summary_failure=False,
+            )
+        msgs = self._msgs(12)
+        with patch("agent.context_compressor.call_llm", side_effect=err):
+            result = c.compress(msgs, current_tokens=999999, force=True)
+
+        assert result == msgs
+        assert c._last_summary_auth_failure is True
+        assert c._last_compress_aborted is True
+        assert c._last_summary_fallback_used is False
+
+    def test_429_weekly_usage_limit_aborts_instead_of_dropping_context(self):
+        """#125: 429 weekly cap must fail closed, not skip-compress as success."""
+        err = StubProviderError("Weekly usage limit reached", status_code=429)
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=2,
+                protect_last_n=2,
+                abort_on_summary_failure=False,
+            )
+        msgs = self._msgs(12)
+        with patch("agent.context_compressor.call_llm", side_effect=err):
+            result = c.compress(msgs, current_tokens=999999, force=True)
+
+        assert result == msgs
+        assert c._last_summary_auth_failure is True
+        assert c._last_compress_aborted is True
+        assert c._last_summary_fallback_used is False
 
     def test_403_also_flags_auth_failure(self):
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):

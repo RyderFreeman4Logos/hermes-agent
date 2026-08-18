@@ -1796,6 +1796,66 @@ class TestAuxiliaryFallbackLayering:
         # Main agent fallback should NOT be needed when chain succeeds
         mock_main.assert_not_called()
 
+    def test_statusless_usage_limit_advances_chain_on_first_attempt(self):
+        """#125: status-less usage-limit on the compression primary walks
+        fallback_chain on attempt 1 — no same-route retry storm."""
+        primary = MagicMock()
+        primary.base_url = "https://opencode.ai/zen/v1"
+        primary.chat.completions.create.side_effect = Exception(
+            "usage limit reached"
+        )
+
+        fallback = MagicMock()
+        fallback.chat.completions.create.return_value = MagicMock(choices=[
+            MagicMock(message=MagicMock(content="from fallback chain")),
+        ])
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary, "deepseek-v4-flash")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("opencode-go", "deepseek-v4-flash", None, None, None)), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain",
+                   return_value=(fallback, "gpt-5.4-mini", "fallback_chain[0](openai-codex)")) as mock_chain, \
+             patch("agent.auxiliary_client._try_main_agent_model_fallback") as mock_main:
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result.choices[0].message.content == "from fallback chain"
+        assert primary.chat.completions.create.call_count == 1
+        mock_chain.assert_called()
+        mock_main.assert_not_called()
+
+    def test_429_weekly_usage_limit_advances_chain_on_first_attempt(self):
+        """#125: live OpenCode Go weekly 429 must walk fallback_chain on attempt 1."""
+        primary = MagicMock()
+        primary.base_url = "https://opencode.ai/zen/v1"
+        err = Exception("Weekly usage limit reached")
+        setattr(err, "status_code", 429)
+        primary.chat.completions.create.side_effect = err
+
+        fallback = MagicMock()
+        fallback.chat.completions.create.return_value = MagicMock(choices=[
+            MagicMock(message=MagicMock(content="from fallback chain")),
+        ])
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary, "deepseek-v4-flash")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("opencode-go", "deepseek-v4-flash", None, None, None)), \
+             patch("agent.auxiliary_client._try_configured_fallback_chain",
+                   return_value=(fallback, "gpt-5.4-mini", "fallback_chain[0](openai-codex)")) as mock_chain, \
+             patch("agent.auxiliary_client._try_main_agent_model_fallback") as mock_main:
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result.choices[0].message.content == "from fallback chain"
+        assert primary.chat.completions.create.call_count == 1
+        mock_chain.assert_called()
+        mock_main.assert_not_called()
 
     def test_warning_emitted_when_all_fallbacks_exhausted(self, monkeypatch, caplog):
         """When chain AND main model both fail, a user-visible warning fires before re-raise."""
@@ -2679,8 +2739,8 @@ class TestAuxiliaryAuthRefreshRetry:
 
 class TestAuxiliaryPoolRotationRetry:
     def test_call_llm_rotates_explicit_codex_pool_on_429(self):
-        rate_err = Exception("usage limit reached")
-        rate_err.status_code = 429
+        rate_err = Exception("Rate limit exceeded: too many requests")
+        setattr(rate_err, "status_code", 429)
 
         stale_client = MagicMock()
         stale_client.base_url = "https://chatgpt.com/backend-api/codex"

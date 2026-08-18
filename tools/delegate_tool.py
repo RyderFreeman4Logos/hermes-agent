@@ -4564,8 +4564,8 @@ def _build_top_level_description() -> str:
         "- Leaf children (the default) cannot call delegate_task, clarify, "
         "memory, send_message, or cronjob; orchestrators regain only "
         "delegate_task.\n"
-        "- Children inherit the parent route unless a named model_profile "
-        "tier is selected from the configured pool. "
+        "- Omitted model_profile uses standard if present, else the first "
+        "tier. Unknown names fail closed. "
         "Results are returned as an array, one entry per task."
     )
 

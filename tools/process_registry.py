@@ -1434,14 +1434,26 @@ class ProcessRegistry:
                     _append_chunk(tail)
             except Exception:
                 pass
-            # Always reap the child to prevent zombie processes.
+            # Reap the launched PID. Pipe EOF is not completion: a long child
+            # (``hermes chat``) can close stdout and stay ``S``, which used to
+            # enqueue exit=None while /proc/<pid> still lived (issue #132).
             try:
                 session.process.wait(timeout=5)
             except Exception as e:
                 logger.debug("Process wait timed out or failed: %s", e)
+            poll = getattr(session.process, "poll", None)
+            rc = poll() if callable(poll) else getattr(session.process, "returncode", None)
+            if rc is None:
+                try:
+                    session.process.wait()
+                except Exception as e:
+                    logger.debug("Process wait after live-PID EOF failed: %s", e)
+                rc = poll() if callable(poll) else getattr(session.process, "returncode", None)
+            if rc is None:
+                return
             session.exited = True
             if session.completion_reason != "killed":
-                session.exit_code = session.process.returncode
+                session.exit_code = rc if isinstance(rc, int) else None
                 session.completion_reason = "exited"
             self._move_to_finished(session)
 

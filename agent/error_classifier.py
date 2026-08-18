@@ -251,6 +251,24 @@ _USAGE_LIMIT_TRANSIENT_SIGNALS = [
     "window",
 ]
 
+# Account/subscription caps that reuse HTTP 429. Distinct from generic
+# "rate limit exceeded" / "limit exceeded" throttles.
+_TERMINAL_ACCOUNT_QUOTA_PATTERNS = (
+    "weekly usage limit",
+    "weekly limit",
+    "usage limit reached",
+    "usage limit has been reached",
+)
+
+
+def _is_terminal_account_quota(error_msg: str, error_type: str = "") -> bool:
+    """True for a non-resetting account/subscription quota wall."""
+    if any(p in error_msg for p in _USAGE_LIMIT_TRANSIENT_SIGNALS):
+        return False
+    if (error_type or "").lower() == "gousagelimiterror":
+        return True
+    return any(p in error_msg for p in _TERMINAL_ACCOUNT_QUOTA_PATTERNS)
+
 # Payload-too-large patterns detected from message text (no status_code attr).
 # Proxies and some backends embed the HTTP status in the error message.
 _PAYLOAD_TOO_LARGE_PATTERNS = [
@@ -1247,6 +1265,17 @@ def _classify_by_status(
                 should_rotate_credential=False,
                 should_fallback=True,
                 error_context=ctx,
+            )
+        # Weekly / subscription caps reuse HTTP 429 (#125). Generic
+        # "rate limit exceeded" stays a throttle; only account-cap wording
+        # (or GoUsageLimitError) is billing so conversation_loop cannot
+        # burn 10×600s on the same route.
+        if _is_terminal_account_quota(error_msg):
+            return result_fn(
+                FailoverReason.billing,
+                retryable=False,
+                should_rotate_credential=True,
+                should_fallback=True,
             )
         return result_fn(
             FailoverReason.rate_limit,

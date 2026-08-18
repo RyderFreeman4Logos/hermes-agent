@@ -4068,7 +4068,19 @@ def _is_payment_error(exc: Exception) -> bool:
     Vertex AI "quota exceeded") are functionally equivalent to credit
     exhaustion — the provider cannot serve the request until the quota
     resets — and should trigger the same provider-fallback logic.
+
+    Status-less usage-limit bodies that ``classify_api_error`` maps to
+    billing (e.g. OpenCode Go ``usage limit reached``) must also match so
+    ``fallback_chain`` advances on attempt 1 instead of retrying the same
+    route (#125).
     """
+    try:
+        from agent.error_classifier import FailoverReason, classify_api_error
+
+        if classify_api_error(exc).reason is FailoverReason.billing:
+            return True
+    except Exception:
+        pass
     status = getattr(exc, "status_code", None)
     if status == 402:
         return True

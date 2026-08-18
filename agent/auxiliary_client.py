@@ -516,6 +516,10 @@ def resolve_aux_attempt_deadline(
         host = float(host_candidate_deadline) if host_candidate_deadline is not None else 0.0
     except (TypeError, ValueError):
         host = 0.0
+    if host_candidate_deadline is not None and host <= 0:
+        # Host already spent its idle/ceiling: expire this attempt now so
+        # fallback_chain can walk before the host fence-cancels (#128).
+        return 0.0
     if host > 0 and timeout > 0:
         return min(generous, host, timeout)
     if host > 0:
@@ -1617,6 +1621,11 @@ class _CodexCompletionsAdapter:
         timeout = kwargs.get("timeout")
         if timeout is not None:
             resp_kwargs["timeout"] = timeout
+        host_deadline = resolve_aux_attempt_deadline(timeout)
+        if host_deadline > 0 and (
+            timeout is None or host_deadline < float(timeout)
+        ):
+            resp_kwargs["timeout"] = host_deadline
 
         # Note: the Codex endpoint (chatgpt.com/backend-api/codex) does NOT
         # support max_output_tokens or temperature — omit to avoid 400 errors.
@@ -9189,6 +9198,57 @@ def _provider_requires_stream(provider: str, base_url: Optional[str]) -> bool:
     return False
 
 
+def _create_bounded(create_fn, timeout_s: float) -> Any:
+    """Bound a blocking ``create()`` so TTFB cannot outrun the host (#128).
+
+    The stream accumulator only exists after ``create()`` returns, so a
+    silent first-byte wait has to expire here or the host fence-cancels
+    first. Detached leftover work is the same late-worker model as the
+    host fence.
+    """
+    if timeout_s <= 0:
+        raise TimeoutError(
+            "Auxiliary streamed call timed out after 0s total ceiling "
+            "(host candidate deadline already expired)"
+        )
+    done = threading.Event()
+    box: Dict[str, Any] = {}
+    progress_hook = getattr(_aux_progress, "hook", None)
+    candidate_deadline = getattr(_aux_progress, "candidate_deadline", None)
+    interrupt_active = getattr(_aux_interrupt_protection, "active", False)
+    interrupt_check = getattr(_aux_interrupt_protection, "cancel_check", None)
+    interrupt_event = getattr(_aux_interrupt_protection, "cancel_event", None)
+
+    def _run() -> None:
+        try:
+            with aux_progress_hook(progress_hook), aux_host_candidate_deadline(
+                candidate_deadline
+            ), aux_interrupt_protection(
+                active=interrupt_active,
+                cancel_check=interrupt_check,
+                cancel_event=interrupt_event,
+            ):
+                box["result"] = create_fn()
+        except BaseException as exc:
+            box["exc"] = exc
+        finally:
+            done.set()
+
+    # ponytail: one daemon waiter per attempt; shard if TTFB bounding
+    # becomes a hotspot.
+    threading.Thread(
+        target=_run, name="hermes-aux-attempt-deadline", daemon=True,
+    ).start()
+    if not done.wait(timeout_s):
+        raise TimeoutError(
+            f"Auxiliary streamed call timed out after {timeout_s:.0f}s "
+            "total ceiling (stream still open but over budget)"
+        )
+    if "exc" in box:
+        raise box["exc"]
+    return box["result"]
+
+
 def _create_with_progress(
     client: Any,
     kwargs: Dict[str, Any],
@@ -9212,16 +9272,37 @@ def _create_with_progress(
     stream-only provider rejects the plain call by definition, so the
     original error is surfaced to the normal recovery chains instead.
     """
-    _notify_aux_progress()  # request dispatched counts as progress
-    if (not _aux_progress_active() and not force_stream) or _client_streams_internally(client):
+    # Dispatch is not summary progress. Ticking the host idle clock here
+    # restarts the 120s fence before TTFB and loses the race to attempt
+    # TimeoutError (#128).
+    if not _aux_progress_active() and not force_stream:
         return client.chat.completions.create(**kwargs)
 
     total_ceiling = _aux_stream_total_ceiling(kwargs.get("timeout"))
+    attempt_started = time.monotonic()
+    kwargs = dict(kwargs)
+    kwargs["timeout"] = total_ceiling
+
+    def _remaining() -> float:
+        return total_ceiling - (time.monotonic() - attempt_started)
+
+    if _client_streams_internally(client):
+        # Codex / Anthropic / Bedrock consume the stream inside create().
+        return _create_bounded(
+            lambda: client.chat.completions.create(**kwargs),
+            total_ceiling,
+        )
+
     stream_kwargs = dict(kwargs)
     stream_kwargs["stream"] = True
     stream_kwargs["stream_options"] = {"include_usage": True}
     try:
-        chunks = client.chat.completions.create(**stream_kwargs)
+        chunks = _create_bounded(
+            lambda: client.chat.completions.create(**stream_kwargs),
+            _remaining(),
+        )
+    except TimeoutError:
+        raise
     except Exception as exc:
         # Genuine provider failures (auth, credit, rate limit, network) are
         # not streaming's fault — surface them unchanged so the existing
@@ -9251,7 +9332,7 @@ def _create_with_progress(
         _notify_aux_progress()
         return chunks
     return _aggregate_chat_stream(
-        chunks, model=str(kwargs.get("model") or ""), total_ceiling=total_ceiling,
+        chunks, model=str(kwargs.get("model") or ""), total_ceiling=_remaining(),
     )
 
 

@@ -2290,6 +2290,27 @@ class TestIsConnectionError:
         err.status_code = 400
         assert _is_connection_error(err) is False
 
+    def test_aiohttp_client_payload_error_is_connection(self):
+        """Truncated HTTP body is a dead stream, not an unknown API error (#127)."""
+        from agent.auxiliary_client import _is_connection_error
+
+        class ClientPayloadError(Exception):
+            pass
+
+        err = ClientPayloadError(
+            "Response payload is not completed: "
+            "<TransferEncodingError: 400, message='Not enough data to satisfy "
+            "transfer length header.'>"
+        )
+        assert _is_connection_error(err) is True
+
+    def test_payload_not_completed_message_is_connection(self):
+        """Message-only wrappers (no aiohttp type) still classify as connection."""
+        from agent.auxiliary_client import _is_connection_error
+
+        err = Exception("Response payload is not completed")
+        assert _is_connection_error(err) is True
+
 
 
 class TestKimiTemperatureOmitted:

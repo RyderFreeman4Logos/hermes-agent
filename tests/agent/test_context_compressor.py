@@ -1164,6 +1164,38 @@ class TestStreamingClosedFallback:
         # Streaming-closed should use the 30s short cooldown.
         assert c._summary_failure_cooldown_until == 1030.0
 
+    def test_client_payload_error_skips_generic_60s_cooldown(self):
+        """aiohttp truncated-body errors must not take the unknown-error 60s pause.
+
+        Production classification lives in ``_is_connection_error`` (unpatched
+        here). A 60s cooldown would mean the generic else-branch still treats
+        ClientPayloadError as unknown (#127).
+        """
+        class ClientPayloadError(Exception):
+            pass
+
+        err = ClientPayloadError(
+            "Response payload is not completed: "
+            "<TransferEncodingError: 400, message='Not enough data to satisfy "
+            "transfer length header.'>"
+        )
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="main-model",
+                quiet_mode=True,
+            )
+
+        with patch(
+            "agent.context_compressor.call_llm",
+            side_effect=err,
+        ), patch("agent.context_compressor.time.monotonic", return_value=1000.0):
+            result = c._generate_summary(self._msgs())
+
+        assert result is None
+        assert c._summary_failure_cooldown_until != 1060.0
+        assert c._last_summary_network_failure is True
+
 
 
 class TestAuxModelFallbackSurfacedToCallers:

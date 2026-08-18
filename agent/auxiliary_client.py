@@ -4214,6 +4214,10 @@ def _is_connection_error(exc: Exception) -> bool:
         "unexpected eof",
         "remoteprotocolerror",
         "localprotocolerror",
+        # aiohttp mid-stream body close (#127). Distinct from httpx/httpcore
+        # phrasing above; without this the compressor treats it as unknown
+        # and pauses 60s on the same dead stream.
+        "payload is not completed",
     )):
         return True
     return False

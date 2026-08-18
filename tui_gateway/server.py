@@ -10069,6 +10069,126 @@ def _notification_event_requires_owner(evt: dict) -> bool:
     )
 
 
+def _session_identity_keys(sid: str, session: dict) -> set[str]:
+    current = {
+        str(sid or ""),
+        str(session.get("session_key") or ""),
+        _session_lookup_key(session, fallback=sid),
+    }
+    current.discard("")
+    return current
+
+
+def _resume_tip(key: str) -> str:
+    if not key:
+        return ""
+    try:
+        db = _get_db()
+    except Exception:
+        db = None
+    if db is None:
+        return key
+    try:
+        return str(db.resolve_resume_session_id(key) or key)
+    except Exception:
+        return key
+
+
+def _iter_live_delegate_records() -> list[dict]:
+    """In-memory live rows plus durable running/finalizing rows (process restart)."""
+    records: list[dict] = []
+    seen: set[str] = set()
+    try:
+        from tools.async_delegation import list_async_delegations
+
+        for rec in list_async_delegations():
+            if rec.get("status") not in {"running", "stalling", "finalizing"}:
+                continue
+            did = str(rec.get("delegation_id") or "")
+            records.append(rec)
+            if did:
+                seen.add(did)
+    except Exception:
+        pass
+    try:
+        from tools.async_delegation import _DB_LOCK, _transaction
+
+        with _DB_LOCK, _transaction() as conn:
+            rows = conn.execute(
+                """SELECT delegation_id, origin_session, origin_ui_session_id,
+                          parent_session_id
+                   FROM async_delegations
+                   WHERE state IN ('running', 'finalizing')"""
+            ).fetchall()
+    except Exception:
+        rows = []
+    for did, session_key, origin_ui, parent_id in rows:
+        did = str(did or "")
+        if did and did in seen:
+            continue
+        records.append(
+            {
+                "delegation_id": did,
+                "session_key": session_key,
+                "origin_ui_session_id": origin_ui,
+                "parent_session_id": parent_id,
+                "status": "running",
+            }
+        )
+    return records
+
+
+def _this_session_live_delegate_origin_keys(sid: str, session: dict) -> set[str]:
+    """Raw owner keys of live delegates belonging to this (possibly compressed) session."""
+    current = _session_identity_keys(sid, session)
+    if not current:
+        return set()
+    current_tips = {_resume_tip(k) for k in current} | current
+    current_tips.discard("")
+    origin: set[str] = set()
+    for rec in _iter_live_delegate_records():
+        rec_keys = {
+            str(rec.get("session_key") or ""),
+            str(rec.get("parent_session_id") or ""),
+            str(rec.get("origin_ui_session_id") or ""),
+        }
+        rec_keys.discard("")
+        rec_keys.discard("default")
+        if not rec_keys:
+            continue
+        if rec_keys & current or any(_resume_tip(k) in current_tips for k in rec_keys):
+            origin |= rec_keys
+    return origin
+
+
+def _is_live_delegate_child_completion(sid: str, session: dict, evt: dict) -> bool:
+    """Child terminal() tails are owned by a live delegate, not the parent session.
+
+    Production ``terminal()`` stores ``task_id="default"`` for parent and child.
+    Ownership is the registry/event session_key or parent_session_id matching
+    the live delegate's raw keys — never task_id inequality.
+    """
+    if evt.get("type") != "completion":
+        return False
+    origin = _this_session_live_delegate_origin_keys(sid, session)
+    if not origin:
+        return False
+    candidates = {str(evt.get("session_key") or "")}
+    try:
+        from tools.process_registry import process_registry
+
+        proc = process_registry.get(str(evt.get("session_id") or ""))
+    except Exception:
+        proc = None
+    if proc is not None:
+        candidates.add(str(getattr(proc, "session_key", "") or ""))
+        candidates.add(str(getattr(proc, "parent_session_id", "") or ""))
+    candidates.discard("")
+    candidates.discard("default")
+    return bool(candidates & origin)
+
+
+
 def _mark_completion_events_consumed(events: list) -> None:
     from tools.process_registry import process_registry
 
@@ -10578,7 +10698,20 @@ def _notification_poller_loop(
         try:
             # ponytail: reuse get() timeout as the idle fan-in window
             # (gateway uses 0.1s); a dedicated timer if cadence must differ.
-            timeout = 0.1 if session.get("_completion_pending") else 0.5
+            # After restart/compress, live-delegate child tails arrive
+            # farther apart than 0.1s — hold those only (2s) so N become
+            # one #131 ingest. Parent-owned tails keep the short window.
+            with session["history_lock"]:
+                pending = list(session.get("_completion_pending") or [])
+            timeout = 0.5
+            if pending:
+                if all(
+                    _is_live_delegate_child_completion(sid, session, item)
+                    for item in pending
+                ):
+                    timeout = 2.0  # ponytail: 2s child-hold; raise if tails space wider
+                else:
+                    timeout = 0.1
             evt = process_registry.completion_queue.get(timeout=timeout)
         except Exception:
             _flush_pending_completions_if_idle(sid, session, _emitted)

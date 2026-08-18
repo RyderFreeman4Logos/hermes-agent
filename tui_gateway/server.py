@@ -9756,9 +9756,9 @@ def _mark_completion_events_consumed(events: list) -> None:
 
 
 def _format_completion_batch(events: list) -> str:
-    """One structured summary for N completions that arrived while busy."""
+    """One structured summary for N completions in the same ingest window."""
     lines = [
-        f"{len(events)} background processes completed while this turn was running."
+        f"{len(events)} background processes completed."
     ]
     for evt in events:
         lines.append(
@@ -10177,7 +10177,8 @@ def _notification_poller_loop(
     agent turn via _run_prompt_submit if the session is idle.
 
     Completions that arrive while session["running"] (blocked on an LLM
-    response) are buffered on the session and emitted as one structured
+    response) are buffered on the session. Idle/between-turn completions
+    share a short queue-empty window. Both paths emit one structured
     batch at the next idle ingest — not N status.update storms, and not
     a one-by-one dump after the loop stops.
 
@@ -10250,7 +10251,10 @@ def _notification_poller_loop(
                         with session["history_lock"]:
                             session["running"] = False
         try:
-            evt = process_registry.completion_queue.get(timeout=0.5)
+            # ponytail: reuse get() timeout as the idle fan-in window
+            # (gateway uses 0.1s); a dedicated timer if cadence must differ.
+            timeout = 0.1 if session.get("_completion_pending") else 0.5
+            evt = process_registry.completion_queue.get(timeout=timeout)
         except Exception:
             _flush_pending_completions_if_idle(sid, session, _emitted)
             continue
@@ -10297,7 +10301,6 @@ def _notification_poller_loop(
         if evt.get("type") == "completion":
             with session["history_lock"]:
                 session.setdefault("_completion_pending", []).append(evt)
-            _flush_pending_completions_if_idle(sid, session, _emitted)
             continue
 
         text = format_process_notification(evt)

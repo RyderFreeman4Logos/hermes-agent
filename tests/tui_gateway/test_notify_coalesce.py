@@ -65,7 +65,7 @@ def _run_poller_until(sid: str, sess: dict, pred, timeout: float = 2.0) -> None:
 def test_busy_completions_coalesce_to_one_ingest_batch_idle_stays_immediate(
     monkeypatch,
 ):
-    """N completions while running become one batch at next ingest; idle is 1:1."""
+    """N completions while running become one batch at next ingest; idle stays immediate for a lone completion."""
     isolated: queue_mod.Queue = queue_mod.Queue()
     monkeypatch.setattr(process_registry, "completion_queue", isolated)
     monkeypatch.setattr(server, "_get_db", lambda: None)
@@ -164,6 +164,54 @@ def test_busy_completions_coalesce_to_one_ingest_batch_idle_stays_immediate(
         stop.set()
         thread.join(timeout=2.0)
         server._sessions.pop(busy_sid, None)
+        for evt in events:
+            process_registry._completion_consumed.discard(evt["session_id"])
+        while not isolated.empty():
+            isolated.get_nowait()
+
+
+def test_idle_completions_coalesce_to_one_ingest_batch(monkeypatch):
+    """N idle/between-turn completions in one window become one parent ingest."""
+    isolated: queue_mod.Queue = queue_mod.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+
+    emitted: list = []
+    turns: list = []
+    sess = _session(running=False)
+    sid = "sid_idle_batch"
+    server._sessions[sid] = sess
+    monkeypatch.setattr(server, "_emit", lambda *args, **_kw: emitted.append(args))
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda _rid, _sid, session, text, **_kw: turns.append(text)
+        or session.__setitem__("running", False),
+    )
+    events = [
+        _completion("proc_idle_a", 0, "echo a"),
+        _completion("proc_idle_b", 1, "echo b"),
+        _completion("proc_idle_c", 0, "echo c"),
+    ]
+    for evt in events:
+        process_registry._completion_consumed.discard(evt["session_id"])
+        isolated.put(evt)
+    try:
+        _run_poller_until(sid, sess, lambda: len(turns) >= 1)
+        status = _process_status(emitted)
+        assert len(status) == 1
+        assert status[0][2]["kind"] == "process"
+        assert len(turns) == 1
+        batch_text = status[0][2]["text"]
+        turn_text = turns[0]
+        for evt in events:
+            assert evt["session_id"] in batch_text
+            assert str(evt["exit_code"]) in batch_text
+            assert evt["session_id"] in turn_text
+            assert str(evt["exit_code"]) in turn_text
+        assert isolated.empty()
+    finally:
+        server._sessions.pop(sid, None)
         for evt in events:
             process_registry._completion_consumed.discard(evt["session_id"])
         while not isolated.empty():

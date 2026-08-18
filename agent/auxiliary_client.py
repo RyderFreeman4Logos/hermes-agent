@@ -9763,13 +9763,13 @@ def _call_llm_impl(
     # Pass the client's actual base_url (not just resolved_base_url) so
     # endpoint-specific temperature overrides can distinguish
     # api.moonshot.ai vs api.kimi.com/coding even on auto-detected routes.
-    effective_extra_body = _fallback_entry_extra_body(
+    request_extra_body = _fallback_entry_extra_body(
         task, request_provider or "", effective_extra_body,
     )
     kwargs = _build_call_kwargs(
         request_provider, final_model, messages,
         temperature=temperature, max_tokens=max_tokens,
-        tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
+        tools=tools, timeout=effective_timeout, extra_body=request_extra_body,
         reasoning_config=reasoning_config,
         base_url=_base_info or resolved_base_url, task=task)
     if extra_headers:
@@ -10603,13 +10603,13 @@ async def _async_call_llm_impl(
     # endpoint-specific temperature overrides can distinguish
     # api.moonshot.ai vs api.kimi.com/coding even on auto-detected routes.
     _client_base = str(getattr(client, "base_url", "") or "")
-    effective_extra_body = _fallback_entry_extra_body(
+    request_extra_body = _fallback_entry_extra_body(
         task, request_provider or "", effective_extra_body,
     )
     kwargs = _build_call_kwargs(
         request_provider, final_model, messages,
         temperature=temperature, max_tokens=max_tokens,
-        tools=tools, timeout=effective_timeout, extra_body=effective_extra_body,
+        tools=tools, timeout=effective_timeout, extra_body=request_extra_body,
         reasoning_config=reasoning_config,
         base_url=_client_base or resolved_base_url, task=task)
 

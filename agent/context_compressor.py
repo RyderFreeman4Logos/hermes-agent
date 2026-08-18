@@ -104,7 +104,10 @@ def _is_summary_access_or_quota_error(exc: Exception) -> bool:
         return True
 
     if classified.reason is FailoverReason.billing:
-        return any(marker in err_text for marker in _SUMMARY_PERMANENT_QUOTA_MARKERS)
+        # Classifier already split transient reset-window quotas into
+        # rate_limit. Remaining billing is terminal — abort compression
+        # instead of dropping the middle as a successful skip (#125).
+        return True
     return any(marker in err_text for marker in _SUMMARY_PERMANENT_QUOTA_MARKERS)
 
 

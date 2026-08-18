@@ -273,6 +273,14 @@ class TestClassifyApiError:
         assert result.reason == FailoverReason.rate_limit
         assert result.should_fallback is True
 
+    def test_429_weekly_usage_limit_is_billing(self):
+        """#125: OpenCode Go weekly cap is quota, not a 600s same-route retry."""
+        e = MockAPIError("Weekly usage limit reached", status_code=429)
+        result = classify_api_error(e)
+        assert result.reason == FailoverReason.billing
+        assert result.retryable is False
+        assert result.should_fallback is True
+
     def test_alibaba_rate_increased_too_quickly(self):
         """Alibaba/DashScope returns a unique throttling message.
 

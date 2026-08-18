@@ -490,19 +490,51 @@ class CompressionCommitFence:
         # a SLOW-but-alive summary model from a HUNG one, so slow models are
         # not killed by a fixed wall-clock deadline while tokens are moving.
         self._last_progress = time.monotonic()
+        self._had_meaningful_progress = False
+        self._wait_started = time.monotonic()
+        self._host_idle: Optional[float] = None
+        self._host_ceiling: Optional[float] = None
+
+    def configure_host_budget(
+        self,
+        *,
+        idle_timeout_seconds: float,
+        total_ceiling_seconds: float,
+        wait_started: Optional[float] = None,
+    ) -> None:
+        """Publish the host's finite idle + ceiling so attempts can expire first."""
+        self._host_idle = float(idle_timeout_seconds)
+        self._host_ceiling = float(total_ceiling_seconds)
+        self._wait_started = (
+            float(wait_started) if wait_started is not None else time.monotonic()
+        )
+
+    def remaining_candidate_deadline(self) -> Optional[float]:
+        """Seconds left for the active aux attempt before the host would abort.
+
+        50ms slack so the attempt TimeoutError wins the race against the
+        host idle/ceiling fence-cancel and ``fallback_chain`` can walk (#128).
+        """
+        if self._host_ceiling is None or self._host_idle is None:
+            return None
+        waited = time.monotonic() - self._wait_started
+        remain_ceil = self._host_ceiling - waited
+        remain_idle = self._host_idle - self.seconds_since_progress()
+        remain = min(remain_ceil, remain_idle) - 0.05
+        return remain if remain > 0 else 0.005
 
     def touch_progress(self) -> None:
-        """Record forward progress (e.g. a streamed summary token arriving).
-
-        Called from the compression worker thread; read by async waiters via
-        :meth:`seconds_since_progress`. A bare float store is atomic in
-        CPython, so no lock is needed.
-        """
+        """Record meaningful summary progress (not keepalive/empty frames)."""
         self._last_progress = time.monotonic()
+        self._had_meaningful_progress = True
 
     def seconds_since_progress(self) -> float:
         """Seconds since the worker last reported forward progress."""
         return max(0.0, time.monotonic() - self._last_progress)
+
+    @property
+    def had_meaningful_progress(self) -> bool:
+        return bool(self._had_meaningful_progress)
 
     def cancel_before_commit(self, cancel_event: Any = None) -> bool:
         """Cancel a pending commit, or wait for an active commit to finish.
@@ -875,6 +907,9 @@ def run_compress_context_with_progress_timeout(
     fence = fence if fence is not None else CompressionCommitFence()
     ceiling = max(float(total_ceiling_seconds), float(idle_timeout_seconds))
     idle = float(idle_timeout_seconds)
+    fence.configure_host_budget(
+        idle_timeout_seconds=idle, total_ceiling_seconds=ceiling,
+    )
     # Sync mirror of gateway session-hygiene's run_in_executor(None, ...) +
     # wait_for loop (gateway/run.py): offload compress_context onto the shared
     # daemon pool, poll with an inactivity budget + total ceiling, then
@@ -1062,6 +1097,15 @@ def run_compress_context_with_progress_timeout(
         fence.release_cancelled_compression_lock()
         waited = time.monotonic() - wait_started
         since_progress = fence.seconds_since_progress()
+        from agent.auxiliary_client import classify_compression_watchdog
+
+        reason = classify_compression_watchdog(
+            idle,
+            waited,
+            ceiling,
+            since_progress,
+            getattr(fence, "had_meaningful_progress", False),
+        )
         if on_timeout is not None:
             try:
                 on_timeout(idle, waited, since_progress)
@@ -1070,6 +1114,23 @@ def run_compress_context_with_progress_timeout(
                     "compress_context timeout callback failed",
                     exc_info=True,
                 )
+        elif reason == "total_ceiling":
+            logger.warning(
+                "Context compression hit the total ceiling after %.1fs "
+                "(last meaningful progress %.1fs ago, ceiling %.1fs); "
+                "continuing without compression",
+                waited,
+                since_progress,
+                ceiling,
+            )
+        elif reason == "candidate_fallback":
+            logger.warning(
+                "Context compression cancelled after fallback progression "
+                "(waited %.1fs, last meaningful progress %.1fs ago); "
+                "continuing without compression",
+                waited,
+                since_progress,
+            )
         else:
             logger.warning(
                 "Context compression made no progress for %.1fs "
@@ -2996,12 +3057,18 @@ def compress_context(
         # streamed total ceiling (see _aux_stream_total_ceiling) instead of
         # outliving the SDK's inactivity timeout indefinitely.
         from agent.auxiliary_client import (
+            aux_host_candidate_deadline,
             aux_interrupt_protection,
             aux_progress_hook,
         )
         _progress_hook = (
             commit_fence.touch_progress if commit_fence is not None
             else (lambda: None)
+        )
+        _host_deadline = (
+            commit_fence.remaining_candidate_deadline
+            if commit_fence is not None
+            else None
         )
         # F4 state-ordering (#76354): a LATE successful summary must not undo
         # the timeout cooldown the host recorded. Install a cancellation
@@ -3032,7 +3099,7 @@ def compress_context(
             else:
                 with aux_progress_hook(_progress_hook), aux_interrupt_protection(
                     cancel_event=_hard_cancel_event
-                ):
+                ), aux_host_candidate_deadline(_host_deadline):
                     compressed = compress_fn(messages, **compress_kwargs)
                     # Freeze a hard stop that arrived after the final provider
                     # attempt unwound but before this transaction can rotate

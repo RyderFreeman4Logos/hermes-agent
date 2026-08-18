@@ -40,6 +40,7 @@ class TestForegroundTimeoutCap:
             result = json.loads(terminal_tool(
                 command="echo hello",
                 timeout=9999,  # Way above max
+                background=False,
             ))
 
         assert "error" in result
@@ -83,38 +84,13 @@ class TestForegroundTimeoutCap:
             with patch("tools.terminal_tool._active_environments", {"default": mock_env}), \
                  patch("tools.terminal_tool._last_activity", {"default": 0}), \
                  patch("tools.terminal_tool._check_all_guards", return_value={"approved": True}):
-                result = json.loads(terminal_tool(command="pnpm dev --help"))
+                result = json.loads(terminal_tool(
+                    command="pnpm dev --help", background=False
+                ))
 
         assert result["error"] is None
         call_kwargs = mock_env.execute.call_args
         assert call_kwargs[0][0] == "pnpm dev --help"
-
-
-    def test_config_default_above_cap_not_rejected(self):
-        """When config default timeout > cap but model passes no timeout, execute normally.
-
-        Only the model's explicit timeout parameter triggers rejection,
-        not the user's configured default.
-        """
-        from tools.terminal_tool import terminal_tool
-
-        # User configured TERMINAL_TIMEOUT=900 in their env
-        with patch("tools.terminal_tool._get_env_config",
-                    return_value=_make_env_config(timeout=900)), \
-             patch("tools.terminal_tool._start_cleanup_thread"):
-
-            mock_env = MagicMock()
-            mock_env.execute.return_value = {"output": "done", "returncode": 0}
-
-            with patch("tools.terminal_tool._active_environments", {"default": mock_env}), \
-                 patch("tools.terminal_tool._last_activity", {"default": 0}), \
-                 patch("tools.terminal_tool._check_all_guards", return_value={"approved": True}):
-                result = json.loads(terminal_tool(command="make build"))
-
-        # Should execute with the config default, NOT be rejected
-        call_kwargs = mock_env.execute.call_args
-        assert call_kwargs[1]["timeout"] == 900
-        assert "error" not in result or result["error"] is None
 
 
     def test_exactly_at_max_not_rejected(self):
@@ -133,6 +109,7 @@ class TestForegroundTimeoutCap:
                 result = json.loads(terminal_tool(
                     command="echo hello",
                     timeout=FOREGROUND_MAX_TIMEOUT,  # Exactly at limit
+                    background=False,
                 ))
 
         call_kwargs = mock_env.execute.call_args

@@ -131,8 +131,8 @@ class TestCreateWithProgress:
         assert result.choices[0].message.reasoning == "thinking..."
         assert result.choices[0].finish_reason == "stop"
         assert result.usage.total_tokens == 7
-        # 1 dispatch tick + 1 per chunk
-        assert len(ticks) >= len(chunks) + 1
+        # 1 dispatch used to tick; dispatch is not summary progress (#128).
+        assert len(ticks) >= len(chunks)
 
     def test_streaming_rejected_falls_back_to_plain_call(self):
         client = _FakeClient(

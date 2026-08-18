@@ -11193,6 +11193,10 @@ def _run_prompt_submit(
                 )
                 payload["recoverable"] = True
             _retire_turn_marker(session, marker_key)
+            if not getattr(agent, "_tui_first_provider_response_recorded", False):
+                emit_cache = getattr(agent, "_tui_cache_callback", None)
+                if callable(emit_cache):
+                    emit_cache("no_field", 0, 0, 0)
             _emit("message.complete", sid, payload)
 
             # ── /goal continuation (Ralph-style loop) ─────────────────

@@ -16,11 +16,16 @@ import pytest
 
 import agent.auxiliary_client as aux
 from agent.auxiliary_client import (
+    CodexAuxiliaryClient,
     _ChatStreamAccumulator,
     _aux_stream_total_ceiling,
     async_call_llm,
     aux_progress_hook,
     call_llm,
+)
+from agent.conversation_compression import (
+    CompressionCommitFence,
+    run_compress_context_with_progress_timeout,
 )
 
 
@@ -308,3 +313,116 @@ class TestHostCandidateDeadlineAdvancesFallback:
         assert result.choices[0].message.content == "from first configured fallback"
         configured.assert_called()
         main_fb.assert_not_called()
+
+    def test_host_wait_ttfb_longer_than_idle_advances_chain(self):
+        """Host fence must not win when create() TTFB exceeds idle (#128 B1)."""
+        original = [{"role": "user", "content": "keep-me"}]
+        compressed = [{"role": "user", "content": "from second configured fallback"}]
+
+        primary = MagicMock()
+        primary.base_url = "https://opencode.ai/zen/v1"
+        primary.chat.completions.create.side_effect = Exception("usage limit reached")
+
+        first = MagicMock()
+        first.base_url = "https://slow.example/v1"
+
+        def _slow_ttfb(**kwargs):
+            time.sleep(0.22)
+            if kwargs.get("stream"):
+                return iter([_text_chunk("too-late-first", finish="stop")])
+            raise AssertionError("first fallback must use the streamed attempt path")
+
+        first.chat.completions.create.side_effect = _slow_ttfb
+
+        second = MagicMock()
+        second.base_url = "https://fast.example/v1"
+        second.chat.completions.create.return_value = _ok("from second configured fallback")
+
+        def worker(fence: CompressionCommitFence):
+            from agent.auxiliary_client import (
+                aux_host_candidate_deadline,
+                aux_progress_hook,
+            )
+
+            with aux_progress_hook(fence.touch_progress), aux_host_candidate_deadline(
+                fence.remaining_candidate_deadline
+            ):
+                result = call_llm(
+                    task="compression",
+                    messages=[{"role": "user", "content": "summarize"}],
+                    timeout=30.0,
+                )
+            if not fence.begin_commit():
+                return (original, "aborted")
+            try:
+                return (
+                    [{"role": "user", "content": result.choices[0].message.content}],
+                    "ok-prompt",
+                )
+            finally:
+                fence.finish_commit()
+
+        p0, p1, p2, p3, p4 = _patch_chain(primary, first, second)
+        with p0, p1, p2 as configured, p3 as main_fb, p4:
+            result_msgs, result_prompt = run_compress_context_with_progress_timeout(
+                worker=worker,
+                messages=original,
+                system_prompt_fallback="fallback-prompt",
+                idle_timeout_seconds=0.16,
+                total_ceiling_seconds=2.0,
+            )
+
+        assert result_msgs == compressed
+        assert result_prompt == "ok-prompt"
+        assert configured.call_args_list[1].kwargs["start_index"] == 1
+        main_fb.assert_not_called()
+
+    def test_codex_internal_stream_honors_host_candidate_deadline(self):
+        """Codex adapters must expire on the host candidate deadline (#128 B2)."""
+        primary = MagicMock()
+        primary.base_url = "https://opencode.ai/zen/v1"
+        primary.chat.completions.create.side_effect = Exception("usage limit reached")
+
+        class _KeepaliveResponses:
+            def create(self, **_kwargs):
+                deadline = time.monotonic() + 1.0
+                while time.monotonic() < deadline:
+                    time.sleep(0.02)
+                    yield SimpleNamespace(type="response.output_text.delta", delta="…")
+                message = SimpleNamespace(
+                    type="message",
+                    content=[SimpleNamespace(type="output_text", text="too-late-codex")],
+                )
+                yield SimpleNamespace(type="response.output_item.done", item=message)
+                yield SimpleNamespace(
+                    type="response.completed",
+                    response=SimpleNamespace(output=[message], usage=None),
+                )
+
+        class _CodexReal:
+            def __init__(self):
+                self.responses = _KeepaliveResponses()
+                self.api_key = "test"
+                self.base_url = "https://example.test/codex"
+
+            def close(self):
+                pass
+
+        first = CodexAuxiliaryClient(_CodexReal(), "codex-slow")
+        second = MagicMock()
+        second.base_url = "https://fast.example/v1"
+        second.chat.completions.create.return_value = _ok("from second configured fallback")
+
+        p0, p1, p2, p3, p4 = _patch_chain(primary, first, second)
+        with p0, p1, p2 as configured, p3 as main_fb, p4:
+            with aux_progress_hook(lambda: None), aux.aux_host_candidate_deadline(0.15):
+                result = call_llm(
+                    task="compression",
+                    messages=[{"role": "user", "content": "summarize"}],
+                    timeout=30.0,
+                )
+
+        assert result.choices[0].message.content == "from second configured fallback"
+        assert configured.call_args_list[1].kwargs["start_index"] == 1
+        main_fb.assert_not_called()
+        assert second.chat.completions.create.called

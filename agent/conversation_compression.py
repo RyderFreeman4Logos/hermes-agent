@@ -514,14 +514,19 @@ class CompressionCommitFence:
 
         50ms slack so the attempt TimeoutError wins the race against the
         host idle/ceiling fence-cancel and ``fallback_chain`` can walk (#128).
+        Once idle or ceiling is gone, return a non-positive budget so the
+        attempt expires immediately instead of flooring to 5ms of extra wait.
         """
         if self._host_ceiling is None or self._host_idle is None:
             return None
         waited = time.monotonic() - self._wait_started
         remain_ceil = self._host_ceiling - waited
         remain_idle = self._host_idle - self.seconds_since_progress()
-        remain = min(remain_ceil, remain_idle) - 0.05
-        return remain if remain > 0 else 0.005
+        leftover = min(remain_ceil, remain_idle)
+        if leftover <= 0:
+            return 0.0
+        remain = leftover - 0.05
+        return remain if remain > 0 else leftover
 
     def touch_progress(self) -> None:
         """Record meaningful summary progress (not keepalive/empty frames)."""

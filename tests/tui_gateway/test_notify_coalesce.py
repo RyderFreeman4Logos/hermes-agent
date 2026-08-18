@@ -216,3 +216,133 @@ def test_idle_completions_coalesce_to_one_ingest_batch(monkeypatch):
             process_registry._completion_consumed.discard(evt["session_id"])
         while not isolated.empty():
             isolated.get_nowait()
+
+
+def test_child_tails_after_compress_do_not_each_start_a_parent_turn(monkeypatch):
+    """After restart/compress, N idle child terminal() tails are one ingest.
+
+    Production terminal() stores task_id=\"default\" for parent and child.
+    A live native delegate may exist only as a durable SQLite row after
+    process restart. #131's 0.1s window is too short for spaced tails;
+    they must still become one parent ingest, and a later parent-owned
+    tail must still deliver.
+    """
+    import tools.async_delegation as ad
+
+    isolated: queue_mod.Queue = queue_mod.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated)
+    ad._reset_for_tests()
+
+    old_key = "sess_pre_compress"
+    new_key = "sess_post_compress"
+    sid = "sid_after_compress"
+
+    class _Db:
+        def resolve_resume_session_id(self, target):
+            return new_key if target == old_key else target
+
+    monkeypatch.setattr(server, "_get_db", lambda: _Db())
+
+    # Production spawn identity: both parent and child collapse to "default".
+    procs = {
+        "proc_child_a": types.SimpleNamespace(
+            task_id="default", session_key=old_key, parent_session_id=old_key
+        ),
+        "proc_child_b": types.SimpleNamespace(
+            task_id="default", session_key=old_key, parent_session_id=old_key
+        ),
+        "proc_parent": types.SimpleNamespace(
+            task_id="default", session_key=new_key, parent_session_id=new_key
+        ),
+    }
+    monkeypatch.setattr(process_registry, "get", lambda pid: procs.get(pid))
+
+    # Process-restart residual: durable running row. Same-process compress
+    # may also have an in-memory record; either must be enough.
+    ad._persist_dispatch(
+        {
+            "delegation_id": "deleg_live",
+            "session_key": old_key,
+            "origin_ui_session_id": "old_tab",
+            "parent_session_id": old_key,
+            "origin_session_id": "",
+            "dispatched_at": time.time(),
+            "goal": "child work",
+        }
+    )
+    with ad._records_lock:
+        ad._records.clear()
+
+    emitted: list = []
+    turns: list = []
+    sess = _session(running=False, session_key=new_key)
+    sess["agent"] = types.SimpleNamespace(session_id=new_key)
+    server._sessions[sid] = sess
+    monkeypatch.setattr(server, "_emit", lambda *args, **_kw: emitted.append(args))
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda _rid, _sid, session, text, **_kw: turns.append(text)
+        or session.__setitem__("running", False),
+    )
+
+    child_events = [
+        {**_completion("proc_child_a", 0, "echo child-a"), "session_key": old_key},
+        {**_completion("proc_child_b", 0, "echo child-b"), "session_key": old_key},
+    ]
+    parent_evt = {
+        **_completion("proc_parent", 0, "echo parent"),
+        "session_key": new_key,
+    }
+    for evt in (*child_events, parent_evt):
+        process_registry._completion_consumed.discard(evt["session_id"])
+
+    stop = threading.Event()
+    thread = threading.Thread(
+        target=server._notification_poller_loop,
+        args=(stop, sid, sess),
+        daemon=True,
+    )
+    thread.start()
+    try:
+        isolated.put(child_events[0])
+        # Give #131's 0.1s singleton flush a chance to fire before the
+        # second tail. The contract is still one ingest for both.
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            time.sleep(0.02)
+        isolated.put(child_events[1])
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            if turns and all(
+                pid in turns[0] for pid in ("proc_child_a", "proc_child_b")
+            ):
+                break
+            time.sleep(0.01)
+
+        assert len(turns) == 1
+        child_text = turns[0]
+        assert "proc_child_a" in child_text
+        assert "proc_child_b" in child_text
+        assert "proc_parent" not in child_text
+        child_status = _process_status(emitted)
+        assert len(child_status) == 1
+
+        isolated.put(parent_evt)
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and len(turns) < 2:
+            time.sleep(0.01)
+
+        assert len(turns) == 2
+        assert "proc_parent" in turns[1]
+        assert isolated.empty()
+    finally:
+        stop.set()
+        thread.join(timeout=2.0)
+        server._sessions.pop(sid, None)
+        ad._delete_durable_delegation("deleg_live")
+        ad._reset_for_tests()
+        for evt in (*child_events, parent_evt):
+            process_registry._completion_consumed.discard(evt["session_id"])
+        while not isolated.empty():
+            isolated.get_nowait()

@@ -16217,7 +16217,7 @@ def test_notification_poller_skips_consumed(monkeypatch):
 
 
 def test_notification_poller_requeues_when_busy(monkeypatch):
-    """When the agent is busy, the poller requeues the event."""
+    """When the agent is busy, completions are buffered, not emitted."""
     import queue as _queue_mod
 
     from tools.process_registry import process_registry
@@ -16252,14 +16252,15 @@ def test_notification_poller_requeues_when_busy(monkeypatch):
     try:
         server._notification_poller_loop(stop, "sid_busy", sess)
 
-        # Status update was emitted (user sees it)
+        # Status is held until idle ingest (no storm). Event is preserved.
         status_calls = [a for a in emitted if a[0] == "status.update"]
-        assert len(status_calls) == 1
-
-        # Event was requeued (agent was busy, no turn triggered)
-        assert not isolated_queue.empty()
-        requeued = isolated_queue.get_nowait()
-        assert requeued["session_id"] == "proc_busy_test"
+        assert status_calls == []
+        assert not isolated_queue.empty() or sess.get("_completion_pending")
+        preserved = []
+        while not isolated_queue.empty():
+            preserved.append(isolated_queue.get_nowait())
+        preserved.extend(sess.get("_completion_pending") or [])
+        assert any(item.get("session_id") == "proc_busy_test" for item in preserved)
     finally:
         server._sessions.pop("sid_busy", None)
         while not process_registry.completion_queue.empty():

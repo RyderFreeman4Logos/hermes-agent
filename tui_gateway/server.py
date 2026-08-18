@@ -10069,6 +10069,131 @@ def _notification_event_requires_owner(evt: dict) -> bool:
     )
 
 
+def _mark_completion_events_consumed(events: list) -> None:
+    from tools.process_registry import process_registry
+
+    for evt in events:
+        if evt.get("type") != "completion":
+            continue
+        sid = evt.get("session_id")
+        if sid:
+            process_registry._completion_consumed.add(sid)
+
+
+def _format_completion_batch(events: list) -> str:
+    """One structured summary for N completions that arrived while busy."""
+    lines = [
+        f"{len(events)} background processes completed while this turn was running."
+    ]
+    for evt in events:
+        lines.append(
+            f"- {evt.get('session_id', 'unknown')} exit={evt.get('exit_code', '?')}"
+        )
+    return "[IMPORTANT: " + "\n".join(lines) + "]"
+
+
+def _submit_process_notification_turn(sid: str, session: dict, evt: dict, text: str) -> bool:
+    """Claim + one agent turn for a process notification (single or batch text)."""
+    rid = f"__notif__{int(time.time() * 1000)}"
+    from tools.async_delegation import (
+        claim_event_delivery, complete_event_delivery, release_event_delivery,
+    )
+    _claim = claim_event_delivery(evt, "tui-poller")
+    if _claim is None:
+        with session["history_lock"]:
+            session["running"] = False
+        return False
+    try:
+        _emit("message.start", sid)
+        if evt.get("type") == "async_delegation":
+            _run_prompt_submit(
+                rid,
+                sid,
+                session,
+                text,
+                display_kind="async_delegation_complete",
+                display_metadata=_async_delegation_display_metadata(evt),
+                turn_origin="subagent_result",
+            )
+        else:
+            _run_prompt_submit(
+                rid, sid, session, text, turn_origin="background_completion"
+            )
+        complete_event_delivery(evt, _claim)
+        return True
+    except Exception as exc:
+        release_event_delivery(evt, _claim)
+        print(
+            f"[tui_gateway] notification poller dispatch failed: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        with session["history_lock"]:
+            session["running"] = False
+        return False
+
+
+def _deliver_completion_notifications(
+    sid: str, session: dict, events: list, emitted: set
+) -> None:
+    """Idle ingest: one item, or one batch when N>1. Never emit N updates."""
+    from tools.process_registry import format_process_notification
+
+    if not events:
+        return
+    if len(events) == 1:
+        evt = events[0]
+        text = format_process_notification(evt)
+        if not text:
+            return
+        with session["history_lock"]:
+            if session.get("running"):
+                session.setdefault("_completion_pending", []).insert(0, evt)
+                return
+            session["running"] = True
+        dedup_key = _notification_event_dedup_key(evt)
+        if dedup_key not in emitted:
+            _emit("status.update", sid, {"kind": "process", "text": text})
+            emitted.add(dedup_key)
+        if _submit_process_notification_turn(sid, session, evt, text):
+            _mark_completion_events_consumed([evt])
+        else:
+            with session["history_lock"]:
+                session.setdefault("_completion_pending", []).insert(0, evt)
+        return
+
+    text = _format_completion_batch(events)
+    with session["history_lock"]:
+        if session.get("running"):
+            pending = session.setdefault("_completion_pending", [])
+            session["_completion_pending"] = list(events) + list(pending)
+            return
+        session["running"] = True
+    batch_key = ("completion-batch",) + tuple(
+        _notification_event_dedup_key(evt) for evt in events
+    )
+    if batch_key not in emitted:
+        _emit("status.update", sid, {"kind": "process", "text": text})
+        emitted.add(batch_key)
+    if _submit_process_notification_turn(sid, session, events[0], text):
+        _mark_completion_events_consumed(events)
+    else:
+        with session["history_lock"]:
+            pending = session.setdefault("_completion_pending", [])
+            session["_completion_pending"] = list(events) + list(pending)
+
+
+def _flush_pending_completions_if_idle(sid: str, session: dict, emitted: set) -> None:
+    with session["history_lock"]:
+        if session.get("running"):
+            return
+        pending = list(session.get("_completion_pending") or [])
+        if not pending:
+            return
+        session["_completion_pending"] = []
+    _deliver_completion_notifications(sid, session, pending, emitted)
+
+
 def _notification_event_dedup_key(evt: dict) -> tuple:
     """Return the UI-emission identity for a process notification event.
 
@@ -10376,6 +10501,11 @@ def _notification_poller_loop(
     status.update (kind=process) for user visibility, then chains an
     agent turn via _run_prompt_submit if the session is idle.
 
+    Completions that arrive while session["running"] (blocked on an LLM
+    response) are buffered on the session and emitted as one structured
+    batch at the next idle ingest — not N status.update storms, and not
+    a one-by-one dump after the loop stops.
+
     The completion_queue is process-global. In multi-session Desktop each
     poller requeues events owned by another live session and drops addressed
     events whose owner is gone; ownerless legacy notifications remain global.
@@ -10447,6 +10577,7 @@ def _notification_poller_loop(
         try:
             evt = process_registry.completion_queue.get(timeout=0.5)
         except Exception:
+            _flush_pending_completions_if_idle(sid, session, _emitted)
             continue
 
         # Multiple desktop sessions share this one process-wide queue. Only
@@ -10485,12 +10616,21 @@ def _notification_poller_loop(
         if evt.get("type") == "completion" and process_registry.is_completion_consumed(_evt_sid):
             continue
 
+        # Completions that land while the session is blocked on an LLM
+        # response stay off the TUI until the next idle ingest. Buffer
+        # them here — do not emit, do not requeue/spin the shared queue.
+        if evt.get("type") == "completion":
+            with session["history_lock"]:
+                session.setdefault("_completion_pending", []).append(evt)
+            _flush_pending_completions_if_idle(sid, session, _emitted)
+            continue
+
         text = format_process_notification(evt)
         if not text:
             continue
 
         # Only emit the same notification identity to TUI once — re-queued
-        # completions get re-emitted every 0.5s otherwise when session is busy,
+        # watch events get re-emitted every 0.5s otherwise when session is busy,
         # while distinct watch_match events from the same process must remain
         # visible independently.
         _dedup_key = _notification_event_dedup_key(evt)
@@ -10512,39 +10652,7 @@ def _notification_poller_loop(
             time.sleep(0.25)
             continue
 
-        rid = f"__notif__{int(time.time() * 1000)}"
-        from tools.async_delegation import (
-            claim_event_delivery, complete_event_delivery, release_event_delivery,
-        )
-        _claim = claim_event_delivery(evt, "tui-poller")
-        if _claim is None:
-            continue
-        try:
-            _emit("message.start", sid)
-            if evt.get("type") == "async_delegation":
-                _run_prompt_submit(
-                    rid,
-                    sid,
-                    session,
-                    text,
-                    display_kind="async_delegation_complete",
-                    display_metadata=_async_delegation_display_metadata(evt),
-                    turn_origin="subagent_result",
-                )
-            else:
-                _run_prompt_submit(
-                    rid, sid, session, text, turn_origin="background_completion"
-                )
-            complete_event_delivery(evt, _claim)
-        except Exception as exc:
-            release_event_delivery(evt, _claim)
-            print(
-                f"[tui_gateway] notification poller dispatch failed: "
-                f"{type(exc).__name__}: {exc}",
-                file=sys.stderr,
-            )
-            with session["history_lock"]:
-                session["running"] = False
+        _submit_process_notification_turn(sid, session, evt, text)
 
     # Drain any remaining events after stop signal (process all pending
     # before exiting so nothing is lost on shutdown). Events owned by other
@@ -10578,6 +10686,10 @@ def _notification_poller_loop(
         _evt_sid = evt.get("session_id", "")
         if evt.get("type") == "completion" and process_registry.is_completion_consumed(_evt_sid):
             continue
+        if evt.get("type") == "completion":
+            with session["history_lock"]:
+                session.setdefault("_completion_pending", []).append(evt)
+            continue
         text = format_process_notification(evt)
         if not text:
             continue
@@ -10593,39 +10705,18 @@ def _notification_poller_loop(
                 break
             session["running"] = True
 
-        rid = f"__notif__{int(time.time() * 1000)}"
-        from tools.async_delegation import (
-            claim_event_delivery, complete_event_delivery, release_event_delivery,
-        )
-        _claim = claim_event_delivery(evt, "tui-poller")
-        if _claim is None:
-            continue
-        try:
-            _emit("message.start", sid)
-            if evt.get("type") == "async_delegation":
-                _run_prompt_submit(
-                    rid,
-                    sid,
-                    session,
-                    text,
-                    display_kind="async_delegation_complete",
-                    display_metadata=_async_delegation_display_metadata(evt),
-                    turn_origin="subagent_result",
-                )
-            else:
-                _run_prompt_submit(
-                    rid, sid, session, text, turn_origin="background_completion"
-                )
-            complete_event_delivery(evt, _claim)
-        except Exception as exc:
-            release_event_delivery(evt, _claim)
-            print(
-                f"[tui_gateway] notification poller dispatch failed: "
-                f"{type(exc).__name__}: {exc}",
-                file=sys.stderr,
-            )
-            with session["history_lock"]:
-                session["running"] = False
+        _submit_process_notification_turn(sid, session, evt, text)
+
+    # One batch for any completions that arrived while busy / on drain.
+    # If the session is still running, leave them on the session so a later
+    # idle ingest (or the next poller) can deliver them — never dump N.
+    _flush_pending_completions_if_idle(sid, session, _emitted)
+    with session["history_lock"]:
+        leftover = list(session.get("_completion_pending") or [])
+        if leftover:
+            session["_completion_pending"] = []
+    for evt in leftover:
+        process_registry.completion_queue.put(evt)
 
     # Hand any other sessions' events back to the shared queue.
     for evt in deferred:

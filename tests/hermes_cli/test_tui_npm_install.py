@@ -137,6 +137,56 @@ def test_no_stray_lockfiles_in_workspace_subdirs(main_mod) -> None:
     )
 
 
+def test_make_tui_argv_rebuilds_or_refuses_when_src_newer_than_dist(
+    tmp_path: Path, main_mod, monkeypatch
+) -> None:
+    """#121: a checkout whose cache-status src is newer than dist must not
+    launch the stale bundle. HERMES_TUI_DIR (live footgun) still has to
+    rebuild or refuse — never return node + old entry.js.
+    """
+    tui_dir = tmp_path / "ui-tui"
+    src = tui_dir / "src" / "app" / "createGatewayEventHandler.ts"
+    src.parent.mkdir(parents=True)
+    src.write_text("// cache-status owner\n")
+    entry = tui_dir / "dist" / "entry.js"
+    entry.parent.mkdir(parents=True)
+    entry.write_text("// stale pre-#115/#118 bundle\n")
+    os.utime(entry, (1_700_000_000, 1_700_000_000))
+    os.utime(src, (1_800_000_000, 1_800_000_000))
+
+    monkeypatch.setenv("HERMES_TUI_DIR", str(tui_dir))
+    monkeypatch.delenv("HERMES_TUI_FORCE_BUILD", raising=False)
+    monkeypatch.setattr(main_mod, "_ensure_tui_node", lambda: None)
+    monkeypatch.setattr(main_mod, "_tui_need_npm_install", lambda _root: False)
+    monkeypatch.setattr(main_mod, "_find_bundled_tui", lambda: None)
+    monkeypatch.setattr(main_mod.shutil, "which", lambda name: f"/bin/{name}")
+    calls: list = []
+
+    def fake_run(*args, **kwargs):
+        calls.append((args, kwargs))
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(main_mod.subprocess, "run", fake_run)
+
+    try:
+        argv, cwd = main_mod._make_tui_argv(tui_dir, tui_dev=False)
+    except SystemExit as exc:
+        assert exc.code not in (0, None)
+        assert not any(
+            len(args) and args[0] and args[0][-1] == str(entry)
+            for args, _kwargs in calls
+        )
+        return
+
+    assert calls, "stale checkout dist must rebuild, not launch as-is"
+    assert any(
+        len(args) and list(args[0][1:3]) == ["run", "build"]
+        for args, _kwargs in calls
+    ), f"expected npm run build, got {calls!r}"
+    assert argv[-1] == str(entry)
+    assert cwd == tui_dir
+
+
 def test_make_tui_argv_omits_workspace_and_scrubs_esbuild_override(
     tmp_path: Path, main_mod, monkeypatch
 ) -> None:

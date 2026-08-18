@@ -5160,6 +5160,42 @@ def _fallback_entry_timeout(task: Optional[str], fb_label: str) -> Optional[floa
     return None
 
 
+def _fallback_entry_extra_body(
+    task: Optional[str],
+    fb_label: str,
+    base: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Per-candidate extra_body. Omitted keys inherit the task-level ``base``.
+
+    ``auxiliary.<task>.fallback_chain`` entries may set ``reasoning_effort``,
+    ``reasoning``, ``thinking``, or ``extra_body`` for that provider+model
+    (#130). Copy the entry dict (same shape as
+    ``tools.delegate_tool._normalize_profile_fallback_chain``); do not
+    invent a second schema. Always return a new dict so one task-level
+    body is not reused across candidates.
+    """
+    result = dict(base or {})
+    entry = _fallback_chain_entry(task, fb_label)
+    if not entry:
+        return result
+    raw = entry.get("extra_body")
+    if isinstance(raw, dict):
+        result.update(raw)
+    if "thinking" in entry:
+        result["thinking"] = entry["thinking"]
+    if "reasoning" in entry:
+        result["reasoning"] = entry["reasoning"]
+    elif "reasoning" not in (raw if isinstance(raw, dict) else {}):
+        effort = entry.get("reasoning_effort")
+        if effort is not None and effort != "":
+            from hermes_constants import parse_reasoning_effort
+
+            parsed = parse_reasoning_effort(effort)
+            if parsed is not None:
+                result["reasoning"] = parsed
+    return result
+
+
 def _fallback_provider_from_label(label: str) -> str:
     """Recover the provider identifier from a fallback display label."""
     match = re.match(
@@ -5309,6 +5345,9 @@ def _call_fallback_candidate_sync(
             task or "call", fb_label, fb_timeout, effective_timeout,
         )
         effective_timeout = fb_timeout
+    effective_extra_body = _fallback_entry_extra_body(
+        task, fb_label, effective_extra_body,
+    )
     destination = _fallback_destination(task, fb_client, fb_model, fb_label)
     fallback_messages, fallback_tools = _replan_synchronous_cache_sections(
         messages,
@@ -5418,6 +5457,9 @@ async def _call_fallback_candidate_async(
             task or "call", fb_label, fb_timeout, effective_timeout,
         )
         effective_timeout = fb_timeout
+    effective_extra_body = _fallback_entry_extra_body(
+        task, fb_label, effective_extra_body,
+    )
     destination = _fallback_destination(task, fb_client, fb_model, fb_label)
     fallback_messages, fallback_tools = _replan_synchronous_cache_sections(
         messages,
@@ -9640,6 +9682,9 @@ def _call_llm_impl(
     # Pass the client's actual base_url (not just resolved_base_url) so
     # endpoint-specific temperature overrides can distinguish
     # api.moonshot.ai vs api.kimi.com/coding even on auto-detected routes.
+    effective_extra_body = _fallback_entry_extra_body(
+        task, request_provider or "", effective_extra_body,
+    )
     kwargs = _build_call_kwargs(
         request_provider, final_model, messages,
         temperature=temperature, max_tokens=max_tokens,
@@ -10477,6 +10522,9 @@ async def _async_call_llm_impl(
     # endpoint-specific temperature overrides can distinguish
     # api.moonshot.ai vs api.kimi.com/coding even on auto-detected routes.
     _client_base = str(getattr(client, "base_url", "") or "")
+    effective_extra_body = _fallback_entry_extra_body(
+        task, request_provider or "", effective_extra_body,
+    )
     kwargs = _build_call_kwargs(
         request_provider, final_model, messages,
         temperature=temperature, max_tokens=max_tokens,

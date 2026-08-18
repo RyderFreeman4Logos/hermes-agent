@@ -2370,13 +2370,17 @@ def _make_tui_argv(tui_dir: Path, tui_dev: bool) -> tuple[list[str], Path]:
     if not tui_dev:
         if ext_dir:
             p = Path(ext_dir)
-            if (p / "dist" / "entry.js").is_file():
+            # #121: a checkout whose cache-status src is newer than dist must
+            # rebuild or refuse. Packaged trees with no newer src stay fast.
+            if (p / "dist" / "entry.js").is_file() and not _tui_need_rebuild(p):
                 node = _node_bin("node")
                 return [node, "--expose-gc", str(p / "dist" / "entry.js")], p
 
         # 1b. Bundled prebuilt TUI (Docker image, Nix build, or prior npm build)
         bundled = _find_bundled_tui()
-        if bundled is not None:
+        if bundled is not None and not (
+            (tui_dir / "src").is_dir() and _tui_need_rebuild(tui_dir)
+        ):
             node = _node_bin("node")
             return [node, "--expose-gc", str(bundled)], bundled.parent
 

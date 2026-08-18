@@ -321,6 +321,27 @@ def check_fn_cache_scope() -> Optional[str]:
         return CHECK_FN_CACHE_BYPASS
 
 
+def _check_fn_ttl_seconds(fn: Callable) -> float:
+    """Return this check_fn's cache TTL.
+
+    Deterministic config gates can set
+    ``_hermes_check_fn_cache_ttl_seconds = 0`` to force a fresh read on every
+    availability pass. External probes keep the default TTL.
+    """
+    try:
+        return float(getattr(fn, "_hermes_check_fn_cache_ttl_seconds"))
+    except (AttributeError, TypeError, ValueError):
+        return _CHECK_FN_TTL_SECONDS
+
+
+def _check_fn_failure_grace_seconds(fn: Callable) -> float:
+    """Return this check_fn's transient-failure grace window."""
+    try:
+        return float(getattr(fn, "_hermes_check_fn_failure_grace_seconds"))
+    except (AttributeError, TypeError, ValueError):
+        return _CHECK_FN_FAILURE_GRACE_SECONDS
+
+
 def _check_fn_cached(fn: Callable) -> bool:
     """Return bool(fn()), TTL-cached across calls.
 
@@ -344,12 +365,14 @@ def _check_fn_cached(fn: Callable) -> bool:
             )
             return False
     cache_key = (fn, scope)
+    ttl_seconds = _check_fn_ttl_seconds(fn)
+    failure_grace_seconds = _check_fn_failure_grace_seconds(fn)
     with _check_fn_cache_lock:
         _prune_check_fn_caches(now)
         cached = _check_fn_cache.get(cache_key)
-        if cached is not None:
+        if cached is not None and ttl_seconds > 0:
             ts, value = cached
-            if now - ts < _CHECK_FN_TTL_SECONDS:
+            if now - ts < ttl_seconds:
                 return value
 
     raised = False
@@ -362,12 +385,22 @@ def _check_fn_cached(fn: Callable) -> bool:
     with _check_fn_cache_lock:
         _prune_check_fn_caches(now)
         if value:
-            _check_fn_last_good[cache_key] = now
-            _check_fn_cache[cache_key] = (now, True)
+            if failure_grace_seconds > 0:
+                _check_fn_last_good[cache_key] = now
+            else:
+                _check_fn_last_good.pop(cache_key, None)
+            if ttl_seconds > 0:
+                _check_fn_cache[cache_key] = (now, True)
+            else:
+                _check_fn_cache.pop(cache_key, None)
             return True
 
         last_good = _check_fn_last_good.get(cache_key)
-        if last_good is not None and now - last_good < _CHECK_FN_FAILURE_GRACE_SECONDS:
+        if (
+            failure_grace_seconds > 0
+            and last_good is not None
+            and now - last_good < failure_grace_seconds
+        ):
             # Recent success → treat this failure as a flake. Serve last-good
             # True and do NOT cache the failure, so the next call re-probes
             # rather than pinning a stale verdict for the full TTL.
@@ -376,7 +409,7 @@ def _check_fn_cached(fn: Callable) -> bool:
                 "treating as transient and keeping tool(s) available",
                 getattr(fn, "__qualname__", fn),
                 "raised" if raised else "returned False",
-                _CHECK_FN_FAILURE_GRACE_SECONDS,
+                failure_grace_seconds,
             )
             return True
 
@@ -387,7 +420,12 @@ def _check_fn_cached(fn: Callable) -> bool:
             getattr(fn, "__qualname__", fn),
             "raised" if raised else "returned False",
         )
-        _check_fn_cache[cache_key] = (now, False)
+        if ttl_seconds > 0:
+            _check_fn_cache[cache_key] = (now, False)
+        else:
+            _check_fn_cache.pop(cache_key, None)
+        if failure_grace_seconds <= 0:
+            _check_fn_last_good.pop(cache_key, None)
         return False
 
 

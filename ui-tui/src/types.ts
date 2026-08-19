@@ -126,6 +126,8 @@ export interface ClarifyReq {
 }
 
 export interface Msg {
+  // Event footnotes are muted by default; low cache hits use this rail (rendered red).
+  eventTone?: 'warn'
   info?: SessionInfo
   kind?: 'diff' | 'event' | 'intro' | 'panel' | 'slash' | 'trail'
   panelData?: PanelData

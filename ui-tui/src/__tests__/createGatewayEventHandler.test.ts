@@ -2218,7 +2218,7 @@ describe('createGatewayEventHandler', () => {
       try {
         onEvent({
           payload: {
-            cache_info: { pct: 87, prompt_tokens: 2_000, read_tokens: 1_740, state: 'hit' },
+            cache_info: { pct: 87, prompt_tokens: 4_000, read_tokens: 3_480, state: 'hit' },
             completed_at: 1_700_000_000.25,
             text: 'final answer'
           },
@@ -2227,8 +2227,9 @@ describe('createGatewayEventHandler', () => {
 
         expect(appended).toEqual([
           { role: 'assistant', text: 'final answer' },
-          { kind: 'event', role: 'system', text: '完成 14:23:05  cache 87%' }
+          { kind: 'event', role: 'system', text: 'agent loop stop at 14:23:05  cache 87% 3480/4000' }
         ])
+        expect(appended.some(msg => msg.text.includes('完成'))).toBe(false)
         expect(formatTime).toHaveBeenCalledWith('en-GB', {
           hour: '2-digit',
           hour12: false,
@@ -2257,7 +2258,89 @@ describe('createGatewayEventHandler', () => {
 
         expect(appended).toEqual([
           { role: 'assistant', text: 'final answer' },
-          { kind: 'event', role: 'system', text: '完成 14:23:05  cache <1% 3/4000' }
+          {
+            eventTone: 'warn',
+            kind: 'event',
+            role: 'system',
+            text: 'agent loop stop at 14:23:05  cache <1% 3/4000'
+          }
+        ])
+      } finally {
+        formatTime.mockRestore()
+      }
+    })
+
+    it('keeps percent-only when token counts are missing', () => {
+      const appended: Msg[] = []
+      const onEvent = createGatewayEventHandler(buildCtx(appended))
+      const formatTime = vi.spyOn(Date.prototype, 'toLocaleTimeString').mockReturnValue('14:23:05')
+
+      try {
+        onEvent({
+          payload: {
+            cache_info: { pct: 87, state: 'hit' },
+            completed_at: 1_700_000_000.25,
+            text: 'final answer'
+          },
+          type: 'message.complete'
+        } as any)
+
+        expect(appended).toEqual([
+          { role: 'assistant', text: 'final answer' },
+          { kind: 'event', role: 'system', text: 'agent loop stop at 14:23:05  cache 87%' }
+        ])
+      } finally {
+        formatTime.mockRestore()
+      }
+    })
+
+    it('marks a finite cache hit below 50% as a warn event', () => {
+      const appended: Msg[] = []
+      const onEvent = createGatewayEventHandler(buildCtx(appended))
+      const formatTime = vi.spyOn(Date.prototype, 'toLocaleTimeString').mockReturnValue('14:23:05')
+
+      try {
+        onEvent({
+          payload: {
+            cache_info: { pct: 49, prompt_tokens: 4_000, read_tokens: 1_960, state: 'hit' },
+            completed_at: 1_700_000_000.25,
+            text: 'final answer'
+          },
+          type: 'message.complete'
+        } as any)
+
+        expect(appended).toEqual([
+          { role: 'assistant', text: 'final answer' },
+          {
+            eventTone: 'warn',
+            kind: 'event',
+            role: 'system',
+            text: 'agent loop stop at 14:23:05  cache 49% 1960/4000'
+          }
+        ])
+      } finally {
+        formatTime.mockRestore()
+      }
+    })
+
+    it('marks a cache miss as a warn event', () => {
+      const appended: Msg[] = []
+      const onEvent = createGatewayEventHandler(buildCtx(appended))
+      const formatTime = vi.spyOn(Date.prototype, 'toLocaleTimeString').mockReturnValue('14:23:05')
+
+      try {
+        onEvent({
+          payload: {
+            cache_info: { state: 'miss' },
+            completed_at: 1_700_000_000.25,
+            text: 'final answer'
+          },
+          type: 'message.complete'
+        } as any)
+
+        expect(appended).toEqual([
+          { role: 'assistant', text: 'final answer' },
+          { eventTone: 'warn', kind: 'event', role: 'system', text: 'agent loop stop at 14:23:05  cache miss' }
         ])
       } finally {
         formatTime.mockRestore()
@@ -2281,7 +2364,7 @@ describe('createGatewayEventHandler', () => {
 
         expect(appended).toEqual([
           { role: 'assistant', text: 'final answer' },
-          { kind: 'event', role: 'system', text: '完成 14:23:05  cache COLD_WRITE' }
+          { kind: 'event', role: 'system', text: 'agent loop stop at 14:23:05  cache COLD_WRITE' }
         ])
       } finally {
         formatTime.mockRestore()
@@ -2305,7 +2388,7 @@ describe('createGatewayEventHandler', () => {
 
         expect(appended).toEqual([
           { role: 'assistant', text: 'final answer' },
-          { kind: 'event', role: 'system', text: '完成 14:23:05  cache unavailable' }
+          { kind: 'event', role: 'system', text: 'agent loop stop at 14:23:05  cache unavailable' }
         ])
       } finally {
         formatTime.mockRestore()

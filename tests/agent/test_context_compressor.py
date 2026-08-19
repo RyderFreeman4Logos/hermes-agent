@@ -622,6 +622,25 @@ class TestTailBudgetCodexReplayFields:
 class TestGenerateSummaryNoneContent:
     """Regression: content=None (from tool-call-only assistant messages) must not crash."""
 
+    def test_summary_call_carries_stable_runtime_identity(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "summary"
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True)
+        c.bind_session_state(session_id="physical-session")
+
+        with patch("agent.context_compressor.call_llm", return_value=mock_response) as call:
+            c._generate_summary([
+                {"role": "user", "content": "do something"},
+                {"role": "assistant", "content": "ok"},
+            ])
+
+        runtime = call.call_args.kwargs["main_runtime"]
+        assert runtime["session_id"] == "physical-session"
+        assert runtime["cache_scope"] == "physical-session"
+
     def test_none_content_does_not_crash(self):
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]

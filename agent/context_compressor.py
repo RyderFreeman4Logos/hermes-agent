@@ -4696,6 +4696,16 @@ FOCUS TOPIC: "{focus_topic}"
 This compaction should PRIORITISE preserving all information related to the focus topic above. For content related to "{focus_topic}", include full detail — exact values, file paths, command outputs, error messages, and decisions. For content NOT related to the focus topic, summarise more aggressively (brief one-liners or omit if truly irrelevant). The focus topic sections should receive roughly 60-70% of the summary token budget. Even for the focus topic, NEVER preserve API keys, tokens, passwords, or credentials — use [REDACTED]."""
 
         try:
+            from agent.auxiliary_client import _runtime_main_value
+
+            _session_id = (
+                _runtime_main_value("session_id")
+                or getattr(self, "_session_id", "")
+            )
+            _cache_scope = (
+                _runtime_main_value("cache_scope")
+                or _session_id
+            )
             call_kwargs = {
                 "task": "compression",
                 "main_runtime": {
@@ -4704,6 +4714,8 @@ This compaction should PRIORITISE preserving all information related to the focu
                     "base_url": self.base_url,
                     "api_key": self.api_key,
                     "api_mode": self.api_mode,
+                    "session_id": _session_id,
+                    "cache_scope": _cache_scope,
                 },
                 "messages": [{"role": "user", "content": prompt}],
                 # NO max_tokens: the output cap must never truncate a summary.

@@ -324,6 +324,7 @@ def test_switch_model_drops_previous_profile_request_overrides():
     with (
         patch("agent.model_metadata.get_model_context_length", return_value=128_000),
         patch("hermes_cli.config.load_config", return_value=cfg),
+        patch("hermes_cli.config.load_config_readonly", return_value=cfg),
     ):
         agent.switch_model(
             "destination-model",

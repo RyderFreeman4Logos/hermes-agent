@@ -4781,7 +4781,7 @@ def _persist_model_switch(result) -> None:
 
 def _snapshot_agent_model_runtime(agent) -> dict:
     """Capture the current agent model runtime for a one-turn restore."""
-    return {
+    snapshot = {
         "model": getattr(agent, "model", ""),
         "provider": getattr(agent, "provider", ""),
         "api_key": getattr(agent, "api_key", ""),
@@ -4789,12 +4789,34 @@ def _snapshot_agent_model_runtime(agent) -> dict:
         "api_mode": getattr(agent, "api_mode", ""),
         "primary_runtime": copy.deepcopy(getattr(agent, "_primary_runtime", None)),
     }
+    if hasattr(agent, "request_overrides"):
+        snapshot["request_overrides"] = copy.deepcopy(agent.request_overrides)
+    snapshot["one_turn_fallback_state"] = {
+        name: copy.deepcopy(getattr(agent, name))
+        for name in (
+            "_fallback_chain",
+            "_fallback_model",
+            "_fallback_index",
+            "_consecutive_stale_streams",
+        )
+        if hasattr(agent, name)
+    }
+    return snapshot
 
 
 def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
     """Restore an agent model runtime captured before a one-turn override."""
     if not snapshot or agent is None:
         return
+
+    def _restore_request_overrides() -> None:
+        if "request_overrides" in snapshot:
+            agent.request_overrides = copy.deepcopy(snapshot["request_overrides"])
+
+    def _restore_one_turn_fallback_state() -> None:
+        for name, value in snapshot.get("one_turn_fallback_state", {}).items():
+            setattr(agent, name, copy.deepcopy(value))
+
     primary = snapshot.get("primary_runtime")
     if primary and hasattr(agent, "_restore_primary_runtime"):
         try:
@@ -4802,6 +4824,8 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
             agent._fallback_activated = True
             agent._rate_limited_until = 0
             if agent._restore_primary_runtime():
+                _restore_request_overrides()
+                _restore_one_turn_fallback_state()
                 return
         except Exception:
             logger.debug("TUI one-turn model restore via primary runtime failed", exc_info=True)
@@ -4813,6 +4837,8 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
             base_url=snapshot.get("base_url", ""),
             api_mode=snapshot.get("api_mode", ""),
         )
+        _restore_request_overrides()
+        _restore_one_turn_fallback_state()
 
 
 def _apply_model_switch(

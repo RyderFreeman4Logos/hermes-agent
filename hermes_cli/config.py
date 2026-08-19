@@ -1587,6 +1587,7 @@ def _custom_provider_entry_to_provider_config(
         "discover_models",
         "extra_body",
         "extra_headers",
+        "send_session_id",
         "ssl_ca_cert",
         "ssl_verify",
     ):

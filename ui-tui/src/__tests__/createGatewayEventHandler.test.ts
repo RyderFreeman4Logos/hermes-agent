@@ -2150,6 +2150,30 @@ describe('createGatewayEventHandler', () => {
       }
     })
 
+    it('renders a positive sub-percent cache hit as <1% with its token pair', () => {
+      const appended: Msg[] = []
+      const onEvent = createGatewayEventHandler(buildCtx(appended))
+      const formatTime = vi.spyOn(Date.prototype, 'toLocaleTimeString').mockReturnValue('14:23:05')
+
+      try {
+        onEvent({
+          payload: {
+            cache_info: { pct: 0, prompt_tokens: 4_000, read_tokens: 3, state: 'hit' },
+            completed_at: 1_700_000_000.25,
+            text: 'final answer'
+          },
+          type: 'message.complete'
+        } as any)
+
+        expect(appended).toEqual([
+          { role: 'assistant', text: 'final answer' },
+          { kind: 'event', role: 'system', text: '完成 14:23:05  cache <1% 3/4000' }
+        ])
+      } finally {
+        formatTime.mockRestore()
+      }
+    })
+
     it('renders COLD_WRITE on the same durable line', () => {
       const appended: Msg[] = []
       const onEvent = createGatewayEventHandler(buildCtx(appended))

@@ -301,6 +301,41 @@ class TestConfiguredAuxiliarySessionId:
         request_headers = client.chat.completions.create.call_args.kwargs["extra_headers"]
         assert request_headers == {"session_id": "root-session", "x-initiator": "user"}
 
+    def test_primary_sync_uses_explicit_runtime_identity(self, monkeypatch):
+        """Compression passes runtime identity explicitly from its worker."""
+        import agent.auxiliary_client as aux
+
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider._get_named_custom_provider",
+            lambda provider: {"send_session_id": True},
+        )
+        client = MagicMock()
+        client.base_url = "https://codex.photonmark.com/openai/v1"
+        client.chat.completions.create.return_value = _DummyResponse()
+        monkeypatch.setattr(
+            aux, "_get_cached_client", lambda *args, **kwargs: (client, "gpt-5.6-luna")
+        )
+
+        aux._call_llm_impl(
+            task="compression",
+            provider="pm",
+            model="gpt-5.6-luna",
+            base_url=client.base_url,
+            api_key="pm-key",
+            api_mode="chat_completions",
+            main_runtime={
+                "provider": "custom:pm",
+                "model": "gpt-5.6-luna",
+                "session_id": "physical-session",
+                "cache_scope": "root-session",
+            },
+            messages=[{"role": "user", "content": "summarize"}],
+            timeout=30.0,
+        )
+
+        request_headers = client.chat.completions.create.call_args.kwargs["extra_headers"]
+        assert request_headers["session_id"] == "root-session"
+
     def test_caller_session_id_overrides_generated_header(self, monkeypatch):
         import agent.auxiliary_client as aux
         from agent.auxiliary_client import _merge_auxiliary_extra_headers

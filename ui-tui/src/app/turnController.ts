@@ -36,22 +36,33 @@ type CacheInfo = {
   state: 'cold_write' | 'hit' | 'miss' | 'unavailable' | 'unknown'
 }
 
-// Restored from 51a37362b / f47ecaf19. Compose one durable line when both
-// stamps exist ("完成 HH:mm:ss  cache NN%"); no-op when the backend omitted them.
+// Restored from 51a37362b / f47ecaf19 / 166a68dce4 / 55f59aa54.
+// "agent loop stop at HH:mm:ss  cache NN% cached/total"; no-op when omitted.
 const cacheFootnote = (cacheInfo?: CacheInfo): null | string => {
   if (!cacheInfo) {
     return null
   }
 
   if (cacheInfo.state === 'hit') {
-    return cacheInfo.read_tokens > 0 &&
-      cacheInfo.prompt_tokens > 0 &&
-      cacheInfo.read_tokens * 100 < cacheInfo.prompt_tokens
-      ? `cache <1% ${cacheInfo.read_tokens}/${cacheInfo.prompt_tokens}`
-      : `cache ${Math.max(0, Math.round(cacheInfo.pct ?? 0))}%`
+    const hasCounts = Number.isFinite(cacheInfo.read_tokens) && Number.isFinite(cacheInfo.prompt_tokens)
+    const pair = hasCounts ? ` ${cacheInfo.read_tokens}/${cacheInfo.prompt_tokens}` : ''
+
+    return hasCounts && cacheInfo.read_tokens! * 100 < cacheInfo.prompt_tokens!
+      ? `cache <1%${pair}`
+      : `cache ${Math.max(0, Math.round(cacheInfo.pct ?? 0))}%${pair}`
   }
 
   return cacheInfo.state === 'cold_write' ? 'cache COLD_WRITE' : `cache ${cacheInfo.state}`
+}
+
+const isLowCacheHit = (cacheInfo?: CacheInfo): boolean => {
+  if (!cacheInfo) {
+    return false
+  }
+
+  return (
+    cacheInfo.state === 'miss' || (cacheInfo.state === 'hit' && Number.isFinite(cacheInfo.pct) && cacheInfo.pct! < 50)
+  )
 }
 
 const completionFootnote = (completedAt?: number): null | string => {
@@ -68,7 +79,7 @@ const completionFootnote = (completedAt?: number): null | string => {
     second: '2-digit'
   })
 
-  return `完成 ${time}`
+  return `agent loop stop at ${time}`
 }
 
 const turnCompletionLine = (payload: { cache_info?: CacheInfo; completed_at?: number }): Msg | null => {
@@ -79,7 +90,12 @@ const turnCompletionLine = (payload: { cache_info?: CacheInfo; completed_at?: nu
     return null
   }
 
-  return { kind: 'event', role: 'system', text: [completion, cache].filter(Boolean).join('  ') }
+  return {
+    kind: 'event',
+    role: 'system',
+    text: [completion, cache].filter(Boolean).join('  '),
+    ...(isLowCacheHit(payload.cache_info) ? { eventTone: 'warn' as const } : {})
+  }
 }
 
 // Extracts the raw patch from a diff-only segment produced by

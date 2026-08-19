@@ -9904,6 +9904,45 @@ def _mark_completion_events_consumed(events: list) -> None:
             process_registry._completion_consumed.add(sid)
 
 
+def _ack_steered_completion_ingest(session: dict) -> None:
+    """ACK staged completions only after leftover enqueue or equivalent ingest."""
+    with session["history_lock"]:
+        pending = list(session.get("_completion_pending") or [])
+        accepted = [evt for evt in pending if evt.get("_steer_accepted")]
+        session["_completion_pending"] = [
+            evt for evt in pending if not evt.get("_steer_accepted")
+        ]
+    if accepted:
+        _mark_completion_events_consumed(accepted)
+
+
+def _bind_completion_steer_guards(session: dict, agent) -> None:
+    """ACK on drain (ingest); unmark on interrupt wipe so pending can replay."""
+    if agent is None or getattr(agent, "_completion_steer_guards", False):
+        return
+    orig_clear = getattr(agent, "clear_interrupt", None)
+    if callable(orig_clear):
+        def _clear(*args, **kwargs):
+            had = bool(getattr(agent, "_pending_steer", None))
+            result = orig_clear(*args, **kwargs)
+            if had and not getattr(agent, "_pending_steer", None):
+                with session["history_lock"]:
+                    for evt in session.get("_completion_pending") or []:
+                        evt.pop("_steer_accepted", None)
+            return result
+
+        agent.clear_interrupt = _clear
+    orig_apply = getattr(agent, "_apply_pending_steer_to_tool_results", None)
+    if callable(orig_apply):
+        def _apply(*args, **kwargs):
+            orig_apply(*args, **kwargs)
+            if not getattr(agent, "_pending_steer", None):
+                _ack_steered_completion_ingest(session)
+
+        agent._apply_pending_steer_to_tool_results = _apply
+    agent._completion_steer_guards = True
+
+
 def _format_completion_batch(events: list) -> str:
     """One structured summary for N completions in the same ingest window."""
     lines = [
@@ -10001,7 +10040,21 @@ def _deliver_completions_via_steer(
             return False
     except Exception:
         return False
-    _mark_completion_events_consumed(events)
+    # steer() True is staging only — ACK at leftover/tool-result ingest.
+    _bind_completion_steer_guards(session, session.get("agent"))
+    with session["history_lock"]:
+        pending = session.setdefault("_completion_pending", [])
+        have = {evt.get("session_id") for evt in pending}
+        for evt in events:
+            sid = evt.get("session_id")
+            if sid in have:
+                for item in pending:
+                    if item.get("session_id") == sid:
+                        item["_steer_accepted"] = True
+            else:
+                staged = dict(evt)
+                staged["_steer_accepted"] = True
+                pending.append(staged)
     return True
 
 
@@ -10063,7 +10116,13 @@ def _flush_pending_completions_if_idle(sid: str, session: dict, emitted: set) ->
         running = bool(session.get("running"))
         if running and not _session_can_steer_completions(session):
             return
-        session["_completion_pending"] = []
+        accepted = [evt for evt in pending if evt.get("_steer_accepted")]
+        fresh = [evt for evt in pending if not evt.get("_steer_accepted")]
+        # Already staged on _pending_steer: do not re-steer or idle-dump.
+        session["_completion_pending"] = list(accepted)
+        if not fresh:
+            return
+        pending = fresh
     if running:
         if not _deliver_completions_via_steer(sid, session, pending, emitted):
             with session["history_lock"]:
@@ -10615,9 +10674,11 @@ def _notification_poller_loop(
     # idle ingest (or the next poller) can deliver them — never dump N.
     _flush_pending_completions_if_idle(sid, session, _emitted)
     with session["history_lock"]:
-        leftover = list(session.get("_completion_pending") or [])
-        if leftover:
-            session["_completion_pending"] = []
+        pending = list(session.get("_completion_pending") or [])
+        leftover = [evt for evt in pending if not evt.get("_steer_accepted")]
+        session["_completion_pending"] = [
+            evt for evt in pending if evt.get("_steer_accepted")
+        ]
     for evt in leftover:
         process_registry.completion_queue.put(evt)
 
@@ -11812,9 +11873,20 @@ def _run_prompt_submit(
         # A real queued prompt still wins: the merge in _enqueue_prompt keeps
         # both texts.
         _leftover_steer = result.get("pending_steer") if isinstance(result, dict) else None
+        if not (isinstance(_leftover_steer, str) and _leftover_steer.strip()):
+            _drain = getattr(agent, "_drain_pending_steer", None)
+            if callable(_drain):
+                try:
+                    _leftover_steer = _drain()
+                except Exception:
+                    _leftover_steer = None
         if isinstance(_leftover_steer, str) and _leftover_steer.strip():
             with session["history_lock"]:
                 _enqueue_prompt(session, _leftover_steer, session.get("transport"))
+            _ack_steered_completion_ingest(session)
+        elif not getattr(agent, "_pending_steer", None):
+            # Inject already took the text, or interrupt wipe unmarked first.
+            _ack_steered_completion_ingest(session)
         if _drain_queued_prompt(rid, sid, session):
             return
 

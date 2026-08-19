@@ -1594,6 +1594,9 @@ class _CodexCompletionsAdapter:
             "input": input_items or [{"role": "user", "content": ""}],
             "store": False,
         }
+        request_headers = kwargs.get("extra_headers")
+        if isinstance(request_headers, dict) and request_headers:
+            resp_kwargs["extra_headers"] = dict(request_headers)
 
         # Preserve the chat.completions timeout contract. This adapter is used
         # by auxiliary calls such as context compression; if the timeout is not
@@ -8529,6 +8532,23 @@ def _contains_profile_reasoning_fields(value: Any) -> bool:
     return False
 
 
+def _configured_auxiliary_session_id(provider: str) -> str:
+    """Return the stable session root for an opted-in named custom provider."""
+    try:
+        from hermes_cli.runtime_provider import _get_named_custom_provider
+
+        entry = _get_named_custom_provider(str(provider or "").strip())
+    except Exception:
+        return ""
+    if not isinstance(entry, dict) or entry.get("send_session_id") is not True:
+        return ""
+    return str(
+        _runtime_main_value("cache_scope")
+        or _runtime_main_value("session_id")
+        or ""
+    ).strip()
+
+
 def _build_call_kwargs(
     provider: str,
     model: str,
@@ -8733,6 +8753,16 @@ def _build_call_kwargs(
                 merged_extra["session_id"] = sticky_key
     if merged_extra:
         kwargs["extra_body"] = merged_extra
+
+    # Named custom providers are opt-in because arbitrary OpenAI-compatible
+    # endpoints may reject this non-standard header. The stable cache scope is
+    # preferred over a rotated physical session id.
+    session_id = _configured_auxiliary_session_id(provider)
+    if session_id:
+        request_headers = kwargs.get("extra_headers")
+        request_headers = dict(request_headers) if isinstance(request_headers, dict) else {}
+        request_headers.setdefault("session_id", session_id)
+        kwargs["extra_headers"] = request_headers
 
     # Anthropic Messages adapters translate Hermes reasoning into native
     # ``thinking`` via a private kwarg (and strip OpenAI-shaped

@@ -105,6 +105,165 @@ class TestAuxiliaryMaxTokensParam:
     pass
 
 
+class TestConfiguredAuxiliarySessionId:
+    def test_named_custom_opt_in_adds_stable_session_id_header(self, monkeypatch):
+        import agent.auxiliary_client as aux
+
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider._get_named_custom_provider",
+            lambda provider: {"send_session_id": True},
+        )
+        token = aux.set_runtime_main(
+            "custom:pm",
+            "gpt-5.6-luna",
+            session_id="physical-session",
+            cache_scope="root-session",
+        )
+        try:
+            kwargs = _build_call_kwargs(
+                "pm",
+                "gpt-5.6-luna",
+                [{"role": "user", "content": "summarize"}],
+                task="compression",
+            )
+        finally:
+            aux.reset_runtime_main(token)
+
+        assert kwargs["extra_headers"]["session_id"] == "root-session"
+
+    def test_named_custom_provider_does_not_receive_session_id_by_default(self, monkeypatch):
+        import agent.auxiliary_client as aux
+
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider._get_named_custom_provider",
+            lambda provider: {},
+        )
+        token = aux.set_runtime_main(
+            "custom:pm",
+            "gpt-5.6-luna",
+            session_id="physical-session",
+            cache_scope="root-session",
+        )
+        try:
+            kwargs = _build_call_kwargs(
+                "pm",
+                "gpt-5.6-luna",
+                [{"role": "user", "content": "summarize"}],
+                task="compression",
+            )
+        finally:
+            aux.reset_runtime_main(token)
+
+        assert "session_id" not in (kwargs.get("extra_headers") or {})
+
+    def test_configured_sync_fallback_uses_same_opt_in_header(self, monkeypatch):
+        import agent.auxiliary_client as aux
+        from agent.auxiliary_client import (
+            _FallbackDestination,
+            _call_fallback_candidate_sync,
+        )
+
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider._get_named_custom_provider",
+            lambda provider: {"send_session_id": True},
+        )
+        monkeypatch.setattr(
+            aux,
+            "_fallback_destination",
+            lambda *args, **kwargs: _FallbackDestination(
+                "pm", "https://codex.photonmark.com/openai/v1", "codex_responses", "gpt-5.6-luna"
+            ),
+        )
+        monkeypatch.setattr(
+            aux,
+            "_replan_synchronous_cache_sections",
+            lambda messages, tools, *, destination: (messages, tools),
+        )
+        client = MagicMock()
+        client.base_url = "https://codex.photonmark.com/openai/v1"
+        client.chat.completions.create.return_value = _DummyResponse()
+
+        token = aux.set_runtime_main(
+            "custom:pm",
+            "gpt-5.6-luna",
+            session_id="physical-session",
+            cache_scope="root-session",
+        )
+        try:
+            _call_fallback_candidate_sync(
+                client,
+                "gpt-5.6-luna",
+                "fallback_chain[0](pm)",
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+                temperature=None,
+                max_tokens=None,
+                tools=None,
+                effective_timeout=30.0,
+                effective_extra_body={},
+                reasoning_config=None,
+            )
+        finally:
+            aux.reset_runtime_main(token)
+
+        request = client.chat.completions.create.call_args.kwargs
+        assert request["extra_headers"]["session_id"] == "root-session"
+
+    @pytest.mark.asyncio
+    async def test_configured_async_fallback_uses_same_opt_in_header(self, monkeypatch):
+        import agent.auxiliary_client as aux
+        from agent.auxiliary_client import (
+            _FallbackDestination,
+            _call_fallback_candidate_async,
+        )
+
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider._get_named_custom_provider",
+            lambda provider: {"send_session_id": True},
+        )
+        monkeypatch.setattr(
+            aux,
+            "_fallback_destination",
+            lambda *args, **kwargs: _FallbackDestination(
+                "pm", "https://codex.photonmark.com/openai/v1", "codex_responses", "gpt-5.6-luna"
+            ),
+        )
+        monkeypatch.setattr(
+            aux,
+            "_replan_synchronous_cache_sections",
+            lambda messages, tools, *, destination: (messages, tools),
+        )
+        client = MagicMock()
+        client.base_url = "https://codex.photonmark.com/openai/v1"
+        client.chat.completions.create = AsyncMock(return_value=_DummyResponse())
+
+        token = aux.set_runtime_main(
+            "custom:pm",
+            "gpt-5.6-luna",
+            session_id="physical-session",
+            cache_scope="root-session",
+        )
+        try:
+            await _call_fallback_candidate_async(
+                client,
+                "gpt-5.6-luna",
+                "fallback_chain[0](pm)",
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+                temperature=None,
+                max_tokens=None,
+                tools=None,
+                effective_timeout=30.0,
+                effective_extra_body={},
+                reasoning_config=None,
+            )
+        finally:
+            aux.reset_runtime_main(token)
+
+        request = client.chat.completions.create.call_args.kwargs
+        assert request["extra_headers"]["session_id"] == "root-session"
+
+
 
 class TestResolveTaskProviderModel:
     @pytest.mark.parametrize(
@@ -3000,6 +3159,14 @@ class TestCodexAdapterReasoningTranslation:
             extra_body={"reasoning": {"effort": "low"}},
         )
         assert captured.get("reasoning") == {"effort": "low", "summary": "auto"}
+
+    def test_request_headers_reach_responses_transport(self):
+        adapter, captured = self._build_adapter()
+        adapter.create(
+            messages=[{"role": "user", "content": "hi"}],
+            extra_headers={"session_id": "root-session"},
+        )
+        assert captured["extra_headers"]["session_id"] == "root-session"
 
 
 

@@ -4923,8 +4923,7 @@ def _retry_same_provider_sync(
     # Preserve per-request attribution headers (e.g. Copilot's
     # ``x-initiator: user``) across the rebuilt-client retry — dropping them
     # here would let a recovery retry silently lose capability gating (#60293).
-    if extra_headers:
-        retry_kwargs["extra_headers"] = dict(extra_headers)
+    _merge_auxiliary_extra_headers(retry_kwargs, extra_headers)
     if _is_anthropic_compat_endpoint(resolved_provider, retry_base):
         retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
     return _validate_llm_response(
@@ -4997,8 +4996,7 @@ async def _retry_same_provider_async(
     )
     # Preserve per-request attribution headers across the rebuilt-client
     # retry — see the sync variant above (#60293).
-    if extra_headers:
-        retry_kwargs["extra_headers"] = dict(extra_headers)
+    _merge_auxiliary_extra_headers(retry_kwargs, extra_headers)
     if _is_anthropic_compat_endpoint(resolved_provider, retry_base):
         retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
     return _validate_llm_response(
@@ -8747,6 +8745,19 @@ def _configured_auxiliary_session_id(provider: str) -> str:
     ).strip()
 
 
+def _merge_auxiliary_extra_headers(
+    kwargs: Dict[str, Any], caller_headers: Optional[Dict[str, str]],
+) -> None:
+    """Merge per-call headers over generated headers without dropping either."""
+    if not caller_headers:
+        return
+    generated = kwargs.get("extra_headers")
+    merged = dict(generated) if isinstance(generated, dict) else {}
+    # Caller values intentionally win, including an explicit session_id.
+    merged.update(caller_headers)
+    kwargs["extra_headers"] = merged
+
+
 def _build_call_kwargs(
     provider: str,
     model: str,
@@ -9802,8 +9813,7 @@ def _call_llm_impl(
         tools=tools, timeout=effective_timeout, extra_body=request_extra_body,
         reasoning_config=reasoning_config,
         base_url=_base_info or resolved_base_url, task=task)
-    if extra_headers:
-        kwargs["extra_headers"] = dict(extra_headers)
+    _merge_auxiliary_extra_headers(kwargs, extra_headers)
 
     # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
     _client_base = str(getattr(client, "base_url", "") or "")

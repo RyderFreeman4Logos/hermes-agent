@@ -263,6 +263,167 @@ class TestConfiguredAuxiliarySessionId:
         request = client.chat.completions.create.call_args.kwargs
         assert request["extra_headers"]["session_id"] == "root-session"
 
+    def test_primary_sync_preserves_opt_in_session_id_with_caller_headers(self, monkeypatch):
+        """The initial custom-provider request must merge, not replace, headers."""
+        import agent.auxiliary_client as aux
+        from agent.auxiliary_client import _call_llm_impl
+
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider._get_named_custom_provider",
+            lambda provider: {"send_session_id": True},
+        )
+        client = MagicMock()
+        client.base_url = "https://codex.photonmark.com/openai/v1"
+        client.chat.completions.create.return_value = _DummyResponse()
+        monkeypatch.setattr(aux, "_get_cached_client", lambda *args, **kwargs: (client, "gpt-5.6-luna"))
+
+        token = aux.set_runtime_main(
+            "custom:pm",
+            "gpt-5.6-luna",
+            session_id="physical-session",
+            cache_scope="root-session",
+        )
+        try:
+            _call_llm_impl(
+                task="compression",
+                provider="pm",
+                model="gpt-5.6-luna",
+                base_url=client.base_url,
+                api_key="pm-key",
+                api_mode="chat_completions",
+                messages=[{"role": "user", "content": "summarize"}],
+                timeout=30.0,
+                extra_headers={"x-initiator": "user"},
+            )
+        finally:
+            aux.reset_runtime_main(token)
+
+        request_headers = client.chat.completions.create.call_args.kwargs["extra_headers"]
+        assert request_headers == {"session_id": "root-session", "x-initiator": "user"}
+
+    def test_caller_session_id_overrides_generated_header(self, monkeypatch):
+        import agent.auxiliary_client as aux
+        from agent.auxiliary_client import _merge_auxiliary_extra_headers
+
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider._get_named_custom_provider",
+            lambda provider: {"send_session_id": True},
+        )
+        token = aux.set_runtime_main(
+            "custom:pm",
+            "gpt-5.6-luna",
+            session_id="physical-session",
+            cache_scope="root-session",
+        )
+        try:
+            kwargs = _build_call_kwargs(
+                "pm",
+                "gpt-5.6-luna",
+                [{"role": "user", "content": "summarize"}],
+                task="compression",
+            )
+            _merge_auxiliary_extra_headers(
+                kwargs,
+                {"session_id": "caller-session", "x-initiator": "user"},
+            )
+        finally:
+            aux.reset_runtime_main(token)
+
+        assert kwargs["extra_headers"] == {
+            "session_id": "caller-session",
+            "x-initiator": "user",
+        }
+
+    def test_sync_same_provider_retry_preserves_opt_in_session_id_with_caller_headers(self, monkeypatch):
+        """Credential recovery retries must retain generated and caller headers."""
+        import agent.auxiliary_client as aux
+        from agent.auxiliary_client import _retry_same_provider_sync
+
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider._get_named_custom_provider",
+            lambda provider: {"send_session_id": True},
+        )
+        client = MagicMock()
+        client.base_url = "https://codex.photonmark.com/openai/v1"
+        client.chat.completions.create.return_value = _DummyResponse()
+        monkeypatch.setattr(aux, "_get_cached_client", lambda *args, **kwargs: (client, "gpt-5.6-luna"))
+
+        token = aux.set_runtime_main(
+            "custom:pm",
+            "gpt-5.6-luna",
+            session_id="physical-session",
+            cache_scope="root-session",
+        )
+        try:
+            _retry_same_provider_sync(
+                task="compression",
+                resolved_provider="pm",
+                resolved_model="gpt-5.6-luna",
+                resolved_base_url=client.base_url,
+                resolved_api_key="pm-key",
+                resolved_api_mode="chat_completions",
+                main_runtime=None,
+                final_model="gpt-5.6-luna",
+                messages=[{"role": "user", "content": "summarize"}],
+                temperature=None,
+                max_tokens=None,
+                tools=None,
+                effective_timeout=30.0,
+                effective_extra_body={},
+                reasoning_config=None,
+                extra_headers={"x-initiator": "user"},
+            )
+        finally:
+            aux.reset_runtime_main(token)
+
+        request_headers = client.chat.completions.create.call_args.kwargs["extra_headers"]
+        assert request_headers == {"session_id": "root-session", "x-initiator": "user"}
+
+    @pytest.mark.asyncio
+    async def test_async_same_provider_retry_preserves_opt_in_session_id_with_caller_headers(self, monkeypatch):
+        """Async credential recovery retries must retain both header sources."""
+        import agent.auxiliary_client as aux
+        from agent.auxiliary_client import _retry_same_provider_async
+
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider._get_named_custom_provider",
+            lambda provider: {"send_session_id": True},
+        )
+        client = MagicMock()
+        client.base_url = "https://codex.photonmark.com/openai/v1"
+        client.chat.completions.create = AsyncMock(return_value=_DummyResponse())
+        monkeypatch.setattr(aux, "_get_cached_client", lambda *args, **kwargs: (client, "gpt-5.6-luna"))
+
+        token = aux.set_runtime_main(
+            "custom:pm",
+            "gpt-5.6-luna",
+            session_id="physical-session",
+            cache_scope="root-session",
+        )
+        try:
+            await _retry_same_provider_async(
+                task="compression",
+                resolved_provider="pm",
+                resolved_model="gpt-5.6-luna",
+                resolved_base_url=client.base_url,
+                resolved_api_key="pm-key",
+                resolved_api_mode="chat_completions",
+                final_model="gpt-5.6-luna",
+                messages=[{"role": "user", "content": "summarize"}],
+                temperature=None,
+                max_tokens=None,
+                tools=None,
+                effective_timeout=30.0,
+                effective_extra_body={},
+                reasoning_config=None,
+                extra_headers={"x-initiator": "user"},
+            )
+        finally:
+            aux.reset_runtime_main(token)
+
+        request_headers = client.chat.completions.create.call_args.kwargs["extra_headers"]
+        assert request_headers == {"session_id": "root-session", "x-initiator": "user"}
+
 
 
 class TestResolveTaskProviderModel:

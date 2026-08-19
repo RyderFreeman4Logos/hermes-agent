@@ -4225,6 +4225,15 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         if not jobs:
             return ""
 
+        def _unavailable(ci: int, exc: BaseException | None = None) -> str:
+            if exc is not None:
+                logger.warning("lean chunk digest %d/%d failed: %s", ci + 1, n_chunks, exc)
+            body = (
+                f"[digest unavailable for segment {ci + 1}/{n_chunks} "
+                "— recover via session_search]"
+            )
+            return f"### Segment {ci + 1}/{n_chunks}\n{body}"
+
         def _digest_one(ci: int, segment: str) -> str:
             try:
                 from agent.auxiliary_client import call_llm
@@ -4244,12 +4253,10 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
                 from agent.agent_runtime_helpers import strip_think_blocks
 
                 body = strip_think_blocks(None, body).strip()
-            except Exception as exc:
-                logger.warning("lean chunk digest %d/%d failed: %s", ci + 1, n_chunks, exc)
-                body = (
-                    f"[digest unavailable for segment {ci + 1}/{n_chunks} "
-                    "— recover via session_search]"
-                )
+            except BaseException as exc:
+                if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                    raise
+                return _unavailable(ci, exc)
             return f"### Segment {ci + 1}/{n_chunks}\n{body}"
 
         from concurrent.futures import ThreadPoolExecutor
@@ -4269,7 +4276,14 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
                     pool.submit(propagate_context_to_thread(_digest_one), ci, segment)
                     for ci, segment in jobs
                 ]
-                digests = [fut.result() for fut in futures]
+                digests = []
+                for fut, (ci, _segment) in zip(futures, jobs):
+                    try:
+                        digests.append(fut.result())
+                    except BaseException as exc:
+                        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                            raise
+                        digests.append(_unavailable(ci, exc))
         return (
             "\n\n" + _LEAN_DIGESTS_HEADING + "\n"
             + "\n\n".join(digests)
@@ -4291,9 +4305,14 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
                 _build_anchor_index(turns_to_summarize)
             )
         if _LEAN_DIGESTS_HEADING not in summary:
-            summary += _redact_compaction_text(
-                self._build_chunk_digests(turns_to_summarize)
-            )
+            try:
+                digest_text = self._build_chunk_digests(turns_to_summarize)
+            except BaseException as exc:
+                if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                    raise
+                logger.warning("lean chunk digest map failed: %s", exc)
+                digest_text = ""
+            summary += _redact_compaction_text(digest_text)
         if _LEAN_USER_MESSAGES_HEADING not in summary:
             summary += _redact_compaction_text(
                 _build_verbatim_user_section(turns_to_summarize)

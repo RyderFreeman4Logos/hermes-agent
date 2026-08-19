@@ -42,6 +42,18 @@ def test_normalize_entry_keeps_extra_headers():
     }
 
 
+def test_normalize_entry_keeps_explicit_session_id_opt_in():
+    normalized = _normalize_custom_provider_entry(
+        {
+            "name": "pm",
+            "base_url": "https://codex.photonmark.com/openai/v1",
+            "send_session_id": True,
+        }
+    )
+    assert normalized is not None
+    assert normalized["send_session_id"] is True
+
+
 def test_normalize_entry_drops_invalid_extra_headers():
     for bad in ("not-a-dict", {}, 42, ["a"]):
         normalized = _normalize_custom_provider_entry(

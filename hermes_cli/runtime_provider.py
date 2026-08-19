@@ -774,6 +774,8 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
                     extra_body = entry.get("extra_body")
                     if isinstance(extra_body, dict):
                         result["extra_body"] = dict(extra_body)
+                    if isinstance(entry.get("send_session_id"), bool):
+                        result["send_session_id"] = entry["send_session_id"]
                     _lift_extra_headers(entry, result)
                     # Command that PRINTS a credential, for gateways issuing
                     # short-lived bearers instead of static keys. Propagated
@@ -832,6 +834,8 @@ def _get_named_custom_provider(requested_provider: str) -> Optional[Dict[str, An
         extra_body = entry.get("extra_body")
         if isinstance(extra_body, dict):
             result["extra_body"] = dict(extra_body)
+        if isinstance(entry.get("send_session_id"), bool):
+            result["send_session_id"] = entry["send_session_id"]
         _lift_extra_headers(entry, result)
         api_mode = _parse_api_mode(entry.get("api_mode"))
         if api_mode:

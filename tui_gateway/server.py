@@ -1673,7 +1673,18 @@ def _cache_info_from_first_call(record: Any) -> dict[str, int | str]:
         pct = int(record["pct"]) if record.get("pct") is not None else 0
     except (TypeError, ValueError):
         pct = 0
-    return {"state": state, "pct": pct}
+    info: dict[str, int | str] = {"state": state, "pct": pct}
+    for key in ("read_tokens", "prompt_tokens"):
+        value = record.get(key)
+        if value is None:
+            continue
+        try:
+            count = int(value)
+        except (TypeError, ValueError):
+            continue
+        if count >= 0:
+            info[key] = count
+    return info
 
 
 def _stamp_loop_cache_info(sid: str, payload: dict) -> None:
@@ -5546,6 +5557,15 @@ def _attach_tui_cache_callback(agent, sid: str):
         session = _sessions.get(sid)
         if isinstance(record, dict) and isinstance(session, dict) and session.get("agent") is agent:
             cache_record = {key: value for key, value in record.items() if value is not None}
+            for key, raw in (("read_tokens", _read), ("prompt_tokens", _prompt)):
+                if key in cache_record:
+                    continue
+                try:
+                    count = int(raw)
+                except (TypeError, ValueError):
+                    continue
+                if count >= 0:
+                    cache_record[key] = count
             cache_record.update(
                 owner="tui_gateway",
                 session=hashlib.sha256(

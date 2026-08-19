@@ -11,6 +11,26 @@ from tools.process_registry import process_registry
 from tui_gateway import server
 
 
+class _SteerAgent:
+    """Minimal AIAgent.steer stand-in used by mid-loop ingest tests."""
+
+    def __init__(self):
+        self.steers: list[str] = []
+        self._pending_steer = None
+        self._model_request_active = threading.Event()
+        self._executing_tools = False
+
+    def steer(self, text: str) -> bool:
+        if not text or not str(text).strip():
+            return False
+        cleaned = str(text).strip()
+        self.steers.append(cleaned)
+        self._pending_steer = (
+            f"{self._pending_steer}\n{cleaned}" if self._pending_steer else cleaned
+        )
+        return True
+
+
 def _session(**extra):
     return {
         "agent": types.SimpleNamespace(),
@@ -344,5 +364,178 @@ def test_child_tails_after_compress_do_not_each_start_a_parent_turn(monkeypatch)
         ad._reset_for_tests()
         for evt in (*child_events, parent_evt):
             process_registry._completion_consumed.discard(evt["session_id"])
+        while not isolated.empty():
+            isolated.get_nowait()
+
+
+def test_midloop_completions_use_steer_rail_not_new_turns(monkeypatch):
+    """N completions while mid-tool-batch land on _pending_steer, not N turns.
+
+    #138: insert into the current loop at least as timely as steer. A live
+    parent executing tools must ingest every child notify_on_complete via
+    AIAgent.steer (one structured batch when N>1) before any new idle turn.
+    """
+    isolated: queue_mod.Queue = queue_mod.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+
+    agent = _SteerAgent()
+    agent._executing_tools = True
+    emitted: list = []
+    turns: list = []
+    sess = _session(running=True, agent=agent)
+    sid = "sid_midloop_steer"
+    server._sessions[sid] = sess
+    monkeypatch.setattr(server, "_emit", lambda *args, **_kw: emitted.append(args))
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda _rid, _sid, session, text, **_kw: turns.append(text)
+        or session.__setitem__("running", False),
+    )
+    events = [
+        _completion("proc_mid_a", 0, "echo a"),
+        _completion("proc_mid_b", 1, "echo b"),
+        _completion("proc_mid_c", 0, "echo c"),
+    ]
+    for evt in events:
+        process_registry._completion_consumed.discard(evt["session_id"])
+
+    stop = threading.Event()
+    thread = threading.Thread(
+        target=server._notification_poller_loop,
+        args=(stop, sid, sess),
+        daemon=True,
+    )
+    thread.start()
+    try:
+        for evt in events:
+            isolated.put(evt)
+        deadline = time.monotonic() + 1.5
+        while time.monotonic() < deadline:
+            if agent.steers:
+                break
+            time.sleep(0.01)
+
+        assert turns == []
+        assert len(agent.steers) == 1
+        steered = agent.steers[0]
+        for evt in events:
+            assert evt["session_id"] in steered
+            assert str(evt["exit_code"]) in steered
+        status = _process_status(emitted)
+        assert len(status) == 1
+        assert all(evt["session_id"] in status[0][2]["text"] for evt in events)
+        assert isolated.empty()
+        assert sess.get("_completion_pending") in (None, [])
+    finally:
+        stop.set()
+        thread.join(timeout=2.0)
+        server._sessions.pop(sid, None)
+        for evt in events:
+            process_registry._completion_consumed.discard(evt["session_id"])
+        while not isolated.empty():
+            isolated.get_nowait()
+
+
+def test_llm_blocked_pileup_is_one_steer_batch_zero_drops(monkeypatch):
+    """Parent blocked on LLM + N notifies → one structured steer; no drops.
+
+    Completions that pile up while _model_request_active must not each
+    become a parent turn, and must not wait for the whole loop to stop.
+    """
+    isolated: queue_mod.Queue = queue_mod.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+
+    agent = _SteerAgent()
+    agent._model_request_active.set()
+    emitted: list = []
+    turns: list = []
+    sess = _session(running=True, agent=agent)
+    sid = "sid_llm_blocked_batch"
+    server._sessions[sid] = sess
+    monkeypatch.setattr(server, "_emit", lambda *args, **_kw: emitted.append(args))
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda _rid, _sid, session, text, **_kw: turns.append(text)
+        or session.__setitem__("running", False),
+    )
+    events = [
+        _completion("proc_llm_a", 0, "echo a"),
+        _completion("proc_llm_b", 0, "echo b"),
+    ]
+    for evt in events:
+        process_registry._completion_consumed.discard(evt["session_id"])
+
+    stop = threading.Event()
+    thread = threading.Thread(
+        target=server._notification_poller_loop,
+        args=(stop, sid, sess),
+        daemon=True,
+    )
+    thread.start()
+    try:
+        isolated.put(events[0])
+        time.sleep(0.15)
+        isolated.put(events[1])
+        deadline = time.monotonic() + 3.5
+        while time.monotonic() < deadline:
+            if agent.steers:
+                break
+            time.sleep(0.01)
+
+        assert turns == []
+        assert sess.get("running") is True
+        assert len(agent.steers) == 1
+        steered = agent.steers[0]
+        assert "proc_llm_a" in steered and "proc_llm_b" in steered
+        assert isolated.empty()
+        consumed = process_registry._completion_consumed
+        assert "proc_llm_a" in consumed
+        assert "proc_llm_b" in consumed
+    finally:
+        stop.set()
+        thread.join(timeout=2.0)
+        server._sessions.pop(sid, None)
+        for evt in events:
+            process_registry._completion_consumed.discard(evt["session_id"])
+        while not isolated.empty():
+            isolated.get_nowait()
+
+
+def test_single_completion_steers_while_parent_waits_on_tools(monkeypatch):
+    """One notify while mid-loop is ingested immediately; loop need not stop."""
+    isolated: queue_mod.Queue = queue_mod.Queue()
+    monkeypatch.setattr(process_registry, "completion_queue", isolated)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+
+    agent = _SteerAgent()
+    agent._executing_tools = True
+    turns: list = []
+    sess = _session(running=True, agent=agent)
+    sid = "sid_single_midloop"
+    server._sessions[sid] = sess
+    monkeypatch.setattr(server, "_emit", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda _rid, _sid, session, text, **_kw: turns.append(text)
+        or session.__setitem__("running", False),
+    )
+    evt = _completion("proc_wait_one", 0, "echo wait")
+    process_registry._completion_consumed.discard("proc_wait_one")
+    isolated.put(evt)
+    try:
+        _run_poller_until(sid, sess, lambda: bool(agent.steers))
+        assert turns == []
+        assert sess.get("running") is True
+        assert len(agent.steers) == 1
+        assert "proc_wait_one" in agent.steers[0]
+        assert isolated.empty()
+    finally:
+        server._sessions.pop(sid, None)
+        process_registry._completion_consumed.discard("proc_wait_one")
         while not isolated.empty():
             isolated.get_nowait()

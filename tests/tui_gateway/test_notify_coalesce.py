@@ -612,3 +612,49 @@ def test_interrupt_after_steer_accept_does_not_drop_completion():
         assert process_registry.is_completion_consumed("proc_int_drop") is False
     finally:
         process_registry._completion_consumed.discard("proc_int_drop")
+
+
+def test_leftover_ack_does_not_consume_later_steer():
+    """Leftover harvest ACKs the snapshot only; a later steer stays replayable."""
+    agent = _SteerAgent()
+
+    def _drain(self):
+        text = self._pending_steer
+        self._pending_steer = None
+        return text
+
+    def clear_interrupt(self, *, preserve_redirect=False):
+        self._pending_steer = None
+        return True
+
+    agent._drain_pending_steer = types.MethodType(_drain, agent)
+    agent.clear_interrupt = types.MethodType(clear_interrupt, agent)
+    sess = _session(running=True, agent=agent)
+    evt_a = _completion("proc_left_a", 0, "echo a")
+    evt_b = _completion("proc_left_b", 0, "echo b")
+    process_registry._completion_consumed.discard("proc_left_a")
+    process_registry._completion_consumed.discard("proc_left_b")
+    try:
+        assert server._deliver_completions_via_steer("sid_left", sess, [evt_a], set())
+        leftover = agent._drain_pending_steer()
+        assert leftover and "proc_left_a" in leftover
+
+        assert server._deliver_completions_via_steer("sid_left", sess, [evt_b], set())
+        assert agent._pending_steer and "proc_left_b" in agent._pending_steer
+
+        with sess["history_lock"]:
+            server._enqueue_prompt(sess, leftover, sess.get("transport"))
+        server._ack_steered_completion_ingest(sess)
+
+        assert "proc_left_a" in process_registry._completion_consumed
+        assert "proc_left_b" not in process_registry._completion_consumed
+        pending_ids = {evt.get("session_id") for evt in (sess.get("_completion_pending") or [])}
+        assert "proc_left_b" in pending_ids
+
+        agent.clear_interrupt()
+        assert agent._pending_steer is None
+        assert "proc_left_b" not in process_registry._completion_consumed
+        assert process_registry.is_completion_consumed("proc_left_b") is False
+    finally:
+        process_registry._completion_consumed.discard("proc_left_a")
+        process_registry._completion_consumed.discard("proc_left_b")

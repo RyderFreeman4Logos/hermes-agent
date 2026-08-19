@@ -10202,12 +10202,22 @@ def _mark_completion_events_consumed(events: list) -> None:
 
 def _ack_steered_completion_ingest(session: dict) -> None:
     """ACK staged completions only after leftover enqueue or equivalent ingest."""
+    live = getattr(session.get("agent"), "_pending_steer", None) or ""
+    live = str(live)
     with session["history_lock"]:
         pending = list(session.get("_completion_pending") or [])
-        accepted = [evt for evt in pending if evt.get("_steer_accepted")]
-        session["_completion_pending"] = [
-            evt for evt in pending if not evt.get("_steer_accepted")
-        ]
+        accepted = []
+        keep = []
+        for evt in pending:
+            sid = evt.get("session_id")
+            # Still only on the live steer rail — not in this ingest snapshot.
+            if evt.get("_steer_accepted") and sid and live and f" {sid} " in f" {live} ":
+                keep.append(evt)
+            elif evt.get("_steer_accepted"):
+                accepted.append(evt)
+            else:
+                keep.append(evt)
+        session["_completion_pending"] = keep
     if accepted:
         _mark_completion_events_consumed(accepted)
 

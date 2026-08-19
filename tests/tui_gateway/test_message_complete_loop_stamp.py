@@ -145,6 +145,8 @@ def test_message_complete_stamps_first_call_cache_info(
     assert isinstance(payload["completed_at"], (int, float))
     assert payload["cache_info"]["state"] == expected_state
     assert payload["cache_info"]["pct"] == expected_pct
+    assert payload["cache_info"]["read_tokens"] == read
+    assert payload["cache_info"]["prompt_tokens"] == 2_000
 
 
 def test_message_complete_unavailable_when_no_provider_usage(frames, turn_env):
@@ -165,6 +167,16 @@ def test_message_complete_unavailable_when_no_provider_usage(frames, turn_env):
     payload = _complete_payloads(frames)[0]
     assert isinstance(payload["completed_at"], (int, float))
     assert payload["cache_info"]["state"] == "unavailable"
+    assert "read_tokens" not in payload["cache_info"]
+    assert "prompt_tokens" not in payload["cache_info"]
+
+
+def test_cache_info_omits_tokens_when_counts_missing():
+    info = server._cache_info_from_first_call({"state": "hit", "pct": 95})
+    assert info["state"] == "hit"
+    assert info["pct"] == 95
+    assert "read_tokens" not in info
+    assert "prompt_tokens" not in info
 
 
 def test_message_complete_does_not_reuse_prior_loop_cache_info(frames, turn_env):

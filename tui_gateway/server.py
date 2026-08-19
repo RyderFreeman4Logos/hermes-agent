@@ -10202,9 +10202,8 @@ def _mark_completion_events_consumed(events: list) -> None:
 
 def _ack_steered_completion_ingest(session: dict) -> None:
     """ACK staged completions only after leftover enqueue or equivalent ingest."""
-    live = getattr(session.get("agent"), "_pending_steer", None) or ""
-    live = str(live)
     with session["history_lock"]:
+        live = str(getattr(session.get("agent"), "_pending_steer", None) or "")
         pending = list(session.get("_completion_pending") or [])
         accepted = []
         keep = []

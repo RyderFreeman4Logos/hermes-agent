@@ -6,6 +6,7 @@ import queue as queue_mod
 import threading
 import time
 import types
+from collections.abc import Callable
 
 from tools.process_registry import process_registry
 from tui_gateway import server
@@ -658,3 +659,56 @@ def test_leftover_ack_does_not_consume_later_steer():
     finally:
         process_registry._completion_consumed.discard("proc_left_a")
         process_registry._completion_consumed.discard("proc_left_b")
+
+
+def test_leftover_ack_toctou_does_not_consume_later_steer():
+    """Stale empty live snapshot must not ACK a concurrent later steer."""
+
+    class HookLock:
+        def __init__(self):
+            self._lock = threading.Lock()
+            self.hook: Callable[[], None] | None = None
+
+        def __enter__(self):
+            if self.hook:
+                fn, self.hook = self.hook, None
+                fn()
+            self._lock.acquire()
+            return self
+
+        def __exit__(self, *exc):
+            self._lock.release()
+            return False
+
+    agent = _SteerAgent()
+    lock = HookLock()
+    sess = _session(running=True, agent=agent, history_lock=lock)
+    evt_a = _completion("proc_race_a", 0, "echo a")
+    evt_b = _completion("proc_race_b", 0, "echo b")
+    process_registry._completion_consumed.discard("proc_race_a")
+    process_registry._completion_consumed.discard("proc_race_b")
+    try:
+        assert server._deliver_completions_via_steer("sid_race", sess, [evt_a], set())
+        leftover = agent._pending_steer
+        agent._pending_steer = None
+        assert leftover and "proc_race_a" in leftover
+        with lock._lock:
+            server._enqueue_prompt(sess, leftover, sess.get("transport"))
+
+        def _inject_b():
+            assert server._deliver_completions_via_steer("sid_race", sess, [evt_b], set())
+
+        lock.hook = _inject_b
+        server._ack_steered_completion_ingest(sess)
+
+        assert "proc_race_a" in process_registry._completion_consumed
+        assert "proc_race_b" not in process_registry._completion_consumed
+        assert process_registry.is_completion_consumed("proc_race_b") is False
+        pending_ids = {
+            evt.get("session_id") for evt in (sess.get("_completion_pending") or [])
+        }
+        assert "proc_race_b" in pending_ids
+        assert agent._pending_steer and "proc_race_b" in agent._pending_steer
+    finally:
+        process_registry._completion_consumed.discard("proc_race_a")
+        process_registry._completion_consumed.discard("proc_race_b")

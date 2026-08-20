@@ -1688,6 +1688,38 @@ def _cache_info_from_first_call(record: Any) -> dict[str, int | str]:
     return info
 
 
+def _cache_info_from_usage(usage: Any) -> dict[str, int | str]:
+    if not isinstance(usage, dict):
+        return {"state": "unavailable", "pct": 0}
+    try:
+        read_tokens = max(0, int(usage.get("cache_read_tokens", 0) or 0))
+        write_tokens = max(0, int(usage.get("cache_write_tokens", 0) or 0))
+        prompt_tokens = max(0, int(usage.get("prompt_tokens", 0) or 0))
+    except (TypeError, ValueError):
+        return {"state": "unavailable", "pct": 0}
+    telemetry = usage.get("cache_telemetry")
+    if telemetry is None and (read_tokens or write_tokens):
+        telemetry = "reported"
+    if telemetry != "reported":
+        state = "unavailable"
+        pct = 0
+    elif read_tokens:
+        state = "hit"
+        pct = round(100 * read_tokens / prompt_tokens) if prompt_tokens else 0
+    elif write_tokens:
+        state = "cold_write"
+        pct = 0
+    else:
+        state = "miss"
+        pct = 0
+    return {
+        "read_tokens": read_tokens,
+        "prompt_tokens": prompt_tokens,
+        "pct": pct,
+        "state": state,
+    }
+
+
 def _stamp_loop_cache_info(sid: str, payload: dict) -> None:
     if "cache_info" not in payload:
         session = _sessions.get(sid) or {}
@@ -8640,6 +8672,11 @@ def _emit_terminal_turn_error(sid: str, session: dict, error: Any) -> None:
         rendered = ""
     if rendered:
         payload["rendered"] = rendered
+    first_usage = getattr(agent, "_first_turn_usage", None) or getattr(
+        agent, "_last_turn_usage", None
+    )
+    if first_usage:
+        payload["cache_info"] = _cache_info_from_usage(first_usage)
     _stamp_loop_cache_info(sid, payload)
     _retire_turn_marker(session)
     _emit("message.complete", sid, payload)
@@ -11803,7 +11840,12 @@ def _run_prompt_submit(
                 )
                 payload["recoverable"] = True
             _retire_turn_marker(session, marker_key)
-            if not getattr(agent, "_tui_first_provider_response_recorded", False):
+            first_usage = getattr(agent, "_first_turn_usage", None) or getattr(
+                agent, "_last_turn_usage", None
+            )
+            if first_usage:
+                payload["cache_info"] = _cache_info_from_usage(first_usage)
+            elif not getattr(agent, "_tui_first_provider_response_recorded", False):
                 emit_cache = getattr(agent, "_tui_cache_callback", None)
                 if callable(emit_cache):
                     emit_cache("no_field", 0, 0, 0)

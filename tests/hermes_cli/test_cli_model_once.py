@@ -91,6 +91,51 @@ def test_cli_model_once_records_restore_and_does_not_persist(monkeypatch):
     assert "next turn only" in printed[-1]
 
 
+def test_cli_provider_only_after_compression_passes_provider_to_switch(monkeypatch):
+    import cli as cli_mod
+
+    captured = []
+    monkeypatch.setattr(cli_mod, "_cprint", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        "hermes_cli.inventory.load_picker_context",
+        lambda: SimpleNamespace(
+            user_providers=None,
+            custom_providers=None,
+            with_overrides=lambda **_: SimpleNamespace(
+                user_providers=None,
+                custom_providers=None,
+            ),
+        ),
+    )
+
+    def fake_switch(**kwargs):
+        captured.append(kwargs)
+        return ModelSwitchResult(
+            success=True,
+            new_model="configured/model",
+            target_provider="anthropic",
+            api_key="[REDACTED]",
+            base_url="https://api.anthropic.com",
+            api_mode="anthropic_messages",
+            provider_label="Anthropic",
+        )
+
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", fake_switch)
+    for raw in (
+        "/model --after-compression --provider anthropic",
+        "/model --provider anthropic --after-compression",
+    ):
+        stub = _StubCLI()
+        stub.agent = _FakeAgent()
+        cli_mod.HermesCLI._handle_model_switch(stub, raw)
+
+    assert [call["raw_input"] for call in captured] == ["", ""]
+    assert [call["explicit_provider"] for call in captured] == [
+        "anthropic",
+        "anthropic",
+    ]
+
+
 def test_cli_model_after_compression_resolves_now_without_mutating_route(monkeypatch):
     import cli as cli_mod
 

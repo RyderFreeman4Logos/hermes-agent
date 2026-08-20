@@ -4429,6 +4429,58 @@ def test_apply_model_switch_after_compression_defers_tui_route(monkeypatch):
     assert "after_compression_model_switch" not in session
 
 
+def test_tui_provider_only_after_compression_passes_to_switch_model(monkeypatch):
+    from hermes_cli.model_switch import ModelSwitchResult
+
+    captured = []
+
+    class Agent:
+        model = "old/model"
+        provider = "openrouter"
+        api_key = "old-key"
+        base_url = "https://openrouter.ai/api/v1"
+        api_mode = "chat_completions"
+
+        def __init__(self):
+            self.calls = []
+
+        def switch_model(self, **kwargs):
+            self.calls.append(kwargs)
+            self.model = kwargs["new_model"]
+            self.provider = kwargs["new_provider"]
+
+    def fake_switch(**kwargs):
+        captured.append(kwargs)
+        return ModelSwitchResult(
+            success=True,
+            new_model="configured/model",
+            target_provider="pm",
+            api_key="[REDACTED]",
+            base_url="https://pm.invalid/v1",
+            api_mode="codex_responses",
+            provider_label="Configured Provider",
+        )
+
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", fake_switch)
+    monkeypatch.setattr(
+        server,
+        "_persist_model_switch",
+        lambda _result: pytest.fail("deferred switch must stay session-scoped"),
+    )
+    for raw in (
+        "--after-compression --provider pm",
+        "--provider pm --after-compression",
+    ):
+        agent = Agent()
+        session = {"agent": agent, "model_override": {"model": "old/model"}}
+        out = server._apply_model_switch("sid", session, raw)
+        assert out["pending"] is True
+        assert agent.calls == []
+
+    assert [call["raw_input"] for call in captured] == ["", ""]
+    assert [call["explicit_provider"] for call in captured] == ["pm", "pm"]
+
+
 def test_startup_runtime_uses_tui_provider_env(monkeypatch):
     monkeypatch.setenv("HERMES_MODEL", "nous/hermes-test")
     monkeypatch.setenv("HERMES_TUI_PROVIDER", "nous")

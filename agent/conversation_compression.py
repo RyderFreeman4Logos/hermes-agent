@@ -3456,8 +3456,6 @@ def compress_context(
 
         _session_commit_succeeded = False
         split_status = "not_applicable"
-        _route_transaction_context = None
-        _route_transaction = None
         if agent._session_db:
             split_status = "pending"
             try:
@@ -3512,46 +3510,27 @@ def compress_context(
                     _release_lock()
                     return messages, _existing_sp
 
-                # Stage the already-resolved route before durable publication.
-                # The transaction consumes it only after the DB seam below
-                # succeeds, and restores the working runtime on any failure.
-                from hermes_cli.model_switch import (
-                    DeferredModelSwitchTransaction,
-                    model_switch_after_compression_transaction,
-                )
+                _deferred_frontend_sync = None
+                _deferred_frontend_result = None
+                _deferred_frontend_old_model = ""
+                _deferred_frontend_old_provider = ""
 
-                if defer_context_engine_notification:
-                    _route_transaction = DeferredModelSwitchTransaction()
-                else:
-                    _route_transaction_context = (
-                        model_switch_after_compression_transaction(agent)
+                if not defer_context_engine_notification:
+                    from hermes_cli.model_switch import (
+                        apply_model_switch_after_compression,
+                        get_model_switch_after_compression,
                     )
-                    _route_transaction = _route_transaction_context.__enter__()
-                if _route_transaction.active:
-                    agent._invalidate_system_prompt()
-                    new_system_prompt = agent._build_system_prompt(system_message)
-                    agent._cached_system_prompt = new_system_prompt
 
-                _route_kwargs = {}
-                if _route_transaction.active:
-                    _route_kwargs = {
-                        "model_config_json": json.dumps(
-                            _route_transaction.model_config,
-                            sort_keys=True,
-                        ),
-                        "model": agent.model,
-                        "system_prompt": new_system_prompt,
-                        "billing_provider": agent.provider,
-                        "billing_base_url": getattr(agent, "base_url", ""),
-                        "billing_mode": getattr(agent, "api_mode", ""),
-                    }
-                _child_route_kwargs = {}
-                if _route_transaction.active:
-                    _child_route_kwargs = {
-                        "billing_provider": agent.provider,
-                        "billing_base_url": getattr(agent, "base_url", ""),
-                        "billing_mode": getattr(agent, "api_mode", ""),
-                    }
+                    _deferred_frontend_result = get_model_switch_after_compression(agent)
+                    _deferred_frontend_sync = getattr(
+                        agent, "_model_switch_after_compression_callback", None
+                    )
+                    _deferred_frontend_old_model = str(getattr(agent, "model", "") or "")
+                    _deferred_frontend_old_provider = str(
+                        getattr(agent, "provider", "") or ""
+                    )
+                    setattr(agent, "_model_switch_after_compression_callback", None)
+                    apply_model_switch_after_compression(agent)
 
                 if in_place:
                     # ── In-place compaction: keep the same session_id ──────────
@@ -3585,7 +3564,6 @@ def compress_context(
                         watermark=_commit_watermark,
                         lock_holder=_lock_holder,
                         source_signature=_commit_source_signature,
-                        **_route_kwargs,
                     )
                     split_status = "in_place_committed"
                     # Reset the flush identity set so the next turn's appends are
@@ -3672,11 +3650,7 @@ def compress_context(
                         source=agent.platform
                         or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
                         model=agent.model,
-                        model_config=(
-                            _route_transaction.model_config
-                            if _route_transaction.active
-                            else agent._session_init_model_config
-                        ),
+                        model_config=agent._session_init_model_config,
                         system_prompt=new_system_prompt,
                         messages=compressed,
                         cwd=getattr(agent, "working_directory", None),
@@ -3690,7 +3664,6 @@ def compress_context(
                         ),
                         watermark_ceiling=_foreign_tail_ceiling,
                         source_signature=_commit_source_signature,
-                        **_child_route_kwargs,
                     )
                     agent.session_id = new_session_id
                     try:
@@ -3780,10 +3753,9 @@ def compress_context(
                 # In-place mode still updates/replaces the current row here.
                 # Rotation already published prompt + compacted handoff atomically.
                 if in_place:
-                    if not _route_transaction.active:
-                        agent._session_db.update_system_prompt(
-                            agent.session_id, new_system_prompt
-                        )
+                    agent._session_db.update_system_prompt(
+                        agent.session_id, new_system_prompt
+                    )
                     agent._last_flushed_db_idx = 0
                 else:
                     agent._last_flushed_db_idx = len(compressed)
@@ -3793,19 +3765,14 @@ def compress_context(
                         for message in compressed
                         if isinstance(message, dict)
                     }
-                if _route_transaction_context is not None:
-                    _route_transaction_context.__exit__(None, None, None)
-                    _route_transaction_context = None
+                if callable(_deferred_frontend_sync) and _deferred_frontend_result is not None:
+                    _deferred_frontend_sync(
+                        _deferred_frontend_result,
+                        _deferred_frontend_old_model,
+                        _deferred_frontend_old_provider,
+                    )
                 _session_commit_succeeded = True
             except Exception as e:
-                if _route_transaction_context is not None:
-                    try:
-                        _route_transaction_context.__exit__(
-                            type(e), e, e.__traceback__
-                        )
-                    except Exception:
-                        pass
-                    _route_transaction_context = None
                 if (
                     not in_place
                     and locals().get("old_session_id")

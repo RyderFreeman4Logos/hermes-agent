@@ -27,16 +27,9 @@ import os
 import re
 import time
 import threading
-from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Callable, Iterator, List, NamedTuple, Optional
+from typing import Any, Callable, List, NamedTuple, Optional
 
-from hermes_state_common import (
-    AUTHORITY_WRITE_INDETERMINATE_ATTR,
-    AUTHORITY_WRITE_OUTCOME_ATTR,
-    AuthorityWriteIndeterminateError,
-    reconcile_authoritative_write,
-)
 from hermes_cli.providers import (
     ProviderDef,
     custom_provider_aliases,
@@ -496,9 +489,6 @@ class ModelSwitchResult:
 _AFTER_COMPRESSION_ATTR = "_model_switch_after_compression"
 _AFTER_COMPRESSION_CALLBACK_ATTR = "_model_switch_after_compression_callback"
 _AFTER_COMPRESSION_CONFIG_KEY = "pending_model_switch_after_compression"
-_RUNTIME_ROUTE_CONFIG_KEY = "runtime_route"
-_AFTER_COMPRESSION_CONTEXT_ATTR = "_deferred_model_switch_context_length"
-_AFTER_COMPRESSION_REASONING_ATTR = "_deferred_model_switch_reasoning_config"
 _RUNTIME_MISSING = object()
 _MODEL_SWITCH_LOCK_ATTR = "_model_switch_transaction_lock"
 _MODEL_SWITCH_LOCK_CREATION = threading.Lock()
@@ -522,14 +512,6 @@ def get_model_switch_after_compression(agent: Any) -> Optional[ModelSwitchResult
     return pending if isinstance(pending, ModelSwitchResult) else None
 
 
-def _read_session_route_snapshot(session_db: Any, session_id: str) -> Optional[dict]:
-    reader = getattr(session_db, "read_session_route_snapshot", None)
-    if callable(reader):
-        return reader(session_id)
-    getter = getattr(session_db, "get_session", None)
-    return getter(session_id) if callable(getter) else None
-
-
 def _session_model_config(agent: Any) -> dict[str, Any]:
     """Return the current durable model config, falling back to init state."""
     config = getattr(agent, "_session_init_model_config", None)
@@ -538,8 +520,9 @@ def _session_model_config(agent: Any) -> dict[str, Any]:
     session_id = getattr(agent, "session_id", None)
     if session_db is None or not session_id:
         return config
-    row = _read_session_route_snapshot(session_db, session_id)
-    if not row:
+    getter = getattr(session_db, "get_session", None)
+    row = getter(session_id) if callable(getter) else None
+    if not isinstance(row, dict):
         return config
     raw = row.get("model_config")
     try:
@@ -547,20 +530,6 @@ def _session_model_config(agent: Any) -> dict[str, Any]:
     except (TypeError, ValueError):
         stored = None
     return copy.deepcopy(stored) if isinstance(stored, dict) else config
-
-
-_SESSION_ROUTE_FIELDS = (
-    "model_config",
-    "model",
-    "system_prompt",
-    "billing_provider",
-    "billing_base_url",
-    "billing_mode",
-)
-
-
-def _session_route_state(row: Optional[dict]) -> Optional[tuple]:
-    return None if row is None else tuple(row.get(key) for key in _SESSION_ROUTE_FIELDS)
 
 
 def _persist_session_model_config(
@@ -571,64 +540,26 @@ def _persist_session_model_config(
     system_prompt: Optional[str] = None,
     result: Optional[ModelSwitchResult] = None,
 ) -> Optional[BaseException]:
-    """Publish route metadata through one durable authority transaction."""
-    authority_interrupt = None
+    """Persist route metadata through the existing session update seams."""
     session_db = getattr(agent, "_session_db", None)
     session_id = getattr(agent, "session_id", None)
     if session_db is not None and session_id:
-        publish = getattr(session_db, "publish_session_route", None)
-        if callable(publish) and result is not None:
-            config_json = json.dumps(config, sort_keys=True)
-            intended = (
-                config_json,
-                model,
-                system_prompt,
-                result.target_provider,
-                result.base_url,
-                result.api_mode,
-            )
-            reader = getattr(session_db, "read_session_route_snapshot", None)
-            getter = getattr(session_db, "get_session", None)
-            if callable(reader) or callable(getter):
-                preimage = _session_route_state(
-                    _read_session_route_snapshot(session_db, session_id)
-                )
-                readback = lambda: _session_route_state(
-                    _read_session_route_snapshot(session_db, session_id)
-                )
-            else:
-                preimage = object()
-
-                def readback():
-                    raise RuntimeError("session route authority readback unavailable")
-
-            outcome = reconcile_authoritative_write(
-                write=lambda: publish(
-                    session_id,
-                    model_config_json=config_json,
-                    model=model,
-                    system_prompt=system_prompt,
-                    billing_provider=result.target_provider,
-                    billing_base_url=result.base_url,
-                    billing_mode=result.api_mode,
-                ),
-                readback=readback,
-                intended=intended,
-                preimage=preimage,
-                label="session route authority",
-            )
-            if isinstance(outcome, BaseException):
-                authority_interrupt = outcome
-        else:
-            session_db.update_session_meta(
+        session_db.update_session_meta(
+            session_id,
+            json.dumps(config, sort_keys=True),
+            model=model,
+        )
+        if system_prompt is not None:
+            session_db.update_system_prompt(session_id, system_prompt)
+        if result is not None and hasattr(session_db, "update_session_billing_route"):
+            session_db.update_session_billing_route(
                 session_id,
-                json.dumps(config, sort_keys=True),
-                model=model,
+                provider=result.target_provider,
+                base_url=result.base_url,
+                billing_mode=result.api_mode or None,
             )
-            if system_prompt is not None:
-                session_db.update_system_prompt(session_id, system_prompt)
     setattr(agent, "_session_init_model_config", copy.deepcopy(config))
-    return authority_interrupt
+    return None
 
 
 def _pending_descriptor(result: ModelSwitchResult) -> dict[str, str]:
@@ -665,49 +596,6 @@ def _applied_model_config(
         if value not in (None, "")
     }
     return applied
-
-
-def _snapshot_durable_session_route(agent: Any) -> tuple[Any, Optional[str], Any]:
-    session_db = getattr(agent, "_session_db", None)
-    session_id = getattr(agent, "session_id", None)
-    if session_db is None or not session_id:
-        return session_db, session_id, None
-    row = _read_session_route_snapshot(session_db, session_id)
-    return session_db, session_id, copy.deepcopy(row) if row else None
-
-
-def _restore_durable_session_route(snapshot: tuple[Any, Optional[str], Any]) -> None:
-    session_db, session_id, row = snapshot
-    if session_db is None or not session_id or not row:
-        return
-    publish = getattr(session_db, "publish_session_route", None)
-    if callable(publish):
-        publish(
-            session_id,
-            model_config_json=row.get("model_config") or "{}",
-            model=row.get("model") or "",
-            system_prompt=row.get("system_prompt"),
-            billing_provider=row.get("billing_provider") or "",
-            billing_base_url=row.get("billing_base_url") or "",
-            billing_mode=row.get("billing_mode") or "",
-        )
-        return
-    session_db.update_session_meta(
-        session_id,
-        row.get("model_config"),
-        model=row.get("model"),
-    )
-    if hasattr(session_db, "update_session_billing_route"):
-        session_db.update_session_billing_route(
-            session_id,
-            provider=row.get("billing_provider") or "",
-            base_url=row.get("billing_base_url") or "",
-            billing_mode=row.get("billing_mode"),
-        )
-    if row.get("system_prompt") is not None and hasattr(
-        session_db, "update_system_prompt"
-    ):
-        session_db.update_system_prompt(session_id, row["system_prompt"])
 
 
 def schedule_model_switch_after_compression(
@@ -788,47 +676,31 @@ def _emit_deferred_model_switch_status(agent: Any, message: str) -> None:
             logger.debug("deferred model-switch status callback failed", exc_info=True)
 
 
-@dataclass
-class DeferredModelSwitchTransaction:
-    """Staged live route consumed only when its publication block succeeds."""
-
-    status: str = "none"
-    result: Optional[ModelSwitchResult] = None
-    model_config: Optional[dict[str, Any]] = None
-
-    @property
-    def active(self) -> bool:
-        return self.status == "staged" and self.result is not None
-
-
-@contextmanager
-def model_switch_after_compression_transaction(
-    agent: Any,
-) -> Iterator[DeferredModelSwitchTransaction]:
-    """Stage, publish, then consume a deferred route under one agent fence."""
+def apply_model_switch_after_compression(agent: Any) -> str:
+    """Apply a pending route after the compression boundary is committed."""
     with model_switch_transaction_lock(agent):
         result = get_model_switch_after_compression(agent)
         if result is None:
-            yield DeferredModelSwitchTransaction()
-            return
-
-        callback = getattr(agent, _AFTER_COMPRESSION_CALLBACK_ATTR, None)
+            return "none"
         old_model = str(getattr(agent, "model", "") or "")
         old_provider = str(getattr(agent, "provider", "") or "")
-        old_config = _session_model_config(agent)
-        durable_snapshot = _snapshot_durable_session_route(agent)
+        callback = getattr(agent, _AFTER_COMPRESSION_CALLBACK_ATTR, None)
         from agent.agent_runtime_helpers import (
             capture_model_runtime_for_rollback,
             restore_model_runtime_for_rollback,
         )
-
         runtime_snapshot = capture_model_runtime_for_rollback(agent)
-        old_context = getattr(agent, _AFTER_COMPRESSION_CONTEXT_ATTR, _RUNTIME_MISSING)
-        old_reasoning = getattr(
-            agent, _AFTER_COMPRESSION_REASONING_ATTR, _RUNTIME_MISSING
+        deferred_context = getattr(
+            agent, "_deferred_model_switch_context_length", _RUNTIME_MISSING
         )
-        setattr(agent, _AFTER_COMPRESSION_CONTEXT_ATTR, result.context_length)
-        setattr(agent, _AFTER_COMPRESSION_REASONING_ATTR, result.reasoning_config)
+        deferred_reasoning = getattr(
+            agent, "_deferred_model_switch_reasoning_config", _RUNTIME_MISSING
+        )
+        applying_boundary = getattr(
+            agent, "_applying_model_switch_after_compression", False
+        )
+        agent._deferred_model_switch_context_length = result.context_length
+        agent._deferred_model_switch_reasoning_config = result.reasoning_config
         agent._applying_model_switch_after_compression = True
         try:
             agent.switch_model(
@@ -838,25 +710,36 @@ def model_switch_after_compression_transaction(
                 result.base_url,
                 result.api_mode,
             )
+            config = _applied_model_config(agent, result, _session_model_config(agent))
+            prompt = None
+            build_prompt = getattr(agent, "_build_system_prompt", None)
+            if callable(build_prompt):
+                prompt = build_prompt(None)
+                agent._cached_system_prompt = prompt
+            _persist_session_model_config(
+                agent,
+                config,
+                model=result.new_model,
+                system_prompt=prompt,
+                result=result,
+            )
         except Exception as exc:
             restore_model_runtime_for_rollback(agent, runtime_snapshot)
-            agent._model_switch_after_compression_state = {
-                "state": "failed",
-                "model": result.new_model,
-                "provider": result.target_provider,
-            }
             _emit_deferred_model_switch_status(
                 agent,
                 "Deferred model switch failed after compression; "
                 f"still using {old_model}: {exc}",
             )
-            yield DeferredModelSwitchTransaction(status="failed", result=result)
-            return
+            agent._model_switch_after_compression_state = {
+                "state": "failed",
+                "model": result.new_model,
+                "provider": result.target_provider,
+            }
+            return "failed"
         finally:
-            agent._applying_model_switch_after_compression = False
             for name, value in (
-                (_AFTER_COMPRESSION_CONTEXT_ATTR, old_context),
-                (_AFTER_COMPRESSION_REASONING_ATTR, old_reasoning),
+                ("_deferred_model_switch_context_length", deferred_context),
+                ("_deferred_model_switch_reasoning_config", deferred_reasoning),
             ):
                 if value is _RUNTIME_MISSING:
                     try:
@@ -865,43 +748,9 @@ def model_switch_after_compression_transaction(
                         pass
                 else:
                     setattr(agent, name, value)
-
-        transaction = DeferredModelSwitchTransaction(
-            status="staged",
-            result=result,
-            model_config=_applied_model_config(agent, result, old_config),
-        )
-        setattr(
-            agent,
-            "_session_init_model_config",
-            copy.deepcopy(transaction.model_config),
-        )
-        try:
-            yield transaction
-        except Exception as exc:
-            restore_model_runtime_for_rollback(agent, runtime_snapshot)
-            setattr(agent, "_session_init_model_config", old_config)
-            try:
-                _restore_durable_session_route(durable_snapshot)
-            except Exception:
-                logger.exception("deferred model-switch durable rollback failed")
-            transaction.status = "failed"
-            agent._model_switch_after_compression_state = {
-                "state": "failed",
-                "model": result.new_model,
-                "provider": result.target_provider,
-            }
-            _emit_deferred_model_switch_status(
-                agent,
-                "Deferred model switch failed after compression; "
-                f"still using {old_model}: {exc}",
-            )
-            raise
-
-        # Consume only after runtime and durable route publication both succeed.
+            agent._applying_model_switch_after_compression = applying_boundary
         setattr(agent, _AFTER_COMPRESSION_ATTR, None)
         setattr(agent, _AFTER_COMPRESSION_CALLBACK_ATTR, None)
-        transaction.status = "applied"
         agent._model_switch_after_compression_state = {
             "state": "applied",
             "model": result.new_model,
@@ -912,56 +761,12 @@ def model_switch_after_compression_transaction(
                 callback(result, old_model, old_provider)
             except Exception:
                 logger.exception("deferred model-switch frontend sync failed")
-        session_db = getattr(agent, "_session_db", None)
-        session_id = getattr(agent, "session_id", None)
-        if session_db is not None and session_id and hasattr(
-            session_db, "update_session_billing_route"
-        ):
-            try:
-                session_db.update_session_billing_route(
-                    session_id,
-                    provider=result.target_provider,
-                    base_url=result.base_url,
-                    billing_mode=result.api_mode or None,
-                )
-            except Exception:
-                logger.warning(
-                    "failed to persist billing route for deferred model switch",
-                    exc_info=True,
-                )
         _emit_deferred_model_switch_status(
             agent,
             "Deferred model switch applied after compression: "
             f"{result.new_model} via {result.provider_label or result.target_provider}",
         )
-
-
-def apply_model_switch_after_compression(agent: Any) -> str:
-    """Apply and durably publish a pending route at a committed boundary."""
-    transaction = DeferredModelSwitchTransaction()
-    try:
-        with model_switch_after_compression_transaction(agent) as transaction:
-            if transaction.active:
-                result = transaction.result
-                assert result is not None
-                prompt = None
-                invalidate_prompt = getattr(agent, "_invalidate_system_prompt", None)
-                build_prompt = getattr(agent, "_build_system_prompt", None)
-                if callable(invalidate_prompt):
-                    invalidate_prompt()
-                if callable(build_prompt):
-                    prompt = build_prompt(None)
-                    agent._cached_system_prompt = prompt
-                _persist_session_model_config(
-                    agent,
-                    transaction.model_config or {},
-                    model=result.new_model,
-                    system_prompt=prompt,
-                    result=result,
-                )
-    except Exception:
-        return "failed"
-    return transaction.status
+        return "applied"
 
 
 @dataclass(frozen=True)
@@ -1148,7 +953,7 @@ MODEL_SWITCH_ERROR_TEXT = {
     MODEL_SWITCH_ERR_ONCE_REQUIRES_TARGET: "/model --once requires a model or provider.",
     MODEL_SWITCH_ERR_AFTER_COMPRESSION_WITH_ONCE: "/model --after-compression cannot be combined with --once",
     MODEL_SWITCH_ERR_AFTER_COMPRESSION_WITH_GLOBAL: "/model --after-compression cannot be combined with --global",
-    MODEL_SWITCH_ERR_AFTER_COMPRESSION_REQUIRES_TARGET: "/model --after-compression requires a model target.",
+    MODEL_SWITCH_ERR_AFTER_COMPRESSION_REQUIRES_TARGET: "/model --after-compression requires a model or provider.",
 }
 
 
@@ -1229,7 +1034,11 @@ def parse_model_switch_args(raw: str) -> ModelSwitchRequest:
         errors.append(MODEL_SWITCH_ERR_AFTER_COMPRESSION_WITH_ONCE)
     if parsed.is_after_compression and parsed.is_global:
         errors.append(MODEL_SWITCH_ERR_AFTER_COMPRESSION_WITH_GLOBAL)
-    if parsed.is_after_compression and not parsed.model_input:
+    if (
+        parsed.is_after_compression
+        and not parsed.model_input
+        and not parsed.explicit_provider
+    ):
         errors.append(MODEL_SWITCH_ERR_AFTER_COMPRESSION_REQUIRES_TARGET)
 
     if parsed.is_after_compression:
@@ -1946,6 +1755,41 @@ def switch_model(
                     ),
                 )
 
+        if not new_model and not validate_live:
+            configured = None
+            if isinstance(user_providers, dict):
+                configured_provider = user_providers.get(
+                    explicit_provider.strip().lower()
+                ) or user_providers.get(target_provider)
+                if isinstance(configured_provider, dict):
+                    configured = configured_provider.get("default_model")
+                    if not configured and isinstance(
+                        configured_provider.get("models"), dict
+                    ):
+                        configured = next(iter(configured_provider["models"]), None)
+            if not configured:
+                try:
+                    from hermes_cli.runtime_provider import _get_named_custom_provider
+
+                    configured = (
+                        _get_named_custom_provider(explicit_provider) or {}
+                    ).get("model")
+                except Exception:
+                    configured = None
+            new_model = str(configured or "").strip()
+            if not new_model:
+                return ModelSwitchResult(
+                    success=False,
+                    target_provider=target_provider,
+                    provider_label=pdef.name,
+                    is_global=is_global,
+                    error_message=(
+                        f"Provider '{pdef.name}' has no locally configured default model. "
+                        f"Specify the model explicitly: /model <model-name> "
+                        f"--provider {explicit_provider} --after-compression"
+                    ),
+                )
+
         # If no model specified, try auto-detect from endpoint
         if not new_model:
             if pdef.base_url:
@@ -2435,11 +2279,16 @@ def switch_model(
         from hermes_cli.models import normalize_opencode_base_url
         base_url = normalize_opencode_base_url(target_provider, api_mode, base_url)
 
-    # --- Get capabilities (legacy) ---
-    capabilities = get_model_capabilities(target_provider, new_model, allow_network=True)
-
-    # --- Get full model info from models.dev ---
-    model_info = get_model_info(target_provider, new_model, allow_network=True)
+    if validate_live:
+        capabilities = get_model_capabilities(
+            target_provider, new_model, allow_network=True
+        )
+        model_info = get_model_info(
+            target_provider, new_model, allow_network=True
+        )
+    else:
+        capabilities = get_model_capabilities(target_provider, new_model)
+        model_info = get_model_info(target_provider, new_model)
 
     # --- Collect warnings ---
     warnings: list[str] = []

@@ -5234,6 +5234,10 @@ def _record_codex_skip(route_info: Optional[Dict[str, Any]], reason: str) -> Non
         route_info["codex_skip_reason"] = reason
 
 
+def _is_codex_provider(provider: Optional[str]) -> bool:
+    return _normalize_aux_provider(provider) == "openai-codex"
+
+
 def _tag_fallback_client(
     client: Any,
     label: str,
@@ -5594,11 +5598,12 @@ def _try_payment_fallback(
     failed_provider: str,
     task: str = None,
     reason: str = "payment error",
+    route_info: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
-    """Try alternative providers after a payment/credit or connection error.
+    """Try remaining Codex providers after a payment/credit or connection error.
 
     Iterates the standard auto-detection chain, skipping the provider that
-    failed.
+    failed and every non-Codex destination.
 
     Returns:
         (client, model, provider_label) or (None, None, "") if no fallback.
@@ -5620,6 +5625,10 @@ def _try_payment_fallback(
     tried = []
     for label, try_fn in _get_provider_chain():
         if label in skip_chain_labels:
+            continue
+        if not _is_codex_provider(label):
+            _record_codex_skip(route_info, "unavailable")
+            tried.append(f"{label} (non-Codex destination)")
             continue
         if _is_provider_unhealthy(label):
             _log_skip_unhealthy(label, task)
@@ -5646,13 +5655,13 @@ def _try_main_agent_model_fallback(
     task: str = None,
     reason: str = "error",
     failed_model: Optional[str] = None,
+    route_info: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Last-resort fallback to the user's main agent provider + model.
 
     Used after the configured fallback_chain is exhausted (or empty) for
-    users with an explicit auxiliary provider.  This is the "safety net"
-    layer: if nothing the user asked for can serve the request, try the
-    main chat model before giving up.
+    users with an explicit auxiliary provider. Only a Codex main route is
+    eligible; non-Codex main-agent safety nets fail closed.
 
     ``failed_model`` narrows the same-provider skip to the exact
     (provider, model) pair that just failed, mirroring
@@ -5685,6 +5694,9 @@ def _try_main_agent_model_fallback(
             return None, None, ""
         main_provider, main_model = _agg_provider, _agg_model
     if not main_provider or not main_model or main_provider.lower() in {"auto", ""}:
+        return None, None, ""
+    if not _is_codex_provider(main_provider):
+        _record_codex_skip(route_info, "unavailable")
         return None, None, ""
 
     # Identity + scope semantics owned by agent.backend_identity (#72468):
@@ -5820,9 +5832,9 @@ def _try_configured_fallback_chain(
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Try user-configured fallback_chain for a specific auxiliary task.
 
-    Reads auxiliary.<task>.fallback_chain from config.yaml and tries each
-    entry in order.  Each entry must have at least ``provider``; ``model``,
-    ``base_url``, and ``api_key`` are optional.
+    Reads auxiliary.<task>.fallback_chain from config.yaml and tries the
+    remaining Codex entries only. Each entry must have at least ``provider``;
+    ``model``, ``base_url``, and ``api_key`` are optional.
 
     ``failed_model`` narrows the skip check to the exact (provider, model)
     pair that just failed, rather than the whole provider. Without it every
@@ -5890,14 +5902,15 @@ def _try_configured_fallback_chain(
     codex_indices = [
         i for i in candidate_indices
         if isinstance(chain[i], dict)
-        and str(chain[i].get("provider") or "").strip().lower() == "openai-codex"
+        and _is_codex_provider(chain[i].get("provider"))
     ]
-    # Codex is the quality-preserving auxiliary fallback. Resolve it before
-    # cheaper pm/localrouter entries; if it cannot be used, the original order
-    # remains available and the reason is retained in route_info.
-    candidate_indices = codex_indices + [
-        i for i in candidate_indices if i not in codex_indices
-    ]
+    # Auxiliary fallback success is deliberately Codex-only. Once every
+    # remaining Codex candidate is exhausted, fail closed instead of walking
+    # into a lower-quality provider or the main-agent safety net.
+    if not codex_indices:
+        _record_codex_skip(route_info, "unavailable")
+        return None, None, ""
+    candidate_indices = codex_indices
 
     for i in candidate_indices:
         if attempted_indices is not None:
@@ -5942,7 +5955,7 @@ def _try_configured_fallback_chain(
                         task, label, resolved_model, fb_ctx, min_ctx,
                     )
                     tried.append(f"{label} (context too small: {fb_ctx}<{min_ctx})")
-                    if fb_provider.lower() == "openai-codex":
+                    if _is_codex_provider(fb_provider):
                         codex_skip_reason = "too_small"
                         _record_codex_skip(route_info, "too_small")
                     continue
@@ -5950,13 +5963,13 @@ def _try_configured_fallback_chain(
                 "Auxiliary %s: %s on %s — configured fallback to %s (%s)",
                 task, reason, failed_provider, label, resolved_model or fb_model or "default",
             )
-            if fb_provider.lower() == "openai-codex":
+            if _is_codex_provider(fb_provider):
                 codex_skip_reason = None
             return _tag_fallback_client(
                 fb_client, label, codex_skip_reason
             ), resolved_model or fb_model, label
         tried.append(label)
-        if fb_provider.lower() == "openai-codex":
+        if _is_codex_provider(fb_provider):
             codex_skip_reason = "unavailable"
             _record_codex_skip(route_info, "unavailable")
 
@@ -6050,6 +6063,7 @@ def _try_main_fallback_chain(
     task: Optional[str],
     failed_provider: str = "",
     reason: str = "error",
+    route_info: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Try the top-level main-agent fallback chain for an auxiliary call.
 
@@ -6086,6 +6100,10 @@ def _try_main_fallback_chain(
             continue
         fb_norm = fb_provider.lower()
         label = f"fallback_providers[{i}]({fb_provider})"
+        if not _is_codex_provider(fb_provider):
+            _record_codex_skip(route_info, "unavailable")
+            tried.append(f"{label} (non-Codex destination)")
+            continue
         if fb_norm in skip:
             tried.append(f"{label} (skipped)")
             continue
@@ -10512,7 +10530,7 @@ def _call_llm_impl_unscoped(
                     fb_resp = None
                 if fb_resp is not None:
                     return fb_resp
-                if _fallback_provider_from_label(fb_label).lower() == "openai-codex":
+                if _is_codex_provider(_fallback_provider_from_label(fb_label)):
                     _record_codex_skip(route_info, "rejected")
                 next_index = _next_configured_fallback_index(fb_label)
                 if next_index is None:
@@ -10525,14 +10543,16 @@ def _call_llm_impl_unscoped(
 
             if is_auto:
                 fb_client, fb_model, fb_label = _try_main_fallback_chain(
-                    task, resolved_provider or "auto", reason=reason)
+                    task, resolved_provider or "auto", reason=reason,
+                    route_info=route_info)
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_payment_fallback(
-                        resolved_provider, task, reason=reason)
+                        resolved_provider, task, reason=reason,
+                        route_info=route_info)
             else:
                 fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
                     resolved_provider, task, reason=reason,
-                    failed_model=_chain_failed_model)
+                    failed_model=_chain_failed_model, route_info=route_info)
 
             if fb_client is not None:
                 _record_route_info(
@@ -10550,7 +10570,8 @@ def _call_llm_impl_unscoped(
                     return fb_resp
                 if is_auto:
                     fb_client, fb_model, fb_label = _try_payment_fallback(
-                        resolved_provider, task, reason="stale fallback credential")
+                        resolved_provider, task, reason="stale fallback credential",
+                        route_info=route_info)
                     if fb_client is not None:
                         _record_route_info(
                             route_info, _fallback_provider_from_label(fb_label), fb_model,
@@ -11317,7 +11338,7 @@ async def _async_call_llm_impl_unscoped(
                     fb_resp = None
                 if fb_resp is not None:
                     return fb_resp
-                if _fallback_provider_from_label(fb_label).lower() == "openai-codex":
+                if _is_codex_provider(_fallback_provider_from_label(fb_label)):
                     _record_codex_skip(route_info, "rejected")
                 next_index = _next_configured_fallback_index(fb_label)
                 if next_index is None:
@@ -11330,14 +11351,16 @@ async def _async_call_llm_impl_unscoped(
 
             if is_auto:
                 fb_client, fb_model, fb_label = _try_main_fallback_chain(
-                    task, resolved_provider or "auto", reason=reason)
+                    task, resolved_provider or "auto", reason=reason,
+                    route_info=route_info)
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_payment_fallback(
-                        resolved_provider, task, reason=reason)
+                        resolved_provider, task, reason=reason,
+                        route_info=route_info)
             else:
                 fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
                     resolved_provider, task, reason=reason,
-                    failed_model=_chain_failed_model)
+                    failed_model=_chain_failed_model, route_info=route_info)
 
             if fb_client is not None:
                 async_fb, async_fb_model = _to_async_client(
@@ -11360,7 +11383,8 @@ async def _async_call_llm_impl_unscoped(
                     return fb_resp
                 if is_auto:
                     fb_client, fb_model, fb_label = _try_payment_fallback(
-                        resolved_provider, task, reason="stale fallback credential")
+                        resolved_provider, task, reason="stale fallback credential",
+                        route_info=route_info)
                     if fb_client is not None:
                         async_fb, async_fb_model = _to_async_client(
                             fb_client, fb_model or "", is_vision=(task == "vision")

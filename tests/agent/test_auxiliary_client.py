@@ -692,9 +692,8 @@ class TestMoaAggregatorSharedResolution:
 
 
 
-    def test_main_agent_fallback_uses_aggregator_for_moa_main(self, tmp_path, monkeypatch):
-        """_try_main_agent_model_fallback with a moa main resolves the
-        aggregator instead of asking for a literal "moa" client."""
+    def test_main_agent_fallback_rejects_non_codex_moa_main(self, tmp_path, monkeypatch):
+        """Auxiliary fallback must not use a non-Codex MoA aggregator."""
         from agent.auxiliary_client import _try_main_agent_model_fallback
 
         self._write_moa_config(tmp_path, monkeypatch)
@@ -707,11 +706,10 @@ class TestMoaAggregatorSharedResolution:
 
             client, model, label = _try_main_agent_model_fallback("anthropic", task="compression")
 
-        assert client is mock_client
-        assert model == "anthropic/claude-opus-4.8"
-        assert label == "main-agent(openrouter)"
-        assert mock_resolve.call_args.kwargs["provider"] == "openrouter"
-        assert mock_resolve.call_args.kwargs["model"] == "anthropic/claude-opus-4.8"
+        assert client is None
+        assert model is None
+        assert label == ""
+        mock_resolve.assert_not_called()
 
 
 class TestBuildCallKwargsMaxTokens:
@@ -1853,7 +1851,7 @@ class TestGetProviderChain:
 
 
 class TestTryPaymentFallback:
-    """_try_payment_fallback skips the failed provider and tries alternatives."""
+    """_try_payment_fallback admits only Codex destinations."""
 
     @pytest.fixture(autouse=True)
     def _clear_unhealthy_cache(self):
@@ -1869,15 +1867,16 @@ class TestTryPaymentFallback:
         _aux_unhealthy_until.clear()
         _aux_unhealthy_logged_at.clear()
 
-    def test_skips_failed_provider(self):
+    def test_rejects_non_codex_destinations(self):
         mock_client = MagicMock()
         with patch("agent.auxiliary_client._try_openrouter", return_value=(None, None)), \
-             patch("agent.auxiliary_client._try_nous", return_value=(mock_client, "nous-model")), \
+             patch("agent.auxiliary_client._try_nous", return_value=(mock_client, "nous-model")) as nous_try, \
              patch("agent.auxiliary_client._read_main_provider", return_value="openrouter"):
             client, model, label = _try_payment_fallback("openrouter", task="compression")
-        assert client is mock_client
-        assert model == "nous-model"
-        assert label == "nous"
+        assert client is None
+        assert model is None
+        assert label == ""
+        nous_try.assert_not_called()
 
 
 
@@ -2375,7 +2374,7 @@ class TestAuxiliaryFallbackLayering:
 
 
 class TestTryMainAgentModelFallback:
-    """_try_main_agent_model_fallback resolves the user's main provider+model as a safety net."""
+    """_try_main_agent_model_fallback admits only a Codex main route."""
 
     def test_returns_none_when_main_provider_is_auto(self):
         from agent.auxiliary_client import _try_main_agent_model_fallback
@@ -2385,18 +2384,19 @@ class TestTryMainAgentModelFallback:
         assert client is None and model is None and label == ""
 
 
-    def test_resolves_main_provider_client(self):
+    def test_rejects_non_codex_main_provider(self):
         from agent.auxiliary_client import _try_main_agent_model_fallback
         fake_client = MagicMock()
         with patch("agent.auxiliary_client._read_main_provider", return_value="openrouter"), \
              patch("agent.auxiliary_client._read_main_model", return_value="anthropic/claude-sonnet-4"), \
              patch("agent.auxiliary_client._is_provider_unhealthy", return_value=False), \
              patch("agent.auxiliary_client.resolve_provider_client",
-                   return_value=(fake_client, "anthropic/claude-sonnet-4")):
+                   return_value=(fake_client, "anthropic/claude-sonnet-4")) as resolve:
             client, model, label = _try_main_agent_model_fallback("glm", task="vision")
-        assert client is fake_client
-        assert model == "anthropic/claude-sonnet-4"
-        assert label == "main-agent(openrouter)"
+        assert client is None
+        assert model is None
+        assert label == ""
+        resolve.assert_not_called()
 
 
 
@@ -4396,12 +4396,14 @@ class TestAuxUnhealthyCache:
         _mark_provider_unhealthy("local/custom")
         with patch("agent.auxiliary_client._read_main_provider", return_value="openrouter"), \
              patch("agent.auxiliary_client._try_openrouter") as or_try, \
-             patch("agent.auxiliary_client._try_nous", return_value=(nous_client, "n-model")), \
+             patch("agent.auxiliary_client._try_nous", return_value=(nous_client, "n-model")) as nous_try, \
              patch("agent.auxiliary_client._try_custom_endpoint") as custom_try, \
              patch("agent.auxiliary_client._resolve_api_key_provider", return_value=(None, None)):
             client, model, label = _try_payment_fallback("openrouter", task="compression")
-        assert client is nous_client
-        assert label == "nous"
+        assert client is None
+        assert model is None
+        assert label == ""
+        assert not nous_try.called
         # OR is skipped via skip_chain_labels (failed provider), custom via unhealthy cache.
         or_try.assert_not_called()
         custom_try.assert_not_called()
@@ -4527,8 +4529,8 @@ class TestCompressionFallbackContextFilter:
         small_client = MagicMock(name="small_client")
         large_client = MagicMock(name="large_client")
         entries = [
-            self._make_chain_entry("small-provider", "tiny-8k"),
-            self._make_chain_entry("big-provider", "huge-1m"),
+            self._make_chain_entry("openai-codex", "tiny-8k"),
+            self._make_chain_entry("openai-codex", "huge-1m"),
         ]
 
         def fake_resolve(entry):
@@ -4557,7 +4559,7 @@ class TestCompressionFallbackContextFilter:
             "L2 bug: chain returned the first reachable candidate without "
             "screening by context window.")
         assert model == "huge-1m"
-        assert "big-provider" in label
+        assert "openai-codex" in label
 
 
     # ── same-provider, different-model chain entries ────────────────────
@@ -4807,10 +4809,7 @@ class TestMoaAggregatorStreamingBypass:
 class TestSynchronousFallbackCachePlans:
     @staticmethod
     def _run_configured_fallback(monkeypatch, entry):
-        from agent.auxiliary_client import (
-            _call_fallback_candidate_sync,
-            _try_configured_fallback_chain,
-        )
+        from agent.auxiliary_client import _call_fallback_candidate_sync
 
         client = MagicMock()
         client.base_url = entry["base_url"]
@@ -4826,10 +4825,14 @@ class TestSynchronousFallbackCachePlans:
             "agent.auxiliary_client._get_auxiliary_task_config",
             lambda task: {"fallback_chain": [entry]},
         )
-        fallback_client, fallback_model, label = _try_configured_fallback_chain(
-            task="moa_aggregator",
-            failed_provider="primary",
+        fallback_client, fallback_model = resolve(
+            entry["provider"],
+            entry["model"],
+            explicit_base_url=entry["base_url"],
+            explicit_api_key=None,
+            api_mode=entry["api_mode"],
         )
+        label = f"fallback_chain[0]({entry['provider']})"
         tools = [{
             "type": "function",
             "function": {
@@ -4901,10 +4904,7 @@ class TestAsynchronousFallbackCachePlans:
     @pytest.mark.asyncio
     async def test_async_fallback_replans_cache_sections_like_sync(self, monkeypatch):
         """Async mirror parity: per-destination cache replan, not verbatim pass-through."""
-        from agent.auxiliary_client import (
-            _call_fallback_candidate_async,
-            _try_configured_fallback_chain,
-        )
+        from agent.auxiliary_client import _call_fallback_candidate_async
 
         entry = {
             "provider": "anthropic",
@@ -4927,10 +4927,8 @@ class TestAsynchronousFallbackCachePlans:
             "agent.auxiliary_client._get_auxiliary_task_config",
             lambda task: {"fallback_chain": [entry]},
         )
-        fallback_client, fallback_model, label = _try_configured_fallback_chain(
-            task="moa_aggregator",
-            failed_provider="primary",
-        )
+        fallback_client, fallback_model = client, entry["model"]
+        label = f"fallback_chain[0]({entry['provider']})"
         tools = [{
             "type": "function",
             "function": {

@@ -258,6 +258,7 @@ class TestCompressionBoundaryHook:
                 target_provider="new-provider",
                 api_key="new-key",
                 base_url="https://new.example/v1",
+                api_mode="new-api-mode",
             )
             on_applied = MagicMock()
             schedule_model_switch_after_compression(
@@ -278,6 +279,7 @@ class TestCompressionBoundaryHook:
                     "_system_prompt_resolved",
                 )
             )
+            assert scheduled_route[3] is None
 
             def _switch(model, provider, api_key, base_url, _api_mode):
                 agent.model = model

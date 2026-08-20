@@ -1868,6 +1868,22 @@ def _compute_host_turn_frame(
             if image_paths is not None
             else list(session.get("attached_images", []))
         )
+    memory_provider_mode = None
+    resume_overrides = session.get("resume_runtime_overrides")
+    if isinstance(resume_overrides, dict):
+        memory_provider_mode = resume_overrides.get("memory_provider_mode_override")
+    if memory_provider_mode not in _VALID_MEMORY_PROVIDER_MODES:
+        try:
+            session_key = str(session.get("session_key") or "")
+            with _session_db(session) as db:
+                row = db.get_session(session_key) if db is not None and session_key else None
+            memory_provider_mode = (_stored_session_runtime_overrides(row) or {}).get(
+                "memory_provider_mode_override"
+            )
+        except Exception:
+            memory_provider_mode = None
+    if memory_provider_mode not in _VALID_MEMORY_PROVIDER_MODES:
+        memory_provider_mode = _session_memory_provider_mode(session)
     return {
         "type": "turn.start",
         "sid": sid,
@@ -1883,6 +1899,7 @@ def _compute_host_turn_frame(
         "model_override": session.get("model_override"),
         "reasoning_config_override": session.get("create_reasoning_override"),
         "service_tier_override": session.get("create_service_tier_override"),
+        "memory_provider_mode_override": memory_provider_mode,
         "source": _session_source(session),
         "attached_images": attached_images,
         "queued_prompt_generation": queued_prompt_generation,

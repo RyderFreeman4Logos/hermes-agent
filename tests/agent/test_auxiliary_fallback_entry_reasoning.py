@@ -7,7 +7,7 @@ from agent.auxiliary_client import _call_fallback_candidate_sync, _call_llm_impl
 
 
 def test_fallback_entries_apply_own_reasoning_effort():
-    """Entry A high and entry B low are applied; omitted inherits task default."""
+    """Entry A high and entry B low apply; omitted gets no local-only payload."""
     chain = [
         {"provider": "custom", "model": "a", "reasoning_effort": "high"},
         {"provider": "custom", "model": "b", "reasoning_effort": "low"},
@@ -57,10 +57,7 @@ def test_fallback_entries_apply_own_reasoning_effort():
         "enabled": True,
         "effort": "low",
     }
-    assert _effort_for("fallback_chain[2](custom)") == {
-        "enabled": True,
-        "effort": "medium",
-    }
+    assert _effort_for("fallback_chain[2](custom)") is None
     assert task_body == {"reasoning": {"enabled": True, "effort": "medium"}}
 
 
@@ -89,7 +86,7 @@ def _client_recording(seen, *, fail=False, text="ok"):
 
 
 def test_unavailable_primary_walk_does_not_rebind_task_extra_body():
-    """Promotion + sequential walk: omitted entry keeps the task default."""
+    """Promotion + sequential walk: omitted entry avoids task-local controls."""
     chain = [
         {
             "provider": "custom",
@@ -137,4 +134,4 @@ def test_unavailable_primary_walk_does_not_rebind_task_extra_body():
     assert seen0[0]["thinking"] == {"type": "enabled"}
     assert seen1[0]["reasoning"] == {"enabled": True, "effort": "low"}
     assert "thinking" not in seen1[0]
-    assert seen2[0] == {"reasoning": {"enabled": True, "effort": "medium"}}
+    assert seen2[0] == {}

@@ -4448,8 +4448,8 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         # sibling chunks then use that route directly instead of re-hitting a
         # dead primary model.
         first_ci, first_segment = jobs[0]
-        selected_route: dict[str, str] | None = None
-        route_info: dict[str, str] = {}
+        selected_route: dict[str, Any] | None = None
+        route_info: dict[str, Any] = {}
         first_digest = _digest_one(
             first_ci, first_segment, route_info=route_info,
         )
@@ -4457,6 +4457,11 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         model = route_info.get("model", "").strip()
         if provider and model and model not in {"default", "unknown"}:
             selected_route = {"provider": provider, "model": model}
+            fallback_label = route_info.get("fallback_label")
+            if fallback_label:
+                selected_route["route_info"] = {
+                    "fallback_label": str(fallback_label),
+                }
 
         remaining = jobs[1:]
         if not remaining:

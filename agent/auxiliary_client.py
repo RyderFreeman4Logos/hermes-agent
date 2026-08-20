@@ -3405,14 +3405,17 @@ def _set_relay_auxiliary_route(
 
 
 def _record_route_info(
-    route_info: Optional[Dict[str, str]],
+    route_info: Optional[Dict[str, Any]],
     provider: Optional[str],
     model: Optional[str],
+    fallback_label: Optional[str] = None,
 ) -> None:
     """Expose the concrete route selected for one auxiliary call."""
     if route_info is not None:
         route_info["provider"] = provider or "auto"
         route_info["model"] = model or "default"
+        if fallback_label and fallback_label.startswith("fallback_chain["):
+            route_info["fallback_label"] = fallback_label
 
 
 def _relay_auxiliary_metadata(
@@ -5177,7 +5180,7 @@ def _fallback_entry_extra_body(
     fb_label: str,
     base: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Per-candidate extra_body. Omitted keys inherit the task-level ``base``.
+    """Build candidate-owned controls without leaking local reasoning fields.
 
     ``auxiliary.<task>.fallback_chain`` entries may set ``reasoning_effort``,
     ``reasoning``, ``thinking``, or ``extra_body`` for that provider+model
@@ -5186,10 +5189,18 @@ def _fallback_entry_extra_body(
     invent a second schema. Always return a new dict so one task-level
     body is not reused across candidates.
     """
+    # A task-level body can contain Qwen/Gemini/Kimi-only thinking controls.
+    # They are not portable across a heterogeneous fallback chain; each
+    # candidate must opt into its own reasoning payload instead.
     result = dict(base or {})
     entry = _fallback_chain_entry(task, fb_label)
     if not entry:
         return result
+    result = {
+        key: value
+        for key, value in result.items()
+        if str(key).strip().lower() not in _PROFILE_REASONING_KEYS
+    }
     raw = entry.get("extra_body")
     if isinstance(raw, dict):
         result.update(raw)
@@ -5216,6 +5227,27 @@ def _fallback_provider_from_label(label: str) -> str:
     )
     return match.group(1).strip() if match else str(label or "").strip()
 
+
+def _record_codex_skip(route_info: Optional[Dict[str, Any]], reason: str) -> None:
+    """Keep one scalar reason when a configured Codex candidate is skipped."""
+    if route_info is not None and "codex_skip_reason" not in route_info:
+        route_info["codex_skip_reason"] = reason
+
+
+def _tag_fallback_client(
+    client: Any,
+    label: str,
+    codex_skip_reason: Optional[str] = None,
+) -> Any:
+    """Carry configured-entry identity through auto-client resolution."""
+    if client is not None and label.startswith("fallback_chain["):
+        try:
+            client._hermes_fallback_label = label
+            if codex_skip_reason:
+                client._hermes_codex_skip_reason = codex_skip_reason
+        except Exception:
+            pass
+    return client
 
 class _FallbackDestination(NamedTuple):
     provider: str
@@ -5783,6 +5815,7 @@ def _try_configured_fallback_chain(
     reason: str = "error",
     failed_model: Optional[str] = None,
     start_index: int = 0,
+    route_info: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Try user-configured fallback_chain for a specific auxiliary task.
 
@@ -5840,8 +5873,23 @@ def _try_configured_fallback_chain(
     )
     tried = []
     min_ctx = _task_minimum_context_length(task)
+    codex_skip_reason = None
 
-    for i, entry in enumerate(chain[start_index:], start=start_index):
+    candidate_indices = list(range(start_index, len(chain)))
+    codex_indices = [
+        i for i in candidate_indices
+        if isinstance(chain[i], dict)
+        and str(chain[i].get("provider") or "").strip().lower() == "openai-codex"
+    ]
+    # Codex is the quality-preserving auxiliary fallback. Resolve it before
+    # cheaper pm/localrouter entries; if it cannot be used, the original order
+    # remains available and the reason is retained in route_info.
+    candidate_indices = codex_indices + [
+        i for i in candidate_indices if i not in codex_indices
+    ]
+
+    for i in candidate_indices:
+        entry = chain[i]
         if not isinstance(entry, dict):
             continue
         fb_provider = str(entry.get("provider", "")).strip()
@@ -5881,13 +5929,23 @@ def _try_configured_fallback_chain(
                         task, label, resolved_model, fb_ctx, min_ctx,
                     )
                     tried.append(f"{label} (context too small: {fb_ctx}<{min_ctx})")
+                    if fb_provider.lower() == "openai-codex":
+                        codex_skip_reason = "too_small"
+                        _record_codex_skip(route_info, "too_small")
                     continue
             logger.info(
                 "Auxiliary %s: %s on %s — configured fallback to %s (%s)",
                 task, reason, failed_provider, label, resolved_model or fb_model or "default",
             )
-            return fb_client, resolved_model or fb_model, label
+            if fb_provider.lower() == "openai-codex":
+                codex_skip_reason = None
+            return _tag_fallback_client(
+                fb_client, label, codex_skip_reason
+            ), resolved_model or fb_model, label
         tried.append(label)
+        if fb_provider.lower() == "openai-codex":
+            codex_skip_reason = "unavailable"
+            _record_codex_skip(route_info, "unavailable")
 
     if tried:
         logger.debug(
@@ -5910,6 +5968,7 @@ def _next_configured_fallback_index(label: str) -> Optional[int]:
 def _try_configured_fallback_for_unavailable_client(
     task: Optional[str],
     failed_provider: str,
+    route_info: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Try task fallback_chain when an explicit aux provider cannot build.
 
@@ -5922,10 +5981,17 @@ def _try_configured_fallback_for_unavailable_client(
     explicit = (failed_provider or "").strip().lower()
     if not task or not explicit or explicit in {"auto"}:
         return None, None, ""
+    if route_info is None:
+        return _try_configured_fallback_chain(
+            task,
+            explicit,
+            reason="provider unavailable",
+        )
     return _try_configured_fallback_chain(
         task,
         explicit,
         reason="provider unavailable",
+        route_info=route_info,
     )
 
 
@@ -9748,6 +9814,12 @@ def _call_llm_impl_unscoped(
     if api_mode:
         resolved_api_mode = api_mode
     effective_extra_body = _get_task_extra_body(task)
+    fallback_label = (
+        str(route_info.get("fallback_label") or "")
+        if isinstance(route_info, dict) else ""
+    )
+    if fallback_label:
+        effective_extra_body = _fallback_entry_extra_body(task, fallback_label, {})
     effective_extra_body.update(extra_body or {})
     effective_provider = resolved_provider
 
@@ -9799,12 +9871,18 @@ def _call_llm_impl_unscoped(
             _explicit = (resolved_provider or "").strip().lower()
             if _explicit and _explicit not in {"auto", "openrouter", "custom"}:
                 fb_client, fb_model, fb_label = _try_configured_fallback_for_unavailable_client(
-                    task, _explicit,
+                    task, _explicit, route_info=route_info,
                 )
                 if fb_client is not None:
                     client, final_model = fb_client, fb_model
                     resolved_provider = fb_label or resolved_provider
                     effective_provider = resolved_provider
+                    _record_route_info(
+                        route_info,
+                        _fallback_provider_from_label(fb_label),
+                        final_model,
+                        fallback_label=fb_label,
+                    )
                 else:
                     raise RuntimeError(
                         f"Provider '{_explicit}' is set in config.yaml but no API key "
@@ -9830,6 +9908,22 @@ def _call_llm_impl_unscoped(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
                 f"Run: hermes setup")
 
+    if not fallback_label:
+        candidate_label = getattr(client, "_hermes_fallback_label", "")
+        if isinstance(candidate_label, str) and candidate_label.startswith("fallback_chain["):
+            fallback_label = candidate_label
+    candidate_skip_reason = getattr(client, "_hermes_codex_skip_reason", "")
+    if (
+        isinstance(candidate_skip_reason, str)
+        and candidate_skip_reason
+        and isinstance(route_info, dict)
+    ):
+        route_info["codex_skip_reason"] = candidate_skip_reason
+    if fallback_label:
+        effective_extra_body = _fallback_entry_extra_body(task, fallback_label, {})
+        effective_extra_body.update(extra_body or {})
+        if isinstance(route_info, dict):
+            route_info["fallback_label"] = fallback_label
     effective_timeout = _effective_aux_timeout(task, timeout)
     request_provider = effective_provider or resolved_provider
     _set_relay_auxiliary_route(
@@ -9838,7 +9932,8 @@ def _call_llm_impl_unscoped(
         resolved_api_mode,
     )
     _record_route_info(
-        route_info, _fallback_provider_from_label(request_provider), final_model
+        route_info, _fallback_provider_from_label(request_provider), final_model,
+        fallback_label=fallback_label,
     )
 
     # Log what we're about to do — makes auxiliary operations visible
@@ -10382,10 +10477,11 @@ def _call_llm_impl_unscoped(
             #   4. For explicit aux providers: main agent model safety net
             fb_client, fb_model, fb_label = _try_configured_fallback_chain(
                 task, resolved_provider or "auto", reason=reason,
-                failed_model=_chain_failed_model)
+                failed_model=_chain_failed_model, route_info=route_info)
             while fb_client is not None:
                 _record_route_info(
-                    route_info, _fallback_provider_from_label(fb_label), fb_model
+                    route_info, _fallback_provider_from_label(fb_label), fb_model,
+                    fallback_label=fb_label,
                 )
                 try:
                     fb_resp = _call_fallback_candidate_sync(
@@ -10401,12 +10497,15 @@ def _call_llm_impl_unscoped(
                     fb_resp = None
                 if fb_resp is not None:
                     return fb_resp
+                if _fallback_provider_from_label(fb_label).lower() == "openai-codex":
+                    _record_codex_skip(route_info, "rejected")
                 next_index = _next_configured_fallback_index(fb_label)
                 if next_index is None:
                     break
                 fb_client, fb_model, fb_label = _try_configured_fallback_chain(
                     task, resolved_provider or "auto", reason=reason,
-                    failed_model=_chain_failed_model, start_index=next_index)
+                    failed_model=_chain_failed_model, start_index=next_index,
+                    route_info=route_info)
 
             if is_auto:
                 fb_client, fb_model, fb_label = _try_main_fallback_chain(
@@ -10421,7 +10520,8 @@ def _call_llm_impl_unscoped(
 
             if fb_client is not None:
                 _record_route_info(
-                    route_info, _fallback_provider_from_label(fb_label), fb_model
+                    route_info, _fallback_provider_from_label(fb_label), fb_model,
+                    fallback_label=fb_label,
                 )
                 fb_resp = _call_fallback_candidate_sync(
                     fb_client, fb_model, fb_label,
@@ -10437,7 +10537,8 @@ def _call_llm_impl_unscoped(
                         resolved_provider, task, reason="stale fallback credential")
                     if fb_client is not None:
                         _record_route_info(
-                            route_info, _fallback_provider_from_label(fb_label), fb_model
+                            route_info, _fallback_provider_from_label(fb_label), fb_model,
+                            fallback_label=fb_label,
                         )
                         fb_resp = _call_fallback_candidate_sync(
                             fb_client, fb_model, fb_label,
@@ -10634,6 +10735,12 @@ async def _async_call_llm_impl_unscoped(
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
     effective_extra_body = _get_task_extra_body(task)
+    fallback_label = (
+        str(route_info.get("fallback_label") or "")
+        if isinstance(route_info, dict) else ""
+    )
+    if fallback_label:
+        effective_extra_body = _fallback_entry_extra_body(task, fallback_label, {})
     effective_extra_body.update(extra_body or {})
     effective_provider = resolved_provider
 
@@ -10681,7 +10788,7 @@ async def _async_call_llm_impl_unscoped(
             _explicit = (resolved_provider or "").strip().lower()
             if _explicit and _explicit not in {"auto", "openrouter", "custom"}:
                 fb_client, fb_model, fb_label = _try_configured_fallback_for_unavailable_client(
-                    task, _explicit,
+                    task, _explicit, route_info=route_info,
                 )
                 if fb_client is not None:
                     client, final_model = _to_async_client(
@@ -10689,6 +10796,12 @@ async def _async_call_llm_impl_unscoped(
                     )
                     resolved_provider = fb_label or resolved_provider
                     effective_provider = resolved_provider
+                    _record_route_info(
+                        route_info,
+                        _fallback_provider_from_label(fb_label),
+                        final_model,
+                        fallback_label=fb_label,
+                    )
                 else:
                     raise RuntimeError(
                         f"Provider '{_explicit}' is set in config.yaml but no API key "
@@ -10712,6 +10825,22 @@ async def _async_call_llm_impl_unscoped(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
                 f"Run: hermes setup")
 
+    if not fallback_label:
+        candidate_label = getattr(client, "_hermes_fallback_label", "")
+        if isinstance(candidate_label, str) and candidate_label.startswith("fallback_chain["):
+            fallback_label = candidate_label
+    candidate_skip_reason = getattr(client, "_hermes_codex_skip_reason", "")
+    if (
+        isinstance(candidate_skip_reason, str)
+        and candidate_skip_reason
+        and isinstance(route_info, dict)
+    ):
+        route_info["codex_skip_reason"] = candidate_skip_reason
+    if fallback_label:
+        effective_extra_body = _fallback_entry_extra_body(task, fallback_label, {})
+        effective_extra_body.update(extra_body or {})
+        if isinstance(route_info, dict):
+            route_info["fallback_label"] = fallback_label
     effective_timeout = _effective_aux_timeout(task, timeout)
     request_provider = effective_provider or resolved_provider
     _set_relay_auxiliary_route(
@@ -10720,7 +10849,8 @@ async def _async_call_llm_impl_unscoped(
         resolved_api_mode,
     )
     _record_route_info(
-        route_info, _fallback_provider_from_label(request_provider), final_model
+        route_info, _fallback_provider_from_label(request_provider), final_model,
+        fallback_label=fallback_label,
     )
 
     # Pass the client's actual base_url (not just resolved_base_url) so
@@ -11144,7 +11274,7 @@ async def _async_call_llm_impl_unscoped(
             #   4. For explicit aux providers: main agent model safety net
             fb_client, fb_model, fb_label = _try_configured_fallback_chain(
                 task, resolved_provider or "auto", reason=reason,
-                failed_model=_chain_failed_model)
+                failed_model=_chain_failed_model, route_info=route_info)
             while fb_client is not None:
                 async_fb, async_fb_model = _to_async_client(
                     fb_client, fb_model or "", is_vision=(task == "vision")
@@ -11153,6 +11283,7 @@ async def _async_call_llm_impl_unscoped(
                     route_info,
                     _fallback_provider_from_label(fb_label),
                     async_fb_model or fb_model,
+                    fallback_label=fb_label,
                 )
                 try:
                     fb_resp = await _call_fallback_candidate_async(
@@ -11168,12 +11299,15 @@ async def _async_call_llm_impl_unscoped(
                     fb_resp = None
                 if fb_resp is not None:
                     return fb_resp
+                if _fallback_provider_from_label(fb_label).lower() == "openai-codex":
+                    _record_codex_skip(route_info, "rejected")
                 next_index = _next_configured_fallback_index(fb_label)
                 if next_index is None:
                     break
                 fb_client, fb_model, fb_label = _try_configured_fallback_chain(
                     task, resolved_provider or "auto", reason=reason,
-                    failed_model=_chain_failed_model, start_index=next_index)
+                    failed_model=_chain_failed_model, start_index=next_index,
+                    route_info=route_info)
 
             if is_auto:
                 fb_client, fb_model, fb_label = _try_main_fallback_chain(
@@ -11194,6 +11328,7 @@ async def _async_call_llm_impl_unscoped(
                     route_info,
                     _fallback_provider_from_label(fb_label),
                     async_fb_model or fb_model,
+                    fallback_label=fb_label,
                 )
                 fb_resp = await _call_fallback_candidate_async(
                     async_fb, async_fb_model or fb_model, fb_label,

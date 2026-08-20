@@ -196,6 +196,45 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
         "reasoning_tokens": canonical_usage.reasoning_tokens,
     }
 
+    # Codex app-server bypasses conversation_loop's normal usage latch and
+    # cache callback, but gateway completion reads those same per-turn fields.
+    # Keep the first provider response before any terminal/error path can
+    # discard it, and expose the same cache state machine as the normal loop.
+    if not getattr(agent, "_first_turn_usage", None):
+        agent._first_turn_usage = dict(usage_dict)
+    agent._last_turn_usage = dict(usage_dict)
+    cache_callback = getattr(agent, "_tui_cache_callback", None)
+    if callable(cache_callback):
+        cache_read = canonical_usage.cache_read_tokens
+        cache_write = canonical_usage.cache_write_tokens
+        if cache_read:
+            cache_state = "hit"
+            cache_pct = round(100 * cache_read / prompt_tokens) if prompt_tokens else 0
+        elif cache_write:
+            cache_state, cache_pct = "cold_write", 0
+        elif canonical_usage.cache_telemetry == "unavailable":
+            cache_state, cache_pct = "no_field", 0
+        else:
+            cache_state, cache_pct = "miss", 0
+        response_index = int(getattr(agent, "_tui_provider_response_index", 0)) + 1
+        agent._tui_provider_response_index = response_index
+        try:
+            cache_callback(
+                cache_state,
+                cache_pct,
+                cache_read,
+                prompt_tokens,
+                {
+                    "request_index": response_index,
+                    "state": cache_state,
+                    "pct": cache_pct if cache_state == "hit" else None,
+                    "timestamp": time.monotonic(),
+                    "turn_origin": getattr(agent, "_cache_turn_origin", "user"),
+                },
+            )
+        except Exception:
+            logger.debug("TUI Codex app-server cache callback failed", exc_info=True)
+
     compressor = getattr(agent, "context_compressor", None)
     if compressor is not None:
         try:

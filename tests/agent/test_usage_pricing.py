@@ -793,3 +793,45 @@ def test_normalize_usage_marks_explicit_zero_cache_telemetry_reported():
 
     assert normalized.cache_read_tokens == 0
     assert normalized.cache_telemetry == "reported"
+
+
+def test_normalize_usage_treats_nullable_openai_cache_field_as_unavailable():
+    normalized = normalize_usage(
+        SimpleNamespace(
+            prompt_tokens=1000,
+            completion_tokens=100,
+            prompt_tokens_details=SimpleNamespace(cached_tokens=None),
+        ),
+        provider="openai",
+        api_mode="chat_completions",
+    )
+
+    assert normalized.cache_telemetry == "unavailable"
+
+
+def test_normalize_usage_treats_nullable_responses_cache_field_as_unavailable():
+    normalized = normalize_usage(
+        SimpleNamespace(
+            input_tokens=1000,
+            output_tokens=100,
+            input_tokens_details=SimpleNamespace(cached_tokens=None),
+        ),
+        provider="openai",
+        api_mode="codex_responses",
+    )
+
+    assert normalized.cache_telemetry == "unavailable"
+
+
+def test_normalize_usage_treats_nullable_anthropic_cache_field_as_unavailable():
+    normalized = normalize_usage(
+        SimpleNamespace(
+            input_tokens=1000,
+            output_tokens=100,
+            cache_read_input_tokens=None,
+        ),
+        provider="anthropic",
+        api_mode="anthropic_messages",
+    )
+
+    assert normalized.cache_telemetry == "unavailable"

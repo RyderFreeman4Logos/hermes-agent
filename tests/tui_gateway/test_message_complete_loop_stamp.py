@@ -179,6 +179,20 @@ def test_cache_info_omits_tokens_when_counts_missing():
     assert "prompt_tokens" not in info
 
 
+def test_cache_info_preserves_cold_write_on_terminal_usage():
+    info = server._cache_info_from_usage(
+        {
+            "prompt_tokens": 100,
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 25,
+            "cache_telemetry": "reported",
+        }
+    )
+
+    assert info["state"] == "cold_write"
+    assert info["pct"] == 0
+
+
 def test_message_complete_does_not_reuse_prior_loop_cache_info(frames, turn_env):
     class _Agent:
         def __init__(self):

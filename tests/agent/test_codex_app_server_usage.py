@@ -58,3 +58,27 @@ def test_app_server_explicit_zero_cache_telemetry_is_reported_miss():
     assert usage["cache_telemetry"] == "reported"
     cache_info = _cache_info_from_usage(usage)
     assert cache_info["state"] == "miss"
+
+
+def test_app_server_usage_latches_and_notifies_tui_on_reported_hit():
+    events = []
+    agent = _make_agent()
+    agent._tui_cache_callback = lambda *args: events.append(args)
+    usage = _record_codex_app_server_usage(
+        agent,
+        SimpleNamespace(
+            token_usage_last={
+                "inputTokens": 100,
+                "cachedInputTokens": 900,
+                "outputTokens": 700,
+                "totalTokens": 1700,
+            }
+        ),
+    )
+
+    assert agent._first_turn_usage["cache_read_tokens"] == 900
+    assert agent._last_turn_usage["cache_read_tokens"] == 900
+    assert _cache_info_from_usage(agent._first_turn_usage)["state"] == "hit"
+    assert events[0][0] == "hit"
+    assert events[0][2] == 900
+    assert events[0][4]["state"] == "hit"

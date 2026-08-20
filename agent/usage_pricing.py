@@ -1052,8 +1052,8 @@ def _usage_get(obj: Any, name: str, default: Any = 0) -> Any:
 
 def _usage_has(obj: Any, name: str) -> bool:
     if isinstance(obj, dict):
-        return name in obj
-    return hasattr(obj, name)
+        return obj.get(name) is not None
+    return getattr(obj, name, None) is not None
 
 
 def _usage_count(value: Any) -> int:

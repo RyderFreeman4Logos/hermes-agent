@@ -1,8 +1,11 @@
 import json
 import threading
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 from acp_adapter.session import SessionManager, SessionState
+from hermes_cli.cli_commands_mixin import CLICommandsMixin
+from tui_gateway.compute_host import ComputeHost
 from tui_gateway import server
 
 
@@ -13,6 +16,12 @@ class DurableDB:
 
     def get_session(self, session_id):
         return self.rows.get(session_id)
+
+    def get_session_title(self, session_id):
+        return (self.rows.get(session_id) or {}).get("title")
+
+    def get_next_title_in_lineage(self, _title):
+        return "synthetic branch"
 
     def create_session(self, session_id, source, model=None, model_config=None, **_kwargs):
         self.rows.setdefault(
@@ -34,6 +43,15 @@ class DurableDB:
         self.updates.append((session_id, json.loads(model_config_json), model))
 
     def replace_messages(self, *_args, **_kwargs):
+        return None
+
+    def append_messages_batch(self, *_args, **_kwargs):
+        return None
+
+    def set_session_title(self, session_id, title):
+        self.rows[session_id]["title"] = title
+
+    def end_session(self, *_args, **_kwargs):
         return None
 
     def get_messages_as_conversation(self, *_args, **_kwargs):
@@ -194,3 +212,158 @@ def test_tui_reset_persists_new_agent_mode(monkeypatch):
     assert config["memory_provider_mode"] == "hybrid"
     assert config["keep"] == "marker"
     assert session["agent"] is new_agent
+
+
+def test_tui_branch_carries_frozen_mode_and_lineage(monkeypatch):
+    db = DurableDB()
+    parent_key = "synthetic-tui-parent"
+    db.create_session(parent_key, source="tui", model_config={"keep": "marker"})
+    parent_agent = FakeAgent("authoritative")
+    session = {
+        "agent": parent_agent,
+        "session_key": parent_key,
+        "history": [{"role": "user", "content": "synthetic prompt"}],
+        "display_history_prefix": [],
+        "history_lock": threading.Lock(),
+        "profile_home": None,
+        "cols": 80,
+        "source": "tui",
+        "cwd": "/synthetic",
+    }
+    make_calls = []
+    branch_key = "synthetic-tui-branch"
+
+    def make_agent(*_args, **kwargs):
+        make_calls.append(dict(kwargs))
+        agent = FakeAgent(kwargs.get("memory_provider_mode_override") or "hybrid")
+        agent._session_db = db
+        return agent
+
+    def init_session(sid, key, agent, history, **_kwargs):
+        server._sessions[sid] = {
+            "agent": agent,
+            "session_key": key,
+            "history": history,
+        }
+
+    @contextmanager
+    def session_db(_session):
+        yield db
+
+    monkeypatch.setattr(server, "_sess", lambda _params, _rid: (session, None))
+    monkeypatch.setattr(server, "_session_db", session_db)
+    monkeypatch.setattr(server, "_new_session_key", lambda: branch_key)
+    monkeypatch.setattr(server.uuid, "uuid4", lambda: SimpleNamespace(hex="12345678"))
+    monkeypatch.setattr(server, "_session_source", lambda _session: "tui")
+    monkeypatch.setattr(server, "_session_cwd", lambda _session: "/synthetic")
+    monkeypatch.setattr(server, "_resolve_model", lambda: "synthetic-model")
+    monkeypatch.setattr(server, "_set_session_context", lambda _key: None)
+    monkeypatch.setattr(server, "_clear_session_context", lambda _token: None)
+    monkeypatch.setattr(server, "_make_agent", make_agent)
+    monkeypatch.setattr(server, "_init_session", init_session)
+    monkeypatch.setattr(server, "_transfer_db_to_agent", lambda *_args: False)
+    monkeypatch.setattr(server, "_session_info", lambda *_args: {})
+    monkeypatch.setattr(server, "_history_to_messages", lambda history: history)
+    monkeypatch.setattr(server, "_emit", lambda *_args: None)
+    monkeypatch.setattr(
+        server,
+        "_load_cfg",
+        lambda: {"memory": {"provider_mode": "hybrid"}},
+    )
+    server._sessions.clear()
+
+    response = server._methods["session.branch"]("synthetic-rid", {"session_id": "parent"})
+
+    assert "error" not in response
+    config = _stored_config(db, branch_key)
+    assert config["memory_provider_mode"] == "authoritative"
+    assert config["_branched_from"] == parent_key
+    assert make_calls[-1]["memory_provider_mode_override"] == "authoritative"
+
+
+def test_cli_branch_carries_frozen_mode_in_new_row(monkeypatch):
+    db = DurableDB()
+    parent_key = "synthetic-cli-parent"
+    db.create_session(parent_key, source="cli", model_config={"keep": "marker"})
+    agent = FakeAgent("authoritative")
+    agent.session_id = parent_key
+    agent.session_start = None
+    agent.reset_session_state = lambda: None
+    cli = CLICommandsMixin.__new__(CLICommandsMixin)
+    cli.conversation_history = [{"role": "user", "content": "synthetic prompt"}]
+    cli._session_db = db
+    cli.session_id = parent_key
+    cli.model = "synthetic-model"
+    cli.max_turns = 4
+    cli.reasoning_config = {"effort": "low"}
+    cli.agent = agent
+    cli._pending_title = None
+    cli._resumed = False
+    cli._transfer_session_yolo = lambda *_args: None
+    monkeypatch.setattr("cli._sync_process_session_id", lambda _session_id: None)
+
+    cli._handle_branch_command("/branch synthetic branch")
+
+    rows = [row for key, row in db.rows.items() if key != parent_key]
+    assert len(rows) == 1
+    config = json.loads(rows[0]["model_config"])
+    assert config["memory_provider_mode"] == "authoritative"
+    assert config["_branched_from"] == parent_key
+
+
+def test_compute_host_rebuild_passes_and_persists_frozen_mode(monkeypatch):
+    db = DurableDB()
+    key = "synthetic-host-session"
+    db.create_session(key, source="tui", model_config={"memory_provider_mode": "authoritative"})
+
+    class ChildServer:
+        def __init__(self):
+            self._sessions = {}
+            self.calls = []
+            self._persist_live_session_runtime = server._persist_live_session_runtime
+
+        def _make_agent(self, *_args, **kwargs):
+            self.calls.append(dict(kwargs))
+            agent = FakeAgent(kwargs.get("memory_provider_mode_override") or "hybrid")
+            agent._session_db = db
+            return agent
+
+        @staticmethod
+        def _transfer_db_to_agent(*_args):
+            return False
+
+        def _init_session(self, sid, session_key, agent, history, **_kwargs):
+            self._sessions[sid] = {
+                "agent": agent,
+                "session_key": session_key,
+                "history": history,
+            }
+
+    child = ChildServer()
+    @contextmanager
+    def session_db(_session):
+        yield db
+
+    monkeypatch.setattr(server, "_session_db", session_db)
+    monkeypatch.setattr(server, "_load_cfg", lambda: {"memory": {"provider_mode": "hybrid"}})
+    serving_session = {
+        "session_key": key,
+        "history": [],
+        "history_lock": threading.Lock(),
+        "cols": 80,
+        "attached_images": [],
+        "profile_home": None,
+    }
+    frame = server._compute_host_turn_frame(
+        "synthetic-rid", "synthetic-host-sid", serving_session, "synthetic prompt"
+    )
+    assert frame["memory_provider_mode_override"] == "authoritative"
+    host = ComputeHost(stdout=SimpleNamespace(write=lambda *_args: None, flush=lambda: None), heartbeat_secs=0)
+    try:
+        session = host._ensure_server_session(child, frame)
+    finally:
+        host.close()
+
+    assert child.calls[-1]["memory_provider_mode_override"] == "authoritative"
+    assert session["agent"]._memory_provider_mode == "authoritative"
+    assert _stored_config(db, key)["memory_provider_mode"] == "authoritative"

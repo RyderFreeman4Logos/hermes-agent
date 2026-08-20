@@ -21,6 +21,11 @@ sys.modules.setdefault("fal_client", types.SimpleNamespace())
 
 from run_agent import AIAgent
 from agent.context_compressor import ContextCompressor
+from hermes_cli.model_switch import (
+    ModelSwitchResult,
+    get_model_switch_after_compression,
+    schedule_model_switch_after_compression,
+)
 
 
 def _make_minimal_agent() -> AIAgent:
@@ -88,5 +93,20 @@ class TestResetSessionState:
         assert agent._user_turn_count == 0, (
             f"_user_turn_count must be 0 after reset; got: {agent._user_turn_count}"
         )
+
+    def test_deferred_model_switch_cleared_on_reset(self):
+        agent = _make_minimal_agent()
+        schedule_model_switch_after_compression(
+            agent,
+            ModelSwitchResult(
+                success=True,
+                new_model="next-model",
+                target_provider="next-provider",
+            ),
+        )
+
+        agent.reset_session_state()
+
+        assert get_model_switch_after_compression(agent) is None
 
 

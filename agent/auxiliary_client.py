@@ -6190,18 +6190,25 @@ def _resolve_auto_route(
     # ── Step 3: aggregator / fallback chain ──────────────────────────────
     tried = []
     for label, try_fn in _get_provider_chain():
+        if not _is_codex_provider(label) and label != "local/custom":
+            tried.append(f"{label} (non-Codex destination)")
+            continue
         if _is_provider_unhealthy(label):
             _log_skip_unhealthy(label)
             tried.append(f"{label} (unhealthy)")
             continue
         client, model = try_fn()
         if client is not None:
+            if not _is_codex_provider(label) and not isinstance(client, CodexAuxiliaryClient):
+                tried.append(f"{label} (non-Codex destination)")
+                continue
+            effective_label = "openai-codex" if isinstance(client, CodexAuxiliaryClient) else label
             if tried:
                 logger.info("Auxiliary auto-detect: using %s (%s) — skipped: %s",
-                            label, model or "default", ", ".join(tried))
+                            effective_label, model or "default", ", ".join(tried))
             else:
-                logger.info("Auxiliary auto-detect: using %s (%s)", label, model or "default")
-            return client, model, label
+                logger.info("Auxiliary auto-detect: using %s (%s)", effective_label, model or "default")
+            return client, model, effective_label
         tried.append(label)
     logger.warning("Auxiliary auto-detect: no provider available (tried: %s). "
                    "Compression, summarization, and memory flush will not work. "
@@ -7228,9 +7235,7 @@ def get_async_text_auxiliary_client(task: str = "", *, main_runtime: Optional[Di
 
 
 _VISION_AUTO_PROVIDER_ORDER = (
-    "openrouter",
-    "nous",
-    "deepinfra",
+    "openai-codex",
 )
 
 
@@ -7317,7 +7322,7 @@ def _strict_vision_backend_available(provider: str) -> bool:
 def get_available_vision_backends() -> List[str]:
     """Return the currently available vision backends in auto-selection order.
 
-    Order: active provider → OpenRouter → Nous → stop.  This is the single
+    Order: active provider → OpenAI Codex → stop.  This is the single
     source of truth for setup, tool gating, and runtime auto-routing of
     vision tasks.
     """
@@ -7389,7 +7394,7 @@ def resolve_vision_provider_client(
 
     if requested == "auto":
         # Vision auto-detection order:
-        #   1. User's main provider + main model (including aggregators).
+        #   1. User's main provider + main model when it supports vision.
         #      _PROVIDER_VISION_MODELS provides per-provider vision model
         #      overrides when the provider has a dedicated multimodal model
         #      that differs from the chat model (e.g. xiaomi → mimo-v2-omni,
@@ -7399,12 +7404,8 @@ def resolve_vision_provider_client(
         #      exception: it has a dedicated strict vision backend with
         #      tier-aware defaults, so it must not fall through to the
         #      user's text chat model here.
-        #   2. OpenRouter (vision-capable aggregator fallback)
-        #   3. Nous Portal (vision-capable aggregator fallback)
-        #   4. DeepInfra   (OpenAI-compatible; vision model discovered
-        #                   live from the catalog — tried when
-        #                   DEEPINFRA_API_KEY is set)
-        #   5. Stop
+        #   2. OpenAI Codex (the only allowed auto fallback)
+        #   3. Stop
         main_provider = str(runtime.get("provider") or _read_main_provider())
         main_model = str(runtime.get("model") or _read_main_model())
         if main_provider.strip().lower() == "moa":
@@ -7525,8 +7526,8 @@ def resolve_vision_provider_client(
                     return _finalize(
                         main_provider, rpc_client, rpc_model or vision_model)
 
-        # Fall back through aggregators (uses their dedicated vision model,
-        # not the user's main model) when main provider has no client.
+        # Fall back to Codex (the only allowed auto fallback) when the main
+        # provider has no vision client.
         for candidate in _VISION_AUTO_PROVIDER_ORDER:
             if candidate == main_provider:
                 continue  # already tried above

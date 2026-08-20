@@ -1214,10 +1214,10 @@ class TestResolveProviderClientUniversalModelFallback:
 
 
 class TestExpiredCodexFallback:
-    """Test that expired Codex tokens don't block the auto chain."""
+    """Test that expired Codex tokens fail closed in the auto chain."""
 
-    def test_expired_codex_falls_through_to_next(self, tmp_path, monkeypatch):
-        """When Codex token is expired, auto chain should skip it and try next provider."""
+    def test_expired_codex_fails_closed_without_codex_candidate(self, tmp_path, monkeypatch):
+        """An expired Codex token must not fall through to another provider."""
         import base64
         import time as _time
 
@@ -1245,12 +1245,13 @@ class TestExpiredCodexFallback:
             mock_build.return_value = MagicMock()
             from agent.auxiliary_client import _resolve_auto
             client, model = _resolve_auto()
-            # Should NOT be Codex, should be Anthropic (or another available provider)
-            assert not isinstance(client, type(None)), "Should find a provider after expired Codex"
+            assert client is None
+            assert model is None
+            mock_build.assert_not_called()
 
 
-    def test_expired_codex_openrouter_wins(self, tmp_path, monkeypatch):
-        """With expired Codex + OpenRouter key, OpenRouter should win (1st in chain)."""
+    def test_expired_codex_does_not_allow_openrouter(self, tmp_path, monkeypatch):
+        """An expired Codex token must not make OpenRouter the auto destination."""
         import base64
         import time as _time
 
@@ -1287,9 +1288,9 @@ class TestExpiredCodexFallback:
             mock_openai.return_value = MagicMock()
             from agent.auxiliary_client import _resolve_auto
             client, model = _resolve_auto()
-            assert client is not None
-            # OpenRouter is 1st in chain, should win
-            mock_openai.assert_called()
+            assert client is None
+            assert model is None
+            mock_openai.assert_not_called()
 
 
 
@@ -3589,15 +3590,11 @@ class TestCodexAdapterGithubResponsesMessageIdDrop:
 
 
 class TestVisionAutoSkipsKimiCoding:
-    """_resolve_auto vision branch skips providers that have no vision on
-    their main endpoint (e.g. Kimi Coding Plan /coding) and falls through
-    to the aggregator chain instead of handing back a client that will 404
-    on every request (#17076).
-    """
+    """Vision auto skips text-only main providers and stays Codex-only."""
 
-    def test_kimi_coding_skipped_falls_through_to_openrouter(self, monkeypatch):
-        """kimi-coding as main + vision auto → OpenRouter (not kimi)."""
-        fake_or_client = MagicMock(name="openrouter_client")
+    def test_kimi_coding_fails_closed_without_codex(self, monkeypatch):
+        """kimi-coding as main + vision auto → fail closed without Codex."""
+        seen = []
 
         monkeypatch.setattr(
             "agent.auxiliary_client._read_main_provider", lambda: "kimi-coding",
@@ -3605,9 +3602,8 @@ class TestVisionAutoSkipsKimiCoding:
         monkeypatch.setattr(
             "agent.auxiliary_client._read_main_model", lambda: "kimi-code",
         )
-        # Guard: if the skip doesn't fire, _resolve_strict_vision_backend
-        # and resolve_provider_client both would try kimi-coding — detect
-        # either via the main-provider call and fail loud.
+        # Guard: if the skip doesn't fire, resolve_provider_client would try
+        # kimi-coding — detect either via the main-provider call and fail loud.
         rpc_mock = MagicMock(side_effect=AssertionError(
             "resolve_provider_client should NOT be called for kimi-coding "
             "on the vision auto path"))
@@ -3616,9 +3612,8 @@ class TestVisionAutoSkipsKimiCoding:
         )
 
         def fake_strict(provider, model=None):
-            if provider == "openrouter":
-                return fake_or_client, "google/gemini-3-flash-preview"
-            if provider == "nous":
+            seen.append(provider)
+            if provider == "openai-codex":
                 return None, None
             raise AssertionError(
                 f"strict vision backend should not be called for {provider!r} "
@@ -3630,9 +3625,8 @@ class TestVisionAutoSkipsKimiCoding:
         )
 
         provider, client, model = resolve_vision_provider_client()
-        assert provider == "openrouter"
-        assert client is fake_or_client
-        assert model == "google/gemini-3-flash-preview"
+        assert (provider, client, model) == (None, None, None)
+        assert seen == ["openai-codex"]
 
 
 

@@ -3456,6 +3456,13 @@ def compress_context(
 
         _session_commit_succeeded = False
         split_status = "not_applicable"
+        _deferred_frontend_sync = None
+        _deferred_frontend_result = None
+        _deferred_frontend_old_model = ""
+        _deferred_frontend_old_provider = ""
+        _deferred_frontend_runtime_snapshot = None
+        _deferred_frontend_pending_config = None
+        _deferred_frontend_durable_snapshot = None
         if agent._session_db:
             split_status = "pending"
             try:
@@ -3529,6 +3536,39 @@ def compress_context(
                     _deferred_frontend_old_provider = str(
                         getattr(agent, "provider", "") or ""
                     )
+                    if _deferred_frontend_result is not None:
+                        from agent.agent_runtime_helpers import (
+                            capture_model_runtime_for_rollback,
+                        )
+
+                        _deferred_frontend_runtime_snapshot = (
+                            capture_model_runtime_for_rollback(agent)
+                        )
+                        _deferred_frontend_pending_config = copy.deepcopy(
+                            getattr(agent, "_session_init_model_config", None)
+                        )
+                        _route_db = getattr(agent, "_session_db", None)
+                        _route_sid = getattr(agent, "session_id", None)
+                        if _route_db is not None and _route_sid:
+                            _route_row = _route_db.get_session(_route_sid)
+                            if isinstance(_route_row, dict):
+                                _deferred_frontend_durable_snapshot = {
+                                    "db": _route_db,
+                                    "session_id": _route_sid,
+                                    "model_config": _route_row.get("model_config"),
+                                    "model": _route_row.get("model"),
+                                    "billing_provider": _route_row.get(
+                                        "billing_provider"
+                                    ),
+                                    "billing_base_url": _route_row.get(
+                                        "billing_base_url"
+                                    ),
+                                    "billing_mode": _route_row.get("billing_mode"),
+                                    "system_prompt": _route_row.get(
+                                        "_system_prompt_resolved",
+                                        _route_row.get("system_prompt"),
+                                    ),
+                                }
                     setattr(agent, "_model_switch_after_compression_callback", None)
                     apply_model_switch_after_compression(agent)
 
@@ -3773,6 +3813,60 @@ def compress_context(
                     )
                 _session_commit_succeeded = True
             except Exception as e:
+                if (
+                    _deferred_frontend_result is not None
+                    and _deferred_frontend_runtime_snapshot is not None
+                ):
+                    from agent.agent_runtime_helpers import (
+                        restore_model_runtime_for_rollback,
+                    )
+
+                    restore_model_runtime_for_rollback(
+                        agent, _deferred_frontend_runtime_snapshot
+                    )
+                    agent._session_init_model_config = copy.deepcopy(
+                        _deferred_frontend_pending_config
+                    )
+                    route = _deferred_frontend_durable_snapshot
+                    if route is not None:
+                        try:
+                            route["db"].update_session_meta(
+                                route["session_id"],
+                                route["model_config"],
+                                model=route["model"],
+                            )
+                            if hasattr(route["db"], "update_session_billing_route"):
+                                route["db"].update_session_billing_route(
+                                    route["session_id"],
+                                    provider=route["billing_provider"],
+                                    base_url=route["billing_base_url"],
+                                    billing_mode=route["billing_mode"],
+                                )
+                            if route["system_prompt"] is not None and hasattr(
+                                route["db"], "update_system_prompt"
+                            ):
+                                route["db"].update_system_prompt(
+                                    route["session_id"], route["system_prompt"]
+                                )
+                        except Exception:
+                            logger.exception(
+                                "deferred model-switch durable rollback failed"
+                            )
+                    setattr(
+                        agent,
+                        "_model_switch_after_compression",
+                        _deferred_frontend_result,
+                    )
+                    setattr(
+                        agent,
+                        "_model_switch_after_compression_callback",
+                        _deferred_frontend_sync,
+                    )
+                    agent._model_switch_after_compression_state = {
+                        "state": "pending",
+                        "model": _deferred_frontend_result.new_model,
+                        "provider": _deferred_frontend_result.target_provider,
+                    }
                 if (
                     not in_place
                     and locals().get("old_session_id")

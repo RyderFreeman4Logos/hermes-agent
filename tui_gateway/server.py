@@ -5144,9 +5144,40 @@ def _apply_pending_model_switch(sid: str, session: dict) -> None:
 class CompressionLockHeld(Exception):
     """Raised by _compress_session_history when compression skipped due
     to a concurrent lock on the session's compression_locks row."""
+
     def __init__(self, holder: str | None = None):
         self.holder = holder
         super().__init__(f"Compression lock held: {holder or 'unknown'}")
+
+
+def _begin_manual_compression_fence(session: dict) -> threading.Event:
+    """Return the generation token that owns this compression boundary."""
+    with session["history_lock"]:
+        if (
+            session.get("running")
+            or session.get("_manual_compression_fence") is not None
+        ):
+            raise RuntimeError(
+                "session busy — /interrupt the current turn before /compress"
+            )
+        fence = threading.Event()
+        session["_manual_compression_fence"] = fence
+        session["_manual_compression_fence_owner"] = threading.get_ident()
+        session["running"] = True
+        return fence
+
+
+def _finish_manual_compression_fence(
+    session: dict, fence: threading.Event | None
+) -> None:
+    """Release only the compression generation represented by ``fence``."""
+    with session["history_lock"]:
+        if fence is None or session.get("_manual_compression_fence") is not fence:
+            return
+        session["running"] = False
+        session.pop("_manual_compression_fence", None)
+        session.pop("_manual_compression_fence_owner", None)
+    fence.set()
 
 
 def _compress_session_history(
@@ -5169,6 +5200,10 @@ def _compress_session_history(
     per-route) is what fixes #35533: previously "/compress here 3" reached
     this helper unparsed and ran a FULL compress focused on the literal
     text "here 3".
+
+    Each route owns a generation token from
+    :func:`_begin_manual_compression_fence` and releases that exact token only
+    after terminal publication and UI cleanup have completed.
     """
     from agent.conversation_compression import (
         finalize_context_engine_compression_notification,
@@ -10588,6 +10623,15 @@ def _notification_poller_loop(
                         with session["history_lock"]:
                             session["running"] = False
         try:
+            # A manual compression fence owns this session's queue boundary.
+            # Check before blocking, then retain any event selected by the shared
+            # queue until the terminal fence opens so FIFO cannot rotate.
+            timeout = 0.5
+            with session["history_lock"]:
+                compression_fence = session.get("_manual_compression_fence")
+            if compression_fence is not None:
+                compression_fence.wait(timeout)
+                continue
             # ponytail: reuse get() timeout as the idle fan-in window
             # (gateway uses 0.1s); a dedicated timer if cadence must differ.
             # After restart/compress, live-delegate child tails arrive
@@ -10612,10 +10656,27 @@ def _notification_poller_loop(
                     )
                     if _active is not None and getattr(_active, "is_set", lambda: False)():
                         timeout = 2.0
-            evt = process_registry.completion_queue.get(timeout=timeout)
+            evt = process_registry.get_completion_for_owner(
+                lambda candidate: not _notification_event_belongs_elsewhere(
+                    sid, session, candidate
+                ),
+                timeout=timeout,
+            )
         except Exception:
             _flush_pending_completions_if_idle(sid, session, _emitted)
             continue
+
+        # A fence can be raised after the ownership snapshot but before the
+        # queue returns. Keep this event reserved instead of requeueing it.
+        while True:
+            with session["history_lock"]:
+                compression_fence = session.get("_manual_compression_fence")
+            if compression_fence is None:
+                break
+            if stop_event.is_set() or session.get("_finalized"):
+                process_registry.requeue_completion_front(evt)
+                return
+            compression_fence.wait(timeout)
 
         # Multiple desktop sessions share this one process-wide queue. Only
         # consume events that belong to *this* session — otherwise a background
@@ -10623,7 +10684,7 @@ def _notification_poller_loop(
         # session's poller happened to wake first (Ben's "reported in a
         # different session" bug). Leave foreign events for their owner.
         if _notification_event_belongs_elsewhere(sid, session, evt):
-            process_registry.completion_queue.put(evt)
+            process_registry.requeue_completion_front(evt)
             time.sleep(0.1)
             continue
 
@@ -10700,6 +10761,11 @@ def _notification_poller_loop(
             evt = process_registry.completion_queue.get_nowait()
         except Exception:
             break
+        with session["history_lock"]:
+            compression_fence = session.get("_manual_compression_fence")
+        if compression_fence is not None:
+            deferred.append(evt)
+            continue
         if _notification_event_belongs_elsewhere(sid, session, evt):
             deferred.append(evt)
             continue
@@ -10757,8 +10823,8 @@ def _notification_poller_loop(
         process_registry.completion_queue.put(evt)
 
     # Hand any other sessions' events back to the shared queue.
-    for evt in deferred:
-        process_registry.completion_queue.put(evt)
+    for evt in reversed(deferred):
+        process_registry.requeue_completion_front(evt)
 
 
 def _async_delegation_display_metadata(evt: dict) -> dict:
@@ -14466,6 +14532,13 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
     if name in _MUTATES_WHILE_RUNNING and session.get("running"):
         return f"session busy — /interrupt the current turn before running /{name}"
 
+    manual_compression_fence = None
+    if name == "compress":
+        try:
+            manual_compression_fence = _begin_manual_compression_fence(session)
+        except RuntimeError as exc:
+            return str(exc)
+
     try:
         if name == "model" and arg and agent:
             result = _apply_model_switch(sid, session, arg)
@@ -14573,6 +14646,9 @@ def _mirror_slash_side_effects(sid: str, session: dict, command: str) -> str:
                 committed=False,
             )
         return f"live session sync failed: {e}"
+    finally:
+        if manual_compression_fence is not None:
+            _finish_manual_compression_fence(session, manual_compression_fence)
     return ""
 
 

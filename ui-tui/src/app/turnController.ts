@@ -651,15 +651,10 @@ class TurnController {
     // only when the gateway elected not to send any (#16391).
     const rawText = (payload.text ?? payload.rendered ?? this.bufRef).trimStart()
     const split = splitReasoning(rawText)
-    // Only dedupe segments AFTER the interim boundary — interim-sealed
-    // segments are preserved even if the final text includes them.
-    // Exception: when response_previewed is true, the final text is the
-    // same model response that was published provisionally as an interim
-    // message. Dedupe against ALL segments (including sealed interims) so
-    // the identical text doesn't render as a duplicate message. (#65919
-    // review: duplicate-message blocker)
-    const dedupeStart = payload.response_previewed ? 0 : (this.interimBoundaryIndex ?? 0)
-    const finalText = finalTail(split.text, this.segmentMessages.slice(dedupeStart))
+    // A commentary interim and its final belong to the same turn, so remove
+    // the commentary prefix when the final repeats it. `startMessage()` resets
+    // segments at each turn boundary, preserving identical replies in later turns.
+    const finalText = finalTail(split.text, this.segmentMessages)
     const existingReasoning = this.reasoningText.trim() || String(payload.reasoning ?? '').trim()
     const savedReasoning = [existingReasoning, existingReasoning ? '' : split.reasoning].filter(Boolean).join('\n\n')
     const savedToolTokens = this.toolTokenAcc

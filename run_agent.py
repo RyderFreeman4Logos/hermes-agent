@@ -6504,12 +6504,15 @@ class AIAgent:
                     think_tail = ctx_scrubber.feed(think_tail)
                 if think_tail:
                     callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
+                    delivered = False
                     for cb in callbacks:
                         try:
                             cb(think_tail)
+                            delivered = True
                         except Exception:
                             pass
-                    self._record_streamed_assistant_text(think_tail)
+                    if delivered:
+                        self._record_streamed_assistant_text(think_tail)
         # Flush any benign partial-tag tail held by the context scrubber so it
         # reaches the UI before we clear state for the next model call.  If
         # the scrubber is mid-span, flush() drops the orphaned content.
@@ -6518,12 +6521,15 @@ class AIAgent:
             tail = scrubber.flush()
             if tail:
                 callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
+                delivered = False
                 for cb in callbacks:
                     try:
                         cb(tail)
+                        delivered = True
                     except Exception:
                         pass
-                self._record_streamed_assistant_text(tail)
+                if delivered:
+                    self._record_streamed_assistant_text(tail)
         self._current_streamed_assistant_text = ""
         self._current_streamed_payload_bytes = 0
 
@@ -6898,13 +6904,16 @@ class AIAgent:
                 text = text.lstrip("\n")
         if not text:
             return
-        self._record_streamed_assistant_text(text)
         callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
+        delivered = False
         for cb in callbacks:
             try:
                 cb(text)
+                delivered = True
             except Exception:
                 pass
+        if delivered:
+            self._record_streamed_assistant_text(text)
         try:
             from agent.plugin_stream_hooks import enqueue_plugin_stream_hook
 

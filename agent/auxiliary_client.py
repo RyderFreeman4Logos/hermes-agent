@@ -5816,6 +5816,7 @@ def _try_configured_fallback_chain(
     failed_model: Optional[str] = None,
     start_index: int = 0,
     route_info: Optional[Dict[str, Any]] = None,
+    attempted_indices: Optional[set[int]] = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Try user-configured fallback_chain for a specific auxiliary task.
 
@@ -5841,6 +5842,11 @@ def _try_configured_fallback_chain(
       provider skipped — the shared credentials/account behind every model
       on that provider are broken, so a sibling can't help and the
       main-agent-model safety net should be reached instead.
+
+    ``attempted_indices`` carries the candidates already considered across
+    repeated walks.  When present, it is authoritative over ``start_index``
+    so Codex prioritization cannot turn a declaration index into a skipped
+    earlier fallback.
 
     Returns:
         (client, model, provider_label) or (None, None, "") if no fallback.
@@ -5875,7 +5881,12 @@ def _try_configured_fallback_chain(
     min_ctx = _task_minimum_context_length(task)
     codex_skip_reason = None
 
-    candidate_indices = list(range(start_index, len(chain)))
+    if attempted_indices is None:
+        candidate_indices = list(range(start_index, len(chain)))
+    else:
+        candidate_indices = [
+            i for i in range(len(chain)) if i not in attempted_indices
+        ]
     codex_indices = [
         i for i in candidate_indices
         if isinstance(chain[i], dict)
@@ -5889,6 +5900,8 @@ def _try_configured_fallback_chain(
     ]
 
     for i in candidate_indices:
+        if attempted_indices is not None:
+            attempted_indices.add(i)
         entry = chain[i]
         if not isinstance(entry, dict):
             continue
@@ -10475,9 +10488,11 @@ def _call_llm_impl_unscoped(
             #   2. For auto: top-level main fallback_providers/fallback_model
             #   3. For auto: built-in auxiliary discovery chain
             #   4. For explicit aux providers: main agent model safety net
+            configured_attempted_indices: set[int] = set()
             fb_client, fb_model, fb_label = _try_configured_fallback_chain(
                 task, resolved_provider or "auto", reason=reason,
-                failed_model=_chain_failed_model, route_info=route_info)
+                failed_model=_chain_failed_model, route_info=route_info,
+                attempted_indices=configured_attempted_indices)
             while fb_client is not None:
                 _record_route_info(
                     route_info, _fallback_provider_from_label(fb_label), fb_model,
@@ -10505,7 +10520,8 @@ def _call_llm_impl_unscoped(
                 fb_client, fb_model, fb_label = _try_configured_fallback_chain(
                     task, resolved_provider or "auto", reason=reason,
                     failed_model=_chain_failed_model, start_index=next_index,
-                    route_info=route_info)
+                    route_info=route_info,
+                    attempted_indices=configured_attempted_indices)
 
             if is_auto:
                 fb_client, fb_model, fb_label = _try_main_fallback_chain(
@@ -11272,9 +11288,11 @@ async def _async_call_llm_impl_unscoped(
             #   2. For auto: top-level main fallback_providers/fallback_model
             #   3. For auto: built-in auxiliary discovery chain
             #   4. For explicit aux providers: main agent model safety net
+            configured_attempted_indices: set[int] = set()
             fb_client, fb_model, fb_label = _try_configured_fallback_chain(
                 task, resolved_provider or "auto", reason=reason,
-                failed_model=_chain_failed_model, route_info=route_info)
+                failed_model=_chain_failed_model, route_info=route_info,
+                attempted_indices=configured_attempted_indices)
             while fb_client is not None:
                 async_fb, async_fb_model = _to_async_client(
                     fb_client, fb_model or "", is_vision=(task == "vision")
@@ -11307,7 +11325,8 @@ async def _async_call_llm_impl_unscoped(
                 fb_client, fb_model, fb_label = _try_configured_fallback_chain(
                     task, resolved_provider or "auto", reason=reason,
                     failed_model=_chain_failed_model, start_index=next_index,
-                    route_info=route_info)
+                    route_info=route_info,
+                    attempted_indices=configured_attempted_indices)
 
             if is_auto:
                 fb_client, fb_model, fb_label = _try_main_fallback_chain(

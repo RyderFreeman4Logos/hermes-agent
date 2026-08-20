@@ -17,6 +17,7 @@ from unittest.mock import MagicMock, patch
 from tools.process_registry import (
     ProcessRegistry,
     ProcessSession,
+    format_process_notification,
 )
 
 
@@ -172,6 +173,48 @@ class TestCompletionQueue:
             registry._move_to_finished(session)
 
         assert len(registry.drain_notifications()) == 1
+
+    @staticmethod
+    def _canonical_delegated_child_completion():
+        return {
+            "type": "completion",
+            "session_id": "proc_child",
+            "command": "echo child",
+            "started_at": 1.0,
+            "exit_code": 0,
+            "completion_reason": "exited",
+            "termination_source": "",
+            "delegated_child": True,
+        }
+
+    def test_routine_delegated_child_suppresses_canonical_envelope(self):
+        assert format_process_notification(self._canonical_delegated_child_completion()) is None
+
+    @pytest.mark.parametrize(
+        ("name", "changes", "missing_fields"),
+        (
+            ("boolean_exit", {"exit_code": False}, ()),
+            ("float_exit", {"exit_code": 0.0}, ()),
+            ("missing_reason", {}, ("completion_reason",)),
+            ("unknown_reason", {"completion_reason": "unknown"}, ()),
+            ("missing_termination_source", {}, ("termination_source",)),
+            ("unknown_termination_source", {"termination_source": "unknown"}, ()),
+            ("missing_session_id", {}, ("session_id",)),
+            ("empty_session_id", {"session_id": ""}, ()),
+            ("missing_command", {}, ("command",)),
+            ("empty_command", {"command": ""}, ()),
+            ("missing_started_at", {}, ("started_at",)),
+            ("boolean_started_at", {"started_at": True}, ()),
+            ("unknown_provenance", {"delegated_child": None}, ()),
+        ),
+    )
+    def test_malformed_delegated_child_completion_fails_open(
+        self, name, changes, missing_fields
+    ):
+        event = {**self._canonical_delegated_child_completion(), **changes}
+        for field in missing_fields:
+            event.pop(field)
+        assert format_process_notification(event) is not None, name
 
     def test_spawn_local_queues_notify_when_reader_finishes_immediately(
         self, registry, monkeypatch

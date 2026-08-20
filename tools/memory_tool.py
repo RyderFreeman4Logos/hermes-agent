@@ -1143,8 +1143,18 @@ def memory_tool(
     return json.dumps(result, ensure_ascii=False)
 
 
+def get_memory_provider_mode(memory_config: Optional[Dict[str, Any]] = None) -> str:
+    """Return the profile's frozen memory routing mode.
+
+    Unknown and legacy values deliberately keep the historical hybrid/mirror
+    behavior. Authoritative routing is opt-in only.
+    """
+    mode = str((memory_config or {}).get("provider_mode", "hybrid") or "hybrid").strip().lower()
+    return "authoritative" if mode == "authoritative" else "hybrid"
+
+
 def check_memory_requirements() -> bool:
-    """Expose the built-in memory tool only when built-in memory is enabled."""
+    """Expose the core memory tool for built-in or authoritative storage."""
     try:
         from hermes_cli.config import load_config
 
@@ -1152,7 +1162,8 @@ def check_memory_requirements() -> bool:
     except Exception:
         return False
     return bool(
-        memory_config.get("memory_enabled")
+        get_memory_provider_mode(memory_config) == "authoritative"
+        or memory_config.get("memory_enabled")
         or memory_config.get("user_profile_enabled")
     )
 

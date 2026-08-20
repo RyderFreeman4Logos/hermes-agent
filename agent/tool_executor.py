@@ -2079,18 +2079,38 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 target = next_args.get("target", "memory")
                 operations = next_args.get("operations")
                 from tools.memory_tool import memory_tool as _memory_tool
-                result = _memory_tool(
-                    action=next_args.get("action"),
-                    target=target,
-                    content=next_args.get("content"),
-                    old_text=next_args.get("old_text"),
-                    operations=operations,
-                    store=agent._memory_store,
-                )
+                if getattr(agent, "_memory_provider_mode", "hybrid") == "authoritative":
+                    if agent._memory_manager:
+                        result = agent._memory_manager.authoritative_memory_write(
+                            next_args,
+                            metadata=agent._build_memory_write_metadata(
+                                task_id=effective_task_id,
+                                tool_call_id=getattr(tool_call, "id", None),
+                            ),
+                        )
+                    else:
+                        result = json.dumps({
+                            "success": False,
+                            "error": "Authoritative memory provider is unavailable.",
+                            "error_class": "provider_unavailable",
+                            "provider_mode": "authoritative",
+                        })
+                else:
+                    result = _memory_tool(
+                        action=next_args.get("action"),
+                        target=target,
+                        content=next_args.get("content"),
+                        old_text=next_args.get("old_text"),
+                        operations=operations,
+                        store=agent._memory_store,
+                    )
                 # Mirror successful built-in memory writes to external
                 # providers. All gating/op-expansion lives behind the manager
                 # interface (MemoryManager.notify_memory_tool_write).
-                if agent._memory_manager:
+                if (
+                    getattr(agent, "_memory_provider_mode", "hybrid") != "authoritative"
+                    and agent._memory_manager
+                ):
                     agent._memory_manager.notify_memory_tool_write(
                         result,
                         next_args,

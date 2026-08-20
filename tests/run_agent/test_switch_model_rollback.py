@@ -17,6 +17,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from hermes_cli.model_switch import (
+    ModelSwitchResult,
+    get_model_switch_after_compression,
+    schedule_model_switch_after_compression,
+)
 from run_agent import AIAgent
 
 
@@ -202,3 +207,101 @@ def test_successful_switch_still_works_after_rollback_refactor():
     assert agent.provider == "openrouter"
     assert agent.api_key == "or-key-new"
     assert agent.client is new_client
+
+
+def _schedule_deferred(agent):
+    result = ModelSwitchResult(
+        success=True,
+        new_model="later-model",
+        target_provider="later-provider",
+        api_key="later-key",
+        base_url="https://later.example/v1",
+        api_mode="chat_completions",
+    )
+    schedule_model_switch_after_compression(agent, result)
+    return result
+
+
+def test_successful_immediate_switch_cancels_deferred_intent():
+    agent = _make_agent_openrouter()
+    _schedule_deferred(agent)
+    agent._create_openai_client = lambda *_a, **_kw: MagicMock()
+
+    with patch("hermes_cli.timeouts.get_provider_request_timeout", return_value=None):
+        agent.switch_model(
+            new_model="immediate-model",
+            new_provider="openrouter",
+            api_key="immediate-key",
+            base_url="https://openrouter.ai/api/v1",
+            api_mode="chat_completions",
+        )
+
+    assert get_model_switch_after_compression(agent) is None
+
+
+def test_failed_immediate_switch_keeps_deferred_intent():
+    agent = _make_agent_openrouter()
+    pending = _schedule_deferred(agent)
+    agent._create_openai_client = MagicMock(
+        side_effect=RuntimeError("simulated immediate failure")
+    )
+
+    with patch("hermes_cli.timeouts.get_provider_request_timeout", return_value=None):
+        with pytest.raises(RuntimeError, match="simulated immediate failure"):
+            agent.switch_model(
+                new_model="broken-model",
+                new_provider="openrouter",
+                api_key="broken-key",
+                base_url="https://openrouter.ai/api/v1",
+                api_mode="chat_completions",
+            )
+
+    assert get_model_switch_after_compression(agent) is pending
+
+
+def test_deferred_apply_uses_scheduled_runtime_metadata_only():
+    from types import SimpleNamespace
+
+    from hermes_cli.model_switch import apply_model_switch_after_compression
+
+    agent = _make_agent_openrouter()
+    agent._invalidate_system_prompt = lambda: None
+    agent._build_system_prompt = lambda system_message=None: "prompt"
+    agent.context_compressor = SimpleNamespace(
+        context_length=32_000,
+        threshold_tokens=24_000,
+        update_model=lambda **values: agent.context_compressor.__dict__.update(values),
+    )
+    pending = ModelSwitchResult(
+        success=True,
+        new_model="openai/gpt-4o-mini",
+        target_provider="openrouter",
+        api_key="new-key",
+        base_url="https://openrouter.ai/api/v1",
+        context_length=128_000,
+        reasoning_config={"effort": "low"},
+    )
+    schedule_model_switch_after_compression(agent, pending)
+
+    with (
+        patch(
+            "agent.model_metadata.get_model_context_length",
+            side_effect=AssertionError("boundary context resolver"),
+        ),
+        patch(
+            "hermes_constants.resolve_reasoning_config",
+            side_effect=AssertionError("boundary reasoning resolver"),
+        ),
+        patch.object(
+            agent,
+            "_ensure_lmstudio_runtime_loaded",
+            side_effect=AssertionError("boundary provider prewarm"),
+            create=True,
+        ),
+    ):
+        status = apply_model_switch_after_compression(agent)
+
+    assert status == "applied"
+    assert agent.model == "openai/gpt-4o-mini"
+    assert agent.context_compressor.context_length == 128_000
+    assert agent.reasoning_config == {"effort": "low"}

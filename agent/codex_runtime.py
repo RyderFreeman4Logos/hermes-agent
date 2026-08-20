@@ -89,20 +89,35 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
                 )
         return {}
 
-    from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
+    from agent.usage_pricing import CanonicalUsage, estimate_usage_cost, normalize_usage
 
+    has_cached_input_tokens = (
+        "cachedInputTokens" in usage and usage["cachedInputTokens"] is not None
+    )
     input_tokens = _coerce_usage_int(usage.get("inputTokens"))
     cache_read_tokens = _coerce_usage_int(usage.get("cachedInputTokens"))
     output_tokens = _coerce_usage_int(usage.get("outputTokens"))
     reasoning_tokens = _coerce_usage_int(usage.get("reasoningOutputTokens"))
     reported_total = _coerce_usage_int(usage.get("totalTokens"))
 
+    normalized_usage = normalize_usage(
+        SimpleNamespace(
+            input_tokens=input_tokens,
+            cached_input_tokens=cache_read_tokens
+            if has_cached_input_tokens else None,
+            output_tokens=output_tokens,
+            output_tokens_details=SimpleNamespace(reasoning_tokens=reasoning_tokens),
+        ),
+        provider=agent.provider,
+        api_mode="codex_app_server",
+    )
     canonical_usage = CanonicalUsage(
-        input_tokens=input_tokens,
-        output_tokens=output_tokens,
-        cache_read_tokens=cache_read_tokens,
-        cache_write_tokens=0,
-        reasoning_tokens=reasoning_tokens,
+        input_tokens=normalized_usage.input_tokens,
+        output_tokens=normalized_usage.output_tokens,
+        cache_read_tokens=normalized_usage.cache_read_tokens,
+        cache_write_tokens=normalized_usage.cache_write_tokens,
+        reasoning_tokens=normalized_usage.reasoning_tokens,
+        cache_telemetry=normalized_usage.cache_telemetry,
         raw_usage=usage,
     )
     prompt_tokens = canonical_usage.prompt_tokens
@@ -116,6 +131,7 @@ def _record_codex_app_server_usage(agent, turn) -> dict[str, Any]:
         "output_tokens": canonical_usage.output_tokens,
         "cache_read_tokens": canonical_usage.cache_read_tokens,
         "cache_write_tokens": canonical_usage.cache_write_tokens,
+        "cache_telemetry": canonical_usage.cache_telemetry,
         "reasoning_tokens": canonical_usage.reasoning_tokens,
     }
 

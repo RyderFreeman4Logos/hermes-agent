@@ -1118,14 +1118,15 @@ def normalize_usage(
 ) -> CanonicalUsage:
     """Normalize raw API response usage into canonical token buckets.
 
-    Handles three API shapes:
+    Handles four API shapes:
     - Anthropic: input_tokens/output_tokens/cache_read_input_tokens/cache_creation_input_tokens
     - Codex Responses: input_tokens includes cache tokens; input_tokens_details.cached_tokens separates them
+    - Codex app-server: input_tokens is uncached; cached_input_tokens is the cache-read bucket
     - OpenAI Chat Completions: prompt_tokens includes cache tokens; prompt_tokens_details.cached_tokens separates them
 
-    In both Codex and OpenAI modes, input_tokens is derived by subtracting cache
-    tokens from the total — the API contract is that input/prompt totals include
-    cached tokens and the details object breaks them out.
+    For Codex Responses and OpenAI modes, input_tokens is derived by subtracting
+    cache tokens from the total — those API contracts report input/prompt totals
+    that include cached tokens and details break them out.
     """
     if not response_usage:
         return CanonicalUsage()
@@ -1159,6 +1160,16 @@ def normalize_usage(
         output_tokens = _to_int(getattr(response_usage, "output_tokens", 0))
         cache_read_tokens = _to_int(getattr(response_usage, "cache_read_input_tokens", 0))
         cache_write_tokens = _to_int(getattr(response_usage, "cache_creation_input_tokens", 0))
+    elif mode == "codex_app_server":
+        input_tokens = _to_int(getattr(response_usage, "input_tokens", 0))
+        output_tokens = _to_int(getattr(response_usage, "output_tokens", 0))
+        cache_telemetry = (
+            "reported"
+            if has_field(response_usage, "cached_input_tokens")
+            else "unavailable"
+        )
+        cache_read_tokens = _to_int(getattr(response_usage, "cached_input_tokens", 0))
+        cache_write_tokens = 0
     elif mode == "codex_responses":
         input_total = _to_int(getattr(response_usage, "input_tokens", 0))
         output_tokens = _to_int(getattr(response_usage, "output_tokens", 0))

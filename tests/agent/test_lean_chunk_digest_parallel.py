@@ -13,10 +13,8 @@ def test_lean_chunk_digests_overlap_and_keep_segment_order():
     active = 0
     max_active = 0
     lock = threading.Lock()
-    started = threading.Event()
-    release = threading.Event()
 
-    def fake_call_llm(*, messages, task, max_tokens):
+    def fake_call_llm(*, messages, task, max_tokens, **kwargs):
         nonlocal active, max_active
         assert task == "compression"
         content = messages[0]["content"]
@@ -25,28 +23,26 @@ def test_lean_chunk_digests_overlap_and_keep_segment_order():
             active += 1
             if active > max_active:
                 max_active = active
-            if active >= 2:
-                started.set()
         try:
-            if is_first:
-                # First segment stays in-flight until the later one has started
-                # (and then a beat longer) so finish order is 2 then 1.
-                assert started.wait(timeout=2), "second chunk never overlapped"
-                time.sleep(0.05)
-            else:
-                release.set()
-                time.sleep(0.01)
+            # The first chunk is the route probe; sibling chunks overlap after
+            # the probe so throughput remains parallel without primary re-hits.
+            time.sleep(0.05 if is_first else 0.01)
         finally:
             with lock:
                 active -= 1
         resp = MagicMock()
         resp.choices = [MagicMock()]
-        resp.choices[0].message.content = "DIGEST-A" if is_first else "DIGEST-B"
+        resp.choices[0].message.content = (
+            "DIGEST-A" if is_first
+            else "DIGEST-B" if "MARKER-B" in content
+            else "DIGEST-C"
+        )
         return resp
 
     turns = [
         {"role": "user", "content": "MARKER-A " + ("aaaa " * 20)},
         {"role": "user", "content": "MARKER-B " + ("bbbb " * 20)},
+        {"role": "user", "content": "MARKER-C " + ("cccc " * 20)},
     ]
     compressor = ContextCompressor("test/model", quiet_mode=True, tail_mode="lean")
 
@@ -81,7 +77,7 @@ def test_lean_chunk_digests_keep_session_contextvars_on_workers():
     seen: list[dict] = []
     lock = threading.Lock()
 
-    def fake_call_llm(*, messages, task, max_tokens):
+    def fake_call_llm(*, messages, task, max_tokens, **kwargs):
         with lock:
             seen.append({
                 "is_worker": threading.current_thread() is not threading.main_thread(),
@@ -160,7 +156,7 @@ def test_lean_chunk_digests_never_exceed_configured_max_concurrency():
     max_active = 0
     lock = threading.Lock()
 
-    def fake_call_llm(*, messages, task, max_tokens):
+    def fake_call_llm(*, messages, task, max_tokens, **kwargs):
         nonlocal active, max_active
         assert task == "compression"
         with lock:
@@ -197,7 +193,7 @@ def test_lean_chunk_digests_never_exceed_configured_max_concurrency():
 
 def test_lean_chunk_digests_isolate_one_chunk_failure():
     """One raising chunk keeps the existing placeholder; others stay real."""
-    def fake_call_llm(*, messages, task, max_tokens):
+    def fake_call_llm(*, messages, task, max_tokens, **kwargs):
         assert task == "compression"
         if "MARKER-B" in messages[0]["content"]:
             raise RuntimeError("boom-middle")
@@ -237,7 +233,7 @@ def test_lean_chunk_digests_serial_when_max_concurrency_is_1():
     lock = threading.Lock()
     order: list[str] = []
 
-    def fake_call_llm(*, messages, task, max_tokens):
+    def fake_call_llm(*, messages, task, max_tokens, **kwargs):
         nonlocal active, max_active
         assert task == "compression"
         body = _digest_body(messages)
@@ -273,10 +269,65 @@ def test_lean_chunk_digests_serial_when_max_concurrency_is_1():
     assert out.find("DIGEST-A") < out.find("DIGEST-B") < out.find("DIGEST-C")
 
 
+def test_lean_chunk_digests_reuse_selected_fallback_route():
+    """Sibling chunks use the route selected after the primary model fails."""
+    calls: list[dict] = []
+
+    def fake_call_llm(*, messages, task, max_tokens, **kwargs):
+        assert task == "compression"
+        calls.append(kwargs)
+        route = kwargs.get("provider"), kwargs.get("model")
+        route_info = kwargs.get("route_info")
+        if route_info is not None:
+            route_info.update(provider="openai-codex", model="gpt-5.6-luna")
+        if route == ("openai-codex", "gpt-5.6-luna"):
+            label = "FALLBACK"
+        else:
+            # This stands in for call_llm's real primary-400 → fallback result.
+            label = "FALLBACK" if not calls[:-1] else "PRIMARY-REHIT"
+        resp = MagicMock()
+        resp.choices = [MagicMock()]
+        resp.choices[0].message.content = label
+        return resp
+
+    turns = [
+        {"role": "user", "content": "MARKER-A " + ("aaaa " * 20)},
+        {"role": "user", "content": "MARKER-B " + ("bbbb " * 20)},
+        {"role": "user", "content": "MARKER-C " + ("cccc " * 20)},
+    ]
+    compressor = ContextCompressor("test/model", quiet_mode=True, tail_mode="lean")
+
+    with (
+        patch("agent.context_compressor._LEAN_DIGEST_CHUNK_CHARS", 40),
+        patch("agent.auxiliary_client.call_llm", fake_call_llm),
+        patch(
+            "agent.auxiliary_client._get_task_max_concurrency",
+            return_value=5,
+        ),
+    ):
+        out = compressor._build_chunk_digests(turns)
+
+    assert "provider" not in calls[0]
+    assert calls[0]["route_info"] == {
+        "provider": "openai-codex",
+        "model": "gpt-5.6-luna",
+    }
+    assert len(calls) > 1
+    assert all(
+        call.get("provider") == "openai-codex"
+        and call.get("model") == "gpt-5.6-luna"
+        for call in calls[1:]
+    )
+    assert "PRIMARY-REHIT" not in out
+    assert out.count("FALLBACK") == len(calls)
+
+
 def test_lean_harvest_cancel_keeps_slots_and_lean_recovery():
     """Queued Future.cancel() still yields 1/N..N/N; augment keeps users/recovery."""
     compressor = ContextCompressor("test/model", quiet_mode=True, tail_mode="lean")
-    turns = _three_marker_turns()
+    turns = _three_marker_turns() + [
+        {"role": "user", "content": "MARKER-D " + ("D" * 70)},
+    ]
     from concurrent.futures import ThreadPoolExecutor
 
     two_started = threading.Event()
@@ -294,17 +345,24 @@ def test_lean_harvest_cancel_keeps_slots_and_lean_recovery():
             submitted_three.set()
         return fut
 
-    def fake_call_llm(*, messages, task, max_tokens):
+    def fake_call_llm(*, messages, task, max_tokens, **kwargs):
         nonlocal in_flight
         assert task == "compression"
-        with lock:
-            in_flight += 1
-            if in_flight >= 2:
-                two_started.set()
-        assert hold.wait(timeout=2), "queued cancel never released workers"
+        content = messages[0]["content"]
+        if "MARKER-A" in content:
+            body = "DIGEST-A"
+        else:
+            with lock:
+                in_flight += 1
+                if in_flight >= 2:
+                    two_started.set()
+            assert hold.wait(timeout=2), "queued cancel never released workers"
+            with lock:
+                in_flight -= 1
+            body = _digest_body(messages)
         resp = MagicMock()
         resp.choices = [MagicMock()]
-        resp.choices[0].message.content = _digest_body(messages)
+        resp.choices[0].message.content = body
         return resp
 
     def cancel_queued():
@@ -333,13 +391,14 @@ def test_lean_harvest_cancel_keeps_slots_and_lean_recovery():
 
     assert out.startswith("KEEP-SUMMARY")
     headers = _segment_headers(out)
-    assert headers == [("1", "3"), ("2", "3"), ("3", "3")]
+    assert headers == [("1", "4"), ("2", "4"), ("3", "4"), ("4", "4")]
     assert "DIGEST-A" in out
     assert "DIGEST-B" in out
-    assert "[digest unavailable for segment 3/3" in out
+    assert "DIGEST-C" in out
+    assert "[digest unavailable for segment 4/4" in out
     assert "recover via session_search" in out
     assert "## User Messages (verbatim, newest first)" in out
-    assert "MARKER-C" in out
+    assert "MARKER-D" in out
     assert "## Context Recovery" in out
     assert "session_id='sess-137-harvest'" in out
 
@@ -352,7 +411,7 @@ def test_lean_chunk_digests_keep_slots_when_worker_raises_baseexception():
         pass
 
     for boom in (AuxiliaryExplicitCancellation(), WorkerFatal("worker-fatal")):
-        def fake_call_llm(*, messages, task, max_tokens, _boom=boom):
+        def fake_call_llm(*, messages, task, max_tokens, _boom=boom, **kwargs):
             assert task == "compression"
             if "MARKER-B" in messages[0]["content"]:
                 raise _boom

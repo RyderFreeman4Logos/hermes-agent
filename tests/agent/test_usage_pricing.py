@@ -766,3 +766,30 @@ def test_normalize_usage_nested_details_win_over_qwen_flat_top_level():
 
     assert normalized.cache_read_tokens == 900
     assert normalized.input_tokens == 1100
+
+
+def test_normalize_usage_marks_missing_cache_telemetry_unavailable():
+    normalized = normalize_usage(
+        SimpleNamespace(prompt_tokens=1000, completion_tokens=100),
+        provider="openai",
+        api_mode="chat_completions",
+    )
+
+    assert normalized.cache_read_tokens == 0
+    assert normalized.cache_write_tokens == 0
+    assert normalized.cache_telemetry == "unavailable"
+
+
+def test_normalize_usage_marks_explicit_zero_cache_telemetry_reported():
+    normalized = normalize_usage(
+        SimpleNamespace(
+            prompt_tokens=1000,
+            completion_tokens=100,
+            prompt_tokens_details=SimpleNamespace(cached_tokens=0),
+        ),
+        provider="openai",
+        api_mode="chat_completions",
+    )
+
+    assert normalized.cache_read_tokens == 0
+    assert normalized.cache_telemetry == "reported"

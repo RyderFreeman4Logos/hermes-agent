@@ -25,6 +25,26 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+_VALID_MEMORY_PROVIDER_MODES = frozenset({"authoritative", "hybrid"})
+
+
+def _session_memory_provider_mode(agent: Any) -> str | None:
+    init_config = getattr(agent, "_session_init_model_config", None)
+    if isinstance(init_config, dict):
+        mode = init_config.get("memory_provider_mode")
+        if mode in _VALID_MEMORY_PROVIDER_MODES:
+            return mode
+    mode = getattr(agent, "_memory_provider_mode", None)
+    return mode if mode in _VALID_MEMORY_PROVIDER_MODES else None
+
+
+def _merge_session_memory_provider_mode(model_config: dict, agent: Any) -> dict:
+    merged = dict(model_config)
+    mode = _session_memory_provider_mode(agent)
+    if mode is not None:
+        merged["memory_provider_mode"] = mode
+    return merged
+
 
 def _translate_acp_cwd(cwd: str) -> str:
     """Translate Windows ACP cwd values when Hermes itself is running in WSL.
@@ -253,6 +273,7 @@ class SessionManager:
             session_id=new_id,
             cwd=cwd,
             model=original.model or None,
+            memory_provider_mode_override=_session_memory_provider_mode(original.agent),
         )
         state = SessionState(
             session_id=new_id,
@@ -431,22 +452,35 @@ class SessionManager:
             session_meta["base_url"] = base_url.strip()
         if isinstance(api_mode, str) and api_mode.strip():
             session_meta["api_mode"] = api_mode.strip()
-        cwd_json = json.dumps(session_meta)
-
         try:
             # Ensure the session record exists.
             existing = db.get_session(state.session_id)
             if existing is None:
+                model_config = _merge_session_memory_provider_mode(
+                    session_meta, state.agent
+                )
                 db.create_session(
                     session_id=state.session_id,
                     source="acp",
                     model=model_str,
-                    model_config={"cwd": state.cwd},
+                    model_config=model_config,
                 )
             else:
-                # Update model_config (contains cwd) if changed.
+                existing_config = existing.get("model_config")
+                if isinstance(existing_config, str):
+                    try:
+                        existing_config = json.loads(existing_config)
+                    except (json.JSONDecodeError, TypeError):
+                        existing_config = {}
+                if not isinstance(existing_config, dict):
+                    existing_config = {}
+                model_config = _merge_session_memory_provider_mode(
+                    {**existing_config, **session_meta}, state.agent
+                )
                 try:
-                    db.update_session_meta(state.session_id, cwd_json, model_str)
+                    db.update_session_meta(
+                        state.session_id, json.dumps(model_config), model_str
+                    )
                 except Exception:
                     logger.debug("Failed to update ACP session metadata", exc_info=True)
 

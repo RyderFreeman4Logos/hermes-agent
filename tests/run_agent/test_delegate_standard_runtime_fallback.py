@@ -85,14 +85,21 @@ def _common_patches(agent):
     )
 
 
-def test_standard_child_429_advances_without_pool_retry_or_cooldown():
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Weekly usage limit reached",
+        "usage limit has been reached",
+    ],
+)
+def test_standard_child_terminal_quota_429_advances_without_pool_retry_or_cooldown(message):
     agent = _make_standard_child(max_retries=3)
     calls = []
 
     def api_call(_kwargs):
         calls.append((agent.provider, agent.model))
         if len(calls) == 1:
-            raise _HTTPError(429, "quota exhausted")
+            raise _HTTPError(429, message)
         return _response("fallback result")
 
     pool_recovery = MagicMock(return_value=(True, True))

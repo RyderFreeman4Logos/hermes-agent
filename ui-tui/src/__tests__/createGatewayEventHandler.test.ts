@@ -193,56 +193,34 @@ describe('createGatewayEventHandler', () => {
     expect(getUiState().status).toBe('cache 95%')
   })
 
-  it('keeps cache_hit status through restore, complete, and waiting-for-input', () => {
-    const onEvent = createGatewayEventHandler(buildCtx([]))
+  it('does not put cache-hit rates on the status bar', () => {
+    const appended: Msg[] = []
+    const ctx = buildCtx(appended)
+    const onEvent = createGatewayEventHandler(ctx)
 
-    vi.useFakeTimers()
+    onEvent({
+      payload: { kind: 'cache_hit', text: 'cache 87%' },
+      type: 'status.update'
+    } as any)
 
-    try {
-      onEvent({ payload: {}, type: 'message.start' } as any)
-      onEvent({ payload: { kind: 'cache_hit', text: 'cache 95%' }, type: 'status.update' } as any)
-      expect(getUiState().status).toBe('cache 95%')
-
-      vi.advanceTimersByTime(4000)
-      expect(getUiState().status).toBe('cache 95%')
-
-      onEvent({ payload: { text: 'done' }, type: 'message.complete' } as any)
-      expect(getUiState().status).toBe('cache 95%')
-
-      onEvent({
-        payload: { choices: ['a'], question: 'pick', request_id: 'q1' },
-        type: 'clarify.request'
-      } as any)
-      expect(getUiState().status).toBe('cache 95%')
-    } finally {
-      vi.useRealTimers()
-    }
+    expect(getUiState().status).not.toBe('cache 87%')
+    expect(ctx.system.sys).not.toHaveBeenCalled()
+    expect(appended).toHaveLength(0)
   })
 
-  it('keeps cache unavailable status through restore, complete, and waiting-for-input', () => {
-    const onEvent = createGatewayEventHandler(buildCtx([]))
+  it('does not put unavailable cache status on the status bar', () => {
+    const appended: Msg[] = []
+    const ctx = buildCtx(appended)
+    const onEvent = createGatewayEventHandler(ctx)
 
-    vi.useFakeTimers()
+    onEvent({
+      payload: { kind: 'cache_hit', text: 'cache unavailable' },
+      type: 'status.update'
+    } as any)
 
-    try {
-      onEvent({ payload: {}, type: 'message.start' } as any)
-      onEvent({ payload: { kind: 'cache_hit', text: 'cache unavailable' }, type: 'status.update' } as any)
-      expect(getUiState().status).toBe('cache unavailable')
-
-      vi.advanceTimersByTime(4000)
-      expect(getUiState().status).toBe('cache unavailable')
-
-      onEvent({ payload: { text: 'done' }, type: 'message.complete' } as any)
-      expect(getUiState().status).toBe('cache unavailable')
-
-      onEvent({
-        payload: { choices: ['a'], question: 'pick', request_id: 'q1' },
-        type: 'clarify.request'
-      } as any)
-      expect(getUiState().status).toBe('cache unavailable')
-    } finally {
-      vi.useRealTimers()
-    }
+    expect(getUiState().status).not.toBe('cache unavailable')
+    expect(ctx.system.sys).not.toHaveBeenCalled()
+    expect(appended).toHaveLength(0)
   })
 
   it('prints compaction progress status into the transcript', () => {

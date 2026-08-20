@@ -849,11 +849,11 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
           return
         }
 
-        setStatus(p.text)
-
         if (p.kind === 'cache_hit') {
           return
         }
+
+        setStatus(p.text)
 
         if (p.kind === 'compressing') {
           sys(p.text)

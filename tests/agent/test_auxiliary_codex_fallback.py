@@ -364,6 +364,80 @@ def test_codex_skip_reason_is_scalar_when_unavailable():
     assert route_info["codex_skip_reason"] == "unavailable"
 
 
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_auto_route_never_returns_non_codex_discovery(async_mode):
+    """Auto provider resolution must fail closed when only pm is available."""
+    pm_client = _client(_SyncCompletions(text="pm"), "https://pm.invalid/v1")
+    runtime = {"provider": "qwen", "model": "qwen-model"}
+    real_resolve = aux.resolve_provider_client
+
+    def resolve_dispatch(provider, *args, **kwargs):
+        if provider == "auto":
+            return real_resolve(provider, *args, **kwargs)
+        return None, None
+
+    with (
+        patch.object(aux, "resolve_provider_client", side_effect=resolve_dispatch),
+        patch.object(aux, "_try_configured_fallback_chain", return_value=(None, None, "")),
+        patch.object(aux, "_try_main_fallback_chain", return_value=(None, None, "")),
+        patch.object(
+            aux,
+            "_get_provider_chain",
+            return_value=[("pm", lambda: (pm_client, "pm-model"))],
+        ),
+        patch.object(aux, "_is_provider_unhealthy", return_value=False),
+    ):
+        client, model = real_resolve(
+            "auto", async_mode=async_mode, main_runtime=runtime,
+        )
+
+    assert client is None
+    assert model is None
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_vision_auto_never_returns_non_codex_fallback(async_mode):
+    """Vision auto must fail closed rather than return OpenRouter or Grok."""
+    non_codex_client = _client(
+        _SyncCompletions(text="non-codex"), "https://openrouter.invalid/v1"
+    )
+    runtime = {"provider": "qwen", "model": "qwen-vision-model"}
+    seen = []
+
+    def fake_strict(provider, model=None):
+        seen.append(provider)
+        if provider == "openai-codex":
+            return None, None
+        return non_codex_client, f"{provider}-vision-model"
+
+    with (
+        patch.object(
+            aux,
+            "_resolve_task_provider_model",
+            return_value=("auto", None, None, None, None),
+        ),
+        patch.object(aux, "_read_main_provider", return_value="qwen"),
+        patch.object(aux, "_read_main_model", return_value="qwen-vision-model"),
+        patch.object(aux, "_resolve_provider_vision_default", return_value=None),
+        patch.object(aux, "_main_model_supports_vision", return_value=False),
+        patch.object(aux, "_resolve_strict_vision_backend", side_effect=fake_strict),
+        patch.object(
+            aux,
+            "_to_async_client",
+            side_effect=lambda client, model, is_vision=False: (client, model),
+        ),
+    ):
+        provider, client, model = aux.resolve_vision_provider_client(
+            provider="auto", async_mode=async_mode, main_runtime=runtime,
+        )
+
+    assert (provider, client, model) == (None, None, None)
+    assert "openai-codex" in seen
+    assert not set(seen) & {
+        "openrouter", "nous", "deepinfra", "pm", "localrouter",
+    }
+
+
 def test_lean_digest_workers_reuse_selected_codex_route_settings():
     """Parallel lean workers carry the selected entry-owned route controls."""
     calls = []

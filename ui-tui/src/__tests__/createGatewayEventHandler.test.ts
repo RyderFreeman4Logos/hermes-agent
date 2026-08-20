@@ -2068,6 +2068,34 @@ describe('createGatewayEventHandler', () => {
       expect(assistantMsgs).toEqual([{ role: 'assistant', text: 'same reply' }])
     })
 
+    it('preserves a prefix-distinct final after commentary', () => {
+      const appended: Msg[] = []
+      const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+      onEvent({ payload: {}, type: 'message.start' } as any)
+      onEvent({ payload: { already_streamed: true, text: 'progress' }, type: 'message.interim' } as any)
+      onEvent({ payload: { text: 'progress complete' }, type: 'message.complete' } as any)
+
+      expect(appended.filter(m => m.role === 'assistant' && m.text).map(m => m.text)).toEqual([
+        'progress',
+        'progress complete'
+      ])
+    })
+
+    it('preserves a trailing-whitespace-distinct final after commentary', () => {
+      const appended: Msg[] = []
+      const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+      onEvent({ payload: {}, type: 'message.start' } as any)
+      onEvent({ payload: { already_streamed: true, text: 'same reply  ' }, type: 'message.interim' } as any)
+      onEvent({ payload: { text: 'same reply' }, type: 'message.complete' } as any)
+
+      expect(appended.filter(m => m.role === 'assistant' && m.text).map(m => m.text)).toEqual([
+        'same reply  ',
+        'same reply'
+      ])
+    })
+
     it('settles identical terminal reply onto interim when response_previewed', () => {
       const appended: Msg[] = []
       const onEvent = createGatewayEventHandler(buildCtx(appended))

@@ -651,10 +651,13 @@ class TurnController {
     // only when the gateway elected not to send any (#16391).
     const rawText = (payload.text ?? payload.rendered ?? this.bufRef).trimStart()
     const split = splitReasoning(rawText)
-    // A commentary interim and its final belong to the same turn, so remove
-    // the commentary prefix when the final repeats it. `startMessage()` resets
-    // segments at each turn boundary, preserving identical replies in later turns.
-    const finalText = finalTail(split.text, this.segmentMessages)
+    // Sealed commentary is separate from streamed post-interim segments: only
+    // byte-identical commentary/final pairs collapse, while post-interim tails
+    // retain their existing prefix handling.
+    const interimBoundary = this.interimBoundaryIndex ?? 0
+    const finalText = textSegments(this.segmentMessages.slice(0, interimBoundary)).includes(split.text)
+      ? ''
+      : finalTail(split.text, this.segmentMessages.slice(interimBoundary))
     const existingReasoning = this.reasoningText.trim() || String(payload.reasoning ?? '').trim()
     const savedReasoning = [existingReasoning, existingReasoning ? '' : split.reasoning].filter(Boolean).join('\n\n')
     const savedToolTokens = this.toolTokenAcc

@@ -4234,18 +4234,29 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             )
             return f"### Segment {ci + 1}/{n_chunks}\n{body}"
 
-        def _digest_one(ci: int, segment: str) -> str:
+        def _digest_one(
+            ci: int,
+            segment: str,
+            *,
+            route: dict[str, str] | None = None,
+            route_info: dict[str, str] | None = None,
+        ) -> str:
             try:
                 from agent.auxiliary_client import call_llm
 
-                resp = call_llm(
-                    messages=[{
+                call_kwargs = {
+                    "messages": [{
                         "role": "user",
                         "content": _LEAN_DIGEST_PROMPT.format(segment=segment),
                     }],
-                    task="compression",
-                    max_tokens=_LEAN_DIGEST_MAX_TOKENS,
-                )
+                    "task": "compression",
+                    "max_tokens": _LEAN_DIGEST_MAX_TOKENS,
+                }
+                if route:
+                    call_kwargs.update(route)
+                elif route_info is not None:
+                    call_kwargs["route_info"] = route_info
+                resp = call_llm(**call_kwargs)
                 body = (
                     resp.choices[0].message.content
                     if hasattr(resp, "choices") else str(resp)
@@ -4264,26 +4275,54 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         from tools.thread_context import propagate_context_to_thread
 
         configured = _get_task_max_concurrency("compression")
-        workers = len(jobs) if configured is None else min(configured, len(jobs))
-        # ponytail: pool size capped at _LEAN_DIGEST_MAX_CHUNKS; raise only if
-        # the chunk ceiling itself is lifted.
-        workers = max(1, min(workers, _LEAN_DIGEST_MAX_CHUNKS))
-        if workers == 1 or len(jobs) == 1:
-            digests = [_digest_one(ci, segment) for ci, segment in jobs]
+        # Probe one small chunk through the normal resolver.  call_llm records
+        # the concrete route it selected, including a primary-400 fallback;
+        # sibling chunks then use that route directly instead of re-hitting a
+        # dead primary model.
+        first_ci, first_segment = jobs[0]
+        selected_route: dict[str, str] | None = None
+        route_info: dict[str, str] = {}
+        first_digest = _digest_one(
+            first_ci, first_segment, route_info=route_info,
+        )
+        provider = route_info.get("provider", "").strip()
+        model = route_info.get("model", "").strip()
+        if provider and model and model not in {"default", "unknown"}:
+            selected_route = {"provider": provider, "model": model}
+
+        remaining = jobs[1:]
+        if not remaining:
+            digests = [first_digest]
         else:
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                futures = [
-                    pool.submit(propagate_context_to_thread(_digest_one), ci, segment)
-                    for ci, segment in jobs
+            workers = len(remaining) if configured is None else min(configured, len(remaining))
+            # ponytail: pool size capped at _LEAN_DIGEST_MAX_CHUNKS; raise only if
+            # the chunk ceiling itself is lifted.
+            workers = max(1, min(workers, _LEAN_DIGEST_MAX_CHUNKS))
+            if workers == 1 or len(remaining) == 1:
+                sibling_digests = [
+                    _digest_one(ci, segment, route=selected_route)
+                    for ci, segment in remaining
                 ]
-                digests = []
-                for fut, (ci, _segment) in zip(futures, jobs):
-                    try:
-                        digests.append(fut.result())
-                    except BaseException as exc:
-                        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
-                            raise
-                        digests.append(_unavailable(ci, exc))
+            else:
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    futures = [
+                        pool.submit(
+                            propagate_context_to_thread(_digest_one),
+                            ci,
+                            segment,
+                            route=selected_route,
+                        )
+                        for ci, segment in remaining
+                    ]
+                    sibling_digests = []
+                    for fut, (ci, _segment) in zip(futures, remaining):
+                        try:
+                            sibling_digests.append(fut.result())
+                        except BaseException as exc:
+                            if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                                raise
+                            sibling_digests.append(_unavailable(ci, exc))
+            digests = [first_digest, *sibling_digests]
         return (
             "\n\n" + _LEAN_DIGESTS_HEADING + "\n"
             + "\n\n".join(digests)

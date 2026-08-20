@@ -2146,7 +2146,7 @@ describe('createGatewayEventHandler', () => {
       expect(appended).toHaveLength(0)
     })
 
-    it('keeps identical interim and terminal replies as separate messages without response_previewed', () => {
+    it('deduplicates identical commentary and final replies in one turn', () => {
       const appended: Msg[] = []
       const onEvent = createGatewayEventHandler(buildCtx(appended))
 
@@ -2155,7 +2155,7 @@ describe('createGatewayEventHandler', () => {
       onEvent({ payload: { text: 'same reply' }, type: 'message.complete' } as any)
 
       const assistantMsgs = appended.filter(m => m.role === 'assistant' && m.text)
-      expect(assistantMsgs).toHaveLength(2)
+      expect(assistantMsgs).toEqual([{ role: 'assistant', text: 'same reply' }])
     })
 
     it('settles identical terminal reply onto interim when response_previewed', () => {
@@ -2174,21 +2174,35 @@ describe('createGatewayEventHandler', () => {
       expect(assistantMsgs[0]?.text).toBe('same reply')
     })
 
-    it('deduplicates flushed chunks within the terminal message after an interim boundary', () => {
+    it('keeps distinct commentary and final replies visible', () => {
       const appended: Msg[] = []
       const onEvent = createGatewayEventHandler(buildCtx(appended))
 
       onEvent({ payload: {}, type: 'message.start' } as any)
-      // Interim seals the first segment
       onEvent({ payload: { already_streamed: true, text: 'interim answer' }, type: 'message.interim' } as any)
-      // Post-interim deltas that match the final text — these get deduped
       onEvent({ payload: { text: 'final answer' }, type: 'message.delta' } as any)
       onEvent({ payload: { text: 'final answer' }, type: 'message.complete' } as any)
 
-      const texts = appended.filter(m => m.role === 'assistant' && m.text).map(m => m.text)
-      // interim + final, no duplication of the final
-      expect(texts).toContain('interim answer')
-      expect(texts.filter(t => t === 'final answer')).toHaveLength(1)
+      expect(appended.filter(m => m.role === 'assistant' && m.text).map(m => m.text)).toEqual([
+        'interim answer',
+        'final answer'
+      ])
+    })
+
+    it('does not suppress identical replies in separate turns', () => {
+      const appended: Msg[] = []
+      const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+      onEvent({ payload: {}, type: 'message.start' } as any)
+      onEvent({ payload: { already_streamed: true, text: 'same reply' }, type: 'message.interim' } as any)
+      onEvent({ payload: { text: 'same reply' }, type: 'message.complete' } as any)
+      onEvent({ payload: {}, type: 'message.start' } as any)
+      onEvent({ payload: { text: 'same reply' }, type: 'message.complete' } as any)
+
+      expect(appended.filter(m => m.role === 'assistant' && m.text).map(m => m.text)).toEqual([
+        'same reply',
+        'same reply'
+      ])
     })
 
     it('ignores malformed message.interim payload', () => {

@@ -234,6 +234,17 @@ class MemoryProvider(ABC):
         """
         raise NotImplementedError(f"Provider {self.name} does not handle tool {tool_name}")
 
+    def authoritative_memory_write(self, request: Dict[str, Any], **kwargs) -> str:
+        """Apply the core memory write atomically in the provider backend.
+
+        Providers must opt into authoritative CRUD explicitly.  The generic
+        tool dispatcher is intentionally not a fallback: it only handles
+        names returned by :meth:`get_tool_schemas`.
+        """
+        raise NotImplementedError(
+            f"Provider {self.name} does not implement authoritative memory writes"
+        )
+
     def shutdown(self) -> None:
         """Clean shutdown — flush queues, close connections."""
 

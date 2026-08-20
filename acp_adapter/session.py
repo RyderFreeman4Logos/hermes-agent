@@ -521,6 +521,7 @@ class SessionManager:
         requested_provider = row.get("billing_provider")
         restored_base_url = row.get("billing_base_url")
         restored_api_mode = None
+        memory_provider_mode = None
         mc = row.get("model_config")
         if mc:
             try:
@@ -530,6 +531,8 @@ class SessionManager:
                     requested_provider = meta.get("provider") or requested_provider
                     restored_base_url = meta.get("base_url") or restored_base_url
                     restored_api_mode = meta.get("api_mode") or restored_api_mode
+                    if meta.get("memory_provider_mode") in {"authoritative", "hybrid"}:
+                        memory_provider_mode = meta["memory_provider_mode"]
             except (json.JSONDecodeError, TypeError):
                 pass
 
@@ -556,6 +559,7 @@ class SessionManager:
                 requested_provider=requested_provider,
                 base_url=restored_base_url,
                 api_mode=restored_api_mode,
+                memory_provider_mode_override=memory_provider_mode,
             )
         except Exception:
             logger.warning("Failed to recreate agent for ACP session %s", session_id, exc_info=True)
@@ -597,6 +601,7 @@ class SessionManager:
         requested_provider: str | None = None,
         base_url: str | None = None,
         api_mode: str | None = None,
+        memory_provider_mode_override: str | None = None,
     ):
         if self._agent_factory is not None:
             return self._agent_factory()
@@ -631,6 +636,7 @@ class SessionManager:
             "session_id": session_id,
             "session_db": self._get_db(),
             "model": model or default_model,
+            "memory_provider_mode_override": memory_provider_mode_override,
         }
 
         try:

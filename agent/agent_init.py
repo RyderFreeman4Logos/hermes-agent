@@ -572,6 +572,7 @@ def init_agent(
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
     requested_provider: str = None,
+    memory_provider_mode_override: str = None,
 ):
     """
     Initialize the AI Agent.
@@ -1766,6 +1767,11 @@ def init_agent(
             agent._user_profile_enabled = mem_config.get("user_profile_enabled", False)
             from tools.memory_tool import get_memory_provider_mode
             agent._memory_provider_mode = get_memory_provider_mode(mem_config)
+            if memory_provider_mode_override in {"authoritative", "hybrid"}:
+                agent._memory_provider_mode = memory_provider_mode_override
+            agent._session_init_model_config["memory_provider_mode"] = (
+                agent._memory_provider_mode
+            )
             agent._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
             if agent._memory_enabled or agent._user_profile_enabled:
                 from tools.memory_tool import MemoryStore

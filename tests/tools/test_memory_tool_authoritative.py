@@ -32,9 +32,166 @@ class RecordingAuthoritativeProvider:
     def get_tool_schemas(self):
         return []
 
-    def handle_tool_call(self, tool_name, args, **kwargs):
-        self.calls.append((tool_name, args, kwargs))
+    def authoritative_memory_write(self, request, **kwargs):
+        self.calls.append(("memory", request, kwargs))
         return json.dumps(self.result)
+
+
+class LegacyMemoryProvider:
+    name = "legacy-provider"
+
+    def __init__(self, result=None):
+        self.handle_calls = []
+        self.mirror_calls = []
+        self.result = result or {"success": True, "status": "[REDACTED]"}
+
+    def is_available(self):
+        return True
+
+    def get_tool_schemas(self):
+        return []
+
+    def handle_tool_call(self, tool_name, args, **kwargs):
+        self.handle_calls.append((tool_name, args, kwargs))
+        return json.dumps(self.result)
+
+    def on_memory_write(self, *args, **kwargs):
+        self.mirror_calls.append((args, kwargs))
+
+
+def test_authoritative_write_requires_explicit_provider_capability():
+    provider = LegacyMemoryProvider()
+    manager = MemoryManager(provider_mode="authoritative")
+    manager.add_provider(provider)
+
+    result = json.loads(
+        manager.authoritative_memory_write(
+            {"action": "add", "target": "memory", "content": "synthetic fact"}
+        )
+    )
+
+    assert result["success"] is False
+    assert result["error_class"] == "provider_capability_missing"
+    assert provider.handle_calls == []
+    assert provider.mirror_calls == []
+
+
+def test_hindsight_shaped_provider_cannot_coerce_retain_into_success():
+    provider = LegacyMemoryProvider({"status": "retain accepted [REDACTED]"})
+    provider.name = "hindsight"
+    provider.get_tool_schemas = lambda: [
+        {"name": "hindsight_retain"},
+        {"name": "hindsight_recall"},
+    ]
+    manager = MemoryManager(provider_mode="authoritative")
+    manager.add_provider(provider)
+
+    result = json.loads(
+        manager.authoritative_memory_write(
+            {"action": "add", "target": "memory", "content": "synthetic fact"}
+        )
+    )
+
+    assert result["success"] is False
+    assert result["error_class"] == "provider_capability_missing"
+    assert provider.handle_calls == []
+
+
+def test_authoritative_receipt_drops_status_and_unbounded_fields():
+    provider = RecordingAuthoritativeProvider(
+        result={
+            "success": True,
+            "drawer_id": {"secret": "[REDACTED]"},
+            "operation_id": "op-synthetic",
+            "operation_ids": ["op-1", {"secret": "[REDACTED]"}],
+            "status": "payload text [REDACTED]",
+            "provider_payload": {"secret": "[REDACTED]"},
+        }
+    )
+    manager = MemoryManager(provider_mode="authoritative")
+    manager.add_provider(provider)
+
+    result = json.loads(
+        manager.authoritative_memory_write(
+            {"action": "add", "target": "memory", "content": "synthetic fact"}
+        )
+    )
+
+    assert result["success"] is True
+    assert result["operation_id"] == "op-synthetic"
+    assert "drawer_id" not in result
+    assert "operation_ids" not in result
+    assert "status" not in result
+    assert "provider_payload" not in result
+    assert "[REDACTED]" not in json.dumps(result)
+
+
+def test_session_payload_freezes_resolved_memory_mode(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hm"))
+    provider = RecordingAuthoritativeProvider()
+    config = {
+        "memory": {
+            "provider": "synthetic-provider",
+            "provider_mode": "authoritative",
+            "memory_enabled": False,
+            "user_profile_enabled": False,
+        },
+        "agent": {},
+    }
+
+    with (
+        patch("hermes_cli.config.load_config", return_value=config),
+        patch("hermes_cli.config.load_config_readonly", return_value=config),
+        patch("plugins.memory.load_memory_provider", return_value=provider),
+        patch("agent.model_metadata.get_model_context_length", return_value=204800),
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="synthetic-key",
+            base_url="https://synthetic.invalid/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=False,
+            session_id="synthetic-session",
+        )
+
+    assert agent._session_init_model_config["memory_provider_mode"] == "authoritative"
+
+
+def test_tui_restore_reads_frozen_memory_mode_from_session_payload():
+    from tui_gateway.server import _stored_session_runtime_overrides
+
+    overrides = _stored_session_runtime_overrides(
+        {
+            "model": "synthetic-model",
+            "model_config": json.dumps(
+                {"memory_provider_mode": "authoritative"}
+            ),
+        }
+    )
+
+    assert overrides["memory_provider_mode_override"] == "authoritative"
+
+
+def test_status_does_not_claim_unimplemented_context_mode(monkeypatch, capfd):
+    config = {
+        "memory": {
+            "provider": "synthetic-provider",
+            "provider_mode": "authoritative",
+        }
+    }
+    with (
+        patch("hermes_cli.config.load_config", return_value=config),
+        patch("hermes_cli.memory_setup._get_available_providers", return_value=[]),
+        patch("hermes_cli.tools_config._get_platform_tools", return_value=set()),
+    ):
+        cmd_status(args=None)
+
+    assert "provider_context_mode=disabled" not in capfd.readouterr().out
 
 
 

@@ -49,10 +49,6 @@ from hermes_cli.sqlite_runtime import (
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple, TypeVar
 
 from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
-    AUTHORITY_WRITE_INDETERMINATE_ATTR,
-    AUTHORITY_WRITE_OUTCOME_ATTR,
-    AuthorityWriteIndeterminateError,
-    reconcile_authoritative_write,
     _BRANCH_CHILD_SQL,
     _COMPRESSION_CHILD_SQL,
     _FTS_CJK_TRIGGERS,
@@ -6920,44 +6916,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             self._delete_unreferenced_system_prompts(conn)
         self._execute_write(_do)
 
-    def publish_session_route(
-        self,
-        session_id: str,
-        *,
-        model_config_json: str,
-        model: Optional[str],
-        system_prompt: Optional[str],
-        billing_provider: Optional[str],
-        billing_base_url: Optional[str],
-        billing_mode: Optional[str],
-    ) -> None:
-        """Atomically publish route, prompt, and billing metadata."""
-        self.flush_token_counts()
-
-        def _do(conn):
-            system_prompt_hash = self._store_system_prompt(conn, system_prompt)
-            updated = conn.execute(
-                """UPDATE sessions SET
-                   model_config = ?, model = ?, system_prompt = NULL,
-                   system_prompt_hash = ?, billing_provider = ?,
-                   billing_base_url = ?, billing_mode = ?
-                   WHERE id = ?""",
-                (
-                    model_config_json,
-                    model,
-                    system_prompt_hash,
-                    billing_provider,
-                    billing_base_url,
-                    billing_mode,
-                    session_id,
-                ),
-            )
-            if updated.rowcount != 1:
-                raise RuntimeError(f"Session route target not found: {session_id}")
-            self._delete_unreferenced_system_prompts(conn)
-
-        self._execute_write(_do)
-
     def update_session_model(
         self, session_id: str, model: str, provider: Optional[str] = None
     ) -> None:
@@ -7950,22 +7908,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return result.rowcount
 
         return self._execute_write(_do) or 0
-
-    def read_session_route_snapshot(
-        self, session_id: str
-    ) -> Optional[Dict[str, Any]]:
-        """Read route authority fields without flushing accounting writes."""
-        with self._read_ctx() as conn:
-            row = conn.execute(
-                """SELECT s.model_config, s.model,
-                          COALESCE(sp.prompt, s.system_prompt) AS system_prompt,
-                          s.billing_provider, s.billing_base_url, s.billing_mode
-                   FROM sessions AS s
-                   LEFT JOIN system_prompts AS sp ON sp.hash = s.system_prompt_hash
-                   WHERE s.id = ?""",
-                (session_id,),
-            ).fetchone()
-        return dict(row) if row else None
 
     def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Get a session by ID."""

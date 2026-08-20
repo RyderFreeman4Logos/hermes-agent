@@ -32,6 +32,7 @@ Usage:
 import codecs
 import json
 import logging
+import math
 import os
 import platform
 import shlex
@@ -1671,12 +1672,24 @@ class ProcessRegistry:
     @staticmethod
     def _is_routine_delegated_child_completion(evt: dict) -> bool:
         """Whether a completed native-child command needs no parent turn."""
+        if not isinstance(evt, dict):
+            return False
+        started_at = evt.get("started_at")
         return (
             evt.get("type") == "completion"
             and evt.get("delegated_child") is True
-            and evt.get("exit_code") == 0
-            and evt.get("completion_reason", "exited") == "exited"
-            and not evt.get("termination_source")
+            and type(evt.get("exit_code")) is int
+            and evt["exit_code"] == 0
+            and evt.get("completion_reason") == "exited"
+            and evt.get("termination_source") == ""
+            and isinstance(evt.get("session_id"), str)
+            and bool(evt["session_id"])
+            and isinstance(evt.get("command"), str)
+            and bool(evt["command"])
+            and isinstance(started_at, (int, float))
+            and not isinstance(started_at, bool)
+            and math.isfinite(started_at)
+            and started_at > 0
         )
 
     def drain_notifications(

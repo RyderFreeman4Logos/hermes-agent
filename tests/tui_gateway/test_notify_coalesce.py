@@ -60,8 +60,83 @@ def _completion(session_id: str, exit_code: int, command: str) -> dict:
     }
 
 
+def _routine_child_completion(session_id: str) -> dict:
+    return {
+        **_completion(session_id, 0, f"echo {session_id}"),
+        "started_at": 1.0,
+        "completion_reason": "exited",
+        "termination_source": "",
+        "delegated_child": True,
+    }
+
+
 def _process_status(emitted: list) -> list:
     return [args for args in emitted if args and args[0] == "status.update"]
+
+
+def test_midloop_routine_child_successes_are_silent_before_batch_projection(monkeypatch):
+    agent = _SteerAgent()
+    child_events = [
+        _routine_child_completion("proc_child_a"),
+        _routine_child_completion("proc_child_b"),
+    ]
+    sess = _session(running=True, agent=agent, _completion_pending=child_events)
+    emitted: list = []
+    monkeypatch.setattr(server, "_emit", lambda *args, **_kw: emitted.append(args))
+
+    server._flush_pending_completions_if_idle("sid_child_midloop", sess, set())
+
+    assert agent.steers == []
+    assert _process_status(emitted) == []
+    assert sess.get("_completion_pending") == []
+    assert all(evt["session_id"] in process_registry._completion_consumed for evt in child_events)
+
+
+def test_idle_routine_child_successes_do_not_submit_parent_turn(monkeypatch):
+    child_events = [
+        _routine_child_completion("proc_child_idle_a"),
+        _routine_child_completion("proc_child_idle_b"),
+    ]
+    sess = _session(running=False, _completion_pending=child_events)
+    turns: list = []
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kw: None)
+    monkeypatch.setattr(
+        server,
+        "_run_prompt_submit",
+        lambda *_args, **_kw: turns.append("submitted"),
+    )
+
+    server._flush_pending_completions_if_idle("sid_child_idle", sess, set())
+
+    assert turns == []
+    assert sess["running"] is False
+    assert sess.get("_completion_pending") == []
+    assert all(evt["session_id"] in process_registry._completion_consumed for evt in child_events)
+
+
+def test_mixed_completion_batch_keeps_parent_order_and_ack_path(monkeypatch):
+    agent = _SteerAgent()
+    child = _routine_child_completion("proc_child_mixed")
+    parent = _completion("proc_parent_mixed", 0, "echo parent")
+    sess = _session(running=True, agent=agent, _completion_pending=[child, parent])
+    emitted: list = []
+    monkeypatch.setattr(server, "_emit", lambda *args, **_kw: emitted.append(args))
+
+    server._flush_pending_completions_if_idle("sid_mixed", sess, set())
+
+    assert len(agent.steers) == 1
+    assert "proc_parent_mixed" in agent.steers[0]
+    assert "proc_child_mixed" not in agent.steers[0]
+    assert len(_process_status(emitted)) == 1
+    assert "proc_parent_mixed" in _process_status(emitted)[0][2]["text"]
+    assert "proc_child_mixed" not in _process_status(emitted)[0][2]["text"]
+    assert "proc_child_mixed" in process_registry._completion_consumed
+    assert "proc_parent_mixed" not in process_registry._completion_consumed
+    assert [evt["session_id"] for evt in sess["_completion_pending"]] == ["proc_parent_mixed"]
+
+    agent._pending_steer = None
+    server._ack_steered_completion_ingest(sess)
+    assert "proc_parent_mixed" in process_registry._completion_consumed
 
 
 def _run_poller_until(sid: str, sess: dict, pred, timeout: float = 2.0) -> None:

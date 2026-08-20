@@ -195,6 +195,21 @@ describe('createGatewayEventHandler', () => {
     expect(ctx.system.sys).toHaveBeenCalledWith('compressing 968 messages (~123,400 tok)…')
   })
 
+  it('does not put cache-hit rates on the status bar', () => {
+    const appended: Msg[] = []
+    const ctx = buildCtx(appended)
+    const onEvent = createGatewayEventHandler(ctx)
+
+    onEvent({
+      payload: { kind: 'cache_hit', text: 'cache 87%' },
+      type: 'status.update'
+    } as any)
+
+    expect(getUiState().status).not.toBe('cache 87%')
+    expect(ctx.system.sys).not.toHaveBeenCalled()
+    expect(appended).toHaveLength(0)
+  })
+
   it('keeps goal verdict text in transcript but shows a brief idle status (#goal statusbar)', () => {
     const appended: Msg[] = []
     const ctx = buildCtx(appended)
@@ -1896,13 +1911,17 @@ describe('createGatewayEventHandler', () => {
 
     try {
       onEvent({
-        payload: { completed_at: 1_700_000_000.25, text: 'final answer' },
+        payload: {
+          cache_info: { pct: 87, prompt_tokens: 2_000, read_tokens: 1_740, state: 'hit' },
+          completed_at: 1_700_000_000.25,
+          text: 'final answer'
+        },
         type: 'message.complete'
       } as any)
 
       expect(appended).toEqual([
         { role: 'assistant', text: 'final answer' },
-        { kind: 'event', role: 'system', text: '完成 14:23:05' }
+        { kind: 'event', role: 'system', text: 'agent loop stop at 14:23:05  cache 87% 1740/2000' }
       ])
       expect(formatTime).toHaveBeenCalledWith('en-GB', {
         hour: '2-digit',
@@ -1929,7 +1948,40 @@ describe('createGatewayEventHandler', () => {
 
     expect(appended).toEqual([
       { role: 'assistant', text: 'final answer' },
-      { kind: 'event', role: 'system', text: 'cache 87%' }
+      { kind: 'event', role: 'system', text: 'cache 87% 1740/2000' }
     ])
+  })
+
+  it('renders positive sub-percent cache hits with their token pair', () => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+    onEvent({
+      payload: {
+        cache_info: { pct: 0, prompt_tokens: 4_000, read_tokens: 3, state: 'hit' },
+        text: 'final answer'
+      },
+      type: 'message.complete'
+    } as any)
+
+    expect(appended.at(-1)).toMatchObject({ kind: 'event', text: 'cache <1% 3/4000' })
+  })
+
+  it('marks a low cache hit footnote as a warning', () => {
+    const appended: Msg[] = []
+    const onEvent = createGatewayEventHandler(buildCtx(appended))
+
+    onEvent({
+      payload: {
+        cache_info: { pct: 49, prompt_tokens: 4_000, read_tokens: 1_960, state: 'hit' },
+        text: 'final answer'
+      },
+      type: 'message.complete'
+    } as any)
+
+    expect(appended.at(-1)).toMatchObject({
+      eventTone: 'warn',
+      text: 'cache 49% 1960/4000'
+    })
   })
 })

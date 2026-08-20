@@ -768,6 +768,10 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
           return
         }
 
+        if (p.kind === 'cache_hit') {
+          return
+        }
+
         if (p.kind === 'goal') {
           sys(p.text)
 

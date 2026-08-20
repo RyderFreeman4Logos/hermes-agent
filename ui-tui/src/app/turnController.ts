@@ -30,29 +30,37 @@ const ACTIVITY_LIMIT = 8
 const TRAIL_LIMIT = 8
 
 type CacheInfo = {
-  pct: number
-  prompt_tokens: number
-  read_tokens: number
-  state: 'cold_write' | 'hit' | 'miss' | 'unknown'
+  pct?: number
+  prompt_tokens?: number
+  read_tokens?: number
+  state: 'cold_write' | 'hit' | 'miss' | 'unavailable' | 'unknown'
 }
 
-const cacheFootnote = (cacheInfo?: CacheInfo): Msg | null => {
+const cacheFootnote = (cacheInfo?: CacheInfo): null | string => {
   if (!cacheInfo) {
     return null
   }
 
   if (cacheInfo.state === 'hit') {
-    return { kind: 'event', role: 'system', text: `cache ${Math.max(0, Math.round(cacheInfo.pct))}%` }
+    const hasCounts = Number.isFinite(cacheInfo.read_tokens) && Number.isFinite(cacheInfo.prompt_tokens)
+    const pair = hasCounts ? ` ${cacheInfo.read_tokens}/${cacheInfo.prompt_tokens}` : ''
+
+    return hasCounts && cacheInfo.read_tokens! * 100 < cacheInfo.prompt_tokens!
+      ? `cache <1%${pair}`
+      : `cache ${Math.max(0, Math.round(cacheInfo.pct ?? 0))}%${pair}`
   }
 
-  return {
-    kind: 'event',
-    role: 'system',
-    text: cacheInfo.state === 'cold_write' ? 'cache cold-write' : `cache ${cacheInfo.state}`
-  }
+  return cacheInfo.state === 'cold_write' ? 'cache COLD_WRITE' : `cache ${cacheInfo.state}`
 }
 
-const completionFootnote = (completedAt?: number): Msg | null => {
+const isLowCacheHit = (cacheInfo?: CacheInfo): boolean =>
+  Boolean(
+    cacheInfo &&
+      (cacheInfo.state === 'miss' ||
+        (cacheInfo.state === 'hit' && Number.isFinite(cacheInfo.pct) && cacheInfo.pct! < 50))
+  )
+
+const completionFootnote = (completedAt?: number): null | string => {
   if (!Number.isFinite(completedAt)) {
     return null
   }
@@ -66,7 +74,23 @@ const completionFootnote = (completedAt?: number): Msg | null => {
     second: '2-digit'
   })
 
-  return { kind: 'event', role: 'system', text: `完成 ${time}` }
+  return `agent loop stop at ${time}`
+}
+
+const turnCompletionLine = (payload: { cache_info?: CacheInfo; completed_at?: number }): Msg | null => {
+  const completion = completionFootnote(payload.completed_at)
+  const cache = cacheFootnote(payload.cache_info)
+
+  if (!completion && !cache) {
+    return null
+  }
+
+  return {
+    kind: 'event',
+    role: 'system',
+    text: [completion, cache].filter(Boolean).join('  '),
+    ...(isLowCacheHit(payload.cache_info) ? { eventTone: 'warn' as const } : {})
+  }
 }
 
 // Extracts the raw patch from a diff-only segment produced by
@@ -677,14 +701,10 @@ class TurnController {
       finalMessages.push({ role: 'assistant', text: finalText })
     }
 
-    const footnote = cacheFootnote(payload.cache_info)
-    if (footnote && finalMessages.some(message => message.role === 'assistant')) {
+    const footnote = turnCompletionLine(payload)
+    const hasTime = Number.isFinite(payload.completed_at)
+    if (footnote && (hasTime || finalMessages.some(message => message.role === 'assistant'))) {
       finalMessages.push(footnote)
-    }
-
-    const completion = completionFootnote(payload.completed_at)
-    if (completion) {
-      finalMessages.push(completion)
     }
 
     const wasInterrupted = this.interrupted

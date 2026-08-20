@@ -114,6 +114,9 @@ export interface ClarifyReq {
 }
 
 export interface Msg {
+  // Low cache-hit footnotes use the warning rail so misses are visible without
+  // turning the transient status bar into a cache-rate display.
+  eventTone?: 'warn'
   info?: SessionInfo
   kind?: 'diff' | 'event' | 'intro' | 'panel' | 'slash' | 'trail'
   panelData?: PanelData

@@ -4942,8 +4942,8 @@ def _apply_model_switch(
             explicit_provider=explicit_provider,
         )
     )
-    if not model_input:
-        raise ValueError("model value required")
+    if not model_input and not explicit_provider:
+        raise ValueError("model or provider value required")
 
     agent = session.get("agent")
     if one_turn and not agent:

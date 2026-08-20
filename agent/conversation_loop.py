@@ -2311,6 +2311,26 @@ def run_conversation(
 
                 agent._turn_received_provider_response = True
 
+                # Retain first-call usage before truncation/partial/error branches
+                # can return without reaching the normal accounting block.
+                if api_call_count == 1 and getattr(response, "usage", None):
+                    first_usage = normalize_usage(
+                        response.usage,
+                        provider=agent.provider,
+                        api_mode=agent.api_mode,
+                    )
+                    agent._first_turn_usage = {
+                        "prompt_tokens": first_usage.prompt_tokens,
+                        "completion_tokens": first_usage.output_tokens,
+                        "total_tokens": first_usage.total_tokens,
+                        "input_tokens": first_usage.input_tokens,
+                        "output_tokens": first_usage.output_tokens,
+                        "cache_read_tokens": first_usage.cache_read_tokens,
+                        "cache_write_tokens": first_usage.cache_write_tokens,
+                        "cache_telemetry": first_usage.cache_telemetry,
+                        "reasoning_tokens": first_usage.reasoning_tokens,
+                    }
+
                 # Check finish_reason before proceeding
                 if agent.api_mode == "codex_responses":
                     status = getattr(response, "status", None)
@@ -2829,6 +2849,7 @@ def run_conversation(
                         "output_tokens": canonical_usage.output_tokens,
                         "cache_read_tokens": canonical_usage.cache_read_tokens,
                         "cache_write_tokens": canonical_usage.cache_write_tokens,
+                        "cache_telemetry": canonical_usage.cache_telemetry,
                         "reasoning_tokens": canonical_usage.reasoning_tokens,
                     }
                     agent.context_compressor.update_from_response(usage_dict)

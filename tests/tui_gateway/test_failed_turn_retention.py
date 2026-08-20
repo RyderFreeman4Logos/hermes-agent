@@ -143,6 +143,12 @@ def test_returned_error_result_retains_snapshot_and_emits_terminal_frame(
 ):
     agent = types.SimpleNamespace(
         session_id="session-key",
+        _first_turn_usage={
+            "cache_read_tokens": 1_740,
+            "cache_write_tokens": 0,
+            "cache_telemetry": "reported",
+            "prompt_tokens": 2_000,
+        },
         run_conversation=lambda *a, **k: {
             "final_response": "",
             "error": "provider 402: billing wall",
@@ -161,6 +167,12 @@ def test_returned_error_result_retains_snapshot_and_emits_terminal_frame(
     assert payload["status"] == "error"
     assert payload["error"] == "provider 402: billing wall"
     assert payload["recoverable"] is True
+    assert payload["cache_info"] == {
+        "read_tokens": 1_740,
+        "prompt_tokens": 2_000,
+        "pct": 87,
+        "state": "hit",
+    }
 
     # The retained snapshot survives the finally block for resume replay.
     snapshot = server._inflight_snapshot(session)
@@ -200,6 +212,12 @@ def test_exception_closes_turn_with_terminal_complete_and_partial(emits, turn_en
 
     agent = types.SimpleNamespace(
         session_id="session-key",
+        _first_turn_usage={
+            "cache_read_tokens": 1_740,
+            "cache_write_tokens": 0,
+            "cache_telemetry": "reported",
+            "prompt_tokens": 2_000,
+        },
         run_conversation=_boom,
         clear_interrupt=lambda: None,
     )
@@ -218,6 +236,12 @@ def test_exception_closes_turn_with_terminal_complete_and_partial(emits, turn_en
     assert payload["recoverable"] is True
     assert payload["partial"] is True
     assert payload["text"] == "half an ans"
+    assert payload["cache_info"] == {
+        "read_tokens": 1_740,
+        "prompt_tokens": 2_000,
+        "pct": 87,
+        "state": "hit",
+    }
 
     snapshot = server._inflight_snapshot(session)
     assert snapshot is not None

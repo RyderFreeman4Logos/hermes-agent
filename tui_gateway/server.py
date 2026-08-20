@@ -4191,15 +4191,19 @@ def _cache_info_from_usage(usage: Any) -> dict[str, int | str] | None:
     write_tokens = tokens(*write_keys)
     prompt_tokens = tokens("prompt_tokens")
     pct = round(100 * read_tokens / prompt_tokens) if prompt_tokens else 0
-    state = (
-        "hit"
-        if read_tokens
-        else "cold_write"
-        if write_tokens
-        else "unknown"
-        if prompt_tokens < 1024
-        else "miss"
-    )
+    telemetry = usage.get("cache_telemetry")
+    if telemetry in {"unavailable", "no_field"}:
+        state = "unavailable"
+    else:
+        state = (
+            "hit"
+            if read_tokens
+            else "cold_write"
+            if write_tokens
+            else "unknown"
+            if prompt_tokens < 1024
+            else "miss"
+        )
     return {
         "read_tokens": read_tokens,
         "prompt_tokens": prompt_tokens,
@@ -6706,6 +6710,12 @@ def _emit_terminal_turn_error(sid: str, session: dict, error: Any) -> None:
         "error": message,
         "recoverable": True,
     }
+    turn_usage = getattr(agent, "_first_turn_usage", None) if agent is not None else None
+    if turn_usage is None and agent is not None:
+        turn_usage = getattr(agent, "_last_turn_usage", None)
+    cache_info = _cache_info_from_usage(turn_usage)
+    if cache_info is not None:
+        payload["cache_info"] = cache_info
     if partial:
         payload["partial"] = True
     try:

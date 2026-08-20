@@ -165,6 +165,29 @@ def test_normalize_usage_openai_prefers_prompt_tokens_details_over_top_level():
     assert normalized.cache_write_tokens == 150
 
 
+def test_normalize_usage_marks_missing_cache_telemetry_unavailable():
+    usage = SimpleNamespace(prompt_tokens=2000, completion_tokens=700)
+
+    normalized = normalize_usage(usage, provider="openai", api_mode="chat_completions")
+
+    assert normalized.cache_read_tokens == 0
+    assert normalized.cache_write_tokens == 0
+    assert normalized.cache_telemetry == "unavailable"
+
+
+def test_normalize_usage_marks_explicit_zero_cache_telemetry_reported():
+    usage = SimpleNamespace(
+        prompt_tokens=2000,
+        completion_tokens=700,
+        prompt_tokens_details=SimpleNamespace(cached_tokens=0),
+    )
+
+    normalized = normalize_usage(usage, provider="openai", api_mode="chat_completions")
+
+    assert normalized.cache_read_tokens == 0
+    assert normalized.cache_telemetry == "reported"
+
+
 def test_openrouter_models_api_pricing_is_converted_from_per_token_to_per_million(monkeypatch):
     monkeypatch.setattr(
         "agent.usage_pricing.fetch_model_metadata",

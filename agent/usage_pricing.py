@@ -34,6 +34,7 @@ class CanonicalUsage:
     cache_read_tokens: int = 0
     cache_write_tokens: int = 0
     reasoning_tokens: int = 0
+    cache_telemetry: Literal["reported", "unavailable"] = "unavailable"
     request_count: int = 1
     raw_usage: Optional[dict[str, Any]] = None
 
@@ -60,6 +61,11 @@ class CanonicalUsage:
             cache_read_tokens=self.cache_read_tokens + other.cache_read_tokens,
             cache_write_tokens=self.cache_write_tokens + other.cache_write_tokens,
             reasoning_tokens=self.reasoning_tokens + other.reasoning_tokens,
+            cache_telemetry=(
+                "reported"
+                if self.cache_telemetry == "reported" or other.cache_telemetry == "reported"
+                else "unavailable"
+            ),
             request_count=self.request_count + other.request_count,
             raw_usage=None,
         )
@@ -1127,7 +1133,28 @@ def normalize_usage(
     provider_name = (provider or "").strip().lower()
     mode = (api_mode or "").strip().lower()
 
+    def has_field(value: Any, name: str) -> bool:
+        if isinstance(value, dict):
+            return name in value and value[name] is not None
+        attributes = getattr(value, "__dict__", None)
+        if isinstance(attributes, dict):
+            return name in attributes and attributes[name] is not None
+        try:
+            return getattr(value, name, None) is not None
+        except Exception:
+            return False
+
+    cache_telemetry: Literal["reported", "unavailable"] = "unavailable"
+
     if mode == "anthropic_messages" or provider_name == "anthropic":
+        cache_telemetry = (
+            "reported"
+            if any(
+                has_field(response_usage, field)
+                for field in ("cache_read_input_tokens", "cache_creation_input_tokens")
+            )
+            else "unavailable"
+        )
         input_tokens = _to_int(getattr(response_usage, "input_tokens", 0))
         output_tokens = _to_int(getattr(response_usage, "output_tokens", 0))
         cache_read_tokens = _to_int(getattr(response_usage, "cache_read_input_tokens", 0))
@@ -1136,6 +1163,14 @@ def normalize_usage(
         input_total = _to_int(getattr(response_usage, "input_tokens", 0))
         output_tokens = _to_int(getattr(response_usage, "output_tokens", 0))
         details = getattr(response_usage, "input_tokens_details", None)
+        cache_telemetry = (
+            "reported"
+            if any(
+                has_field(details, field)
+                for field in ("cached_tokens", "cache_creation_tokens")
+            )
+            else "unavailable"
+        )
         cache_read_tokens = _to_int(getattr(details, "cached_tokens", 0) if details else 0)
         cache_write_tokens = _to_int(
             getattr(details, "cache_creation_tokens", 0) if details else 0
@@ -1151,6 +1186,24 @@ def normalize_usage(
         # fallback, cache writes are undercounted as 0 and cache reads can be
         # missed when the proxy only surfaces them at the top level.
         # Port of cline/cline#10266.
+        cache_telemetry = (
+            "reported"
+            if any(
+                has_field(details, field)
+                for field in ("cached_tokens", "cache_write_tokens")
+            )
+            or any(
+                has_field(response_usage, field)
+                for field in (
+                    "cache_read_input_tokens",
+                    "cache_creation_input_tokens",
+                    "cache_write_tokens",
+                    "prompt_cache_hit_tokens",
+                    "prompt_cache_miss_tokens",
+                )
+            )
+            else "unavailable"
+        )
         cache_read_tokens = _to_int(getattr(details, "cached_tokens", 0) if details else 0)
         if not cache_read_tokens:
             cache_read_tokens = _to_int(getattr(response_usage, "cache_read_input_tokens", 0))
@@ -1170,6 +1223,8 @@ def normalize_usage(
             cache_write_tokens = _to_int(
                 getattr(response_usage, "cache_creation_input_tokens", 0)
             )
+        if not cache_write_tokens:
+            cache_write_tokens = _to_int(getattr(response_usage, "cache_write_tokens", 0))
         input_tokens = max(0, prompt_total - cache_read_tokens - cache_write_tokens)
 
     reasoning_tokens = 0
@@ -1196,6 +1251,7 @@ def normalize_usage(
         cache_read_tokens=cache_read_tokens,
         cache_write_tokens=cache_write_tokens,
         reasoning_tokens=reasoning_tokens,
+        cache_telemetry=cache_telemetry,
     )
 
 

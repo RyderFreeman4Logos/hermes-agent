@@ -13923,6 +13923,33 @@ def test_cache_info_classifies_first_call_usage():
     }
 
 
+def test_cache_info_does_not_misclassify_missing_cache_telemetry():
+    assert server._cache_info_from_usage(
+        {
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "cache_telemetry": "unavailable",
+            "prompt_tokens": 2_000,
+        }
+    ) == {
+        "read_tokens": 0,
+        "prompt_tokens": 2_000,
+        "pct": 0,
+        "state": "unavailable",
+    }
+
+
+def test_cache_info_classifies_explicit_zero_cache_telemetry_as_miss():
+    assert server._cache_info_from_usage(
+        {
+            "cache_read_tokens": 0,
+            "cache_write_tokens": 0,
+            "cache_telemetry": "reported",
+            "prompt_tokens": 2_000,
+        }
+    )["state"] == "miss"
+
+
 def test_prompt_submit_message_complete_prefers_first_call_cache_usage(monkeypatch):
     emitted: list[tuple[str, str, dict]] = []
 

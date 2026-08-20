@@ -10200,6 +10200,21 @@ def _mark_completion_events_consumed(events: list) -> None:
             process_registry._completion_consumed.add(sid)
 
 
+def _filter_routine_delegated_child_completions(events: list) -> list:
+    """Consume silent child successes before completion fan-in projects them."""
+    from tools.process_registry import ProcessRegistry
+
+    visible = []
+    silent = []
+    for evt in events:
+        if ProcessRegistry._is_routine_delegated_child_completion(evt):
+            silent.append(evt)
+        else:
+            visible.append(evt)
+    _mark_completion_events_consumed(silent)
+    return visible
+
+
 def _ack_steered_completion_ingest(session: dict) -> None:
     """ACK staged completions only after leftover enqueue or equivalent ingest."""
     with session["history_lock"]:
@@ -10428,6 +10443,9 @@ def _flush_pending_completions_if_idle(sid: str, session: dict, emitted: set) ->
         if not fresh:
             return
         pending = fresh
+    pending = _filter_routine_delegated_child_completions(pending)
+    if not pending:
+        return
     if running:
         if not _deliver_completions_via_steer(sid, session, pending, emitted):
             with session["history_lock"]:

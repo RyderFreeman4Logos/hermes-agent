@@ -265,7 +265,19 @@ class TestCompressionBoundaryHook:
                 pending,
                 on_applied=on_applied,
             )
-            scheduled_config = db.get_session(original_sid)["model_config"]
+            scheduled_session = db.get_session(original_sid)
+            assert scheduled_session is not None
+            scheduled_config = scheduled_session["model_config"]
+            scheduled_route = tuple(
+                scheduled_session.get(key)
+                for key in (
+                    "model",
+                    "billing_provider",
+                    "billing_base_url",
+                    "billing_mode",
+                    "_system_prompt_resolved",
+                )
+            )
 
             def _switch(model, provider, api_key, base_url, _api_mode):
                 agent.model = model
@@ -291,7 +303,19 @@ class TestCompressionBoundaryHook:
             assert (agent.model, agent.provider, agent.api_key, agent.base_url) == original_route
             assert agent.switch_model.call_count == 1
             assert get_model_switch_after_compression(agent) is pending
-            assert db.get_session(original_sid)["model_config"] == scheduled_config
+            restored_session = db.get_session(original_sid)
+            assert restored_session is not None
+            assert restored_session["model_config"] == scheduled_config
+            assert tuple(
+                restored_session.get(key)
+                for key in (
+                    "model",
+                    "billing_provider",
+                    "billing_base_url",
+                    "billing_mode",
+                    "_system_prompt_resolved",
+                )
+            ) == scheduled_route
             on_applied.assert_not_called()
             compressor.on_session_start.assert_not_called()
 

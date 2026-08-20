@@ -123,3 +123,49 @@ def test_lean_chunk_digests_keep_session_contextvars_on_workers():
         assert hit["runtime"].get("provider") == "custom"
         assert hit["secret"] is not None
         assert hit["secret"].get("OPENAI_API_KEY") == "PROFILE-SECRET"
+
+
+def test_lean_chunk_digests_reuse_selected_fallback_route():
+    """Sibling chunks use the route selected after the primary model fails."""
+    calls: list[dict] = []
+
+    def fake_call_llm(*, messages, task, max_tokens, **kwargs):
+        assert task == "compression"
+        calls.append(kwargs)
+        route = kwargs.get("provider"), kwargs.get("model")
+        if route == ("openai-codex", "gpt-5.6-luna"):
+            label = "FALLBACK"
+        else:
+            # This stands in for call_llm's real primary-400 → fallback result.
+            label = "FALLBACK" if not calls[:-1] else "PRIMARY-REHIT"
+        resp = MagicMock()
+        resp.choices = [MagicMock()]
+        resp.choices[0].message.content = label
+        return resp
+
+    turns = [
+        {"role": "user", "content": "MARKER-A " + ("aaaa " * 20)},
+        {"role": "user", "content": "MARKER-B " + ("bbbb " * 20)},
+        {"role": "user", "content": "MARKER-C " + ("cccc " * 20)},
+    ]
+    compressor = ContextCompressor("test/model", quiet_mode=True, tail_mode="lean")
+
+    with (
+        patch("agent.context_compressor._LEAN_DIGEST_CHUNK_CHARS", 40),
+        patch("agent.auxiliary_client.call_llm", fake_call_llm),
+        patch(
+            "agent.auxiliary_client._get_task_max_concurrency",
+            return_value=5,
+        ),
+    ):
+        out = compressor._build_chunk_digests(turns)
+
+    assert calls[0] == {}
+    assert len(calls) > 1
+    assert all(
+        call.get("provider") == "openai-codex"
+        and call.get("model") == "gpt-5.6-luna"
+        for call in calls[1:]
+    )
+    assert "PRIMARY-REHIT" not in out
+    assert out.count("FALLBACK") == len(calls)

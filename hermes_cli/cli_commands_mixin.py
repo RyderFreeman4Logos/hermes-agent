@@ -1416,6 +1416,12 @@ class CLICommandsMixin:
         # list_sessions_rich() can keep the branch visible in /resume and
         # /sessions even after the parent is reopened and re-ended with a
         # different end_reason (e.g. tui_shutdown overwriting 'branched').
+        init_config = getattr(self.agent, "_session_init_model_config", None)
+        memory_provider_mode = (
+            init_config.get("memory_provider_mode")
+            if isinstance(init_config, dict)
+            else None
+        ) or getattr(self.agent, "_memory_provider_mode", None)
         try:
             self._session_db.create_session(
                 session_id=new_session_id,
@@ -1424,6 +1430,7 @@ class CLICommandsMixin:
                 model_config={
                     "max_iterations": self.max_turns,
                     "reasoning_config": self.reasoning_config,
+                    "memory_provider_mode": memory_provider_mode,
                     "_branched_from": parent_session_id,
                 },
                 parent_session_id=parent_session_id,

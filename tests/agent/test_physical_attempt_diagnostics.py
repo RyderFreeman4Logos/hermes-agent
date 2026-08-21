@@ -247,6 +247,39 @@ def test_pair_distinguishes_later_history_from_complete_equality(monkeypatch, tm
     assert all(len(pair["digests"]["later_history"]) == 64 for pair in pairs)
 
 
+def test_enabled_diagnostics_work_without_posix_uid_apis(monkeypatch, tmp_path):
+    from agent import physical_attempt_diagnostics as diagnostics
+    from hermes_cli import config
+
+    monkeypatch.setattr(diagnostics, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(config, "read_raw_config_readonly", lambda: _config(True))
+    monkeypatch.delattr(diagnostics.os, "geteuid")
+    diagnostics._LAST_ATTEMPT.clear()
+
+    attempts = [
+        diagnostics.start_attempt(
+            {"messages": [{"role": "system", "content": "fixed"}]},
+            api_mode="chat_completions",
+            route="chat_completions",
+            provider="provider",
+            model="model",
+            retry=0,
+            loop=loop,
+            correlation="non-posix",
+        )
+        for loop in (1, 2)
+    ]
+    assert all(attempt is not None for attempt in attempts)
+
+    records = [
+        json.loads(line)
+        for line in (
+            tmp_path / "observability" / "physical_attempt_digests.jsonl"
+        ).read_text(encoding="utf-8").splitlines()
+    ]
+    assert [record["phase"] for record in records] == ["attempt", "attempt", "pair"]
+
+
 def test_retention_stays_bounded_for_unique_correlations_and_records(
     monkeypatch, tmp_path
 ):

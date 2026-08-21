@@ -1454,7 +1454,9 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                         if int(getattr(agent, "_fallback_index", 0) or 0) > 0
                         else "primary"
                     ),
-                    "retry_count": attempt,
+                    "retry_count": int(
+                        getattr(agent, "_current_api_retry_count", 0) or 0
+                    ) + attempt,
                 },
                 defer_logical_completion=True,
             )

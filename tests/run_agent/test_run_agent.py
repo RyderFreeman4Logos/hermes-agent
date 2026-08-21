@@ -2853,6 +2853,93 @@ class TestRunConversation:
             },
         ]
 
+    def test_first_main_route_after_in_place_compression_keeps_cache_key(
+        self, agent, tmp_path
+    ):
+        """The first real request after compression must use the stable prefix."""
+        from agent.transports.codex import _cache_scope_from_session_id, _content_cache_key
+        from hermes_state import SessionDB
+
+        db = SessionDB(db_path=tmp_path / "state.db")
+        session_id = "production-boundary-session"
+        db.create_session(session_id, source="cli", model=agent.model)
+        agent._session_db = db
+        agent._session_db_created = True
+        agent.session_id = session_id
+        agent._last_flushed_db_idx = 0
+        agent._flushed_db_message_ids = set()
+        agent._flushed_db_message_session_id = session_id
+        agent.compression_in_place = True
+        agent.compression_enabled = False
+        agent._use_prompt_caching = True
+        agent._use_native_cache_layout = False
+        agent._cache_ttl = "5m"
+        agent.provider = "boundary-test"
+        agent.base_url = "https://api.openai.com/v1"
+        agent._base_url_lower = agent.base_url.lower()
+        agent._base_url_hostname = "api.openai.com"
+
+        agent._memory_manager = MagicMock()
+        agent._memory_manager.build_system_prompt.return_value = "old volatile suffix"
+        agent._memory_manager.prefetch_all.return_value = ""
+        agent._memory_manager.describe_recall.return_value = ""
+        initial_prompt = agent._build_system_prompt()
+        stable_prefix = agent._cached_system_prompt_static
+        agent._cached_system_prompt = initial_prompt
+        agent._memory_manager.build_system_prompt.return_value = "rebuilt volatile suffix"
+
+        def _fake_compress(messages, current_tokens=None, focus_topic=None, force=False):
+            return [
+                {"role": "user", "content": "[CONTEXT COMPACTION] summary"},
+                {"role": "assistant", "content": "recent reply"},
+            ]
+
+        agent.context_compressor.compress = _fake_compress
+        agent.context_compressor._last_compress_aborted = False
+        agent.context_compressor._last_summary_error = None
+        agent.context_compressor.compression_count = 1
+        source_messages = [
+            {"role": "user" if index % 2 == 0 else "assistant", "content": f"m{index}"}
+            for index in range(8)
+        ]
+        compressed, _rebuilt_prompt = agent._compress_context(
+            source_messages, None, approx_tokens=100_000
+        )
+
+        assert agent._last_compaction_in_place is True
+        assert agent.context_compressor.awaiting_real_usage_after_compression is True
+        assert agent.session_id == session_id
+        assert agent._memory_manager.build_system_prompt.call_count >= 2
+
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="done",
+            finish_reason="stop",
+            usage={"prompt_tokens": 512, "completion_tokens": 1, "total_tokens": 513},
+        )
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(
+                "next request", conversation_history=compressed, task_id="post-compress"
+            )
+
+        assert result["completed"] is True
+        assert agent.client.chat.completions.create.call_count == 1
+        request = agent.client.chat.completions.create.call_args_list[0].kwargs
+        scope = _cache_scope_from_session_id(session_id)
+        assert request["prompt_cache_key"] == _content_cache_key(
+            stable_prefix, agent.tools, scope
+        )
+        assert request["prompt_cache_key"] != _content_cache_key("", agent.tools, scope)
+        system = request["messages"][0]
+        assert system["role"] == "system"
+        assert isinstance(system["content"], list)
+        assert system["content"][0]["cache_control"] == {"type": "ephemeral"}
+        assert len(system["content"][0]["text"]) == len(stable_prefix)
+        db.close()
+
     def test_codex_content_filter_incomplete_routes_to_policy_fallback(self, agent):
         self._setup_agent(agent)
         agent.api_mode = "codex_responses"

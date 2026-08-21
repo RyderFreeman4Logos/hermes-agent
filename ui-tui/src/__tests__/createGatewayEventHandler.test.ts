@@ -2253,7 +2253,7 @@ describe('createGatewayEventHandler', () => {
       }
     })
 
-    it('marks a cache miss as a warn event', () => {
+    it('renders known cache miss totals on the warn event', () => {
       const appended: Msg[] = []
       const onEvent = createGatewayEventHandler(buildCtx(appended))
       const formatTime = vi.spyOn(Date.prototype, 'toLocaleTimeString').mockReturnValue('14:23:05')
@@ -2261,7 +2261,7 @@ describe('createGatewayEventHandler', () => {
       try {
         onEvent({
           payload: {
-            cache_info: { state: 'miss' },
+            cache_info: { pct: 0, prompt_tokens: 4_000, read_tokens: 0, state: 'miss' },
             completed_at: 1_700_000_000.25,
             text: 'final answer'
           },
@@ -2270,7 +2270,12 @@ describe('createGatewayEventHandler', () => {
 
         expect(appended).toEqual([
           { role: 'assistant', text: 'final answer' },
-          { eventTone: 'warn', kind: 'event', role: 'system', text: 'agent loop stop at 14:23:05  cache miss' }
+          {
+            eventTone: 'warn',
+            kind: 'event',
+            role: 'system',
+            text: 'agent loop stop at 14:23:05  cache miss 0/4000'
+          }
         ])
       } finally {
         formatTime.mockRestore()

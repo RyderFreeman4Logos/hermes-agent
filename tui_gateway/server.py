@@ -1701,9 +1701,8 @@ def _cache_info_from_usage(usage: Any) -> dict[str, int | str]:
     if telemetry is None and (read_tokens or write_tokens):
         telemetry = "reported"
     if telemetry != "reported":
-        state = "unavailable"
-        pct = 0
-    elif read_tokens:
+        return {"state": "unavailable", "pct": 0}
+    if read_tokens:
         state = "hit"
         pct = round(100 * read_tokens / prompt_tokens) if prompt_tokens else 0
     elif write_tokens:

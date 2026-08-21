@@ -52,6 +52,12 @@ const cacheFootnote = (cacheInfo?: CacheInfo): null | string => {
       : `cache ${Math.max(0, Math.round(cacheInfo.pct ?? 0))}%${pair}`
   }
 
+  if (cacheInfo.state === 'miss') {
+    const hasCounts = Number.isFinite(cacheInfo.read_tokens) && Number.isFinite(cacheInfo.prompt_tokens)
+
+    return hasCounts ? `cache miss ${cacheInfo.read_tokens}/${cacheInfo.prompt_tokens}` : 'cache miss'
+  }
+
   return cacheInfo.state === 'cold_write' ? 'cache COLD_WRITE' : `cache ${cacheInfo.state}`
 }
 

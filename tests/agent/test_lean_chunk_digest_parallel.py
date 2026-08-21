@@ -5,6 +5,8 @@ import threading
 import time
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from agent.context_compressor import ContextCompressor
 
 
@@ -189,6 +191,64 @@ def test_lean_chunk_digests_never_exceed_configured_max_concurrency():
     headers = _segment_headers(out)
     assert headers == [("1", "3"), ("2", "3"), ("3", "3")]
     assert out.find("DIGEST-A") < out.find("DIGEST-B") < out.find("DIGEST-C")
+
+
+def _five_marker_turns():
+    return [
+        {"role": "user", "content": "MARKER-A " + ("A" * 70)},
+        {"role": "user", "content": "MARKER-B " + ("B" * 70)},
+        {"role": "user", "content": "MARKER-C " + ("C" * 70)},
+        {"role": "user", "content": "MARKER-D " + ("D" * 70)},
+        {"role": "user", "content": "MARKER-E " + ("E" * 70)},
+    ]
+
+
+@pytest.mark.parametrize(("selected_index", "expected"), [(0, 2), (1, 3)])
+def test_lean_chunk_digests_use_selected_fallback_entry_limit(selected_index, expected):
+    """Pool width follows the selected fallback entry, not the task cap (#163)."""
+    active = 0
+    max_active = 0
+    lock = threading.Lock()
+
+    def fake_call_llm(*, messages, task, max_tokens, **kwargs):
+        nonlocal active, max_active
+        assert task == "compression"
+        route_info = kwargs.get("route_info")
+        if route_info is not None and "fallback_label" not in route_info:
+            route_info.update(
+                provider="openai-codex",
+                model="codex-model",
+                fallback_label=f"fallback_chain[{selected_index}](openai-codex)",
+            )
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        try:
+            time.sleep(0.04)
+        finally:
+            with lock:
+                active -= 1
+        response = MagicMock()
+        response.choices = [MagicMock()]
+        response.choices[0].message.content = "DIGEST"
+        return response
+
+    config = {
+        "max_concurrency": 5,
+        "fallback_chain": [
+            {"provider": "openai-codex", "model": "codex-model", "max_concurrency": 2},
+            {"provider": "openai-codex", "model": "codex-model", "max_concurrency": 3},
+        ],
+    }
+    compressor = ContextCompressor("test/model", quiet_mode=True, tail_mode="lean")
+    with (
+        patch("agent.context_compressor._LEAN_DIGEST_CHUNK_CHARS", 88),
+        patch("agent.auxiliary_client.call_llm", fake_call_llm),
+        patch("agent.auxiliary_client._get_auxiliary_task_config", return_value=config),
+    ):
+        compressor._build_chunk_digests(_five_marker_turns())
+
+    assert max_active == expected
 
 
 def test_lean_chunk_digests_isolate_one_chunk_failure():

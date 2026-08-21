@@ -8436,18 +8436,13 @@ def _get_task_extra_body(task: str) -> Dict[str, Any]:
 # chain, multiplying request volume on already-degraded endpoints. A per-task
 # semaphore caps in-flight calls so retry amplification stays bounded.
 
-_aux_sync_semaphores: Dict[str, Tuple[int, threading.BoundedSemaphore]] = {}
-_aux_async_semaphores: Dict[Tuple[str, int], Tuple[int, Any]] = {}
+_aux_sync_semaphores: Dict[Tuple[str, str], Tuple[int, threading.BoundedSemaphore]] = {}
+_aux_async_semaphores: Dict[Tuple[Tuple[str, str], int], Tuple[int, Any]] = {}
 _aux_sem_lock = threading.Lock()
 
 
-def _get_task_max_concurrency(task: Optional[str]) -> Optional[int]:
-    """Return ``auxiliary.<task>.max_concurrency`` as a positive int, or None."""
-    if not task or task == "vision":
-        # Vision already uses this key for its encode/resize CPU worker pool;
-        # its LLM calls deliberately remain concurrent.
-        return None
-    raw = _get_auxiliary_task_config(task).get("max_concurrency")
+def _parse_max_concurrency(raw: Any) -> Optional[int]:
+    """Return a configured positive concurrency limit, or None."""
     if raw is None:
         return None
     try:
@@ -8457,23 +8452,59 @@ def _get_task_max_concurrency(task: Optional[str]) -> Optional[int]:
     return value if value > 0 else None
 
 
-def _acquire_sync_aux_semaphore(task: Optional[str]) -> Optional[threading.BoundedSemaphore]:
-    """Get a per-task sync semaphore, rebuilding it after a config change."""
-    limit = _get_task_max_concurrency(task)
+def _fallback_entry_max_concurrency(
+    task: Optional[str], fb_label: str,
+) -> Optional[int]:
+    """Resolve a positive ``max_concurrency`` from a fallback-chain entry."""
+    entry = _fallback_chain_entry(task, fb_label)
+    return _parse_max_concurrency(entry.get("max_concurrency")) if entry else None
+
+
+def _get_task_max_concurrency(
+    task: Optional[str], fallback_label: str = "",
+) -> Optional[int]:
+    """Return the selected entry limit, or the task-level positive limit."""
+    if not task or task == "vision":
+        # Vision already uses this key for its encode/resize CPU worker pool;
+        # its LLM calls deliberately remain concurrent.
+        return None
+    entry_limit = _fallback_entry_max_concurrency(task, fallback_label)
+    if entry_limit is not None:
+        return entry_limit
+    return _parse_max_concurrency(_get_auxiliary_task_config(task).get("max_concurrency"))
+
+
+def _auxiliary_concurrency_scope(
+    task: Optional[str], fallback_label: str,
+) -> Tuple[str, str]:
+    """Share task-level permits, but isolate valid fallback candidates."""
+    if _fallback_entry_max_concurrency(task, fallback_label) is None:
+        fallback_label = ""
+    return task or "", fallback_label
+
+
+def _acquire_sync_aux_semaphore(
+    task: Optional[str], fallback_label: str = "",
+) -> Optional[threading.BoundedSemaphore]:
+    """Get a per-task or valid-candidate sync semaphore."""
+    limit = _get_task_max_concurrency(task, fallback_label)
     if limit is None:
         return None
+    scope = _auxiliary_concurrency_scope(task, fallback_label)
     with _aux_sem_lock:
-        entry = _aux_sync_semaphores.get(task)
+        entry = _aux_sync_semaphores.get(scope)
         if entry is None or entry[0] != limit:
             semaphore = threading.BoundedSemaphore(limit)
-            _aux_sync_semaphores[task] = (limit, semaphore)
+            _aux_sync_semaphores[scope] = (limit, semaphore)
             return semaphore
         return entry[1]
 
 
-def _acquire_async_aux_semaphore(task: Optional[str]):
-    """Get a per-task, per-event-loop async semaphore after config lookup."""
-    limit = _get_task_max_concurrency(task)
+def _acquire_async_aux_semaphore(
+    task: Optional[str], fallback_label: str = "",
+):
+    """Get a per-task or valid-candidate async semaphore per event loop."""
+    limit = _get_task_max_concurrency(task, fallback_label)
     if limit is None:
         return None
     import asyncio
@@ -8481,7 +8512,8 @@ def _acquire_async_aux_semaphore(task: Optional[str]):
         loop = asyncio.get_running_loop()
     except RuntimeError:
         return None
-    key = (task, id(loop))
+    scope = _auxiliary_concurrency_scope(task, fallback_label)
+    key = (scope, id(loop))
     with _aux_sem_lock:
         entry = _aux_async_semaphores.get(key)
         if entry is None or entry[0] != limit:
@@ -9485,7 +9517,11 @@ def call_llm(
     route_info: Optional[Dict[str, str]] = None,
 ) -> Any:
     """Run an auxiliary LLM request, applying the configured task limit."""
-    semaphore = _acquire_sync_aux_semaphore(task)
+    fallback_label = (
+        str(route_info.get("fallback_label") or "")
+        if isinstance(route_info, dict) else ""
+    )
+    semaphore = _acquire_sync_aux_semaphore(task, fallback_label)
     if semaphore is not None:
         semaphore.acquire()
     try:
@@ -10453,7 +10489,11 @@ async def async_call_llm(
     route_info: Optional[Dict[str, str]] = None,
 ) -> Any:
     """Run an asynchronous auxiliary LLM request under the configured limit."""
-    semaphore = _acquire_async_aux_semaphore(task)
+    fallback_label = (
+        str(route_info.get("fallback_label") or "")
+        if isinstance(route_info, dict) else ""
+    )
+    semaphore = _acquire_async_aux_semaphore(task, fallback_label)
     if semaphore is not None:
         await semaphore.acquire()
     try:

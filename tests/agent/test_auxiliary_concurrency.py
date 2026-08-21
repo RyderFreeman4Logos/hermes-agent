@@ -68,6 +68,33 @@ class TestGetTaskMaxConcurrency:
         ):
             assert _get_task_max_concurrency("compression") is None
 
+    @pytest.mark.parametrize("raw", [None, "not-a-number", 0, -2])
+    def test_invalid_entry_uses_task_level_limit(self, raw):
+        config = {
+            "max_concurrency": 5,
+            "fallback_chain": [{"max_concurrency": raw}],
+        }
+        with patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value=config,
+        ):
+            assert _get_task_max_concurrency(
+                "compression", "fallback_chain[0](openai-codex)"
+            ) == 5
+
+    def test_valid_entry_overrides_task_level_limit(self):
+        config = {
+            "max_concurrency": 5,
+            "fallback_chain": [{"max_concurrency": 2}],
+        }
+        with patch(
+            "agent.auxiliary_client._get_auxiliary_task_config",
+            return_value=config,
+        ):
+            assert _get_task_max_concurrency(
+                "compression", "fallback_chain[0](openai-codex)"
+            ) == 2
+
 
 class TestSemaphoreCache:
     def test_sync_returns_none_when_unset(self):
@@ -175,6 +202,70 @@ class TestSyncCallEnforcesLimit:
 
         assert max_active <= limit, f"observed {max_active} > limit {limit}"
         assert client.chat.completions.create.call_count == n_callers
+
+    @pytest.mark.parametrize(("fallback_index", "limit"), [(0, 2), (1, 3)])
+    def test_call_llm_uses_selected_fallback_entry_limit(self, fallback_index, limit):
+        active = 0
+        max_active = 0
+        lock = threading.Lock()
+
+        def fake_create(**kwargs):
+            nonlocal active, max_active
+            with lock:
+                active += 1
+                max_active = max(max_active, active)
+            try:
+                time.sleep(0.04)
+            finally:
+                with lock:
+                    active -= 1
+            return MagicMock()
+
+        client = MagicMock()
+        client.base_url = "https://example.test/v1"
+        client.chat.completions.create.side_effect = fake_create
+        config = {
+            "max_concurrency": 5,
+            "fallback_chain": [
+                {"max_concurrency": 2},
+                {"max_concurrency": 3},
+            ],
+        }
+        label = f"fallback_chain[{fallback_index}](openai-codex)"
+        with (
+            patch(
+                "agent.auxiliary_client._resolve_task_provider_model",
+                return_value=("openrouter", "test-model", None, None, None),
+            ),
+            patch(
+                "agent.auxiliary_client._get_cached_client",
+                return_value=(client, "test-model"),
+            ),
+            patch(
+                "agent.auxiliary_client._validate_llm_response",
+                side_effect=lambda resp, _task, **_kwargs: resp,
+            ),
+            patch(
+                "agent.auxiliary_client._get_auxiliary_task_config",
+                return_value=config,
+            ),
+        ):
+            threads = [
+                threading.Thread(
+                    target=lambda: call_llm(
+                        task="compression",
+                        messages=[{"role": "user", "content": "hi"}],
+                        route_info={"fallback_label": label},
+                    )
+                )
+                for _ in range(6)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5)
+
+        assert max_active == limit
 
     def test_call_llm_unlimited_when_not_configured(self):
         client = MagicMock()

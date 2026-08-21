@@ -4274,7 +4274,6 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         from agent.auxiliary_client import _get_task_max_concurrency
         from tools.thread_context import propagate_context_to_thread
 
-        configured = _get_task_max_concurrency("compression")
         # Probe one small chunk through the normal resolver.  call_llm records
         # the concrete route it selected, including a primary-400 fallback;
         # sibling chunks then use that route directly instead of re-hitting a
@@ -4295,6 +4294,9 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
                     "fallback_label": str(fallback_label),
                 }
 
+        configured = _get_task_max_concurrency(
+            "compression", str(route_info.get("fallback_label") or ""),
+        )
         remaining = jobs[1:]
         if not remaining:
             digests = [first_digest]

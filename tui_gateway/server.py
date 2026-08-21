@@ -4863,6 +4863,8 @@ def _attach_model_switch_after_compression(sid: str, session: dict, agent) -> No
             "api_key": result.api_key,
             "api_mode": result.api_mode,
         }
+        if result.reasoning_config is not None:
+            session["model_override"]["reasoning_config"] = dict(result.reasoning_config)
         _append_model_switch_marker(
             session,
             model=result.new_model,
@@ -5082,11 +5084,12 @@ def _apply_model_switch(
                 base_url=result.base_url,
                 api_mode=result.api_mode,
             )
-            if result.reasoning_config is not None:
-                agent.reasoning_config = result.reasoning_config
+            reasoning_config = getattr(result, "reasoning_config", None)
+            if reasoning_config is not None:
+                agent.reasoning_config = reasoning_config
                 runtime = getattr(agent, "_primary_runtime", None)
                 if isinstance(runtime, dict):
-                    runtime["reasoning_config"] = result.reasoning_config
+                    runtime["reasoning_config"] = reasoning_config
         except Exception as exc:
             # The in-place swap rolled the agent back to the old working
             # model/client and re-raised.  Abort the commit: do NOT restart the
@@ -5132,7 +5135,7 @@ def _apply_model_switch(
             "base_url": result.base_url,
             "api_key": result.api_key,
             "api_mode": result.api_mode,
-            "reasoning_config": result.reasoning_config,
+            "reasoning_config": getattr(result, "reasoning_config", None),
         }
     session.pop("after_compression_model_switch", None)
     if persist_global:
@@ -7312,6 +7315,10 @@ def _make_agent(
             if not resolution.selected_model:
                 raise RuntimeError("Auth fallback resolved without a model")
             model = resolution.selected_model
+    if reasoning_config_override is None and isinstance(model_override, dict):
+        override_reasoning = model_override.get("reasoning_config")
+        if isinstance(override_reasoning, dict):
+            reasoning_config_override = dict(override_reasoning)
     _pr = _load_provider_routing()
     agent = AIAgent(
         model=model,

@@ -9,6 +9,7 @@ import os
 import secrets
 import stat
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -20,7 +21,7 @@ __all__ = ["Attempt", "enabled", "prepare_cache_scope", "start_attempt"]
 _KEY_FILE = "physical_attempt_digests.key"
 _RECORDS_FILE = "physical_attempt_digests.jsonl"
 _LOCK = threading.Lock()
-_LAST_ATTEMPT: dict[tuple[str, str], "Attempt"] = {}
+_LAST_ATTEMPT: dict[tuple[str, str, str, str], "Attempt"] = {}
 _CACHE_SCOPE_ENVELOPE = "_hermes_physical_attempt_cache_scope"
 # ponytail: fixed local caps; add configurable rotation only if diagnostics volume needs it.
 _MAX_TRACKED_CORRELATIONS = 256
@@ -33,6 +34,8 @@ class Attempt:
 
     digest: str
     route: str
+    provider: str
+    model: str
     loop: int
     retry: int
     correlation: str
@@ -81,7 +84,6 @@ def start_attempt(
     scope: dict[str, str] | None = None,
 ) -> Attempt | None:
     """Record an opt-in HMAC-only request identity and adjacent-loop pair."""
-    del provider, model
     if not enabled() or loop is None or loop < 0 or not correlation:
         return None
     try:
@@ -103,6 +105,8 @@ def start_attempt(
         attempt = Attempt(
             digest=hmac.new(key, b"attempt\0" + secrets.token_bytes(32), hashlib.sha256).hexdigest(),
             route=_label(route),
+            provider=_label(provider),
+            model=_label(model),
             loop=loop,
             retry=max(0, int(retry)),
             correlation=correlation,
@@ -112,8 +116,11 @@ def start_attempt(
         _append({
             "schema": "hermes.physical_attempt.v1",
             "phase": "attempt",
+            "timestamp_ns": time.time_ns(),
             "attempt_digest": attempt.digest,
             "route": attempt.route,
+            "provider": attempt.provider,
+            "model": attempt.model,
             "loop": attempt.loop,
             "retry": attempt.retry,
             "digests": components,
@@ -126,7 +133,7 @@ def start_attempt(
 
 
 def _pair(current: Attempt) -> None:
-    identity = (current.correlation, current.route)
+    identity = (current.correlation, current.route, current.provider, current.model)
     with _LOCK:
         previous = _LAST_ATTEMPT.pop(identity, None)
         _LAST_ATTEMPT[identity] = current
@@ -139,6 +146,10 @@ def _pair(current: Attempt) -> None:
     _append({
         "schema": "hermes.physical_attempt.v1",
         "phase": "pair",
+        "timestamp_ns": time.time_ns(),
+        "route": current.route,
+        "provider": current.provider,
+        "model": current.model,
         "previous_attempt_digest": previous.digest,
         "current_attempt_digest": current.digest,
         "previous_loop": previous.loop,

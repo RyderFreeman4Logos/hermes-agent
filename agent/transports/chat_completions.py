@@ -44,6 +44,16 @@ def _static_prompt_instructions(messages: list[dict[str, Any]]) -> str:
     content = first.get("content")
     if isinstance(content, str):
         return content
+    if isinstance(content, list) and content:
+        # A cache plan marks the stable system prefix in the first block and
+        # leaves the rebuilt volatile suffix outside the routing key.
+        first_block = content[0]
+        if (
+            isinstance(first_block, dict)
+            and "cache_control" in first_block
+            and isinstance(first_block.get("text"), str)
+        ):
+            return first_block["text"]
     try:
         return json.dumps(content, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     except (TypeError, ValueError):

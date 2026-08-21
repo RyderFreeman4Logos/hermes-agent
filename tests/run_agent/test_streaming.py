@@ -556,10 +556,72 @@ class TestStreamingFallback:
         # Connection cleanup should happen for each failed retry
         assert mock_close.call_count >= 2
 
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_streaming_retry_pairs_final_retry_with_next_loop(
+        self, mock_close, mock_create, monkeypatch, tmp_path
+    ):
+        import httpx
+        import json
+        from openai import APIError as OAIAPIError
+
+        from agent import physical_attempt_diagnostics as diagnostics
+        from hermes_cli import config
+        from run_agent import AIAgent
+
+        monkeypatch.setenv("HERMES_STREAM_RETRIES", "1")
+        monkeypatch.setattr(diagnostics, "get_hermes_home", lambda: tmp_path)
+        monkeypatch.setattr(config, "read_raw_config_readonly", lambda: {
+            "observability": {"physical_attempt_digests": {"enabled": True}}
+        })
+        diagnostics._LAST_ATTEMPT.clear()
+
+        dropped = OAIAPIError(
+            message="Network connection lost.",
+            request=httpx.Request("POST", "https://example.invalid/chat/completions"),
+            body={"message": "Network connection lost."},
+        )
+        def complete():
+            return iter([
+                _make_stream_chunk(content="ok"),
+                _make_stream_chunk(finish_reason="stop"),
+            ])
+
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.side_effect = [dropped, complete(), complete()]
+        mock_create.return_value = mock_client
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://example.invalid/v1",
+            model="test-model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "chat_completions"
+        agent._interrupt_requested = False
+        agent.session_id = "session-1"
+        request = {
+            "model": "test-model",
+            "messages": [{"role": "system", "content": "fixed"}],
+        }
+
+        for loop in (1, 2):
+            agent._current_api_request_id = f"turn:api:{loop}"
+            agent._interruptible_streaming_api_call(request)
+
+        records = [
+            json.loads(line)
+            for line in (
+                tmp_path / "observability" / "physical_attempt_digests.jsonl"
+            ).read_text().splitlines()
+        ]
+        pair = next(record for record in records if record["phase"] == "pair")
+        assert pair["previous_attempt_retry"] == 1
 
 
 # ── Test: Reasoning Streaming ────────────────────────────────────────────
-
 
 class TestReasoningStreaming:
     """Verify reasoning content is accumulated and callback fires."""

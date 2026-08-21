@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 
 def _config(enabled: bool) -> dict[str, object]:
@@ -40,6 +41,13 @@ def test_pair_emits_only_hmac_digests_for_final_then_next_first_attempt(
     sentinel = "ISSUE108-PRIVATE-SENTINEL"
     monkeypatch.setattr(diagnostics, "get_hermes_home", lambda: tmp_path)
     monkeypatch.setattr(config, "read_raw_config_readonly", lambda: _config(True))
+    timestamps = iter((101, 102, 103, 104))
+    monkeypatch.setattr(
+        diagnostics,
+        "time",
+        SimpleNamespace(time_ns=lambda: next(timestamps)),
+        raising=False,
+    )
     diagnostics._LAST_ATTEMPT.clear()
 
     scope = diagnostics.prepare_cache_scope({"private_scope": sentinel})
@@ -99,6 +107,12 @@ def test_pair_emits_only_hmac_digests_for_final_then_next_first_attempt(
         ).read_text().splitlines()
     ]
     pair = next(record for record in records if record["phase"] == "pair")
+    assert [record["timestamp_ns"] for record in records] == [101, 102, 103, 104]
+    assert (pair["route"], pair["provider"], pair["model"]) == (
+        "chat_completions",
+        "provider",
+        "model",
+    )
     assert pair["previous_loop"] == 1
     assert pair["current_loop"] == 2
     assert pair["previous_attempt_retry"] == 1
@@ -143,6 +157,42 @@ def test_pair_emits_only_hmac_digests_for_final_then_next_first_attempt(
         forbidden not in json.dumps(records, sort_keys=True)
         for forbidden in ("messages", "extra_headers", "authorization", "cookies", "private.example")
     )
+
+
+def test_pair_does_not_cross_provider_or_model_routes(monkeypatch, tmp_path):
+    from agent import physical_attempt_diagnostics as diagnostics
+    from hermes_cli import config
+
+    monkeypatch.setattr(diagnostics, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(config, "read_raw_config_readonly", lambda: _config(True))
+    diagnostics._LAST_ATTEMPT.clear()
+
+    for correlation, later_provider, later_model in (
+        ("provider-switch", "fallback", "grok-4.6"),
+        ("model-switch", "custom", "other-model"),
+    ):
+        for loop, provider, model in (
+            (1, "custom", "grok-4.6"),
+            (2, later_provider, later_model),
+        ):
+            diagnostics.start_attempt(
+                {"messages": [{"role": "system", "content": "fixed"}]},
+                api_mode="chat_completions",
+                route="chat_completions",
+                provider=provider,
+                model=model,
+                retry=0,
+                loop=loop,
+                correlation=correlation,
+            )
+
+    records = [
+        json.loads(line)
+        for line in (
+            tmp_path / "observability" / "physical_attempt_digests.jsonl"
+        ).read_text(encoding="utf-8").splitlines()
+    ]
+    assert [record["phase"] for record in records] == ["attempt"] * 4
 
 
 def test_pair_classifies_first_changed_tools_segment(monkeypatch, tmp_path):
@@ -306,8 +356,8 @@ def test_retention_stays_bounded_for_unique_correlations_and_records(
 
     records_path = tmp_path / "observability" / "physical_attempt_digests.jsonl"
     assert list(diagnostics._LAST_ATTEMPT) == [
-        ("correlation-6", "chat_completions"),
-        ("correlation-7", "chat_completions"),
+        ("correlation-6", "chat_completions", "provider", "model"),
+        ("correlation-7", "chat_completions", "provider", "model"),
     ]
     assert records_path.stat().st_size <= 1024
     assert all(json.loads(line)["phase"] == "attempt" for line in records_path.read_text().splitlines())

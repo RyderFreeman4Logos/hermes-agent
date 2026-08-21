@@ -2200,6 +2200,33 @@ describe('createGatewayEventHandler', () => {
       }
     })
 
+    it('explains a low first-request hit caused by compression', () => {
+      const appended: Msg[] = []
+      const onEvent = createGatewayEventHandler(buildCtx(appended))
+      const formatTime = vi.spyOn(Date.prototype, 'toLocaleTimeString').mockReturnValue('14:23:05')
+
+      try {
+        onEvent({
+          payload: {
+            cache_info: {
+              compression_bound: true,
+              pct: 0,
+              prompt_tokens: 4_000,
+              read_tokens: 3,
+              state: 'hit'
+            },
+            completed_at: 1_700_000_000.25,
+            text: 'final answer'
+          },
+          type: 'message.complete'
+        } as any)
+
+        expect(appended.at(-1)?.text).toContain('because of compression')
+      } finally {
+        formatTime.mockRestore()
+      }
+    })
+
     it('keeps percent-only when token counts are missing', () => {
       const appended: Msg[] = []
       const onEvent = createGatewayEventHandler(buildCtx(appended))

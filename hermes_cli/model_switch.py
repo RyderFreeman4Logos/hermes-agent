@@ -562,13 +562,16 @@ def _persist_session_model_config(
     return None
 
 
-def _pending_descriptor(result: ModelSwitchResult) -> dict[str, str]:
+def _pending_descriptor(result: ModelSwitchResult) -> dict[str, Any]:
     """Durable scheduling metadata; resolved credentials stay memory-only."""
-    return {
+    descriptor: dict[str, Any] = {
         "model": result.new_model,
         "provider": result.target_provider,
         "api_mode": result.api_mode,
     }
+    if result.reasoning_config is not None:
+        descriptor["reasoning_config"] = copy.deepcopy(result.reasoning_config)
+    return descriptor
 
 
 def _applied_model_config(
@@ -585,6 +588,8 @@ def _applied_model_config(
         "api_mode": result.api_mode or None,
     }
     applied.update(route)
+    if result.reasoning_config is not None:
+        applied["reasoning_config"] = copy.deepcopy(result.reasoning_config)
     applied["gateway_runtime"] = {
         key: value
         for key, value in {
@@ -780,6 +785,7 @@ class ModelFlagParseResult:
     is_session: bool = False
     is_once: bool = False
     is_after_compression: bool = False
+    reasoning: str = ""
 # ---------------------------------------------------------------------------
 # Flag parsing
 # ---------------------------------------------------------------------------
@@ -813,12 +819,13 @@ def parse_model_flags_detailed(raw_args: str) -> ModelFlagParseResult:
     is_session = False
     is_once = False
     is_after_compression = False
+    reasoning = ""
 
     # Normalize Unicode dashes (Telegram/iOS auto-converts -- to em/en dash)
     # A single Unicode dash before a flag keyword becomes "--"
     import re as _re
     raw_args = _re.sub(
-        r'[\u2012\u2013\u2014\u2015](provider|global|session|refresh|once|after-compression)',
+        r'[\u2012\u2013\u2014\u2015](provider|global|session|refresh|once|after-compression|reasoning)',
         r'--\1',
         raw_args,
     )
@@ -844,6 +851,12 @@ def parse_model_flags_detailed(raw_args: str) -> ModelFlagParseResult:
         elif parts[i] == "--after-compression":
             is_after_compression = True
             i += 1
+        elif parts[i] == "--reasoning" and i + 1 < len(parts):
+            reasoning = parts[i + 1].strip().lower()
+            i += 2
+        elif parts[i] == "--reasoning":
+            reasoning = "__missing__"
+            i += 1
         elif parts[i] == "--provider" and i + 1 < len(parts):
             explicit_provider = parts[i + 1]
             i += 2
@@ -860,6 +873,7 @@ def parse_model_flags_detailed(raw_args: str) -> ModelFlagParseResult:
         is_session=is_session,
         is_once=is_once,
         is_after_compression=is_after_compression,
+        reasoning=reasoning,
     )
 
 
@@ -944,6 +958,7 @@ MODEL_SWITCH_ERR_ONCE_REQUIRES_TARGET = "once_requires_target"
 MODEL_SWITCH_ERR_AFTER_COMPRESSION_WITH_ONCE = "after_compression_with_once"
 MODEL_SWITCH_ERR_AFTER_COMPRESSION_WITH_GLOBAL = "after_compression_with_global"
 MODEL_SWITCH_ERR_AFTER_COMPRESSION_REQUIRES_TARGET = "after_compression_requires_target"
+MODEL_SWITCH_ERR_INVALID_REASONING = "invalid_reasoning"
 
 # Canonical (surface-neutral) error copy.  Surfaces prepend their own
 # decoration ("  ✗ " in the CLI, "❌ " in the gateway) but MUST NOT change
@@ -954,6 +969,7 @@ MODEL_SWITCH_ERROR_TEXT = {
     MODEL_SWITCH_ERR_AFTER_COMPRESSION_WITH_ONCE: "/model --after-compression cannot be combined with --once",
     MODEL_SWITCH_ERR_AFTER_COMPRESSION_WITH_GLOBAL: "/model --after-compression cannot be combined with --global",
     MODEL_SWITCH_ERR_AFTER_COMPRESSION_REQUIRES_TARGET: "/model --after-compression requires a model or provider.",
+    MODEL_SWITCH_ERR_INVALID_REASONING: "/model --reasoning requires one of: none, minimal, low, medium, high, xhigh, max, ultra.",
 }
 
 
@@ -979,6 +995,7 @@ class ModelSwitchRequest:
     is_after_compression: bool = False
     force_refresh: bool = False
     scope: str = "default"
+    reasoning: str = ""
     errors: tuple = ()
 
     # Compat properties so a ModelSwitchRequest can be passed anywhere a
@@ -997,6 +1014,7 @@ class ModelSwitchRequest:
             is_session=self.is_session,
             is_once=self.is_once,
             is_after_compression=self.is_after_compression,
+            reasoning=self.reasoning,
         )
 
     def error_messages(self) -> list:
@@ -1034,10 +1052,16 @@ def parse_model_switch_args(raw: str) -> ModelSwitchRequest:
         errors.append(MODEL_SWITCH_ERR_AFTER_COMPRESSION_WITH_ONCE)
     if parsed.is_after_compression and parsed.is_global:
         errors.append(MODEL_SWITCH_ERR_AFTER_COMPRESSION_WITH_GLOBAL)
+    if parsed.reasoning:
+        from hermes_constants import VALID_REASONING_EFFORTS
+
+        if parsed.reasoning != "none" and parsed.reasoning not in VALID_REASONING_EFFORTS:
+            errors.append(MODEL_SWITCH_ERR_INVALID_REASONING)
     if (
         parsed.is_after_compression
         and not parsed.model_input
         and not parsed.explicit_provider
+        and not parsed.reasoning
     ):
         errors.append(MODEL_SWITCH_ERR_AFTER_COMPRESSION_REQUIRES_TARGET)
 
@@ -1062,6 +1086,7 @@ def parse_model_switch_args(raw: str) -> ModelSwitchRequest:
         is_after_compression=parsed.is_after_compression,
         force_refresh=parsed.force_refresh,
         scope=scope,
+        reasoning=parsed.reasoning,
         errors=tuple(errors),
     )
 

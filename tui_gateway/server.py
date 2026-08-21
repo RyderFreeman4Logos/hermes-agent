@@ -5008,11 +5008,13 @@ def _apply_model_switch(
         after_compression = bool(
             getattr(parsed_flags, "is_after_compression", False)
         )
+        reasoning = getattr(parsed_flags, "reasoning", "")
         errors = tuple(getattr(parsed_flags, "errors", ()))
     else:
         model_input, explicit_provider, is_global_flag, _force_refresh, is_session = parsed_flags
         one_turn = False
         after_compression = False
+        reasoning = ""
         errors = ()
     # Conflict validation delegates to the shared single-owner parser; the
     # TUI surfaces it as a raised ValueError (its historical behavior)
@@ -5033,10 +5035,15 @@ def _apply_model_switch(
             explicit_provider=explicit_provider,
         )
     )
+    agent = session.get("agent")
+    if reasoning and not model_input and not explicit_provider:
+        if agent is None:
+            raise ValueError("/model --reasoning requires a live session")
+        model_input = getattr(agent, "model", "") or ""
+        explicit_provider = getattr(agent, "provider", "") or ""
     if not model_input and not explicit_provider:
         raise ValueError("model or provider value required")
 
-    agent = session.get("agent")
     if one_turn and not agent:
         raise ValueError("/model --once requires a live session")
     if agent:
@@ -5092,6 +5099,10 @@ def _apply_model_switch(
     )
     if not result.success:
         raise ValueError(result.error_message or "model switch failed")
+    if reasoning:
+        from hermes_constants import parse_reasoning_effort
+
+        result.reasoning_config = parse_reasoning_effort(reasoning)
 
     restore_snapshot = _snapshot_agent_model_runtime(agent) if (one_turn and agent) else None
 
@@ -5162,6 +5173,11 @@ def _apply_model_switch(
                 base_url=result.base_url,
                 api_mode=result.api_mode,
             )
+            if result.reasoning_config is not None:
+                agent.reasoning_config = result.reasoning_config
+                runtime = getattr(agent, "_primary_runtime", None)
+                if isinstance(runtime, dict):
+                    runtime["reasoning_config"] = result.reasoning_config
         except Exception as exc:
             # The in-place swap rolled the agent back to the old working
             # model/client and re-raised.  Abort the commit: do NOT restart the
@@ -5207,6 +5223,7 @@ def _apply_model_switch(
             "base_url": result.base_url,
             "api_key": result.api_key,
             "api_mode": result.api_mode,
+            "reasoning_config": result.reasoning_config,
         }
     session.pop("after_compression_model_switch", None)
     if persist_global:

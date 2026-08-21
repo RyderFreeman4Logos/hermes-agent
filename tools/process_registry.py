@@ -2009,8 +2009,9 @@ class ProcessRegistry:
             timeout: Max seconds to block. Falls back to TERMINAL_TIMEOUT config.
 
         Returns:
-            dict with status ("exited", "timeout", "interrupted", "not_found")
-            and output snapshot.
+            dict with status ("exited", "running", "timeout", "interrupted", "not_found")
+            and output snapshot. A running notified session returns immediately;
+            its completion is delivered through the existing notification queue.
         """
         from tools.ansi_strip import strip_ansi
         from tools.interrupt import is_interrupted as _is_interrupted
@@ -2046,6 +2047,24 @@ class ProcessRegistry:
         session = self.get(session_id)
         if session is None:
             return {"status": "not_found", "error": f"No process with ID {session_id}"}
+
+        # A notified process already has an autonomous completion path. Do not
+        # hold the parent agent turn on a redundant foreground wait: yielding
+        # here lets unrelated prompts/completions arrive while this process runs.
+        if session.notify_on_complete and not session.exited:
+            return {
+                "status": "running",
+                "session_id": session.id,
+                "command": session.command,
+                "process_running": True,
+                "wait_deferred": True,
+                "notify_on_complete": True,
+                "note": (
+                    "process.wait was auto-backgrounded because notify_on_complete "
+                    "is set; continue other work and you will be notified exactly "
+                    "once when the process exits."
+                ),
+            }
 
         deadline = time.monotonic() + effective_timeout
 
@@ -3019,8 +3038,9 @@ PROCESS_SCHEMA = {
     "description": (
         "Manage background processes started with terminal(background=true). "
         "Actions: 'list' (show all), 'poll' (check status + new output), "
-        "'log' (full output with pagination), 'wait' (block until done or timeout), "
-        "'kill' (terminate), 'write' (send raw stdin data without newline), "
+        "'log' (full output with pagination), 'wait' (return immediately for "
+        "notify_on_complete targets; otherwise block until done or timeout), "
+        "'kill' (terminate), 'write' (send raw stdin without newline), "
         "'submit' (send data + Enter, for answering prompts), 'close' (close stdin/send EOF)."
     ),
     "parameters": {
@@ -3041,7 +3061,7 @@ PROCESS_SCHEMA = {
             },
             "timeout": {
                 "type": "integer",
-                "description": "Max seconds to block for 'wait' action. Returns partial output on timeout.",
+                "description": "Max seconds to block for 'wait' action when the target is not already configured for completion notification.",
                 "minimum": 1
             },
             "offset": {

@@ -718,6 +718,63 @@ def test_cache_scope_envelope_is_digested_then_removed_before_relay_and_provider
     assert sentinel not in json.dumps(records, sort_keys=True)
 
 
+def test_real_config_records_codex_input_history_through_relay(relay_turn, tmp_path):
+    from agent import physical_attempt_diagnostics as diagnostics
+
+    sentinel = "ISSUE170-PRIVATE-CODEX-HISTORY"
+    profile = tmp_path / "profile"
+    profile.mkdir(exist_ok=True)
+    (profile / "config.yaml").write_text(
+        "observability:\n  physical_attempt_digests:\n    enabled: true\n",
+        encoding="utf-8",
+    )
+    diagnostics._LAST_ATTEMPT.clear()
+    provider_requests = []
+
+    for loop, text in ((1, f"{sentinel}-old"), (2, f"{sentinel}-new")):
+        relay_llm.execute(
+            {
+                "model": "test-model",
+                "instructions": "fixed",
+                "input": [{"role": "user", "content": text}],
+                "tools": [],
+                "prompt_cache_key": "fixed",
+            },
+            lambda request: provider_requests.append(request) or {
+                "id": f"response-{loop}",
+                "object": "response",
+                "created_at": 0,
+                "status": "completed",
+                "model": "test-model",
+                "output": [],
+            },
+            session_id="session-1",
+            name="openai-codex",
+            model_name="test-model",
+            metadata={
+                "api_mode": "codex_responses",
+                "api_request_id": f"real-config:api:{loop}",
+            },
+        )
+
+    records = [
+        json.loads(line)
+        for line in (
+            profile / "observability" / "physical_attempt_digests.jsonl"
+        ).read_text(encoding="utf-8").splitlines()
+    ]
+    pair = next(record for record in records if record["phase"] == "pair")
+    assert len(provider_requests) == 2
+    assert pair["first_differing_segment"] == "later_history"
+    assert pair["equal"] == {
+        "cache_scope": True,
+        "later_history": False,
+        "prefix": True,
+        "tools": True,
+    }
+    assert sentinel not in json.dumps(records, sort_keys=True)
+
+
 def test_unrelated_extra_body_keeps_session_cache_scope_fallback(monkeypatch):
     prepared = []
     monkeypatch.setattr(

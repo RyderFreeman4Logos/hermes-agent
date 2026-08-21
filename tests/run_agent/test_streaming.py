@@ -776,6 +776,48 @@ class TestCodexStreamCallbacks:
         # 1 initial + 1 retry = 2 calls
         assert call_count["n"] == 2
 
+    def test_codex_retry_metadata_combines_outer_and_inner_attempts(self, monkeypatch):
+        import httpx
+
+        from agent import relay_llm
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://example.invalid/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "codex_responses"
+        agent._interrupt_requested = False
+        agent._current_api_retry_count = 2
+
+        events = [
+            SimpleNamespace(type="response.created"),
+            SimpleNamespace(
+                type="response.completed",
+                response=SimpleNamespace(status="completed", id="r1", usage=None),
+            ),
+        ]
+        retries = []
+
+        def fake_stream(*_args, metadata, **_kwargs):
+            retries.append(metadata["retry_count"])
+            if len(retries) == 1:
+                raise httpx.ConnectError(
+                    "retry",
+                    request=httpx.Request("POST", "https://example.invalid"),
+                )
+            return iter(events)
+
+        monkeypatch.setattr(relay_llm, "stream", fake_stream)
+
+        agent._run_codex_stream({}, client=MagicMock())
+
+        assert retries == [2, 3]
+
     def test_codex_create_stream_fallback_refreshes_activity_on_every_event(self):
         from run_agent import AIAgent
 

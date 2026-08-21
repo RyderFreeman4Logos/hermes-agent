@@ -72,13 +72,11 @@ async def _execute_attempt_async(
 def _request_with_cache_scope(request: dict[str, Any], session_id: str) -> dict[str, Any]:
     """Attach a diagnostic-only cache scope before Relay sees the request."""
     extra_body = request.get("extra_body")
-    cache_scope = (
-        request.get("prompt_cache_key")
-        if request.get("prompt_cache_key") is not None
-        else extra_body.get("prompt_cache_key")
-        if isinstance(extra_body, dict)
-        else session_id
-    )
+    cache_scope = request.get("prompt_cache_key")
+    if cache_scope is None and isinstance(extra_body, dict):
+        cache_scope = extra_body.get("prompt_cache_key")
+    if cache_scope is None:
+        cache_scope = session_id
     scope = physical_attempt_diagnostics.prepare_cache_scope(cache_scope)
     return request if scope is None else {
         **request,

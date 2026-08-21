@@ -22,6 +22,9 @@ _RECORDS_FILE = "physical_attempt_digests.jsonl"
 _LOCK = threading.Lock()
 _LAST_ATTEMPT: dict[tuple[str, str], "Attempt"] = {}
 _CACHE_SCOPE_ENVELOPE = "_hermes_physical_attempt_cache_scope"
+# ponytail: fixed local caps; add configurable rotation only if diagnostics volume needs it.
+_MAX_TRACKED_CORRELATIONS = 256
+_MAX_RECORDS_BYTES = 8 * 1024 * 1024
 
 
 @dataclass
@@ -125,8 +128,10 @@ def start_attempt(
 def _pair(current: Attempt) -> None:
     identity = (current.correlation, current.route)
     with _LOCK:
-        previous = _LAST_ATTEMPT.get(identity)
+        previous = _LAST_ATTEMPT.pop(identity, None)
         _LAST_ATTEMPT[identity] = current
+        while len(_LAST_ATTEMPT) > _MAX_TRACKED_CORRELATIONS:
+            _LAST_ATTEMPT.pop(next(iter(_LAST_ATTEMPT)))
     if previous is None or previous.loop != current.loop - 1:
         return
     names = ("prefix", "tools", "cache_scope", "later_history")
@@ -249,8 +254,12 @@ def _private_fd(path: Path, flags: int) -> int:
 
 def _append(record: dict[str, Any]) -> None:
     path = _root() / _RECORDS_FILE
-    fd = _private_fd(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT)
-    try:
-        os.write(fd, (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode())
-    finally:
-        os.close(fd)
+    payload = (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    with _LOCK:
+        fd = _private_fd(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT)
+        try:
+            if os.fstat(fd).st_size + len(payload) > _MAX_RECORDS_BYTES:
+                os.ftruncate(fd, 0)
+            os.write(fd, payload)
+        finally:
+            os.close(fd)

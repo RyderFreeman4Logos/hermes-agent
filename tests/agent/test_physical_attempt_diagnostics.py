@@ -108,10 +108,11 @@ def test_pair_emits_only_hmac_digests_for_final_then_next_first_attempt(
     ]
     pair = next(record for record in records if record["phase"] == "pair")
     assert [record["timestamp_ns"] for record in records] == [101, 102, 103, 104]
-    assert (pair["route"], pair["provider"], pair["model"]) == (
-        "chat_completions",
-        "provider",
-        "model",
+    assert pair["route"] == "chat_completions"
+    assert len(pair["provider"]) == len(pair["model"]) == 64
+    assert all(
+        character in "0123456789abcdef"
+        for character in pair["provider"] + pair["model"]
     )
     assert pair["previous_loop"] == 1
     assert pair["current_loop"] == 2
@@ -355,9 +356,52 @@ def test_retention_stays_bounded_for_unique_correlations_and_records(
         )
 
     records_path = tmp_path / "observability" / "physical_attempt_digests.jsonl"
-    assert list(diagnostics._LAST_ATTEMPT) == [
-        ("correlation-6", "chat_completions", "provider", "model"),
-        ("correlation-7", "chat_completions", "provider", "model"),
-    ]
+    assert len(diagnostics._LAST_ATTEMPT) == 2
+    assert all(key[1] == "chat_completions" for key in diagnostics._LAST_ATTEMPT)
+    assert all(
+        len(key[2]) == len(key[3]) == 64
+        for key in diagnostics._LAST_ATTEMPT
+    )
+    assert all(character in "0123456789abcdef" for key in diagnostics._LAST_ATTEMPT for character in "".join(key[2:]))
     assert records_path.stat().st_size <= 1024
     assert all(json.loads(line)["phase"] == "attempt" for line in records_path.read_text().splitlines())
+
+
+def test_persisted_labels_redact_url_encoded_and_credential_shaped_values(
+    monkeypatch, tmp_path
+):
+    from agent import physical_attempt_diagnostics as diagnostics
+    from hermes_cli import config
+
+    sentinel = "ISSUE170-PRIVATE-LABEL"
+    monkeypatch.setattr(diagnostics, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(config, "read_raw_config_readonly", lambda: _config(True))
+    diagnostics._LAST_ATTEMPT.clear()
+    labels = (
+        (f"https://provider.example/v1/{sentinel}", f"provider-{sentinel}", f"model-{sentinel}"),
+        (f"route%3A%2F%2F{sentinel}", f"Bearer-{sentinel}", f"sk-proj-{sentinel}"),
+    )
+
+    for loop, (route, provider, model) in enumerate(labels, start=1):
+        diagnostics.start_attempt(
+            {"messages": []},
+            api_mode="chat_completions",
+            route=route,
+            provider=provider,
+            model=model,
+            retry=0,
+            loop=loop,
+            correlation="label-privacy",
+        )
+
+    records = [
+        json.loads(line)
+        for line in (
+            tmp_path / "observability" / "physical_attempt_digests.jsonl"
+        ).read_text(encoding="utf-8").splitlines()
+    ]
+    serialized = json.dumps(records, sort_keys=True)
+    assert sentinel not in serialized
+    assert sentinel not in repr(diagnostics._LAST_ATTEMPT)
+    for record, raw_labels in zip(records, labels):
+        assert all(record[field] != raw for field, raw in zip(("route", "provider", "model"), raw_labels))

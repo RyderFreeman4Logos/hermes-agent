@@ -4481,6 +4481,57 @@ def test_tui_provider_only_after_compression_passes_to_switch_model(monkeypatch)
     assert [call["explicit_provider"] for call in captured] == ["pm", "pm"]
 
 
+def test_tui_reasoning_only_after_compression_keeps_route(monkeypatch):
+    from hermes_cli.model_switch import ModelSwitchResult, get_model_switch_after_compression
+
+    class Agent:
+        model = "old/model"
+        provider = "openrouter"
+        api_key = "old-key"
+        base_url = "https://openrouter.ai/api/v1"
+        api_mode = "chat_completions"
+
+        def __init__(self):
+            self.calls = []
+
+        def switch_model(self, **kwargs):
+            self.calls.append(kwargs)
+
+    def fake_switch(**kwargs):
+        return ModelSwitchResult(
+            success=True,
+            new_model=kwargs["raw_input"],
+            target_provider=kwargs["explicit_provider"],
+            api_key="old-key",
+            base_url="https://openrouter.ai/api/v1",
+            api_mode="chat_completions",
+            reasoning_config={"enabled": True, "effort": "medium"},
+        )
+
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", fake_switch)
+    monkeypatch.setattr(
+        server,
+        "_persist_model_switch",
+        lambda _result: pytest.fail("deferred switch must stay session-scoped"),
+    )
+    agent = Agent()
+    session = {"agent": agent}
+
+    out = server._apply_model_switch(
+        "sid",
+        session,
+        "--after-compression --reasoning low",
+        confirm_expensive_model=True,
+    )
+
+    assert out["pending"] is True
+    pending = get_model_switch_after_compression(agent)
+    assert pending is not None
+    assert (pending.new_model, pending.target_provider) == ("old/model", "openrouter")
+    assert pending.reasoning_config == {"enabled": True, "effort": "low"}
+    assert agent.calls == []
+
+
 def test_startup_runtime_uses_tui_provider_env(monkeypatch):
     monkeypatch.setenv("HERMES_MODEL", "nous/hermes-test")
     monkeypatch.setenv("HERMES_TUI_PROVIDER", "nous")

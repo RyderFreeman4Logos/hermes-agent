@@ -8335,6 +8335,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             "provider": provider or None,
             "base_url": result.base_url or None,
             "api_mode": result.api_mode or None,
+            "reasoning_config": getattr(result, "reasoning_config", None),
         }
         try:
             db.update_session_model(sid, result.new_model)
@@ -10587,6 +10588,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         is_session = request.is_session
         one_turn = request.is_once
         after_compression = request.is_after_compression
+        reasoning = request.reasoning
         if request.errors:
             # CLI decoration: "  ✗ " prefix over the canonical error copy.
             _cprint(f"  ✗ {request.error_messages()[0]}")
@@ -10634,7 +10636,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         custom_provs = ctx.custom_providers if ctx is not None else None
 
         # No args at all: open prompt_toolkit-native picker modal
-        if not model_input and not explicit_provider:
+        if not model_input and not explicit_provider and not reasoning:
             model_display = self.model or "unknown"
             provider_display = get_label(self.provider) if self.provider else "unknown"
 
@@ -10668,6 +10670,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             )
             return
 
+        # A reasoning-only request keeps the current route and changes only
+        # the request effort; resolve the route once so deferred scheduling
+        # still carries a complete provider/model identity.
+        if reasoning and not model_input and not explicit_provider:
+            model_input = self.model or ""
+            explicit_provider = self.provider or ""
+
         # Perform the switch
         result = switch_model(
             raw_input=model_input,
@@ -10685,6 +10694,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if not result.success:
             _cprint(f"  ✗ {result.error_message}")
             return
+        if reasoning:
+            from hermes_constants import parse_reasoning_effort
+
+            result.reasoning_config = parse_reasoning_effort(reasoning)
         result.is_after_compression = after_compression
 
         if self.agent is not None and not after_compression:
@@ -10757,6 +10770,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 self.api_key = getattr(applied_agent, "api_key", applied_result.api_key)
                 self.base_url = getattr(applied_agent, "base_url", applied_result.base_url)
                 self.api_mode = getattr(applied_agent, "api_mode", applied_result.api_mode)
+                self.reasoning_config = applied_result.reasoning_config
                 self._pending_one_turn_model_restore = None
                 self._pending_model_switch_note = (
                     "[Note: model was just switched from "
@@ -10796,6 +10810,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             "api_key": self.api_key,
             "base_url": self.base_url,
             "api_mode": self.api_mode,
+            "reasoning_config": getattr(self, "reasoning_config", None),
         }
         self.model = result.new_model
         self.provider = result.target_provider
@@ -10822,6 +10837,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     base_url=result.base_url,
                     api_mode=result.api_mode,
                 )
+                if result.reasoning_config is not None:
+                    self.agent.reasoning_config = copy.deepcopy(result.reasoning_config)
+                    runtime = getattr(self.agent, "_primary_runtime", None)
+                    if isinstance(runtime, dict):
+                        runtime["reasoning_config"] = copy.deepcopy(result.reasoning_config)
             except Exception as exc:
                 # Agent rolled itself back; roll the CLI back too and abort so a
                 # failed switch is a no-op rather than a dead session (#50163).
@@ -10836,6 +10856,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Store a note to prepend to the next user message so the model
         # knows a switch occurred (avoids injecting system messages mid-history
         # which breaks providers and prompt caching).
+        if result.reasoning_config is not None:
+            self.reasoning_config = copy.deepcopy(result.reasoning_config)
         from hermes_cli.model_switch import format_model_for_display
         _display_old = format_model_for_display(old_model)
         _display_new = format_model_for_display(result.new_model)

@@ -1768,6 +1768,7 @@ class GatewaySlashCommandsMixin:
         is_session = request.is_session
         one_turn = request.is_once
         after_compression = request.is_after_compression
+        reasoning = request.reasoning
         if request.errors:
             # Gateway decoration: "❌ " prefix over the canonical error copy.
             return f"❌ {request.error_messages()[0]}"
@@ -1833,7 +1834,7 @@ class GatewaySlashCommandsMixin:
             current_api_key = override.get("api_key", current_api_key)
 
         # No args: show interactive picker (Telegram/Discord) or text list
-        if not model_input and not explicit_provider:
+        if not model_input and not explicit_provider and not reasoning:
             # Try interactive picker if the platform supports it
             adapter = getattr(self, "_adapter_for_source")(source)
             has_picker = (
@@ -2187,6 +2188,10 @@ class GatewaySlashCommandsMixin:
             lines.append(t("gateway.model.usage_persist"))
             return "\n".join(lines)
 
+        if reasoning and not model_input and not explicit_provider:
+            model_input = current_model
+            explicit_provider = current_provider
+
         # Perform the switch
         skew_error = _model_switch_skew_guard()
         if skew_error:
@@ -2211,6 +2216,10 @@ class GatewaySlashCommandsMixin:
 
         if not result.success:
             return t("gateway.model.error_prefix", error=result.error_message)
+        if reasoning:
+            from hermes_constants import parse_reasoning_effort
+
+            result.reasoning_config = parse_reasoning_effort(reasoning)
 
         if not after_compression:
             try:
@@ -2271,6 +2280,11 @@ class GatewaySlashCommandsMixin:
                         base_url=result.base_url,
                         api_mode=result.api_mode,
                     )
+                    if result.reasoning_config is not None:
+                        cached_entry[0].reasoning_config = result.reasoning_config
+                        runtime = getattr(cached_entry[0], "_primary_runtime", None)
+                        if isinstance(runtime, dict):
+                            runtime["reasoning_config"] = result.reasoning_config
                 except Exception as exc:
                     # In-place swap rolled the agent back to the OLD working
                     # model/client and re-raised.  Abort the commit: skip DB
@@ -2328,6 +2342,7 @@ class GatewaySlashCommandsMixin:
                 "api_key": result.api_key,
                 "base_url": result.base_url,
                 "api_mode": result.api_mode,
+                "reasoning_config": result.reasoning_config,
             }
             # A successful immediate /model supersedes deferred intent.
             self._after_compression_model_switches.pop(session_key, None)

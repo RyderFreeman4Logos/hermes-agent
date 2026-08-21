@@ -6516,6 +6516,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "base_url": result.base_url,
                 "api_mode": result.api_mode,
             }
+            if result.reasoning_config is not None:
+                current.conversation.model_override["reasoning_config"] = dict(
+                    result.reasoning_config
+                )
             pending_notes = getattr(self, "_pending_model_notes", None)
             if pending_notes is not None:
                 pending_notes[session_key] = (
@@ -9074,8 +9078,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if resolved_session_key:
             _r_state = self._peek_session_state(resolved_session_key)
-            if _r_state is not None and _r_state.conversation.reasoning_override is not None:
-                return _r_state.conversation.reasoning_override
+            if _r_state is not None:
+                if _r_state.conversation.reasoning_override is not None:
+                    return _r_state.conversation.reasoning_override
+                model_override = _r_state.conversation.model_override
+                if isinstance(model_override, dict):
+                    model_reasoning = model_override.get("reasoning_config")
+                    if isinstance(model_reasoning, dict):
+                        return dict(model_reasoning)
         return self._load_reasoning_config(model)
 
     def _set_session_reasoning_override(

@@ -245,3 +245,36 @@ def test_pair_distinguishes_later_history_from_complete_equality(monkeypatch, tm
         sort_keys=True,
     ).encode("utf-8"))
     assert all(len(pair["digests"]["later_history"]) == 64 for pair in pairs)
+
+
+def test_retention_stays_bounded_for_unique_correlations_and_records(
+    monkeypatch, tmp_path
+):
+    from agent import physical_attempt_diagnostics as diagnostics
+    from hermes_cli import config
+
+    monkeypatch.setattr(diagnostics, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(config, "read_raw_config_readonly", lambda: _config(True))
+    monkeypatch.setattr(diagnostics, "_MAX_TRACKED_CORRELATIONS", 2, raising=False)
+    monkeypatch.setattr(diagnostics, "_MAX_RECORDS_BYTES", 1024, raising=False)
+    diagnostics._LAST_ATTEMPT.clear()
+
+    for index in range(8):
+        diagnostics.start_attempt(
+            {"messages": [{"role": "system", "content": "fixed"}]},
+            api_mode="chat_completions",
+            route="chat_completions",
+            provider="provider",
+            model="model",
+            retry=0,
+            loop=1,
+            correlation=f"correlation-{index}",
+        )
+
+    records_path = tmp_path / "observability" / "physical_attempt_digests.jsonl"
+    assert list(diagnostics._LAST_ATTEMPT) == [
+        ("correlation-6", "chat_completions"),
+        ("correlation-7", "chat_completions"),
+    ]
+    assert records_path.stat().st_size <= 1024
+    assert all(json.loads(line)["phase"] == "attempt" for line in records_path.read_text().splitlines())

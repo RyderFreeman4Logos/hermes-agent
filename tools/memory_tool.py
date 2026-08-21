@@ -1146,11 +1146,22 @@ def memory_tool(
 def get_memory_provider_mode(memory_config: Optional[Dict[str, Any]] = None) -> str:
     """Return the profile's frozen memory routing mode.
 
-    Unknown and legacy values deliberately keep the historical hybrid/mirror
-    behavior. Authoritative routing is opt-in only.
+    Explicit values win. If the key is absent, Mempal becomes authoritative
+    only when both built-in Markdown stores are disabled; other configurations
+    retain the historical hybrid behavior.
     """
-    mode = str((memory_config or {}).get("provider_mode", "hybrid") or "hybrid").strip().lower()
-    return "authoritative" if mode == "authoritative" else "hybrid"
+    memory_config = memory_config or {}
+    if "provider_mode" in memory_config:
+        mode = str(memory_config.get("provider_mode") or "hybrid").strip().lower()
+        return "authoritative" if mode == "authoritative" else "hybrid"
+    provider = str(memory_config.get("provider") or "").strip().lower()
+    if (
+        provider == "mempal"
+        and not memory_config.get("memory_enabled", True)
+        and not memory_config.get("user_profile_enabled", True)
+    ):
+        return "authoritative"
+    return "hybrid"
 
 
 def check_memory_requirements() -> bool:

@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 from agent.memory_manager import MemoryManager
 from hermes_cli.memory_setup import cmd_status
-from tools.memory_tool import check_memory_requirements
+from tools.memory_tool import check_memory_requirements, get_memory_provider_mode
 
 
 class RecordingAuthoritativeProvider:
@@ -192,6 +192,30 @@ def test_status_does_not_claim_unimplemented_context_mode(monkeypatch, capfd):
         cmd_status(args=None)
 
     assert "provider_context_mode=disabled" not in capfd.readouterr().out
+
+
+
+def test_mempal_without_provider_mode_defaults_authoritative_when_markdown_off(monkeypatch, tmp_path):
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "memory:\n"
+        "  provider: mempal\n"
+        "  memory_enabled: false\n"
+        "  user_profile_enabled: false\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    from hermes_cli.config import load_config
+
+    config = load_config()
+    memory_config = config["memory"]
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: config)
+
+    assert "provider_mode" not in memory_config
+    assert get_memory_provider_mode(memory_config) == "authoritative"
+    assert check_memory_requirements() is True
 
 
 

@@ -1694,6 +1694,8 @@ def _cache_info_from_first_call(record: Any) -> dict[str, int | str]:
     except (TypeError, ValueError):
         pct = 0
     info: dict[str, int | str] = {"state": state, "pct": pct}
+    if record.get("compression_bound") is True:
+        info["compression_bound"] = True
     for key in ("read_tokens", "prompt_tokens"):
         value = record.get(key)
         if value is None:
@@ -1737,11 +1739,19 @@ def _cache_info_from_usage(usage: Any) -> dict[str, int | str]:
 
 
 def _stamp_loop_cache_info(sid: str, payload: dict) -> None:
+    session = _sessions.get(sid) or {}
     if "cache_info" not in payload:
-        session = _sessions.get(sid) or {}
         payload["cache_info"] = _cache_info_from_first_call(
             session.get("first_provider_response")
         )
+    record = session.get("first_provider_response")
+    cache_info = payload.get("cache_info")
+    if (
+        isinstance(cache_info, dict)
+        and isinstance(record, dict)
+        and record.get("compression_bound") is True
+    ):
+        cache_info["compression_bound"] = True
 
 
 def _emit(event: str, sid: str, payload: dict | None = None):
@@ -5847,6 +5857,12 @@ def _attach_tui_cache_callback(agent, sid: str):
         session = _sessions.get(sid)
         if isinstance(record, dict) and isinstance(session, dict) and session.get("agent") is agent:
             cache_record = {key: value for key, value in record.items() if value is not None}
+            if getattr(
+                getattr(agent, "context_compressor", None),
+                "awaiting_real_usage_after_compression",
+                False,
+            ):
+                cache_record["compression_bound"] = True
             for key, raw in (("read_tokens", _read), ("prompt_tokens", _prompt)):
                 if key in cache_record:
                     continue

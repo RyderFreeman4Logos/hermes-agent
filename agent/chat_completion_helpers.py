@@ -3728,6 +3728,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         "api_request_id": getattr(
                             agent, "_current_api_request_id", None
                         ),
+                        "retry_count": int(
+                            getattr(agent, "_current_api_retry_count", 0) or 0
+                        ),
                         "call_role": (
                             "delegated"
                             if getattr(agent, "is_subagent", False)
@@ -4073,7 +4076,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             except Exception:
                 pass
 
-    def _call_chat_completions(stream_attempt_id: int):
+    def _call_chat_completions(stream_attempt_id: int, retry_count: int):
         """Stream a chat completions response."""
         import httpx as _httpx
         # Per-provider / per-model request_timeout_seconds (from config.yaml)
@@ -4242,6 +4245,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 metadata={
                     "api_mode": "chat_completions",
                     "api_request_id": getattr(agent, "_current_api_request_id", None),
+                    "retry_count": int(
+                        getattr(agent, "_current_api_retry_count", 0) or 0
+                    ) + retry_count,
                     "call_role": (
                         "delegated"
                         if getattr(agent, "is_subagent", False)
@@ -4696,7 +4702,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             usage=usage_obj,
         )
 
-    def _call_anthropic(request_client):
+    def _call_anthropic(request_client, retry_count: int):
         """Stream an Anthropic Messages API response.
 
         Fires delta callbacks for real-time token delivery, but returns
@@ -4784,6 +4790,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 metadata={
                     "api_mode": "anthropic_messages",
                     "api_request_id": getattr(agent, "_current_api_request_id", None),
+                    "retry_count": int(
+                        getattr(agent, "_current_api_retry_count", 0) or 0
+                    ) + retry_count,
                     "call_role": (
                         "delegated"
                         if getattr(agent, "is_subagent", False)
@@ -4947,9 +4956,13 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             ),
                             kind="anthropic_messages",
                         )
-                        result["response"] = _call_anthropic(request_client)
+                        result["response"] = _call_anthropic(
+                            request_client, _stream_attempt
+                        )
                     else:
-                        result["response"] = _call_chat_completions(stream_attempt_id)
+                        result["response"] = _call_chat_completions(
+                            stream_attempt_id, _stream_attempt
+                        )
                     _emit_stream_end(
                         final_text=_stream_final_text(result["response"]),
                         finished=True,

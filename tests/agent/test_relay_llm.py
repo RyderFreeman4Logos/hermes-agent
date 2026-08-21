@@ -465,6 +465,19 @@ def test_cache_scope_envelope_is_digested_then_removed_before_relay_and_provider
     assert sentinel not in json.dumps(records, sort_keys=True)
 
 
+def test_unrelated_extra_body_keeps_session_cache_scope_fallback(monkeypatch):
+    prepared = []
+    monkeypatch.setattr(
+        relay_llm.physical_attempt_diagnostics,
+        "prepare_cache_scope",
+        lambda scope: prepared.append(scope) or None,
+    )
+
+    request = {"extra_body": {"temperature": 0}}
+    assert relay_llm._request_with_cache_scope(request, "session-1") is request
+    assert prepared == ["session-1"]
+
+
 def test_non_stream_result_survives_logical_scope_close_failure(
     relay_turn, monkeypatch
 ):

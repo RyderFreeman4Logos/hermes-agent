@@ -26,6 +26,16 @@ _CACHE_SCOPE_ENVELOPE = "_hermes_physical_attempt_cache_scope"
 # ponytail: fixed local caps; add configurable rotation only if diagnostics volume needs it.
 _MAX_TRACKED_CORRELATIONS = 256
 _MAX_RECORDS_BYTES = 8 * 1024 * 1024
+_LABEL_ALLOWLIST = frozenset(
+    {
+        "anthropic_messages",
+        "chat_completions",
+        "codex_responses",
+        "openai_chat",
+        "responses",
+        "unknown",
+    }
+)
 
 
 @dataclass
@@ -104,9 +114,9 @@ def start_attempt(
         byte_lengths = {name: len(value) for name, value in component_bytes.items()}
         attempt = Attempt(
             digest=hmac.new(key, b"attempt\0" + secrets.token_bytes(32), hashlib.sha256).hexdigest(),
-            route=_label(route),
-            provider=_label(provider),
-            model=_label(model),
+            route=_label(route, key),
+            provider=_label(provider, key),
+            model=_label(model, key),
             loop=loop,
             retry=max(0, int(retry)),
             correlation=correlation,
@@ -215,9 +225,16 @@ def _serialized(value: Any) -> bytes:
     ).encode("utf-8")
 
 
-def _label(value: Any) -> str:
-    text = str(value or "")
-    return text if text and len(text) <= 128 and "://" not in text else "unknown"
+def _label(value: Any, key: bytes) -> str:
+    try:
+        text = str(value or "")
+        if not text or len(text) > 128:
+            return "unknown"
+        if text in _LABEL_ALLOWLIST:
+            return text
+        return hmac.new(key, b"label\0" + text.encode("utf-8"), hashlib.sha256).hexdigest()
+    except Exception:
+        return "unknown"
 
 
 def _root() -> Path:

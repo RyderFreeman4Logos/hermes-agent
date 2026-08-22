@@ -3049,18 +3049,15 @@ class TestRunConversation:
         assert result["completed"] is True
         system = agent.client.chat.completions.create.call_args.kwargs["messages"][0]
         assert system["role"] == "system"
-        assert system["content"] == [
-            {
-                "type": "text",
-                "text": "stable instructions",
-                "cache_control": {"type": "ephemeral"},
-            },
-            {
-                "type": "text",
-                "text": "\n\nsession context",
-                "cache_control": {"type": "ephemeral"},
-            },
-        ]
+        assert system["content"][0] == {
+            "type": "text",
+            "text": "stable instructions",
+            "cache_control": {"type": "ephemeral"},
+        }
+        assert system["content"][1]["text"].startswith(
+            "\n\nsession context\n\n[Agent loop timing]\nCurrent loop start:"
+        )
+        assert system["content"][1]["cache_control"] == {"type": "ephemeral"}
 
     def test_first_main_route_after_in_place_compression_keeps_cache_key(
         self, agent, tmp_path

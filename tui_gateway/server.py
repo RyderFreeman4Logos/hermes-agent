@@ -5107,6 +5107,52 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
         )
 
 
+def _attach_model_switch_after_compression(sid: str, session: dict, agent) -> None:
+    """Attach this TUI session's deferred route to its live agent."""
+    pending = session.get("after_compression_model_switch")
+    if pending is None:
+        return
+
+    from hermes_cli.model_switch import schedule_model_switch_after_compression
+
+    def _on_applied(result, old_model, _old_provider):
+        if session.get("after_compression_model_switch") is not result:
+            return
+        session.pop("after_compression_model_switch", None)
+        session.pop("one_turn_model_restore", None)
+        session["model_override"] = {
+            "model": result.new_model,
+            "provider": result.target_provider,
+            "base_url": result.base_url,
+            "api_key": result.api_key,
+            "api_mode": result.api_mode,
+        }
+        if result.reasoning_config is not None:
+            session["model_override"]["reasoning_config"] = dict(result.reasoning_config)
+        _append_model_switch_marker(
+            session,
+            model=result.new_model,
+            provider=result.target_provider,
+        )
+        _emit("session.info", sid, _session_info(agent, session))
+        _emit(
+            "status",
+            sid,
+            {
+                "message": (
+                    f"Model switched after compression: {old_model} → "
+                    f"{result.new_model}"
+                )
+            },
+        )
+
+    schedule_model_switch_after_compression(
+        agent,
+        pending,
+        on_applied=_on_applied,
+    )
+
+
 def _apply_model_switch(
     sid: str,
     session: dict,
@@ -5134,15 +5180,28 @@ def _apply_model_switch(
         is_global_flag = parsed_flags.is_global
         is_session = parsed_flags.is_session
         one_turn = parsed_flags.is_once
+        after_compression = bool(
+            getattr(parsed_flags, "is_after_compression", False)
+        )
+        reasoning = getattr(parsed_flags, "reasoning", "")
+        errors = tuple(getattr(parsed_flags, "errors", ()))
     else:
         model_input, explicit_provider, is_global_flag, _force_refresh, is_session = parsed_flags
         one_turn = False
+        after_compression = False
+        reasoning = ""
+        errors = ()
     # Conflict validation delegates to the shared single-owner parser; the
     # TUI surfaces it as a raised ValueError (its historical behavior)
     # using the canonical error copy.
+    if errors:
+        raise ValueError(MODEL_SWITCH_ERROR_TEXT[errors[0]])
     if is_global_flag and one_turn:
         raise ValueError(MODEL_SWITCH_ERROR_TEXT[MODEL_SWITCH_ERR_ONCE_WITH_GLOBAL])
     persist_global = (
+        False
+        if after_compression
+        else
         persist_override
         if persist_override is not None
         else resolve_persist_behavior(
@@ -5152,10 +5211,15 @@ def _apply_model_switch(
             explicit_provider=explicit_provider,
         )
     )
-    if not model_input:
+    agent = session.get("agent")
+    if reasoning and not model_input and not explicit_provider:
+        if agent is None:
+            raise ValueError("/model --reasoning requires a live session")
+        model_input = getattr(agent, "model", "") or ""
+        explicit_provider = getattr(agent, "provider", "") or ""
+    if not model_input and not explicit_provider:
         raise ValueError("model value required")
 
-    agent = session.get("agent")
     if one_turn and not agent:
         raise ValueError("/model --once requires a live session")
     if agent:
@@ -5207,13 +5271,20 @@ def _apply_model_switch(
         explicit_provider=explicit_provider,
         user_providers=user_provs,
         custom_providers=custom_provs,
+        validate_live=not after_compression,
     )
     if not result.success:
         raise ValueError(result.error_message or "model switch failed")
 
+    if reasoning:
+        from hermes_constants import parse_reasoning_effort
+
+        result.reasoning_config = parse_reasoning_effort(reasoning)
+    result.is_after_compression = after_compression
+
     restore_snapshot = _snapshot_agent_model_runtime(agent) if (one_turn and agent) else None
 
-    if agent:
+    if agent and not after_compression:
         try:
             from hermes_cli.context_switch_guard import merge_preflight_compression_warning
 
@@ -5256,6 +5327,21 @@ def _apply_model_switch(
                 "confirm_message": confirm_msg,
             }
 
+    if after_compression:
+        if agent is None:
+            raise ValueError("/model --after-compression requires a live session")
+        replaced = session.get("after_compression_model_switch")
+        session["after_compression_model_switch"] = result
+        _attach_model_switch_after_compression(sid, session, agent)
+        return {
+            "value": result.new_model,
+            "warning": result.warning_message or "",
+            "confirm_required": False,
+            "scope": "after_compression",
+            "pending": True,
+            "replaced": replaced is not None,
+        }
+
     if agent:
         try:
             agent.switch_model(
@@ -5278,6 +5364,12 @@ def _apply_model_switch(
                 f"Model switch to {result.new_model} failed ({exc}); "
                 f"staying on {getattr(agent, 'model', current_model)}."
             ) from exc
+        reasoning_config = getattr(result, "reasoning_config", None)
+        if reasoning_config is not None:
+            agent.reasoning_config = reasoning_config
+            runtime = getattr(agent, "_primary_runtime", None)
+            if isinstance(runtime, dict):
+                runtime["reasoning_config"] = reasoning_config
         _restart_slash_worker(sid, session)
         _persist_live_session_runtime(session)
         _persist_live_session_system_prompt(session)
@@ -5310,6 +5402,7 @@ def _apply_model_switch(
             "base_url": result.base_url,
             "api_key": result.api_key,
             "api_mode": result.api_mode,
+            "reasoning_config": getattr(result, "reasoning_config", None),
         }
     if persist_global:
         _persist_model_switch(result)
@@ -7549,6 +7642,10 @@ def _make_agent(
             if not resolution.selected_model:
                 raise RuntimeError("Auth fallback resolved without a model")
             model = resolution.selected_model
+    if reasoning_config_override is None and isinstance(model_override, dict):
+        override_reasoning = model_override.get("reasoning_config")
+        if isinstance(override_reasoning, dict):
+            reasoning_config_override = dict(override_reasoning)
     _pr = _load_provider_routing()
     agent = AIAgent(
         model=model,

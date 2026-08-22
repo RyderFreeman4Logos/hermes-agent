@@ -51,6 +51,32 @@ def test_after_compression_requires_model_target_or_provider():
     assert provider_only.errors == ()
 
 
+def test_after_compression_allows_reasoning_only_request():
+    request = parse_model_switch_args("--after-compression --reasoning low")
+
+    assert request.target == ""
+    assert request.reasoning == "low"
+    assert request.errors == ()
+
+
+def test_after_compression_keeps_explicit_reasoning_for_model_target():
+    request = parse_model_switch_args(
+        "grok-4.6 --after-compression --reasoning low"
+    )
+
+    assert request.target == "grok-4.6"
+    assert request.reasoning == "low"
+    assert request.errors == ()
+
+
+def test_invalid_reasoning_is_rejected_before_deferred_scheduling():
+    request = parse_model_switch_args(
+        "grok-4.6 --after-compression --reasoning definitely-not-valid"
+    )
+
+    assert request.errors
+
+
 def test_provider_only_after_compression_uses_configured_default(monkeypatch):
     config = {
         "providers": {

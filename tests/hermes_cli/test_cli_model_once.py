@@ -87,6 +87,50 @@ def test_cli_model_once_records_restore_and_does_not_persist(monkeypatch):
     assert "next turn only" in printed[-1]
 
 
+def test_cli_reasoning_only_after_compression_keeps_route(monkeypatch):
+    import cli as cli_mod
+    from hermes_cli.model_switch import get_model_switch_after_compression
+
+    stub = _StubCLI()
+    stub.agent = _FakeAgent()
+    monkeypatch.setattr(cli_mod, "_cprint", lambda *_a, **_k: None)
+    monkeypatch.setattr(
+        "hermes_cli.inventory.load_picker_context",
+        lambda: SimpleNamespace(
+            user_providers=None,
+            custom_providers=None,
+            with_overrides=lambda **_: SimpleNamespace(
+                user_providers=None,
+                custom_providers=None,
+            ),
+        ),
+    )
+
+    def fake_switch(**kwargs):
+        return ModelSwitchResult(
+            success=True,
+            new_model=kwargs["raw_input"],
+            target_provider=kwargs["explicit_provider"],
+            api_key="sk-old",
+            base_url="https://openrouter.ai/api/v1",
+            api_mode="chat_completions",
+            reasoning_config={"enabled": True, "effort": "medium"},
+        )
+
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", fake_switch)
+
+    cli_mod.HermesCLI._handle_model_switch(
+        stub,
+        "/model --after-compression --reasoning low",
+    )
+
+    pending = get_model_switch_after_compression(stub.agent)
+    assert pending is not None
+    assert (pending.new_model, pending.target_provider) == ("old/model", "openrouter")
+    assert pending.reasoning_config == {"enabled": True, "effort": "low"}
+    assert stub.agent.calls == []
+
+
 def test_cli_restore_model_runtime_snapshot_restores_agent():
     import cli as cli_mod
 

@@ -516,3 +516,56 @@ async def test_compress_command_cleanup_does_not_block_event_loop():
         "event loop was blocked during manual /compress cleanup: only "
         f"{observed.get('ticks_during_block')} ticks while agent.close() was running"
     )
+
+
+@pytest.mark.asyncio
+async def test_compress_command_does_not_claim_success_when_estimate_stays_over_threshold():
+    """Manual /compress must not report success when the next-turn estimate
+    is still at/over the compressor trigger.
+
+    262_144-token window → official 75% small-window floor = 196_608.
+    A leftover ~200k is still over that trigger — skip/abort with size.
+    """
+    history = _make_history()
+    compressed = [
+        history[0],
+        {"role": "assistant", "content": "compressed summary"},
+        history[-1],
+    ]
+    runner = _make_runner(history)
+    agent_instance = MagicMock()
+    agent_instance.shutdown_memory_provider = MagicMock()
+    agent_instance.close = MagicMock()
+    agent_instance._cached_system_prompt = ""
+    agent_instance.tools = None
+    agent_instance.context_compressor.has_content_to_compress.return_value = True
+    agent_instance.context_compressor.threshold_tokens = 196_608
+    agent_instance.context_compressor.context_length = 262_144
+    agent_instance.context_compressor._last_compress_aborted = False
+    agent_instance.context_compressor._last_summary_fallback_used = False
+    agent_instance.context_compressor._last_summary_error = None
+    agent_instance.context_compressor._last_aux_model_failure_model = None
+    agent_instance.context_compressor._last_aux_model_failure_error = None
+    agent_instance.session_id = "sess-1"
+    agent_instance._compress_context.return_value = (compressed, "")
+    agent_instance._compression_skipped_due_to_lock = False
+
+    def _estimate(messages, **_kwargs):
+        if messages == history:
+            return 350_000
+        if messages == compressed:
+            return 200_000
+        raise AssertionError(f"unexpected transcript: {messages!r}")
+
+    with (
+        patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "test-key"}),
+        patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+        patch("run_agent.AIAgent", return_value=agent_instance),
+        patch("agent.model_metadata.estimate_request_tokens_rough", side_effect=_estimate),
+    ):
+        result = await runner._handle_compress_command(_make_event())
+
+    assert "Compressed:" not in result, result
+    assert "200,000" in result
+    assert any(word in result.lower() for word in ("skip", "abort", "incomplete")), result
+    agent_instance._compress_context.assert_called_once()

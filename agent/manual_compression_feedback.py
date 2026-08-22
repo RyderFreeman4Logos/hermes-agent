@@ -70,6 +70,27 @@ def summarize_manual_compression(
     if not isinstance(failure_reason, str) or not failure_reason.strip():
         failure_reason = None
 
+    raw_threshold = (
+        getattr(compression_state, "threshold_tokens", None)
+        if compression_state is not None
+        else None
+    )
+    threshold_tokens = (
+        raw_threshold
+        if isinstance(raw_threshold, int)
+        and not isinstance(raw_threshold, bool)
+        and raw_threshold > 0
+        else None
+    )
+    # Auto preflight retries while leftover >= threshold_tokens. Manual
+    # /compress is one pass — do not label that leftover a success.
+    leftover_over_threshold = (
+        not aborted
+        and not refused_would_grow
+        and threshold_tokens is not None
+        and after_tokens >= threshold_tokens
+    )
+
     if refused_would_grow:
         headline = (
             f"Compression refused (summary would grow the conversation): "
@@ -77,6 +98,12 @@ def summarize_manual_compression(
         )
     elif aborted:
         headline = f"Compression aborted: {before_count} messages preserved"
+    elif leftover_over_threshold:
+        headline = (
+            f"Compression incomplete: next-turn estimate still "
+            f"~{after_tokens:,} tokens (threshold {threshold_tokens:,})"
+        )
+        aborted = True
     elif fallback_used:
         headline = (
             f"Compressed with fallback: {before_count} → {after_count} messages"
@@ -101,6 +128,11 @@ def summarize_manual_compression(
         note = (
             "The generated summary was larger than what it would replace; "
             "no messages were removed."
+        )
+    elif leftover_over_threshold:
+        note = (
+            "Skipped success: next-turn estimate is still at or above the "
+            "compression threshold."
         )
     elif aborted:
         note = "Summary generation failed; no messages were removed."

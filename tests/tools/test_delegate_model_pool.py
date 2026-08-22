@@ -212,6 +212,26 @@ class TestBuildChildOverrideChain:
         assert kwargs["fallback_model"] == profile_chain
         assert kwargs["model"] == "deepseek-v4-flash"
 
+    def test_standard_profile_is_attached_to_child_runtime(self):
+        parent = _parent()
+        with patch("run_agent.AIAgent") as mock_agent:
+            child = MagicMock()
+            mock_agent.return_value = child
+            _build_child_agent(
+                task_index=0,
+                goal="g",
+                context=None,
+                toolsets=None,
+                model="deepseek-v4-flash",
+                max_iterations=5,
+                parent_agent=parent,
+                task_count=1,
+                override_fallback_chain=[{"provider": "openrouter", "model": "fb-one"}],
+                model_profile="standard",
+            )
+        assert child._delegate_model_profile == "standard"
+        assert child._delegate_has_successful_llm_request is False
+
 
 _BANNED_SCHEMA_WORDS = (
     "provider",

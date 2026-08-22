@@ -846,8 +846,6 @@ class MemoryManager:
         "operation_id",
         "operation_ids",
         "error_class",
-        "partial_write",
-        "status",
     }
 
     def authoritative_memory_write(
@@ -951,50 +949,20 @@ class MemoryManager:
             )
 
         try:
-            capability = next(
-                (
-                    getattr(provider, name)
-                    for name in (
-                        "authoritative_memory_write",
-                        "durable_memory_write",
-                        "handle_memory_write",
-                    )
-                    if callable(getattr(provider, name, None))
-                ),
-                None,
+            capability = getattr(provider, "authoritative_memory_write", None)
+            if not callable(capability):
+                return tool_error(
+                    "Authoritative memory provider lacks core write capability.",
+                    success=False,
+                    error_class="provider_capability_missing",
+                )
+            raw_result = capability(request, **kwargs)
+        except NotImplementedError:
+            return tool_error(
+                "Authoritative memory provider lacks core write capability.",
+                success=False,
+                error_class="provider_capability_missing",
             )
-            if callable(capability):
-                parameters = inspect.signature(capability).parameters
-                if "action" in parameters or "operations" in parameters:
-                    accepts_kwargs = any(
-                        parameter.kind == inspect.Parameter.VAR_KEYWORD
-                        for parameter in parameters.values()
-                    )
-                    call_args = (
-                        request
-                        if accepts_kwargs
-                        else {key: value for key, value in request.items() if key in parameters}
-                    )
-                    raw_result = capability(**call_args, **kwargs)
-                else:
-                    positional = [
-                        parameter
-                        for parameter in parameters.values()
-                        if parameter.kind
-                        in {
-                            inspect.Parameter.POSITIONAL_ONLY,
-                            inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                        }
-                    ]
-                    if positional or any(
-                        parameter.kind == inspect.Parameter.VAR_POSITIONAL
-                        for parameter in parameters.values()
-                    ):
-                        raw_result = capability(request, **kwargs)
-                    else:
-                        raw_result = capability(**request, **kwargs)
-            else:
-                raw_result = provider.handle_tool_call("memory", request, **kwargs)
         except Exception:
             logger.warning(
                 "Authoritative memory provider '%s' rejected a core write",
@@ -1041,9 +1009,14 @@ class MemoryManager:
             receipt["action"] = request["action"]
         if isinstance(request.get("operations"), list):
             receipt["operation_count"] = len(request["operations"])
+        scalar_types = (str, int, float, bool)
         for key in cls._AUTHORITATIVE_RECEIPT_KEYS:
-            if key in raw_result:
-                receipt[key] = raw_result[key]
+            value = raw_result.get(key)
+            if key == "operation_ids":
+                if isinstance(value, list) and all(isinstance(item, scalar_types) for item in value):
+                    receipt[key] = value
+            elif isinstance(value, scalar_types):
+                receipt[key] = value
         if partial_write:
             receipt["success"] = False
             receipt["error_class"] = "partial_write"

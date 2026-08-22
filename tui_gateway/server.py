@@ -4242,6 +4242,7 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     api_mode = str(model_config.get("api_mode") or "").strip()
     reasoning_config = model_config.get("reasoning_config")
     service_tier = str(model_config.get("service_tier") or "").strip()
+    memory_provider_mode = model_config.get("memory_provider_mode")
 
     # Heal a bare ``"custom"`` provider stored by an older build (or any leak
     # site that bypassed _runtime_model_config's normalization). Bare custom is
@@ -4290,6 +4291,8 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
         overrides["service_tier_override"] = ""
     elif service_tier:
         overrides["service_tier_override"] = service_tier
+    if memory_provider_mode in {"authoritative", "hybrid"}:
+        overrides["memory_provider_mode_override"] = memory_provider_mode
 
     return overrides
 
@@ -4302,6 +4305,7 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
     api_mode = str(getattr(agent, "api_mode", "") or "").strip()
     reasoning_config = getattr(agent, "reasoning_config", None)
     service_tier = getattr(agent, "service_tier", None)
+    memory_provider_mode = getattr(agent, "_memory_provider_mode", None)
 
     if model:
         config["model"] = model
@@ -4351,6 +4355,8 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
         config["service_tier"] = service_tier
     else:
         config.pop("service_tier", None)
+    if memory_provider_mode in {"authoritative", "hybrid"}:
+        config["memory_provider_mode"] = memory_provider_mode
 
     return config
 
@@ -7272,6 +7278,7 @@ def _make_agent(
     reasoning_config_override: dict | None = None,
     service_tier_override: str | None = None,
     platform_override: str | None = None,
+    memory_provider_mode_override: str | None = None,
 ):
     # AC-4 test seam: dead unless explicitly armed by the isolated certify
     # harness. Both inline and compute-host paths construct through _make_agent,
@@ -7427,6 +7434,7 @@ def _make_agent(
             if service_tier_override is not None
             else _load_service_tier()
         ),
+        memory_provider_mode_override=memory_provider_mode_override,
         enabled_toolsets=_load_enabled_toolsets(_resolve_agent_platform(platform_override)),
         # OpenRouter provider-routing prefs (config.yaml `provider_routing`).
         # Mirrors the messaging gateway + CLI so the desktop/TUI honors the same

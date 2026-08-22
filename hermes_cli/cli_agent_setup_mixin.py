@@ -14,6 +14,7 @@ loaded) so this module never imports ``cli`` at import time -> no import cycle.
 
 from __future__ import annotations
 
+import json
 import sys
 
 from rich.markup import escape as _escape
@@ -457,6 +458,7 @@ class CLIAgentSetupMixin:
                     )
                 self._restore_session_cwd(session_meta, quiet=_quiet_mode)
                 self._restore_session_yolo(session_meta, quiet=_quiet_mode)
+                self._restore_session_memory_mode(session_meta)
                 self._restore_session_model(session_meta, quiet=_quiet_mode)
             else:
                 if _quiet_mode:
@@ -510,6 +512,9 @@ class CLIAgentSetupMixin:
                 prefill_messages=self.prefill_messages or None,
                 reasoning_config=self.reasoning_config,
                 service_tier=self.service_tier,
+                memory_provider_mode_override=getattr(
+                    self, "_memory_provider_mode_override", None
+                ),
                 request_overrides=request_overrides,
                 providers_allowed=self._providers_only,
                 providers_ignored=self._providers_ignore,
@@ -644,6 +649,18 @@ class CLIAgentSetupMixin:
             return None
         return None
 
+    def _restore_session_memory_mode(self, session_meta: dict) -> None:
+        raw_config = (session_meta or {}).get("model_config")
+        if isinstance(raw_config, str):
+            try:
+                raw_config = json.loads(raw_config)
+            except (TypeError, ValueError):
+                raw_config = {}
+        mode = raw_config.get("memory_provider_mode") if isinstance(raw_config, dict) else None
+        self._memory_provider_mode_override = (
+            mode if mode in {"authoritative", "hybrid"} else None
+        )
+
     def _preload_resumed_session(self) -> bool:
         """Load a resumed session's history from the DB early (before first chat).
 
@@ -725,6 +742,7 @@ class CLIAgentSetupMixin:
             )
             self._restore_session_cwd(session_meta)
             self._restore_session_yolo(session_meta)
+            self._restore_session_memory_mode(session_meta)
             self._restore_session_model(session_meta)
         else:
             accent_color = _accent_hex()

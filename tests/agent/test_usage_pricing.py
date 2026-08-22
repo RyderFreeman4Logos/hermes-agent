@@ -520,6 +520,23 @@ def test_usage_without_any_cache_fields_still_normalizes():
     assert normalized.input_tokens == 500
 
 
+def test_custom_routes_preserve_large_provider_cached_tokens():
+    usage = SimpleNamespace(
+        prompt_tokens=258_467,
+        completion_tokens=500,
+        prompt_tokens_details=SimpleNamespace(cached_tokens=200_000),
+    )
+
+    for provider in ("custom", "custom:localrouter"):
+        normalized = normalize_usage(
+            usage,
+            provider=provider,
+            api_mode="chat_completions",
+        )
+        assert normalized.cache_read_tokens == 200_000
+        assert normalized.input_tokens == 58_467
+
+
 def test_normalize_usage_handles_dict_shaped_usage():
     """Regression test for #74314: when the Responses API returns usage as a
     plain dict (e.g. from a middleware/proxy that deserialises JSON to dict

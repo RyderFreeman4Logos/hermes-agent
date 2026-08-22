@@ -42,6 +42,9 @@ DEFAULT_CONFIG = {
         # behavior everywhere.
         "terminal_continue": True,
     },
+    "observability": {
+        "physical_attempt_digests": {"enabled": False},
+    },
     "agent": {
         # Unlimited by default. The agent turn cap caused more problems than
         # it solved (silent mid-task truncation). null = unlimited; set a

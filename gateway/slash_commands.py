@@ -1786,10 +1786,12 @@ class GatewaySlashCommandsMixin:
         force_refresh = request.force_refresh
         is_session = request.is_session
         one_turn = request.is_once
+        after_compression = request.is_after_compression
+        reasoning = request.reasoning
         if request.errors:
             # Gateway decoration: "❌ " prefix over the canonical error copy.
             return f"❌ {request.error_messages()[0]}"
-        persist_global = resolve_persist_behavior(
+        persist_global = False if after_compression else resolve_persist_behavior(
             is_global_flag,
             is_session,
             is_once=one_turn,
@@ -1851,7 +1853,7 @@ class GatewaySlashCommandsMixin:
             current_api_key = override.get("api_key", current_api_key)
 
         # No args: show interactive picker (Telegram/Discord) or text list
-        if not model_input and not explicit_provider:
+        if not model_input and not explicit_provider and not reasoning:
             # Try interactive picker if the platform supports it
             adapter = getattr(self, "_adapter_for_source")(source)
             has_picker = (
@@ -2201,6 +2203,10 @@ class GatewaySlashCommandsMixin:
             lines.append(t("gateway.model.usage_persist"))
             return "\n".join(lines)
 
+        if reasoning and not model_input and not explicit_provider:
+            model_input = current_model
+            explicit_provider = current_provider
+
         # Perform the switch
         skew_error = _model_switch_skew_guard()
         if skew_error:
@@ -2220,30 +2226,38 @@ class GatewaySlashCommandsMixin:
             explicit_provider=explicit_provider,
             user_providers=user_provs,
             custom_providers=custom_provs,
+            validate_live=not after_compression,
         )
 
         if not result.success:
             return t("gateway.model.error_prefix", error=result.error_message)
 
-        try:
-            from hermes_cli.context_switch_guard import (
-                enrich_model_switch_warnings_for_gateway,
-            )
+        if reasoning:
+            from hermes_constants import parse_reasoning_effort
 
-            # Offload: merge_preflight_compression_warning() calls the sync
-            # resolve_display_context_length() provider probe ladder — must
-            # not run on the loop.
-            await asyncio.to_thread(
-                enrich_model_switch_warnings_for_gateway,
-                result,
-                self,
-                session_key=session_key,
-                source=source,
-                custom_providers=custom_provs,
-                load_gateway_config=_load_gateway_config,
-            )
-        except Exception as exc:
-            logger.debug("preflight-compression switch warning failed: %s", exc)
+            result.reasoning_config = parse_reasoning_effort(reasoning)
+        result.is_after_compression = after_compression
+
+        if not after_compression:
+            try:
+                from hermes_cli.context_switch_guard import (
+                    enrich_model_switch_warnings_for_gateway,
+                )
+
+                # Offload: merge_preflight_compression_warning() calls the sync
+                # resolve_display_context_length() provider probe ladder — must
+                # not run on the loop.
+                await asyncio.to_thread(
+                    enrich_model_switch_warnings_for_gateway,
+                    result,
+                    self,
+                    session_key=session_key,
+                    source=source,
+                    custom_providers=custom_provs,
+                    load_gateway_config=_load_gateway_config,
+                )
+            except Exception as exc:
+                logger.debug("preflight-compression switch warning failed: %s", exc)
 
         async def _finish_switch() -> str:
             """Apply the resolved switch (agent, session, config) and build the reply."""
@@ -2255,6 +2269,24 @@ class GatewaySlashCommandsMixin:
                 with _cache_lock:
                     cached_entry = _cache.get(session_key)
 
+            if after_compression:
+                state = self._session_state(session_key)
+                replaced = state.conversation.after_compression_model_switch
+                state.conversation.after_compression_model_switch = result
+                if cached_entry and cached_entry[0] is not None:
+                    self._attach_model_switch_after_compression(
+                        session_key,
+                        cached_entry[0],
+                    )
+                lines = [
+                    "Model switch scheduled after the next successful compression: "
+                    f"`{result.new_model}`",
+                    f"Provider: {result.provider_label or result.target_provider}",
+                ]
+                if replaced is not None:
+                    lines.append("_(replaced the previously scheduled model switch)_")
+                return "\n".join(lines)
+
             if cached_entry and cached_entry[0] is not None:
                 try:
                     cached_entry[0].switch_model(
@@ -2264,6 +2296,11 @@ class GatewaySlashCommandsMixin:
                         base_url=result.base_url,
                         api_mode=result.api_mode,
                     )
+                    if result.reasoning_config is not None:
+                        cached_entry[0].reasoning_config = result.reasoning_config
+                        runtime = getattr(cached_entry[0], "_primary_runtime", None)
+                        if isinstance(runtime, dict):
+                            runtime["reasoning_config"] = result.reasoning_config
                 except Exception as exc:
                     # In-place swap rolled the agent back to the OLD working
                     # model/client and re-raised.  Abort the commit: skip DB
@@ -2321,6 +2358,7 @@ class GatewaySlashCommandsMixin:
                 "api_key": result.api_key,
                 "base_url": result.base_url,
                 "api_mode": result.api_mode,
+                "reasoning_config": result.reasoning_config,
             }
             if one_turn:
                 if not hasattr(self, "_pending_one_turn_model_restores"):

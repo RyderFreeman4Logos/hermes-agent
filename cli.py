@@ -8705,6 +8705,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             "provider": provider or None,
             "base_url": result.base_url or None,
             "api_mode": result.api_mode or None,
+            "reasoning_config": getattr(result, "reasoning_config", None),
         }
         try:
             db.update_session_model(sid, result.new_model)
@@ -11246,6 +11247,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         force_refresh = request.force_refresh
         is_session = request.is_session
         one_turn = request.is_once
+        after_compression = request.is_after_compression
+        reasoning = request.reasoning
         if request.errors:
             # CLI decoration: "  ✗ " prefix over the canonical error copy.
             _cprint(f"  ✗ {request.error_messages()[0]}")
@@ -11254,7 +11257,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # --session/--once force session-scope, otherwise defer to
         # model.persist_switch_by_default (defaults to False so /model is
         # session-scoped unless the user opts in).
-        persist_global = resolve_persist_behavior(
+        persist_global = False if after_compression else resolve_persist_behavior(
             is_global_flag, is_session, is_once=one_turn,
             explicit_provider=explicit_provider,
         )
@@ -11291,7 +11294,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         custom_provs = ctx.custom_providers if ctx is not None else None
 
         # No args at all: open prompt_toolkit-native picker modal
-        if not model_input and not explicit_provider:
+        if not model_input and not explicit_provider and not reasoning:
             model_display = self.model or "unknown"
             provider_display = get_label(self.provider) if self.provider else "unknown"
 
@@ -11325,6 +11328,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             )
             return
 
+        if reasoning and not model_input and not explicit_provider:
+            model_input = self.model or ""
+            explicit_provider = self.provider or ""
+
         # Perform the switch
         result = switch_model(
             raw_input=model_input,
@@ -11336,13 +11343,20 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             explicit_provider=explicit_provider,
             user_providers=user_provs,
             custom_providers=custom_provs,
+            validate_live=not after_compression,
         )
 
         if not result.success:
             _cprint(f"  ✗ {result.error_message}")
             return
 
-        if self.agent is not None:
+        if reasoning:
+            from hermes_constants import parse_reasoning_effort
+
+            result.reasoning_config = parse_reasoning_effort(reasoning)
+        result.is_after_compression = after_compression
+
+        if self.agent is not None and not after_compression:
             try:
                 from hermes_cli.context_switch_guard import merge_preflight_compression_warning
 
@@ -11390,6 +11404,51 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             _cprint("  Model switch cancelled.")
             return
 
+        if result.is_after_compression:
+            if self.agent is None:
+                _cprint("  ✗ No active session is available for deferred switching.")
+                return
+            from hermes_cli.model_switch import (
+                format_model_for_display,
+                schedule_model_switch_after_compression,
+            )
+
+            old_model = str(self.model or "")
+
+            def _sync_deferred_model_switch(applied_result, _old_model, _old_provider):
+                applied_agent = self.agent
+                self.model = applied_result.new_model
+                self.provider = applied_result.target_provider
+                self.requested_provider = applied_result.target_provider
+                self._explicit_api_key = applied_result.api_key
+                self._explicit_base_url = applied_result.base_url
+                self.api_key = getattr(applied_agent, "api_key", applied_result.api_key)
+                self.base_url = getattr(applied_agent, "base_url", applied_result.base_url)
+                self.api_mode = getattr(applied_agent, "api_mode", applied_result.api_mode)
+                self.reasoning_config = applied_result.reasoning_config
+                self._pending_one_turn_model_restore = None
+                self._pending_model_switch_note = (
+                    "[Note: model was just switched from "
+                    f"{format_model_for_display(old_model)} to "
+                    f"{format_model_for_display(applied_result.new_model)} via "
+                    f"{applied_result.provider_label or applied_result.target_provider}. "
+                    "Adjust your self-identification accordingly.]"
+                )
+
+            replaced = schedule_model_switch_after_compression(
+                self.agent,
+                result,
+                on_applied=_sync_deferred_model_switch,
+            )
+            _cprint(
+                "  ✓ Model switch scheduled after the next successful compression: "
+                f"{format_model_for_display(result.new_model)}"
+            )
+            _cprint(f"    Provider: {result.provider_label or result.target_provider}")
+            if replaced is not None:
+                _cprint("    (replaced the previously scheduled model switch)")
+            return
+
         # Apply to CLI state.
         # Update requested_provider so _ensure_runtime_credentials() doesn't
         # overwrite the switch on the next turn (it re-resolves from this).
@@ -11406,6 +11465,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             "api_key": self.api_key,
             "base_url": self.base_url,
             "api_mode": self.api_mode,
+            "reasoning_config": getattr(self, "reasoning_config", None),
         }
         self.model = result.new_model
         self.provider = result.target_provider
@@ -11432,6 +11492,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     base_url=result.base_url,
                     api_mode=result.api_mode,
                 )
+                if result.reasoning_config is not None:
+                    self.agent.reasoning_config = copy.deepcopy(result.reasoning_config)
+                    runtime = getattr(self.agent, "_primary_runtime", None)
+                    if isinstance(runtime, dict):
+                        runtime["reasoning_config"] = copy.deepcopy(result.reasoning_config)
             except Exception as exc:
                 # Agent rolled itself back; roll the CLI back too and abort so a
                 # failed switch is a no-op rather than a dead session (#50163).
@@ -11442,6 +11507,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     f"staying on {old_model}."
                 )
                 return
+
+        if result.reasoning_config is not None:
+            self.reasoning_config = copy.deepcopy(result.reasoning_config)
 
         # Store a note to prepend to the next user message so the model
         # knows a switch occurred (avoids injecting system messages mid-history

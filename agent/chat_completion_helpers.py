@@ -16,6 +16,7 @@ sites unchanged.  Symbols that tests patch on ``run_agent`` (e.g.
 from __future__ import annotations
 
 import contextvars
+import copy
 import json
 import logging
 import math
@@ -2405,6 +2406,17 @@ def _fallback_entry_key(fb: dict) -> tuple[str, str, str]:
     )
 
 
+def _close_rejected_fallback_client(client) -> None:
+    if client is None:
+        return
+    try:
+        close = getattr(client, "close", None)
+        if callable(close):
+            close()
+    except Exception:
+        logger.debug("rejected fallback client cleanup failed", exc_info=True)
+
+
 def _fallback_entry_unavailable_without_network(agent, fb: dict) -> Optional[str]:
     """Return a skip reason for fallback entries known to be unusable locally."""
     fb_provider = (fb.get("provider") or "").strip().lower()
@@ -2503,6 +2515,12 @@ def try_activate_fallback(
                 time.monotonic() + _FALLBACK_EXHAUSTED_COOLDOWN_S,
             )
         return False
+    if not getattr(agent, "_fallback_activated", False):
+        primary_runtime = getattr(agent, "_primary_runtime", None)
+        if isinstance(primary_runtime, dict):
+            primary_runtime["request_overrides"] = copy.deepcopy(
+                getattr(agent, "request_overrides", {}) or {}
+            )
     fb = agent._fallback_chain[agent._fallback_index]
     agent._fallback_index += 1
     fb_key = _fallback_entry_key(fb)
@@ -2557,6 +2575,8 @@ def try_activate_fallback(
     # Use centralized router for client construction.
     # raw_codex=True because the main agent needs direct responses.stream()
     # access for Codex providers.
+    candidate_snapshot = None
+    fb_client = None
     try:
         from agent.auxiliary_client import resolve_provider_client
         # Pass base_url and api_key from fallback config so custom
@@ -2610,6 +2630,12 @@ def try_activate_fallback(
                 fb_provider)
             unavailable.add(fb_key)
             return _try_next_fallback()  # try next in chain
+        from agent.agent_runtime_helpers import capture_model_runtime_for_rollback
+
+        candidate_snapshot = capture_model_runtime_for_rollback(agent)
+        for _client_name in ("client", "_anthropic_client"):
+            if hasattr(agent, _client_name):
+                candidate_snapshot[_client_name] = getattr(agent, _client_name)
         try:
             from hermes_cli.model_normalize import normalize_model_for_provider
 
@@ -2684,6 +2710,9 @@ def try_activate_fallback(
         # Read from the fallback entry so the flag travels with the active
         # provider; restore_primary_runtime will revert it from the snapshot.
         agent._reasoning_echo_flag = bool(fb.get("reasoning_echo", False))
+        from agent.agent_runtime_helpers import _rebuild_request_overrides
+
+        _rebuild_request_overrides(agent)
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent._fallback_activated = True
@@ -2867,6 +2896,31 @@ def try_activate_fallback(
         _reset_stale_streak(agent)
         return True
     except Exception as e:
+        cleanup_clients = []
+        if fb_client is not None:
+            cleanup_clients.append(fb_client)
+        if candidate_snapshot is not None:
+            for _client_name in ("client", "_anthropic_client"):
+                _current_client = getattr(agent, _client_name, None)
+                _previous_client = candidate_snapshot.get(_client_name)
+                if _current_client is not None and _current_client is not _previous_client:
+                    cleanup_clients.append(_current_client)
+            try:
+                from agent.agent_runtime_helpers import restore_model_runtime_for_rollback
+
+                restore_model_runtime_for_rollback(agent, candidate_snapshot)
+            except Exception:
+                logger.error("Failed to roll back rejected fallback candidate", exc_info=True)
+        closed_ids = set()
+        for _client in cleanup_clients:
+            if id(_client) in closed_ids:
+                continue
+            closed_ids.add(id(_client))
+            if candidate_snapshot is None or all(
+                _client is not candidate_snapshot.get(_name)
+                for _name in ("client", "_anthropic_client")
+            ):
+                _close_rejected_fallback_client(_client)
         if fb_provider == "nous":
             unavailable.add(fb_key)
         logger.error("Failed to activate fallback %s: %s", fb_model, e)

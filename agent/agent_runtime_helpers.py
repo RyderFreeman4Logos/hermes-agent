@@ -1582,6 +1582,9 @@ def restore_primary_runtime(agent) -> bool:
         agent.api_key = rt["api_key"]
         agent._reasoning_echo_flag = rt.get("reasoning_echo_flag", False)
         agent._client_kwargs = dict(rt["client_kwargs"])
+        agent.request_overrides = copy.deepcopy(
+            rt.get("request_overrides", {}) or {}
+        )
         agent._use_prompt_caching = rt["use_prompt_caching"]
         # Default to native layout when the restored snapshot predates the
         # native-vs-proxy split (older sessions saved before this PR).
@@ -2610,10 +2613,13 @@ _MODEL_RUNTIME_ROLLBACK_FIELDS = (
     "_use_prompt_caching", "_use_native_cache_layout", "reasoning_config",
     "_cached_system_prompt", "_primary_runtime", "_fallback_activated",
     "_fallback_index", "_fallback_chain", "_fallback_model",
+    "_pending_fallback_notice", "_consecutive_stale_streams",
 )
 
 
 def _rollback_copy(value):
+    if value is _MODEL_RUNTIME_MISSING:
+        return value
     try:
         return copy.deepcopy(value)
     except Exception:
@@ -2650,6 +2656,21 @@ def restore_model_runtime_for_rollback(agent, snapshot: dict) -> None:
     if compressor_state is not None and compressor is not None:
         compressor.__dict__.clear()
         compressor.__dict__.update(compressor_state)
+
+
+def _rebuild_request_overrides(agent) -> None:
+    """Rebuild route-scoped overrides after changing model or endpoint."""
+    agent.request_overrides = {}
+    try:
+        from agent.agent_init import _merge_custom_provider_extra_body
+        from hermes_cli.config import get_compatible_custom_providers, load_config
+
+        _merge_custom_provider_extra_body(
+            agent,
+            get_compatible_custom_providers(load_config()),
+        )
+    except Exception:
+        logger.debug("request override rebuild skipped", exc_info=True)
 
 
 def _switch_model_unlocked(agent, new_model, new_provider, api_key='', base_url='', api_mode=''):
@@ -2788,16 +2809,7 @@ def _switch_model_unlocked(agent, new_model, new_provider, api_key='', base_url=
                 "refusing to keep the previous provider's endpoint"
             )
         agent.api_mode = api_mode
-        agent.request_overrides = {}
-        try:
-            from agent.agent_init import _merge_custom_provider_extra_body
-            from hermes_cli.config import get_compatible_custom_providers, load_config
-
-            _merge_custom_provider_extra_body(
-                agent, get_compatible_custom_providers(load_config())
-            )
-        except Exception:
-            logger.debug("request override reset failed on model switch", exc_info=True)
+        _rebuild_request_overrides(agent)
         # Invalidate transport cache — new api_mode may need a different transport
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
@@ -3070,6 +3082,9 @@ def _switch_model_unlocked(agent, new_model, new_provider, api_key='', base_url=
         "api_mode": agent.api_mode,
         "api_key": getattr(agent, "api_key", ""),
         "client_kwargs": dict(agent._client_kwargs),
+        "request_overrides": copy.deepcopy(
+            getattr(agent, "request_overrides", {}) or {}
+        ),
         "use_prompt_caching": agent._use_prompt_caching,
         "use_native_cache_layout": agent._use_native_cache_layout,
         "reasoning_config": dict(agent.reasoning_config) if getattr(agent, "reasoning_config", None) else None,

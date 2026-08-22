@@ -1899,8 +1899,8 @@ DEFAULT_CONFIG = {
         "provider": "",
         # Storage routing: "hybrid" keeps built-in Markdown as the source of
         # truth; "authoritative" makes the configured provider the only write
-        # target for the core memory tool.
-        "provider_mode": "hybrid",
+        # target for the core memory tool. When omitted, Mempal with both
+        # Markdown stores disabled resolves to authoritative.
     },
 
     # Subagent delegation — override the provider:model used by delegate_task

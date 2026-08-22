@@ -1195,7 +1195,7 @@ def parse_model_switch_args(raw: str) -> ModelSwitchRequest:
         errors.append(MODEL_SWITCH_ERR_AFTER_COMPRESSION_WITH_ONCE)
     if parsed.is_after_compression and parsed.is_global:
         errors.append(MODEL_SWITCH_ERR_AFTER_COMPRESSION_WITH_GLOBAL)
-    if parsed.is_after_compression and not parsed.model_input:
+    if parsed.is_after_compression and not parsed.model_input and not parsed.explicit_provider:
         errors.append(MODEL_SWITCH_ERR_AFTER_COMPRESSION_REQUIRES_TARGET)
 
     if parsed.is_after_compression:
@@ -1915,6 +1915,39 @@ def switch_model(
                     ),
                 )
 
+        # Deferred provider-only switches must use a configured default rather
+        # than probing the endpoint at the compression boundary.
+        if not new_model and not validate_live:
+            configured = None
+            if isinstance(user_providers, dict):
+                configured_provider = user_providers.get(explicit_provider)
+                if isinstance(configured_provider, dict):
+                    configured = configured_provider.get("default_model")
+                    models = configured_provider.get("models")
+                    if not configured and isinstance(models, dict):
+                        configured = next(iter(models), None)
+            if not configured:
+                try:
+                    from hermes_cli.runtime_provider import _get_named_custom_provider
+                    configured = (
+                        _get_named_custom_provider(explicit_provider) or {}
+                    ).get("model")
+                except Exception:
+                    configured = None
+            new_model = str(configured or "").strip()
+            if not new_model:
+                return ModelSwitchResult(
+                    success=False,
+                    target_provider=target_provider,
+                    provider_label=pdef.name,
+                    is_global=is_global,
+                    error_message=(
+                        f"Provider '{pdef.name}' has no locally configured default model. "
+                        f"Specify the model explicitly: /model <model-name> "
+                        f"--provider {explicit_provider} --after-compression"
+                    ),
+                )
+
         # If no model specified, try auto-detect from endpoint
         if not new_model:
             if pdef.base_url:
@@ -2508,14 +2541,16 @@ def switch_model(
         from hermes_cli.models import normalize_opencode_base_url
         base_url = normalize_opencode_base_url(target_provider, api_mode, base_url)
 
-    capabilities = get_model_capabilities(
-        target_provider, new_model, allow_network=validate_live
-    )
-
-    # --- Get full model info from models.dev ---
-    model_info = get_model_info(
-        target_provider, new_model, allow_network=validate_live
-    )
+    if validate_live:
+        capabilities = get_model_capabilities(
+            target_provider, new_model, allow_network=True
+        )
+        model_info = get_model_info(
+            target_provider, new_model, allow_network=True
+        )
+    else:
+        capabilities = get_model_capabilities(target_provider, new_model)
+        model_info = get_model_info(target_provider, new_model)
 
     # --- Collect warnings ---
     warnings: list[str] = []

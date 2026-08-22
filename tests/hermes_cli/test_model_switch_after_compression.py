@@ -41,9 +41,56 @@ def test_after_compression_rejects_immediate_scopes():
     )
 
 
-def test_after_compression_requires_model_target():
+def test_after_compression_requires_model_target_or_provider():
     request = parse_model_switch_args("--after-compression")
     assert MODEL_SWITCH_ERR_AFTER_COMPRESSION_REQUIRES_TARGET in request.errors
+
+    provider_only = parse_model_switch_args(
+        "--after-compression --provider anthropic"
+    )
+    assert provider_only.errors == ()
+
+
+def test_provider_only_after_compression_uses_configured_default(monkeypatch):
+    config = {
+        "providers": {
+            "pm": {
+                "base_url": "https://pm.invalid/v1",
+                "api_key": "[REDACTED]",
+                "api_mode": "codex_responses",
+                "default_model": "current-model",
+                "models": {"current-model": {"context_length": 262_144}},
+            }
+        }
+    }
+    monkeypatch.setattr("hermes_cli.runtime_provider.load_config", lambda: config)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: config)
+    monkeypatch.setattr("hermes_cli.model_switch.get_model_info", lambda *_a: None)
+    monkeypatch.setattr(
+        "hermes_cli.model_switch.get_model_capabilities", lambda *_a: None
+    )
+    monkeypatch.setattr(
+        "hermes_cli.models.validate_requested_model",
+        lambda *_a, **_k: {"accepted": True, "persist": True, "recognized": True},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider._auto_detect_local_model",
+        lambda *_a, **_k: (_ for _ in ()).throw(
+            AssertionError("provider-only deferred switch must use configured default")
+        ),
+    )
+
+    result = switch_model(
+        raw_input="",
+        explicit_provider="pm",
+        current_provider="openai-codex",
+        current_model="old-model",
+        user_providers=config["providers"],
+        validate_live=False,
+    )
+
+    assert result.success, result.error_message
+    assert (result.target_provider, result.new_model) == ("pm", "current-model")
 
 
 def test_after_compression_allows_explicit_session_scope():

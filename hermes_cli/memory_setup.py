@@ -508,9 +508,6 @@ def cmd_status(args) -> None:
     else:
         storage_mode = "none"
         core_tool_routing = "hidden"
-    provider_context_mode = mem_config.get("provider_context_mode")
-    if not provider_context_mode:
-        provider_context_mode = "provider_controlled" if provider_name else "disabled"
 
     print("\nMemory status\n" + "─" * 40)
     print("  Built-in (MEMORY.md / USER.md):")
@@ -521,7 +518,6 @@ def cmd_status(args) -> None:
     print(f"  provider_mode={provider_mode}")
     print(f"  storage_mode={storage_mode}")
     print(f"  built_in_injection={built_in_injection}")
-    print(f"  provider_context_mode={provider_context_mode}")
     print(f"  core_tool_routing={core_tool_routing}")
 
     providers = _get_available_providers()

@@ -9843,6 +9843,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self.conversation_history = []
         self._pending_title = None
         self._resumed = False
+        try:
+            from tools.memory_tool import get_memory_provider_mode
+
+            _new_memory_provider_mode = get_memory_provider_mode(
+                CLI_CONFIG.get("memory", {})
+            )
+        except Exception:
+            _new_memory_provider_mode = "hybrid"
+        self._memory_provider_mode_override = None
         # /new clears the -m / --model override flag: an explicit CLI model
         # was for the previous session only, not for every session spawned
         # afterwards.
@@ -9915,7 +9924,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self.agent.session_id = self.session_id
             self.agent.session_start = self.session_start
             self.agent.reasoning_config = self.reasoning_config
+            self.agent._memory_provider_mode = _new_memory_provider_mode
+            if getattr(self.agent, "_memory_manager", None) is not None:
+                self.agent._memory_manager.provider_mode = _new_memory_provider_mode
             self.agent.reset_session_state()
+            if isinstance(getattr(self.agent, "_session_init_model_config", None), dict):
+                self.agent._session_init_model_config["memory_provider_mode"] = (
+                    _new_memory_provider_mode
+                )
             if hasattr(self.agent, "_last_flushed_db_idx"):
                 self.agent._last_flushed_db_idx = 0
             if hasattr(self.agent, "_todo_store"):
@@ -9937,6 +9953,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         model_config={
                             "max_iterations": self.max_turns,
                             "reasoning_config": self.reasoning_config,
+                            "memory_provider_mode": _new_memory_provider_mode,
                         },
                     )
                     self.agent._session_db_created = True

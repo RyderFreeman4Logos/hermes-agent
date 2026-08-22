@@ -726,7 +726,7 @@ def test_session_resume_rejects_runaway_transcript_before_history_load(
     assert "safe resume limit is 20000" in response["error"]["message"]
 
 
-def test_session_resume_guard_failure_fails_open(server, monkeypatch):
+def test_session_resume_guard_failure_fails_open(server, monkeypatch, caplog):
     """A transient guard error must not block resume (fail open, log only)."""
     reopened = []
 
@@ -740,7 +740,8 @@ def test_session_resume_guard_failure_fails_open(server, monkeypatch):
         def resolve_resume_session_id(self, sid):
             return sid
 
-        def assert_resume_safe(self, _sid):
+        def assert_resume_safe(self, _sid, include_ancestors=True):
+            assert include_ancestors is False
             raise RuntimeError("database is locked")
 
         def reopen_session(self, sid):
@@ -767,6 +768,7 @@ def test_session_resume_guard_failure_fails_open(server, monkeypatch):
     assert err.get("code") != 4130
     assert "resume safety check failed" not in str(err.get("message", ""))
     assert reopened == ["transient-guard-session"]
+    assert "database is locked" in caplog.text
 
 
 def test_session_resume_active_turn_payload_matches_desktop_fixture(server, monkeypatch):

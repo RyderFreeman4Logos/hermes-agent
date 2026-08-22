@@ -1682,7 +1682,35 @@ def _event_frame(event: str, sid: str, payload: dict | None = None) -> dict:
     return {"jsonrpc": "2.0", "method": "event", "params": params}
 
 
+def _cache_info_from_first_call(record: Any) -> dict[str, int | str]:
+    """Map the first-provider-response record onto the FE cache_info stamp."""
+    if not isinstance(record, dict):
+        return {"state": "unavailable", "pct": 0}
+    state = str(record.get("state") or "unavailable")
+    if state == "no_field":
+        state = "unavailable"
+    try:
+        pct = int(record["pct"]) if record.get("pct") is not None else 0
+    except (TypeError, ValueError):
+        pct = 0
+    return {"state": state, "pct": pct}
+
+
+def _stamp_loop_cache_info(sid: str, payload: dict) -> None:
+    if "cache_info" not in payload:
+        session = _sessions.get(sid) or {}
+        payload["cache_info"] = _cache_info_from_first_call(
+            session.get("first_provider_response")
+        )
+
+
 def _emit(event: str, sid: str, payload: dict | None = None):
+    # This is the authoritative moment a terminal turn frame leaves the
+    # gateway. Keep it on the frame (rather than a client-side Date.now())
+    # so the TUI can distinguish a delayed delivery from an agent that just
+    # stopped. Copy rather than mutate because some callers reuse payloads.
+    if event == "message.complete":
+        payload = {**(payload or {}), "completed_at": time.time()}
     write_json(_event_frame(event, sid, payload))
 
 
@@ -8782,6 +8810,7 @@ def _emit_terminal_turn_error(
         rendered = ""
     if rendered:
         payload["rendered"] = rendered
+    _stamp_loop_cache_info(sid, payload)
     _retire_turn_marker(session)
     _emit("message.complete", sid, payload)
 
@@ -11358,6 +11387,7 @@ def _run_prompt_submit(
             _cancel_tui_cache_warm(session, retain_arm=True)
         agent._tui_first_provider_response_record_enabled = True
         agent._tui_first_provider_response_recorded = False
+        session.pop("first_provider_response", None)
         if hasattr(agent, "clear_interrupt"):
             try:
                 agent.clear_interrupt()
@@ -11926,6 +11956,7 @@ def _run_prompt_submit(
                 payload["recoverable"] = True
                 if _error_surface:
                     payload["error_surface"] = _error_surface
+            _stamp_loop_cache_info(sid, payload)
             _retire_turn_marker(session, marker_key)
             _emit("message.complete", sid, payload)
 

@@ -1267,6 +1267,71 @@ class TestInvalidateSystemPrompt:
 
 
 class TestBuildApiKwargs:
+    def test_named_custom_profile_request_reuses_stable_prefix_key(
+        self, agent, monkeypatch
+    ):
+        """The resolved named-custom route emits a stable cache key on the wire."""
+        from hermes_cli import runtime_provider
+        from providers import get_provider_profile
+
+        custom_provider = {
+            "name": "localrouter",
+            "base_url": "https://localrouter.invalid/v1",
+            "api_key": "localrouter-test-key",
+        }
+        monkeypatch.setattr(
+            runtime_provider,
+            "_get_named_custom_provider",
+            lambda requested: (
+                custom_provider if requested == "custom:localrouter" else None
+            ),
+        )
+        monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+
+        runtime = runtime_provider.resolve_runtime_provider(
+            requested="custom:localrouter", target_model="local-model"
+        )
+        assert runtime["provider"] == "custom"
+        assert runtime["requested_provider"] == "custom:localrouter"
+        assert get_provider_profile(runtime["provider"]) is not None
+
+        agent.provider = runtime["provider"]
+        agent.requested_provider = runtime["requested_provider"]
+        agent.base_url = runtime["base_url"]
+        agent.api_mode = runtime["api_mode"]
+        agent.model = "local-model"
+        agent.session_id = "same-route-session"
+        stable = {
+            "type": "text",
+            "text": "stable prefix",
+            "cache_control": {"type": "ephemeral"},
+        }
+
+        def emitted_request(user_text, stable_text="stable prefix"):
+            request = agent._build_api_kwargs(
+                [
+                    {
+                        "role": "system",
+                        "content": [
+                            {**stable, "text": stable_text},
+                            {"type": "text", "text": "volatile"},
+                        ],
+                    },
+                    {"role": "user", "content": user_text},
+                ]
+            )
+            agent.client.chat.completions.create(**request)
+            return agent.client.chat.completions.create.call_args_list[-1].kwargs
+
+        first = emitted_request("first request")
+        second = emitted_request("second request")
+        changed_prefix = emitted_request("third request", stable_text="changed prefix")
+
+        assert second["prompt_cache_key"].startswith("pck_")
+        assert len(second["prompt_cache_key"]) == len("pck_") + 24
+        assert second["prompt_cache_key"] == first["prompt_cache_key"]
+        assert changed_prefix["prompt_cache_key"] != second["prompt_cache_key"]
+
     def test_basic_kwargs(self, agent):
         messages = [{"role": "user", "content": "hi"}]
         kwargs = agent._build_api_kwargs(messages)

@@ -1897,6 +1897,10 @@ DEFAULT_CONFIG = {
         # "hindsight", "holographic", "retaindb", "byterover".
         # Only ONE external provider is allowed at a time.
         "provider": "",
+        # Storage routing: "hybrid" keeps built-in Markdown as the source of
+        # truth; "authoritative" makes the configured provider the only write
+        # target for the core memory tool.
+        "provider_mode": "hybrid",
     },
 
     # Subagent delegation — override the provider:model used by delegate_task

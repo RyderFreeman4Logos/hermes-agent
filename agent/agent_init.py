@@ -1825,6 +1825,7 @@ def init_agent(
     agent._memory_store = None
     agent._memory_enabled = False
     agent._user_profile_enabled = False
+    agent._memory_provider_mode = "hybrid"
     agent._memory_nudge_interval = 10
     agent._turns_since_memory = 0
     agent._iters_since_skill = 0
@@ -1840,14 +1841,17 @@ def init_agent(
     _memory_toolset_requested = (
         "memory" in _enabled_toolsets and "memory" not in _disabled_toolsets
     )
+    mem_config = {}
     if not skip_memory or _memory_toolset_requested:
         try:
             from tools.memory_tool import (
                 get_builtin_memory_config,
                 get_builtin_memory_store_flags,
+                get_memory_provider_mode,
             )
 
             mem_config = get_builtin_memory_config(_agent_cfg)
+            agent._memory_provider_mode = get_memory_provider_mode(mem_config)
             agent._memory_enabled, agent._user_profile_enabled = get_builtin_memory_store_flags(
                 _agent_cfg
             )
@@ -1873,11 +1877,16 @@ def init_agent(
         try:
             _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
 
-            if _mem_provider_name and _mem_provider_name.strip():
+            if (
+                (_mem_provider_name and _mem_provider_name.strip())
+                or agent._memory_provider_mode == "authoritative"
+            ):
                 from agent.memory_manager import MemoryManager as _MemoryManager
                 from plugins.memory import load_memory_provider as _load_mem
-                agent._memory_manager = _MemoryManager()
-                _mp = _load_mem(_mem_provider_name)
+                agent._memory_manager = _MemoryManager(
+                    provider_mode=agent._memory_provider_mode,
+                )
+                _mp = _load_mem(_mem_provider_name) if _mem_provider_name else None
                 if _mp and _mp.is_available():
                     agent._memory_manager.add_provider(_mp)
                 elif _mp is not None:
@@ -1945,10 +1954,12 @@ def init_agent(
                     _ra().logger.info("Memory provider '%s' activated", _mem_provider_name)
                 else:
                     _ra().logger.debug("Memory provider '%s' not found or not available", _mem_provider_name)
-                    agent._memory_manager = None
+                    if agent._memory_provider_mode != "authoritative":
+                        agent._memory_manager = None
         except Exception as _mpe:
             _ra().logger.warning("Memory provider plugin init failed: %s", _mpe)
-            agent._memory_manager = None
+            if agent._memory_provider_mode != "authoritative":
+                agent._memory_manager = None
 
     from agent.memory_manager import inject_memory_provider_tools as _inject_memory_provider_tools
     _inject_memory_provider_tools(agent)

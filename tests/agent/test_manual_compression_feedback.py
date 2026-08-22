@@ -64,5 +64,30 @@ def test_fallback_compression_reports_dropped_message_count():
     assert "invalid response" in feedback["note"]
 
 
+def test_leftover_over_threshold_is_not_success():
+    before = _messages(12)
+    after = before[:2] + before[-2:]
+    state = SimpleNamespace(
+        threshold_tokens=196_608,
+        _last_compress_aborted=False,
+        _last_summary_fallback_used=False,
+        _last_summary_error=None,
+    )
+
+    feedback = summarize_manual_compression(
+        before,
+        after,
+        350_000,
+        200_000,
+        compression_state=state,
+    )
+
+    assert feedback["aborted"] is True
+    assert "Compressed:" not in feedback["headline"]
+    assert "200,000" in feedback["headline"]
+    assert "incomplete" in feedback["headline"].lower()
+    assert "threshold" in feedback["note"].lower()
+
+
 
 

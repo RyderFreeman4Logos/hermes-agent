@@ -684,7 +684,8 @@ class ChatCompletionsTransport(ProviderTransport):
             messages=sanitized,
             tools=api_kwargs.get("tools"),
             supports_prompt_cache_key=bool(params.get("supports_prompt_cache_key"))
-            or _is_openai_api_base_url(params.get("base_url")),
+            or _is_openai_api_base_url(params.get("base_url"))
+            or str(params.get("provider_name") or "").startswith("custom:"),
             session_id=params.get("session_id"),
             cache_scope_id=params.get("cache_scope_id"),
         )

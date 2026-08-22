@@ -173,6 +173,25 @@ def _content_cache_key(
     return f"pck_{digest}"
 
 
+def _cache_key_instructions(
+    messages: List[Dict[str, Any]], instructions: str
+) -> str:
+    """Use the marked stable system prefix for cache routing when present."""
+    if messages and isinstance(messages[0], dict):
+        first = messages[0]
+        if first.get("role") in {"system", "developer"}:
+            content = first.get("content")
+            if isinstance(content, list) and content:
+                first_block = content[0]
+                if (
+                    isinstance(first_block, dict)
+                    and "cache_control" in first_block
+                    and isinstance(first_block.get("text"), str)
+                ):
+                    return first_block["text"]
+    return instructions
+
+
 def _is_azure_foundry_responses(params: Dict[str, Any]) -> bool:
     """Return True for Microsoft Foundry's OpenAI-compatible Responses API.
 
@@ -536,7 +555,7 @@ class ResponsesApiTransport(ProviderTransport):
             params.get("cache_scope_id") or session_id
         )
         cache_key = _content_cache_key(
-            instructions, response_tools, _cache_scope
+            _cache_key_instructions(messages, instructions), response_tools, _cache_scope
         ) or _cache_scope
         # xAI Responses takes prompt_cache_key in extra_body (set further
         # down); GitHub Models opts out of cache-key routing entirely.

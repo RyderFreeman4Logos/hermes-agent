@@ -90,6 +90,35 @@ class TestCodexBuildKwargs:
         )
         assert kw1["prompt_cache_key"] != kw2["prompt_cache_key"]
 
+    def test_short_gap_same_route_reuses_marked_stable_prefix_key(self, transport):
+        """A volatile suffix must not evict an unchanged marked prefix bucket."""
+        def key(volatile):
+            return transport.build_kwargs(
+                model="gpt-5.6-luna",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "stable prefix",
+                                "cache_control": {"type": "ephemeral"},
+                            },
+                            {"type": "text", "text": volatile},
+                        ],
+                    },
+                    {"role": "user", "content": "same route"},
+                ],
+                tools=[],
+                session_id="same-route-session",
+            )["prompt_cache_key"]
+
+        first = key("first volatile suffix")
+        second = key("second volatile suffix")
+
+        assert first.startswith("pck_")
+        assert second == first
+
     def test_github_responses_drops_message_item_id_end_to_end(self, transport):
         # #32716: Copilot binds codex_message_items ids to a backend
         # "connection" that doesn't survive credential rotation, a gateway

@@ -2465,6 +2465,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
             # Session DB row deferred to first run_conversation() call.
             # pending_title applied post-first-message (see cli.exec handler).
             current["agent"] = agent
+            _persist_live_session_runtime(current)
             # Baseline for the per-turn config sync; the profile home
             # override is still active here.
             current["config_model_seen"] = _config_model_target()
@@ -2971,6 +2972,35 @@ def _register_session_cwd(session: dict | None) -> None:
         pass
 
 
+_VALID_MEMORY_PROVIDER_MODES = frozenset({"authoritative", "hybrid"})
+
+
+def _session_memory_provider_mode(session: dict) -> str:
+    agent = session.get("agent")
+    init_config = getattr(agent, "_session_init_model_config", None)
+    if isinstance(init_config, dict):
+        mode = init_config.get("memory_provider_mode")
+        if mode in _VALID_MEMORY_PROVIDER_MODES:
+            return mode
+    mode = getattr(agent, "_memory_provider_mode", None)
+    if mode in _VALID_MEMORY_PROVIDER_MODES:
+        return mode
+    overrides = session.get("resume_runtime_overrides")
+    if isinstance(overrides, dict):
+        mode = overrides.get("memory_provider_mode_override")
+        if mode in _VALID_MEMORY_PROVIDER_MODES:
+            return mode
+    try:
+        from tools.memory_tool import get_memory_provider_mode
+
+        memory_config = _load_cfg().get("memory", {})
+        return get_memory_provider_mode(
+            memory_config if isinstance(memory_config, dict) else {}
+        )
+    except Exception:
+        return "hybrid"
+
+
 def _ensure_session_db_row(session: dict) -> None:
     """Idempotently persist the session's DB row on first real activity.
 
@@ -3067,6 +3097,7 @@ def _ensure_session_db_row(session: dict) -> None:
         # service_tier value to the provider. Persist a durable marker so resume
         # can distinguish that choice from an omitted/inherited tier.
         model_config["service_tier"] = create_service_tier_override or "normal"
+    model_config["memory_provider_mode"] = _session_memory_provider_mode(session)
     # Branch lineage: stamp the same ``_branched_from`` marker the TUI /branch
     # uses so list_sessions_rich keeps the branch listed and the desktop sidebar
     # can nest it under its parent.
@@ -7112,6 +7143,7 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
     finally:
         _clear_session_context(tokens)
     session["agent"] = new_agent
+    _persist_live_session_runtime(session)
     session["config_model_seen"] = _config_model_target()
     session["attached_images"] = []
     session["queued_prompt"] = None

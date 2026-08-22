@@ -1369,7 +1369,8 @@ def _build_memory_schema_overrides() -> Dict[str, Any]:
 
     parameters = copy.deepcopy(MEMORY_SCHEMA["parameters"])
     target_schema = parameters["properties"]["target"]
-    target_schema["enum"] = targets
+    if targets:
+        target_schema["enum"] = targets
 
     description = MEMORY_SCHEMA["description"]
     if targets == ["memory"]:

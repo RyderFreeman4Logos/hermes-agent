@@ -69,6 +69,20 @@ class TestBuiltinMemoryToolAvailability:
         )
         assert "memory" not in _memory_tool_names()
 
+    def test_authoritative_mempal_keeps_target_enum_when_builtins_disabled(self, hermes_home):
+        _write_memory_config(
+            hermes_home,
+            provider="mempal",
+            memory_enabled=False,
+            user_profile_enabled=False,
+        )
+        assert "memory" in _memory_tool_names()
+        definition = _memory_tool_definition()
+        target_enum = definition["parameters"]["properties"]["target"]["enum"]
+        assert target_enum
+        assert set(target_enum) <= {"memory", "user"}
+        assert target_enum == ["memory", "user"]
+
     def test_tool_present_when_only_user_profile_enabled(self, hermes_home):
         _write_memory_config(
             hermes_home, memory_enabled=False, user_profile_enabled=True

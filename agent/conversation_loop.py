@@ -114,11 +114,16 @@ def _standard_child_has_successful_llm_request(agent) -> bool:
     return bool(getattr(agent, "_delegate_has_successful_llm_request", False))
 
 
-def _standard_child_can_fallback(agent, *, rate_limited: bool = False) -> bool:
+def _standard_child_can_fallback(
+    agent, *, rate_limited: bool = False, terminal_quota: bool = False
+) -> bool:
     """Permit only pre-success 429 fallback for standard-profile children."""
     if not _is_standard_profile_child(agent):
         return True
-    return rate_limited and not _standard_child_has_successful_llm_request(agent)
+    return (
+        (rate_limited or terminal_quota)
+        and not _standard_child_has_successful_llm_request(agent)
+    )
 
 
 def _response_error_code(response) -> Optional[int]:
@@ -4808,6 +4813,10 @@ def run_conversation(
                     context_length=_ctx_len,
                     num_messages=len(api_messages) if api_messages else 0,
                 )
+                _terminal_quota_429 = (
+                    status_code == 429
+                    and classified.reason == FailoverReason.billing
+                )
                 logger.debug(
                     "Error classified: reason=%s status=%s retryable=%s compress=%s rotate=%s fallback=%s",
                     classified.reason.value, classified.status_code,
@@ -5498,6 +5507,7 @@ def run_conversation(
                             FailoverReason.rate_limit,
                             FailoverReason.upstream_rate_limit,
                         },
+                        terminal_quota=_terminal_quota_429,
                     )
                     and agent._fallback_index < len(agent._fallback_chain)
                 ):
@@ -5511,7 +5521,7 @@ def run_conversation(
                     # different model regardless of pool state.
                     _is_upstream = classified.reason == FailoverReason.upstream_rate_limit
                     pool_may_recover = (
-                        False if _is_upstream
+                        False if _is_upstream or _terminal_quota_429
                         else _ra()._pool_may_recover_from_rate_limit(
                             agent._credential_pool,
                         )
@@ -5543,7 +5553,10 @@ def run_conversation(
                             )
                         else:
                             agent._buffer_status("⚠️ Rate limited — switching to fallback provider...")
-                        if agent._try_activate_fallback(reason=classified.reason):
+                        if agent._try_activate_fallback(
+                            reason=classified.reason,
+                            terminal_quota=_terminal_quota_429,
+                        ):
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
                             retry_count = 0
@@ -5556,12 +5569,15 @@ def run_conversation(
                 # no configured fallback could be activated.
                 if (
                     _is_standard_profile_child(agent)
-                    and classified.reason
-                    in {
-                        FailoverReason.rate_limit,
-                        FailoverReason.upstream_rate_limit,
-                    }
-                    and not _standard_child_has_successful_llm_request(agent)
+                    and _standard_child_can_fallback(
+                        agent,
+                        rate_limited=classified.reason
+                        in {
+                            FailoverReason.rate_limit,
+                            FailoverReason.upstream_rate_limit,
+                        },
+                        terminal_quota=_terminal_quota_429,
+                    )
                 ):
                     retry_count = max_retries
 
@@ -6429,18 +6445,20 @@ def run_conversation(
                     if (
                         _standard_child_can_fallback(
                             agent,
-                        rate_limited=classified.reason
-                        in {
-                            FailoverReason.rate_limit,
-                            FailoverReason.upstream_rate_limit,
-                        },
+                            rate_limited=classified.reason
+                            in {
+                                FailoverReason.rate_limit,
+                                FailoverReason.upstream_rate_limit,
+                            },
+                            terminal_quota=_terminal_quota_429,
                         )
                         and agent._try_activate_fallback(
                             reason=(
                                 classified.reason
                                 if _is_standard_profile_child(agent)
                                 else None
-                            )
+                            ),
+                            terminal_quota=_terminal_quota_429,
                         )
                     ):
                         active_system_prompt = _sync_failover_system_message(

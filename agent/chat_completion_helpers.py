@@ -2438,7 +2438,23 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     auth resolution and client construction — no duplicated provider→key
     mappings.
     """
-    if reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
+    if getattr(agent, "_delegate_model_profile", None) == "standard":
+        if getattr(agent, "_delegate_has_successful_llm_request", False):
+            return False
+        if reason not in {
+            FailoverReason.rate_limit,
+            FailoverReason.upstream_rate_limit,
+        }:
+            return False
+
+    if (
+        reason in {
+            FailoverReason.rate_limit,
+            FailoverReason.billing,
+            FailoverReason.upstream_rate_limit,
+        }
+        and getattr(agent, "_delegate_model_profile", None) != "standard"
+    ):
         # Only start cooldown when leaving the primary provider.  If we're
         # already on a fallback and chain-switching, the primary wasn't the
         # source of the 429 so the cooldown should not be reset/extended.

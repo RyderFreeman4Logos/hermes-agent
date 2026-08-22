@@ -106,7 +106,41 @@ from utils import base_url_host_matches, env_var_enabled
 logger = logging.getLogger(__name__)
 
 
-# Scaffold marker used by _apply_active_turn_redirect and the ghost-row filter
+def _is_standard_profile_child(agent) -> bool:
+    return getattr(agent, "_delegate_model_profile", None) == "standard"
+
+
+def _standard_child_has_successful_llm_request(agent) -> bool:
+    return bool(getattr(agent, "_delegate_has_successful_llm_request", False))
+
+
+def _standard_child_can_fallback(agent, *, rate_limited: bool = False) -> bool:
+    """Permit only pre-success 429 fallback for standard-profile children."""
+    if not _is_standard_profile_child(agent):
+        return True
+    return rate_limited and not _standard_child_has_successful_llm_request(agent)
+
+
+def _response_error_code(response) -> Optional[int]:
+    error = getattr(response, "error", None) if response is not None else None
+    code = getattr(error, "code", None)
+    if code is None and isinstance(error, dict):
+        code = error.get("code")
+    try:
+        return int(code) if code is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _standard_child_can_fallback_invalid_response(agent, response) -> bool:
+    if not _is_standard_profile_child(agent):
+        return True
+    return (
+        not _standard_child_has_successful_llm_request(agent)
+        and _response_error_code(response) == 429
+    )
+
+
 # in the api_messages loop. Module-level so both sites can never drift.
 _INTERRUPT_SCAFFOLD_MARKER = "[This response was interrupted by a user correction.]"
 
@@ -2825,7 +2859,10 @@ def run_conversation(
             # limited, skip the API call entirely.  Each attempt
             # (including SDK-level retries) counts against RPH and
             # deepens the rate limit hole.
-            if agent.provider == "nous":
+            if agent.provider == "nous" and not (
+                _is_standard_profile_child(agent)
+                and _standard_child_has_successful_llm_request(agent)
+            ):
                 try:
                     from agent.nous_rate_guard import (
                         nous_rate_limit_remaining,
@@ -2841,7 +2878,16 @@ def run_conversation(
                             f"⏳ {_nous_msg} Trying fallback..."
                         )
                         agent._buffer_status(f"⏳ {_nous_msg}")
-                        if agent._try_activate_fallback():
+                        if (
+                            _standard_child_can_fallback(agent, rate_limited=True)
+                            and agent._try_activate_fallback(
+                                reason=(
+                                    FailoverReason.rate_limit
+                                    if _is_standard_profile_child(agent)
+                                    else None
+                                )
+                            )
+                        ):
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
                             retry_count = 0
@@ -3319,7 +3365,16 @@ def run_conversation(
                     # rather than retrying with extended backoff.
                     if agent._fallback_index < len(agent._fallback_chain):
                         agent._buffer_status("⚠️ Empty/malformed response — switching to fallback...")
-                    if agent._try_activate_fallback():
+                    if (
+                        _standard_child_can_fallback_invalid_response(agent, response)
+                        and agent._try_activate_fallback(
+                            reason=(
+                                FailoverReason.rate_limit
+                                if _is_standard_profile_child(agent)
+                                else None
+                            )
+                        )
+                    ):
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -3393,7 +3448,16 @@ def run_conversation(
                         # Try fallback before giving up
                         if agent._has_pending_fallback():
                             agent._buffer_status(f"⚠️ Max retries ({max_retries}) for invalid responses — trying fallback...")
-                        if agent._try_activate_fallback():
+                        if (
+                            _standard_child_can_fallback_invalid_response(agent, response)
+                            and agent._try_activate_fallback(
+                                reason=(
+                                    FailoverReason.rate_limit
+                                    if _is_standard_profile_child(agent)
+                                    else None
+                                )
+                            )
+                        ):
                             active_system_prompt = _sync_failover_system_message(
                                 agent, api_messages, active_system_prompt)
                             retry_count = 0
@@ -3463,6 +3527,8 @@ def run_conversation(
                     continue  # Retry the API call
 
                 agent._turn_received_provider_response = True
+                if _is_standard_profile_child(agent):
+                    agent._delegate_has_successful_llm_request = True
 
                 # Check finish_reason before proceeding
                 if agent.api_mode == "codex_responses":
@@ -3567,11 +3633,11 @@ def run_conversation(
                     # Deterministic for the unchanged prompt — never retry.
                     # Try a configured fallback once (a different model may not
                     # refuse); otherwise surface the refusal terminally.
-                    if agent._has_pending_fallback():
+                    if agent._has_pending_fallback() and _standard_child_can_fallback(agent):
                         agent._buffer_status(
                             "⚠️ Model declined to respond (safety refusal) — trying fallback..."
                         )
-                    if agent._try_activate_fallback():
+                    if _standard_child_can_fallback(agent) and agent._try_activate_fallback():
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -3786,6 +3852,7 @@ def run_conversation(
                         if (
                             _cf_terminated
                             and agent._fallback_index < len(agent._fallback_chain)
+                            and _standard_child_can_fallback(agent)
                         ):
                             agent._vprint(
                                 f"{agent.log_prefix}🛡️  Content filter terminated "
@@ -4780,13 +4847,16 @@ def run_conversation(
                         )
                         continue
 
-                recovered_with_pool, _retry.has_retried_429 = agent._recover_with_credential_pool(
-                    status_code=status_code,
-                    has_retried_429=_retry.has_retried_429,
-                    classified_reason=classified.reason,
-                    error_context=error_context,
-                    billing_unverified=classified.billing_unverified,
-                )
+                if _is_standard_profile_child(agent):
+                    recovered_with_pool = False
+                else:
+                    recovered_with_pool, _retry.has_retried_429 = agent._recover_with_credential_pool(
+                        status_code=status_code,
+                        has_retried_429=_retry.has_retried_429,
+                        classified_reason=classified.reason,
+                        error_context=error_context,
+                        billing_unverified=classified.billing_unverified,
+                    )
                 if recovered_with_pool:
                     continue
 
@@ -5419,7 +5489,18 @@ def run_conversation(
                     (is_rate_limited and _wrapped_output_cap_budget is None)
                     or (_is_transport_failure and retry_count >= 2)
                 )
-                if _should_fallback and agent._fallback_index < len(agent._fallback_chain):
+                if (
+                    _should_fallback
+                    and _standard_child_can_fallback(
+                        agent,
+                        rate_limited=classified.reason
+                        in {
+                            FailoverReason.rate_limit,
+                            FailoverReason.upstream_rate_limit,
+                        },
+                    )
+                    and agent._fallback_index < len(agent._fallback_chain)
+                ):
                     # Don't eagerly fallback if credential pool rotation may
                     # still recover.  See _pool_may_recover_from_rate_limit
                     # for the single-credential-pool exception.  Fixes #11314.
@@ -5471,6 +5552,19 @@ def run_conversation(
                             _retry.restart_with_rebuilt_messages = True
                             break
 
+                # Standard children never retry a 429 on the same route when
+                # no configured fallback could be activated.
+                if (
+                    _is_standard_profile_child(agent)
+                    and classified.reason
+                    in {
+                        FailoverReason.rate_limit,
+                        FailoverReason.upstream_rate_limit,
+                    }
+                    and not _standard_child_has_successful_llm_request(agent)
+                ):
+                    retry_count = max_retries
+
                 # ── Auth-failure provider failover ───────────────────────
                 # A 401/403 that survives the per-provider credential-refresh
                 # attempt above (each guarded by its own
@@ -5488,6 +5582,7 @@ def run_conversation(
                 # + provider-specific troubleshooting guidance unchanged.
                 if (
                     classified.is_auth
+                    and _standard_child_can_fallback(agent)
                     and not _retry.auth_failover_attempted
                     and agent._fallback_index < len(agent._fallback_chain)
                 ):
@@ -5527,6 +5622,7 @@ def run_conversation(
                 # successful response.
                 if (
                     is_rate_limited
+                    and not _is_standard_profile_child(agent)
                     and agent.provider == "nous"
                     and classified.reason == FailoverReason.rate_limit
                     and not recovered_with_pool
@@ -6069,7 +6165,7 @@ def run_conversation(
                     )
                 ) and not is_context_length_error
 
-                if is_client_error:
+                if is_client_error and not _is_standard_profile_child(agent):
                     # Copilot self-heal BEFORE fallback: a stale/degraded
                     # credential surfaces as a 400
                     # ``model_not_available_for_integrator`` /
@@ -6109,7 +6205,10 @@ def run_conversation(
                             agent._buffer_status("⚠️ TLS certificate verification failed — trying fallback...")
                         else:
                             agent._buffer_status(f"⚠️ Non-retryable error (HTTP {status_code}) — trying fallback...")
-                    if agent._try_activate_fallback():
+                    if (
+                        _standard_child_can_fallback(agent)
+                        and agent._try_activate_fallback()
+                    ):
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -6307,8 +6406,12 @@ def run_conversation(
                     # client once for transient transport errors (stale
                     # connection pool, TCP reset).  Only attempted once
                     # per API call block.
-                    if not _retry.primary_recovery_attempted and agent._try_recover_primary_transport(
+                    if (
+                        not _is_standard_profile_child(agent)
+                        and not _retry.primary_recovery_attempted
+                        and agent._try_recover_primary_transport(
                         api_error, retry_count=retry_count, max_retries=max_retries,
+                        )
                     ):
                         _retry.primary_recovery_attempted = True
                         retry_count = 0
@@ -6323,7 +6426,23 @@ def run_conversation(
                     # Try fallback before giving up entirely
                     if agent._has_pending_fallback():
                         agent._buffer_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
-                    if agent._try_activate_fallback():
+                    if (
+                        _standard_child_can_fallback(
+                            agent,
+                        rate_limited=classified.reason
+                        in {
+                            FailoverReason.rate_limit,
+                            FailoverReason.upstream_rate_limit,
+                        },
+                        )
+                        and agent._try_activate_fallback(
+                            reason=(
+                                classified.reason
+                                if _is_standard_profile_child(agent)
+                                else None
+                            )
+                        )
+                    ):
                         active_system_prompt = _sync_failover_system_message(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
@@ -7909,7 +8028,11 @@ def run_conversation(
                     # chain.  This covers the case where a model
                     # (e.g. GLM-4.5-Air) consistently returns empty
                     # due to context degradation or provider issues.
-                    if _truly_empty and agent._fallback_chain:
+                    if (
+                        _truly_empty
+                        and agent._fallback_chain
+                        and _standard_child_can_fallback(agent)
+                    ):
                         logger.warning(
                             "Empty response after %d retries — "
                             "attempting fallback (model=%s, provider=%s)",

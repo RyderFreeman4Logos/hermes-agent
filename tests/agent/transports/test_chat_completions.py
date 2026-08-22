@@ -829,6 +829,36 @@ class TestPromptCacheKeyCapability:
         assert "prompt_cache_key" not in kwargs
         assert "prompt_cache_key" not in body
 
+    def test_named_custom_same_route_reuses_stable_prefix_key(self, transport):
+        """Short-gap main requests keep one cache bucket for a stable prefix."""
+        stable = {
+            "type": "text",
+            "text": "stable prefix",
+            "cache_control": {"type": "ephemeral"},
+        }
+
+        def key(user_text):
+            return transport.build_kwargs(
+                model="grok-4.6",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": [stable, {"type": "text", "text": "volatile"}],
+                    },
+                    {"role": "user", "content": user_text},
+                ],
+                tools=self._tools(),
+                session_id="same-route-session",
+                provider_name="custom:localrouter",
+                base_url="https://localrouter.invalid/v1",
+            )["prompt_cache_key"]
+
+        first = key("first request")
+        second = key("second request")
+
+        assert first.startswith("pck_")
+        assert second == first
+
     def test_explicit_top_level_and_extra_body_overrides_are_preserved(self, transport):
         from providers.base import ProviderProfile
 

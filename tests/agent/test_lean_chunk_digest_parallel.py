@@ -192,11 +192,16 @@ def test_lean_chunk_digests_never_exceed_configured_max_concurrency():
 
 
 def test_lean_chunk_digests_isolate_one_chunk_failure():
-    """One raising chunk keeps the existing placeholder; others stay real."""
+    """A failed chunk retries before falling back to its placeholder."""
+    attempts = 0
+
     def fake_call_llm(*, messages, task, max_tokens, **kwargs):
+        nonlocal attempts
         assert task == "compression"
         if "MARKER-B" in messages[0]["content"]:
-            raise RuntimeError("boom-middle")
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("boom-middle")
         resp = MagicMock()
         resp.choices = [MagicMock()]
         resp.choices[0].message.content = _digest_body(messages)
@@ -219,11 +224,10 @@ def test_lean_chunk_digests_isolate_one_chunk_failure():
     b = out.index("### Segment 2/")
     c = out.index("### Segment 3/")
     assert "DIGEST-A" in out[a:b]
-    assert "DIGEST-B" not in out
-    assert "[digest unavailable for segment 2/3" in out[b:c]
-    assert "recover via session_search" in out[b:c]
+    assert attempts == 2
+    assert "DIGEST-B" in out[b:c]
+    assert "[digest unavailable for segment 2/3" not in out[b:c]
     assert "DIGEST-C" in out[c:]
-    assert "boom-middle" not in out
 
 
 def test_lean_chunk_digests_serial_when_max_concurrency_is_1():

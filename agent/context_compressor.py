@@ -4502,34 +4502,42 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             route: dict[str, str] | None = None,
             route_info: dict[str, str] | None = None,
         ) -> str:
-            try:
-                from agent.auxiliary_client import call_llm
+            from agent.auxiliary_client import call_llm
 
-                call_kwargs = {
-                    "messages": [{
-                        "role": "user",
-                        "content": _LEAN_DIGEST_PROMPT.format(segment=segment),
-                    }],
-                    "task": "compression",
-                    "max_tokens": _LEAN_DIGEST_MAX_TOKENS,
-                }
-                if route:
-                    call_kwargs.update(route)
-                elif route_info is not None:
-                    call_kwargs["route_info"] = route_info
-                resp = call_llm(**call_kwargs)
-                body = (
-                    resp.choices[0].message.content
-                    if hasattr(resp, "choices") else str(resp)
-                ) or ""
-                from agent.agent_runtime_helpers import strip_think_blocks
+            call_kwargs = {
+                "messages": [{
+                    "role": "user",
+                    "content": _LEAN_DIGEST_PROMPT.format(segment=segment),
+                }],
+                "task": "compression",
+                "max_tokens": _LEAN_DIGEST_MAX_TOKENS,
+            }
+            if route:
+                call_kwargs.update(route)
+            elif route_info is not None:
+                call_kwargs["route_info"] = route_info
+            for attempt in range(2):
+                try:
+                    resp = call_llm(**call_kwargs)
+                    body = (
+                        resp.choices[0].message.content
+                        if hasattr(resp, "choices") else str(resp)
+                    ) or ""
+                    from agent.agent_runtime_helpers import strip_think_blocks
 
-                body = strip_think_blocks(None, body).strip()
-            except BaseException as exc:
-                if isinstance(exc, (KeyboardInterrupt, SystemExit)):
-                    raise
-                return _unavailable(ci, exc)
-            return f"### Segment {ci + 1}/{n_chunks}\n{body}"
+                    body = strip_think_blocks(None, body).strip()
+                    return f"### Segment {ci + 1}/{n_chunks}\n{body}"
+                except BaseException as exc:
+                    if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                        raise
+                    if attempt == 0 and isinstance(exc, Exception) and not _is_summary_access_or_quota_error(exc):
+                        logger.warning(
+                            "lean chunk digest %d/%d failed; retrying candidate: %s",
+                            ci + 1, n_chunks, exc,
+                        )
+                        continue
+                    return _unavailable(ci, exc)
+            return _unavailable(ci)
 
         from concurrent.futures import ThreadPoolExecutor
         from agent.auxiliary_client import _get_task_max_concurrency

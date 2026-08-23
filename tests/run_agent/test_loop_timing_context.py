@@ -161,10 +161,13 @@ def test_timing_context_is_injected_as_api_only_system_context():
         agent.run_conversation("hello")
 
     sent_messages = agent.client.chat.completions.create.call_args.kwargs["messages"]
-    assert sent_messages[0]["role"] == "system"
-    assert "[Agent loop timing]" in sent_messages[0]["content"]
-    assert "Current loop start:" in sent_messages[0]["content"]
-    assert all(
-        "[Agent loop timing]" not in str(message.get("content", ""))
+    assert sent_messages[0] == {"role": "system", "content": "You are helpful."}
+    timing_messages = [
+        message
         for message in sent_messages[1:]
-    )
+        if "[Agent loop timing]" in str(message.get("content", ""))
+    ]
+    assert len(timing_messages) == 1
+    assert timing_messages[0]["role"] == "system"
+    assert "Current loop start:" in timing_messages[0]["content"]
+    assert "cache_control" not in timing_messages[0]

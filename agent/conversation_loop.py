@@ -2420,9 +2420,6 @@ def run_conversation(
         if agent.ephemeral_system_prompt:
             effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
         _loop_timing_text = getattr(agent, "_loop_timing_context_text", "")
-        if _loop_timing_text:
-            # API-only context keeps the cached system-prompt prefix stable.
-            effective_system = (effective_system + "\n\n" + _loop_timing_text).strip()
         if effective_system:
             api_messages = [{"role": "system", "content": effective_system}] + api_messages
 
@@ -2592,6 +2589,11 @@ def run_conversation(
             )
             api_messages = _initial_cache_plan.messages
             tools_for_api = _initial_cache_plan.tools
+
+        # Timing is API-only context. Append it after cache planning so it never
+        # receives a breakpoint or changes the stable cached prefix.
+        if _loop_timing_text:
+            api_messages.append({"role": "system", "content": _loop_timing_text})
 
         # Build a persistent-MoA request before measuring compression pressure.
         # MoA reference output is injected into the aggregator prompt, but it

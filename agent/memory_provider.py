@@ -37,9 +37,37 @@ import logging
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+MEMORY_TARGETS = frozenset({"memory", "user"})
+MEMORY_PROVIDER_MODES = frozenset({"authoritative", "hybrid"})
+
+
+def normalize_memory_target(value: Any, *, default: str | None = "memory") -> str | None:
+    """Return a canonical memory target, rejecting coercible falsey values."""
+    if value is None:
+        return default
+    if isinstance(value, Enum):
+        value = value.value
+    return value if isinstance(value, str) and value in MEMORY_TARGETS else None
+
+
+def validate_memory_provider_mode(value: Any) -> str:
+    """Validate a user-admitted provider mode without coercing its type."""
+    if isinstance(value, str) and value in MEMORY_PROVIDER_MODES:
+        return value
+    raise ValueError("invalid memory provider mode")
+
+
+def normalize_memory_provider_mode(value: Any, *, default: str | None = "hybrid") -> str | None:
+    """Normalize persisted provider mode values to a safe fallback."""
+    try:
+        return validate_memory_provider_mode(value)
+    except (TypeError, ValueError):
+        return default
 
 # Default glyph for the deterministic memory indicators. Providers override
 # per-status with their own brand mark (e.g. Hindsight uses "👁️").
@@ -233,6 +261,16 @@ class MemoryProvider(ABC):
         Only called for tool names returned by get_tool_schemas().
         """
         raise NotImplementedError(f"Provider {self.name} does not handle tool {tool_name}")
+
+    def authoritative_memory_write(self, request: Dict[str, Any], **kwargs) -> str:
+        """Apply the core memory write atomically in the provider backend.
+
+        Providers must opt into authoritative CRUD explicitly; generic provider
+        tools are never treated as an equivalent write capability.
+        """
+        raise NotImplementedError(
+            f"Provider {self.name} does not implement authoritative memory writes"
+        )
 
     def shutdown(self) -> None:
         """Clean shutdown — flush queues, close connections."""

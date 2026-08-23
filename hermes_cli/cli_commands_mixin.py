@@ -14,6 +14,7 @@ Import discipline (mirrors gateway/slash_commands.py, PR #41886):
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import sys
@@ -28,6 +29,7 @@ from rich.markup import escape as _escape
 from rich.panel import Panel
 
 from hermes_constants import display_hermes_home, is_termux as _is_termux_environment
+from agent.memory_provider import normalize_memory_provider_mode
 from agent.turn_context import extract_api_content_sidecar
 from hermes_cli.browser_connect import (
     DEFAULT_BROWSER_CDP_URL,
@@ -1416,6 +1418,15 @@ class CLICommandsMixin:
         # list_sessions_rich() can keep the branch visible in /resume and
         # /sessions even after the parent is reopened and re-ended with a
         # different end_reason (e.g. tui_shutdown overwriting 'branched').
+        init_config = getattr(self.agent, "_session_init_model_config", None)
+        if isinstance(init_config, dict) and "memory_provider_mode" in init_config:
+            memory_provider_mode = normalize_memory_provider_mode(
+                init_config["memory_provider_mode"]
+            ) or "hybrid"
+        else:
+            memory_provider_mode = normalize_memory_provider_mode(
+                getattr(self.agent, "_memory_provider_mode", None)
+            ) or "hybrid"
         try:
             self._session_db.create_session(
                 session_id=new_session_id,
@@ -1423,7 +1434,8 @@ class CLICommandsMixin:
                 model=self.model,
                 model_config={
                     "max_iterations": self.max_turns,
-                    "reasoning_config": self.reasoning_config,
+                    "reasoning_config": copy.deepcopy(self.reasoning_config),
+                    "memory_provider_mode": memory_provider_mode,
                     "_branched_from": parent_session_id,
                 },
                 parent_session_id=parent_session_id,

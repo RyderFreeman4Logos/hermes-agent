@@ -513,6 +513,7 @@ class AIAgent:
         checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False,
         requested_provider: str = None,
+        memory_provider_mode_override: str = None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent``."""
         if tool_delay is not None:
@@ -603,6 +604,7 @@ class AIAgent:
             checkpoint_max_total_size_mb=checkpoint_max_total_size_mb,
             checkpoint_max_file_size_mb=checkpoint_max_file_size_mb,
             pass_session_id=pass_session_id,
+            memory_provider_mode_override=memory_provider_mode_override,
         )
 
     def _get_session_db_for_recall(self):
@@ -4362,8 +4364,8 @@ class AIAgent:
         if self._memory_manager:
             try:
                 self._memory_manager.on_session_end(messages or [])
-            except Exception as e:
-                logger.warning("Memory provider on_session_end failed during shutdown: %s", e, exc_info=True)
+            except Exception:
+                logger.warning("Memory provider shutdown hook failed (provider_error)")
             try:
                 self._memory_manager.shutdown_all()
             except Exception:

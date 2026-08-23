@@ -457,6 +457,11 @@ class CompressionCommitFence:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        self._publication_condition = threading.Condition(self._lock)
+        self._progress_publications = {}
+        self._next_progress_publication = 0
+        self._progress_quiescent = threading.Event()
+        self._progress_quiescent.set()
         self._cancelled = False
         self._commit_started = False
         # Lock-free commit-phase marker (#76354 review F1). ``begin_commit``
@@ -468,12 +473,8 @@ class CompressionCommitFence:
         # flight" even while the commit itself is hung — which is exactly when
         # the overrun warning must be able to fire.
         self._commit_phase = threading.Event()
-        # Lock-free admission revocation (#76354 review F2). Set by
-        # :meth:`revoke_commit_admission` on ANY host unwind (KeyboardInterrupt,
-        # cancellation, unexpected exception) without touching the fence lock,
-        # so a host that cannot afford to block behind an in-flight commit can
-        # still guarantee no FUTURE commit is admitted. Plain bool store —
-        # atomic in CPython.
+        # Admission revocation closes state under the same condition lock as
+        # cancellation and commit admission.
         self._admission_revoked = False
         # Holder-qualified durable-lock release hook (#76354 review F4;
         # transplanted from PR #71569 by @ciabata-git). The worker publishes an
@@ -490,63 +491,167 @@ class CompressionCommitFence:
         # a SLOW-but-alive summary model from a HUNG one, so slow models are
         # not killed by a fixed wall-clock deadline while tokens are moving.
         self._last_progress = time.monotonic()
+        self._had_meaningful_progress = False
+        self._wait_started = time.monotonic()
+        self._host_idle: Optional[float] = None
+        self._host_ceiling: Optional[float] = None
+
+    def configure_host_budget(
+        self,
+        *,
+        idle_timeout_seconds: float,
+        total_ceiling_seconds: float,
+        wait_started: Optional[float] = None,
+    ) -> None:
+        """Publish one fixed total deadline and its dynamic idle window."""
+        self._host_idle = float(idle_timeout_seconds)
+        self._host_ceiling = float(total_ceiling_seconds)
+        if (
+            not math.isfinite(self._host_idle)
+            or self._host_idle < 0
+            or not math.isfinite(self._host_ceiling)
+            or self._host_ceiling < 0
+        ):
+            raise ValueError("Compression host budgets must be finite and non-negative")
+        started = (
+            float(wait_started) if wait_started is not None else time.monotonic()
+        )
+        self._wait_started = started
+        self._absolute_total_deadline = started + self._host_ceiling
+        # Idle starts with THIS wait, not fence construction / a prior waiter.
+        self._last_progress = started
+        self._had_meaningful_progress = False
+
+    def remaining_absolute_total(self) -> Optional[float]:
+        """Return the remaining fixed monotonic total budget."""
+        deadline = getattr(self, "_absolute_total_deadline", None)
+        if deadline is None:
+            return None
+        return max(0.0, deadline - time.monotonic())
+
+    def remaining_current_idle(self) -> Optional[float]:
+        """Return the remaining dynamic idle budget."""
+        if self._host_idle is None:
+            return None
+        return max(0.0, self._host_idle - self.seconds_since_progress())
+
+    def next_wait(self) -> Optional[float]:
+        """Return the next bounded wait: the smaller total or idle remainder."""
+        remaining = [
+            value
+            for value in (
+                self.remaining_absolute_total(),
+                self.remaining_current_idle(),
+            )
+            if value is not None
+        ]
+        return min(remaining) if remaining else None
+
+    def remaining_candidate_deadline(self) -> Optional[float]:
+        """Return a small admission margin before the shared next wait."""
+        wait = self.next_wait()
+        if wait is None or wait <= 0:
+            return 0.0 if wait is not None else None
+        return wait - 0.05 if wait > 0.05 else wait
+
+    def remaining_absolute_total_deadline(self) -> Optional[float]:
+        """Compatibility alias for the fixed total budget."""
+        return self.remaining_absolute_total()
+
+    def configured_idle_timeout(self) -> Optional[float]:
+        """Return the host's configured dynamic idle window."""
+        return self._host_idle
+
+    def _wait_for_progress_publications_locked(self) -> None:
+        """Drain prior callbacks unless this publisher is re-entering."""
+        owner = threading.get_ident()
+        if owner in self._progress_publications.values():
+            return
+        while self._progress_publications:
+            self._publication_condition.wait()
+
+    def begin_progress_publication(self, has_hook: bool = False) -> Optional[int]:
+        """Atomically mark progress and optionally reserve a host callback."""
+        with self._publication_condition:
+            if self._cancelled or self._admission_revoked or self._commit_started:
+                return None
+            self._last_progress = time.monotonic()
+            self._had_meaningful_progress = True
+            if not has_hook:
+                return 0
+            self._next_progress_publication += 1
+            token = self._next_progress_publication
+            self._progress_publications[token] = threading.get_ident()
+            self._progress_quiescent.clear()
+            return token
+
+    def end_progress_publication(self, token: int) -> None:
+        """Release one reserved host callback, including after hook failure."""
+        with self._publication_condition:
+            self._progress_publications.pop(token, None)
+            if not self._progress_publications:
+                self._progress_quiescent.set()
+            self._publication_condition.notify_all()
+
+    def mark_meaningful_progress_if_active(self) -> bool:
+        """Mark progress only while this one-attempt fence is still active."""
+        return self.begin_progress_publication() is not None
+
+    def mark_meaningful_progress(self) -> None:
+        """Record meaningful progress without changing the fixed total."""
+        self._last_progress = time.monotonic()
+        self._had_meaningful_progress = True
 
     def touch_progress(self) -> None:
-        """Record forward progress (e.g. a streamed summary token arriving).
-
-        Called from the compression worker thread; read by async waiters via
-        :meth:`seconds_since_progress`. A bare float store is atomic in
-        CPython, so no lock is needed.
-        """
-        self._last_progress = time.monotonic()
+        """Backward-compatible name for :meth:`mark_meaningful_progress`."""
+        self.mark_meaningful_progress()
 
     def seconds_since_progress(self) -> float:
         """Seconds since the worker last reported forward progress."""
         return max(0.0, time.monotonic() - self._last_progress)
 
-    def cancel_before_commit(self, cancel_event: Any = None) -> bool:
-        """Cancel a pending commit, or wait for an active commit to finish.
+    @property
+    def had_meaningful_progress(self) -> bool:
+        return bool(self._had_meaningful_progress)
 
-        Returns ``True`` when cancellation won before the commit boundary.
-        Returns ``False`` when the worker had already entered the boundary; in
-        that case acquiring this lock waits until all session mutation finishes.
-        """
-        with self._lock:
+    def cancel_before_commit(self, cancel_event: Any = None) -> bool:
+        """Cancel a pending commit and drain earlier host publications."""
+        with self._publication_condition:
             if self._commit_started:
                 if cancel_event is not None:
                     cancel_event.set()
+                self._wait_for_progress_publications_locked()
                 return False
             self._cancelled = True
             if cancel_event is not None:
                 cancel_event.set()
+            self._wait_for_progress_publications_locked()
             return True
 
     def try_cancel_before_commit(self) -> Optional[bool]:
-        """Non-blocking form of :meth:`cancel_before_commit`.
-
-        Returns ``None`` while an active commit owns the fence, allowing an
-        async caller to yield instead of blocking its event loop.
-        """
+        """Non-blocking admission followed by a bounded publication drain."""
         if not self._lock.acquire(blocking=False):
             return None
         try:
             if self._commit_started:
                 return False
             self._cancelled = True
+            self._wait_for_progress_publications_locked()
             return True
         finally:
             self._lock.release()
 
     def begin_commit(self, cancel_event: Any = None) -> bool:
-        """Atomically admit commit unless a hard cancellation already won."""
-        self._lock.acquire()
+        """Atomically admit commit after draining earlier host publications."""
+        self._publication_condition.acquire()
         if (
             self._cancelled
             or self._admission_revoked
             or (cancel_event is not None and bool(cancel_event.is_set()))
         ):
             self._cancelled = True
-            self._lock.release()
+            self._wait_for_progress_publications_locked()
+            self._publication_condition.release()
             if self._admission_revoked:
                 # Round-2 #1: a revoke that lost the fence-lock race to this
                 # very begin_commit deferred its lease release; the commit was
@@ -558,12 +663,14 @@ class CompressionCommitFence:
         # Set while the fence lock is held so observers can never see
         # commit_in_flight=True for a commit that lost to cancellation.
         self._commit_phase.set()
+        self._wait_for_progress_publications_locked()
         return True
 
     def finish_commit(self) -> None:
         """Leave a commit boundary entered by :meth:`begin_commit`."""
+        self._wait_for_progress_publications_locked()
         self._commit_phase.clear()
-        self._lock.release()
+        self._publication_condition.release()
         if self._admission_revoked:
             # Round-2 #1: a revoke that arrived while THIS commit was in
             # flight deferred its durable-lease release rather than freeing
@@ -592,44 +699,11 @@ class CompressionCommitFence:
         return self._cancelled or self._admission_revoked
 
     def revoke_commit_admission(self) -> None:
-        """Revoke FUTURE commit admission without blocking on the fence lock.
-
-        #76354 review F2: every host unwind path (KeyboardInterrupt, task
-        cancellation, unexpected exception while waiting) must guarantee a
-        detached worker cannot later enter the commit boundary and mutate
-        durable/session state. The flag store is lock-free: a commit that is
-        ALREADY in flight cannot be safely abandoned (the invariant "commit
-        never abandoned mid-mutation" holds), but no NEW commit will be
-        admitted after this call — ``begin_commit`` re-checks the flag under
-        the fence lock.
-
-        Round-2 #1 (durable-lease timing): the worker's holder-qualified
-        lease release (F4) must NOT run while an admitted commit is still
-        mutating SessionDB — a second compressor could otherwise acquire the
-        durable lock mid-commit and interleave with the first commit's
-        writes. The release decision is therefore made under the fence lock:
-
-        - non-blocking acquire succeeds → no commit is in flight (an
-          admitted commit RETAINS the lock until ``finish_commit``), so the
-          lease is released immediately, while still holding the lock so a
-          concurrent ``begin_commit`` cannot slip in between the check and
-          the release (it would be refused anyway — the flag is already set).
-        - acquire fails → the lock holder is either an in-flight commit or a
-          transient boundary (lock-setup / cancel admission). Defer: the
-          release then runs in ``finish_commit`` (after the mutation fully
-          completes) or on the ``begin_commit``-refusal path, whichever the
-          worker reaches first. Both are idempotent with the worker's own
-          outer cleanup because the DB release is holder-qualified.
-        """
-        self._admission_revoked = True
-        if self._lock.acquire(blocking=False):
-            try:
-                self.release_cancelled_compression_lock()
-            finally:
-                self._lock.release()
-        # else: deferred — finish_commit()/begin_commit() re-check
-        # _admission_revoked and perform the release once no commit can be
-        # mid-mutation.
+        """Close future commit/progress admission and drain host callbacks."""
+        with self._publication_condition:
+            self._admission_revoked = True
+            self._wait_for_progress_publications_locked()
+            self.release_cancelled_compression_lock()
 
     # ── Holder-qualified durable-lease cancellation (#76354 F4) ──────────
     # Transplanted from PR #71569 (@ciabata-git): the worker publishes an
@@ -787,33 +861,62 @@ def resolve_context_compression_timeouts(
     """
     idle = DEFAULT_CONTEXT_TIMEOUT_SECONDS
     ceiling = DEFAULT_CONTEXT_TOTAL_CEILING_SECONDS
+    aux_timeout = None
+    config_root = compression_cfg
     cfg = compression_cfg
     if cfg is None:
         try:
             from hermes_cli.config import load_config
 
             raw = load_config()
-            maybe = raw.get("compression", {}) if isinstance(raw, dict) else {}
-            cfg = maybe if isinstance(maybe, dict) else {}
+            config_root = raw if isinstance(raw, dict) else {}
         except Exception:
-            cfg = {}
+            config_root = {}
+    if isinstance(config_root, dict):
+        maybe = config_root.get("compression")
+        cfg = maybe if isinstance(maybe, dict) else config_root
+        auxiliary = config_root.get("auxiliary", {})
+        auxiliary_compression = (
+            auxiliary.get("compression", {})
+            if isinstance(auxiliary, dict)
+            else {}
+        )
+        raw_aux_timeout = (
+            auxiliary_compression.get("timeout")
+            if isinstance(auxiliary_compression, dict)
+            else None
+        )
+        if raw_aux_timeout is not None:
+            try:
+                parsed = float(raw_aux_timeout)
+                if math.isfinite(parsed) and parsed > 0:
+                    aux_timeout = parsed
+            except (TypeError, ValueError):
+                pass
+    else:
+        cfg = {}
     if isinstance(cfg, dict):
         raw_idle = cfg.get("context_timeout_seconds")
         if raw_idle is not None:
             try:
                 parsed = float(raw_idle)
                 # Explicit 0/negative disables; positive values win.
-                idle = parsed
+                if math.isfinite(parsed):
+                    idle = parsed
             except (TypeError, ValueError):
                 pass
         raw_ceiling = cfg.get("context_total_ceiling_seconds")
         if raw_ceiling is not None:
             try:
                 parsed = float(raw_ceiling)
-                if parsed > 0:
+                if math.isfinite(parsed) and parsed > 0:
                     ceiling = parsed
             except (TypeError, ValueError):
                 pass
+    if aux_timeout is not None:
+        # The host must not preempt a longer configured compression request.
+        # Its own idle budget still detects a silent provider.
+        ceiling = max(ceiling, aux_timeout)
     if idle > 0:
         ceiling = max(ceiling, idle)
     return idle, ceiling
@@ -861,11 +964,18 @@ def run_compress_context_with_progress_timeout(
     only on the timeout path, so successful compression never pays for (or
     fails on) an eager prompt rebuild.
     """
-    if idle_timeout_seconds <= 0:
+    try:
+        idle = float(idle_timeout_seconds)
+        ceiling = float(total_ceiling_seconds)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("compression timeout budgets must be numeric") from exc
+    if not math.isfinite(idle) or idle <= 0:
         raise ValueError(
             "run_compress_context_with_progress_timeout requires "
             "idle_timeout_seconds > 0; call compress_context directly to disable"
         )
+    if not math.isfinite(ceiling) or ceiling < 0:
+        raise ValueError("compression total ceiling must be finite and non-negative")
 
     def _resolve_fallback_prompt() -> str:
         if callable(system_prompt_fallback):
@@ -873,8 +983,7 @@ def run_compress_context_with_progress_timeout(
         return system_prompt_fallback
 
     fence = fence if fence is not None else CompressionCommitFence()
-    ceiling = max(float(total_ceiling_seconds), float(idle_timeout_seconds))
-    idle = float(idle_timeout_seconds)
+    ceiling = max(ceiling, idle)
     # Sync mirror of gateway session-hygiene's run_in_executor(None, ...) +
     # wait_for loop (gateway/run.py): offload compress_context onto the shared
     # daemon pool, poll with an inactivity budget + total ceiling, then
@@ -923,6 +1032,14 @@ def run_compress_context_with_progress_timeout(
 
     # Bare pool workers start with an empty ContextVar map; propagate the
     # parent conversation/approval context into the worker.
+    # Idle / leftover start when THIS wait begins — after admit, at submit
+    # (configure-before-admit ages leftover through pool admission; #128 B1).
+    wait_started = time.monotonic()
+    fence.configure_host_budget(
+        idle_timeout_seconds=idle,
+        total_ceiling_seconds=ceiling,
+        wait_started=wait_started,
+    )
     try:
         future = executor.submit(
             propagate_context_to_thread(_fence_gated_worker), fence
@@ -931,8 +1048,7 @@ def run_compress_context_with_progress_timeout(
         _release_compression_admission()
         raise
     future.add_done_callback(_release_compression_admission)
-    wait_started = time.monotonic()
-    # F2: EVERY host unwind (KeyboardInterrupt, task cancellation, unexpected
+    # F2: EVERY host unwind (KeyboardInterrupt, task cancellation, unexpected)
     # exception while waiting) must revoke future commit admission before the
     # host resumes, or a detached worker could later commit and mutate durable
     # state behind the caller's back. ``handled_exit`` marks the paths that
@@ -1062,6 +1178,15 @@ def run_compress_context_with_progress_timeout(
         fence.release_cancelled_compression_lock()
         waited = time.monotonic() - wait_started
         since_progress = fence.seconds_since_progress()
+        from agent.auxiliary_client import classify_compression_watchdog
+
+        reason = classify_compression_watchdog(
+            idle,
+            waited,
+            ceiling,
+            since_progress,
+            getattr(fence, "had_meaningful_progress", False),
+        )
         if on_timeout is not None:
             try:
                 on_timeout(idle, waited, since_progress)
@@ -1070,6 +1195,23 @@ def run_compress_context_with_progress_timeout(
                     "compress_context timeout callback failed",
                     exc_info=True,
                 )
+        elif reason == "total_ceiling":
+            logger.warning(
+                "Context compression hit the total ceiling after %.1fs "
+                "(last meaningful progress %.1fs ago, ceiling %.1fs); "
+                "continuing without compression",
+                waited,
+                since_progress,
+                ceiling,
+            )
+        elif reason == "candidate_fallback":
+            logger.warning(
+                "Context compression cancelled after fallback progression "
+                "(waited %.1fs, last meaningful progress %.1fs ago); "
+                "continuing without compression",
+                waited,
+                since_progress,
+            )
         else:
             logger.warning(
                 "Context compression made no progress for %.1fs "
@@ -2972,13 +3114,13 @@ def compress_context(
         _activity_heartbeat = _CompressionActivityHeartbeat(
             agent, commit_fence=commit_fence
         ).start()
-        # Publish forward progress to the commit fence while the summary LLM
-        # call streams. Async hosts (gateway session hygiene) poll
-        # ``commit_fence.seconds_since_progress()`` to extend their deadline
-        # while tokens are moving — so a SLOW summary model is only killed
-        # when it is actually silent, not merely thorough. The hook is
-        # thread-local and the compress call is synchronous on this thread,
-        # so it cannot leak into unrelated auxiliary calls.
+        # Publish forward progress through ``_notify_aux_progress``'s shared,
+        # fence-locked seam while the summary LLM call streams. Async hosts
+        # (gateway session hygiene) poll ``commit_fence.seconds_since_progress()``
+        # to extend their deadline while tokens are moving — so a SLOW summary
+        # model is only killed when it is actually silent, not merely thorough.
+        # The hook is thread-local and the compress call is synchronous on this
+        # thread, so it cannot leak into unrelated auxiliary calls.
         #
         # Callers that pass no commit_fence install a no-op progress hook
         # here.  AIAgent._compress_context injects an owned fence for
@@ -2992,12 +3134,25 @@ def compress_context(
         # streamed total ceiling (see _aux_stream_total_ceiling) instead of
         # outliving the SDK's inactivity timeout indefinitely.
         from agent.auxiliary_client import (
+            aux_host_candidate_deadline,
             aux_interrupt_protection,
             aux_progress_hook,
         )
-        _progress_hook = (
-            commit_fence.touch_progress if commit_fence is not None
-            else (lambda: None)
+        _progress_hook = lambda: None
+        _host_deadline = (
+            commit_fence.remaining_candidate_deadline
+            if commit_fence is not None
+            else None
+        )
+        _host_total_deadline = (
+            commit_fence.remaining_absolute_total_deadline
+            if commit_fence is not None
+            else None
+        )
+        _host_idle_timeout = (
+            commit_fence.configured_idle_timeout()
+            if commit_fence is not None
+            else None
         )
         # F4 state-ordering (#76354): a LATE successful summary must not undo
         # the timeout cooldown the host recorded. Install a cancellation
@@ -3028,6 +3183,11 @@ def compress_context(
             else:
                 with aux_progress_hook(_progress_hook), aux_interrupt_protection(
                     cancel_event=_hard_cancel_event
+                ), aux_host_candidate_deadline(
+                    _host_deadline,
+                    total_deadline=_host_total_deadline,
+                    idle_timeout=_host_idle_timeout,
+                    fence=commit_fence,
                 ):
                     compressed = compress_fn(messages, **compress_kwargs)
                     # Freeze a hard stop that arrived after the final provider

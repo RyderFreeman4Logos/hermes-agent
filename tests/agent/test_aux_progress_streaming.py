@@ -14,7 +14,9 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import agent.conversation_compression as compression
 from agent.auxiliary_client import (
+    _ChatStreamAccumulator,
     _acreate_with_stream,
     _aggregate_chat_stream,
     _aggregate_chat_stream_async,
@@ -22,6 +24,8 @@ from agent.auxiliary_client import (
     _create_with_progress,
     _notify_aux_progress,
     _provider_requires_stream,
+    CodexAuxiliaryClient,
+    aux_host_candidate_deadline,
     aux_progress_hook,
 )
 from agent.conversation_compression import CompressionCommitFence
@@ -65,6 +69,35 @@ class _FakeClient:
         return self._response
 
 
+class _TimedSyncStream:
+    def __init__(self, count: int, interval: float):
+        self._count = count
+        self._interval = interval
+
+    def __iter__(self):
+        for index in range(self._count):
+            time.sleep(self._interval)
+            yield _chunk(content=str(index), finish_reason="stop")
+
+
+class _TimedAsyncStream:
+    def __init__(self, count: int, interval: float):
+        self._remaining = count
+        self._interval = interval
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        import asyncio
+
+        if self._remaining <= 0:
+            raise StopAsyncIteration
+        self._remaining -= 1
+        await asyncio.sleep(self._interval)
+        return _chunk(content="x", finish_reason="stop")
+
+
 _COMPLETE = SimpleNamespace(
     id="r1", model="m1", object="chat.completion",
     choices=[SimpleNamespace(
@@ -84,7 +117,7 @@ class TestAuxProgressHook:
     def test_hook_installed_and_restored(self):
         ticks = []
         with aux_progress_hook(lambda: ticks.append(1)):
-            _notify_aux_progress()
+            _notify_aux_progress("progress")
         _notify_aux_progress()  # outside — must not tick
         assert ticks == [1]
 
@@ -112,6 +145,48 @@ class TestAuxProgressHook:
 
 class TestCreateWithProgress:
 
+    def test_sync_stream_establishment_uses_idle_and_total_minimum(self):
+        client = _FakeClient()
+
+        def _slow_create(**_kwargs):
+            time.sleep(0.15)
+            return iter([_chunk(content="late", finish_reason="stop")])
+
+        client.chat.completions.create = _slow_create
+        with (
+            aux_progress_hook(lambda: None),
+            aux_host_candidate_deadline(
+                lambda: 0.05,
+                total_deadline=lambda: 0.5,
+                idle_timeout=0.05,
+            ),
+        ):
+            started = time.monotonic()
+            with pytest.raises(TimeoutError):
+                _create_with_progress(
+                    client, {"model": "m1", "messages": [], "timeout": 30}
+                )
+        assert time.monotonic() - started < 0.12
+
+    def test_sync_plain_call_is_bounded_by_active_host_deadline(self):
+        calls = []
+        client = _FakeClient()
+
+        def _slow_create(**_kwargs):
+            calls.append(True)
+            time.sleep(0.15)
+            return _COMPLETE
+
+        client.chat.completions.create = _slow_create
+        with aux_host_candidate_deadline(0.05):
+            started = time.monotonic()
+            with pytest.raises(TimeoutError):
+                _create_with_progress(
+                    client, {"model": "m1", "messages": [], "timeout": 30}
+                )
+        assert time.monotonic() - started < 0.12
+        assert calls == [True]
+
     def test_hook_upgrades_to_streaming_and_ticks_per_chunk(self):
         chunks = [
             _chunk(reasoning="thinking..."),
@@ -131,8 +206,8 @@ class TestCreateWithProgress:
         assert result.choices[0].message.reasoning == "thinking..."
         assert result.choices[0].finish_reason == "stop"
         assert result.usage.total_tokens == 7
-        # 1 dispatch tick + 1 per chunk
-        assert len(ticks) >= len(chunks) + 1
+        # 1 dispatch used to tick; dispatch is not summary progress (#128).
+        assert len(ticks) >= len(chunks)
 
     def test_streaming_rejected_falls_back_to_plain_call(self):
         client = _FakeClient(
@@ -148,6 +223,61 @@ class TestCreateWithProgress:
         assert len(client.calls) == 2
         assert client.calls[0].get("stream") is True
         assert "stream" not in client.calls[1]
+
+    def test_streaming_rejection_fallback_keeps_absolute_total(self):
+        calls = []
+        client = _FakeClient()
+
+        def _create(**kwargs):
+            calls.append(kwargs)
+            if kwargs.get("stream"):
+                time.sleep(0.08)
+                raise RuntimeError("stream is not supported by this model")
+            time.sleep(0.15)
+            return _COMPLETE
+
+        client.chat.completions.create = _create
+        with (
+            aux_progress_hook(lambda: None),
+            aux_host_candidate_deadline(
+                lambda: 0.1,
+                total_deadline=lambda: 0.1,
+                idle_timeout=0.1,
+            ),
+        ):
+            started = time.monotonic()
+            with pytest.raises(TimeoutError):
+                _create_with_progress(
+                    client, {"model": "m1", "messages": [], "timeout": 30}
+                )
+        assert time.monotonic() - started < 0.18
+        assert len(calls) == 2
+
+    def test_streaming_rejection_after_total_does_not_dispatch_fallback(self):
+        calls = []
+        client = _FakeClient()
+
+        def _create(**kwargs):
+            calls.append(kwargs)
+            time.sleep(0.12)
+            if kwargs.get("stream"):
+                raise RuntimeError("stream is not supported by this model")
+            return _COMPLETE
+
+        client.chat.completions.create = _create
+        with (
+            aux_progress_hook(lambda: None),
+            aux_host_candidate_deadline(
+                lambda: 0.1,
+                total_deadline=lambda: 0.1,
+                idle_timeout=0.1,
+            ),
+        ):
+            with pytest.raises(TimeoutError):
+                _create_with_progress(
+                    client, {"model": "m1", "messages": [], "timeout": 30}
+                )
+        assert len(calls) == 1
 
 
 
@@ -178,6 +308,32 @@ class TestAggregateChatStream:
         assert tool_calls[0].function.arguments == '{"a": 1}'
         assert result.choices[0].finish_reason == "tool_calls"
 
+    def test_whitespace_and_empty_tool_deltas_do_not_count_as_progress(self):
+        empty_tool = SimpleNamespace(
+            index=0,
+            id="",
+            function=SimpleNamespace(name="", arguments=""),
+        )
+        ticks = []
+        with aux_progress_hook(lambda: ticks.append(True)):
+            _aggregate_chat_stream(
+                iter(
+                    [
+                        _chunk(content=" \n\t"),
+                        _chunk(tool_calls=[empty_tool]),
+                    ]
+                )
+            )
+        assert ticks == []
+
+        acc = _ChatStreamAccumulator(model="m", total_ceiling=5.0)
+        with aux_progress_hook(lambda: ticks.append(True)):
+            acc.feed(_chunk())
+        assert ticks == []
+        with aux_progress_hook(lambda: ticks.append(True)):
+            acc.feed(_chunk(content="hello"))
+        assert ticks == [True]
+
 
     def test_stream_close_is_called(self):
         closed = []
@@ -193,6 +349,40 @@ class TestAggregateChatStream:
         assert result.choices[0].message.content == "ok"
         assert closed == [True]
 
+    def test_live_stream_resets_idle_without_resetting_total(self):
+        started = time.monotonic()
+        result = _aggregate_chat_stream(
+            _TimedSyncStream(count=8, interval=0.03),
+            idle_timeout=0.1,
+            total_ceiling=0.6,
+        )
+        assert result.choices[0].message.content == "01234567"
+        assert time.monotonic() - started > 0.1
+
+    def test_silent_stream_expires_within_idle_window(self):
+        started = time.monotonic()
+
+        def _silent():
+            time.sleep(0.2)
+            yield _chunk(content="late")
+
+        with pytest.raises(TimeoutError, match="idle"):
+            _aggregate_chat_stream(
+                _silent(), idle_timeout=0.05, total_ceiling=0.6
+            )
+        assert time.monotonic() - started < 0.15
+
+    def test_progress_cannot_extend_absolute_total(self):
+        ticks = []
+        with aux_progress_hook(lambda: ticks.append(True)):
+            with pytest.raises(TimeoutError, match="total ceiling"):
+                _aggregate_chat_stream(
+                    _TimedSyncStream(count=20, interval=0.02),
+                    idle_timeout=0.1,
+                    total_ceiling=0.18,
+                )
+        assert len(ticks) >= 5
+
 
 
 # ---------------------------------------------------------------------------
@@ -200,12 +390,20 @@ class TestAggregateChatStream:
 # ---------------------------------------------------------------------------
 
 class TestStreamCeiling:
-    def test_floor_applies_to_small_timeouts(self):
-        assert _aux_stream_total_ceiling(30) == 600.0
+    def test_uses_configured_timeout(self):
+        assert _aux_stream_total_ceiling(30) == 30.0
+
+    def test_host_idle_ttfb_and_absolute_total_are_separate(self):
+        with aux_host_candidate_deadline(
+            lambda: 0.1,
+            total_deadline=lambda: 0.6,
+            idle_timeout=0.1,
+        ):
+            assert _aux_stream_total_ceiling(30) == 0.6
 
 
-    def test_none_timeout_gets_floor(self):
-        assert _aux_stream_total_ceiling(None) == 600.0
+    def test_none_timeout_uses_default(self):
+        assert _aux_stream_total_ceiling(None) == 30.0
 
 
 # ---------------------------------------------------------------------------
@@ -221,18 +419,432 @@ class TestFenceProgress:
         assert fence.seconds_since_progress() < 0.05
 
     def test_fence_hook_wiring_matches_compressor_usage(self):
-        # conversation_compression installs fence.touch_progress as the hook;
-        # verify the pair works end-to-end through _notify_aux_progress.
+        # The shared seam marks the fence before notifying the host hook.
         fence = CompressionCommitFence()
         time.sleep(0.05)
-        with aux_progress_hook(fence.touch_progress):
-            _notify_aux_progress()
+        ticks = []
+        with (
+            aux_progress_hook(lambda: ticks.append(1)),
+            aux_host_candidate_deadline(None, fence=fence),
+        ):
+            assert _notify_aux_progress("progress") is True
         assert fence.seconds_since_progress() < 0.05
+        assert ticks == [1]
+
+    def test_late_codex_progress_cannot_mutate_cancelled_fence(self):
+        started = threading.Event()
+        release = threading.Event()
+
+        class _Responses:
+            def create(self, **_kwargs):
+                started.set()
+                assert release.wait(timeout=1)
+                yield SimpleNamespace(
+                    type="response.output_text.delta", delta="late"
+                )
+                message = SimpleNamespace(
+                    type="message",
+                    content=[SimpleNamespace(type="output_text", text="done")],
+                )
+                yield SimpleNamespace(type="response.output_item.done", item=message)
+                yield SimpleNamespace(
+                    type="response.completed",
+                    response=SimpleNamespace(output=[message], usage=None),
+                )
+
+        real_client = SimpleNamespace(
+            api_key="test",
+            base_url="https://example.test/codex",
+            responses=_Responses(),
+            close=lambda: None,
+        )
+        client = CodexAuxiliaryClient(real_client, "codex")
+        fence = CompressionCommitFence()
+        fence.configure_host_budget(
+            idle_timeout_seconds=1.0, total_ceiling_seconds=2.0
+        )
+        host_ticks = []
+        outcome = {}
+
+        def _worker():
+            try:
+                with (
+                    aux_progress_hook(lambda: host_ticks.append(True)),
+                    aux_host_candidate_deadline(
+                        fence.next_wait,
+                        total_deadline=fence.remaining_absolute_total,
+                        idle_timeout=1.0,
+                        fence=fence,
+                    ),
+                ):
+                    outcome["result"] = _create_with_progress(
+                        client, {"model": "m", "messages": [], "timeout": 30}
+                    )
+            except BaseException as exc:  # pragma: no cover - asserted below
+                outcome["exc"] = exc
+
+        worker = threading.Thread(target=_worker, daemon=True)
+        worker.start()
+        assert started.wait(timeout=1)
+        assert fence.cancel_before_commit() is True
+        last_progress = fence._last_progress
+        release.set()
+        worker.join(timeout=1)
+
+        assert not worker.is_alive()
+        assert "exc" not in outcome
+        assert outcome["result"].choices[0].message.content == "done"
+        assert fence._last_progress == last_progress
+        assert host_ticks == []
+        assert fence.begin_commit() is False
+
+    def _run_external_transition_drain(self, transition, monkeypatch):
+        fence = CompressionCommitFence()
+        mark_returned = threading.Event()
+        allow_hook_call = threading.Event()
+        hook_started = threading.Event()
+        allow_hook_return = threading.Event()
+        original_begin = fence.begin_progress_publication
+
+        def _begin(has_hook=False):
+            token = original_begin(has_hook)
+            mark_returned.set()
+            assert allow_hook_call.wait(timeout=1)
+            return token
+
+        monkeypatch.setattr(fence, "begin_progress_publication", _begin)
+        outcome = {}
+
+        def _publish():
+            def _hook():
+                hook_started.set()
+                assert allow_hook_return.wait(timeout=1)
+
+            with aux_progress_hook(_hook):
+                outcome["accepted"] = _notify_aux_progress("progress", fence=fence)
+
+        publisher = threading.Thread(target=_publish, daemon=True)
+        publisher.start()
+        assert mark_returned.wait(timeout=1)
+        transition_done = threading.Event()
+
+        def _transition():
+            if transition == "cancel":
+                outcome["transition"] = fence.cancel_before_commit()
+            elif transition == "revoke":
+                fence.revoke_commit_admission()
+                outcome["transition"] = True
+            else:
+                outcome["transition"] = fence.begin_commit()
+                if outcome["transition"]:
+                    fence.finish_commit()
+            transition_done.set()
+
+        waiter = threading.Thread(target=_transition, daemon=True)
+        waiter.start()
+        allow_hook_call.set()
+        assert hook_started.wait(timeout=1)
+        assert not transition_done.wait(timeout=0.05)
+        allow_hook_return.set()
+        publisher.join(timeout=1)
+        waiter.join(timeout=1)
+
+        assert not publisher.is_alive()
+        assert not waiter.is_alive()
+        assert outcome == {"accepted": True, "transition": True}
+        assert fence.mark_meaningful_progress_if_active() is False
+
+    @pytest.mark.parametrize("transition", ["cancel", "revoke", "begin"])
+    def test_external_transition_waits_for_progress_hook(self, transition, monkeypatch):
+        self._run_external_transition_drain(transition, monkeypatch)
+
+    @pytest.mark.parametrize("transition", ["cancel", "revoke", "begin"])
+    def test_reentrant_transition_does_not_deadlock(self, transition):
+        fence = CompressionCommitFence()
+        outcome = {}
+        finished = threading.Event()
+
+        def _hook():
+            if transition == "cancel":
+                outcome[transition] = fence.cancel_before_commit()
+            elif transition == "revoke":
+                fence.revoke_commit_admission()
+                outcome[transition] = True
+            else:
+                outcome[transition] = fence.begin_commit()
+                if outcome[transition]:
+                    fence.finish_commit()
+
+        def _publish():
+            with aux_progress_hook(_hook):
+                outcome["accepted"] = _notify_aux_progress("progress", fence=fence)
+            finished.set()
+
+        publisher = threading.Thread(target=_publish, daemon=True)
+        publisher.start()
+        assert finished.wait(timeout=1)
+        publisher.join(timeout=1)
+
+        assert not publisher.is_alive()
+        assert outcome["accepted"] is True
+        assert outcome[transition] is True
+        assert _notify_aux_progress("later", fence=fence) is False
+
+    @pytest.mark.parametrize("transition", ["cancel", "revoke", "begin"])
+    def test_two_reentrant_transitions_do_not_deadlock(self, transition):
+        fence = CompressionCommitFence()
+        hook_started = [threading.Event(), threading.Event()]
+        finished = [threading.Event(), threading.Event()]
+        outcome = {}
+        both_hooks = threading.Barrier(2)
+
+        def _publish(index):
+            def _hook():
+                hook_started[index].set()
+                both_hooks.wait(timeout=1)
+                if transition == "cancel":
+                    outcome[(index, "transition")] = fence.cancel_before_commit()
+                elif transition == "revoke":
+                    fence.revoke_commit_admission()
+                    outcome[(index, "transition")] = True
+                else:
+                    outcome[(index, "transition")] = fence.begin_commit()
+                    if outcome[(index, "transition")]:
+                        fence.finish_commit()
+
+            with aux_progress_hook(_hook):
+                outcome[index] = _notify_aux_progress("progress", fence=fence)
+            finished[index].set()
+
+        publishers = [
+            threading.Thread(target=_publish, args=(index,), daemon=True)
+            for index in range(2)
+        ]
+        for publisher in publishers:
+            publisher.start()
+        for started in hook_started:
+            assert started.wait(timeout=1)
+        for done in finished:
+            assert done.wait(timeout=1)
+        for publisher in publishers:
+            publisher.join(timeout=1)
+
+        assert all(not publisher.is_alive() for publisher in publishers)
+        assert all(outcome[index] is True for index in range(2))
+        assert all(outcome[(index, "transition")] is True for index in range(2))
+        assert fence._progress_publications == {}
+        assert fence._progress_quiescent.is_set()
+        if transition == "cancel":
+            assert fence._cancelled is True
+            assert fence._admission_revoked is False
+            assert fence._commit_started is False
+        elif transition == "revoke":
+            assert fence._admission_revoked is True
+        else:
+            assert fence._commit_started is True
+            assert fence._commit_phase.is_set() is False
+        assert _notify_aux_progress("late", fence=fence) is False
+
+    @pytest.mark.parametrize("transition", ["cancel", "revoke", "begin"])
+    def test_reentrant_transition_and_external_drain_do_not_deadlock(self, transition):
+        fence = CompressionCommitFence()
+        reentrant_done = threading.Event()
+        allow_hook_return = threading.Event()
+        external_started = threading.Event()
+        external_done = threading.Event()
+        outcome = {}
+
+        def _hook():
+            if transition == "cancel":
+                outcome["reentrant"] = fence.cancel_before_commit()
+            elif transition == "revoke":
+                fence.revoke_commit_admission()
+                outcome["reentrant"] = True
+            else:
+                outcome["reentrant"] = fence.begin_commit()
+                if outcome["reentrant"]:
+                    fence.finish_commit()
+            reentrant_done.set()
+            assert allow_hook_return.wait(timeout=1)
+
+        def _publish():
+            with aux_progress_hook(_hook):
+                outcome["accepted"] = _notify_aux_progress("progress", fence=fence)
+
+        publisher = threading.Thread(target=_publish, daemon=True)
+        publisher.start()
+        assert reentrant_done.wait(timeout=1)
+
+        def _external():
+            external_started.set()
+            if transition == "cancel":
+                outcome["external"] = fence.cancel_before_commit()
+            elif transition == "revoke":
+                fence.revoke_commit_admission()
+                outcome["external"] = True
+            else:
+                outcome["external"] = fence.begin_commit()
+                if outcome["external"]:
+                    fence.finish_commit()
+            external_done.set()
+
+        external = threading.Thread(target=_external, daemon=True)
+        external.start()
+        assert external_started.wait(timeout=1)
+        assert not external_done.wait(timeout=0.05)
+        allow_hook_return.set()
+        publisher.join(timeout=1)
+        external.join(timeout=1)
+
+        assert not publisher.is_alive()
+        assert not external.is_alive()
+        assert outcome == {"accepted": True, "reentrant": True, "external": True}
+        assert fence._progress_publications == {}
+        assert fence._progress_quiescent.is_set()
+        assert _notify_aux_progress("late", fence=fence) is False
+
+    def test_reentrant_revoke_waits_for_fence_lock_release(self, monkeypatch):
+        fence = CompressionCommitFence()
+        token_ready = threading.Event()
+        allow_begin_return = threading.Event()
+        original_begin = fence.begin_progress_publication
+
+        def _begin(has_hook=False):
+            token = original_begin(has_hook)
+            token_ready.set()
+            assert allow_begin_return.wait(timeout=1)
+            return token
+
+        monkeypatch.setattr(fence, "begin_progress_publication", _begin)
+        lock_held = threading.Event()
+        release_lock = threading.Event()
+
+        def _hold_lock():
+            fence._lock.acquire()
+            lock_held.set()
+            try:
+                assert release_lock.wait(timeout=1)
+            finally:
+                fence._lock.release()
+
+        hook_started = threading.Event()
+        finished = threading.Event()
+
+        def _hook():
+            hook_started.set()
+            fence.revoke_commit_admission()
+
+        def _publish():
+            with aux_progress_hook(_hook):
+                assert _notify_aux_progress("progress", fence=fence) is True
+            finished.set()
+
+        publisher = threading.Thread(target=_publish, daemon=True)
+        publisher.start()
+        assert token_ready.wait(timeout=1)
+        holder = threading.Thread(target=_hold_lock, daemon=True)
+        holder.start()
+        assert lock_held.wait(timeout=1)
+        allow_begin_return.set()
+        assert hook_started.wait(timeout=1)
+        assert fence._admission_revoked is False
+        assert not finished.wait(timeout=0.05)
+        release_lock.set()
+        holder.join(timeout=1)
+        publisher.join(timeout=1)
+
+        assert not holder.is_alive()
+        assert not publisher.is_alive()
+        assert finished.is_set()
+        assert fence._admission_revoked is True
+        assert fence._progress_publications == {}
+
+    def test_hook_failure_releases_progress_publication(self):
+        fence = CompressionCommitFence()
+
+        def _raise():
+            raise RuntimeError("hook failure")
+
+        with aux_progress_hook(_raise):
+            assert _notify_aux_progress("progress", fence=fence) is True
+        assert fence._progress_publications == {}
+        assert fence._progress_quiescent.is_set()
+        assert fence.cancel_before_commit() is True
+
+    @pytest.mark.parametrize("transition", ["cancel", "revoke", "begin"])
+    def test_external_transition_waits_for_two_concurrent_progress_hooks(self, transition):
+        fence = CompressionCommitFence()
+        hook_started = [threading.Event(), threading.Event()]
+        allow_hook_return = [threading.Event(), threading.Event()]
+        hook_seen = []
+        outcome = {}
+
+        def _publish(index):
+            def _hook():
+                hook_started[index].set()
+                assert allow_hook_return[index].wait(timeout=1)
+                hook_seen.append(index)
+
+            with aux_progress_hook(_hook):
+                outcome[index] = _notify_aux_progress("progress", fence=fence)
+
+        publishers = [
+            threading.Thread(target=_publish, args=(index,), daemon=True)
+            for index in range(2)
+        ]
+        for publisher in publishers:
+            publisher.start()
+        for started in hook_started:
+            assert started.wait(timeout=1)
+
+        transition_started = threading.Event()
+        transition_done = threading.Event()
+
+        def _transition():
+            transition_started.set()
+            if transition == "cancel":
+                outcome["transition"] = fence.cancel_before_commit()
+            elif transition == "revoke":
+                fence.revoke_commit_admission()
+                outcome["transition"] = True
+            else:
+                outcome["transition"] = fence.begin_commit()
+                if outcome["transition"]:
+                    fence.finish_commit()
+            transition_done.set()
+
+        waiter = threading.Thread(target=_transition, daemon=True)
+        waiter.start()
+        assert transition_started.wait(timeout=1)
+        assert not transition_done.wait(timeout=0.05)
+        allow_hook_return[0].set()
+        publishers[0].join(timeout=1)
+        assert not transition_done.wait(timeout=0.05)
+        allow_hook_return[1].set()
+        for publisher in publishers:
+            publisher.join(timeout=1)
+        waiter.join(timeout=1)
+
+        assert all(not publisher.is_alive() for publisher in publishers)
+        assert not waiter.is_alive()
+        assert outcome == {0: True, 1: True, "transition": True}
+        assert sorted(hook_seen) == [0, 1]
+        assert fence._progress_publications == {}
+        assert fence._progress_quiescent.is_set()
+        assert _notify_aux_progress("late", fence=fence) is False
+        if transition == "cancel":
+            assert fence._cancelled is True
+        elif transition == "revoke":
+            assert fence._admission_revoked is True
+        else:
+            assert fence._commit_started is True
+            assert fence._commit_phase.is_set() is False
 
 
 # ---------------------------------------------------------------------------
 # Stream-only providers (credit @kudi88, PR #60686)
 # ---------------------------------------------------------------------------
+
 
 class TestProviderRequiresStream:
 
@@ -357,3 +969,73 @@ class TestAsyncStreamAggregation:
         )
         assert calls[0]["stream"] is True
         assert result.choices[0].message.content == "ok"
+
+    @pytest.mark.asyncio
+    async def test_live_async_stream_resets_idle_without_resetting_total(self):
+        started = time.monotonic()
+        result = await _aggregate_chat_stream_async(
+            _TimedAsyncStream(count=8, interval=0.03),
+            idle_timeout=0.1,
+            total_ceiling=0.6,
+        )
+        assert result.choices[0].message.content == "xxxxxxxx"
+        assert time.monotonic() - started > 0.1
+
+    @pytest.mark.asyncio
+    async def test_silent_async_stream_expires_within_idle_window(self):
+        import asyncio
+
+        class _SilentAsyncStream:
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                await asyncio.sleep(0.2)
+                return _chunk(content="late")
+
+        started = time.monotonic()
+        with pytest.raises(TimeoutError, match="idle"):
+            await _aggregate_chat_stream_async(
+                _SilentAsyncStream(), idle_timeout=0.05, total_ceiling=0.6
+            )
+        assert time.monotonic() - started < 0.15
+
+    @pytest.mark.asyncio
+    async def test_async_whitespace_and_empty_tool_deltas_do_not_count(self):
+        empty_tool = SimpleNamespace(
+            index=0,
+            id="",
+            function=SimpleNamespace(name="", arguments=""),
+        )
+
+        class _AsyncStream:
+            def __init__(self):
+                self.items = [
+                    _chunk(content=" \n\t"),
+                    _chunk(tool_calls=[empty_tool]),
+                ]
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if not self.items:
+                    raise StopAsyncIteration
+                return self.items.pop(0)
+
+        ticks = []
+        with aux_progress_hook(lambda: ticks.append(True)):
+            await _aggregate_chat_stream_async(_AsyncStream())
+        assert ticks == []
+
+    @pytest.mark.asyncio
+    async def test_async_progress_cannot_extend_absolute_total(self):
+        ticks = []
+        with aux_progress_hook(lambda: ticks.append(True)):
+            with pytest.raises(TimeoutError, match="total ceiling"):
+                await _aggregate_chat_stream_async(
+                    _TimedAsyncStream(count=20, interval=0.02),
+                    idle_timeout=0.1,
+                    total_ceiling=0.18,
+                )
+        assert len(ticks) >= 5

@@ -715,6 +715,41 @@ class TestPromptCacheKeyCapability:
                 list(result)
         return captured
 
+    def test_post_compress_request_reuses_unchanged_stable_prefix_key(self, transport):
+        """Compression may rebuild only the volatile system-prompt suffix."""
+        marker = {"type": "ephemeral"}
+
+        def key(volatile_suffix):
+            return transport.build_kwargs(
+                model="cache-model",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "stable prefix",
+                                "cache_control": marker,
+                            },
+                            {
+                                "type": "text",
+                                "text": volatile_suffix,
+                                "cache_control": marker,
+                            },
+                        ],
+                    },
+                    {"role": "user", "content": "next request"},
+                ],
+                tools=[],
+                session_id="session-after-compress",
+                supports_prompt_cache_key=True,
+            )["prompt_cache_key"]
+
+        before_compress = key("volatile before compression")
+        first_after_compress = key("rebuilt volatile suffix")
+
+        assert first_after_compress == before_compress
+
     def test_profile_capability_emits_content_key_in_nonstream_request_body(self, transport):
         from providers.base import ProviderProfile
 

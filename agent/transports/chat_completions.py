@@ -44,6 +44,16 @@ def _static_prompt_instructions(messages: list[dict[str, Any]]) -> str:
     content = first.get("content")
     if isinstance(content, str):
         return content
+    if isinstance(content, list) and content:
+        # A cache plan marks the stable system prefix in the first block and
+        # leaves the rebuilt volatile suffix outside the routing key.
+        first_block = content[0]
+        if (
+            isinstance(first_block, dict)
+            and "cache_control" in first_block
+            and isinstance(first_block.get("text"), str)
+        ):
+            return first_block["text"]
     try:
         return json.dumps(content, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     except (TypeError, ValueError):
@@ -706,7 +716,8 @@ class ChatCompletionsTransport(ProviderTransport):
             messages=sanitized,
             tools=api_kwargs.get("tools"),
             supports_prompt_cache_key=bool(params.get("supports_prompt_cache_key"))
-            or _is_openai_api_base_url(params.get("base_url")),
+            or _is_openai_api_base_url(params.get("base_url"))
+            or str(params.get("provider_name") or "").strip().lower().startswith("custom:"),
             session_id=params.get("session_id"),
             cache_scope_id=params.get("cache_scope_id"),
         )
@@ -869,7 +880,8 @@ class ChatCompletionsTransport(ProviderTransport):
             api_kwargs,
             messages=sanitized,
             tools=api_kwargs.get("tools"),
-            supports_prompt_cache_key=bool(getattr(profile, "supports_prompt_cache_key", False)),
+            supports_prompt_cache_key=bool(getattr(profile, "supports_prompt_cache_key", False))
+            or str(params.get("provider_name") or "").strip().lower().startswith("custom:"),
             session_id=params.get("session_id"),
             cache_scope_id=params.get("cache_scope_id"),
         )

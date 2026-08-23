@@ -2764,7 +2764,6 @@ def terminal_tool(
             return tool_error(
                 f"timeout must be a positive number of seconds (got {timeout})."
             )
-        timeout_was_omitted = timeout is None
         effective_timeout = timeout or default_timeout
 
         background_was_omitted = background is None
@@ -2772,9 +2771,7 @@ def terminal_tool(
         auto_background_threshold = int(
             config.get("auto_background_timeout_threshold", 200)
         )
-        auto_promoted = background_was_omitted and (
-            timeout_was_omitted or effective_timeout > auto_background_threshold
-        )
+        auto_promoted = background_was_omitted and effective_timeout > auto_background_threshold
         if auto_promoted:
             try:
                 from gateway.session_context import async_delivery_supported
@@ -3965,11 +3962,11 @@ TERMINAL_SCHEMA = {
             },
             "background": {
                 "type": "boolean",
-                "description": "Run in the background, returning a session_id. When omitted, Hermes enables background and completion notification if timeout is omitted or exceeds terminal.auto_background_timeout_threshold. Explicit background=false is the only auto-promotion opt-out. Pair background=true with notify_on_complete=true for bounded work; leave notifications off only for servers, watchers, and daemons."
+                "description": "Run in the background, returning a session_id. When omitted, Hermes keeps the command in the foreground unless its effective timeout exceeds terminal.auto_background_timeout_threshold; then it uses managed background execution with completion notification. Explicit background=false always keeps the command in the foreground (subject to the foreground timeout cap). Pair background=true with notify_on_complete=true for bounded work; leave notifications off only for servers, watchers, and daemons."
             },
             "timeout": {
                 "type": "integer",
-                "description": f"Max seconds to wait (default: 180, foreground max: {FOREGROUND_MAX_TIMEOUT}). When omitted, or when it exceeds terminal.auto_background_timeout_threshold while background is omitted, Hermes promotes the call to managed background execution with completion notification. Foreground timeout above {FOREGROUND_MAX_TIMEOUT}s is rejected; use background=true for longer commands.",
+                "description": f"Max seconds to wait (default: 180, foreground max: {FOREGROUND_MAX_TIMEOUT}). When background is omitted, Hermes promotes the call to managed background execution with completion notification only when the effective timeout exceeds terminal.auto_background_timeout_threshold. Foreground timeout above {FOREGROUND_MAX_TIMEOUT}s is rejected; use background=true for longer commands.",
                 "minimum": 1
             },
             "workdir": {

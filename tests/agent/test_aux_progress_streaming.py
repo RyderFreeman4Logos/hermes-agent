@@ -200,12 +200,12 @@ class TestAggregateChatStream:
 # ---------------------------------------------------------------------------
 
 class TestStreamCeiling:
-    def test_floor_applies_to_small_timeouts(self):
-        assert _aux_stream_total_ceiling(30) == 600.0
+    def test_uses_configured_timeout(self):
+        assert _aux_stream_total_ceiling(30) == 30.0
 
 
-    def test_none_timeout_gets_floor(self):
-        assert _aux_stream_total_ceiling(None) == 600.0
+    def test_none_timeout_uses_default(self):
+        assert _aux_stream_total_ceiling(None) == 30.0
 
 
 # ---------------------------------------------------------------------------

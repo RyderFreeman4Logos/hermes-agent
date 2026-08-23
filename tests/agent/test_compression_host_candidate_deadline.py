@@ -1,7 +1,7 @@
 """#128: host candidate deadline must walk fallback_chain, not abort.
 
 A live first route can keep the connection open (empty/keepalive frames)
-past the host's 600s total ceiling while its own aux timeout is still
+past the configured compression deadline while its own aux timeout is still
 open. The host then fence-cancels the whole worker and returns
 uncompressed context instead of advancing auxiliary.compression.fallback_chain.
 """
@@ -131,8 +131,9 @@ class TestHostCandidateDeadlineAdvancesFallback:
         assert callable(resolve), "shared attempt-deadline helper is required"
         assert callable(host_cm), "host candidate deadline context is required"
         assert resolve(aux_timeout=30.0, host_candidate_deadline=0.2) == 0.2
-        # No host override keeps the existing generous single-call ceiling.
-        assert resolve(aux_timeout=30.0, host_candidate_deadline=None) == _aux_stream_total_ceiling(30.0)
+        # No host override must preserve the configured local timeout.
+        assert resolve(aux_timeout=30.0, host_candidate_deadline=None) == 30.0
+        assert resolve(aux_timeout=1700.0, host_candidate_deadline=None) == 1700.0
         with host_cm(0.2):
             assert _aux_stream_total_ceiling(30.0) == 0.2
 
@@ -223,7 +224,7 @@ class TestHostCandidateDeadlineAdvancesFallback:
             classify(
                 idle=120.0,
                 waited=120.0,
-                ceiling=600.0,
+                ceiling=1700.0,
                 since_progress=120.0,
                 had_meaningful_progress=False,
             )
@@ -232,8 +233,8 @@ class TestHostCandidateDeadlineAdvancesFallback:
         assert (
             classify(
                 idle=120.0,
-                waited=600.0,
-                ceiling=600.0,
+                waited=1700.0,
+                ceiling=1700.0,
                 since_progress=5.0,
                 had_meaningful_progress=True,
             )
@@ -243,7 +244,7 @@ class TestHostCandidateDeadlineAdvancesFallback:
             classify(
                 idle=120.0,
                 waited=30.0,
-                ceiling=600.0,
+                ceiling=1700.0,
                 since_progress=30.0,
                 had_meaningful_progress=True,
             )

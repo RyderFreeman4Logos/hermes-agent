@@ -491,20 +491,16 @@ def resolve_aux_attempt_deadline(
 ) -> float:
     """One finite attempt budget for host + aux + fallback progression.
 
-    Without a host bound this is the historical generous stream ceiling
-    (idle-per-chunk timeout, 600s floor). A positive host candidate
-    deadline is the remaining host budget for this attempt and wins when
-    shorter, so a still-open first route cannot outlive the host and
-    skip ``fallback_chain`` (#128).
+    Without a host bound, the configured auxiliary timeout is the operation
+    deadline. A positive host candidate deadline is the remaining operation
+    budget for this attempt and wins when shorter, so a still-open first route
+    cannot outlive the host and skip ``fallback_chain`` (#128, #193).
     """
     try:
         timeout = float(aux_timeout) if aux_timeout is not None else 0.0
     except (TypeError, ValueError):
         timeout = 0.0
-    generous = max(
-        _AUX_STREAM_CEILING_FLOOR_SECONDS,
-        _AUX_STREAM_CEILING_MULTIPLIER * timeout,
-    )
+    candidate = timeout if timeout > 0 else _DEFAULT_AUX_TIMEOUT
     if host_candidate_deadline is None:
         host_candidate_deadline = getattr(_aux_progress, "candidate_deadline", None)
     if callable(host_candidate_deadline):
@@ -517,14 +513,12 @@ def resolve_aux_attempt_deadline(
     except (TypeError, ValueError):
         host = 0.0
     if host_candidate_deadline is not None and host <= 0:
-        # Host already spent its idle/ceiling: expire this attempt now so
+        # Host already spent its operation budget: expire this attempt now so
         # fallback_chain can walk before the host fence-cancels (#128).
         return 0.0
-    if host > 0 and timeout > 0:
-        return min(generous, host, timeout)
     if host > 0:
-        return min(generous, host)
-    return generous
+        return min(candidate, host)
+    return candidate
 
 
 def classify_compression_watchdog(
@@ -9263,18 +9257,13 @@ def _obj_get(obj: Any, key: str, default: Any = None) -> Any:
 # A total ceiling still bounds the pathological 1-token-per-idle-window
 # stream; see _aux_stream_total_ceiling().
 
-_AUX_STREAM_CEILING_FLOOR_SECONDS = 600.0
-_AUX_STREAM_CEILING_MULTIPLIER = 4.0
+# A configured auxiliary timeout is both the local idle timeout and the
+# finite operation deadline for a progress-hooked compression attempt. The
+# host may provide a shorter remaining operation budget for fallback walking.
 
 
 def _aux_stream_total_ceiling(effective_timeout: Optional[float]) -> float:
-    """Absolute wall-clock bound for a progress-hooked streamed aux call.
-
-    Generous by design when no host is supervising — the idle timeout is
-    the real guard; this only stops a degenerate trickle. Under a host
-    candidate deadline the attempt is capped so expiry stays inside
-    ``call_llm`` and ``fallback_chain`` can advance (#128).
-    """
+    """Return the configured operation deadline for a streamed aux call."""
     return resolve_aux_attempt_deadline(effective_timeout)
 
 

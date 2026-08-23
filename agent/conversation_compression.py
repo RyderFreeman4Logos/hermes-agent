@@ -827,6 +827,7 @@ def resolve_context_compression_timeouts(
     """
     idle = DEFAULT_CONTEXT_TIMEOUT_SECONDS
     ceiling = DEFAULT_CONTEXT_TOTAL_CEILING_SECONDS
+    aux_timeout = None
     cfg = compression_cfg
     if cfg is None:
         try:
@@ -835,6 +836,24 @@ def resolve_context_compression_timeouts(
             raw = load_config()
             maybe = raw.get("compression", {}) if isinstance(raw, dict) else {}
             cfg = maybe if isinstance(maybe, dict) else {}
+            auxiliary = raw.get("auxiliary", {}) if isinstance(raw, dict) else {}
+            auxiliary_compression = (
+                auxiliary.get("compression", {})
+                if isinstance(auxiliary, dict)
+                else {}
+            )
+            raw_aux_timeout = (
+                auxiliary_compression.get("timeout")
+                if isinstance(auxiliary_compression, dict)
+                else None
+            )
+            if raw_aux_timeout is not None:
+                try:
+                    parsed = float(raw_aux_timeout)
+                    if parsed > 0:
+                        aux_timeout = parsed
+                except (TypeError, ValueError):
+                    pass
         except Exception:
             cfg = {}
     if isinstance(cfg, dict):
@@ -854,6 +873,10 @@ def resolve_context_compression_timeouts(
                     ceiling = parsed
             except (TypeError, ValueError):
                 pass
+    if aux_timeout is not None:
+        # The host must not preempt a longer configured compression request.
+        # Its own idle budget still detects a silent provider.
+        ceiling = max(ceiling, aux_timeout)
     if idle > 0:
         ceiling = max(ceiling, idle)
     return idle, ceiling

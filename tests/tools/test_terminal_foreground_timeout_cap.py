@@ -39,6 +39,7 @@ class TestForegroundTimeoutCap:
 
             result = json.loads(terminal_tool(
                 command="echo hello",
+                background=False,
                 timeout=9999,  # Way above max
             ))
 
@@ -132,6 +133,7 @@ class TestForegroundTimeoutCap:
                  patch("tools.terminal_tool._check_all_guards", return_value={"approved": True}):
                 result = json.loads(terminal_tool(
                     command="echo hello",
+                    background=False,
                     timeout=FOREGROUND_MAX_TIMEOUT,  # Exactly at limit
                 ))
 

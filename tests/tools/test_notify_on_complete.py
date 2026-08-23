@@ -130,6 +130,52 @@ class TestCompletionQueue:
         ids = {c["session_id"] for c in completions}
         assert ids == {"proc_0", "proc_1", "proc_2"}
 
+    def test_spawn_local_queues_notify_when_reader_finishes_immediately(
+        self, registry, monkeypatch
+    ):
+        """Immediate completion retains routing provenance and queues once."""
+        import tools.process_registry as pr
+        from types import SimpleNamespace
+
+        def finish(session):
+            session.exited = True
+            session.exit_code = 0
+            registry._move_to_finished(session)
+
+        monkeypatch.setattr(
+            pr.subprocess, "Popen", lambda *_a, **_kw: MagicMock(pid=123)
+        )
+        monkeypatch.setattr(
+            pr.threading,
+            "Thread",
+            lambda **kw: SimpleNamespace(start=lambda: kw["target"](*kw["args"])),
+        )
+        monkeypatch.setattr(registry, "_reader_loop", finish)
+        monkeypatch.setattr(registry, "_safe_host_start_time", lambda _pid: None)
+        monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+
+        session = registry.spawn_local(
+            "true",
+            cwd="/tmp",
+            task_id="task-immediate",
+            session_key="key-immediate",
+            notify_on_complete=True,
+            watcher_metadata={
+                "watcher_platform": "telegram",
+                "parent_session_id": "parent-immediate",
+            },
+        )
+        completion = registry.completion_queue.get_nowait()
+
+        assert registry.completion_queue.empty()
+        assert (
+            completion["platform"],
+            completion["parent_session_id"],
+            completion["session_key"],
+            completion["task_id"],
+        ) == ("telegram", "parent-immediate", "key-immediate", "task-immediate")
+        assert completion["session_id"] == session.id
+
 
 # =========================================================================
 # Checkpoint persistence
@@ -286,7 +332,8 @@ def _silent_bg_base_config(tmp_path):
         "modal_image": "",
         "daytona_image": "",
         "cwd": str(tmp_path),
-        "timeout": 30,
+        "timeout": 180,
+        "auto_background_timeout_threshold": 200,
     }
 
 
@@ -298,8 +345,12 @@ def _silent_bg_harness(monkeypatch, tmp_path):
     from types import SimpleNamespace
 
     config = _silent_bg_base_config(tmp_path)
-    dummy_env = SimpleNamespace(env={})
-
+    dummy_env = SimpleNamespace(
+        env={},
+        execute=MagicMock(
+            return_value={"output": "done", "exit_code": 0, "error": None}
+        ),
+    )
     def fake_spawn_local(**kwargs):
         return SimpleNamespace(
             id="proc_silent_test",
@@ -320,23 +371,121 @@ def _silent_bg_harness(monkeypatch, tmp_path):
     monkeypatch.setattr(process_registry_module.process_registry, "spawn_local", fake_spawn_local)
     monkeypatch.setitem(terminal_tool_module._active_environments, "default", dummy_env)
     monkeypatch.setitem(terminal_tool_module._last_activity, "default", 0.0)
+    terminal_tool_module._test_env = dummy_env
     return terminal_tool_module
 
 
-def test_background_without_notify_emits_silent_process_hint(monkeypatch, tmp_path):
-    """The footgun case (May 2026 PR #31231): bg=True alone runs silently
-    and the agent has no signal it finished. Tool must nudge."""
+def _call_terminal_handler(
+    monkeypatch,
+    tmp_path,
+    *,
+    call_style="handler",
+    config_overrides=None,
+    command="printf done",
+    **args,
+):
+    from gateway import session_context
+
     tt = _silent_bg_harness(monkeypatch, tmp_path)
+    if config_overrides:
+        config = _silent_bg_base_config(tmp_path)
+        config.update(config_overrides)
+        monkeypatch.setattr(tt, "_get_env_config", lambda: config)
+    monkeypatch.setattr(session_context, "async_delivery_supported", lambda: True)
+    try:
+        raw = (
+            tt.terminal_tool(command=command, **args)
+            if call_style == "direct"
+            else tt._handle_terminal({"command": command, **args})
+        )
+        result = json.loads(raw)
+    finally:
+        tt._active_environments.pop("default", None)
+        tt._last_activity.pop("default", None)
+    return tt, result
+
+
+@pytest.mark.parametrize(
+    ("call_style", "config_overrides", "args", "expected"),
+    [
+        ("handler", {"timeout": 7200}, {}, "foreground"),
+        ("direct", {}, {"timeout": 7200}, "background"),
+        ("handler", {}, {"timeout": 7200}, "background"),
+        ("handler", {}, {"timeout": 7200, "notify_on_complete": False}, "background"),
+        ("handler", {}, {"timeout": 7200, "background": False}, "error"),
+    ],
+)
+def test_background_provenance_matrix(
+    monkeypatch, tmp_path, call_style, config_overrides, args, expected
+):
+    tt, result = _call_terminal_handler(
+        monkeypatch,
+        tmp_path,
+        call_style=call_style,
+        config_overrides=config_overrides,
+        **args,
+    )
+
+    if expected == "foreground":
+        assert result["error"] is None
+        tt._test_env.execute.assert_called_once()
+    elif expected == "background":
+        assert result["session_id"] == "proc_silent_test"
+        assert result["notify_on_complete"] is True
+    else:
+        assert "Foreground timeout 7200s exceeds the maximum" in result["error"]
+
+
+@pytest.mark.parametrize(
+    ("notification_args", "env_type"),
+    [
+        ({"notify_on_complete": True}, "local"),
+        ({"watch_patterns": ["READY"]}, "local"),
+        ({"notify_on_complete": True}, "docker"),
+    ],
+)
+def test_unsupported_notification_refused_before_spawn(monkeypatch, tmp_path, notification_args, env_type):
+    """Unsupported async promises refuse before any backend can spawn."""
+    from gateway import session_context
+    from tools import process_registry as process_registry_module
+
+    tt = _silent_bg_harness(monkeypatch, tmp_path)
+    tt._get_env_config().__setitem__("env_type", env_type)
+    registry = ProcessRegistry()
+    monkeypatch.setattr(process_registry_module, "process_registry", registry)
+    monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+    monkeypatch.setattr(session_context, "async_delivery_supported", lambda: False)
+    local_spawn = MagicMock(side_effect=AssertionError("local spawn was not refused"))
+    env_spawn = MagicMock(side_effect=AssertionError("env spawn was not refused"))
+    monkeypatch.setattr(registry, "spawn_local", local_spawn)
+    monkeypatch.setattr(registry, "spawn_via_env", env_spawn)
     try:
         result = json.loads(
             tt.terminal_tool(
-                command="while true; do gh pr checks 999; sleep 30; done",
-                background=True,
+                command="printf done", background=True, pty=True, **notification_args
             )
         )
     finally:
         tt._active_environments.pop("default", None)
         tt._last_activity.pop("default", None)
+
+    assert result["exit_code"] != 0
+    assert result["status"] == "error"
+    assert result["notify_unsupported"] is True
+    local_spawn.assert_not_called()
+    env_spawn.assert_not_called()
+    assert registry.completion_queue.empty()
+
+
+def test_background_without_notify_emits_silent_process_hint(monkeypatch, tmp_path):
+    """The footgun case (May 2026 PR #31231): bg=True alone runs silently
+    and the agent has no signal it finished. Tool must nudge."""
+    _tt, result = _call_terminal_handler(
+        monkeypatch,
+        tmp_path,
+        command="while true; do gh pr checks 999; sleep 30; done",
+        background=True,
+    )
 
     assert result["session_id"] == "proc_silent_test"
     hint = result.get("hint", "")
@@ -351,18 +500,13 @@ def test_background_without_notify_emits_silent_process_hint(monkeypatch, tmp_pa
 
 def test_background_with_notify_does_not_emit_hint(monkeypatch, tmp_path):
     """The correct shape — bg+notify together — must not nag."""
-    tt = _silent_bg_harness(monkeypatch, tmp_path)
-    try:
-        result = json.loads(
-            tt.terminal_tool(
-                command="pytest tests/",
-                background=True,
-                notify_on_complete=True,
-            )
-        )
-    finally:
-        tt._active_environments.pop("default", None)
-        tt._last_activity.pop("default", None)
+    _tt, result = _call_terminal_handler(
+        monkeypatch,
+        tmp_path,
+        command="pytest tests/",
+        background=True,
+        notify_on_complete=True,
+    )
 
     assert "hint" not in result, (
         f"Correct usage must not emit a hint, got: {result.get('hint')!r}"
@@ -419,18 +563,13 @@ def test_non_ci_background_command_does_not_emit_homebrew_hint(monkeypatch, tmp_
     """A long-running task that happens to use awk for unrelated reasons
     must not be mistaken for a CI poller — the gating signal is the
     combination of `gh pr ...` AND a stdout parser."""
-    tt = _silent_bg_harness(monkeypatch, tmp_path)
-    try:
-        result = json.loads(
-            tt.terminal_tool(
-                command="cat /var/log/syslog | awk '/error/ {print}' > /tmp/errs.log",
-                background=True,
-                notify_on_complete=True,
-            )
-        )
-    finally:
-        tt._active_environments.pop("default", None)
-        tt._last_activity.pop("default", None)
+    _tt, result = _call_terminal_handler(
+        monkeypatch,
+        tmp_path,
+        command="cat /var/log/syslog | awk '/error/ {print}' > /tmp/errs.log",
+        background=True,
+        notify_on_complete=True,
+    )
 
     assert "hint" not in result, (
         f"Non-CI command using awk must not be flagged as homebrew CI poller, got: {result.get('hint')!r}"

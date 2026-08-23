@@ -68,13 +68,15 @@ def _runner(adapter, *, session_db=...):
     return runner
 
 
-def _finished_session(registry, session_id="proc_boundary", **kwargs):
+def _finished_session(
+    registry, session_id="proc_boundary", task_id="task", output_buffer="done\n", **kwargs
+):
     session = ProcessSession(
         id=session_id,
         command="echo done",
-        task_id="task",
+        task_id=task_id,
         started_at=1234.5,
-        output_buffer="done\n",
+        output_buffer=output_buffer,
         exited=True,
         exit_code=0,
         notify_on_complete=True,
@@ -173,6 +175,33 @@ def test_watcher_falls_back_to_process_session_stamp(
     _run_watcher(monkeypatch, runner, _watcher("proc_boundary"))
 
     assert captured.get("parent_session_id") == "sess-from-registry"
+
+
+def test_watcher_preserves_subagent_task_id_and_trims_output(
+    monkeypatch, isolated_registry,
+):
+    task_id = "sa-watcher-regression"
+    _finished_session(
+        isolated_registry,
+        task_id=task_id,
+        output_buffer="output line\n" * 100,
+    )
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+
+    captured = {}
+
+    async def _capture(text, evt):
+        captured["text"] = text
+        captured["event"] = evt
+        return True
+
+    monkeypatch.setattr(runner, "_deliver_completion_notification", _capture)
+    _run_watcher(monkeypatch, runner, _watcher("proc_boundary", "sess-spawner"))
+
+    assert captured["event"]["task_id"] == task_id
+    assert f"Started by subagent {task_id}" in captured["text"]
+    assert "output trimmed — subagent-owned process" in captured["text"]
 
 
 # ---------------------------------------------------------------------------

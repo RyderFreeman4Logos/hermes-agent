@@ -1,7 +1,9 @@
 """Tests for tools/process_registry.py — ProcessRegistry query methods, pruning, checkpoint."""
 
+import asyncio
 import json
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -566,44 +568,420 @@ class TestStdinHelpers:
         registry._running[s.id] = s
 
         result = registry.close_stdin(s.id)
+        again = registry.close_stdin(s.id)
 
         proc.stdin.close.assert_called_once()
         assert result["status"] == "ok"
+        assert again["status"] == "already_closed"
 
-    def test_close_stdin_allows_eof_driven_process_to_finish(self, registry, tmp_path):
-        """PTY mode: writing data + sending EOF lets an EOF-driven child finish.
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX PTY VEOF semantics")
+    @pytest.mark.parametrize(
+        ("failure_stage", "failure", "event_count"),
+        [
+            ("first_gate", SystemExit("first gate"), 0),
+            ("second_gate", KeyboardInterrupt("second gate"), 1),
+            ("poll_constructor", asyncio.CancelledError("poll constructor"), 2),
+            ("poll_register", RuntimeError("poll register"), 2),
+            ("constructor", KeyboardInterrupt("constructor"), 2),
+            ("start", SystemExit("start"), 2),
+            ("start_launched", SystemExit("started"), 2),
+            ("write", asyncio.CancelledError("write"), 2),
+            ("release", KeyboardInterrupt("release"), 2),
+        ],
+    )
+    def test_close_stdin_setup_is_transactional(
+        self, registry, monkeypatch, failure_stage, failure, event_count
+    ):
+        import termios
+        import tools.process_registry as process_registry
 
-        Background non-PTY mode used to expose subprocess stdin via a pipe,
-        but PR #214b95392 detached non-PTY stdin to DEVNULL to fix keyboard
-        lockout (#17959). For interactive stdin → PTY mode is now the only
-        supported path.
-        """
+        session = _make_session()
+        session._pty = MagicMock(fd=123)
+        registry._running[session.id] = session
+        slave_fd, peer_fd = os.pipe()
+        cc = [b"\0"] * 32
+        cc[termios.VEOF] = b"\x01"
+        monkeypatch.setattr(termios, "tcgetattr", lambda _fd: [0, 0, 0, 0, 0, 0, cc])
+        monkeypatch.setattr(registry, "_open_pty_slave", lambda _fd: slave_fd)
+
+        real_event = threading.Event
+        events = []
+        release_failed = False
+
+        class TestEvent(real_event):
+            def set(self):
+                nonlocal release_failed
+                if (
+                    failure_stage == "release"
+                    and self is events[0]
+                    and not release_failed
+                ):
+                    release_failed = True
+                    raise failure
+                return super().set()
+
+        def make_event():
+            if failure_stage == "first_gate" and not events:
+                raise failure
+            if failure_stage == "second_gate" and len(events) == 1:
+                raise failure
+            event = TestEvent()
+            events.append(event)
+            return event
+
+        monkeypatch.setattr(process_registry.threading, "Event", make_event)
+
+        class TestPoll:
+            def register(self, *_args):
+                if failure_stage == "poll_register":
+                    raise failure
+
+            def poll(self, _timeout):
+                return []
+
+        def make_poll():
+            if failure_stage == "poll_constructor":
+                raise failure
+            return TestPoll()
+
+        monkeypatch.setattr(process_registry.select, "poll", make_poll)
+        real_close = os.close
+        slave_closes = []
+
+        def track_slave_close(fd):
+            if fd == slave_fd:
+                slave_closes.append(fd)
+            real_close(fd)
+
+        monkeypatch.setattr(process_registry.os, "close", track_slave_close)
+        real_thread = threading.Thread
+        helpers = []
+
+        def make_thread(*args, **kwargs):
+            if failure_stage == "constructor":
+                raise failure
+            if failure_stage in ("start", "start_launched"):
+                class StartFailureThread(real_thread):
+                    def start(self):
+                        if failure_stage == "start_launched":
+                            super().start()
+                        raise failure
+
+                helper = StartFailureThread(*args, **kwargs)
+            else:
+                helper = real_thread(*args, **kwargs)
+            helpers.append(helper)
+            return helper
+
+        monkeypatch.setattr(process_registry.threading, "Thread", make_thread)
+        if failure_stage == "write":
+            session._pty.write.side_effect = failure
+
+        try:
+            with pytest.raises(type(failure)) as raised:
+                registry.close_stdin(session.id)
+            assert raised.value is failure
+
+            assert len(events) >= event_count
+            assert all(event.is_set() for event in events[:event_count])
+            assert session._stdin_closed is False
+            assert session._pty_eof_thread is None
+            assert session._pty_eof_cancel is None
+            assert session._pty_eof_start is None
+            assert all(helper.ident is None or not helper.is_alive() for helper in helpers)
+            assert all(helper.daemon for helper in helpers)
+            assert slave_closes == [slave_fd]
+            with pytest.raises(OSError):
+                os.fstat(slave_fd)
+            if failure_stage == "start_launched":
+                reused_fd = os.dup(peer_fd)
+                assert reused_fd == slave_fd
+                registry._stop_pty_eof_helper(session)
+                registry._stop_pty_eof_helper(session)
+                os.fstat(reused_fd)
+                real_close(reused_fd)
+            assert not any(
+                thread.name.startswith(f"proc-pty-eof-{session.id}")
+                and thread.is_alive()
+                and not thread.daemon
+                for thread in threading.enumerate()
+            )
+        finally:
+            for event in events:
+                event.set()
+            for helper in helpers:
+                if helper.ident is not None and helper.is_alive():
+                    helper.join(5)
+            try:
+                os.close(slave_fd)
+            except OSError:
+                pass
+            os.close(peer_fd)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX PTY VEOF semantics")
+    def test_eof_helper_closes_slave_on_early_failure(self):
+        slave_fd, peer_fd = os.pipe()
+        failure = RuntimeError("wait")
+        start = MagicMock()
+        start.wait.side_effect = failure
+
+        try:
+            with pytest.raises(RuntimeError) as raised:
+                ProcessRegistry._pty_eof_after_record(
+                    _make_session(),
+                    b"\x01",
+                    slave_fd,
+                    start,
+                    threading.Event(),
+                    MagicMock(),
+                )
+
+            assert raised.value is failure
+            with pytest.raises(OSError):
+                os.fstat(slave_fd)
+        finally:
+            try:
+                os.close(slave_fd)
+            except OSError:
+                pass
+            os.close(peer_fd)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX PTY VEOF semantics")
+    def test_child_exit_before_helper_arm_cancels_concurrent_close(
+        self, registry, monkeypatch
+    ):
+        import termios
+
+        session = _make_session()
+        session._pty = MagicMock(fd=123)
+        registry._running[session.id] = session
+        slave_fd, peer_fd = os.pipe()
+        cc = [b"\0"] * 32
+        cc[termios.VEOF] = b"\x01"
+        monkeypatch.setattr(termios, "tcgetattr", lambda _fd: [0, 0, 0, 0, 0, 0, cc])
+        monkeypatch.setattr(registry, "_open_pty_slave", lambda _fd: slave_fd)
+
+        first_write = threading.Event()
+        release_write = threading.Event()
+        writes = []
+        import tools.process_registry as process_registry
+        real_event = threading.Event
+        helper_events = []
+
+        def make_helper_event():
+            event = real_event()
+            helper_events.append(event)
+            return event
+
+        monkeypatch.setattr(process_registry.threading, "Event", make_helper_event)
+
+        def blocked_first_write(data):
+            writes.append(data)
+            if len(writes) == 1:
+                first_write.set()
+                assert release_write.wait(5)
+
+        session._pty.write.side_effect = blocked_first_write
+        result = {}
+        close_thread = threading.Thread(
+            target=lambda: result.update(registry.close_stdin(session.id))
+        )
+        stop_started = threading.Event()
+
+        def stop_on_child_exit():
+            session.exited = True
+            stop_started.set()
+            registry._stop_pty_eof_helper(session)
+
+        stop_thread = threading.Thread(target=stop_on_child_exit)
+        try:
+            close_thread.start()
+            assert first_write.wait(5)
+            helper = session._pty_eof_thread
+            assert helper is not None
+            helper_start = session._pty_eof_start
+            helper_cancel = session._pty_eof_cancel
+            assert helper_start is not None and not helper_start.is_set()
+            assert helper_cancel is not None and not helper_cancel.is_set()
+            stop_thread.start()
+            assert stop_started.wait(5)
+            release_write.set()
+            close_thread.join(5)
+            stop_thread.join(5)
+
+            assert not close_thread.is_alive()
+            assert not stop_thread.is_alive()
+            assert result["status"] == "ok"
+            assert writes == [b"\x01"]
+            assert not helper.is_alive()
+            assert helper_start.is_set()
+            assert helper_cancel.is_set()
+            assert session._pty_eof_thread is None
+            assert session._pty_eof_cancel is None
+            assert session._pty_eof_start is None
+            with pytest.raises(OSError):
+                os.fstat(slave_fd)
+            registry._stop_pty_eof_helper(session)
+        finally:
+            release_write.set()
+            for event in helper_events:
+                event.set()
+            close_thread.join(5)
+            stop_thread.join(5)
+            try:
+                os.close(slave_fd)
+            except OSError:
+                pass
+            os.close(peer_fd)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX PTY VEOF semantics")
+    def test_daemon_eof_helper_does_not_pin_parent_exit(self, tmp_path):
+        ready = tmp_path / "ready"
+        release = tmp_path / "release"
+        os.mkfifo(ready)
+        os.mkfifo(release)
+        child = (
+            f"open({str(ready)!r},'w').write('1');"
+            f"open({str(release)!r}).read(1)"
+        )
+        parent = (
+            "import shlex,sys;"
+            "from tools.process_registry import ProcessRegistry;"
+            "registry=ProcessRegistry();"
+            f"session=registry.spawn_local(shlex.quote(sys.executable)+' -c '+shlex.quote({child!r}),"
+            f"cwd={str(tmp_path)!r},use_pty=True);"
+            f"open({str(ready)!r}).read(1);"
+            "assert registry.write_stdin(session.id,'pending')['status']=='ok';"
+            "assert registry.close_stdin(session.id)['status']=='ok';"
+            "helper=session._pty_eof_thread;"
+            "print(f'MAIN_RETURN pid={session.pid} daemon={helper.daemon} alive={helper.is_alive()}',flush=True)"
+        )
+
+        result = subprocess.run(
+            [sys.executable, "-c", parent],
+            cwd=tmp_path,
+            env=os.environ.copy(),
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert "daemon=True alive=True" in result.stdout
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX PTY VEOF semantics")
+    @pytest.mark.parametrize(
+        "input_mode", ["pending", "empty", "consumed", "reader_exit"]
+    )
+    def test_close_stdin_crosses_canonical_read_boundary(
+        self, registry, tmp_path, monkeypatch, input_mode
+    ):
+        """PTY EOF reaches two canonical reads without closing duplex output."""
+        gate = tmp_path / "read-gate"
+        os.mkfifo(gate)
+        exit_without_read = (
+            "print('final',flush=True);raise SystemExit;"
+            if input_mode == "reader_exit" else ""
+        )
+        child = (
+            "import os,termios;"
+            "a=termios.tcgetattr(0);a[6][termios.VEOF]=b'\\x01';"
+            "termios.tcsetattr(0,termios.TCSANOW,a);print('ready',flush=True);"
+            f"open({str(gate)!r}).read(1);"
+            f"{exit_without_read}"
+            "x=os.read(0,1024);print('got:'+x.decode(),flush=True);"
+            "y=os.read(0,1024);print('eof:'+str(y==b''),flush=True);"
+            "print('final',flush=True)"
+        )
+        moved = []
+        move_to_finished = registry._move_to_finished
+
+        def record_move(session):
+            moved.append(session.id)
+            move_to_finished(session)
+
+        monkeypatch.setattr(registry, "_move_to_finished", record_move)
         session = registry.spawn_local(
-            'python3 -c "import sys; print(sys.stdin.read().strip())"',
+            f"{shlex.quote(sys.executable)} -c {shlex.quote(child)}",
             cwd=str(tmp_path),
             use_pty=True,
         )
+        pid = session.pid
 
         try:
-            # Wait for the PTY child to be up rather than sleeping blindly.
             assert _wait_until(
-                lambda: registry.poll(session.id)["status"] == "running",
+                lambda: "ready" in registry.poll(session.id).get("output_preview", ""),
                 timeout=5.0,
                 interval=0.02,
-            ), "PTY session never reached running"
-            assert registry.submit_stdin(session.id, "hello")["status"] == "ok"
-            assert registry.close_stdin(session.id)["status"] == "ok"
+            ), "PTY child never configured its nondefault VEOF"
+            eof_writes = []
+            pty_write = session._pty.write
 
-            deadline = time.time() + 5
-            while time.time() < deadline:
-                poll = registry.poll(session.id)
-                if poll["status"] == "exited":
-                    assert poll["exit_code"] == 0
-                    assert "hello" in poll["output_preview"]
-                    return
-                time.sleep(0.02)
+            def record_pty_write(data):
+                if data == b"\x01":
+                    eof_writes.append(data)
+                return pty_write(data)
 
-            pytest.fail("process did not exit after stdin was closed")
+            monkeypatch.setattr(session._pty, "write", record_pty_write)
+            eof_helper = None
+            if input_mode == "consumed":
+                gate.write_text("go", encoding="utf-8")
+                assert registry.submit_stdin(session.id, "hello")["status"] == "ok"
+                assert _wait_until(
+                    lambda: "got:hello" in registry.poll(session.id).get("output_preview", ""),
+                    timeout=5.0,
+                    interval=0.02,
+                ), "PTY child never consumed the complete record"
+            else:
+                if input_mode in ("pending", "reader_exit"):
+                    assert registry.write_stdin(session.id, "hello")["status"] == "ok"
+                assert registry.close_stdin(session.id)["status"] == "ok"
+                assert eof_writes == [b"\x01"]
+                assert registry.close_stdin(session.id)["status"] == "already_closed"
+                assert registry.write_stdin(session.id, "later")["status"] == "error"
+                eof_helper = session._pty_eof_thread
+                assert eof_helper is not None and eof_helper.daemon
+                gate.write_text("go", encoding="utf-8")
+
+            if input_mode == "consumed":
+                assert registry.close_stdin(session.id)["status"] == "ok"
+                assert registry.close_stdin(session.id)["status"] == "already_closed"
+                assert registry.write_stdin(session.id, "later")["status"] == "error"
+                eof_helper = session._pty_eof_thread
+
+            assert _wait_until(
+                lambda: registry.poll(session.id)["status"] == "exited",
+                timeout=5.0,
+                interval=0.02,
+            ), "process did not exit after stdin was closed"
+            poll = registry.poll(session.id)
+            expected = "hello" if input_mode != "empty" else ""
+            expected_eofs = (
+                [b"\x01"]
+                if input_mode == "reader_exit"
+                else [b"\x01", b"\x01"]
+            )
+            assert eof_writes == expected_eofs
+            assert poll["exit_code"] == 0
+            if input_mode != "reader_exit":
+                assert f"got:{expected}" in poll["output_preview"]
+                assert "eof:True" in poll["output_preview"]
+            assert "final" in poll["output_preview"]
+            session._reader_thread.join(timeout=1)
+            assert not session._reader_thread.is_alive()
+            assert eof_helper is not None
+            assert not eof_helper.is_alive()
+            assert session._pty_eof_thread is None
+            assert session._pty_eof_cancel is None
+            assert session._pty_eof_start is None
+            assert moved == [session.id]
+            assert session.id not in registry._running
+            assert registry._finished[session.id] is session
+            assert session._pty.closed and session._pty.fd == -1
+            with pytest.raises(ChildProcessError):
+                os.waitpid(pid, os.WNOHANG)
+            with pytest.raises(ProcessLookupError):
+                os.kill(pid, 0)
         finally:
             registry.kill_process(session.id)
 
@@ -812,44 +1190,100 @@ class TestSpawnEnvSanitization:
 # =========================================================================
 
 class TestPopenLeakOnSetupFailure:
-    """Regression for issue #2749: subprocess orphaned when post-Popen setup raises."""
+    """Regression for issue #2749: failed reader setup must not leak launches."""
 
-    def test_popen_killed_when_thread_creation_fails(self, registry):
-        """If Thread() raises after Popen, proc must be killed — not orphaned."""
+    @pytest.mark.parametrize("backend", ["pipe", "pty", "env"])
+    @pytest.mark.parametrize("failure_mode", ["constructor", "start"])
+    def test_thread_setup_failure_rolls_back(
+        self, registry, monkeypatch, backend, failure_mode
+    ):
+        """Every backend cleans up equally for Thread() and start() failures."""
+        import tools.process_registry as pr
+        from types import SimpleNamespace
+
+        errors = {
+            "pipe": "Thread creation failed",
+            "pty": "PTY reader creation failed",
+            "env": "Poller creation failed",
+        }
+        error = errors[backend]
+        checkpoint = MagicMock()
+        monkeypatch.setattr(registry, "_write_checkpoint", checkpoint)
+        monkeypatch.setattr(registry, "_safe_host_start_time", lambda _pid: None)
+        monkeypatch.setattr(pr, "_find_shell", lambda: "/bin/bash")
+
+        def fail():
+            raise RuntimeError(error)
+
+        def make_thread(*_args, **_kwargs):
+            if failure_mode == "constructor":
+                fail()
+            thread = MagicMock()
+            thread.start.side_effect = fail
+            return thread
+
+        monkeypatch.setattr(pr.threading, "Thread", make_thread)
+
         killed = []
+        popen = MagicMock()
+        terminated = []
+        waited = []
+        commands = []
+        if backend == "pipe":
+            proc = MagicMock(pid=9999)
+            proc.stdout = iter([])
+            proc.stdin = MagicMock()
+            proc.poll.return_value = None
+            proc.kill.side_effect = lambda: killed.append(True)
+            monkeypatch.setattr(pr.subprocess, "Popen", lambda *_a, **_kw: proc)
+            monkeypatch.setattr(
+                pr.os,
+                "getpgid",
+                lambda _pid: (_ for _ in ()).throw(ProcessLookupError),
+            )
+            launch = lambda: registry.spawn_local("echo hello", cwd="/tmp")
+        elif backend == "pty":
+            class FakePty:
+                pid = 5432
 
-        proc = MagicMock()
-        proc.pid = 9999
-        proc.stdout = iter([])
-        proc.stdin = MagicMock()
-        proc.poll.return_value = None
+                @classmethod
+                def spawn(cls, *_args, **_kwargs):
+                    return cls()
 
-        def fake_kill():
-            killed.append(True)
+                def terminate(self, force=False):
+                    terminated.append(force)
 
-        proc.kill = fake_kill
-        proc.wait = MagicMock()
+                def wait(self):
+                    waited.append(True)
 
-        def boom(*args, **kwargs):
-            raise RuntimeError("Thread creation failed")
+            monkeypatch.setitem(
+                sys.modules, "ptyprocess", SimpleNamespace(PtyProcess=FakePty)
+            )
+            monkeypatch.setattr(pr.subprocess, "Popen", popen)
+            launch = lambda: registry.spawn_local("echo hello", cwd="/tmp", use_pty=True)
+        else:
+            class FakeEnv:
+                def execute(self, command, **kwargs):
+                    commands.append((command, kwargs))
+                    return {"output": "4321\n", "returncode": 0}
 
-        # proc.pid is a MagicMock-backed fake; os.getpgid(fake_pid) would query
-        # the real OS for an arbitrary PID. On a busy host that PID may exist,
-        # in which case spawn_local's primary cleanup path
-        # (os.killpg(os.getpgid(pid), SIGKILL)) succeeds against an UNRELATED
-        # real process group and proc.kill() is never reached — flaky failure,
-        # and a real risk of SIGKILLing an innocent process group. Force the
-        # ProcessLookupError fallback so the test deterministically exercises
-        # proc.kill() and never issues a real killpg.
-        with patch("tools.process_registry._find_shell", return_value="/bin/bash"), \
-             patch("subprocess.Popen", return_value=proc), \
-             patch("threading.Thread", side_effect=boom), \
-             patch("os.getpgid", side_effect=ProcessLookupError), \
-             patch.object(registry, "_write_checkpoint"):
-            with pytest.raises(RuntimeError, match="Thread creation failed"):
-                registry.spawn_local("echo hello", cwd="/tmp")
+            launch = lambda: registry.spawn_via_env(FakeEnv(), "echo hello")
 
-        assert killed, "proc.kill() must be called when post-Popen setup raises"
+        with pytest.raises(RuntimeError, match=error):
+            launch()
+
+        assert registry._running == {}
+        assert registry.completion_queue.empty()
+        checkpoint.assert_called_once()
+        if backend == "pipe":
+            assert killed
+        elif backend == "pty":
+            popen.assert_not_called()
+            assert terminated == [True]
+            assert waited == [True]
+        else:
+            assert any(command.startswith("kill 4321") for command, _ in commands)
+
 
 # =========================================================================
 # Spawn rewrite regression (issue #68915)

@@ -4893,7 +4893,7 @@ def _persist_model_switch(result) -> None:
 
 def _snapshot_agent_model_runtime(agent) -> dict:
     """Capture the current agent model runtime for a one-turn restore."""
-    return {
+    snapshot = {
         "model": getattr(agent, "model", ""),
         "provider": getattr(agent, "provider", ""),
         "api_key": getattr(agent, "api_key", ""),
@@ -4901,12 +4901,34 @@ def _snapshot_agent_model_runtime(agent) -> dict:
         "api_mode": getattr(agent, "api_mode", ""),
         "primary_runtime": copy.deepcopy(getattr(agent, "_primary_runtime", None)),
     }
+    if hasattr(agent, "request_overrides"):
+        snapshot["request_overrides"] = copy.deepcopy(agent.request_overrides)
+    snapshot["one_turn_fallback_state"] = {
+        name: copy.deepcopy(getattr(agent, name))
+        for name in (
+            "_fallback_chain",
+            "_fallback_model",
+            "_fallback_index",
+            "_consecutive_stale_streams",
+        )
+        if hasattr(agent, name)
+    }
+    return snapshot
 
 
 def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
     """Restore an agent model runtime captured before a one-turn override."""
     if not snapshot or agent is None:
         return
+
+    def _restore_request_overrides() -> None:
+        if "request_overrides" in snapshot:
+            agent.request_overrides = copy.deepcopy(snapshot["request_overrides"])
+
+    def _restore_one_turn_fallback_state() -> None:
+        for name, value in snapshot.get("one_turn_fallback_state", {}).items():
+            setattr(agent, name, copy.deepcopy(value))
+
     primary = snapshot.get("primary_runtime")
     if primary and hasattr(agent, "_restore_primary_runtime"):
         try:
@@ -4914,6 +4936,8 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
             agent._fallback_activated = True
             agent._rate_limited_until = 0
             if agent._restore_primary_runtime():
+                _restore_request_overrides()
+                _restore_one_turn_fallback_state()
                 return
         except Exception:
             logger.debug("TUI one-turn model restore via primary runtime failed", exc_info=True)
@@ -4925,6 +4949,8 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
             base_url=snapshot.get("base_url", ""),
             api_mode=snapshot.get("api_mode", ""),
         )
+        _restore_request_overrides()
+        _restore_one_turn_fallback_state()
 
 
 def _apply_model_switch(
@@ -6701,6 +6727,22 @@ def _agent_fallback_model(agent):
 
 def _background_agent_kwargs(agent, task_id: str) -> dict:
     cfg = _load_cfg()
+    service_tier = getattr(agent, "service_tier", None) or _load_service_tier()
+    try:
+        from hermes_cli.models import resolve_fast_mode_overrides
+
+        fast_mode_overrides = (
+            resolve_fast_mode_overrides(str(getattr(agent, "model", "") or "")) or {}
+            if service_tier
+            else {}
+        )
+    except Exception:
+        fast_mode_overrides = {}
+    from agent.agent_init import _request_override_projections
+
+    caller_overrides, fast_mode_overrides = _request_override_projections(
+        agent, fast_mode_overrides
+    )
 
     return {
         "base_url": getattr(agent, "base_url", None) or None,
@@ -6733,8 +6775,9 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
         "session_id": task_id,
         "reasoning_config": getattr(agent, "reasoning_config", None)
         or _load_reasoning_config(str(getattr(agent, "model", "") or "")),
-        "service_tier": getattr(agent, "service_tier", None) or _load_service_tier(),
-        "request_overrides": dict(getattr(agent, "request_overrides", {}) or {}),
+        "service_tier": service_tier,
+        "request_overrides": caller_overrides,
+        "fast_mode_overrides": fast_mode_overrides,
         "platform": "tui",
         "session_db": _get_db(),
         "fallback_model": _agent_fallback_model(agent),
@@ -12193,6 +12236,10 @@ def _(rid, params: dict) -> dict:
             current_overrides.pop("speed", None)
             if nv == "fast":
                 current_overrides.update(overrides)
+            caller_overrides = getattr(agent, "_caller_request_overrides", {}) or {}
+            for name in ("service_tier", "speed"):
+                if name in caller_overrides:
+                    current_overrides[name] = caller_overrides[name]
             agent.request_overrides = current_overrides
             _persist_live_session_runtime(session)
             _emit(

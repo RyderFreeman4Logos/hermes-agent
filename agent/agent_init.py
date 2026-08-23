@@ -19,6 +19,7 @@ preserved.
 
 from __future__ import annotations
 
+import copy as _copy
 import logging
 import os
 import re
@@ -49,10 +50,9 @@ from agent.tool_guardrails import (
     ToolGuardrailDecision,
 )
 from hermes_cli.config import cfg_get
-from hermes_cli.route_identity import normalize_route_base_url
 from hermes_cli.timeouts import get_provider_request_timeout
 from hermes_constants import get_hermes_home
-from utils import base_url_host_matches, is_truthy_value
+from utils import base_url_host_matches, is_truthy_value, normalize_route_base_url
 
 # Use the same logger name as run_agent so tests patching ``run_agent.logger``
 # capture our warnings.  (run_agent.py also does
@@ -398,9 +398,41 @@ def _record_codex_gpt55_autoraise_notice(autoraise: Dict[str, Any]) -> None:
 
 
 def _normalized_custom_base_url(value: Any) -> str:
-    if not isinstance(value, str):
-        return ""
-    return value.strip().rstrip("/")
+    return normalize_route_base_url(value)
+
+
+def _request_override_projections(
+    agent, derived_overrides: Optional[Dict[str, Any]] = None
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """Return independent caller-owned and derived runtime projections."""
+    caller = _copy.deepcopy(getattr(agent, "_caller_request_overrides", {}) or {})
+    derived = _copy.deepcopy(derived_overrides or {})
+    return (
+        caller if isinstance(caller, dict) else {},
+        derived if isinstance(derived, dict) else {},
+    )
+
+
+def _compose_request_overrides(
+    agent,
+    derived_overrides: Optional[Dict[str, Any]] = None,
+    *,
+    custom_providers: Optional[List[Dict[str, Any]]] = None,
+) -> None:
+    """Compose owned caller state with a fresh derived runtime projection."""
+    caller, derived = _request_override_projections(agent, derived_overrides)
+    composed = derived
+    derived_extra_body = composed.get("extra_body")
+    caller_extra_body = caller.get("extra_body")
+    if isinstance(derived_extra_body, dict) and isinstance(caller_extra_body, dict):
+        caller["extra_body"] = {
+            **_copy.deepcopy(derived_extra_body),
+            **_copy.deepcopy(caller_extra_body),
+        }
+    composed.update(caller)
+    agent.request_overrides = composed
+    if custom_providers is not None:
+        _merge_custom_provider_extra_body(agent, custom_providers)
 
 
 def _custom_provider_model_matches(agent_model: str, entry: Dict[str, Any]) -> bool:
@@ -464,9 +496,9 @@ def _custom_provider_extra_body_for_agent(
         provider_model = str(entry.get("model", "") or "").strip()
         if provider_model:
             if _custom_provider_model_matches(model, entry):
-                return dict(extra_body)
+                return _copy.deepcopy(extra_body)
         elif fallback is None:
-            fallback = dict(extra_body)
+            fallback = _copy.deepcopy(extra_body)
 
     return fallback
 
@@ -481,11 +513,11 @@ def _merge_custom_provider_extra_body(agent, custom_providers: List[Dict[str, An
     if not extra_body:
         return
 
-    overrides = dict(getattr(agent, "request_overrides", {}) or {})
-    merged_extra_body = dict(extra_body)
+    overrides = _copy.deepcopy(getattr(agent, "request_overrides", {}) or {})
+    merged_extra_body = _copy.deepcopy(extra_body)
     existing_extra_body = overrides.get("extra_body")
     if isinstance(existing_extra_body, dict):
-        merged_extra_body.update(existing_extra_body)
+        merged_extra_body.update(_copy.deepcopy(existing_extra_body))
     overrides["extra_body"] = merged_extra_body
     agent.request_overrides = overrides
 
@@ -563,6 +595,7 @@ def init_agent(
     reasoning_config: Dict[str, Any] = None,
     service_tier: str = None,
     request_overrides: Dict[str, Any] = None,
+    fast_mode_overrides: Dict[str, Any] = None,
     prefill_messages: List[Dict[str, Any]] = None,
     platform: str = None,
     user_id: str = None,
@@ -938,7 +971,8 @@ def init_agent(
     # keep it in sync with the active provider.
     agent._reasoning_echo_flag = agent._read_reasoning_echo_from_config()
     agent.service_tier = service_tier
-    agent.request_overrides = dict(request_overrides or {})
+    agent._caller_request_overrides = _copy.deepcopy(request_overrides or {})
+    _compose_request_overrides(agent, fast_mode_overrides)
     agent.prefill_messages = prefill_messages or []  # Prefilled conversation turns
     agent._force_ascii_payload = False
     
@@ -3043,6 +3077,7 @@ def init_agent(
         "api_mode": agent.api_mode,
         "api_key": getattr(agent, "api_key", ""),
         "client_kwargs": dict(agent._client_kwargs),
+        "request_overrides": _copy.deepcopy(agent.request_overrides),
         "use_prompt_caching": agent._use_prompt_caching,
         "use_native_cache_layout": agent._use_native_cache_layout,
         "reasoning_echo_flag": getattr(agent, "_reasoning_echo_flag", False),

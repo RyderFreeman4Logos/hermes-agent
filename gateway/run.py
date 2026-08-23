@@ -5765,7 +5765,7 @@ class TurnRunner:
                 prefill_messages=self._runner._prefill_messages or None,
                 reasoning_config=reasoning_config,
                 service_tier=self._runner._service_tier,
-                request_overrides=turn_route.get("request_overrides"),
+                fast_mode_overrides=turn_route.get("request_overrides"),
                 providers_allowed=pr.get("only"),
                 providers_ignored=pr.get("ignore"),
                 providers_order=pr.get("order"),
@@ -5878,7 +5878,13 @@ class TurnRunner:
         agent.event_callback = ctx._event_callback_sync
         agent.reasoning_config = reasoning_config
         agent.service_tier = self._runner._service_tier
-        agent.request_overrides = turn_route.get("request_overrides") or {}
+        from agent.agent_init import _compose_request_overrides
+
+        _compose_request_overrides(
+            agent,
+            turn_route.get("request_overrides") or {},
+            custom_providers=getattr(agent, "_custom_providers", []),
+        )
         # Must-deliver notes for THIS turn ride the current user message
         # (api_content sidecar), never the system prompt: staged by
         # _handle_message_with_agent (auto-reset note, first-contact
@@ -22722,7 +22728,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     disabled_toolsets=disabled_toolsets,
                     reasoning_config=reasoning_config,
                     service_tier=self._service_tier,
-                    request_overrides=turn_route.get("request_overrides"),
+                    fast_mode_overrides=turn_route.get("request_overrides"),
                     providers_allowed=pr.get("only"),
                     providers_ignored=pr.get("ignore"),
                     providers_order=pr.get("order"),

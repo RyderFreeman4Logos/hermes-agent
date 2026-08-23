@@ -812,44 +812,100 @@ class TestSpawnEnvSanitization:
 # =========================================================================
 
 class TestPopenLeakOnSetupFailure:
-    """Regression for issue #2749: subprocess orphaned when post-Popen setup raises."""
+    """Regression for issue #2749: failed reader setup must not leak launches."""
 
-    def test_popen_killed_when_thread_creation_fails(self, registry):
-        """If Thread() raises after Popen, proc must be killed — not orphaned."""
+    @pytest.mark.parametrize("backend", ["pipe", "pty", "env"])
+    @pytest.mark.parametrize("failure_mode", ["constructor", "start"])
+    def test_thread_setup_failure_rolls_back(
+        self, registry, monkeypatch, backend, failure_mode
+    ):
+        """Every backend cleans up equally for Thread() and start() failures."""
+        import tools.process_registry as pr
+        from types import SimpleNamespace
+
+        errors = {
+            "pipe": "Thread creation failed",
+            "pty": "PTY reader creation failed",
+            "env": "Poller creation failed",
+        }
+        error = errors[backend]
+        checkpoint = MagicMock()
+        monkeypatch.setattr(registry, "_write_checkpoint", checkpoint)
+        monkeypatch.setattr(registry, "_safe_host_start_time", lambda _pid: None)
+        monkeypatch.setattr(pr, "_find_shell", lambda: "/bin/bash")
+
+        def fail():
+            raise RuntimeError(error)
+
+        def make_thread(*_args, **_kwargs):
+            if failure_mode == "constructor":
+                fail()
+            thread = MagicMock()
+            thread.start.side_effect = fail
+            return thread
+
+        monkeypatch.setattr(pr.threading, "Thread", make_thread)
+
         killed = []
+        popen = MagicMock()
+        terminated = []
+        waited = []
+        commands = []
+        if backend == "pipe":
+            proc = MagicMock(pid=9999)
+            proc.stdout = iter([])
+            proc.stdin = MagicMock()
+            proc.poll.return_value = None
+            proc.kill.side_effect = lambda: killed.append(True)
+            monkeypatch.setattr(pr.subprocess, "Popen", lambda *_a, **_kw: proc)
+            monkeypatch.setattr(
+                pr.os,
+                "getpgid",
+                lambda _pid: (_ for _ in ()).throw(ProcessLookupError),
+            )
+            launch = lambda: registry.spawn_local("echo hello", cwd="/tmp")
+        elif backend == "pty":
+            class FakePty:
+                pid = 5432
 
-        proc = MagicMock()
-        proc.pid = 9999
-        proc.stdout = iter([])
-        proc.stdin = MagicMock()
-        proc.poll.return_value = None
+                @classmethod
+                def spawn(cls, *_args, **_kwargs):
+                    return cls()
 
-        def fake_kill():
-            killed.append(True)
+                def terminate(self, force=False):
+                    terminated.append(force)
 
-        proc.kill = fake_kill
-        proc.wait = MagicMock()
+                def wait(self):
+                    waited.append(True)
 
-        def boom(*args, **kwargs):
-            raise RuntimeError("Thread creation failed")
+            monkeypatch.setitem(
+                sys.modules, "ptyprocess", SimpleNamespace(PtyProcess=FakePty)
+            )
+            monkeypatch.setattr(pr.subprocess, "Popen", popen)
+            launch = lambda: registry.spawn_local("echo hello", cwd="/tmp", use_pty=True)
+        else:
+            class FakeEnv:
+                def execute(self, command, **kwargs):
+                    commands.append((command, kwargs))
+                    return {"output": "4321\n", "returncode": 0}
 
-        # proc.pid is a MagicMock-backed fake; os.getpgid(fake_pid) would query
-        # the real OS for an arbitrary PID. On a busy host that PID may exist,
-        # in which case spawn_local's primary cleanup path
-        # (os.killpg(os.getpgid(pid), SIGKILL)) succeeds against an UNRELATED
-        # real process group and proc.kill() is never reached — flaky failure,
-        # and a real risk of SIGKILLing an innocent process group. Force the
-        # ProcessLookupError fallback so the test deterministically exercises
-        # proc.kill() and never issues a real killpg.
-        with patch("tools.process_registry._find_shell", return_value="/bin/bash"), \
-             patch("subprocess.Popen", return_value=proc), \
-             patch("threading.Thread", side_effect=boom), \
-             patch("os.getpgid", side_effect=ProcessLookupError), \
-             patch.object(registry, "_write_checkpoint"):
-            with pytest.raises(RuntimeError, match="Thread creation failed"):
-                registry.spawn_local("echo hello", cwd="/tmp")
+            launch = lambda: registry.spawn_via_env(FakeEnv(), "echo hello")
 
-        assert killed, "proc.kill() must be called when post-Popen setup raises"
+        with pytest.raises(RuntimeError, match=error):
+            launch()
+
+        assert registry._running == {}
+        assert registry.completion_queue.empty()
+        checkpoint.assert_called_once()
+        if backend == "pipe":
+            assert killed
+        elif backend == "pty":
+            popen.assert_not_called()
+            assert terminated == [True]
+            assert waited == [True]
+        else:
+            assert any(command.startswith("kill 4321") for command, _ in commands)
+
 
 # =========================================================================
 # Spawn rewrite regression (issue #68915)

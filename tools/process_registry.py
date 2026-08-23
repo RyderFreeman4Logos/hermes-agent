@@ -956,6 +956,22 @@ class ProcessRegistry:
             except (psutil.AccessDenied, OSError):
                 pass
 
+    def _rollback_failed_launch(self, session: ProcessSession) -> None:
+        """Remove a failed post-registration launch without emitting completion."""
+        with self._lock:
+            if self._running.get(session.id) is session:
+                self._running.pop(session.id, None)
+        session.notify_on_complete = False
+        session.exited = True
+        session.exit_code = -1
+        session.completion_reason = "failed_start"
+        session.termination_source = "failed_start"
+        session._completion_event.set()
+        try:
+            self._write_checkpoint()
+        except Exception:
+            logger.exception("Could not persist failed launch cleanup for %s", session.id)
+
     # ----- Spawn -----
 
     @staticmethod
@@ -979,6 +995,8 @@ class ProcessRegistry:
         session_key: str = "",
         env_vars: dict = None,
         use_pty: bool = False,
+        notify_on_complete: bool = False,
+        watcher_metadata: Optional[Dict[str, Any]] = None,
     ) -> ProcessSession:
         """
         Spawn a background process locally.
@@ -1006,6 +1024,8 @@ class ProcessRegistry:
             session_key=session_key,
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
             started_at=time.time(),
+            notify_on_complete=notify_on_complete,
+            **(watcher_metadata or {}),
         )
 
         pty_scope_attempted = False
@@ -1056,6 +1076,10 @@ class ProcessRegistry:
                 # Store the pty handle on the session for read/write
                 session._pty = pty_proc
 
+                with self._lock:
+                    self._prune_if_needed()
+                    self._running[session.id] = session
+
                 # PTY reader thread
                 reader = threading.Thread(
                     target=self._pty_reader_loop,
@@ -1066,10 +1090,6 @@ class ProcessRegistry:
                 session._reader_thread = reader
                 reader.start()
 
-                with self._lock:
-                    self._prune_if_needed()
-                    self._running[session.id] = session
-
                 self._write_checkpoint()
                 return session
 
@@ -1077,6 +1097,21 @@ class ProcessRegistry:
                 logger.warning("ptyprocess not installed, falling back to pipe mode")
             except Exception as e:
                 logger.warning("PTY spawn failed (%s), falling back to pipe mode", e)
+                if session._pty is not None:
+                    # The PTY child already exists. Reaping it and refusing a
+                    # pipe fallback avoids executing the command twice.
+                    session.notify_on_complete = False
+                    try:
+                        session._pty.terminate(force=True)
+                    except Exception:
+                        if session.pid:
+                            self._terminate_host_pid(session.pid, session.host_start_time)
+                    try:
+                        session._pty.wait()
+                    except Exception:
+                        pass
+                    self._rollback_failed_launch(session)
+                    raise
                 if pty_scope_attempted and session.systemd_unit:
                     if not _stop_systemd_unit(session.systemd_unit):
                         raise RuntimeError(
@@ -1162,6 +1197,10 @@ class ProcessRegistry:
         session.host_start_time = self._safe_host_start_time(session.pid)
 
         try:
+            with self._lock:
+                self._prune_if_needed()
+                self._running[session.id] = session
+
             # Start output reader thread
             reader = threading.Thread(
                 target=self._reader_loop,
@@ -1172,15 +1211,12 @@ class ProcessRegistry:
             session._reader_thread = reader
             reader.start()
 
-            with self._lock:
-                self._prune_if_needed()
-                self._running[session.id] = session
-
             self._write_checkpoint()
         except Exception:
             # Post-Popen setup failed — kill the orphaned subprocess (and any
             # descendants spawned via setsid) before re-raising so they do not
             # leak as untracked background processes.
+            session.notify_on_complete = False
             try:
                 if session.systemd_unit:
                     # The worker runs in its own systemd scope and, since the
@@ -1205,6 +1241,7 @@ class ProcessRegistry:
                 proc.wait(timeout=5)
             except Exception:
                 pass
+            self._rollback_failed_launch(session)
             raise
 
         return session
@@ -1217,6 +1254,8 @@ class ProcessRegistry:
         task_id: str = "",
         session_key: str = "",
         timeout: int = 10,
+        notify_on_complete: bool = False,
+        watcher_metadata: Optional[Dict[str, Any]] = None,
     ) -> ProcessSession:
         """
         Spawn a background process through a non-local environment backend.
@@ -1238,6 +1277,8 @@ class ProcessRegistry:
             started_at=time.time(),
             env_ref=env,
             pid_scope="sandbox",
+            notify_on_complete=notify_on_complete,
+            **(watcher_metadata or {}),
         )
 
         # Run the command in the sandbox with output capture
@@ -1289,23 +1330,37 @@ class ProcessRegistry:
             session.output_buffer = f"Failed to start: {e}"
 
         if not session.exited:
-            # Start a poller thread that periodically reads the log file
-            reader = threading.Thread(
-                target=self._env_poller_loop,
-                args=(session, env, log_path, pid_path, exit_path),
-                daemon=True,
-                name=f"proc-poller-{session.id}",
-            )
-            session._reader_thread = reader
-            reader.start()
+            try:
+                with self._lock:
+                    self._prune_if_needed()
+                    self._running[session.id] = session
 
-        with self._lock:
-            self._prune_if_needed()
-            if not session.exited:
-                self._running[session.id] = session
-
-        if not session.exited:
-            self._write_checkpoint()
+                # Start a poller thread that periodically reads the log file
+                reader = threading.Thread(
+                    target=self._env_poller_loop,
+                    args=(session, env, log_path, pid_path, exit_path),
+                    daemon=True,
+                    name=f"proc-poller-{session.id}",
+                )
+                session._reader_thread = reader
+                reader.start()
+                self._write_checkpoint()
+            except Exception:
+                session.notify_on_complete = False
+                session.exited = True
+                if session.env_ref and session.pid:
+                    try:
+                        session.env_ref.execute(
+                            f"kill {session.pid} 2>/dev/null", timeout=5
+                        )
+                    except Exception:
+                        logger.debug(
+                            "Could not terminate failed environment launch %s",
+                            session.id,
+                            exc_info=True,
+                        )
+                self._rollback_failed_launch(session)
+                raise
 
         return session
 
@@ -1576,6 +1631,8 @@ class ProcessRegistry:
                 "session_id": session.id,
                 "session_key": session.session_key,
                 "task_id": session.task_id,
+                "platform": session.watcher_platform,
+                "parent_session_id": session.parent_session_id,
                 "command": session.command,
                 "exit_code": session.exit_code,
                 "completion_reason": session.completion_reason,

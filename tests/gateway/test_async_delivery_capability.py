@@ -182,9 +182,17 @@ class TestTerminalNotifyGate:
     def _clean_watchers(self):
         from tools.process_registry import process_registry
 
+        process_registry._running.clear()
+        process_registry._finished.clear()
         process_registry.pending_watchers = []
+        while not process_registry.completion_queue.empty():
+            process_registry.completion_queue.get_nowait()
         yield
+        process_registry._running.clear()
+        process_registry._finished.clear()
         process_registry.pending_watchers = []
+        while not process_registry.completion_queue.empty():
+            process_registry.completion_queue.get_nowait()
 
     def _run_bg(self, command):
         from tools.terminal_tool import terminal_tool
@@ -193,7 +201,7 @@ class TestTerminalNotifyGate:
             terminal_tool(command=command, background=True, notify_on_complete=True)
         )
 
-    def test_api_server_skips_watcher_and_notes(self):
+    def test_api_server_refuses_notification_before_spawn(self):
         from tools.process_registry import process_registry
 
         tokens = set_session_vars(
@@ -204,9 +212,13 @@ class TestTerminalNotifyGate:
         finally:
             clear_session_vars(tokens)
 
-        assert d.get("notify_on_complete") is False
-        assert d.get("notify_unsupported"), "must explain the limitation"
-        assert "poll" in d["notify_unsupported"].lower()
-        assert len(process_registry.pending_watchers) == 0
+        assert d["status"] == "error"
+        assert d["exit_code"] != 0
+        assert d["notify_unsupported"] is True
+        assert "not started" in d["error"]
+        assert not process_registry._running
+        assert not process_registry._finished
+        assert process_registry.completion_queue.empty()
+        assert not process_registry.pending_watchers
 
 

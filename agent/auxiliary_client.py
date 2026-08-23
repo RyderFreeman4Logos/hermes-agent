@@ -44,6 +44,7 @@ Payment / credit exhaustion fallback:
   their OpenRouter balance but has Codex OAuth or another provider available.
 """
 
+import asyncio
 import contextlib
 import contextvars
 import copy
@@ -3320,14 +3321,17 @@ def _set_relay_auxiliary_route(
 
 
 def _record_route_info(
-    route_info: Optional[Dict[str, str]],
+    route_info: Optional[Dict[str, Any]],
     provider: Optional[str],
     model: Optional[str],
+    fallback_label: Optional[str] = None,
 ) -> None:
     """Expose the concrete route selected for one auxiliary call."""
     if route_info is not None:
         route_info["provider"] = provider or "auto"
         route_info["model"] = model or "default"
+        if fallback_label and fallback_label.startswith("fallback_chain["):
+            route_info["fallback_label"] = fallback_label
 
 
 def _relay_auxiliary_metadata(
@@ -5074,6 +5078,200 @@ class _FallbackDestination(NamedTuple):
     base_url: str
     api_mode: Optional[str]
     model: Optional[str]
+    credential_scope: str = ""
+
+
+class _FallbackRoute(NamedTuple):
+    """Secret-free selected route descriptor for caller-owned metadata."""
+
+    label: str
+    destination: _FallbackDestination
+
+
+class _StaleFallbackRoute(Exception):
+    """Private control flow for a selected configured route that changed."""
+
+    def __init__(self, label: str) -> None:
+        super().__init__("selected fallback route changed")
+        self.label = label
+
+
+def _validate_fallback_base_url(value: Any) -> str:
+    """Reject credential-bearing or malformed fallback URLs without echoing them."""
+    if value is None:
+        return ""
+    base_url = str(value)
+    if not base_url or any(
+        char == "\\" or char.isspace() or ord(char) <= 0x1F or 0x80 <= ord(char) <= 0x9F or ord(char) == 0x7F
+        for char in base_url
+    ):
+        raise ValueError("fallback base_url is malformed")
+    try:
+        parsed = urlparse(base_url)
+        # Accessors perform the authority/port validation that urlparse defers.
+        if not parsed.scheme or not parsed.hostname:
+            raise ValueError("missing URL scheme or hostname")
+        parsed.port
+        if re.search(r"%(?![0-9A-Fa-f]{2})", base_url):
+            raise ValueError("malformed percent escape")
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("embedded credentials")
+        # Match the strict URL/IDNA validation used by the HTTP client stack.
+        from httpx import URL
+        strict_url = URL(base_url)
+        _ = strict_url.host
+    except Exception:
+        raise ValueError("fallback base_url is malformed") from None
+    return base_url
+
+
+def _fallback_credential_scope(entry: Dict[str, Any]) -> str:
+    """Return a nonsecret identity for the entry's credential source."""
+    key_env = str(entry.get("key_env") or entry.get("api_key_env") or "").strip()
+    if key_env:
+        return f"env:{key_env}"
+    if str(entry.get("api_key") or "").strip():
+        return "inline"
+    return f"provider:{str(entry.get('provider') or '').strip()}"
+
+
+def _fallback_route(
+    task: Optional[str],
+    client: Any,
+    model: Optional[str],
+    label: str,
+) -> _FallbackRoute:
+    return _FallbackRoute(
+        label=label,
+        destination=_fallback_destination(task, client, model, label),
+    )
+
+
+def _record_selected_fallback_route(
+    route_info: Optional[Dict[str, Any]], route: _FallbackRoute,
+) -> None:
+    if route_info is not None:
+        route_info["_fallback_route"] = route
+
+
+def _failed_fallback_labels(route_info: Optional[Dict[str, Any]]) -> set[str]:
+    if not isinstance(route_info, dict):
+        return set()
+    labels = route_info.get("_failed_fallback_labels")
+    return set(labels) if isinstance(labels, (set, list, tuple)) else set()
+
+
+def _remember_failed_fallback(
+    route_info: Optional[Dict[str, Any]], label: str,
+) -> None:
+    if isinstance(route_info, dict) and label:
+        labels = route_info.setdefault("_failed_fallback_labels", [])
+        if isinstance(labels, set):
+            labels = route_info["_failed_fallback_labels"] = list(labels)
+        if isinstance(labels, list) and label not in labels:
+            labels.append(label)
+
+
+def _discard_selected_fallback_route(
+    route_info: Optional[Dict[str, Any]],
+    *,
+    failed_label: Optional[str] = None,
+) -> None:
+    if not isinstance(route_info, dict):
+        return
+    route = route_info.get("_fallback_route")
+    label = failed_label or str(route_info.get("fallback_label") or "")
+    if not label and isinstance(route, _FallbackRoute):
+        label = route.label
+    if label:
+        _remember_failed_fallback(route_info, label)
+    route_info.pop("_fallback_route", None)
+    route_info.pop("provider", None)
+    route_info.pop("model", None)
+    route_info.pop("fallback_label", None)
+
+
+def _fallback_label_identity(label: str) -> Optional[Tuple[str, int]]:
+    match = re.match(r"(fallback_chain|fallback_providers)\[(\d+)\]", label or "")
+    return (match.group(1), int(match.group(2))) if match else None
+
+
+def _fallback_label_excluded(label: str, skip_labels: set[str]) -> bool:
+    if label in skip_labels:
+        return True
+    identity = _fallback_label_identity(label)
+    return identity is not None and any(
+        _fallback_label_identity(skipped) == identity for skipped in skip_labels
+    )
+
+
+def _release_task_scope_for_fallback(lease: Optional[Dict[str, Any]]) -> None:
+    """Swap the primary task permit for the selected candidate permit."""
+    if not lease:
+        return
+    semaphore = lease.pop("semaphore", None)
+    if semaphore is not None:
+        semaphore.release()
+
+
+def _route_from_info(route_info: Optional[Dict[str, Any]]) -> Optional[_FallbackRoute]:
+    route = route_info.get("_fallback_route") if isinstance(route_info, dict) else None
+    return route if isinstance(route, _FallbackRoute) else None
+
+
+def _fallback_response_has_content(response: Any) -> bool:
+    if response is None:
+        return False
+    choices = getattr(response, "choices", None)
+    if choices is None:
+        return bool(response)
+    if not choices:
+        return False
+    message = getattr(choices[0], "message", None)
+    content = getattr(message, "content", None)
+    reasoning = getattr(message, "reasoning_content", None)
+    return bool(content) or (isinstance(reasoning, str) and bool(reasoning))
+
+
+def _resolve_selected_fallback_route(
+    task: Optional[str], route: _FallbackRoute, *, async_mode: bool = False,
+) -> Tuple[Optional[Any], Optional[str]]:
+    """Resolve a descriptor privately without putting its client in metadata."""
+    entry = _fallback_chain_entry(task, route.label)
+    if entry is not None:
+        client, model = _resolve_fallback_entry(entry)
+        current = _fallback_destination_from_entry(entry, client, model)
+        if current != route.destination:
+            raise _StaleFallbackRoute(route.label)
+        if client is not None and async_mode:
+            client, model = _to_async_client(
+                client, model or route.destination.model or "", is_vision=(task == "vision"),
+            )
+    else:
+        if route.label.startswith("fallback_chain["):
+            raise _StaleFallbackRoute(route.label)
+        destination = route.destination
+        client, model = _get_cached_client(
+            destination.provider, destination.model or "", async_mode=async_mode,
+            base_url=destination.base_url or "", api_mode=destination.api_mode or "", task=task,
+        )
+    if client is None:
+        raise _StaleFallbackRoute(route.label)
+    return client, model or route.destination.model
+
+
+def _prepare_selected_fallback_replan(
+    route_info: Optional[Dict[str, Any]],
+    route: _FallbackRoute,
+    error: Optional[BaseException],
+) -> Tuple[BaseException, str]:
+    """Capture the failed selected label before clearing its route metadata."""
+    _discard_selected_fallback_route(route_info, failed_label=route.label)
+    if isinstance(error, _StaleFallbackRoute):
+        return RuntimeError("selected fallback route is unavailable"), "selected fallback route changed"
+    return error or RuntimeError(
+        "selected fallback route returned no usable response"
+    ), "selected fallback route failed"
 
 
 def _complete_fallback_destination(
@@ -5081,7 +5279,9 @@ def _complete_fallback_destination(
     base_url: str,
     api_mode: Optional[str],
     model: Optional[str],
+    credential_scope: str = "",
 ) -> _FallbackDestination:
+    base_url = _validate_fallback_base_url(base_url)
     if not api_mode:
         if _endpoint_speaks_anthropic_messages(base_url):
             api_mode = "anthropic_messages"
@@ -5097,7 +5297,7 @@ def _complete_fallback_destination(
                 api_mode = str(runtime.get("api_mode") or "").strip() or None
             except Exception:
                 pass
-    return _FallbackDestination(provider, base_url, api_mode, model)
+    return _FallbackDestination(provider, base_url, api_mode, model, credential_scope)
 
 
 def _fallback_destination_from_entry(
@@ -5106,14 +5306,15 @@ def _fallback_destination_from_entry(
     fb_model: Optional[str],
 ) -> _FallbackDestination:
     provider = str(entry.get("provider") or "").strip()
-    base_url = str(
-        entry.get("base_url") or getattr(fb_client, "base_url", "") or ""
-    ).strip()
+    configured_base_url = str(entry.get("base_url") or "").strip()
+    base_url = configured_base_url or str(getattr(fb_client, "base_url", "") or "").strip()
     api_mode = str(
         entry.get("api_mode") or entry.get("transport") or ""
     ).strip() or None
     model = fb_model or str(entry.get("model") or "").strip() or None
-    return _complete_fallback_destination(provider, base_url, api_mode, model)
+    return _complete_fallback_destination(
+        provider, base_url, api_mode, model, _fallback_credential_scope(entry)
+    )
 
 
 def _fallback_destination(
@@ -5128,7 +5329,7 @@ def _fallback_destination(
         return attached
 
     provider = _fallback_provider_from_label(fb_label)
-    base_url = str(getattr(fb_client, "base_url", "") or "")
+    base_url = str(getattr(fb_client, "base_url", "") or "").strip()
     api_mode = None
     model = fb_model
 
@@ -5180,6 +5381,7 @@ def _call_fallback_candidate_sync(
     effective_timeout: float,
     effective_extra_body: dict,
     reasoning_config: Optional[dict],
+    destination: Optional[_FallbackDestination] = None,
 ) -> Optional[Any]:
     """Call one fallback candidate with stale-credential recovery.
 
@@ -5209,7 +5411,7 @@ def _call_fallback_candidate_sync(
             task or "call", fb_label, fb_timeout, effective_timeout,
         )
         effective_timeout = fb_timeout
-    destination = _fallback_destination(task, fb_client, fb_model, fb_label)
+    destination = destination or _fallback_destination(task, fb_client, fb_model, fb_label)
     fallback_messages, fallback_tools = _replan_synchronous_cache_sections(
         messages,
         tools,
@@ -5251,6 +5453,7 @@ def _call_fallback_candidate_sync(
                     or str(getattr(retry_client, "base_url", "") or ""),
                     destination.api_mode,
                     retry_model or destination.model,
+                    destination.credential_scope,
                 )
                 retry_messages, retry_tools = _replan_synchronous_cache_sections(
                     messages,
@@ -5305,6 +5508,7 @@ async def _call_fallback_candidate_async(
     effective_timeout: float,
     effective_extra_body: dict,
     reasoning_config: Optional[dict],
+    destination: Optional[_FallbackDestination] = None,
 ) -> Optional[Any]:
     """Async mirror of :func:`_call_fallback_candidate_sync`."""
     fb_timeout = _fallback_entry_timeout(task, fb_label)
@@ -5315,7 +5519,7 @@ async def _call_fallback_candidate_async(
             task or "call", fb_label, fb_timeout, effective_timeout,
         )
         effective_timeout = fb_timeout
-    destination = _fallback_destination(task, fb_client, fb_model, fb_label)
+    destination = destination or _fallback_destination(task, fb_client, fb_model, fb_label)
     fallback_messages, fallback_tools = _replan_synchronous_cache_sections(
         messages,
         tools,
@@ -5358,6 +5562,7 @@ async def _call_fallback_candidate_async(
                     or str(getattr(retry_client, "base_url", "") or ""),
                     destination.api_mode,
                     retry_model or destination.model,
+                    destination.credential_scope,
                 )
                 retry_messages, retry_tools = _replan_synchronous_cache_sections(
                     messages,
@@ -5393,6 +5598,84 @@ async def _call_fallback_candidate_async(
             task or "call", fb_label, fb_err,
         )
         return None
+
+
+
+def _run_fallback_candidate_sync(
+    fb_client: Any,
+    fb_model: Optional[str],
+    fb_label: str,
+    *,
+    route_info: Optional[Dict[str, Any]],
+    scope_lease: Optional[Dict[str, Any]],
+    **kwargs: Any,
+) -> Optional[Any]:
+    _release_task_scope_for_fallback(scope_lease)
+    semaphore = _acquire_sync_aux_semaphore(kwargs.get("task"), fb_label)
+    if semaphore is not None:
+        semaphore.acquire()
+    try:
+        route = _fallback_route(kwargs.get("task"), fb_client, fb_model, fb_label)
+        response = _call_fallback_candidate_sync(
+            fb_client, fb_model, fb_label, **kwargs,
+        )
+    except BaseException:
+        _remember_failed_fallback(route_info, fb_label)
+        raise
+    finally:
+        if semaphore is not None:
+            semaphore.release()
+    if response is not None:
+        _record_route_info(
+            route_info, _fallback_provider_from_label(fb_label), fb_model, fb_label,
+        )
+        _record_selected_fallback_route(route_info, route)
+    else:
+        _remember_failed_fallback(route_info, fb_label)
+    return response
+
+
+async def _run_fallback_candidate_async(
+    fb_client: Any,
+    fb_model: Optional[str],
+    fb_label: str,
+    *,
+    route_info: Optional[Dict[str, Any]],
+    scope_lease: Optional[Dict[str, Any]],
+    **kwargs: Any,
+) -> Optional[Any]:
+    _release_task_scope_for_fallback(scope_lease)
+    semaphore = _acquire_async_aux_semaphore(kwargs.get("task"), fb_label)
+    if semaphore is not None:
+        await semaphore.acquire()
+    try:
+        original_route = _fallback_route(kwargs.get("task"), fb_client, fb_model, fb_label)
+        async_fb, async_model = _to_async_client(
+            fb_client, fb_model or "", is_vision=(kwargs.get("task") == "vision"),
+        )
+        route = _FallbackRoute(fb_label, original_route.destination)
+        response = await _call_fallback_candidate_async(
+            async_fb, async_model or fb_model, fb_label,
+            destination=original_route.destination,
+            **kwargs,
+        )
+    except BaseException as exc:
+        if isinstance(exc, (AuxiliaryExplicitCancellation, asyncio.CancelledError)):
+            raise
+        _remember_failed_fallback(route_info, fb_label)
+        raise
+    finally:
+        if semaphore is not None:
+            semaphore.release()
+    if response is not None:
+        _record_route_info(
+            route_info, _fallback_provider_from_label(fb_label),
+            async_model or fb_model, fb_label,
+        )
+        _record_selected_fallback_route(route_info, route)
+    else:
+        _remember_failed_fallback(route_info, fb_label)
+    return response
 
 
 def _try_payment_fallback(
@@ -5619,6 +5902,7 @@ def _try_configured_fallback_chain(
     failed_provider: str,
     reason: str = "error",
     failed_model: Optional[str] = None,
+    skip_labels: Optional[set[str]] = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Try user-configured fallback_chain for a specific auxiliary task.
 
@@ -5697,6 +5981,8 @@ def _try_configured_fallback_chain(
         fb_model = fb_model_raw or None
 
         label = f"fallback_chain[{i}]({fb_provider})"
+        if _fallback_label_excluded(label, skip_labels or set()):
+            continue
 
         try:
             fb_client, resolved_model = _resolve_fallback_entry(entry)
@@ -5773,7 +6059,7 @@ def _resolve_fallback_entry(entry: Dict[str, Any]) -> Tuple[Optional[Any], Optio
     model = str(entry.get("model") or "").strip() or None
     if not provider or not model:
         return None, None
-    base_url = str(entry.get("base_url") or "").strip() or None
+    base_url = _validate_fallback_base_url(entry.get("base_url")) or None
     api_key = _fallback_entry_api_key(entry)
     api_mode = str(entry.get("api_mode") or entry.get("transport") or "").strip() or None
     client, resolved_model = resolve_provider_client(
@@ -8362,44 +8648,82 @@ def _get_task_extra_body(task: str) -> Dict[str, Any]:
 # chain, multiplying request volume on already-degraded endpoints. A per-task
 # semaphore caps in-flight calls so retry amplification stays bounded.
 
-_aux_sync_semaphores: Dict[str, Tuple[int, threading.BoundedSemaphore]] = {}
-_aux_async_semaphores: Dict[Tuple[str, int], Tuple[int, Any]] = {}
+_aux_sync_semaphores: Dict[Tuple[str, str], Tuple[int, threading.BoundedSemaphore]] = {}
+_aux_async_semaphores: Dict[Tuple[Tuple[str, str], int], Tuple[int, Any]] = {}
 _aux_sem_lock = threading.Lock()
 
 
-def _get_task_max_concurrency(task: Optional[str]) -> Optional[int]:
-    """Return ``auxiliary.<task>.max_concurrency`` as a positive int, or None."""
+def _parse_max_concurrency(raw: Any) -> Optional[int]:
+    """Return a configured positive integer limit, or None."""
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, int):
+        return raw if raw > 0 else None
+    if not isinstance(raw, str):
+        return None
+    text = raw.strip()
+    if not re.fullmatch(r"[+-]?[0-9]+", text):
+        return None
+    value = int(text)
+    return value if value > 0 else None
+
+
+def _fallback_entry_max_concurrency(
+    task: Optional[str], fallback_label: str,
+) -> Optional[int]:
+    """Resolve a positive ``max_concurrency`` from a fallback-chain entry."""
+    entry = _fallback_chain_entry(task, fallback_label)
+    return _parse_max_concurrency(entry.get("max_concurrency")) if entry else None
+
+
+def _get_task_max_concurrency(
+    task: Optional[str], fallback_label: str = "",
+) -> Optional[int]:
+    """Return the selected entry limit, or the task-level positive limit."""
     if not task or task == "vision":
         # Vision already uses this key for its encode/resize CPU worker pool;
         # its LLM calls deliberately remain concurrent.
         return None
+    default = 2 if task == "compression" else None
+    entry_limit = _fallback_entry_max_concurrency(task, fallback_label)
+    if entry_limit is not None:
+        return entry_limit
     raw = _get_auxiliary_task_config(task).get("max_concurrency")
-    if raw is None:
-        return None
-    try:
-        value = int(raw)
-    except (TypeError, ValueError):
-        return None
-    return value if value > 0 else None
+    value = _parse_max_concurrency(raw)
+    return value if value is not None else default
 
 
-def _acquire_sync_aux_semaphore(task: Optional[str]) -> Optional[threading.BoundedSemaphore]:
-    """Get a per-task sync semaphore, rebuilding it after a config change."""
-    limit = _get_task_max_concurrency(task)
+def _auxiliary_concurrency_scope(
+    task: Optional[str], fallback_label: str,
+) -> Tuple[str, str]:
+    """Share task-level permits, but isolate valid fallback candidates."""
+    if _fallback_entry_max_concurrency(task, fallback_label) is None:
+        fallback_label = ""
+    return task or "", fallback_label
+
+
+def _acquire_sync_aux_semaphore(
+    task: Optional[str], fallback_label: str = "",
+) -> Optional[threading.BoundedSemaphore]:
+    """Get a per-task or valid-candidate sync semaphore."""
+    limit = _get_task_max_concurrency(task, fallback_label)
     if limit is None:
         return None
+    scope = _auxiliary_concurrency_scope(task, fallback_label)
     with _aux_sem_lock:
-        entry = _aux_sync_semaphores.get(task)
+        entry = _aux_sync_semaphores.get(scope)
         if entry is None or entry[0] != limit:
             semaphore = threading.BoundedSemaphore(limit)
-            _aux_sync_semaphores[task] = (limit, semaphore)
+            _aux_sync_semaphores[scope] = (limit, semaphore)
             return semaphore
         return entry[1]
 
 
-def _acquire_async_aux_semaphore(task: Optional[str]):
-    """Get a per-task, per-event-loop async semaphore after config lookup."""
-    limit = _get_task_max_concurrency(task)
+def _acquire_async_aux_semaphore(
+    task: Optional[str], fallback_label: str = "",
+):
+    """Get a per-task or valid-candidate async semaphore per event loop."""
+    limit = _get_task_max_concurrency(task, fallback_label)
     if limit is None:
         return None
     import asyncio
@@ -8407,7 +8731,8 @@ def _acquire_async_aux_semaphore(task: Optional[str]):
         loop = asyncio.get_running_loop()
     except RuntimeError:
         return None
-    key = (task, id(loop))
+    scope = _auxiliary_concurrency_scope(task, fallback_label)
+    key = (scope, id(loop))
     with _aux_sem_lock:
         entry = _aux_async_semaphores.get(key)
         if entry is None or entry[0] != limit:
@@ -9296,10 +9621,15 @@ def call_llm(
     api_mode: str = None,
     stream: bool = False,
     stream_options: dict = None,
-    route_info: Optional[Dict[str, str]] = None,
+    route_info: Optional[Dict[str, Any]] = None,
 ) -> Any:
     """Run an auxiliary LLM request, applying the configured task limit."""
-    semaphore = _acquire_sync_aux_semaphore(task)
+    fallback_label = (
+        str(route_info.get("fallback_label") or "")
+        if isinstance(route_info, dict) else ""
+    )
+    semaphore = _acquire_sync_aux_semaphore(task, fallback_label)
+    lease = {"semaphore": semaphore}
     if semaphore is not None:
         semaphore.acquire()
     try:
@@ -9322,13 +9652,14 @@ def call_llm(
             stream=stream,
             stream_options=stream_options,
             route_info=route_info,
+            _scope_lease=lease,
         )
-        if stream and semaphore is not None:
-            stream_semaphore = semaphore
-            semaphore = None
+        if stream and lease.get("semaphore") is not None:
+            stream_semaphore = lease.pop("semaphore")
             return _release_sync_semaphore_after_stream(response, stream_semaphore)
         return response
     finally:
+        semaphore = lease.pop("semaphore", None)
         if semaphore is not None:
             semaphore.release()
 
@@ -9367,7 +9698,8 @@ def _call_llm_impl(
     api_mode: str = None,
     stream: bool = False,
     stream_options: dict = None,
-    route_info: Optional[Dict[str, str]] = None,
+    route_info: Optional[Dict[str, Any]] = None,
+    _scope_lease: Optional[Dict[str, Any]] = None,
 ) -> Any:
     """Centralized synchronous LLM call.
 
@@ -9407,6 +9739,69 @@ def _call_llm_impl(
     Raises:
         RuntimeError: If no provider is configured.
     """
+    selected_route = _route_from_info(route_info)
+    if selected_route is not None:
+        selected_failure: Optional[BaseException] = None
+        try:
+            selected_client, selected_model = _resolve_selected_fallback_route(
+                task, selected_route,
+            )
+            effective_extra_body = _get_task_extra_body(task)
+            effective_extra_body.update(extra_body or {})
+            effective_timeout = _effective_aux_timeout(task, timeout)
+            _set_relay_auxiliary_route(
+                selected_route.destination.provider, selected_route.destination.model,
+                selected_route.destination.api_mode,
+            )
+            response = _call_fallback_candidate_sync(
+                selected_client, selected_model, selected_route.label,
+                task=task, messages=messages, temperature=temperature,
+                max_tokens=max_tokens, tools=tools,
+                effective_timeout=effective_timeout,
+                effective_extra_body=effective_extra_body,
+                reasoning_config=reasoning_config,
+                destination=selected_route.destination,
+            )
+            if _fallback_response_has_content(response):
+                return _validate_llm_response(
+                    response, task,
+                    provider=selected_route.destination.provider,
+                    base_url=selected_route.destination.base_url,
+                )
+            selected_failure, failure_reason = _prepare_selected_fallback_replan(
+                route_info, selected_route, None,
+            )
+        except _StaleFallbackRoute as exc:
+            selected_failure, failure_reason = _prepare_selected_fallback_replan(
+                route_info, selected_route, exc,
+            )
+        except BaseException as exc:
+            if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                raise
+            selected_failure, failure_reason = _prepare_selected_fallback_replan(
+                route_info, selected_route, exc,
+            )
+        if selected_failure is not None:
+            fb_client, fb_model, fb_label = _try_configured_fallback_chain(
+                task, "auto", reason=failure_reason,
+                skip_labels=_failed_fallback_labels(route_info),
+            )
+            if fb_client is not None:
+                replan_extra_body = _get_task_extra_body(task)
+                replan_extra_body.update(extra_body or {})
+                fb_resp = _run_fallback_candidate_sync(
+                    fb_client, fb_model, fb_label,
+                    route_info=route_info, scope_lease=_scope_lease,
+                    task=task, messages=messages,
+                    temperature=temperature, max_tokens=max_tokens,
+                    tools=tools, effective_timeout=_effective_aux_timeout(task, timeout),
+                    effective_extra_body=replan_extra_body,
+                    reasoning_config=reasoning_config,
+                )
+                if fb_resp is not None:
+                    return fb_resp
+            raise selected_failure
+
     # Capture one immutable runtime snapshot for keying, resolution, retries,
     # and fallbacks. Reading ambient state independently in each phase lets a
     # concurrent /model switch produce a key for one runtime and a client for
@@ -10044,7 +10439,9 @@ def _call_llm_impl(
             if is_auto:
                 fb_client, fb_model, fb_label = _try_configured_fallback_chain(
                     task, resolved_provider or "auto", reason=reason,
-                    failed_model=_chain_failed_model)
+                    failed_model=_chain_failed_model,
+                    skip_labels=_failed_fallback_labels(route_info),
+                )
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_main_fallback_chain(
                         task, resolved_provider or "auto", reason=reason)
@@ -10054,41 +10451,48 @@ def _call_llm_impl(
             else:
                 fb_client, fb_model, fb_label = _try_configured_fallback_chain(
                     task, resolved_provider or "auto", reason=reason,
-                    failed_model=_chain_failed_model)
+                    failed_model=_chain_failed_model,
+                    skip_labels=_failed_fallback_labels(route_info),
+                )
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
                         resolved_provider, task, reason=reason,
-                        failed_model=_chain_failed_model)
-
+                        failed_model=_chain_failed_model,
+                    )
             if fb_client is not None:
-                _record_route_info(
-                    route_info, _fallback_provider_from_label(fb_label), fb_model
-                )
-                fb_resp = _call_fallback_candidate_sync(
+                fb_resp = _run_fallback_candidate_sync(
                     fb_client, fb_model, fb_label,
+                    route_info=route_info, scope_lease=_scope_lease,
                     task=task, messages=messages,
                     temperature=temperature, max_tokens=max_tokens,
                     tools=tools, effective_timeout=effective_timeout,
                     effective_extra_body=effective_extra_body,
-                    reasoning_config=reasoning_config)
+                    reasoning_config=reasoning_config,
+                )
                 if fb_resp is not None:
                     return fb_resp
                 # The candidate had a stale/unrefreshable credential and was
                 # quarantined — walk the discovery chain once more; unhealthy
                 # entries are skipped so the next viable candidate serves.
-                fb_client, fb_model, fb_label = _try_payment_fallback(
-                    resolved_provider, task, reason="stale fallback credential")
-                if fb_client is not None:
-                    _record_route_info(
-                        route_info, _fallback_provider_from_label(fb_label), fb_model
+                fb_client, fb_model, fb_label = _try_configured_fallback_chain(
+                    task, resolved_provider or "auto", reason="stale fallback credential",
+                    failed_model=_chain_failed_model,
+                    skip_labels=_failed_fallback_labels(route_info),
+                )
+                if fb_client is None:
+                    fb_client, fb_model, fb_label = _try_payment_fallback(
+                        resolved_provider, task, reason="stale fallback credential",
                     )
-                    fb_resp = _call_fallback_candidate_sync(
+                if fb_client is not None:
+                    fb_resp = _run_fallback_candidate_sync(
                         fb_client, fb_model, fb_label,
+                        route_info=route_info, scope_lease=_scope_lease,
                         task=task, messages=messages,
                         temperature=temperature, max_tokens=max_tokens,
                         tools=tools, effective_timeout=effective_timeout,
                         effective_extra_body=effective_extra_body,
-                        reasoning_config=reasoning_config)
+                        reasoning_config=reasoning_config,
+                    )
                     if fb_resp is not None:
                         return fb_resp
             # All fallback layers exhausted — emit a single user-visible
@@ -10185,10 +10589,15 @@ async def async_call_llm(
     timeout: float = None,
     extra_body: dict = None,
     reasoning_config: Optional[dict] = None,
-    route_info: Optional[Dict[str, str]] = None,
+    route_info: Optional[Dict[str, Any]] = None,
 ) -> Any:
     """Run an asynchronous auxiliary LLM request under the configured limit."""
-    semaphore = _acquire_async_aux_semaphore(task)
+    fallback_label = (
+        str(route_info.get("fallback_label") or "")
+        if isinstance(route_info, dict) else ""
+    )
+    semaphore = _acquire_async_aux_semaphore(task, fallback_label)
+    lease = {"semaphore": semaphore}
     if semaphore is not None:
         await semaphore.acquire()
     try:
@@ -10207,8 +10616,10 @@ async def async_call_llm(
             extra_body=extra_body,
             reasoning_config=reasoning_config,
             route_info=route_info,
+            _scope_lease=lease,
         )
     finally:
+        semaphore = lease.pop("semaphore", None)
         if semaphore is not None:
             semaphore.release()
 
@@ -10228,12 +10639,79 @@ async def _async_call_llm_impl(
     timeout: float = None,
     extra_body: dict = None,
     reasoning_config: Optional[dict] = None,
-    route_info: Optional[Dict[str, str]] = None,
+    route_info: Optional[Dict[str, Any]] = None,
+    _scope_lease: Optional[Dict[str, Any]] = None,
 ) -> Any:
     """Centralized asynchronous LLM call.
 
     Same as call_llm() but async. See call_llm() for full documentation.
     """
+    selected_route = _route_from_info(route_info)
+    if selected_route is not None:
+        selected_failure: Optional[BaseException] = None
+        try:
+            selected_client, selected_model = _resolve_selected_fallback_route(
+                task, selected_route, async_mode=True,
+            )
+            effective_extra_body = _get_task_extra_body(task)
+            effective_extra_body.update(extra_body or {})
+            effective_timeout = _effective_aux_timeout(task, timeout)
+            _set_relay_auxiliary_route(
+                selected_route.destination.provider, selected_route.destination.model,
+                selected_route.destination.api_mode,
+            )
+            response = await _call_fallback_candidate_async(
+                selected_client, selected_model, selected_route.label,
+                task=task, messages=messages, temperature=temperature,
+                max_tokens=max_tokens, tools=tools,
+                effective_timeout=effective_timeout,
+                effective_extra_body=effective_extra_body,
+                reasoning_config=reasoning_config,
+                destination=selected_route.destination,
+            )
+            if _fallback_response_has_content(response):
+                return _validate_llm_response(
+                    response, task,
+                    provider=selected_route.destination.provider,
+                    base_url=selected_route.destination.base_url,
+                )
+            selected_failure, failure_reason = _prepare_selected_fallback_replan(
+                route_info, selected_route, None,
+            )
+        except _StaleFallbackRoute as exc:
+            selected_failure, failure_reason = _prepare_selected_fallback_replan(
+                route_info, selected_route, exc,
+            )
+        except BaseException as exc:
+            if isinstance(
+                exc,
+                (AuxiliaryExplicitCancellation, asyncio.CancelledError, KeyboardInterrupt, SystemExit),
+            ):
+                raise
+            selected_failure, failure_reason = _prepare_selected_fallback_replan(
+                route_info, selected_route, exc,
+            )
+        if selected_failure is not None:
+            fb_client, fb_model, fb_label = _try_configured_fallback_chain(
+                task, "auto", reason=failure_reason,
+                skip_labels=_failed_fallback_labels(route_info),
+            )
+            if fb_client is not None:
+                replan_extra_body = _get_task_extra_body(task)
+                replan_extra_body.update(extra_body or {})
+                fb_resp = await _run_fallback_candidate_async(
+                    fb_client, fb_model, fb_label,
+                    route_info=route_info, scope_lease=_scope_lease,
+                    task=task, messages=messages,
+                    temperature=temperature, max_tokens=max_tokens,
+                    tools=tools, effective_timeout=_effective_aux_timeout(task, timeout),
+                    effective_extra_body=replan_extra_body,
+                    reasoning_config=reasoning_config,
+                )
+                if fb_resp is not None:
+                    return fb_resp
+            raise selected_failure
+
     # Keep every async phase on the same runtime identity, even if another
     # session switches models while this task is awaiting network I/O.
     main_runtime = _normalize_main_runtime(main_runtime)
@@ -10742,7 +11220,9 @@ async def _async_call_llm_impl(
             if is_auto:
                 fb_client, fb_model, fb_label = _try_configured_fallback_chain(
                     task, resolved_provider or "auto", reason=reason,
-                    failed_model=_chain_failed_model)
+                    failed_model=_chain_failed_model,
+                    skip_labels=_failed_fallback_labels(route_info),
+                )
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_main_fallback_chain(
                         task, resolved_provider or "auto", reason=reason)
@@ -10752,51 +11232,48 @@ async def _async_call_llm_impl(
             else:
                 fb_client, fb_model, fb_label = _try_configured_fallback_chain(
                     task, resolved_provider or "auto", reason=reason,
-                    failed_model=_chain_failed_model)
+                    failed_model=_chain_failed_model,
+                    skip_labels=_failed_fallback_labels(route_info),
+                )
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
                         resolved_provider, task, reason=reason,
-                        failed_model=_chain_failed_model)
-
+                        failed_model=_chain_failed_model,
+                    )
             if fb_client is not None:
-                # Convert sync fallback client to async
-                async_fb, async_fb_model = _to_async_client(
-                    fb_client, fb_model or "", is_vision=(task == "vision")
-                )
-                _record_route_info(
-                    route_info,
-                    _fallback_provider_from_label(fb_label),
-                    async_fb_model or fb_model,
-                )
-                fb_resp = await _call_fallback_candidate_async(
-                    async_fb, async_fb_model or fb_model, fb_label,
+                fb_resp = await _run_fallback_candidate_async(
+                    fb_client, fb_model, fb_label,
+                    route_info=route_info, scope_lease=_scope_lease,
                     task=task, messages=messages,
                     temperature=temperature, max_tokens=max_tokens,
                     tools=tools, effective_timeout=effective_timeout,
                     effective_extra_body=effective_extra_body,
-                    reasoning_config=reasoning_config)
+                    reasoning_config=reasoning_config,
+                )
                 if fb_resp is not None:
                     return fb_resp
                 # Stale/unrefreshable candidate credential — quarantined; walk
-                # the discovery chain once more (unhealthy entries skipped).
-                fb_client, fb_model, fb_label = _try_payment_fallback(
-                    resolved_provider, task, reason="stale fallback credential")
+                # the configured chain again, skipping every failed candidate.
+                fb_client, fb_model, fb_label = _try_configured_fallback_chain(
+                    task, resolved_provider or "auto",
+                    reason="stale fallback credential",
+                    failed_model=_chain_failed_model,
+                    skip_labels=_failed_fallback_labels(route_info),
+                )
+                if fb_client is None:
+                    fb_client, fb_model, fb_label = _try_payment_fallback(
+                        resolved_provider, task, reason="stale fallback credential",
+                    )
                 if fb_client is not None:
-                    async_fb, async_fb_model = _to_async_client(
-                        fb_client, fb_model or "", is_vision=(task == "vision")
-                    )
-                    _record_route_info(
-                        route_info,
-                        _fallback_provider_from_label(fb_label),
-                        async_fb_model or fb_model,
-                    )
-                    fb_resp = await _call_fallback_candidate_async(
-                        async_fb, async_fb_model or fb_model, fb_label,
+                    fb_resp = await _run_fallback_candidate_async(
+                        fb_client, fb_model, fb_label,
+                        route_info=route_info, scope_lease=_scope_lease,
                         task=task, messages=messages,
                         temperature=temperature, max_tokens=max_tokens,
                         tools=tools, effective_timeout=effective_timeout,
                         effective_extra_body=effective_extra_body,
-                        reasoning_config=reasoning_config)
+                        reasoning_config=reasoning_config,
+                    )
                     if fb_resp is not None:
                         return fb_resp
             # All fallback layers exhausted — warn before re-raising. (#26882)

@@ -715,6 +715,32 @@ class TestPromptCacheKeyCapability:
                 list(result)
         return captured
 
+    def test_post_compress_request_reuses_explicit_stable_prefix_key(self, transport):
+        """Cache routing is independent of Anthropic wire decoration."""
+        def key(volatile_suffix, *, stable="stable prefix", tools=None, session="session-after-compress"):
+            return transport.build_kwargs(
+                model="cache-model",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": f"{stable}\n\n{volatile_suffix}",
+                    },
+                    {"role": "user", "content": "next request"},
+                ],
+                tools=tools or [],
+                session_id=session,
+                supports_prompt_cache_key=True,
+                cache_key_instructions=stable,
+            )["prompt_cache_key"]
+
+        before_compress = key("volatile before compression")
+        first_after_compress = key("rebuilt volatile suffix")
+
+        assert first_after_compress == before_compress
+        assert key("rebuilt volatile suffix", stable="changed prefix") != first_after_compress
+        assert key("rebuilt volatile suffix", tools=self._tools()) != first_after_compress
+        assert key("rebuilt volatile suffix", session="different-session") != first_after_compress
+
     def test_profile_capability_emits_content_key_in_nonstream_request_body(self, transport):
         from providers.base import ProviderProfile
 

@@ -1876,6 +1876,17 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
     # cheap after the first call. Resolved after the anthropic/bedrock early
     # returns above, which don't use prompt_cache_key.
     _cache_scope_id = _prompt_cache_scope_for_agent(agent)
+    _cache_key_instructions = getattr(agent, "_cached_system_prompt_static", None)
+    first = api_messages[0] if api_messages else None
+    if not (
+        isinstance(_cache_key_instructions, str)
+        and isinstance(first, dict)
+        and first.get("role") in {"system", "developer"}
+        and flatten_message_text(first.get("content"), sep="").startswith(
+            _cache_key_instructions
+        )
+    ):
+        _cache_key_instructions = None
 
     if agent.api_mode == "codex_responses":
         _ct = agent._get_transport()
@@ -1943,6 +1954,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             reasoning_config=agent.reasoning_config,
             session_id=getattr(agent, "session_id", None),
             cache_scope_id=_cache_scope_id,
+            cache_key_instructions=_cache_key_instructions,
             base_url=agent.base_url,
             max_tokens=agent.max_tokens,
             timeout=agent._resolved_api_call_timeout(),
@@ -2053,7 +2065,9 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
             request_overrides=agent.request_overrides,
             session_id=getattr(agent, "session_id", None),
             cache_scope_id=_cache_scope_id,
+            cache_key_instructions=_cache_key_instructions,
             provider_profile=_profile,
+            provider_name=getattr(agent, "requested_provider", None),
             ollama_num_ctx=agent._ollama_num_ctx,
             # Context forwarded to profile hooks:
             provider_preferences=_prefs or None,
@@ -2086,6 +2100,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         request_overrides=agent.request_overrides,
         session_id=getattr(agent, "session_id", None),
         cache_scope_id=_cache_scope_id,
+        cache_key_instructions=_cache_key_instructions,
         model_lower=(agent.model or "").lower(),
         is_openrouter=_is_or,
         is_nous=_is_nous,

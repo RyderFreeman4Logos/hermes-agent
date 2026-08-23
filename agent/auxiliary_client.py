@@ -3320,14 +3320,17 @@ def _set_relay_auxiliary_route(
 
 
 def _record_route_info(
-    route_info: Optional[Dict[str, str]],
+    route_info: Optional[Dict[str, Any]],
     provider: Optional[str],
     model: Optional[str],
+    fallback_label: Optional[str] = None,
 ) -> None:
     """Expose the concrete route selected for one auxiliary call."""
     if route_info is not None:
         route_info["provider"] = provider or "auto"
         route_info["model"] = model or "default"
+        if fallback_label and fallback_label.startswith("fallback_chain["):
+            route_info["fallback_label"] = fallback_label
 
 
 def _relay_auxiliary_metadata(
@@ -5060,6 +5063,39 @@ def _fallback_entry_timeout(task: Optional[str], fb_label: str) -> Optional[floa
     return None
 
 
+def _fallback_entry_extra_body(
+    task: Optional[str],
+    fb_label: str,
+    base: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Build fallback-owned request controls without cross-route leakage."""
+    result = dict(base or {})
+    entry = _fallback_chain_entry(task, fb_label)
+    if not entry:
+        return result
+    result = {
+        key: value
+        for key, value in result.items()
+        if str(key).strip().lower() not in _PROFILE_REASONING_KEYS
+    }
+    raw = entry.get("extra_body")
+    if isinstance(raw, dict):
+        result.update(raw)
+    if "thinking" in entry:
+        result["thinking"] = entry["thinking"]
+    if "reasoning" in entry:
+        result["reasoning"] = entry["reasoning"]
+    elif "reasoning" not in (raw if isinstance(raw, dict) else {}):
+        effort = entry.get("reasoning_effort")
+        if effort not in (None, ""):
+            from hermes_constants import parse_reasoning_effort
+
+            parsed = parse_reasoning_effort(effort)
+            if parsed is not None:
+                result["reasoning"] = parsed
+    return result
+
+
 def _fallback_provider_from_label(label: str) -> str:
     """Recover the provider identifier from a fallback display label."""
     match = re.match(
@@ -5069,11 +5105,172 @@ def _fallback_provider_from_label(label: str) -> str:
     return match.group(1).strip() if match else str(label or "").strip()
 
 
+def _record_codex_skip(route_info: Optional[Dict[str, Any]], reason: str) -> None:
+    """Keep one scalar reason when a configured Codex candidate is skipped."""
+    if route_info is not None and "codex_skip_reason" not in route_info:
+        route_info["codex_skip_reason"] = reason
+
+
+def _is_codex_provider(provider: Optional[str]) -> bool:
+    return _normalize_aux_provider(provider) == "openai-codex"
+
+
+_MOA_FALLBACK_TASKS = frozenset({"moa_reference", "moa_aggregator"})
+
+
+def _task_allows_non_codex_fallback(task: Optional[str]) -> bool:
+    """Return whether the task retains its legacy non-Codex fallback policy."""
+    return task in _MOA_FALLBACK_TASKS
+
+
+def _tag_fallback_client(
+    client: Any,
+    label: str,
+    codex_skip_reason: Optional[str] = None,
+) -> Any:
+    """Carry configured-entry identity through client resolution."""
+    if client is not None and label.startswith("fallback_chain["):
+        try:
+            client._hermes_fallback_label = label
+            if codex_skip_reason:
+                client._hermes_codex_skip_reason = codex_skip_reason
+        except Exception:
+            pass
+    return client
+
+
 class _FallbackDestination(NamedTuple):
     provider: str
     base_url: str
     api_mode: Optional[str]
     model: Optional[str]
+
+
+def _is_codex_destination(
+    provider: Optional[str],
+    api_mode: Optional[str] = None,
+    client: Any = None,
+) -> bool:
+    """Recognize Codex by effective transport, not only provider naming."""
+    if _is_codex_provider(provider):
+        return True
+    if str(api_mode or "").strip().lower() == "codex_responses":
+        return True
+    return isinstance(client, (CodexAuxiliaryClient, AsyncCodexAuxiliaryClient))
+
+
+def _fallback_entry_is_codex(entry: Dict[str, Any]) -> bool:
+    destination = _fallback_destination_from_entry(
+        entry, None, str(entry.get("model") or "").strip() or None,
+    )
+    return _is_codex_destination(destination.provider, destination.api_mode)
+
+
+def _fallback_label_is_codex(
+    label: str,
+    candidate_destinations: Optional[Dict[str, _FallbackDestination]],
+) -> bool:
+    destination = (candidate_destinations or {}).get(label)
+    if destination is not None:
+        return _is_codex_destination(destination.provider, destination.api_mode)
+    return _is_codex_provider(_fallback_provider_from_label(label))
+
+
+def _provider_chain_candidate_is_codex(label: str) -> bool:
+    """Admit built-in candidates using route metadata before client creation."""
+    if _is_codex_provider(label):
+        return True
+    if label == "local/custom":
+        try:
+            _base_url, _api_key, api_mode = _resolve_custom_runtime()
+        except Exception:
+            return False
+        return _is_codex_destination("custom", api_mode)
+    return False
+
+
+def _normalize_fallback_base_url(value: Any) -> str:
+    """Normalize endpoint identity without exposing credential material."""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    parsed = urlparse(raw)
+    if not (parsed.scheme or parsed.netloc):
+        return raw.rstrip("/")
+    return urlunparse((
+        parsed.scheme.lower(),
+        parsed.netloc.lower(),
+        parsed.path.rstrip("/"),
+        "",
+        parsed.query,
+        parsed.fragment,
+    ))
+
+
+_FALLBACK_SECRET_KEYS = frozenset({
+    "api_key", "api_key_env", "key", "key_env", "password", "secret",
+    "token", "access_token", "refresh_token",
+})
+_FALLBACK_ROUTE_KEYS = frozenset({
+    "provider", "model", "base_url", "api_mode", "transport",
+    "api_key", "api_key_env", "key_env", "credential_scope",
+    "credential_id", "credential_name", "auth_profile", "profile",
+    "pool", "pool_id",
+})
+
+
+def _freeze_fallback_identity_value(value: Any, key: str = "") -> Any:
+    """Make request controls hashable while excluding secret-shaped fields."""
+    if key.strip().lower() in _FALLBACK_SECRET_KEYS:
+        return "<redacted>"
+    if isinstance(value, dict):
+        return tuple(sorted(
+            (str(k), _freeze_fallback_identity_value(v, str(k)))
+            for k, v in value.items()
+            if str(k).strip().lower() not in _FALLBACK_SECRET_KEYS
+        ))
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_fallback_identity_value(item) for item in value)
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return type(value).__qualname__
+
+
+def _fallback_credential_scope_identity(entry: Dict[str, Any]) -> tuple:
+    """Return only nonsecret credential selectors for candidate identity."""
+    identity = []
+    for key in (
+        "credential_scope", "credential_id", "credential_name", "auth_profile",
+        "profile", "pool", "pool_id", "key_env", "api_key_env",
+    ):
+        value = str(entry.get(key) or "").strip()
+        if value:
+            identity.append((key, value))
+    if entry.get("api_key"):
+        identity.append(("inline_api_key", True))
+    return tuple(identity)
+
+
+def _fallback_candidate_identity(entry: Dict[str, Any]) -> tuple:
+    """Build the complete effective identity before physical resolution."""
+    provider = _normalize_aux_provider(str(entry.get("provider") or "").strip())
+    raw_model = str(entry.get("model") or "").strip() or None
+    model = _normalize_resolved_model(raw_model, provider) or raw_model or ""
+    destination = _fallback_destination_from_entry(entry, None, model)
+    controls = {
+        key: value
+        for key, value in entry.items()
+        if str(key).strip().lower() not in _FALLBACK_ROUTE_KEYS
+        and not str(key).strip().lower().endswith("_key")
+    }
+    return (
+        provider,
+        model,
+        _normalize_fallback_base_url(destination.base_url),
+        (destination.api_mode or "").strip().lower(),
+        _fallback_credential_scope_identity(entry),
+        _freeze_fallback_identity_value(controls),
+    )
 
 
 def _complete_fallback_destination(
@@ -5094,6 +5291,8 @@ def _complete_fallback_destination(
                     explicit_base_url=base_url or None,
                     target_model=model or "",
                 )
+                if not base_url:
+                    base_url = str(runtime.get("base_url") or "").strip()
                 api_mode = str(runtime.get("api_mode") or "").strip() or None
             except Exception:
                 pass
@@ -5102,8 +5301,8 @@ def _complete_fallback_destination(
 
 def _fallback_destination_from_entry(
     entry: Dict[str, Any],
-    fb_client: Any,
-    fb_model: Optional[str],
+    fb_client: Any = None,
+    fb_model: Optional[str] = None,
 ) -> _FallbackDestination:
     provider = str(entry.get("provider") or "").strip()
     base_url = str(
@@ -5123,10 +5322,6 @@ def _fallback_destination(
     fb_label: str,
 ) -> _FallbackDestination:
     """Return the resolved route identity used by a fallback request."""
-    attached = getattr(fb_client, "_hermes_fallback_destination", None)
-    if isinstance(attached, _FallbackDestination):
-        return attached
-
     provider = _fallback_provider_from_label(fb_label)
     base_url = str(getattr(fb_client, "base_url", "") or "")
     api_mode = None
@@ -5180,6 +5375,7 @@ def _call_fallback_candidate_sync(
     effective_timeout: float,
     effective_extra_body: dict,
     reasoning_config: Optional[dict],
+    destination: Optional[_FallbackDestination] = None,
 ) -> Optional[Any]:
     """Call one fallback candidate with stale-credential recovery.
 
@@ -5209,7 +5405,10 @@ def _call_fallback_candidate_sync(
             task or "call", fb_label, fb_timeout, effective_timeout,
         )
         effective_timeout = fb_timeout
-    destination = _fallback_destination(task, fb_client, fb_model, fb_label)
+    effective_extra_body = _fallback_entry_extra_body(
+        task, fb_label, effective_extra_body,
+    )
+    destination = destination or _fallback_destination(task, fb_client, fb_model, fb_label)
     fallback_messages, fallback_tools = _replan_synchronous_cache_sections(
         messages,
         tools,
@@ -5305,6 +5504,7 @@ async def _call_fallback_candidate_async(
     effective_timeout: float,
     effective_extra_body: dict,
     reasoning_config: Optional[dict],
+    destination: Optional[_FallbackDestination] = None,
 ) -> Optional[Any]:
     """Async mirror of :func:`_call_fallback_candidate_sync`."""
     fb_timeout = _fallback_entry_timeout(task, fb_label)
@@ -5315,7 +5515,10 @@ async def _call_fallback_candidate_async(
             task or "call", fb_label, fb_timeout, effective_timeout,
         )
         effective_timeout = fb_timeout
-    destination = _fallback_destination(task, fb_client, fb_model, fb_label)
+    effective_extra_body = _fallback_entry_extra_body(
+        task, fb_label, effective_extra_body,
+    )
+    destination = destination or _fallback_destination(task, fb_client, fb_model, fb_label)
     fallback_messages, fallback_tools = _replan_synchronous_cache_sections(
         messages,
         tools,
@@ -5399,6 +5602,9 @@ def _try_payment_fallback(
     failed_provider: str,
     task: str = None,
     reason: str = "payment error",
+    route_info: Optional[Dict[str, Any]] = None,
+    candidate_destinations: Optional[Dict[str, _FallbackDestination]] = None,
+    codex_only: bool = False,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Try alternative providers after a payment/credit or connection error.
 
@@ -5424,6 +5630,10 @@ def _try_payment_fallback(
 
     tried = []
     for label, try_fn in _get_provider_chain():
+        if codex_only and not _provider_chain_candidate_is_codex(label):
+            _record_codex_skip(route_info, "unavailable")
+            tried.append(f"{label} (non-Codex destination)")
+            continue
         if label in skip_chain_labels:
             continue
         if _is_provider_unhealthy(label):
@@ -5432,6 +5642,13 @@ def _try_payment_fallback(
             continue
         client, model = try_fn()
         if client is not None:
+            if candidate_destinations is not None:
+                candidate_destinations[label] = _complete_fallback_destination(
+                    label,
+                    str(getattr(client, "base_url", "") or ""),
+                    None,
+                    model,
+                )
             logger.info(
                 "Auxiliary %s: %s on %s — falling back to %s (%s)",
                 task or "call", reason, failed_provider, label, model or "default",
@@ -5451,6 +5668,9 @@ def _try_main_agent_model_fallback(
     task: str = None,
     reason: str = "error",
     failed_model: Optional[str] = None,
+    route_info: Optional[Dict[str, Any]] = None,
+    candidate_destinations: Optional[Dict[str, _FallbackDestination]] = None,
+    codex_only: bool = True,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Last-resort fallback to the user's main agent provider + model.
 
@@ -5482,7 +5702,8 @@ def _try_main_agent_model_fallback(
     """
     main_provider = (_read_main_provider() or "").strip()
     main_model = (_read_main_model() or "").strip()
-    if main_provider.lower() == "moa":
+    is_moa_main = main_provider.lower() == "moa"
+    if is_moa_main:
         # MoA virtual provider: fall back to the preset's aggregator — the
         # acting model — instead of the unreachable "moa"/<preset-name> pair.
         _agg_provider, _agg_model = _resolve_moa_aggregator(main_model)
@@ -5490,6 +5711,14 @@ def _try_main_agent_model_fallback(
             return None, None, ""
         main_provider, main_model = _agg_provider, _agg_model
     if not main_provider or not main_model or main_provider.lower() in {"auto", ""}:
+        return None, None, ""
+    main_destination = _complete_fallback_destination(
+        main_provider, "", None, main_model,
+    )
+    if codex_only and not is_moa_main and not _is_codex_destination(
+        main_destination.provider, main_destination.api_mode,
+    ):
+        _record_codex_skip(route_info, "unavailable")
         return None, None, ""
 
     # Identity + scope semantics owned by agent.backend_identity (#72468):
@@ -5525,6 +5754,13 @@ def _try_main_agent_model_fallback(
         return None, None, ""
 
     label = f"main-agent({main_provider})"
+    if candidate_destinations is not None:
+        candidate_destinations[label] = _complete_fallback_destination(
+            main_provider,
+            str(getattr(client, "base_url", "") or ""),
+            None,
+            resolved_model or main_model,
+        )
     logger.info(
         "Auxiliary %s: %s on %s — falling back to main agent model %s (%s)",
         task or "call", reason, failed_provider, label, resolved_model or main_model,
@@ -5619,6 +5855,12 @@ def _try_configured_fallback_chain(
     failed_provider: str,
     reason: str = "error",
     failed_model: Optional[str] = None,
+    start_index: int = 0,
+    route_info: Optional[Dict[str, Any]] = None,
+    attempted_indices: Optional[set[int]] = None,
+    attempted_identities: Optional[set[tuple]] = None,
+    candidate_destinations: Optional[Dict[str, _FallbackDestination]] = None,
+    codex_only: bool = False,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Try user-configured fallback_chain for a specific auxiliary task.
 
@@ -5676,8 +5918,30 @@ def _try_configured_fallback_chain(
     )
     tried = []
     min_ctx = _task_minimum_context_length(task)
+    codex_skip_reason = None
+    if attempted_identities is None:
+        attempted_identities = set()
 
-    for i, entry in enumerate(chain):
+    if attempted_indices is None:
+        candidate_indices = list(range(start_index, len(chain)))
+    else:
+        candidate_indices = [
+            i for i in range(len(chain)) if i not in attempted_indices
+        ]
+    if codex_only:
+        candidate_indices = [
+            i for i in candidate_indices
+            if isinstance(chain[i], dict)
+            and _fallback_entry_is_codex(chain[i])
+        ]
+        if not candidate_indices:
+            _record_codex_skip(route_info, "unavailable")
+            return None, None, ""
+
+    for i in candidate_indices:
+        if attempted_indices is not None:
+            attempted_indices.add(i)
+        entry = chain[i]
         if not isinstance(entry, dict):
             continue
         fb_provider = str(entry.get("provider", "")).strip()
@@ -5694,6 +5958,12 @@ def _try_configured_fallback_chain(
             failure_scope,
         ):
             continue
+        identity = _fallback_candidate_identity(entry)
+        if identity in attempted_identities:
+            if attempted_indices is not None:
+                attempted_indices.add(i)
+            continue
+        attempted_identities.add(identity)
         fb_model = fb_model_raw or None
 
         label = f"fallback_chain[{i}]({fb_provider})"
@@ -5704,6 +5974,11 @@ def _try_configured_fallback_chain(
             fb_client, resolved_model = None, None
 
         if fb_client is not None:
+            destination = _fallback_destination_from_entry(
+                entry, fb_client, resolved_model or fb_model,
+            )
+            if candidate_destinations is not None:
+                candidate_destinations[label] = destination
             if min_ctx is not None and resolved_model:
                 fb_ctx = _candidate_context_window(
                     fb_provider,
@@ -5717,13 +5992,20 @@ def _try_configured_fallback_chain(
                         task, label, resolved_model, fb_ctx, min_ctx,
                     )
                     tried.append(f"{label} (context too small: {fb_ctx}<{min_ctx})")
+                    codex_skip_reason = "too_small"
+                    _record_codex_skip(route_info, "too_small")
                     continue
             logger.info(
                 "Auxiliary %s: %s on %s — configured fallback to %s (%s)",
                 task, reason, failed_provider, label, resolved_model or fb_model or "default",
             )
-            return fb_client, resolved_model or fb_model, label
+            codex_skip_reason = None
+            return _tag_fallback_client(
+                fb_client, label, codex_skip_reason
+            ), resolved_model or fb_model, label
         tried.append(label)
+        codex_skip_reason = "unavailable"
+        _record_codex_skip(route_info, "unavailable")
 
     if tried:
         logger.debug(
@@ -5733,9 +6015,20 @@ def _try_configured_fallback_chain(
     return None, None, ""
 
 
+def _next_configured_fallback_index(label: str) -> Optional[int]:
+    """Return the entry after a configured-chain label, if any."""
+    if not label.startswith("fallback_chain["):
+        return None
+    try:
+        return int(label.split("[", 1)[1].split("]", 1)[0]) + 1
+    except (IndexError, ValueError):
+        return None
+
+
 def _try_configured_fallback_for_unavailable_client(
     task: Optional[str],
     failed_provider: str,
+    route_info: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Try task fallback_chain when an explicit aux provider cannot build.
 
@@ -5748,10 +6041,13 @@ def _try_configured_fallback_for_unavailable_client(
     explicit = (failed_provider or "").strip().lower()
     if not task or not explicit or explicit in {"auto"}:
         return None, None, ""
+    call_kwargs: Dict[str, Any] = {"reason": "provider unavailable"}
+    if route_info is not None:
+        call_kwargs["route_info"] = route_info
     return _try_configured_fallback_chain(
         task,
         explicit,
-        reason="provider unavailable",
+        **call_kwargs,
     )
 
 
@@ -5783,13 +6079,6 @@ def _resolve_fallback_entry(entry: Dict[str, Any]) -> Tuple[Optional[Any], Optio
         explicit_api_key=api_key,
         api_mode=api_mode,
     )
-    if client is not None:
-        try:
-            client._hermes_fallback_destination = _fallback_destination_from_entry(
-                entry, client, resolved_model
-            )
-        except Exception:
-            pass
     return client, resolved_model
 
 
@@ -5797,6 +6086,9 @@ def _try_main_fallback_chain(
     task: Optional[str],
     failed_provider: str = "",
     reason: str = "error",
+    route_info: Optional[Dict[str, Any]] = None,
+    candidate_destinations: Optional[Dict[str, _FallbackDestination]] = None,
+    codex_only: bool = False,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Try the top-level main-agent fallback chain for an auxiliary call.
 
@@ -5833,6 +6125,10 @@ def _try_main_fallback_chain(
             continue
         fb_norm = fb_provider.lower()
         label = f"fallback_providers[{i}]({fb_provider})"
+        if codex_only and not _fallback_entry_is_codex(entry):
+            _record_codex_skip(route_info, "unavailable")
+            tried.append(f"{label} (non-Codex destination)")
+            continue
         if fb_norm in skip:
             tried.append(f"{label} (skipped)")
             continue
@@ -5846,6 +6142,11 @@ def _try_main_fallback_chain(
             logger.debug("Auxiliary %s: main fallback %s failed to resolve: %s", task or "call", label, exc)
             fb_client, resolved_model = None, None
         if fb_client is not None:
+            destination = _fallback_destination_from_entry(
+                entry, fb_client, resolved_model or fb_model,
+            )
+            if candidate_destinations is not None:
+                candidate_destinations[fb_provider] = destination
             if min_ctx is not None:
                 fb_ctx = _candidate_context_window(
                     fb_provider,
@@ -6059,17 +6360,25 @@ def _resolve_auto_route(
     # for users who have not declared a fallback policy.
     if task:
         fb_client, fb_model, fb_label = _try_configured_fallback_chain(
-            task, main_provider or "auto", reason="main provider unavailable")
+            task, main_provider or "auto", reason="main provider unavailable",
+            codex_only=not _task_allows_non_codex_fallback(task),
+        )
         if fb_client is not None:
             return fb_client, fb_model, _fallback_provider_from_label(fb_label)
     fb_client, fb_model, fb_label = _try_main_fallback_chain(
-        task, main_provider or "auto", reason="main provider unavailable")
+        task, main_provider or "auto", reason="main provider unavailable",
+        codex_only=not _task_allows_non_codex_fallback(task),
+    )
     if fb_client is not None:
         return fb_client, fb_model, fb_label
 
     # ── Step 3: aggregator / fallback chain ──────────────────────────────
     tried = []
+    codex_only = not _task_allows_non_codex_fallback(task)
     for label, try_fn in _get_provider_chain():
+        if codex_only and not _provider_chain_candidate_is_codex(label):
+            tried.append(f"{label} (non-Codex destination)")
+            continue
         if _is_provider_unhealthy(label):
             _log_skip_unhealthy(label)
             tried.append(f"{label} (unhealthy)")
@@ -7155,9 +7464,7 @@ def get_async_text_auxiliary_client(task: str = "", *, main_runtime: Optional[Di
 
 
 _VISION_AUTO_PROVIDER_ORDER = (
-    "openrouter",
-    "nous",
-    "deepinfra",
+    "openai-codex",
 )
 
 
@@ -7455,6 +7762,8 @@ def resolve_vision_provider_client(
         # Fall back through aggregators (uses their dedicated vision model,
         # not the user's main model) when main provider has no client.
         for candidate in _VISION_AUTO_PROVIDER_ORDER:
+            if not _is_codex_provider(candidate):
+                continue
             if candidate == main_provider:
                 continue  # already tried above
             sync_client, default_model = _resolve_strict_vision_backend(candidate)
@@ -9296,7 +9605,7 @@ def call_llm(
     api_mode: str = None,
     stream: bool = False,
     stream_options: dict = None,
-    route_info: Optional[Dict[str, str]] = None,
+    route_info: Optional[Dict[str, Any]] = None,
 ) -> Any:
     """Run an auxiliary LLM request, applying the configured task limit."""
     semaphore = _acquire_sync_aux_semaphore(task)
@@ -9367,7 +9676,7 @@ def _call_llm_impl(
     api_mode: str = None,
     stream: bool = False,
     stream_options: dict = None,
-    route_info: Optional[Dict[str, str]] = None,
+    route_info: Optional[Dict[str, Any]] = None,
 ) -> Any:
     """Centralized synchronous LLM call.
 
@@ -9416,7 +9725,17 @@ def _call_llm_impl(
         task, provider, model, base_url, api_key)
     if api_mode:
         resolved_api_mode = api_mode
+    codex_only_fallback = (
+        resolved_provider in {"auto", "", None}
+        and not _task_allows_non_codex_fallback(task)
+    )
     effective_extra_body = _get_task_extra_body(task)
+    fallback_label = (
+        str(route_info.get("fallback_label") or "")
+        if isinstance(route_info, dict) else ""
+    )
+    if fallback_label:
+        effective_extra_body = _fallback_entry_extra_body(task, fallback_label, {})
     effective_extra_body.update(extra_body or {})
     effective_provider = resolved_provider
 
@@ -9468,12 +9787,18 @@ def _call_llm_impl(
             _explicit = (resolved_provider or "").strip().lower()
             if _explicit and _explicit not in {"auto", "openrouter", "custom"}:
                 fb_client, fb_model, fb_label = _try_configured_fallback_for_unavailable_client(
-                    task, _explicit,
+                    task, _explicit, route_info=route_info,
                 )
                 if fb_client is not None:
                     client, final_model = fb_client, fb_model
                     resolved_provider = fb_label or resolved_provider
                     effective_provider = resolved_provider
+                    _record_route_info(
+                        route_info,
+                        _fallback_provider_from_label(fb_label),
+                        final_model,
+                        fallback_label=fb_label,
+                    )
                 else:
                     raise RuntimeError(
                         f"Provider '{_explicit}' is set in config.yaml but no API key "
@@ -9499,6 +9824,18 @@ def _call_llm_impl(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
                 f"Run: hermes setup")
 
+    if not fallback_label:
+        candidate_label = getattr(client, "_hermes_fallback_label", "")
+        if isinstance(candidate_label, str) and candidate_label.startswith("fallback_chain["):
+            fallback_label = candidate_label
+    candidate_skip_reason = getattr(client, "_hermes_codex_skip_reason", "")
+    if candidate_skip_reason and isinstance(route_info, dict):
+        route_info["codex_skip_reason"] = candidate_skip_reason
+    if fallback_label:
+        effective_extra_body = _fallback_entry_extra_body(task, fallback_label, {})
+        effective_extra_body.update(extra_body or {})
+        if isinstance(route_info, dict):
+            route_info["fallback_label"] = fallback_label
     effective_timeout = _effective_aux_timeout(task, timeout)
     request_provider = effective_provider or resolved_provider
     _set_relay_auxiliary_route(
@@ -9507,7 +9844,8 @@ def _call_llm_impl(
         resolved_api_mode,
     )
     _record_route_info(
-        route_info, _fallback_provider_from_label(request_provider), final_model
+        route_info, _fallback_provider_from_label(request_provider), final_model,
+        fallback_label=fallback_label,
     )
 
     # Log what we're about to do — makes auxiliary operations visible
@@ -10040,29 +10378,91 @@ def _call_llm_impl(
             #   2. For auto: top-level main fallback_providers/fallback_model
             #   3. For auto: built-in auxiliary discovery chain
             #   4. For explicit aux providers: main agent model safety net
-            fb_client, fb_model, fb_label = (None, None, "")
+            configured_attempted_indices: set[int] = set()
+            configured_attempted_identities: set[tuple] = set()
+            fallback_destinations: Dict[str, _FallbackDestination] = {}
             if is_auto:
                 fb_client, fb_model, fb_label = _try_configured_fallback_chain(
                     task, resolved_provider or "auto", reason=reason,
-                    failed_model=_chain_failed_model)
-                if fb_client is None:
-                    fb_client, fb_model, fb_label = _try_main_fallback_chain(
-                        task, resolved_provider or "auto", reason=reason)
-                if fb_client is None:
-                    fb_client, fb_model, fb_label = _try_payment_fallback(
-                        resolved_provider, task, reason=reason)
+                    failed_model=_chain_failed_model,
+                    route_info=route_info,
+                    attempted_indices=configured_attempted_indices,
+                    attempted_identities=configured_attempted_identities,
+                    candidate_destinations=fallback_destinations,
+                    codex_only=codex_only_fallback,
+                )
             else:
                 fb_client, fb_model, fb_label = _try_configured_fallback_chain(
                     task, resolved_provider or "auto", reason=reason,
-                    failed_model=_chain_failed_model)
+                    failed_model=_chain_failed_model,
+                    route_info=route_info,
+                    attempted_indices=configured_attempted_indices,
+                    attempted_identities=configured_attempted_identities,
+                    candidate_destinations=fallback_destinations,
+                    codex_only=codex_only_fallback,
+                )
+
+            while fb_client is not None:
+                _record_route_info(
+                    route_info, _fallback_provider_from_label(fb_label), fb_model,
+                    fallback_label=fb_label,
+                )
+                try:
+                    fb_resp = _call_fallback_candidate_sync(
+                        fb_client, fb_model, fb_label,
+                        task=task, messages=messages,
+                        temperature=temperature, max_tokens=max_tokens,
+                        tools=tools, effective_timeout=effective_timeout,
+                        effective_extra_body=effective_extra_body,
+                        reasoning_config=reasoning_config,
+                        destination=fallback_destinations.get(fb_label),
+                    )
+                except Exception:
+                    if not fb_label.startswith("fallback_chain["):
+                        raise
+                    fb_resp = None
+                if fb_resp is not None:
+                    return fb_resp
+                if _fallback_label_is_codex(fb_label, fallback_destinations):
+                    _record_codex_skip(route_info, "rejected")
+                next_index = _next_configured_fallback_index(fb_label)
+                if next_index is None:
+                    break
+                fb_client, fb_model, fb_label = _try_configured_fallback_chain(
+                    task, resolved_provider or "auto", reason=reason,
+                    failed_model=_chain_failed_model,
+                    start_index=next_index,
+                    route_info=route_info,
+                    attempted_indices=configured_attempted_indices,
+                    attempted_identities=configured_attempted_identities,
+                    candidate_destinations=fallback_destinations,
+                    codex_only=codex_only_fallback,
+                )
+
+            if is_auto:
+                fb_client, fb_model, fb_label = _try_main_fallback_chain(
+                    task, resolved_provider or "auto", reason=reason,
+                    route_info=route_info,
+                    candidate_destinations=fallback_destinations,
+                    codex_only=codex_only_fallback)
                 if fb_client is None:
-                    fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
+                    fb_client, fb_model, fb_label = _try_payment_fallback(
                         resolved_provider, task, reason=reason,
-                        failed_model=_chain_failed_model)
+                        route_info=route_info,
+                    candidate_destinations=fallback_destinations,
+                    codex_only=codex_only_fallback)
+            else:
+                fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
+                    resolved_provider, task, reason=reason,
+                    failed_model=_chain_failed_model,
+                    route_info=route_info,
+                    candidate_destinations=fallback_destinations,
+                    codex_only=codex_only_fallback)
 
             if fb_client is not None:
                 _record_route_info(
-                    route_info, _fallback_provider_from_label(fb_label), fb_model
+                    route_info, _fallback_provider_from_label(fb_label), fb_model,
+                    fallback_label=fb_label,
                 )
                 fb_resp = _call_fallback_candidate_sync(
                     fb_client, fb_model, fb_label,
@@ -10070,27 +10470,33 @@ def _call_llm_impl(
                     temperature=temperature, max_tokens=max_tokens,
                     tools=tools, effective_timeout=effective_timeout,
                     effective_extra_body=effective_extra_body,
-                    reasoning_config=reasoning_config)
+                    reasoning_config=reasoning_config,
+                    destination=fallback_destinations.get(fb_label),
+                )
                 if fb_resp is not None:
                     return fb_resp
-                # The candidate had a stale/unrefreshable credential and was
-                # quarantined — walk the discovery chain once more; unhealthy
-                # entries are skipped so the next viable candidate serves.
-                fb_client, fb_model, fb_label = _try_payment_fallback(
-                    resolved_provider, task, reason="stale fallback credential")
-                if fb_client is not None:
-                    _record_route_info(
-                        route_info, _fallback_provider_from_label(fb_label), fb_model
-                    )
-                    fb_resp = _call_fallback_candidate_sync(
-                        fb_client, fb_model, fb_label,
-                        task=task, messages=messages,
-                        temperature=temperature, max_tokens=max_tokens,
-                        tools=tools, effective_timeout=effective_timeout,
-                        effective_extra_body=effective_extra_body,
-                        reasoning_config=reasoning_config)
-                    if fb_resp is not None:
-                        return fb_resp
+                if is_auto:
+                    fb_client, fb_model, fb_label = _try_payment_fallback(
+                        resolved_provider, task, reason="stale fallback credential",
+                        route_info=route_info,
+                    candidate_destinations=fallback_destinations,
+                    codex_only=codex_only_fallback)
+                    if fb_client is not None:
+                        _record_route_info(
+                            route_info, _fallback_provider_from_label(fb_label), fb_model,
+                            fallback_label=fb_label,
+                        )
+                        fb_resp = _call_fallback_candidate_sync(
+                            fb_client, fb_model, fb_label,
+                            task=task, messages=messages,
+                            temperature=temperature, max_tokens=max_tokens,
+                            tools=tools, effective_timeout=effective_timeout,
+                            effective_extra_body=effective_extra_body,
+                            reasoning_config=reasoning_config,
+                            destination=fallback_destinations.get(fb_label),
+                        )
+                        if fb_resp is not None:
+                            return fb_resp
             # All fallback layers exhausted — emit a single user-visible
             # warning so the operator knows aux task is about to fail.
             # (#26882) The error itself is re-raised below.
@@ -10185,7 +10591,7 @@ async def async_call_llm(
     timeout: float = None,
     extra_body: dict = None,
     reasoning_config: Optional[dict] = None,
-    route_info: Optional[Dict[str, str]] = None,
+    route_info: Optional[Dict[str, Any]] = None,
 ) -> Any:
     """Run an asynchronous auxiliary LLM request under the configured limit."""
     semaphore = _acquire_async_aux_semaphore(task)
@@ -10228,7 +10634,7 @@ async def _async_call_llm_impl(
     timeout: float = None,
     extra_body: dict = None,
     reasoning_config: Optional[dict] = None,
-    route_info: Optional[Dict[str, str]] = None,
+    route_info: Optional[Dict[str, Any]] = None,
 ) -> Any:
     """Centralized asynchronous LLM call.
 
@@ -10239,7 +10645,17 @@ async def _async_call_llm_impl(
     main_runtime = _normalize_main_runtime(main_runtime)
     resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
         task, provider, model, base_url, api_key)
+    codex_only_fallback = (
+        resolved_provider in {"auto", "", None}
+        and not _task_allows_non_codex_fallback(task)
+    )
     effective_extra_body = _get_task_extra_body(task)
+    fallback_label = (
+        str(route_info.get("fallback_label") or "")
+        if isinstance(route_info, dict) else ""
+    )
+    if fallback_label:
+        effective_extra_body = _fallback_entry_extra_body(task, fallback_label, {})
     effective_extra_body.update(extra_body or {})
     effective_provider = resolved_provider
 
@@ -10287,7 +10703,7 @@ async def _async_call_llm_impl(
             _explicit = (resolved_provider or "").strip().lower()
             if _explicit and _explicit not in {"auto", "openrouter", "custom"}:
                 fb_client, fb_model, fb_label = _try_configured_fallback_for_unavailable_client(
-                    task, _explicit,
+                    task, _explicit, route_info=route_info,
                 )
                 if fb_client is not None:
                     client, final_model = _to_async_client(
@@ -10295,6 +10711,12 @@ async def _async_call_llm_impl(
                     )
                     resolved_provider = fb_label or resolved_provider
                     effective_provider = resolved_provider
+                    _record_route_info(
+                        route_info,
+                        _fallback_provider_from_label(fb_label),
+                        final_model,
+                        fallback_label=fb_label,
+                    )
                 else:
                     raise RuntimeError(
                         f"Provider '{_explicit}' is set in config.yaml but no API key "
@@ -10318,6 +10740,18 @@ async def _async_call_llm_impl(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
                 f"Run: hermes setup")
 
+    if not fallback_label:
+        candidate_label = getattr(client, "_hermes_fallback_label", "")
+        if isinstance(candidate_label, str) and candidate_label.startswith("fallback_chain["):
+            fallback_label = candidate_label
+    candidate_skip_reason = getattr(client, "_hermes_codex_skip_reason", "")
+    if candidate_skip_reason and isinstance(route_info, dict):
+        route_info["codex_skip_reason"] = candidate_skip_reason
+    if fallback_label:
+        effective_extra_body = _fallback_entry_extra_body(task, fallback_label, {})
+        effective_extra_body.update(extra_body or {})
+        if isinstance(route_info, dict):
+            route_info["fallback_label"] = fallback_label
     effective_timeout = _effective_aux_timeout(task, timeout)
     request_provider = effective_provider or resolved_provider
     _set_relay_auxiliary_route(
@@ -10326,7 +10760,8 @@ async def _async_call_llm_impl(
         resolved_api_mode,
     )
     _record_route_info(
-        route_info, _fallback_provider_from_label(request_provider), final_model
+        route_info, _fallback_provider_from_label(request_provider), final_model,
+        fallback_label=fallback_label,
     )
 
     # Pass the client's actual base_url (not just resolved_base_url) so
@@ -10738,28 +11173,31 @@ async def _async_call_llm_impl(
             #   2. For auto: top-level main fallback_providers/fallback_model
             #   3. For auto: built-in auxiliary discovery chain
             #   4. For explicit aux providers: main agent model safety net
-            fb_client, fb_model, fb_label = (None, None, "")
+            configured_attempted_indices: set[int] = set()
+            configured_attempted_identities: set[tuple] = set()
+            fallback_destinations: Dict[str, _FallbackDestination] = {}
             if is_auto:
                 fb_client, fb_model, fb_label = _try_configured_fallback_chain(
                     task, resolved_provider or "auto", reason=reason,
-                    failed_model=_chain_failed_model)
-                if fb_client is None:
-                    fb_client, fb_model, fb_label = _try_main_fallback_chain(
-                        task, resolved_provider or "auto", reason=reason)
-                if fb_client is None:
-                    fb_client, fb_model, fb_label = _try_payment_fallback(
-                        resolved_provider, task, reason=reason)
+                    failed_model=_chain_failed_model,
+                    route_info=route_info,
+                    attempted_indices=configured_attempted_indices,
+                    attempted_identities=configured_attempted_identities,
+                    candidate_destinations=fallback_destinations,
+                    codex_only=codex_only_fallback,
+                )
             else:
                 fb_client, fb_model, fb_label = _try_configured_fallback_chain(
                     task, resolved_provider or "auto", reason=reason,
-                    failed_model=_chain_failed_model)
-                if fb_client is None:
-                    fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
-                        resolved_provider, task, reason=reason,
-                        failed_model=_chain_failed_model)
+                    failed_model=_chain_failed_model,
+                    route_info=route_info,
+                    attempted_indices=configured_attempted_indices,
+                    attempted_identities=configured_attempted_identities,
+                    candidate_destinations=fallback_destinations,
+                    codex_only=codex_only_fallback,
+                )
 
-            if fb_client is not None:
-                # Convert sync fallback client to async
+            while fb_client is not None:
                 async_fb, async_fb_model = _to_async_client(
                     fb_client, fb_model or "", is_vision=(task == "vision")
                 )
@@ -10767,6 +11205,69 @@ async def _async_call_llm_impl(
                     route_info,
                     _fallback_provider_from_label(fb_label),
                     async_fb_model or fb_model,
+                    fallback_label=fb_label,
+                )
+                try:
+                    fb_resp = await _call_fallback_candidate_async(
+                        async_fb, async_fb_model or fb_model, fb_label,
+                        task=task, messages=messages,
+                        temperature=temperature, max_tokens=max_tokens,
+                        tools=tools, effective_timeout=effective_timeout,
+                        effective_extra_body=effective_extra_body,
+                        reasoning_config=reasoning_config,
+                        destination=fallback_destinations.get(fb_label),
+                    )
+                except Exception:
+                    if not fb_label.startswith("fallback_chain["):
+                        raise
+                    fb_resp = None
+                if fb_resp is not None:
+                    return fb_resp
+                if _fallback_label_is_codex(fb_label, fallback_destinations):
+                    _record_codex_skip(route_info, "rejected")
+                next_index = _next_configured_fallback_index(fb_label)
+                if next_index is None:
+                    break
+                fb_client, fb_model, fb_label = _try_configured_fallback_chain(
+                    task, resolved_provider or "auto", reason=reason,
+                    failed_model=_chain_failed_model,
+                    start_index=next_index,
+                    route_info=route_info,
+                    attempted_indices=configured_attempted_indices,
+                    attempted_identities=configured_attempted_identities,
+                    candidate_destinations=fallback_destinations,
+                    codex_only=codex_only_fallback,
+                )
+
+            if is_auto:
+                fb_client, fb_model, fb_label = _try_main_fallback_chain(
+                    task, resolved_provider or "auto", reason=reason,
+                    route_info=route_info,
+                    candidate_destinations=fallback_destinations,
+                    codex_only=codex_only_fallback)
+                if fb_client is None:
+                    fb_client, fb_model, fb_label = _try_payment_fallback(
+                        resolved_provider, task, reason=reason,
+                        route_info=route_info,
+                    candidate_destinations=fallback_destinations,
+                    codex_only=codex_only_fallback)
+            else:
+                fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
+                    resolved_provider, task, reason=reason,
+                    failed_model=_chain_failed_model,
+                    route_info=route_info,
+                    candidate_destinations=fallback_destinations,
+                    codex_only=codex_only_fallback)
+
+            if fb_client is not None:
+                async_fb, async_fb_model = _to_async_client(
+                    fb_client, fb_model or "", is_vision=(task == "vision")
+                )
+                _record_route_info(
+                    route_info,
+                    _fallback_provider_from_label(fb_label),
+                    async_fb_model or fb_model,
+                    fallback_label=fb_label,
                 )
                 fb_resp = await _call_fallback_candidate_async(
                     async_fb, async_fb_model or fb_model, fb_label,
@@ -10774,31 +11275,38 @@ async def _async_call_llm_impl(
                     temperature=temperature, max_tokens=max_tokens,
                     tools=tools, effective_timeout=effective_timeout,
                     effective_extra_body=effective_extra_body,
-                    reasoning_config=reasoning_config)
+                    reasoning_config=reasoning_config,
+                    destination=fallback_destinations.get(fb_label),
+                )
                 if fb_resp is not None:
                     return fb_resp
-                # Stale/unrefreshable candidate credential — quarantined; walk
-                # the discovery chain once more (unhealthy entries skipped).
-                fb_client, fb_model, fb_label = _try_payment_fallback(
-                    resolved_provider, task, reason="stale fallback credential")
-                if fb_client is not None:
-                    async_fb, async_fb_model = _to_async_client(
-                        fb_client, fb_model or "", is_vision=(task == "vision")
-                    )
-                    _record_route_info(
-                        route_info,
-                        _fallback_provider_from_label(fb_label),
-                        async_fb_model or fb_model,
-                    )
-                    fb_resp = await _call_fallback_candidate_async(
-                        async_fb, async_fb_model or fb_model, fb_label,
-                        task=task, messages=messages,
-                        temperature=temperature, max_tokens=max_tokens,
-                        tools=tools, effective_timeout=effective_timeout,
-                        effective_extra_body=effective_extra_body,
-                        reasoning_config=reasoning_config)
-                    if fb_resp is not None:
-                        return fb_resp
+                if is_auto:
+                    fb_client, fb_model, fb_label = _try_payment_fallback(
+                        resolved_provider, task, reason="stale fallback credential",
+                        route_info=route_info,
+                    candidate_destinations=fallback_destinations,
+                    codex_only=codex_only_fallback)
+                    if fb_client is not None:
+                        async_fb, async_fb_model = _to_async_client(
+                            fb_client, fb_model or "", is_vision=(task == "vision")
+                        )
+                        _record_route_info(
+                            route_info,
+                            _fallback_provider_from_label(fb_label),
+                            async_fb_model or fb_model,
+                            fallback_label=fb_label,
+                        )
+                        fb_resp = await _call_fallback_candidate_async(
+                            async_fb, async_fb_model or fb_model, fb_label,
+                            task=task, messages=messages,
+                            temperature=temperature, max_tokens= max_tokens,
+                            tools=tools, effective_timeout=effective_timeout,
+                            effective_extra_body=effective_extra_body,
+                            reasoning_config=reasoning_config,
+                            destination=fallback_destinations.get(fb_label),
+                        )
+                        if fb_resp is not None:
+                            return fb_resp
             # All fallback layers exhausted — warn before re-raising. (#26882)
             logger.warning(
                 "Auxiliary %s (async): %s on %s and all fallbacks exhausted "

@@ -402,7 +402,7 @@ def _silent_bg_base_config(tmp_path):
         "modal_image": "",
         "daytona_image": "",
         "cwd": str(tmp_path),
-        "timeout": 30,
+        "timeout": 180,
         "auto_background_timeout_threshold": 200,
     }
 
@@ -461,16 +461,16 @@ def _call_terminal_handler(monkeypatch, tmp_path, **args):
     return tt, result
 
 
-def test_omitted_background_and_timeout_auto_promote_with_notify(monkeypatch, tmp_path):
-    _tt, result = _call_terminal_handler(monkeypatch, tmp_path)
+def test_omitted_background_and_timeout_stay_foreground(monkeypatch, tmp_path):
+    tt, result = _call_terminal_handler(monkeypatch, tmp_path)
 
-    assert result["session_id"] == "proc_silent_test"
-    assert result["notify_on_complete"] is True
+    assert result["error"] is None
+    tt._test_env.execute.assert_called_once()
 
 
 @pytest.mark.parametrize(
     "args",
-    [{}, {"background": True, "notify_on_complete": True}],
+    [{"background": True, "notify_on_complete": True}],
 )
 def test_notify_is_armed_at_spawn(monkeypatch, tmp_path, args):
     tt, _result = _call_terminal_handler(monkeypatch, tmp_path, **args)

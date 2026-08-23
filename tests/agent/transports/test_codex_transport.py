@@ -106,6 +106,41 @@ class TestCodexBuildKwargs:
         )
         assert kw1["prompt_cache_key"] != kw2["prompt_cache_key"]
 
+    def test_short_gap_reuses_explicit_stable_prefix_without_marker_leak(self, transport):
+        """Responses keeps full text on wire but keys only the explicit stable tier."""
+        def request(volatile, *, stable="stable prefix", tools=None, session="same-route-session"):
+            return transport.build_kwargs(
+                model="gpt-5.6-luna",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": stable,
+                                "cache_control": {"type": "ephemeral"},
+                            },
+                            {"type": "text", "text": f"\n\n{volatile}"},
+                        ],
+                    },
+                    {"role": "user", "content": "same route"},
+                ],
+                tools=tools or [],
+                session_id=session,
+                cache_key_instructions=stable,
+            )
+
+        first = request("first volatile suffix")
+        second = request("second volatile suffix")
+
+        assert first["prompt_cache_key"].startswith("pck_")
+        assert second["prompt_cache_key"] == first["prompt_cache_key"]
+        assert second["instructions"] == "stable prefix\n\nsecond volatile suffix"
+        assert "cache_control" not in second["instructions"]
+        assert request("second volatile suffix", stable="changed")["prompt_cache_key"] != second["prompt_cache_key"]
+        assert request("second volatile suffix", tools=[{"type": "function", "function": {"name": "other"}}])["prompt_cache_key"] != second["prompt_cache_key"]
+        assert request("second volatile suffix", session="other-session")["prompt_cache_key"] != second["prompt_cache_key"]
+
     def test_github_responses_drops_message_item_id_end_to_end(self, transport):
         # #32716: Copilot binds codex_message_items ids to a backend
         # "connection" that doesn't survive credential rotation, a gateway

@@ -30,10 +30,22 @@ const ACTIVITY_LIMIT = 8
 const TRAIL_LIMIT = 8
 
 type CacheInfo = {
+  compression_bound?: boolean
   pct?: number
   prompt_tokens?: number
   read_tokens?: number
   state: 'cold_write' | 'hit' | 'miss' | 'unavailable' | 'unknown'
+}
+
+const compressionReason = (cacheInfo: CacheInfo): string => {
+  if (!cacheInfo.compression_bound) {
+    return ''
+  }
+
+  return cacheInfo.state === 'miss' ||
+    (cacheInfo.state === 'hit' && Number.isFinite(cacheInfo.pct) && cacheInfo.pct! < 50)
+    ? ' because of compression'
+    : ''
 }
 
 // Restored from 51a37362b / f47ecaf19 / 166a68dce4 / 55f59aa54.
@@ -48,14 +60,16 @@ const cacheFootnote = (cacheInfo?: CacheInfo): null | string => {
     const pair = hasCounts ? ` ${cacheInfo.read_tokens}/${cacheInfo.prompt_tokens}` : ''
 
     return hasCounts && cacheInfo.read_tokens! * 100 < cacheInfo.prompt_tokens!
-      ? `cache <1%${pair}`
-      : `cache ${Math.max(0, Math.round(cacheInfo.pct ?? 0))}%${pair}`
+      ? `cache <1%${pair}${compressionReason(cacheInfo)}`
+      : `cache ${Math.max(0, Math.round(cacheInfo.pct ?? 0))}%${pair}${compressionReason(cacheInfo)}`
   }
 
   if (cacheInfo.state === 'miss') {
     const hasCounts = Number.isFinite(cacheInfo.read_tokens) && Number.isFinite(cacheInfo.prompt_tokens)
 
-    return hasCounts ? `cache miss ${cacheInfo.read_tokens}/${cacheInfo.prompt_tokens}` : 'cache miss'
+    return hasCounts
+      ? `cache miss ${cacheInfo.read_tokens}/${cacheInfo.prompt_tokens}${compressionReason(cacheInfo)}`
+      : `cache miss${compressionReason(cacheInfo)}`
   }
 
   return cacheInfo.state === 'cold_write' ? 'cache COLD_WRITE' : `cache ${cacheInfo.state}`

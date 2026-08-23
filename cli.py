@@ -10893,9 +10893,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             "api_key": self.api_key,
             "base_url": self.base_url,
             "api_mode": self.api_mode,
-            "agent_primary_runtime": copy.deepcopy(
+            "agent_primary_runtime": (
                 getattr(agent, "_primary_runtime", None)
-            ) if agent is not None else None,
+                if agent is not None
+                else None
+            ),
         }
 
     def _restore_model_runtime_snapshot(self, snapshot: dict | None) -> None:
@@ -10922,13 +10924,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         primary = snapshot.get("agent_primary_runtime")
         if primary and hasattr(agent, "_restore_primary_runtime"):
             try:
-                agent._primary_runtime = copy.deepcopy(primary)
+                agent._primary_runtime = primary
                 agent._fallback_activated = True
                 agent._rate_limited_until = 0
                 if agent._restore_primary_runtime():
                     return
             except Exception:
-                logger.debug("CLI one-turn model restore via primary runtime failed", exc_info=True)
+                logger.debug("CLI one-turn model restore via primary runtime failed")
 
         if hasattr(agent, "switch_model"):
             try:
@@ -10939,8 +10941,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     base_url=snapshot.get("base_url", ""),
                     api_mode=snapshot.get("api_mode", ""),
                 )
-            except Exception as exc:
-                logger.warning("CLI one-turn model restore failed: %s", exc)
+            except Exception:
+                logger.warning("CLI one-turn model restore failed")
 
     @staticmethod
     def _filter_model_picker_entries(entries: list, query: str) -> list:

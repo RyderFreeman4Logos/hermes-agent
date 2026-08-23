@@ -149,3 +149,23 @@ def test_cli_restore_model_runtime_prefers_primary_runtime():
     assert stub.agent.model == "old/model"
     assert stub.agent.provider == "openrouter"
     assert stub.agent.calls == []
+
+
+def test_pr41_r11_cli_snapshot_does_not_copy_hostile_runtime_graph():
+    import cli as cli_mod
+
+    calls = []
+
+    class Hostile:
+        def __deepcopy__(self, _memo):
+            calls.append("copy")
+            return self
+
+    stub = _StubCLI()
+    primary = {"request_overrides": {"hostile": Hostile()}}
+    stub.agent = SimpleNamespace(_primary_runtime=primary)
+
+    snapshot = cli_mod.HermesCLI._snapshot_model_runtime(stub)
+
+    assert calls == []
+    assert snapshot["agent_primary_runtime"] is primary

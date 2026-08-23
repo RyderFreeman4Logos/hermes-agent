@@ -7464,6 +7464,103 @@ def test_config_set_fast_updates_live_agent_session_scoped(monkeypatch):
         server._sessions.pop("sid", None)
 
 
+def test_pr41_r12_fast_toggle_uses_detached_staged_projection(monkeypatch):
+    caller = {"extra_body": {"caller": {"nested": ["keep"]}}}
+    old_map = {"extra_body": {"caller": {"nested": ["old"]}}}
+    agent = types.SimpleNamespace(
+        model="openai/gpt-5.4",
+        provider="openai",
+        base_url="https://api.openai.com/v1",
+        service_tier=None,
+        _caller_request_overrides=caller,
+        request_overrides=old_map,
+        _custom_providers=[],
+    )
+    session = _session(agent=agent)
+    server._sessions["pr41-r12"] = session
+    monkeypatch.setattr(server, "_persist_live_session_runtime", lambda _session: None)
+    monkeypatch.setattr(server, "_session_info", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        "hermes_cli.models.resolve_fast_mode_overrides",
+        lambda _model: {"service_tier": "priority"},
+    )
+
+    try:
+        response = server.handle_request(
+            {
+                "id": "pr41-r12",
+                "method": "config.set",
+                "params": {
+                    "session_id": "pr41-r12",
+                    "key": "fast",
+                    "value": "fast",
+                },
+            }
+        )
+    finally:
+        server._sessions.pop("pr41-r12", None)
+
+    assert response["result"]["value"] == "fast"
+    assert agent.service_tier == "priority"
+    assert agent.request_overrides == {
+        "service_tier": "priority",
+        "extra_body": {"caller": {"nested": ["keep"]}},
+    }
+    assert agent.request_overrides is not old_map
+    assert agent.request_overrides["extra_body"] is not caller["extra_body"]
+    assert (
+        agent.request_overrides["extra_body"]["caller"]
+        is not caller["extra_body"]["caller"]
+    )
+
+
+def test_pr41_r12_legacy_fast_rejection_is_atomic_and_hook_free(monkeypatch):
+    calls = []
+
+    class Hostile:
+        def __deepcopy__(self, _memo):
+            calls.append("copy")
+            raise RuntimeError("private payload")
+
+    old_map = {"foo": Hostile(), "speed": "slow"}
+    agent = types.SimpleNamespace(
+        model="openai/gpt-5.4",
+        provider="openai",
+        base_url="https://api.openai.com/v1",
+        service_tier=None,
+        request_overrides=old_map,
+    )
+    session = _session(agent=agent)
+    server._sessions["pr41-r12-reject"] = session
+    monkeypatch.setattr(
+        "hermes_cli.models.resolve_fast_mode_overrides",
+        lambda _model: {"service_tier": "priority"},
+    )
+
+    try:
+        response = server.handle_request(
+            {
+                "id": "pr41-r12-reject",
+                "method": "config.set",
+                "params": {
+                    "session_id": "pr41-r12-reject",
+                    "key": "fast",
+                    "value": "fast",
+                },
+            }
+        )
+    finally:
+        server._sessions.pop("pr41-r12-reject", None)
+
+    assert response is not None
+    assert response["error"]["code"] == 4002
+    assert agent.service_tier is None
+    assert agent.request_overrides is old_map
+    assert session.get("create_service_tier_override") is None
+    assert calls == []
+
+
 def test_config_set_fast_status_is_non_mutating(monkeypatch):
     writes = []
     emits = []

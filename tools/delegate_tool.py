@@ -1853,7 +1853,7 @@ def _build_child_agent(
     # same class of silent-drag the override_provider filter-clearing below
     # already prevents for OpenRouter routing preferences.  Predictability >
     # liveness for explicit pins: the pinned child fails loudly instead.
-    parent_fallback = (
+    parent_fallback: Any = (
         None
         if override_provider
         else (getattr(parent_agent, "_fallback_chain", None) or None)
@@ -1896,6 +1896,22 @@ def _build_child_agent(
     child_optional_kwargs: Dict[str, Any] = {}
     if isinstance(child_max_tokens, int):
         child_optional_kwargs["max_tokens"] = child_max_tokens
+
+    derived_request_overrides = dict(override_request_overrides or {})
+    service_tier = getattr(parent_agent, "service_tier", None)
+    if isinstance(service_tier, str) and service_tier:
+        from hermes_cli.models import resolve_fast_mode_overrides
+
+        derived_request_overrides.update(
+            resolve_fast_mode_overrides(effective_model) or {}
+        )
+    from agent.agent_init import _request_override_projections
+
+    child_caller_overrides, child_fast_overrides = _request_override_projections(
+        parent_agent, derived_request_overrides
+    )
+    if child_fast_overrides:
+        child_optional_kwargs["fast_mode_overrides"] = child_fast_overrides
 
     # Each child gets a DEDICATED SessionDB connection instead of the parent's
     # live object. The parent's handle is owned by the parent's lifecycle
@@ -1965,11 +1981,7 @@ def _build_child_agent(
                 provider_sort=child_provider_sort,
                 provider_require_parameters=child_provider_require_parameters,
                 provider_data_collection=child_provider_data_collection,
-                request_overrides=(
-                    dict(override_request_overrides or {})
-                    if override_provider
-                    else dict(getattr(parent_agent, "request_overrides", {}) or {})
-                ),
+                request_overrides=child_caller_overrides,
                 openrouter_min_coding_score=child_openrouter_min_coding_score,
                 tool_progress_callback=child_progress_cb,
                 iteration_budget=None,  # fresh budget per subagent

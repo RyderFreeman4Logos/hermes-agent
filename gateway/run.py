@@ -3713,6 +3713,30 @@ def _load_gateway_config(config_path: "Path | None" = None) -> dict:
     return raw
 
 
+def _apply_cached_turn_runtime(
+    agent,
+    *,
+    reasoning_config,
+    service_tier,
+    derived_overrides,
+) -> None:
+    """Stage cached-turn request state before publishing live fields."""
+    from agent.agent_init import _project_request_overrides
+
+    projected = _project_request_overrides(
+        agent,
+        provider=getattr(agent, "provider", ""),
+        model=getattr(agent, "model", ""),
+        base_url=getattr(agent, "base_url", ""),
+        service_tier=service_tier,
+        derived_overrides=derived_overrides,
+        custom_providers=getattr(agent, "_custom_providers", []),
+    )
+    agent.reasoning_config = reasoning_config
+    agent.service_tier = service_tier
+    agent.request_overrides = projected
+
+
 def _checkpoint_agent_kwargs(config: dict | None) -> dict:
     """Translate gateway checkpoint config into ``AIAgent`` constructor args.
 
@@ -5765,7 +5789,7 @@ class TurnRunner:
                 prefill_messages=self._runner._prefill_messages or None,
                 reasoning_config=reasoning_config,
                 service_tier=self._runner._service_tier,
-                request_overrides=turn_route.get("request_overrides"),
+                fast_mode_overrides=turn_route.get("request_overrides"),
                 providers_allowed=pr.get("only"),
                 providers_ignored=pr.get("ignore"),
                 providers_order=pr.get("order"),
@@ -5876,9 +5900,12 @@ class TurnRunner:
         agent.notice_callback = _notice_callback_sync
         agent.notice_clear_callback = None
         agent.event_callback = ctx._event_callback_sync
-        agent.reasoning_config = reasoning_config
-        agent.service_tier = self._runner._service_tier
-        agent.request_overrides = turn_route.get("request_overrides") or {}
+        _apply_cached_turn_runtime(
+            agent,
+            reasoning_config=reasoning_config,
+            service_tier=self._runner._service_tier,
+            derived_overrides=turn_route.get("request_overrides") or {},
+        )
         # Must-deliver notes for THIS turn ride the current user message
         # (api_content sidecar), never the system prompt: staged by
         # _handle_message_with_agent (auto-reset note, first-contact
@@ -22722,7 +22749,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     disabled_toolsets=disabled_toolsets,
                     reasoning_config=reasoning_config,
                     service_tier=self._service_tier,
-                    request_overrides=turn_route.get("request_overrides"),
+                    fast_mode_overrides=turn_route.get("request_overrides"),
                     providers_allowed=pr.get("only"),
                     providers_ignored=pr.get("ignore"),
                     providers_order=pr.get("order"),

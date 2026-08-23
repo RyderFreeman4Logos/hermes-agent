@@ -4901,30 +4901,61 @@ def _persist_model_switch(result) -> None:
 
 def _snapshot_agent_model_runtime(agent) -> dict:
     """Capture the current agent model runtime for a one-turn restore."""
-    return {
+    from agent.agent_init import _copy_request_override_graph
+
+    snapshot = {
         "model": getattr(agent, "model", ""),
         "provider": getattr(agent, "provider", ""),
         "api_key": getattr(agent, "api_key", ""),
         "base_url": getattr(agent, "base_url", ""),
         "api_mode": getattr(agent, "api_mode", ""),
-        "primary_runtime": copy.deepcopy(getattr(agent, "_primary_runtime", None)),
+        "primary_runtime": getattr(agent, "_primary_runtime", None),
     }
+    if hasattr(agent, "request_overrides"):
+        snapshot["request_overrides"] = _copy_request_override_graph(
+            agent.request_overrides
+        )
+    snapshot["one_turn_fallback_state"] = {
+        name: _copy_request_override_graph(getattr(agent, name))
+        for name in (
+            "_fallback_chain",
+            "_fallback_model",
+            "_fallback_index",
+            "_consecutive_stale_streams",
+        )
+        if hasattr(agent, name)
+    }
+    return snapshot
 
 
 def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
     """Restore an agent model runtime captured before a one-turn override."""
     if not snapshot or agent is None:
         return
+    from agent.agent_init import _copy_request_override_graph
+
+    def _restore_request_overrides() -> None:
+        if "request_overrides" in snapshot:
+            agent.request_overrides = _copy_request_override_graph(
+                snapshot["request_overrides"]
+            )
+
+    def _restore_one_turn_fallback_state() -> None:
+        for name, value in snapshot.get("one_turn_fallback_state", {}).items():
+            setattr(agent, name, _copy_request_override_graph(value))
+
     primary = snapshot.get("primary_runtime")
     if primary and hasattr(agent, "_restore_primary_runtime"):
         try:
-            agent._primary_runtime = copy.deepcopy(primary)
+            agent._primary_runtime = primary
             agent._fallback_activated = True
             agent._rate_limited_until = 0
             if agent._restore_primary_runtime():
+                _restore_request_overrides()
+                _restore_one_turn_fallback_state()
                 return
         except Exception:
-            logger.debug("TUI one-turn model restore via primary runtime failed", exc_info=True)
+            logger.debug("TUI one-turn model restore via primary runtime failed")
     if hasattr(agent, "switch_model"):
         agent.switch_model(
             new_model=snapshot.get("model", ""),
@@ -4933,6 +4964,8 @@ def _restore_agent_model_runtime(agent, snapshot: dict | None) -> None:
             base_url=snapshot.get("base_url", ""),
             api_mode=snapshot.get("api_mode", ""),
         )
+        _restore_request_overrides()
+        _restore_one_turn_fallback_state()
 
 
 def _apply_model_switch(
@@ -6709,6 +6742,22 @@ def _agent_fallback_model(agent):
 
 def _background_agent_kwargs(agent, task_id: str) -> dict:
     cfg = _load_cfg()
+    service_tier = getattr(agent, "service_tier", None) or _load_service_tier()
+    try:
+        from hermes_cli.models import resolve_fast_mode_overrides
+
+        fast_mode_overrides = (
+            resolve_fast_mode_overrides(str(getattr(agent, "model", "") or "")) or {}
+            if service_tier
+            else {}
+        )
+    except Exception:
+        fast_mode_overrides = {}
+    from agent.agent_init import _request_override_projections
+
+    caller_overrides, fast_mode_overrides = _request_override_projections(
+        agent, fast_mode_overrides
+    )
 
     return {
         "base_url": getattr(agent, "base_url", None) or None,
@@ -6741,8 +6790,9 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
         "session_id": task_id,
         "reasoning_config": getattr(agent, "reasoning_config", None)
         or _load_reasoning_config(str(getattr(agent, "model", "") or "")),
-        "service_tier": getattr(agent, "service_tier", None) or _load_service_tier(),
-        "request_overrides": dict(getattr(agent, "request_overrides", {}) or {}),
+        "service_tier": service_tier,
+        "request_overrides": caller_overrides,
+        "fast_mode_overrides": fast_mode_overrides,
         "platform": "tui",
         "session_db": _get_db(),
         "fallback_model": _agent_fallback_model(agent),
@@ -11557,7 +11607,7 @@ def _run_prompt_submit(
                     _persist_live_session_runtime(session)
                     _persist_live_session_system_prompt(session)
                 except Exception:
-                    logger.debug("TUI one-turn model restore failed", exc_info=True)
+                    logger.debug("TUI one-turn model restore failed")
             try:
                 if approval_token is not None:
                     reset_current_session_key(approval_token)
@@ -12180,6 +12230,27 @@ def _(rid, params: dict) -> dict:
                     "fast mode is not available for this model",
                 )
 
+        projected_overrides = None
+        target_service_tier = "priority" if nv == "fast" else None
+        if agent is not None:
+            from agent.agent_init import (
+                _RequestOverrideProjectionError,
+                _project_request_overrides,
+            )
+
+            try:
+                projected_overrides = _project_request_overrides(
+                    agent,
+                    provider=getattr(agent, "provider", ""),
+                    model=getattr(agent, "model", ""),
+                    base_url=getattr(agent, "base_url", ""),
+                    service_tier=target_service_tier,
+                    derived_overrides=overrides or {},
+                    custom_providers=getattr(agent, "_custom_providers", []),
+                )
+            except _RequestOverrideProjectionError:
+                return _err(rid, 4002, "fast mode request overrides were rejected")
+
         if session is not None:
             # Session-scoped, like `reasoning` below (global persistence is
             # `--global` / Settings → Model territory). Writing config.yaml
@@ -12195,13 +12266,8 @@ def _(rid, params: dict) -> dict:
         else:
             _write_config_key("agent.service_tier", nv)
         if agent is not None:
-            agent.service_tier = "priority" if nv == "fast" else None
-            current_overrides = dict(getattr(agent, "request_overrides", {}) or {})
-            current_overrides.pop("service_tier", None)
-            current_overrides.pop("speed", None)
-            if nv == "fast":
-                current_overrides.update(overrides)
-            agent.request_overrides = current_overrides
+            agent.service_tier = target_service_tier
+            agent.request_overrides = projected_overrides
             _persist_live_session_runtime(session)
             _emit(
                 "session.info",

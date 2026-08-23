@@ -84,7 +84,7 @@ def test_unrouted_runtime_keeps_parent_pool_and_overrides():
     with patch("hermes_cli.config.load_config", return_value={}), patch("hermes_cli.config.load_config_readonly", return_value={}):
         rt = br._resolve_review_runtime(agent)
     assert rt["credential_pool"] == "parent-pool"
-    assert rt["request_overrides"] == {"service_tier": "priority"}
+    assert rt["request_overrides"] == {}
     assert rt["max_tokens"] == 4096
 
 

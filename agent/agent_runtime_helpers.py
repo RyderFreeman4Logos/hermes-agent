@@ -40,7 +40,13 @@ from agent.trajectory import convert_scratchpad_to_think
 from agent.credential_pool import STATUS_EXHAUSTED, credential_pool_matches_provider
 from agent.error_classifier import FailoverReason
 from agent.turn_context import drop_stale_api_content
-from utils import base_url_host_matches, base_url_hostname, env_var_enabled, atomic_json_write
+from utils import (
+    atomic_json_write,
+    base_url_host_matches,
+    base_url_hostname,
+    env_var_enabled,
+    normalize_route_base_url,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1322,6 +1328,21 @@ def try_recover_primary_transport(
     ):
         return False
 
+    rt = agent._primary_runtime
+    from agent.agent_init import _RequestOverrideProjectionError
+
+    try:
+        projected_overrides = _project_request_overrides_for_runtime(
+            agent,
+            provider=rt["provider"],
+            model=rt["model"],
+            base_url=rt["base_url"],
+            service_tier=getattr(agent, "service_tier", None),
+            legacy_request_overrides=rt.get("request_overrides"),
+        )
+    except _RequestOverrideProjectionError:
+        return False
+
     try:
         # Retire the existing client to release stale connections. #70773:
         # never hard-close the shared client here — this runs on the
@@ -1339,7 +1360,6 @@ def try_recover_primary_transport(
                 pass
 
         # Rebuild from primary snapshot
-        rt = agent._primary_runtime
         agent._client_kwargs = dict(rt["client_kwargs"])
         agent.model = rt["model"]
         agent.provider = rt["provider"]
@@ -1349,6 +1369,7 @@ def try_recover_primary_transport(
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent.api_key = rt["api_key"]
+        agent.request_overrides = projected_overrides
         agent._reasoning_echo_flag = rt.get("reasoning_echo_flag", False)
 
         if agent.api_mode == "anthropic_messages":
@@ -1570,6 +1591,20 @@ def restore_primary_runtime(agent) -> bool:
     agent._restore_wait_logged = False
 
     rt = agent._primary_runtime
+    from agent.agent_init import _RequestOverrideProjectionError
+
+    try:
+        projected_overrides = _project_request_overrides_for_runtime(
+            agent,
+            provider=rt["provider"],
+            model=rt["model"],
+            base_url=rt["base_url"],
+            service_tier=getattr(agent, "service_tier", None),
+            legacy_request_overrides=rt.get("request_overrides"),
+        )
+    except _RequestOverrideProjectionError:
+        return False
+
     try:
         # ── Core runtime state ──
         agent.model = rt["model"]
@@ -1582,6 +1617,7 @@ def restore_primary_runtime(agent) -> bool:
         agent.api_key = rt["api_key"]
         agent._reasoning_echo_flag = rt.get("reasoning_echo_flag", False)
         agent._client_kwargs = dict(rt["client_kwargs"])
+        agent.request_overrides = projected_overrides
         agent._use_prompt_caching = rt["use_prompt_caching"]
         # Default to native layout when the restored snapshot predates the
         # native-vs-proxy split (older sessions saved before this PR).
@@ -2600,6 +2636,68 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     return client
 
 
+_RUNTIME_OVERRIDE_UNSET = object()
+
+
+def _project_request_overrides_for_runtime(
+    agent,
+    *,
+    provider: str,
+    model: str,
+    base_url: str,
+    service_tier: Optional[str],
+    legacy_request_overrides: Any = _RUNTIME_OVERRIDE_UNSET,
+) -> Dict[str, Any]:
+    """Stage one detached request mapping for an explicit target runtime."""
+    custom_providers = getattr(agent, "_custom_providers", [])
+    try:
+        from hermes_cli.config import (
+            get_compatible_custom_providers,
+            load_config_readonly,
+        )
+
+        custom_providers = get_compatible_custom_providers(load_config_readonly())
+    except Exception:
+        logger.debug("runtime override rebuild skipped: custom_provider_resolution_failed")
+
+    derived_overrides = {}
+    if service_tier:
+        try:
+            from hermes_cli.models import resolve_fast_mode_overrides
+
+            derived_overrides = resolve_fast_mode_overrides(model) or {}
+        except Exception:
+            logger.debug("runtime override rebuild skipped: fast_mode_resolution_failed")
+
+    from agent.agent_init import (
+        _RequestOverrideProjectionError,
+        _project_request_overrides,
+    )
+
+    caller_overrides = (
+        getattr(agent, "_caller_request_overrides", {})
+        if legacy_request_overrides is _RUNTIME_OVERRIDE_UNSET
+        or hasattr(agent, "_caller_request_overrides")
+        else legacy_request_overrides
+    )
+    try:
+        return _project_request_overrides(
+            agent,
+            provider=provider,
+            model=model,
+            base_url=base_url,
+            service_tier=service_tier,
+            derived_overrides=derived_overrides,
+            custom_providers=custom_providers,
+            caller_overrides=caller_overrides,
+        )
+    except _RequestOverrideProjectionError:
+        logger.debug("runtime override rebuild failed: request_override_copy_rejected")
+        raise _RequestOverrideProjectionError(
+            "request override projection rejected"
+        ) from None
+
+
 def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mode=''):
     """Switch the model/provider in-place for a live agent.
 
@@ -2640,6 +2738,32 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
 
     old_model = agent.model
     old_provider = agent.provider
+    old_base_url = agent.base_url
+
+    old_norm_provider = (old_provider or "").strip().lower()
+    new_norm_provider = (new_provider or "").strip().lower()
+    if base_url:
+        target_base_url = base_url
+    elif old_norm_provider == new_norm_provider:
+        target_base_url = old_base_url
+    else:
+        raise ValueError(
+            f"switch_model: no base_url resolved for provider "
+            f"'{new_provider}' (switching from '{old_provider}'); "
+            "refusing to keep the previous provider's endpoint"
+        )
+    if new_norm_provider == "moa":
+        target_base_url = "moa://local"
+        api_mode = "chat_completions"
+    base_url = target_base_url
+    projected_overrides = _project_request_overrides_for_runtime(
+        agent,
+        provider=new_provider,
+        model=new_model,
+        base_url=target_base_url,
+        service_tier=getattr(agent, "service_tier", None),
+    )
+    from agent.agent_init import _copy_request_override_graph
 
     # ── Snapshot all fields the swap+rebuild can mutate ──
     # If the rebuild raises (bad API key, network error, build_anthropic_client
@@ -2671,9 +2795,14 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             "_reasoning_echo_flag",
         )
     }
-    # _client_kwargs is a dict — snapshot a shallow copy so mutating the
-    # live dict doesn't poison the rollback target.
-    _snapshot["_client_kwargs"] = dict(getattr(agent, "_client_kwargs", {}) or {})
+    # Mutable request state needs an independent rollback copy.
+    _snapshot["_client_kwargs"] = getattr(agent, "_client_kwargs", _MISSING)
+    _old_request_overrides = getattr(agent, "request_overrides", _MISSING)
+    _snapshot["request_overrides"] = (
+        _copy_request_override_graph(_old_request_overrides)
+        if _old_request_overrides is not _MISSING
+        else _MISSING
+    )
     # Snapshot the credential pool reference so a failed client rebuild can
     # restore the original pool (issue #52727: pool reload is part of this
     # switch and must be reversible on rollback).
@@ -2685,7 +2814,11 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
     def _restore_snapshot() -> None:
         for _name, _value in _snapshot.items():
             if _value is _MISSING:
-                # Attribute did not exist before the swap — don't fabricate it.
+                if _name == "request_overrides":
+                    try:
+                        delattr(agent, _name)
+                    except AttributeError:
+                        pass
                 continue
             try:
                 setattr(agent, _name, _value)
@@ -2719,17 +2852,9 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         # provider genuinely has none. Re-selecting the SAME provider with
         # an empty base_url (e.g. a credential-only refresh) is still fine
         # to keep the current URL. See #47828.
-        old_norm_provider = (old_provider or "").strip().lower()
-        new_norm_provider = (new_provider or "").strip().lower()
-        if base_url:
-            agent.base_url = base_url
-        elif old_norm_provider != new_norm_provider:
-            raise ValueError(
-                f"switch_model: no base_url resolved for provider "
-                f"'{new_provider}' (switching from '{old_provider}'); "
-                "refusing to keep the previous provider's endpoint"
-            )
+        agent.base_url = target_base_url
         agent.api_mode = api_mode
+        agent.request_overrides = projected_overrides
         # Invalidate transport cache — new api_mode may need a different transport
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
@@ -2987,6 +3112,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         "api_mode": agent.api_mode,
         "api_key": getattr(agent, "api_key", ""),
         "client_kwargs": dict(agent._client_kwargs),
+        "request_overrides": _copy_request_override_graph(agent.request_overrides),
         "use_prompt_caching": agent._use_prompt_caching,
         "use_native_cache_layout": agent._use_native_cache_layout,
         "reasoning_config": dict(agent.reasoning_config) if getattr(agent, "reasoning_config", None) else None,

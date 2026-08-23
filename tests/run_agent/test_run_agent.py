@@ -2997,6 +2997,44 @@ class TestRunConversation:
             },
         ]
 
+    def test_loop_timing_is_trailing_uncached_system_context(self, agent):
+        self._setup_agent(agent)
+        agent._cached_system_prompt = "stable instructions"
+        agent._cached_system_prompt_static = "stable instructions"
+        agent._use_prompt_caching = True
+        agent._use_native_cache_layout = False
+        agent._cache_ttl = "5m"
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="Final answer",
+            finish_reason="stop",
+        )
+
+        with (
+            patch(
+                "agent.conversation_loop._loop_timing_context",
+                return_value="[Agent loop timing]\nCurrent loop start: now",
+                create=True,
+            ),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is True
+        messages = agent.client.chat.completions.create.call_args.kwargs["messages"]
+        assert messages[0]["content"] == [
+            {
+                "type": "text",
+                "text": "stable instructions",
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
+        assert messages[-1] == {
+            "role": "system",
+            "content": "[Agent loop timing]\nCurrent loop start: now",
+        }
+
     def test_codex_content_filter_incomplete_routes_to_policy_fallback(self, agent):
         self._setup_agent(agent)
         agent.api_mode = "codex_responses"
@@ -3790,15 +3828,20 @@ class TestRunConversation:
         assert len(requests) == 2
 
         replay = requests[1]["messages"]
-        assert [m["role"] for m in replay[-3:]] == [
+        replay_without_timing = [
+            message
+            for message in replay
+            if "[Agent loop timing]" not in str(message.get("content", ""))
+        ]
+        assert [m["role"] for m in replay_without_timing[-3:]] == [
             "user",
             "assistant",
             "user",
         ]
         # Scaffold rides on the user correction (api_content → content), never
         # as the assistant placeholder's own reply (#81841).
-        placeholder = replay[-2]["content"]
-        correction = replay[-1]["content"]
+        placeholder = replay_without_timing[-2]["content"]
+        correction = replay_without_timing[-1]["content"]
         assert "interrupted by a user correction" not in (placeholder or "")
         assert "interrupted by a user correction" in correction
         assert correction.endswith("No, use Postgres instead.")
@@ -4137,8 +4180,13 @@ class TestRunConversation:
         assert result["final_response"] == "Part 1 Part 2"
 
         second_call_messages = agent.client.chat.completions.create.call_args_list[1].kwargs["messages"]
-        assert second_call_messages[-1]["role"] == "user"
-        assert "truncated by the output length limit" in second_call_messages[-1]["content"]
+        continuation = next(
+            message
+            for message in reversed(second_call_messages)
+            if "[Agent loop timing]" not in str(message.get("content", ""))
+        )
+        assert continuation["role"] == "user"
+        assert "truncated by the output length limit" in continuation["content"]
 
     def test_length_continuation_preserves_large_provider_default_output_cap(self, agent):
         """Continuation retries must not shrink a higher provider default cap."""
@@ -4212,8 +4260,13 @@ class TestRunConversation:
         )
 
         third_call_messages = agent.client.chat.completions.create.call_args_list[2].kwargs["messages"]
-        assert third_call_messages[-1]["role"] == "user"
-        assert "truncated by the output length limit" in third_call_messages[-1]["content"]
+        continuation = next(
+            message
+            for message in reversed(third_call_messages)
+            if "[Agent loop timing]" not in str(message.get("content", ""))
+        )
+        assert continuation["role"] == "user"
+        assert "truncated by the output length limit" in continuation["content"]
 
 
 
@@ -4797,8 +4850,8 @@ class TestRunConversation:
         # output-cap retry would call the compressor but re-transmit the same
         # oversized request forever.
         second_messages = second_call.get("messages", [])
-        assert second_messages[-1].get("content") == "hello"
-        assert len(second_messages) == 2
+        assert second_messages[-2].get("content") == "hello"
+        assert len(second_messages) == 3
         assert second_messages[0]["role"] == "system"
         # context_length was NOT mutated by an output-cap error.
         assert agent.context_compressor.context_length == 200_000

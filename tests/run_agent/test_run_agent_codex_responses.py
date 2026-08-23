@@ -1310,6 +1310,31 @@ def test_build_api_kwargs_xai_oauth_sends_cache_key_via_extra_body(monkeypatch):
     )
 
 
+def test_xai_prompt_cache_key_ignores_trailing_loop_timing(monkeypatch):
+    agent = _build_xai_oauth_agent(monkeypatch)
+    stable_messages = [
+        {"role": "system", "content": "Stable instructions"},
+        {"role": "user", "content": "Ping"},
+    ]
+
+    def build(timing_text):
+        return agent._build_api_kwargs(
+            [*stable_messages, {"role": "system", "content": timing_text}]
+        )
+
+    first = build(
+        "[Agent loop timing]\nCurrent loop start: 2026-08-22T11:28:03-07:00"
+    )
+    second = build(
+        "[Agent loop timing]\nCurrent loop start: 2026-08-22T11:28:05-07:00"
+    )
+
+    assert first["extra_body"]["prompt_cache_key"] == second["extra_body"]["prompt_cache_key"]
+    assert first["instructions"] == second["instructions"] == "Stable instructions"
+    assert "[Agent loop timing]" not in first["instructions"]
+    assert "[Agent loop timing]" in str(first["input"])
+    assert "[Agent loop timing]" in str(second["input"])
+
 
 
 def test_try_refresh_codex_client_credentials_handles_xai_oauth(monkeypatch):

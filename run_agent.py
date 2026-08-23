@@ -8517,7 +8517,7 @@ class AIAgent:
             set_accounting_context,
         )
         from agent import relay_runtime
-        from agent.conversation_loop import run_conversation
+        from agent.conversation_loop import _loop_timing_context, run_conversation
         from agent.portal_tags import (
             reset_conversation_context,
             set_conversation_context,
@@ -8859,6 +8859,7 @@ class AIAgent:
             # which may be observed from another thread.
             with bind_subagent_parent(self), scoped_runtime_main({}):
                 try:
+                    self._loop_timing_context_text = _loop_timing_context(self) or ""
                     if durable_turn_lease_thread is not None:
                         with durable_turn_lease_activity_lock:
                             durable_turn_lease_turn_active = True
@@ -8877,6 +8878,8 @@ class AIAgent:
                         moa_config=moa_config,
                     )
                 finally:
+                    _loop_timing_context(self, stop=True)
+                    self._loop_timing_context_text = ""
                     # The lease remains held through relay/task finalization, but
                     # those post-loop steps must not receive a late refresh
                     # interrupt that poisons the next turn on a cached agent.

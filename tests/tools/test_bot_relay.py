@@ -182,6 +182,7 @@ class _FakeAgent:
         self._bot_mode_protocol = True
         self.tools: list = []
         self.valid_tool_names: set = set()
+        self._tool_snapshot_generation = 0
 
 
 @pytest.fixture(autouse=True)
@@ -209,6 +210,8 @@ def test_tool_injects_despite_legacy_soul_protocol(tmp_path):
     agent = _FakeAgent(home)
     assert ensure_message_agent_tool(agent) is True
     assert [t["function"]["name"] for t in agent.tools] == [MESSAGE_AGENT_TOOL_NAME]
+    assert agent.valid_tool_names == {MESSAGE_AGENT_TOOL_NAME}
+    assert agent._tool_snapshot_generation == 1
 
 
 def test_relay_route_queues_envelope_and_spawns_waiter(tmp_path, monkeypatch):

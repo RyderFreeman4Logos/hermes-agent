@@ -198,6 +198,33 @@ class TestLoadMCPConfig:
         assert server["env"]["PLUGIN_DATA"].startswith(str(home / "plugin-data"))
         assert "agent_plugin" not in server
 
+    def test_public_discovery_config_failure_log_is_static(self, monkeypatch):
+        import tools.mcp_tool as mcp_tool
+        from hermes_cli import plugins
+
+        marker = "portable-plugin-credential-marker"
+        logger = MagicMock()
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config", lambda: {"mcp_servers": {}}
+        )
+        monkeypatch.setattr(
+            plugins,
+            "discover_plugins",
+            lambda: (_ for _ in ()).throw(RuntimeError(marker)),
+        )
+
+        with patch.object(mcp_tool, "logger", logger):
+            assert mcp_tool.discover_mcp_tools() == []
+
+        calls = [
+            call
+            for method in (logger.debug, logger.info, logger.warning, logger.error)
+            for call in method.call_args_list
+        ]
+        assert calls
+        assert all(len(call.args) == 1 and call.kwargs == {} for call in calls)
+        assert marker not in repr(calls)
+
 
 class TestMCPParallelSafetyProvenance:
     def test_parallel_safe_servers_keep_exact_raw_names(self, monkeypatch):
@@ -773,12 +800,11 @@ class TestDiscoverAndRegister:
         assert registered == ["mcp__srv__safe_tool"]
         assert registry.get_entry("mcp__srv__read_file") is None
         assert registry.get_entry("mcp__srv__safe_tool") is not None
-        assert any(
-            "name normalization collision" in record.message
-            and "tool 'read-file'" in record.message
-            and "tool 'read_file'" in record.message
-            for record in caplog.records
-        )
+        assert [record.message for record in caplog.records] == [
+            "MCP tool registration rejected a name collision"
+        ]
+        assert "read-file" not in caplog.text
+        assert "read_file" not in caplog.text
 
     def test_native_tool_wins_over_generated_utility_on_collision(self, caplog):
         """A server-native tool named `read_resource` must survive its collision
@@ -827,10 +853,10 @@ class TestDiscoverAndRegister:
         )
         assert any(
             record.levelno == logging.INFO
-            and "keeping the native tool and dropping the utility" in record.message
-            and "read_resource" in record.message
+            and record.message == "MCP generated utility shadowed by a native tool"
             for record in caplog.records
         )
+        assert "read_resource" not in caplog.text
 
 # ---------------------------------------------------------------------------
 # MCPServerTask (run / start / shutdown)
@@ -1039,6 +1065,99 @@ class TestGracefulFallback:
 # ---------------------------------------------------------------------------
 
 class TestShutdown:
+
+    def test_public_shutdown_failure_logs_are_static(self):
+        import tools.mcp_tool as mcp_mod
+
+        server_marker = "shutdown-server-session-marker"
+        exception_marker = "shutdown-credential-exception-marker"
+        server = MagicMock()
+        server.name = server_marker
+
+        async def _fail_shutdown():
+            raise RuntimeError(exception_marker)
+
+        server.shutdown = _fail_shutdown
+        logger = MagicMock()
+        with mcp_mod._lock:
+            mcp_mod._servers.clear()
+            mcp_mod._servers[server_marker] = server
+        mcp_mod._ensure_mcp_loop()
+
+        def _schedule(coro, loop, **_kwargs):
+            future = asyncio.run_coroutine_threadsafe(coro, loop)
+
+            class FailedWait:
+                def result(self, timeout):
+                    future.result(timeout)
+                    raise RuntimeError(exception_marker)
+
+            return FailedWait()
+
+        try:
+            with (
+                patch.object(mcp_mod, "logger", logger),
+                patch("agent.async_utils.safe_schedule_threadsafe", side_effect=_schedule),
+            ):
+                mcp_mod.shutdown_mcp_servers()
+        finally:
+            with mcp_mod._lock:
+                mcp_mod._servers.clear()
+            mcp_mod._stop_mcp_loop()
+
+        calls = [
+            call
+            for method in (logger.debug, logger.info, logger.warning, logger.error)
+            for call in method.call_args_list
+        ]
+        assert calls
+        assert all(
+            len(call.args) == 1 and call.kwargs == {} for call in calls
+        ), calls
+        assert server_marker not in repr(calls)
+        assert exception_marker not in repr(calls)
+
+    def test_public_shutdown_real_method_timeout_log_is_static(self):
+        import tools.mcp_tool as mcp_mod
+
+        server_marker = "shutdown-server-identity-secret-marker"
+        server = mcp_mod.MCPServerTask(server_marker)
+        logger = MagicMock()
+        mcp_mod._ensure_mcp_loop()
+        with mcp_mod._lock:
+            loop = mcp_mod._mcp_loop
+        assert loop is not None
+
+        async def install_running_task():
+            return asyncio.create_task(asyncio.Event().wait())
+
+        server._task = asyncio.run_coroutine_threadsafe(
+            install_running_task(), loop
+        ).result(timeout=2)
+        with mcp_mod._lock:
+            mcp_mod._servers.clear()
+            mcp_mod._servers[server_marker] = server
+
+        async def force_shutdown_timeout(task, timeout):
+            assert task is server._task
+            assert timeout == 10
+            raise asyncio.TimeoutError
+
+        try:
+            with (
+                patch.object(mcp_mod, "logger", logger),
+                patch.object(mcp_mod.asyncio, "wait_for", force_shutdown_timeout),
+            ):
+                mcp_mod.shutdown_mcp_servers()
+        finally:
+            with mcp_mod._lock:
+                mcp_mod._servers.clear()
+            mcp_mod._stop_mcp_loop()
+
+        logger.warning.assert_called_once_with(
+            "MCP server shutdown timed out; task cancelled"
+        )
+        assert server_marker not in repr(logger.method_calls)
 
     def test_shutdown_drains_parked_server_after_bounded_wait_expires(self):
         """The public shutdown path drains a parked server if graceful shutdown stalls.
@@ -2260,7 +2379,12 @@ class TestDiscoveryFailedCount:
 
     def test_failed_server_increments_failed_count(self):
         """When _discover_and_register_server raises, failed_count increments."""
-        from tools.mcp_tool import discover_mcp_tools, _servers, _ensure_mcp_loop
+        from tools.mcp_tool import (
+            _ensure_mcp_loop,
+            _server_connect_errors,
+            _servers,
+            discover_mcp_tools,
+        )
 
         fake_config = {
             "good_server": {"command": "npx", "args": ["good"]},
@@ -2284,27 +2408,27 @@ class TestDiscoveryFailedCount:
              patch("tools.mcp_tool._existing_tool_names", return_value=["mcp__good_server__tool_a"]):
             _ensure_mcp_loop()
 
-            # Capture the logger to verify failed_count in summary
+            # Capture the logger to verify the failure-class summaries.
             with patch("tools.mcp_tool.logger") as mock_logger:
                 discover_mcp_tools()
 
-                # Find the summary info call
-                info_calls = [
-                    str(call)
-                    for call in mock_logger.info.call_args_list
-                    if "failed" in str(call).lower() or "MCP:" in str(call)
+                assert [call.args for call in mock_logger.info.call_args_list] == [
+                    ("MCP server registration completed with failures",),
+                    ("MCP tool discovery completed with failures",),
                 ]
-                # The summary should mention the failure
-                assert any("1 failed" in str(c) for c in info_calls), (
-                    f"Summary should report 1 failed server, got: {info_calls}"
-                )
 
         _servers.pop("good_server", None)
         _servers.pop("bad_server", None)
+        _server_connect_errors.pop("bad_server", None)
 
     def test_ok_servers_excludes_failures(self):
         """ok_servers count correctly excludes failed servers."""
-        from tools.mcp_tool import discover_mcp_tools, _servers, _ensure_mcp_loop
+        from tools.mcp_tool import (
+            _ensure_mcp_loop,
+            _server_connect_errors,
+            _servers,
+            discover_mcp_tools,
+        )
 
         fake_config = {
             "ok1": {"command": "npx", "args": ["ok1"]},
@@ -2331,18 +2455,17 @@ class TestDiscoveryFailedCount:
             with patch("tools.mcp_tool.logger") as mock_logger:
                 discover_mcp_tools()
 
-                info_calls = [str(call) for call in mock_logger.info.call_args_list]
-                # Should say "2 server(s)" not "3 server(s)"
-                assert any("2 server" in str(c) for c in info_calls), (
-                    f"Summary should report 2 ok servers, got: {info_calls}"
-                )
-                assert any("1 failed" in str(c) for c in info_calls), (
-                    f"Summary should report 1 failed, got: {info_calls}"
-                )
+                assert [call.args for call in mock_logger.info.call_args_list] == [
+                    ("MCP server registration completed with failures",),
+                    ("MCP tool discovery completed with failures",),
+                ]
+                assert set(_servers) & set(fake_config) == {"ok1", "ok2"}
+                assert _server_connect_errors["fail1"] == "MCP server connection failed"
 
         _servers.pop("ok1", None)
         _servers.pop("ok2", None)
         _servers.pop("fail1", None)
+        _server_connect_errors.pop("fail1", None)
 
 
 class TestMCPSelectiveToolLoading:
@@ -2577,6 +2700,160 @@ class TestSanitizeMcpNameComponent:
 
 class TestRegisterMcpServers:
     """Verify the new register_mcp_servers() public API."""
+
+    @pytest.mark.parametrize("api_name", ["register_mcp_servers", "discover_mcp_tools"])
+    def test_public_invalid_url_diagnostics_are_static(self, monkeypatch, api_name):
+        import tools.mcp_tool as mcp_tool
+
+        server_marker = f"invalid-url-server-identity-{api_name}"
+        url_marker = "file:///private/mcp?token=credential-shaped-marker"
+        config = {server_marker: {"url": url_marker}}
+        if api_name == "discover_mcp_tools":
+            monkeypatch.setattr(
+                "hermes_cli.config.load_config", lambda: {"mcp_servers": config}
+            )
+
+        logger = MagicMock()
+        try:
+            with patch.object(mcp_tool, "logger", logger):
+                if api_name == "discover_mcp_tools":
+                    mcp_tool.discover_mcp_tools()
+                else:
+                    mcp_tool.register_mcp_servers(config)
+        finally:
+            with mcp_tool._lock:
+                mcp_tool._servers.pop(server_marker, None)
+                mcp_tool._server_connecting.discard(server_marker)
+                mcp_tool._server_connect_errors.pop(server_marker, None)
+                mcp_tool._server_connect_retry_after.pop(server_marker, None)
+                mcp_tool._server_connect_failures.pop(server_marker, None)
+                mcp_tool._parallel_safe_servers.discard(server_marker)
+
+        calls = [
+            call
+            for method in (logger.debug, logger.info, logger.warning, logger.error)
+            for call in method.call_args_list
+        ]
+        rendered = repr(calls)
+        assert logger.warning.call_args_list
+        assert all(
+            len(call.args) == 1
+            and isinstance(call.args[0], str)
+            and call.kwargs == {}
+            for call in calls
+        )
+        assert server_marker not in rendered
+        assert url_marker not in rendered
+        assert "credential-shaped-marker" not in rendered
+        assert "InvalidMcpUrlError" not in rendered
+
+    def test_registration_discovery_logs_are_static_and_content_free(self, monkeypatch):
+        import tools.mcp_tool as mcp_tool
+
+        server_marker = "server-session-identity-marker"
+        suspicious_server_marker = "suspicious-server-identity-marker"
+        suspicious_issue_marker = "https://validator-issue.invalid/?token=validator-token-marker"
+        timeout_server_marker = "timeout-server-session-marker"
+        forbidden = (
+            server_marker,
+            suspicious_server_marker,
+            suspicious_issue_marker,
+            timeout_server_marker,
+            "exception-text-marker",
+            "command-marker",
+            "args-marker",
+            "https://url-marker.invalid",
+            "credential-like-marker",
+            "provider-payload-marker",
+        )
+        config = {
+            suspicious_server_marker: {"command": "blocked-command-marker"},
+            server_marker: {
+                "lazy": True,
+                "command": "command-marker",
+                "args": ["--args-marker"],
+                "url": "https://url-marker.invalid/?token=credential-like-marker",
+                "headers": {"Authorization": "Bearer credential-like-marker"},
+                "provider_payload": "provider-payload-marker",
+            }
+        }
+
+        async def _connect_failure(_name, _config):
+            raise RuntimeError(
+                "exception-text-marker credential-like-marker provider-payload-marker"
+            )
+
+        def _run(factory, *, timeout):
+            return asyncio.run(factory())
+
+        logger = MagicMock()
+        from hermes_cli import mcp_security
+
+        monkeypatch.setattr(mcp_tool, "_ensure_mcp_sdk", lambda: True)
+        monkeypatch.setattr(
+            mcp_security,
+            "validate_mcp_server_entry",
+            lambda name, _cfg: [suspicious_issue_marker]
+            if name == suspicious_server_marker
+            else [],
+        )
+        monkeypatch.setattr(mcp_tool, "_connect_cooldown_active", lambda _name: False)
+        monkeypatch.setattr(mcp_tool, "_ensure_mcp_loop", lambda: None)
+        monkeypatch.setattr(mcp_tool, "_run_on_mcp_loop", _run)
+        monkeypatch.setattr(
+            mcp_tool, "_discover_and_register_server", _connect_failure
+        )
+        monkeypatch.setattr(mcp_tool, "_resolve_server_lazy", lambda *_args: True)
+        monkeypatch.setattr(
+            mcp_tool,
+            "_register_from_cache_sync",
+            lambda *_args: (_ for _ in ()).throw(
+                RuntimeError("exception-text-marker credential-like-marker")
+            ),
+        )
+
+        try:
+            with patch("tools.mcp_schema_cache.config_fingerprint", return_value="fp"), \
+                 patch("tools.mcp_schema_cache.get_cached_entry", return_value={"tools": []}), \
+                 patch.object(mcp_tool, "logger", logger):
+                mcp_tool.register_mcp_servers(config)
+
+                monkeypatch.setattr(
+                    mcp_tool, "_resolve_server_lazy", lambda *_args: False
+                )
+                monkeypatch.setattr(
+                    mcp_tool,
+                    "_run_on_mcp_loop",
+                    MagicMock(side_effect=TimeoutError("exception-text-marker")),
+                )
+                with pytest.raises(TimeoutError):
+                    mcp_tool.register_mcp_servers(
+                        {
+                            timeout_server_marker: {
+                                "command": "command-marker",
+                                "args": ["--args-marker"],
+                            }
+                        }
+                    )
+        finally:
+            with mcp_tool._lock:
+                for name in (server_marker, timeout_server_marker):
+                    mcp_tool._servers.pop(name, None)
+                    mcp_tool._server_connecting.discard(name)
+                    mcp_tool._server_connect_errors.pop(name, None)
+                    mcp_tool._server_connect_retry_after.pop(name, None)
+                    mcp_tool._server_connect_failures.pop(name, None)
+                    mcp_tool._parallel_safe_servers.discard(name)
+
+        calls = [
+            call
+            for method in (logger.debug, logger.info, logger.warning, logger.error)
+            for call in method.call_args_list
+        ]
+        rendered = repr(calls)
+        assert len(logger.warning.call_args_list) >= 3
+        assert all(len(call.args) == 1 and call.kwargs == {} for call in calls)
+        assert all(marker not in rendered for marker in forbidden)
 
     def test_mcp_not_available_returns_empty(self):
         from tools.mcp_tool import register_mcp_servers

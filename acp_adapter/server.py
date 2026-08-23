@@ -1153,46 +1153,32 @@ class HermesACPAgent(acp.Agent):
 
             await asyncio.to_thread(register_mcp_servers, config_map)
         except Exception:
-            logger.warning(
-                "Session %s: failed to register ACP MCP servers",
-                state.session_id,
-                exc_info=True,
-            )
+            try:
+                logger.warning("ACP MCP server registration failed")
+            except Exception:
+                pass
             return
 
         try:
-            from model_tools import get_tool_definitions
-            from agent.memory_manager import inject_memory_provider_tools
+            from tools.mcp_tool import refresh_agent_mcp_tools
 
             enabled_toolsets = _expand_acp_enabled_toolsets(
                 getattr(state.agent, "enabled_toolsets", None) or ["hermes-acp"],
                 mcp_server_names=[server.name for server in mcp_servers],
             )
-            state.agent.enabled_toolsets = enabled_toolsets
-            disabled_toolsets = getattr(state.agent, "disabled_toolsets", None)
-            state.agent.tools = get_tool_definitions(
-                enabled_toolsets=enabled_toolsets,
-                disabled_toolsets=disabled_toolsets,
+            refresh_agent_mcp_tools(
+                state.agent,
+                enabled_override=enabled_toolsets,
+                disabled_override=getattr(state.agent, "disabled_toolsets", None),
                 quiet_mode=True,
+                raise_on_exhaustion=True,
             )
-            state.agent.valid_tool_names = {
-                tool["function"]["name"] for tool in state.agent.tools or []
-            }
-            inject_memory_provider_tools(state.agent)
-            invalidate = getattr(state.agent, "_invalidate_system_prompt", None)
-            if callable(invalidate):
-                invalidate()
-            logger.info(
-                "Session %s: refreshed tool surface after ACP MCP registration (%d tools)",
-                state.session_id,
-                len(state.agent.tools or []),
-            )
+            logger.info("ACP MCP tool-surface refresh completed")
         except Exception:
-            logger.warning(
-                "Session %s: failed to refresh tool surface after ACP MCP registration",
-                state.session_id,
-                exc_info=True,
-            )
+            try:
+                logger.warning("ACP MCP tool-surface refresh failed")
+            except Exception:
+                pass
 
     def _schedule_mcp_late_refresh(self, state: SessionState) -> None:
         """Refresh the agent's tool snapshot when background MCP discovery lands late.
@@ -1271,22 +1257,16 @@ class HermesACPAgent(acp.Agent):
 
                     added = refresh_agent_mcp_tools(agent, quiet_mode=True)
                 if added:
-                    logger.info(
-                        "Session %s: late MCP refresh added %d tools: %s",
-                        session_id,
-                        len(added),
-                        ", ".join(sorted(added)),
-                    )
+                    logger.info("ACP late MCP tool-surface refresh completed")
             except Exception:
-                logger.debug(
-                    "Session %s: late MCP refresh failed",
-                    session_id,
-                    exc_info=True,
-                )
+                try:
+                    logger.debug("ACP late MCP tool-surface refresh failed")
+                except Exception:
+                    pass
 
         threading.Thread(
             target=_wait_then_refresh,
-            name=f"acp-mcp-late-refresh-{session_id}",
+            name="acp-mcp-late-refresh",
             daemon=True,
         ).start()
 

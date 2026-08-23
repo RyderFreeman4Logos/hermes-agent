@@ -76,23 +76,131 @@ def _warn_memory_provider_unavailable(name: str, reason: str = "") -> None:
     no memory and no diagnostic. A common trigger is systemd/gateway services
     not inheriting ``~/.hermes/.env``. See NousResearch/hermes-agent#2765.
 
-    ``reason`` is the provider's ``unavailable_reason()`` — a provider-specific,
-    actionable hint (e.g. which package to install). Because an unavailable
-    provider is never initialized, this is the only place such a hint can reach
-    the user, so it is appended to the warning when present (#7718).
+    Provider names and reasons are not logged because plugin-controlled text may
+    contain request, credential, or response data. The arguments remain for the
+    compatibility and once-per-provider deduplication contract.
     """
     if name in _warned_unavailable_providers:
         return
     _warned_unavailable_providers.add(name)
     logger.warning(
-        "Memory provider %r is selected but reports unavailable — external memory "
+        "Selected memory provider reports unavailable — external memory "
         "is disabled for this session (built-in memory still works). Check the "
         "provider's credentials/config with 'hermes memory status'. Note: "
         "systemd/gateway services do not inherit ~/.hermes/.env automatically; set "
-        "any required variables in the service environment.%s",
-        name,
-        f" {reason}" if reason else "",
+        "any required variables in the service environment. "
+        "Status: provider_unavailable."
     )
+
+
+def build_memory_subsystem(
+    agent: Any,
+    config: Dict[str, Any],
+    *,
+    skip_memory: bool,
+    provider_mode: str,
+    session_id: str,
+) -> Dict[str, Any]:
+    """Construct and initialize one complete memory subsystem off to the side."""
+    from tools.memory_tool import (
+        MemoryStore,
+        get_builtin_memory_config,
+        get_builtin_memory_store_flags,
+    )
+
+    enabled = False
+    profile_enabled = False
+    store = None
+    manager = None
+    mem_config: Dict[str, Any] = {}
+    enabled_toolsets = getattr(agent, "enabled_toolsets", None) or []
+    disabled_toolsets = getattr(agent, "disabled_toolsets", None) or []
+    memory_requested = "memory" in enabled_toolsets and "memory" not in disabled_toolsets
+    if not skip_memory or memory_requested:
+        mem_config = get_builtin_memory_config(config)
+        enabled, profile_enabled = get_builtin_memory_store_flags(config)
+        if enabled or profile_enabled:
+            store = MemoryStore(
+                memory_char_limit=mem_config.get("memory_char_limit", 2200),
+                user_char_limit=mem_config.get("user_char_limit", 1375),
+                memory_enabled=enabled,
+                user_profile_enabled=profile_enabled,
+            )
+            store.load_from_disk()
+
+    if not skip_memory:
+        provider_name = str(mem_config.get("provider", "") or "").strip()
+        if provider_name or provider_mode == "authoritative":
+            from agent.memory_manager import MemoryManager
+            from plugins.memory import load_memory_provider
+
+            manager = MemoryManager(provider_mode=provider_mode)
+            provider = None
+            try:
+                provider = load_memory_provider(provider_name) if provider_name else None
+                if provider and provider.is_available():
+                    manager.add_provider(provider)
+                elif provider is not None:
+                    _warn_memory_provider_unavailable(provider_name)
+                if manager.providers:
+                    init_kwargs = {
+                        "session_id": session_id,
+                        "platform": getattr(agent, "platform", None) or "cli",
+                        "hermes_home": str(get_hermes_home()),
+                        "agent_context": "primary",
+                    }
+                    if init_kwargs["platform"] == "cli":
+                        init_kwargs["warning_callback"] = agent._emit_warning
+                        init_kwargs["status_callback"] = agent._emit_status
+                    session_db = getattr(agent, "_session_db", None)
+                    if session_db:
+                        try:
+                            title = session_db.get_session_title(session_id)
+                            if title:
+                                init_kwargs["session_title"] = title
+                        except Exception:
+                            pass
+                    for attr, key in (
+                        ("_user_id", "user_id"),
+                        ("_user_id_alt", "user_id_alt"),
+                        ("_user_name", "user_name"),
+                        ("_chat_id", "chat_id"),
+                        ("_chat_name", "chat_name"),
+                        ("_chat_type", "chat_type"),
+                        ("_thread_id", "thread_id"),
+                        ("_gateway_session_key", "gateway_session_key"),
+                    ):
+                        value = getattr(agent, attr, None)
+                        if value:
+                            init_kwargs[key] = value
+                    try:
+                        from hermes_cli.profiles import get_active_profile_name
+
+                        init_kwargs["agent_identity"] = get_active_profile_name()
+                        init_kwargs["agent_workspace"] = "hermes"
+                    except Exception:
+                        pass
+                    manager.initialize_all(**init_kwargs)
+                    _ra().logger.info("Memory provider '%s' activated", provider_name)
+                elif provider_mode != "authoritative":
+                    manager = None
+            except BaseException:
+                if provider is not None and provider not in manager.providers:
+                    try:
+                        provider.shutdown()
+                    except Exception:
+                        pass
+                manager.shutdown_all()
+                raise
+
+    return {
+        "config": mem_config,
+        "memory_enabled": enabled,
+        "user_profile_enabled": profile_enabled,
+        "store": store,
+        "manager": manager,
+        "provider_mode": provider_mode,
+    }
 
 
 def _ra():
@@ -589,6 +697,7 @@ def init_agent(
     checkpoint_max_file_size_mb: int = 10,
     pass_session_id: bool = False,
     requested_provider: str = None,
+    memory_provider_mode_override: str = None,
 ):
     """
     Initialize the AI Agent.
@@ -1560,6 +1669,43 @@ def init_agent(
             print(f"🔄 Fallback chain ({len(agent._fallback_chain)} providers): " +
                   " → ".join(f"{f['model']} ({f['provider']})" for f in agent._fallback_chain))
 
+    # Resolve the session-owned memory mode before any tool availability/schema
+    # callback runs. The same typed value is reused for store/provider construction.
+    try:
+        from hermes_cli.config import load_config_readonly as _load_agent_config
+
+        _agent_cfg = _load_agent_config()
+    except Exception:
+        _agent_cfg = {}
+    from agent.memory_provider import normalize_memory_provider_mode
+    from tools.memory_tool import (
+        frozen_memory_surface,
+        get_builtin_memory_config,
+        get_builtin_memory_store_flags,
+        get_memory_provider_mode,
+    )
+
+    agent._skip_memory = bool(skip_memory)
+    _memory_config = get_builtin_memory_config(_agent_cfg)
+    agent._memory_config = dict(_memory_config)
+    _memory_toolset_requested = (
+        "memory" in (agent.enabled_toolsets or [])
+        and "memory" not in (agent.disabled_toolsets or [])
+    )
+    if not skip_memory or _memory_toolset_requested:
+        agent._memory_enabled, agent._user_profile_enabled = (
+            get_builtin_memory_store_flags(_agent_cfg)
+        )
+        agent._memory_provider_mode = get_memory_provider_mode(_memory_config)
+        if memory_provider_mode_override is not None:
+            agent._memory_provider_mode = (
+                normalize_memory_provider_mode(memory_provider_mode_override) or "hybrid"
+            )
+    else:
+        agent._memory_enabled = False
+        agent._user_profile_enabled = False
+        agent._memory_provider_mode = "hybrid"
+
     # A multiplexed gateway may enter a different HERMES_HOME after
     # ``model_tools`` was first imported. Ensure that profile's keyed plugin
     # manager has discovered its registrations before taking the tool snapshot.
@@ -1570,19 +1716,17 @@ def init_agent(
     except Exception:
         logger.warning("Plugin discovery failed during agent setup", exc_info=True)
 
-    # Get available tools with filtering. Capture the registry generation this
-    # snapshot is derived from FIRST, so a later concurrent refresh can tell
-    # whether it holds a newer or staler view (see refresh_agent_mcp_tools).
-    try:
-        from tools.registry import registry as _snapshot_registry
-        agent._tool_snapshot_generation = _snapshot_registry._generation
-    except Exception:
-        agent._tool_snapshot_generation = 0
-    agent.tools = _ra().get_tool_definitions(
-        enabled_toolsets=enabled_toolsets,
-        disabled_toolsets=disabled_toolsets,
-        quiet_mode=agent.quiet_mode,
-    )
+    # Per-agent publication epoch; the registry keeps its own generation.
+    agent._tool_snapshot_generation = 0
+    with frozen_memory_surface(
+        agent._memory_provider_mode,
+        (agent._memory_enabled, agent._user_profile_enabled),
+    ):
+        agent.tools = _ra().get_tool_definitions(
+            enabled_toolsets=enabled_toolsets,
+            disabled_toolsets=disabled_toolsets,
+            quiet_mode=agent.quiet_mode,
+        )
     
     # Show tool configuration and store valid tool names for validation
     agent.valid_tool_names = set()
@@ -1767,12 +1911,7 @@ def init_agent(
     from tools.todo_tool import TodoStore
     agent._todo_store = TodoStore()
     
-    # Load config once for memory, skills, and compression sections
-    try:
-        from hermes_cli.config import load_config_readonly as _load_agent_config
-        _agent_cfg = _load_agent_config()
-    except Exception:
-        _agent_cfg = {}
+    # Config was loaded before the tool snapshot so memory mode and schema share it.
 
     # Codex commentary visibility (display.show_commentary, default true).
     # When true, completed Codex phase=commentary messages are delivered as
@@ -1820,134 +1959,34 @@ def init_agent(
     # broad pseudo-public config object on the agent instance.
     agent._aux_compression_context_length_config = None
 
-    # Persistent memory (MEMORY.md + USER.md) -- loaded from disk
-    agent._memory_store = None
-    agent._memory_enabled = False
-    agent._user_profile_enabled = False
+    # Persistent memory and its provider are built from the same frozen mode
+    # that owned the tool snapshot above.
     agent._memory_nudge_interval = 10
     agent._turns_since_memory = 0
     agent._iters_since_skill = 0
-    # skip_memory=True skips the external memory *provider*. Flush/background
-    # agents can still pass enabled_toolsets=["memory"] so the built-in file
-    # store exists and the memory tool does not fail with store=None (#65429).
-    # A toolset on disabled_toolsets is not a request: a caller that denylists
-    # memory while its default toolset still names it must not get MEMORY.md
-    # loaded by an enabled-only check. (Cron agents now run with
-    # skip_memory=False and take the normal path here.)
-    _enabled_toolsets = agent.enabled_toolsets or []
-    _disabled_toolsets = agent.disabled_toolsets or []
-    _memory_toolset_requested = (
-        "memory" in _enabled_toolsets and "memory" not in _disabled_toolsets
-    )
-    if not skip_memory or _memory_toolset_requested:
-        try:
-            from tools.memory_tool import (
-                get_builtin_memory_config,
-                get_builtin_memory_store_flags,
-            )
-
-            mem_config = get_builtin_memory_config(_agent_cfg)
-            agent._memory_enabled, agent._user_profile_enabled = get_builtin_memory_store_flags(
-                _agent_cfg
-            )
-            agent._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
-            if agent._memory_enabled or agent._user_profile_enabled:
-                from tools.memory_tool import MemoryStore
-                agent._memory_store = MemoryStore(
-                    memory_char_limit=mem_config.get("memory_char_limit", 2200),
-                    user_char_limit=mem_config.get("user_char_limit", 1375),
-                    memory_enabled=agent._memory_enabled,
-                    user_profile_enabled=agent._user_profile_enabled,
-                )
-                agent._memory_store.load_from_disk()
-        except Exception:
-            pass  # Memory is optional -- don't break agent init
-    
-
-
-    # Memory provider plugin (external — one at a time, alongside built-in)
-    # Reads memory.provider from config to select which plugin to activate.
-    agent._memory_manager = None
-    if not skip_memory:
-        try:
-            _mem_provider_name = mem_config.get("provider", "") if mem_config else ""
-
-            if _mem_provider_name and _mem_provider_name.strip():
-                from agent.memory_manager import MemoryManager as _MemoryManager
-                from plugins.memory import load_memory_provider as _load_mem
-                agent._memory_manager = _MemoryManager()
-                _mp = _load_mem(_mem_provider_name)
-                if _mp and _mp.is_available():
-                    agent._memory_manager.add_provider(_mp)
-                elif _mp is not None:
-                    # Skip the (potentially expensive) unavailable_reason() call
-                    # if we've already warned for this provider — the gateway
-                    # builds a fresh AIAgent per message, so without this guard
-                    # unavailable_reason() (which reads config from disk and may
-                    # probe importlib) runs on every turn.
-                    if _mem_provider_name not in _warned_unavailable_providers:
-                        try:
-                            _unavailable_reason = _mp.unavailable_reason()
-                        except Exception:
-                            _unavailable_reason = ""
-                        _warn_memory_provider_unavailable(_mem_provider_name, _unavailable_reason)
-                if agent._memory_manager.providers:
-                    _init_kwargs = {
-                        "session_id": agent.session_id,
-                        "platform": platform or "cli",
-                        "hermes_home": str(get_hermes_home()),
-                        "agent_context": "primary",
-                    }
-                    if _init_kwargs["platform"] == "cli":
-                        _init_kwargs["warning_callback"] = agent._emit_warning
-                        _init_kwargs["status_callback"] = agent._emit_status
-                    # Thread session title for memory provider scoping
-                    # (e.g. honcho uses this to derive chat-scoped session keys)
-                    if agent._session_db:
-                        try:
-                            _st = agent._session_db.get_session_title(agent.session_id)
-                            if _st:
-                                _init_kwargs["session_title"] = _st
-                        except Exception:
-                            pass
-                    # Thread gateway user identity for per-user memory scoping
-                    if agent._user_id:
-                        _init_kwargs["user_id"] = agent._user_id
-                    if agent._user_id_alt:
-                        _init_kwargs["user_id_alt"] = agent._user_id_alt
-                    if agent._user_name:
-                        _init_kwargs["user_name"] = agent._user_name
-                    if agent._chat_id:
-                        _init_kwargs["chat_id"] = agent._chat_id
-                    if agent._chat_name:
-                        _init_kwargs["chat_name"] = agent._chat_name
-                    if agent._chat_type:
-                        _init_kwargs["chat_type"] = agent._chat_type
-                    if agent._thread_id:
-                        _init_kwargs["thread_id"] = agent._thread_id
-                    # Thread gateway session key for stable per-chat Honcho session isolation
-                    if agent._gateway_session_key:
-                        _init_kwargs["gateway_session_key"] = agent._gateway_session_key
-                    # Profile identity for per-profile provider scoping
-                    try:
-                        from hermes_cli.profiles import get_active_profile_name
-                        _profile = get_active_profile_name()
-                        _init_kwargs["agent_identity"] = _profile
-                        _init_kwargs["agent_workspace"] = "hermes"
-                    except Exception:
-                        pass
-                    # NOTE: status_callback (for the deterministic retain
-                    # indicator) is wired above, CLI-only — gateway status is
-                    # delivered on a different path (see the platform=="cli"
-                    # block), and the indicator no-ops when it's absent.
-                    agent._memory_manager.initialize_all(**_init_kwargs)
-                    _ra().logger.info("Memory provider '%s' activated", _mem_provider_name)
-                else:
-                    _ra().logger.debug("Memory provider '%s' not found or not available", _mem_provider_name)
-                    agent._memory_manager = None
-        except Exception as _mpe:
-            _ra().logger.warning("Memory provider plugin init failed: %s", _mpe)
-            agent._memory_manager = None
+    try:
+        _memory = build_memory_subsystem(
+            agent,
+            _agent_cfg,
+            skip_memory=skip_memory,
+            provider_mode=agent._memory_provider_mode,
+            session_id=agent.session_id,
+        )
+    except Exception:
+        _ra().logger.warning("Memory provider plugin initialization failed (provider_error)")
+        _memory = {
+            "config": _memory_config,
+            "memory_enabled": agent._memory_enabled,
+            "user_profile_enabled": agent._user_profile_enabled,
+            "store": None,
+            "manager": None,
+        }
+    agent._memory_store = _memory["store"]
+    agent._memory_manager = _memory["manager"]
+    agent._memory_enabled = _memory["memory_enabled"]
+    agent._user_profile_enabled = _memory["user_profile_enabled"]
+    agent._memory_nudge_interval = int(_memory["config"].get("nudge_interval", 10))
+    agent._session_init_model_config["memory_provider_mode"] = agent._memory_provider_mode
 
     from agent.memory_manager import inject_memory_provider_tools as _inject_memory_provider_tools
     _inject_memory_provider_tools(agent)
@@ -2880,6 +2919,17 @@ def init_agent(
             agent.valid_tool_names.add(_tname)
             agent._context_engine_tool_names.add(_tname)
             _existing_tool_names.add(_tname)
+
+    # Publish the complete initial registry/memory/context/bot surface through
+    # the same registry-generation + agent-epoch CAS used by live rebuilds.
+    from tools.mcp_tool import refresh_agent_mcp_tools
+
+    refresh_agent_mcp_tools(
+        agent,
+        quiet_mode=True,
+        raise_on_exhaustion=True,
+        definition_builder=_ra().get_tool_definitions,
+    )
 
     # Notify context engine of session start
     if hasattr(agent, "context_compressor") and agent.context_compressor:

@@ -30,10 +30,10 @@ import logging
 import re
 import inspect
 import threading
-from concurrent.futures import Future, ThreadPoolExecutor, wait
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeoutError, wait
 from typing import Any, Callable, Dict, List, Optional
 
-from agent.memory_provider import MemoryProvider
+from agent.memory_provider import MemoryProvider, normalize_memory_provider_mode, normalize_memory_target
 from agent.skill_commands import extract_user_instruction_from_skill_message
 from tools.registry import tool_error
 
@@ -45,6 +45,19 @@ logger = logging.getLogger(__name__)
 # running past this window dies with the interpreter.
 _SYNC_DRAIN_TIMEOUT_S = 5.0
 _EXTERNAL_PREFETCH_TIMEOUT_S = 8.0
+_OPAQUE_OPERATION_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,63}\Z")
+
+
+def _load_provider_json(value: str) -> Any:
+    def reject_duplicate_keys(pairs):
+        result = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError("provider result has duplicate keys")
+            result[key] = item
+        return result
+
+    return json.loads(value, object_pairs_hook=reject_duplicate_keys)
 
 
 def normalize_tool_schema(schema: Any) -> Optional[Dict[str, Any]]:
@@ -140,9 +153,7 @@ def inject_memory_provider_tools(agent: Any) -> int:
         schema = normalize_tool_schema(raw_schema)
         if schema is None:
             logger.warning(
-                "Memory provider returned a tool schema with no resolvable "
-                "name; skipping to avoid poisoning the request (%r)",
-                raw_schema,
+                "Memory provider tool schema rejected (provider_protocol_error)"
             )
             continue
         tool_name = schema["name"]
@@ -368,8 +379,14 @@ class MemoryManager:
     provider is allowed.  Failures in one provider never block the other.
     """
 
-    def __init__(self, *, external_prefetch_timeout: Optional[float] = None) -> None:
+    def __init__(
+        self,
+        *,
+        external_prefetch_timeout: Optional[float] = None,
+        provider_mode: str = "hybrid",
+    ) -> None:
         self._providers: List[MemoryProvider] = []
+        self.provider_mode = normalize_memory_provider_mode(provider_mode) or "hybrid"
         self._tool_to_provider: Dict[str, MemoryProvider] = {}
         self._has_external: bool = False  # True once a non-builtin provider is added
         self._external_prefetch_timeout = (
@@ -398,6 +415,11 @@ class MemoryManager:
             "abandoned_prefetches": 0,
             "active_tasks": 0,
         }
+
+    @staticmethod
+    def _log_provider_failure(operation: str, *, level: int = logging.WARNING) -> None:
+        """Log a provider failure without exposing provider-controlled data."""
+        logger.log(level, "Memory provider operation failed (%s)", operation)
 
     # -- Registration --------------------------------------------------------
 
@@ -495,11 +517,8 @@ class MemoryManager:
                 block = provider.system_prompt_block()
                 if block and block.strip():
                     blocks.append(block)
-            except Exception as e:
-                logger.warning(
-                    "Memory provider '%s' system_prompt_block() failed: %s",
-                    provider.name, e,
-                )
+            except Exception:
+                self._log_provider_failure("system_prompt_block")
         return "\n\n".join(blocks)
 
     # -- Prefetch / recall ---------------------------------------------------
@@ -537,11 +556,8 @@ class MemoryManager:
                 result = self._prefetch_provider(provider, clean_query, session_id=session_id)
                 if result and result.strip():
                     parts.append(result)
-            except Exception as e:
-                logger.debug(
-                    "Memory provider '%s' prefetch failed (non-fatal): %s",
-                    provider.name, e,
-                )
+            except Exception:
+                self._log_provider_failure("prefetch", level=logging.DEBUG)
         return "\n\n".join(parts)
 
     def _prefetch_provider(
@@ -613,11 +629,8 @@ class MemoryManager:
         for provider in self._providers:
             try:
                 status = provider.recall_status()
-            except Exception as e:
-                logger.debug(
-                    "Memory provider '%s' recall_status failed (non-fatal): %s",
-                    provider.name, e,
-                )
+            except Exception:
+                self._log_provider_failure("recall_status", level=logging.DEBUG)
                 continue
             if status is None:
                 continue
@@ -650,11 +663,8 @@ class MemoryManager:
             for provider in providers:
                 try:
                     provider.queue_prefetch(clean_query, session_id=session_id)
-                except Exception as e:
-                    logger.debug(
-                        "Memory provider '%s' queue_prefetch failed (non-fatal): %s",
-                        provider.name, e,
-                    )
+                except Exception:
+                    self._log_provider_failure("queue_prefetch", level=logging.DEBUG)
 
         self._submit_background(_run, kind="prefetch")
 
@@ -722,62 +732,51 @@ class MemoryManager:
                             assistant_content,
                             session_id=session_id,
                         )
-                except Exception as e:
-                    logger.warning(
-                        "Memory provider '%s' sync_turn failed: %s",
-                        provider.name, e,
-                    )
+                except Exception:
+                    self._log_provider_failure("sync_turn")
 
         self._submit_background(_run)
 
     # -- Background dispatch -------------------------------------------------
 
-    def _submit_background(self, fn, *, kind: str = "write") -> None:
-        """Queue ``fn`` on the serialized worker and track its durability class.
-
-        The submitted callable is wrapped with the CALLER's contextvars:
-        profile isolation in multi-profile processes (gateway multiplexer,
-        dashboard, cron) is a ContextVar-scoped HERMES_HOME override, and
-        executor worker threads start with empty contexts — without the
-        wrap, a provider resolving ambient state (config paths, secrets)
-        from the worker would silently land on the default profile.
-        """
+    def _submit_background(self, fn, *, kind: str = "write") -> Optional[Future]:
+        """Queue ``fn`` on the serialized worker and return its ticket."""
         import contextvars
         from functools import partial
 
-        ctx = contextvars.copy_context()
-        fn = partial(ctx.run, fn)
+        fn = partial(contextvars.copy_context().run, fn)
         executor = self._get_sync_executor()
         if executor is None:
             if self._shutting_down:
                 logger.warning("Memory manager is shutting down; rejecting late %s task", kind)
-                return
-            # Creation failure outside shutdown: preserve the historical
-            # fail-safe behavior and run the operation inline.
+                return None
             try:
                 fn()
             except Exception as e:  # pragma: no cover - fn guards internally
                 logger.debug("Inline memory background task failed: %s", e)
-            return
+            done = Future()
+            done.set_result(None)
+            return done
         try:
-            # Make submit+tracking atomic with the shutdown snapshot. The
-            # callback is attached after releasing the lock because an already
-            # completed future invokes callbacks synchronously.
             with self._sync_executor_lock:
                 if self._shutting_down:
                     logger.warning("Memory manager is shutting down; rejecting late %s task", kind)
-                    return
+                    return None
                 future = executor.submit(fn)
                 self._background_futures[future] = kind
             future.add_done_callback(self._forget_background_future)
+            return future
         except RuntimeError:
             if self._shutting_down:
                 logger.warning("Memory manager shut down during %s submission; task rejected", kind)
-                return
+                return None
             try:
                 fn()
             except Exception as e:  # pragma: no cover - fn guards internally
                 logger.debug("Inline memory background task failed: %s", e)
+            done = Future()
+            done.set_result(None)
+            return done
 
     def _forget_background_future(self, future: Future) -> None:
         with self._sync_executor_lock:
@@ -829,6 +828,318 @@ class MemoryManager:
         except Exception:
             return False
 
+    # -- Core memory routing --------------------------------------------------
+
+    _AUTHORITATIVE_ERROR_CLASSES = frozenset(
+        {
+            "partial_write",
+            "provider_error",
+            "provider_protocol_error",
+            "provider_rejected",
+        }
+    )
+    _PROVIDER_TOOL_RESULT_MAX_BYTES = 16 * 1024
+
+    def authoritative_memory_write(self, args: Dict[str, Any], **kwargs) -> str:
+        """Route the core memory write to an explicitly capable provider."""
+        if self.provider_mode != "authoritative":
+            return tool_error(
+                "Authoritative memory routing is not enabled.",
+                success=False,
+                error_class="invalid_provider_mode",
+            )
+
+        if type(args) is not dict:
+            return tool_error(
+                "Authoritative memory request must be an object.",
+                success=False,
+                error_class="invalid_request",
+            )
+        target = normalize_memory_target(args.get("target"))
+        if target is None:
+            return tool_error(
+                "Invalid target. Use 'memory' or 'user'.",
+                success=False,
+                error_class="invalid_target",
+            )
+        try:
+            request, _ = self._bounded_provider_json({**args, "target": target})
+        except (TypeError, ValueError):
+            return tool_error(
+                "Authoritative memory request is invalid or too large.",
+                success=False,
+                error_class="invalid_request",
+            )
+        if request.get("content") is None and request.get("new_text") is not None:
+            request["content"] = request["new_text"]
+
+        operations = request.get("operations")
+        if operations is not None:
+            if not isinstance(operations, list) or not operations:
+                return tool_error(
+                    "operations must be a non-empty list.",
+                    success=False,
+                    error_class="invalid_operations",
+                )
+            for operation in operations:
+                if not isinstance(operation, dict):
+                    return tool_error(
+                        "Each operation must be an object.",
+                        success=False,
+                        error_class="invalid_operations",
+                    )
+                action = operation.get("action")
+                if action not in {"add", "replace", "remove"}:
+                    return tool_error(
+                        "Each operation must use add, replace, or remove.",
+                        success=False,
+                        error_class="invalid_action",
+                    )
+                if operation.get("content") is None and operation.get("new_text") is not None:
+                    operation["content"] = operation["new_text"]
+                old_text = operation.get("old_text")
+                content = operation.get("content")
+                if action in {"replace", "remove"} and (
+                    type(old_text) is not str or not old_text.strip()
+                ):
+                    return tool_error(
+                        "old_text is required for replace/remove.",
+                        success=False,
+                        error_class="missing_old_text",
+                    )
+                if action in {"add", "replace"} and (
+                    type(content) is not str or not content.strip()
+                ):
+                    return tool_error(
+                        "content is required for add/replace.",
+                        success=False,
+                        error_class="missing_content",
+                    )
+        else:
+            action = request.get("action")
+            if action not in {"add", "replace", "remove"}:
+                return tool_error(
+                    "Use add, replace, or remove.",
+                    success=False,
+                    error_class="invalid_action",
+                )
+            old_text = request.get("old_text")
+            content = request.get("content")
+            if action in {"replace", "remove"} and (
+                type(old_text) is not str or not old_text.strip()
+            ):
+                return tool_error(
+                    "old_text is required for replace/remove.",
+                    success=False,
+                    error_class="missing_old_text",
+                )
+            if action in {"add", "replace"} and (
+                type(content) is not str or not content.strip()
+            ):
+                return tool_error(
+                    "content is required for add/replace.",
+                    success=False,
+                    error_class="missing_content",
+                )
+
+        provider = next(
+            (candidate for candidate in self._providers if candidate.name != "builtin"),
+            None,
+        )
+        if provider is None:
+            return tool_error(
+                "Authoritative memory provider is unavailable.",
+                success=False,
+                error_class="provider_unavailable",
+            )
+        capability = getattr(provider, "authoritative_memory_write", None)
+        if not callable(capability):
+            return tool_error(
+                "Authoritative memory provider lacks core write capability.",
+                success=False,
+                error_class="provider_capability_missing",
+            )
+        trusted_target = target
+        trusted_action = request.get("action")
+        trusted_operation_count = (
+            len(request["operations"])
+            if isinstance(request.get("operations"), list)
+            else None
+        )
+        try:
+            provider_request, _ = self._bounded_provider_json(request)
+            raw_result = capability(provider_request, **kwargs)
+        except NotImplementedError:
+            return tool_error(
+                "Authoritative memory provider lacks core write capability.",
+                success=False,
+                error_class="provider_capability_missing",
+            )
+        except Exception:
+            self._log_provider_failure("authoritative_memory_write")
+            return tool_error(
+                "Authoritative memory provider failed.",
+                success=False,
+                error_class="provider_error",
+            )
+
+        return self._authoritative_receipt(
+            raw_result,
+            target=trusted_target,
+            action=trusted_action,
+            operation_count=trusted_operation_count,
+        )
+
+    @classmethod
+    def _authoritative_receipt(
+        cls,
+        raw_result: Any,
+        *,
+        target: str,
+        action: Any,
+        operation_count: int | None,
+    ) -> str:
+        if isinstance(raw_result, str):
+            try:
+                raw_result = _load_provider_json(raw_result)
+            except (TypeError, ValueError):
+                raw_result = None
+        if not isinstance(raw_result, dict) or not isinstance(raw_result.get("success"), bool):
+            return tool_error(
+                "Authoritative memory provider returned an invalid receipt.",
+                success=False,
+                error_class="provider_protocol_error",
+            )
+
+        partial_write = raw_result.get("partial_write", False)
+        if not isinstance(partial_write, bool):
+            return tool_error(
+                "Authoritative memory provider returned an invalid receipt.",
+                success=False,
+                error_class="provider_protocol_error",
+            )
+        receipt: Dict[str, Any] = {
+            "success": raw_result["success"] is True and not partial_write,
+            "provider_mode": "authoritative",
+            "target": target,
+        }
+        if action:
+            receipt["action"] = action
+        if operation_count is not None:
+            receipt["operation_count"] = operation_count
+        operation_id = raw_result.get("operation_id")
+        if isinstance(operation_id, str) and _OPAQUE_OPERATION_ID_RE.fullmatch(operation_id):
+            receipt["operation_id"] = operation_id
+        if partial_write:
+            receipt["error_class"] = "partial_write"
+        if not receipt["success"]:
+            error_class = raw_result.get("error_class")
+            if isinstance(error_class, str) and error_class in cls._AUTHORITATIVE_ERROR_CLASSES:
+                receipt.setdefault("error_class", error_class)
+            elif error_class is not None:
+                receipt.setdefault("error_class", "provider_error")
+            else:
+                receipt.setdefault("error_class", "provider_rejected")
+            receipt["error"] = "Authoritative memory provider rejected the operation."
+        return json.dumps(receipt, ensure_ascii=False)
+
+    @classmethod
+    def _bounded_provider_json(cls, value: Any) -> tuple[Any, str]:
+        """Return one bounded canonical JSON copy or raise ``ValueError``."""
+        stack = [(value, 0)]
+        seen = set()
+        nodes = 0
+        while stack:
+            item, depth = stack.pop()
+            nodes += 1
+            if depth > 20 or nodes > cls._PROVIDER_TOOL_RESULT_MAX_BYTES:
+                raise ValueError("provider result exceeds structural bound")
+            item_type = type(item)
+            if item_type is dict:
+                if len(item) > cls._PROVIDER_TOOL_RESULT_MAX_BYTES:
+                    raise ValueError("provider result exceeds structural bound")
+                identity = id(item)
+                if identity in seen:
+                    raise ValueError("provider result is cyclic")
+                seen.add(identity)
+                for key, child in item.items():
+                    if (
+                        type(key) is not str
+                        or len(key.encode()) > cls._PROVIDER_TOOL_RESULT_MAX_BYTES
+                    ):
+                        raise ValueError("provider result has invalid key")
+                    stack.append((child, depth + 1))
+            elif item_type is list:
+                if len(item) > cls._PROVIDER_TOOL_RESULT_MAX_BYTES:
+                    raise ValueError("provider result exceeds structural bound")
+                identity = id(item)
+                if identity in seen:
+                    raise ValueError("provider result is cyclic")
+                seen.add(identity)
+                stack.extend((child, depth + 1) for child in item)
+            elif item_type is str:
+                if len(item.encode()) > cls._PROVIDER_TOOL_RESULT_MAX_BYTES:
+                    raise ValueError("provider result exceeds structural bound")
+            elif item_type not in {bool, int, float, type(None)}:
+                raise ValueError("provider result is not JSON")
+
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        if len(encoded.encode()) > cls._PROVIDER_TOOL_RESULT_MAX_BYTES:
+            raise ValueError("provider result exceeds byte bound")
+        return json.loads(encoded), encoded
+
+    @classmethod
+    def _project_provider_tool_result(
+        cls, raw_result: Any, tool_name: str, trusted_args_json: str
+    ) -> str:
+        """Project the legacy exact tool/argument acknowledgement only."""
+        if type(raw_result) is str:
+            try:
+                if (
+                    len(raw_result) > cls._PROVIDER_TOOL_RESULT_MAX_BYTES
+                    or len(raw_result.encode()) > cls._PROVIDER_TOOL_RESULT_MAX_BYTES
+                ):
+                    raise ValueError("provider result exceeds byte bound")
+                raw_result = _load_provider_json(raw_result)
+            except (TypeError, ValueError, OverflowError, RecursionError):
+                return tool_error(
+                    "Memory provider tool failed.",
+                    success=False,
+                    error_class="provider_protocol_error",
+                )
+        try:
+            if (
+                type(raw_result) is not dict
+                or len(raw_result) != 2
+                or set(raw_result) != {"handled", "args"}
+                or type(raw_result["handled"]) is not str
+                or raw_result["handled"] != tool_name
+            ):
+                raise ValueError("provider result does not match invocation")
+            _, provider_json = cls._bounded_provider_json(raw_result["args"])
+            if provider_json != trusted_args_json:
+                raise ValueError("provider arguments do not match invocation")
+            _, encoded = cls._bounded_provider_json(
+                {
+                    "success": True,
+                    "handled": tool_name,
+                    "args": json.loads(trusted_args_json),
+                }
+            )
+            return encoded
+        except (TypeError, ValueError, OverflowError, RecursionError):
+            return tool_error(
+                "Memory provider tool failed.",
+                success=False,
+                error_class="provider_error",
+            )
+
     # -- Tools ---------------------------------------------------------------
 
     def get_all_tool_schemas(self) -> List[Dict[str, Any]]:
@@ -850,9 +1161,8 @@ class MemoryManager:
                     schema = normalize_tool_schema(raw_schema)
                     if schema is None:
                         logger.warning(
-                            "Memory provider '%s' returned a tool schema with "
-                            "no resolvable name; skipping (%r)",
-                            provider.name, raw_schema,
+                            "Memory provider tool schema rejected "
+                            "(provider_protocol_error)"
                         )
                         continue
                     name = schema["name"]
@@ -861,11 +1171,8 @@ class MemoryManager:
                     if name not in seen:
                         schemas.append(schema)
                         seen.add(name)
-            except Exception as e:
-                logger.warning(
-                    "Memory provider '%s' get_tool_schemas() failed: %s",
-                    provider.name, e,
-                )
+            except Exception:
+                self._log_provider_failure("get_tool_schemas")
         return schemas
 
     def get_all_tool_names(self) -> set:
@@ -888,13 +1195,26 @@ class MemoryManager:
         if provider is None:
             return tool_error(f"No memory provider handles tool '{tool_name}'")
         try:
-            return provider.handle_tool_call(tool_name, args, **kwargs)
-        except Exception as e:
-            logger.error(
-                "Memory provider '%s' handle_tool_call(%s) failed: %s",
-                provider.name, tool_name, e,
+            _, trusted_args_json = self._bounded_provider_json(args)
+            provider_args = json.loads(trusted_args_json)
+        except (TypeError, ValueError, OverflowError, RecursionError):
+            return tool_error(
+                "Memory provider tool failed.",
+                success=False,
+                error_class="provider_error",
             )
-            return tool_error(f"Memory tool '{tool_name}' failed: {e}")
+        try:
+            raw_result = provider.handle_tool_call(tool_name, provider_args, **kwargs)
+        except Exception:
+            self._log_provider_failure("handle_tool_call", level=logging.ERROR)
+            return tool_error(
+                "Memory provider tool failed.",
+                success=False,
+                error_class="provider_error",
+            )
+        return self._project_provider_tool_result(
+            raw_result, tool_name, trusted_args_json
+        )
 
     # -- Lifecycle hooks -----------------------------------------------------
 
@@ -906,23 +1226,16 @@ class MemoryManager:
         for provider in self._providers:
             try:
                 provider.on_turn_start(turn_number, message, **kwargs)
-            except Exception as e:
-                logger.debug(
-                    "Memory provider '%s' on_turn_start failed: %s",
-                    provider.name, e,
-                )
+            except Exception:
+                self._log_provider_failure("on_turn_start", level=logging.DEBUG)
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         """Notify all providers of session end."""
         for provider in self._providers:
             try:
                 provider.on_session_end(messages)
-            except Exception as e:
-                logger.warning(
-                    "Memory provider '%s' on_session_end failed: %s",
-                    provider.name, e,
-                    exc_info=True,
-                )
+            except Exception:
+                self._log_provider_failure("on_session_end")
 
     def commit_session_boundary_async(
         self,
@@ -931,47 +1244,107 @@ class MemoryManager:
         new_session_id: str,
         parent_session_id: str = "",
         reason: str = "new_session",
-    ) -> None:
-        """Queue old-session extraction + provider rebinding as ONE serialized task.
-
-        Session rotation (/new) must deliver ``on_session_end`` (end-of-session
-        extraction — an LLM-bound call that can take seconds) strictly BEFORE
-        ``on_session_switch`` (which rebinds provider-internal ``_session_id`` /
-        turn buffers to the new session). Running extraction inline blocked the
-        /new command for the whole LLM round-trip (#16454); running it on an
-        ad-hoc thread raced the inline switch — providers key off internal
-        state, so a late ``on_session_end`` ran against post-switch bindings
-        (transcript misattributed to the new session id, double-ingest of the
-        old turn buffer, new-session buffers cleared).
-
-        Submitting BOTH hooks as one task on the manager's single background
-        worker gives both properties at a single chokepoint: the caller returns
-        immediately, and the worker's FIFO order serializes end→switch against
-        every other provider write (per-turn ``sync_all``, prefetches), which
-        already share the same worker. If the executor is unavailable,
-        ``_submit_background`` degrades to inline execution — the pre-#16454
-        synchronous behavior, slow but correct.
-        """
+        reset: bool = True,
+        retire: bool = False,
+        release_event: Optional[threading.Event] = None,
+    ) -> Future:
+        """Queue one FIFO session boundary, optionally retiring this manager."""
         if not self._providers:
-            return
+            ticket = Future()
+            ticket.set_result(None)
+            return ticket
         snapshot = list(messages or [])
 
         def _run() -> None:
+            if release_event is not None:
+                release_event.wait()
+            if retire:
+                try:
+                    self.on_session_end(snapshot)
+                except Exception:
+                    self._log_provider_failure("session_boundary_end")
+                finally:
+                    try:
+                        self._shutdown_providers()
+                    finally:
+                        with self._sync_executor_lock:
+                            self._shutdown_drain_state.update(
+                                status="drained", active_tasks=0
+                            )
+                return
             try:
                 self.on_session_end(snapshot)
-            except Exception as e:  # pragma: no cover - on_session_end guards per-provider
-                logger.warning("Session-boundary extraction failed: %s", e)
+            except Exception:
+                self._log_provider_failure("session_boundary_end")
             try:
                 self.on_session_switch(
                     new_session_id,
                     parent_session_id=parent_session_id,
-                    reset=True,
+                    reset=reset,
                     reason=reason,
                 )
-            except Exception as e:  # pragma: no cover - on_session_switch guards per-provider
-                logger.warning("Session-boundary switch failed: %s", e)
+            except Exception:
+                self._log_provider_failure("session_boundary_switch")
 
-        self._submit_background(_run)
+        if not retire:
+            ticket = self._submit_background(_run)
+            if ticket is not None:
+                return ticket
+            failed = Future()
+            failed.set_exception(RuntimeError("memory boundary admission failed"))
+            return failed
+
+        # Submit the retirement boundary and cut admission under the same lock:
+        # a stale-pointer write is either ahead of this boundary or rejected.
+        executor = self._get_sync_executor()
+        if executor is None:
+            failed = Future()
+            failed.set_exception(RuntimeError("memory retirement admission failed"))
+            return failed
+        import contextvars
+        from functools import partial
+
+        fn = partial(contextvars.copy_context().run, _run)
+        with self._sync_executor_lock:
+            if self._shutting_down or self._sync_executor is not executor:
+                failed = Future()
+                failed.set_exception(RuntimeError("memory retirement admission failed"))
+                return failed
+            ticket = executor.submit(fn)
+            self._background_futures[ticket] = "retirement"
+            self._shutting_down = True
+            self._sync_executor = None
+            self._shutdown_drain_state.update(status="draining")
+        ticket.add_done_callback(self._forget_background_future)
+        executor.shutdown(wait=False, cancel_futures=False)
+        return ticket
+
+    def wait_for_retirement(
+        self, ticket: Future, timeout: Optional[float] = None
+    ) -> bool:
+        """Bound a retirement wait without cancelling its FIFO boundary."""
+        try:
+            ticket.result(
+                timeout=_SYNC_DRAIN_TIMEOUT_S if timeout is None else timeout
+            )
+            return True
+        except FutureTimeoutError:
+            with self._sync_executor_lock:
+                pending = {
+                    future: kind
+                    for future, kind in self._background_futures.items()
+                    if not future.done()
+                }
+                self._shutdown_drain_state.update(
+                    status="timed_out",
+                    abandoned_writes=sum(kind == "write" for kind in pending.values()),
+                    abandoned_prefetches=sum(
+                        kind == "prefetch" for kind in pending.values()
+                    ),
+                    active_tasks=1 if pending else 0,
+                )
+            logger.warning("Memory retirement timed out; queued boundary remains active")
+            return False
 
     def on_session_switch(
         self,
@@ -1015,11 +1388,8 @@ class MemoryManager:
                     reset=reset,
                     **kwargs,
                 )
-            except Exception as e:
-                logger.debug(
-                    "Memory provider '%s' on_session_switch failed: %s",
-                    provider.name, e,
-                )
+            except Exception:
+                self._log_provider_failure("on_session_switch", level=logging.DEBUG)
 
     def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
         """Notify all providers before context compression.
@@ -1033,11 +1403,8 @@ class MemoryManager:
                 result = provider.on_pre_compress(messages)
                 if result and result.strip():
                     parts.append(result)
-            except Exception as e:
-                logger.debug(
-                    "Memory provider '%s' on_pre_compress failed: %s",
-                    provider.name, e,
-                )
+            except Exception:
+                self._log_provider_failure("on_pre_compress", level=logging.DEBUG)
         return "\n\n".join(parts)
 
     @staticmethod
@@ -1090,11 +1457,8 @@ class MemoryManager:
                     provider.on_memory_write(action, target, content, dict(metadata or {}))
                 else:
                     provider.on_memory_write(action, target, content)
-            except Exception as e:
-                logger.debug(
-                    "Memory provider '%s' on_memory_write failed: %s",
-                    provider.name, e,
-                )
+            except Exception:
+                self._log_provider_failure("on_memory_write", level=logging.DEBUG)
 
     # Actions the bridge mirrors to external providers. The built-in memory
     # tool can also return non-mutating shapes (errors, staged-for-approval
@@ -1174,8 +1538,8 @@ class MemoryManager:
                     str(op.get("content") or ""),
                     metadata=metadata,
                 )
-            except Exception as e:
-                logger.debug("notify_memory_tool_write failed for op %s: %s", action, e)
+            except Exception:
+                self._log_provider_failure("notify_memory_tool_write", level=logging.DEBUG)
 
     def on_delegation(self, task: str, result: str, *,
                       child_session_id: str = "", **kwargs) -> None:
@@ -1185,30 +1549,27 @@ class MemoryManager:
                 provider.on_delegation(
                     task, result, child_session_id=child_session_id, **kwargs
                 )
-            except Exception as e:
-                logger.debug(
-                    "Memory provider '%s' on_delegation failed: %s",
-                    provider.name, e,
-                )
+            except Exception:
+                self._log_provider_failure("on_delegation", level=logging.DEBUG)
 
-    def shutdown_all(self) -> None:
-        """Shut down all providers (reverse order for clean teardown).
-
-        Drains the background sync/prefetch executor first (bounded by
-        ``_SYNC_DRAIN_TIMEOUT_S``) so a turn's final sync has a chance to
-        land before providers are torn down. The worker threads are
-        daemon, so anything still wedged past the drain window dies with
-        the interpreter rather than blocking exit.
-        """
-        self._drain_sync_executor()
+    def _shutdown_providers(self) -> None:
+        """Shut providers down without waiting on the current worker."""
+        first_failure = None
         for provider in reversed(self._providers):
             try:
                 provider.shutdown()
-            except Exception as e:
-                logger.warning(
-                    "Memory provider '%s' shutdown failed: %s",
-                    provider.name, e,
-                )
+            except Exception:
+                self._log_provider_failure("shutdown")
+            except BaseException as failure:
+                if first_failure is None:
+                    first_failure = failure
+        if first_failure is not None:
+            raise first_failure
+
+    def shutdown_all(self) -> None:
+        """Drain accepted background work, then shut down providers."""
+        self._drain_sync_executor()
+        self._shutdown_providers()
 
     @property
     def shutdown_drain_state(self) -> Dict[str, Any]:
@@ -1284,8 +1645,5 @@ class MemoryManager:
         for provider in self._providers:
             try:
                 provider.initialize(session_id=session_id, **kwargs)
-            except Exception as e:
-                logger.warning(
-                    "Memory provider '%s' initialize failed: %s",
-                    provider.name, e,
-                )
+            except Exception:
+                self._log_provider_failure("initialize")

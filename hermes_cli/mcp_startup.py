@@ -95,9 +95,9 @@ def start_background_mcp_discovery(*, logger, thread_name: str) -> None:
                             "Background MCP discovery completed with zero connected servers"
                         )
                 except Exception:
-                    logger.debug("Failed to inspect MCP status after background discovery", exc_info=True)
+                    logger.debug("Failed to inspect MCP status after background discovery")
             except Exception:
-                logger.debug("Background MCP tool discovery failed", exc_info=True)
+                logger.debug("Background MCP tool discovery failed")
             finally:
                 if token is not None:
                     try:
@@ -259,7 +259,4 @@ def ensure_mcp_discovery_before_agent_build(
         )
         wait_for_mcp_discovery(timeout=timeout, single_query=single_query)
     except Exception:
-        logger.debug(
-            "MCP discovery readiness check failed before agent build",
-            exc_info=True,
-        )
+        logger.debug("MCP discovery readiness check failed before agent build")

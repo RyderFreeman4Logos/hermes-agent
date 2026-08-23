@@ -213,7 +213,7 @@ def _get_mcp_stderr_log() -> Any:
             fh.fileno()
             _mcp_stderr_log_fh = fh
         except Exception as exc:  # pragma: no cover — best-effort fallback
-            logger.debug("Failed to open MCP stderr log, using devnull: %s", exc)
+            logger.debug('MCP stderr log initialization failed')
             try:
                 _mcp_stderr_log_fh = open(os.devnull, "w", encoding="utf-8")
             except Exception:
@@ -871,12 +871,7 @@ def _scan_mcp_description(server_name: str, tool_name: str, description: str) ->
         if pattern.search(description):
             findings.append(reason)
     if findings:
-        logger.warning(
-            "MCP server '%s' tool '%s': suspicious description content — %s. "
-            "Description: %.200s",
-            server_name, tool_name, "; ".join(findings),
-            description,
-        )
+        logger.warning("Suspicious MCP tool description detected")
     return findings
 
 
@@ -958,11 +953,7 @@ async def _paginate_full_list(list_method, items_attr: str, server_name: str,
         if not isinstance(cursor, str) or not cursor:
             break
     else:
-        logger.warning(
-            "MCP server '%s': %s pagination exceeded %d pages; "
-            "truncating at %d items",
-            server_name, items_attr, _MCP_LIST_MAX_PAGES, len(items),
-        )
+        logger.warning('MCP pagination limit reached')
     return items
 
 
@@ -1575,37 +1566,23 @@ def _resolve_identity_header(server_name: str, config: dict):
     if raw is None:
         return None
     if not isinstance(raw, dict):
-        logger.warning(
-            "MCP server '%s': identity_header must be a mapping with "
-            "'name' and 'value'/'value_from' keys (got %s) — ignoring",
-            server_name, type(raw).__name__,
-        )
+        logger.warning('MCP identity header configuration invalid')
         return None
     name = raw.get("name")
     if not isinstance(name, str) or not name.strip():
-        logger.warning(
-            "MCP server '%s': identity_header requires a non-empty "
-            "'name' — ignoring", server_name,
-        )
+        logger.warning('MCP identity header configuration invalid')
         return None
     value_from = (raw.get("value_from") or "static").strip().lower()
     if value_from == "static":
         value = raw.get("value")
         if not isinstance(value, str) or not value.strip():
-            logger.warning(
-                "MCP server '%s': identity_header with value_from: static "
-                "requires a non-empty string 'value' — ignoring",
-                server_name,
-            )
+            logger.warning('MCP identity header configuration invalid')
             return None
         return (name.strip(), value)
     if value_from == "profile":
         from hermes_cli.profiles import get_active_profile_name
         return (name.strip(), get_active_profile_name())
-    logger.warning(
-        "MCP server '%s': identity_header value_from must be 'static' or "
-        "'profile' (got %r) — ignoring", server_name, value_from,
-    )
+    logger.warning('MCP identity header configuration invalid')
     return None
 
 
@@ -1621,10 +1598,7 @@ def _apply_identity_header(server_name: str, config: dict, headers: dict) -> dic
         return headers
     name, value = resolved
     if any(key.lower() == name.lower() for key in headers):
-        logger.debug(
-            "MCP server '%s': identity_header '%s' already set via explicit "
-            "headers config — keeping the explicit value", server_name, name,
-        )
+        logger.debug('MCP explicit identity header retained')
         return headers
     headers[name] = value
     return headers
@@ -1663,63 +1637,27 @@ def _make_redirect_header_stripper(
 
 
 def _format_connect_error(exc: BaseException) -> str:
-    """Render nested MCP connection errors into an actionable short message."""
-
-    def _find_missing(current: BaseException) -> Optional[str]:
-        nested = getattr(current, "exceptions", None)
-        if nested:
-            for child in nested:
-                missing = _find_missing(child)
-                if missing:
-                    return missing
-            return None
+    """Classify MCP connection failures without projecting exception content."""
+    pending = [exc]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
         if isinstance(current, FileNotFoundError):
-            if getattr(current, "filename", None):
-                return str(current.filename)
-            match = re.search(r"No such file or directory: '([^']+)'", str(current))
-            if match:
-                return match.group(1)
-        for attr in ("__cause__", "__context__"):
-            nested_exc = getattr(current, attr, None)
-            if isinstance(nested_exc, BaseException):
-                missing = _find_missing(nested_exc)
-                if missing:
-                    return missing
-        return None
-
-    def _flatten_messages(current: BaseException) -> List[str]:
+            return "MCP server executable unavailable"
         nested = getattr(current, "exceptions", None)
         if nested:
-            flattened: List[str] = []
-            for child in nested:
-                flattened.extend(_flatten_messages(child))
-            return flattened
-        messages = []
-        text = str(current).strip()
-        if text:
-            messages.append(text)
-        for attr in ("__cause__", "__context__"):
-            nested_exc = getattr(current, attr, None)
-            if isinstance(nested_exc, BaseException):
-                messages.extend(_flatten_messages(nested_exc))
-        return messages or [current.__class__.__name__]
-
-    missing = _find_missing(exc)
-    if missing:
-        message = f"missing executable '{missing}'"
-        if os.path.basename(missing) in {"npx", "npm", "node"}:
-            message += (
-                " (ensure Node.js is installed and PATH includes its bin directory, "
-                "or set mcp_servers.<name>.command to an absolute path and include "
-                "that directory in mcp_servers.<name>.env.PATH)"
+            pending.extend(
+                child for child in nested if isinstance(child, BaseException)
             )
-        return _sanitize_error(message)
-
-    deduped: List[str] = []
-    for item in _flatten_messages(exc):
-        if item not in deduped:
-            deduped.append(item)
-    return _sanitize_error("; ".join(deduped[:3]))
+        pending.extend(
+            nested_exc
+            for attr in ("__cause__", "__context__")
+            if isinstance((nested_exc := getattr(current, attr, None)), BaseException)
+        )
+    return "MCP server connection failed"
 
 
 # ---------------------------------------------------------------------------
@@ -2507,11 +2445,7 @@ class MCPServerTask:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.info(
-                    "MCP server '%s': server/discover rejected (%s) despite "
-                    "protocol=%s — falling back to the legacy handshake",
-                    self.name, exc, mode,
-                )
+                logger.info('MCP protocol fallback activated')
                 return await asyncio.wait_for(
                     session.initialize(), timeout=connect_timeout
                 )
@@ -2520,10 +2454,7 @@ class MCPServerTask:
                 session.initialize(), timeout=connect_timeout
             )
         if mode != "auto":
-            logger.warning(
-                "MCP server '%s': unknown protocol=%r — treating as 'auto' "
-                "(valid: auto, stateless, legacy)", self.name, mode,
-            )
+            logger.warning('MCP protocol configuration invalid')
         try:
             return await asyncio.wait_for(
                 session.initialize(), timeout=connect_timeout
@@ -2539,11 +2470,7 @@ class MCPServerTask:
                 # Legacy SDK generation (mcp 1.x) has no server/discover
                 # client — nothing to fall back to.
                 raise
-            logger.info(
-                "MCP server '%s': legacy handshake rejected (%s) — "
-                "retrying via server/discover (2026-07-28 stateless server)",
-                self.name, exc,
-            )
+            logger.info('MCP protocol fallback activated')
             return await asyncio.wait_for(
                 session.discover(), timeout=connect_timeout
             )
@@ -2604,7 +2531,7 @@ class MCPServerTask:
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception("MCP server '%s': dynamic tool refresh failed", self.name)
+            logger.warning("MCP dynamic tool refresh failed")
 
     def _schedule_tools_refresh(self) -> asyncio.Task:
         """Schedule a background tool refresh and keep it strongly referenced."""
@@ -2731,37 +2658,38 @@ class MCPServerTask:
             # "tool not connected" / stale-handler races during startup
             # notifications. Tools absent from the fresh list are no longer
             # callable, so remove only those stale registry entries first.
-            toolset_name = f"mcp-{self.name}"
-            stale_tool_names = old_tool_names - {
-                mcp_prefixed_tool_name(self.name, tool.name)
-                for tool in new_mcp_tools
-            }
-            for tool_name in stale_tool_names:
-                # Never let one server's refresh remove a colliding name that
-                # is currently owned by another server.
-                if registry.get_toolset_for_tool(tool_name) != toolset_name:
-                    continue
-                registry.deregister(tool_name)
-                _forget_mcp_tool_server(tool_name)
+            with registry._lock:
+                toolset_name = f"mcp-{self.name}"
+                stale_tool_names = old_tool_names - {
+                    mcp_prefixed_tool_name(self.name, tool.name)
+                    for tool in new_mcp_tools
+                }
+                for tool_name in stale_tool_names:
+                    # Never let one server's refresh remove a colliding name that
+                    # is currently owned by another server.
+                    if registry.get_toolset_for_tool(tool_name) != toolset_name:
+                        continue
+                    registry.deregister(tool_name)
+                    _forget_mcp_tool_server(tool_name)
 
-            # 3. Re-register with the fresh list. The helper may skip names that
-            # are ambiguous after normalization.
-            self._tools = new_mcp_tools
-            registered_names = _register_server_tools(
-                self.name, self, self._config
-            )
+                # 3. Re-register with the fresh list. The helper may skip names that
+                # are ambiguous after normalization.
+                self._tools = new_mcp_tools
+                registered_names = _register_server_tools(
+                    self.name, self, self._config
+                )
 
-            # A previously unique raw name can become ambiguous without changing
-            # its normalized registry name. In that case the pre-pass above does
-            # not consider it stale, so remove any old entry that the final,
-            # collision-checked registration set no longer owns.
-            registered_name_set = set(registered_names)
-            for tool_name in old_tool_names - registered_name_set:
-                if registry.get_toolset_for_tool(tool_name) != toolset_name:
-                    continue
-                registry.deregister(tool_name)
-                _forget_mcp_tool_server(tool_name)
-            self._registered_tool_names = registered_names
+                # A previously unique raw name can become ambiguous without changing
+                # its normalized registry name. In that case the pre-pass above does
+                # not consider it stale, so remove any old entry that the final,
+                # collision-checked registration set no longer owns.
+                registered_name_set = set(registered_names)
+                for tool_name in old_tool_names - registered_name_set:
+                    if registry.get_toolset_for_tool(tool_name) != toolset_name:
+                        continue
+                    registry.deregister(tool_name)
+                    _forget_mcp_tool_server(tool_name)
+                self._registered_tool_names = registered_names
 
             # 4. Log what changed (user-visible notification)
             new_tool_names = set(self._registered_tool_names)
@@ -2773,16 +2701,9 @@ class MCPServerTask:
             if removed:
                 changes.append(f"removed: {', '.join(sorted(removed))}")
             if changes:
-                logger.warning(
-                    "MCP server '%s': tools changed dynamically — %s. "
-                    "Verify these changes are expected.",
-                    self.name, "; ".join(changes),
-                )
+                logger.warning("MCP dynamic tool refresh changed the tool surface")
             else:
-                logger.info(
-                    "MCP server '%s': dynamically refreshed %d tool(s) (no changes)",
-                    self.name, len(self._registered_tool_names),
-                )
+                logger.info("MCP dynamic tool refresh completed without changes")
 
     async def _keepalive_probe(self) -> None:
         """Exercise the session to detect a stale/expired connection.
@@ -2814,12 +2735,7 @@ class MCPServerTask:
                     # No ping, no tools → no cheaper probe to fall back to.
                     raise
                 self._ping_unsupported = True
-                logger.info(
-                    "MCP server '%s': does not implement the optional 'ping' "
-                    "utility (-32601); using 'list_tools' for keepalive on "
-                    "this connection.",
-                    self.name,
-                )
+                logger.info('MCP keepalive fallback activated')
 
         # Fallback probe for servers without ping support.
         await asyncio.wait_for(self.session.list_tools(), timeout=30.0)
@@ -2839,11 +2755,7 @@ class MCPServerTask:
             self._reconnect_retries = 0
             if self._was_parked:
                 self._was_parked = False
-                logger.warning(
-                    "MCP server '%s': revived — session healthy again after "
-                    "parking (state: parked → connected)",
-                    self.name,
-                )
+                logger.warning('MCP connection revived')
 
     async def _wait_for_lifecycle_event(self) -> str:
         """Block until either _shutdown_event or _reconnect_event fires.
@@ -2925,11 +2837,7 @@ class MCPServerTask:
                         await self._keepalive_probe()
                     except Exception as exc:
                         root = _unwrap_exception_group(exc)
-                        logger.warning(
-                            "MCP server '%s' keepalive failed, triggering "
-                            "reconnect (state: connected → degraded): %s: %s",
-                            self.name, type(root).__name__, root,
-                        )
+                        logger.warning('MCP keepalive failed')
                         self._reconnect_event.set()
                         break
                     # Keepalive succeeded — the session survived a full
@@ -2998,10 +2906,7 @@ class MCPServerTask:
         if config.get("identity_header") is not None:
             # Headers don't exist on stdio transports — warn and ignore so a
             # copy-pasted HTTP config block doesn't silently mislead.
-            logger.warning(
-                "MCP server '%s': identity_header is only supported on "
-                "HTTP/SSE transports — ignored for stdio servers", self.name,
-            )
+            logger.warning('MCP identity header unsupported for transport')
         if not _ensure_mcp_sdk():
             raise ImportError(
                 f"MCP server '{self.name}' requires the 'mcp' Python SDK, but "
@@ -3036,11 +2941,7 @@ class MCPServerTask:
                 timeout=_OSV_MALWARE_CHECK_TIMEOUT_S,
             )
         except asyncio.TimeoutError:
-            logger.warning(
-                "MCP server '%s': OSV malware preflight timed out after %.0fs "
-                "(network slow/unreachable) — proceeding without the check.",
-                self.name, _OSV_MALWARE_CHECK_TIMEOUT_S,
-            )
+            logger.warning('MCP malware preflight timed out')
             malware_error = None
         if malware_error:
             raise ValueError(
@@ -3369,11 +3270,7 @@ class MCPServerTask:
             raise eg
         if not self._ready.is_set():
             raise eg
-        logger.debug(
-            "MCP server '%s': transport TaskGroup exited after a live session "
-            "(%r) — reconnecting immediately instead of backing off",
-            self.name, eg,
-        )
+        logger.debug('MCP transport ended after live session')
         return "reconnect"
 
     async def _run_http(self, config: dict):
@@ -3430,7 +3327,7 @@ class MCPServerTask:
                     self.name, url, config.get("oauth"),
                 )
             except Exception as exc:
-                logger.warning("MCP OAuth setup failed for '%s': %s", self.name, exc)
+                logger.warning('MCP OAuth setup failed')
                 raise
 
         sampling_kwargs = self._sampling.session_kwargs() if self._sampling else {}
@@ -3534,10 +3431,7 @@ class MCPServerTask:
                         self._session_proven = False
                         reason = await self._wait_for_lifecycle_event()
                         if reason == "reconnect":
-                            logger.info(
-                                "MCP server '%s': reconnect requested — "
-                                "tearing down SSE session", self.name,
-                            )
+                            logger.info('MCP reconnect requested')
             except BaseExceptionGroup as _eg:
                 # SSE transport TaskGroup dropped (idle timeout / stream blip):
                 # reconnect immediately instead of backoff/park (#66092).
@@ -3599,10 +3493,7 @@ class MCPServerTask:
                             self._session_proven = False
                             reason = await self._wait_for_lifecycle_event()
                             if reason == "reconnect":
-                                logger.info(
-                                    "MCP server '%s': reconnect requested — "
-                                    "tearing down HTTP session", self.name,
-                                )
+                                logger.info('MCP reconnect requested')
             except BaseExceptionGroup as _eg:
                 # Streamable-HTTP transport TaskGroup dropped: reconnect
                 # immediately instead of backoff/park (#66092).
@@ -3646,10 +3537,7 @@ class MCPServerTask:
                         self._session_proven = False
                         reason = await self._wait_for_lifecycle_event()
                         if reason == "reconnect":
-                            logger.info(
-                                "MCP server '%s': reconnect requested — "
-                                "tearing down legacy HTTP session", self.name,
-                            )
+                            logger.info('MCP reconnect requested')
             except BaseExceptionGroup as _eg:
                 # Legacy Streamable-HTTP transport TaskGroup dropped: reconnect
                 # immediately instead of backoff/park (#66092).
@@ -3673,11 +3561,7 @@ class MCPServerTask:
         if self.session is None:
             return
         if not self._advertises_tools():
-            logger.info(
-                "MCP server '%s': does not advertise 'tools' capability — "
-                "skipping tools/list (prompts/resources remain available)",
-                self.name,
-            )
+            logger.info("MCP tool discovery skipped for unsupported capability")
             self._tools = []
             self._register_discovered_tools_if_needed()
             return
@@ -3754,12 +3638,7 @@ class MCPServerTask:
 
         # Validate: warn if both url and command are present
         if "url" in config and "command" in config:
-            logger.warning(
-                "MCP server '%s' has both 'url' and 'command' in config. "
-                "Using HTTP transport ('url'). Remove 'command' to silence "
-                "this warning.",
-                self.name,
-            )
+            logger.warning('MCP transport configuration conflict')
 
         # Validate remote URL once, up front.  Raising here (rather than
         # letting it blow up inside the SDK's httpx layer on every retry)
@@ -3770,7 +3649,7 @@ class MCPServerTask:
             try:
                 _validate_remote_mcp_url(self.name, config.get("url"))
             except InvalidMcpUrlError as exc:
-                logger.warning("%s", exc)
+                logger.warning("MCP URL validation failed")
                 self._error = exc
                 self._ready.set()
                 return
@@ -3797,7 +3676,7 @@ class MCPServerTask:
                         client_cert=_resolve_client_cert(self.name, config),
                     )
                 except NonMcpEndpointError as exc:
-                    logger.warning("%s", exc)
+                    logger.warning("MCP endpoint preflight failed")
                     self._error = exc
                     self._ready.set()
                     return
@@ -3820,11 +3699,7 @@ class MCPServerTask:
                 if self._shutdown_event.is_set():
                     break
                 if lifecycle_reason == "recycle":
-                    logger.info(
-                        "MCP server '%s': stdio session recycled after %s; "
-                        "waiting for lazy reconnect",
-                        self.name, self._recycled_reason,
-                    )
+                    logger.info('MCP stdio session recycled')
                     self.session = None
                     await self._wait_for_lazy_reconnect()
                     if self._shutdown_event.is_set():
@@ -3834,11 +3709,7 @@ class MCPServerTask:
                 # Per-cycle reconnect chatter — DEBUG. In the flapping case
                 # this fires on every rebuild; the WARNINGs live on the
                 # state transitions.
-                logger.debug(
-                    "MCP server '%s': reconnecting (OAuth recovery or "
-                    "manual refresh)",
-                    self.name,
-                )
+                logger.debug('MCP reconnect started')
                 # A clean transport return means a session was established and
                 # then asked to rebuild (auth recovery / manual refresh /
                 # keepalive failure / transport TaskGroup drop). That alone is
@@ -3856,14 +3727,7 @@ class MCPServerTask:
                     # flapping transport still reaches the park.
                     self._reconnect_retries += 1
                     if self._reconnect_retries > _MAX_RECONNECT_RETRIES:
-                        logger.warning(
-                            "MCP server '%s': %d consecutive reconnects "
-                            "without a healthy session (rapid-drop budget "
-                            "exhausted), parking; will self-probe every %ds "
-                            "until it recovers (state: degraded → parked)",
-                            self.name, _MAX_RECONNECT_RETRIES,
-                            _PARKED_RETRY_INTERVAL,
-                        )
+                        logger.warning('MCP rapid reconnect budget exhausted')
                         self._was_parked = True
                         self._deregister_tools()
                         self._reconnect_event.clear()
@@ -3872,12 +3736,7 @@ class MCPServerTask:
                         )
                         if parked == "shutdown":
                             break
-                        logger.debug(
-                            "MCP server '%s': attempting revival from parked "
-                            "state (self-probe or explicit reconnect request); "
-                            "rebuilding transport.",
-                            self.name,
-                        )
+                        logger.debug('MCP parked connection revival started')
                         # One probe attempt per wake — see the exception-path
                         # park below.
                         self._reconnect_retries = _MAX_RECONNECT_RETRIES
@@ -3912,11 +3771,7 @@ class MCPServerTask:
                 root = _unwrap_exception_group(exc)
                 failure_class = _classify_mcp_failure(root)
                 if self._is_recycled_stdio():
-                    logger.warning(
-                        "MCP server '%s': lazy reconnect after stdio recycle "
-                        "failed, marking unavailable while retrying: %s: %s",
-                        self.name, type(root).__name__, root,
-                    )
+                    logger.warning('MCP lazy reconnect failed')
                     self._recycled_reason = None
 
                 # If this is the first connection attempt, retry with backoff
@@ -3939,21 +3794,9 @@ class MCPServerTask:
                         # keeps the task alive so the 300s self-probe (and an
                         # explicit /mcp refresh) can pick up fresh tokens.
                         if _is_auth_error(root):
-                            logger.warning(
-                                "MCP server '%s' failed initial authentication, "
-                                "parking until credentials change; re-authenticate "
-                                "with `hermes mcp login %s` "
-                                "(state: connecting → parked): %s: %s",
-                                self.name, self.name,
-                                type(root).__name__, root,
-                            )
+                            logger.warning('MCP initial authentication failed')
                         else:
-                            logger.warning(
-                                "MCP server '%s' failed initial connection with a "
-                                "permanent error, parking without retries "
-                                "(state: connecting → parked): %s: %s",
-                                self.name, type(root).__name__, root,
-                            )
+                            logger.warning('MCP permanent initial connection failed')
                         self._error = exc
                         self._ready.set()
                         self._was_parked = True
@@ -3964,12 +3807,7 @@ class MCPServerTask:
                         )
                         if parked == "shutdown":
                             return
-                        logger.debug(
-                            "MCP server '%s': attempting revival after "
-                            "permanent initial failure (self-probe or explicit "
-                            "reconnect request); rebuilding transport.",
-                            self.name,
-                        )
+                        logger.debug("MCP permanent-failure revival started")
                         initial_retries = 0
                         self._reconnect_retries = 0
                         backoff = 1.0
@@ -3979,13 +3817,7 @@ class MCPServerTask:
 
                     initial_retries += 1
                     if initial_retries > _MAX_INITIAL_CONNECT_RETRIES:
-                        logger.warning(
-                            "MCP server '%s' failed initial connection after "
-                            "%d attempts, parking until a reconnect is "
-                            "requested (state: connecting → parked): %s: %s",
-                            self.name, _MAX_INITIAL_CONNECT_RETRIES,
-                            type(root).__name__, root,
-                        )
+                        logger.warning('MCP initial connection retry budget exhausted')
                         self._error = exc
                         self._ready.set()
                         self._was_parked = True
@@ -3996,12 +3828,7 @@ class MCPServerTask:
                         )
                         if parked == "shutdown":
                             return
-                        logger.debug(
-                            "MCP server '%s': attempting revival after initial "
-                            "connection failures (self-probe or explicit "
-                            "reconnect request); rebuilding transport.",
-                            self.name,
-                        )
+                        logger.debug('MCP initial-failure revival started')
                         initial_retries = 0
                         self._reconnect_retries = 0
                         backoff = 1.0
@@ -4009,13 +3836,7 @@ class MCPServerTask:
                         self._ready.clear()
                         continue
 
-                    logger.debug(
-                        "MCP server '%s' initial connection failed "
-                        "(attempt %d/%d), retrying in %.0fs: %s: %s",
-                        self.name, initial_retries,
-                        _MAX_INITIAL_CONNECT_RETRIES, backoff,
-                        type(root).__name__, root,
-                    )
+                    logger.debug('MCP initial connection failed')
                     await asyncio.sleep(_jittered(backoff))
                     backoff = min(backoff * 2, _MAX_BACKOFF_SECONDS)
 
@@ -4028,10 +3849,7 @@ class MCPServerTask:
 
                 # If shutdown was requested, don't reconnect
                 if self._shutdown_event.is_set():
-                    logger.debug(
-                        "MCP server '%s' disconnected during shutdown: %s: %s",
-                        self.name, type(root).__name__, root,
-                    )
+                    logger.debug('MCP disconnected during shutdown')
                     return
 
                 if failure_class == "permanent":
@@ -4039,13 +3857,7 @@ class MCPServerTask:
                     # (revoked credentials, URL now serving a web page, stdio
                     # binary uninstalled). Retrying can't help — park
                     # immediately without burning the retry ladder.
-                    logger.warning(
-                        "MCP server '%s' hit a permanent error, parking "
-                        "without retries; will self-probe every %ds "
-                        "(state: connected → parked): %s: %s",
-                        self.name, _PARKED_RETRY_INTERVAL,
-                        type(root).__name__, root,
-                    )
+                    logger.warning('MCP permanent connection failure parked')
                     self._was_parked = True
                     self._deregister_tools()
                     self._reconnect_event.clear()
@@ -4054,26 +3866,14 @@ class MCPServerTask:
                     )
                     if parked == "shutdown":
                         return
-                    logger.debug(
-                        "MCP server '%s': attempting revival from parked state "
-                        "(permanent error; self-probe or explicit reconnect "
-                        "request); rebuilding transport.",
-                        self.name,
-                    )
+                    logger.debug('MCP parked connection revival started')
                     self._reconnect_retries = _MAX_RECONNECT_RETRIES
                     backoff = 1.0
                     continue
 
                 self._reconnect_retries += 1
                 if self._reconnect_retries > _MAX_RECONNECT_RETRIES:
-                    logger.warning(
-                        "MCP server '%s' failed after %d reconnection attempts, "
-                        "parking; will self-probe every %ds until it recovers "
-                        "(state: degraded → parked): %s: %s",
-                        self.name, _MAX_RECONNECT_RETRIES,
-                        _PARKED_RETRY_INTERVAL,
-                        type(root).__name__, root,
-                    )
+                    logger.warning('MCP reconnect budget exhausted')
                     # Do NOT return — exiting the task orphans the server:
                     # nothing would ever listen for _reconnect_event again
                     # and the server would be permanently wedged for the
@@ -4093,12 +3893,7 @@ class MCPServerTask:
                     )
                     if parked == "shutdown":
                         return
-                    logger.debug(
-                        "MCP server '%s': attempting revival from parked state "
-                        "(self-probe or explicit reconnect request); "
-                        "rebuilding transport.",
-                        self.name,
-                    )
+                    logger.debug('MCP parked connection revival started')
                     # One probe attempt per wake: budget of 1 so a still-dead
                     # server parks again for another interval instead of
                     # burning 5 rapid retries each cycle.
@@ -4109,12 +3904,7 @@ class MCPServerTask:
                 # Per-attempt retry chatter stays at DEBUG; state transitions
                 # (connected->degraded, degraded->parked, parked->revived)
                 # carry the WARNINGs — one line per transition, not per try.
-                logger.debug(
-                    "MCP server '%s' connection lost (attempt %d/%d), "
-                    "reconnecting in %.0fs: %s: %s",
-                    self.name, self._reconnect_retries, _MAX_RECONNECT_RETRIES,
-                    backoff, type(root).__name__, root,
-                )
+                logger.debug('MCP connection lost')
                 await asyncio.sleep(_jittered(backoff))
                 backoff = min(backoff * 2, _MAX_BACKOFF_SECONDS)
 
@@ -4156,10 +3946,7 @@ class MCPServerTask:
             try:
                 await asyncio.wait_for(self._task, timeout=10)
             except asyncio.TimeoutError:
-                logger.warning(
-                    "MCP server '%s' shutdown timed out, cancelling task",
-                    self.name,
-                )
+                logger.warning("MCP server shutdown timed out; task cancelled")
                 self._task.cancel()
                 try:
                     await self._task
@@ -4353,10 +4140,7 @@ def _normalize_server_trust(value: Any) -> str:
         return _TRUST_FULL
     if text == _TRUST_UNTRUSTED:
         return _TRUST_UNTRUSTED
-    logger.warning(
-        "MCP trust: unrecognized trust value %r — treating as 'untrusted' "
-        "(valid values: full, untrusted)", value,
-    )
+    logger.warning("MCP trust value invalid; using untrusted")
     return _TRUST_UNTRUSTED
 
 
@@ -5452,14 +5236,7 @@ def _warn_hidden_whitespace(server_name: str, config: dict) -> List[str]:
         if dedupe_key in _whitespace_warned:
             continue
         _whitespace_warned.add(dedupe_key)
-        logger.warning(
-            "MCP server '%s': config value '%s' has hidden leading or "
-            "trailing whitespace — this often causes authentication or "
-            "connection failures. Check for stray spaces/newlines in "
-            "config.yaml (or the referenced env var).",
-            server_name,
-            key_path,
-        )
+        logger.warning("MCP config contains hidden surrounding whitespace")
     return flagged
 
 
@@ -5480,11 +5257,7 @@ def _filter_suspicious_mcp_servers(servers: Dict[str, dict]) -> Dict[str, dict]:
             continue
         issues = _validate_mcp_server_entry(name, cfg)
         if issues:
-            logger.warning(
-                "Skipping suspicious MCP server '%s': %s",
-                name,
-                "; ".join(issues),
-            )
+            logger.warning("Suspicious MCP server configuration skipped")
             continue
         safe_servers[name] = cfg
     return safe_servers
@@ -5530,17 +5303,14 @@ def _load_mcp_config() -> Dict[str, dict]:
             portable = get_plugin_manager().get_portable_mcp_servers()
             for name, cfg in _filter_suspicious_mcp_servers(portable).items():
                 if name in safe_servers:
-                    logger.warning(
-                        "Portable MCP server '%s' conflicts with native config; skipping",
-                        name,
-                    )
+                    logger.warning("Portable MCP server conflicts with native config; skipping")
                     continue
                 safe_servers[name] = dict(cfg)
         except Exception:
-            logger.debug("Failed to load portable MCP servers", exc_info=True)
+            logger.debug("Portable MCP server discovery failed")
         return safe_servers
-    except Exception as exc:
-        logger.debug("Failed to load MCP config: %s", exc)
+    except Exception:
+        logger.debug("MCP configuration load failed")
         return {}
 
 
@@ -5625,10 +5395,7 @@ def _request_lazy_reconnect(server_name: str, server: MCPServerTask) -> bool:
     try:
         return bool(_run_on_mcp_loop(_await_ready, timeout=_RECYCLED_RECONNECT_TIMEOUT))
     except Exception as exc:
-        logger.warning(
-            "MCP server '%s': lazy reconnect after stdio recycle failed: %s",
-            server_name, exc,
-        )
+        logger.warning('MCP lazy reconnect failed')
         return False
 
 
@@ -6571,7 +6338,7 @@ def _normalize_name_filter(value: Any, label: str) -> set[str]:
         return {value}
     if isinstance(value, (list, tuple, set)):
         return {str(item) for item in value}
-    logger.warning("MCP config %s must be a string or list of strings; ignoring %r", label, value)
+    logger.warning("MCP name filter config invalid; ignoring")
     return set()
 
 
@@ -6606,7 +6373,7 @@ def _parse_boolish(value: Any, default: bool = True) -> bool:
             return True
         if lowered in {"false", "0", "no", "off"}:
             return False
-    logger.warning("MCP config expected a boolean-ish value, got %r; using default=%s", value, default)
+    logger.warning("MCP boolean config invalid; using default")
     return default
 
 
@@ -6621,12 +6388,12 @@ def _get_lifecycle_seconds(config: dict, key: str) -> Optional[float]:
     try:
         seconds = float(raw)
     except (TypeError, ValueError):
-        logger.warning("MCP config %s must be a number of seconds; ignoring %r", key, raw)
+        logger.warning("MCP lifecycle duration must be a number of seconds")
         return None
     if seconds == 0:
         return None
     if seconds < 0:
-        logger.warning("MCP config %s must be positive; ignoring %r", key, raw)
+        logger.warning("MCP lifecycle duration must be positive")
         return None
     return seconds
 
@@ -6688,10 +6455,10 @@ def _select_utility_schemas(server_name: str, server: MCPServerTask, config: dic
     for entry in _build_utility_schemas(server_name):
         handler_key = entry["handler_key"]
         if handler_key in {"list_resources", "read_resource"} and not resources_enabled:
-            logger.debug("MCP server '%s': skipping utility '%s' (resources disabled)", server_name, handler_key)
+            logger.debug('MCP utility disabled by configuration')
             continue
         if handler_key in {"list_prompts", "get_prompt"} and not prompts_enabled:
-            logger.debug("MCP server '%s': skipping utility '%s' (prompts disabled)", server_name, handler_key)
+            logger.debug('MCP utility disabled by configuration')
             continue
 
         # Preferred gate: check the server's advertised capabilities. Skip
@@ -6699,13 +6466,7 @@ def _select_utility_schemas(server_name: str, server: MCPServerTask, config: dic
         if advertised_caps is not None:
             cap_attr = _UTILITY_CAPABILITY_ATTRS[handler_key]
             if getattr(advertised_caps, cap_attr, None) is None:
-                logger.debug(
-                    "MCP server '%s': skipping utility '%s' "
-                    "(server does not advertise '%s' capability)",
-                    server_name,
-                    handler_key,
-                    cap_attr,
-                )
+                logger.debug('MCP utility capability unavailable')
                 continue
         else:
             # Legacy fallback for test fixtures or older code paths where
@@ -6714,12 +6475,7 @@ def _select_utility_schemas(server_name: str, server: MCPServerTask, config: dic
             # any server that was working before this fix.
             required_method = _UTILITY_CAPABILITY_METHODS[handler_key]
             if not hasattr(server.session, required_method):
-                logger.debug(
-                    "MCP server '%s': skipping utility '%s' (session lacks %s)",
-                    server_name,
-                    handler_key,
-                    required_method,
-                )
+                logger.debug('MCP utility method unavailable')
                 continue
         selected.append(entry)
     return selected
@@ -6803,11 +6559,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
 
     for mcp_tool in server._tools:
         if not _should_register(mcp_tool.name):
-            logger.debug(
-                "MCP server '%s': skipping tool '%s' (filtered by config)",
-                name,
-                mcp_tool.name,
-            )
+            logger.debug("MCP tool registration skipped by configuration")
             continue
 
         _scan_mcp_description(name, mcp_tool.name, mcp_tool.description or "")
@@ -6855,13 +6607,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
     for candidate in candidates:
         key = (candidate["registry_name"], candidate["origin"])
         if key in seen_candidates:
-            logger.debug(
-                "MCP server '%s': duplicate registration candidate %s for '%s'; "
-                "keeping one",
-                name,
-                candidate["origin"],
-                candidate["registry_name"],
-            )
+            logger.debug("MCP duplicate registration candidate ignored")
             continue
         seen_candidates.add(key)
         unique_candidates.append(candidate)
@@ -6892,27 +6638,12 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
         if len(native_origins) == 1 and utility_origins:
             for util_origin in utility_origins:
                 shadowed_utilities.add((registry_name, util_origin))
-            logger.info(
-                "MCP server '%s': generated utility %s normalizes onto "
-                "server-native %s — keeping the native tool and dropping the "
-                "utility (the utility only applies when the server has no such "
-                "tool of its own)",
-                name,
-                ", ".join(utility_origins),
-                native_origins[0],
-            )
+            logger.info("MCP generated utility shadowed by a native tool")
             continue
         ambiguous_names[registry_name] = sorted(origins)
 
     for registry_name, origins in sorted(ambiguous_names.items()):
-        logger.error(
-            "MCP server '%s': name normalization collision for '%s' from %s; "
-            "skipping every colliding entry instead of choosing an arbitrary "
-            "handler",
-            name,
-            registry_name,
-            ", ".join(origins),
-        )
+        logger.error("MCP tool registration rejected a name collision")
 
     for candidate in unique_candidates:
         registry_name = candidate["registry_name"]
@@ -6924,23 +6655,9 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
         existing_toolset = registry.get_toolset_for_tool(registry_name)
         if existing_toolset and existing_toolset != toolset_name:
             if existing_toolset.startswith("mcp-"):
-                logger.error(
-                    "MCP server '%s': %s normalizes to '%s', already owned by "
-                    "MCP toolset '%s' — skipping to preserve the existing owner",
-                    name,
-                    candidate["origin"],
-                    registry_name,
-                    existing_toolset,
-                )
+                logger.error("MCP tool registration preserved an existing MCP owner")
             else:
-                logger.warning(
-                    "MCP server '%s': %s (→ '%s') collides with built-in tool "
-                    "in toolset '%s' — skipping to preserve built-in",
-                    name,
-                    candidate["origin"],
-                    registry_name,
-                    existing_toolset,
-                )
+                logger.warning("MCP tool registration preserved a built-in owner")
             continue
 
         registry.register(
@@ -6956,13 +6673,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
         # The pre-check above is advisory only. Multiple servers connect in
         # parallel, so ToolRegistry.register() is the atomic ownership gate.
         if registry.get_toolset_for_tool(registry_name) != toolset_name:
-            logger.error(
-                "MCP server '%s': registration of %s as '%s' was rejected by "
-                "the registry; skipping provenance/count updates",
-                name,
-                candidate["origin"],
-                registry_name,
-            )
+            logger.error("MCP tool registration was rejected by the registry")
             continue
 
         _track_mcp_tool_server(registry_name, name)
@@ -7004,8 +6715,8 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
                 ttl_ms=(getattr(server, "_list_cache_meta", None) or {}).get("ttl_ms"),
                 cache_scope=(getattr(server, "_list_cache_meta", None) or {}).get("cache_scope"),
             )
-        except Exception as exc:
-            logger.debug("MCP schema cache write failed for '%s': %s", name, exc)
+        except Exception:
+            logger.debug("MCP schema cache write failed")
 
     return registered_names
 
@@ -7090,11 +6801,7 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
         registry_name = schema["name"]
         existing_toolset = registry.get_toolset_for_tool(registry_name)
         if existing_toolset and existing_toolset != toolset_name:
-            logger.warning(
-                "MCP server '%s' (lazy): cached tool '%s' collides with "
-                "toolset '%s' — skipping",
-                name, registry_name, existing_toolset,
-            )
+            logger.warning("MCP lazy registration rejected a cached tool collision")
             continue
         registry.register(
             name=registry_name,
@@ -7149,10 +6856,7 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
             _lazy_server_configs[name] = dict(config)
             _lazy_server_fingerprints[name] = fingerprint
             _lazy_server_tool_names[name] = list(registered_names)
-        logger.info(
-            "MCP server '%s' (lazy): registered %d tool(s) from schema cache",
-            name, len(registered_names),
-        )
+        logger.info("MCP lazy registration completed from schema cache")
     return registered_names
 
 async def _discover_and_register_server(name: str, config: dict) -> List[str]:
@@ -7208,12 +6912,7 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
     registered_names = _register_server_tools(name, server, config)
     server._registered_tool_names = list(registered_names)
 
-    transport_type = "HTTP" if "url" in config else "stdio"
-    logger.info(
-        "MCP server '%s' (%s): registered %d tool(s): %s",
-        name, transport_type, len(registered_names),
-        ", ".join(registered_names),
-    )
+    logger.info("MCP server discovery and registration completed")
     return registered_names
 
 
@@ -7298,7 +6997,6 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     # refreshes the cache for next time).
     eager_servers: Dict[str, dict] = dict(new_servers)
     lazy_registered = 0
-    lazy_server_count = 0
     try:
         from tools.mcp_schema_cache import config_fingerprint, get_cached_entry
     except Exception:  # pragma: no cover - cache module missing
@@ -7315,25 +7013,18 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
                 _server_connecting.discard(name)
             try:
                 names = _register_from_cache_sync(name, cfg, entry)
-            except Exception as exc:
-                logger.warning(
-                    "Failed lazy MCP registration for '%s': %s", name, exc,
-                )
+            except Exception:
+                logger.warning("MCP lazy registration failed")
                 with _lock:
                     _server_connecting.add(name)
                 continue
             eager_servers.pop(name, None)
             lazy_registered += len(names)
-            lazy_server_count += 1
     new_servers = eager_servers
 
     if not new_servers:
         if lazy_registered:
-            logger.info(
-                "MCP: registered %d lazy tool(s) from schema cache "
-                "(no processes spawned)",
-                lazy_registered,
-            )
+            logger.info("MCP lazy registration completed without process startup")
         return _existing_tool_names()
 
     # Start the background event loop for MCP connections
@@ -7352,7 +7043,6 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         )
         for name, result in zip(server_names, results):
             if isinstance(result, BaseException):
-                command = new_servers.get(name, {}).get("command")
                 message = _format_connect_error(result)
                 with _lock:
                     _server_connecting.discard(name)
@@ -7362,12 +7052,7 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
                     # (#50394). Isolated to this server -- healthy servers
                     # in the same batch are unaffected.
                     _record_connect_failure(name)
-                logger.warning(
-                    "Failed to connect to MCP server '%s'%s: %s",
-                    name,
-                    f" (command={command})" if command else "",
-                    message,
-                )
+                logger.warning("MCP server connection failed during registration")
             else:
                 with _lock:
                     _server_connecting.discard(name)
@@ -7394,19 +7079,15 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         with _lock:
             stale = [n for n in new_servers if n in _server_connecting]
             if stale:
-                logger.warning(
-                    "MCP discovery %s while %d server(s) were still "
-                    "connecting; clearing stale connecting set: %s",
-                    "timed out" if isinstance(_e, TimeoutError) else "interrupted",
-                    len(stale),
-                    ", ".join(stale),
-                )
+                if isinstance(_e, TimeoutError):
+                    logger.warning("MCP discovery timed out with pending connections")
+                    connect_error = "MCP discovery timed out"
+                else:
+                    logger.warning("MCP discovery was interrupted with pending connections")
+                    connect_error = "MCP discovery interrupted"
                 _server_connecting.difference_update(stale)
                 for _sn in stale:
-                    _server_connect_errors.setdefault(
-                        _sn,
-                        f"Connection attempt {'timed out' if isinstance(_e, TimeoutError) else 'interrupted'} during discovery",
-                    )
+                    _server_connect_errors.setdefault(_sn, connect_error)
         raise
     finally:
         if _was_interrupted:
@@ -7425,12 +7106,11 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         )
     failed = len(new_servers) - len(connected)
     new_tool_count += lazy_registered
-    connected_count = len(connected) + lazy_server_count
     if new_tool_count or failed:
-        summary = f"MCP: registered {new_tool_count} tool(s) from {connected_count} server(s)"
         if failed:
-            summary += f" ({failed} failed)"
-        logger.info(summary)
+            logger.info("MCP server registration completed with failures")
+        else:
+            logger.info("MCP server registration completed")
 
     return _existing_tool_names()
 
@@ -7474,11 +7154,7 @@ def discover_mcp_tools() -> List[str]:
                 break
 
         if cookie is None:
-            logger.warning(
-                "MCP discovery lock still held after %d retries -- "
-                "running discovery unguarded",
-                _MCP_DISCOVERY_LOCK_MAX_RETRIES,
-            )
+            logger.warning("MCP discovery lock unavailable after bounded retries")
         elif cookie is not _LOCK_UNAVAILABLE:
             logger.debug("Retry succeeded -- acquired MCP discovery lock")
 
@@ -7510,10 +7186,10 @@ def discover_mcp_tools() -> List[str]:
 
         failed_count = len(new_server_names) - len(connected_server_names)
         if new_tool_count or failed_count:
-            summary = f"  MCP: {new_tool_count} tool(s) from {len(connected_server_names)} server(s)"
             if failed_count:
-                summary += f" ({failed_count} failed)"
-            logger.info(summary)
+                logger.info("MCP tool discovery completed with failures")
+            else:
+                logger.info("MCP tool discovery completed")
 
         return tool_names
 
@@ -7691,6 +7367,8 @@ def probe_mcp_server_tools() -> Dict[str, List[tuple]]:
 # agent's run loop reads those during tool iteration, so a concurrent write
 # mid-read could otherwise expose a half-updated list.
 _agent_tools_lock = threading.Lock()
+# Full shutdown→discover→target-refresh serialization shared by TUI/gateway.
+_mcp_reload_lock = threading.Lock()
 
 
 def has_registered_mcp_tools() -> bool:
@@ -7728,6 +7406,8 @@ def refresh_agent_mcp_tools(
     enabled_override=None,
     disabled_override=None,
     quiet_mode: bool = True,
+    raise_on_exhaustion: bool = False,
+    definition_builder=None,
 ) -> set:
     """Re-derive an already-built agent's tool snapshot from the live registry.
 
@@ -7763,85 +7443,107 @@ def refresh_agent_mcp_tools(
     explicit user consent; the late-binding and between-turns paths only rebuild
     at a turn boundary, before that turn's ``tools=`` prefix is assembled).
     """
-    from model_tools import get_tool_definitions
+    from copy import copy
+    import model_tools
+    from tools.memory_tool import frozen_memory_surface
     from tools.registry import registry
 
-    # Explicit reloads (/reload-mcp) pass freshly-resolved toolsets so a server
-    # the user just ENABLED in config is picked up; the agent's stored selection
-    # is then updated to match. The automatic paths (between-turns, late-binding)
-    # pass nothing and reuse the agent's build-time selection unchanged.
-    if enabled_override is not None or disabled_override is not None:
-        enabled = enabled_override if enabled_override is not None else getattr(agent, "enabled_toolsets", None)
-        disabled = disabled_override if disabled_override is not None else getattr(agent, "disabled_toolsets", None)
-        agent.enabled_toolsets = enabled
-        agent.disabled_toolsets = disabled
-    else:
-        enabled = getattr(agent, "enabled_toolsets", None)
-        disabled = getattr(agent, "disabled_toolsets", None)
+    definition_builder = definition_builder or model_tools.get_tool_definitions
+    for _attempt in range(3):
+        with _agent_tools_lock:
+            epoch = getattr(agent, "_tool_snapshot_generation", 0)
+            epoch = epoch if isinstance(epoch, int) else 0
+            enabled = (
+                enabled_override
+                if enabled_override is not None
+                else getattr(agent, "enabled_toolsets", None)
+            )
+            disabled = (
+                disabled_override
+                if disabled_override is not None
+                else getattr(agent, "disabled_toolsets", None)
+            )
+            staged_agent = copy(agent)
+            staged_agent.enabled_toolsets = enabled
+            staged_agent.disabled_toolsets = disabled
+            coupled = {
+                "_memory_manager": getattr(agent, "_memory_manager", None),
+                "_memory_store": getattr(agent, "_memory_store", None),
+                "_memory_enabled": bool(getattr(agent, "_memory_enabled", False)),
+                "_user_profile_enabled": bool(getattr(agent, "_user_profile_enabled", False)),
+                "_memory_provider_mode": getattr(agent, "_memory_provider_mode", "hybrid"),
+                "_memory_config": getattr(agent, "_memory_config", {}),
+                "_session_init_model_config": getattr(agent, "_session_init_model_config", {}),
+            }
+        with registry._lock:
+            registry_generation = registry._generation
 
-    # Capture the registry generation this rebuild is derived from BEFORE the
-    # (potentially slow) get_tool_definitions call. Used at publish time to
-    # reject a stale write: if two callers race (e.g. the late-refresh daemon
-    # and the between-turns prologue around turn 1), a slower caller that
-    # computed an OLDER set must not clobber a newer set another caller already
-    # published. ``registry._generation`` bumps on every (de)register.
-    snapshot_generation = registry._generation
-
-    # Registry-derived tools (built-ins + MCP), filtered to the agent's toolsets.
-    # Computed OUTSIDE the lock (get_tool_definitions can be slow); the diff and
-    # publish below happen together in ONE critical section so two concurrent
-    # callers can't torn-publish or compute overlapping ``added`` sets.
-    new_defs = list(
-        get_tool_definitions(
-            enabled_toolsets=enabled,
-            disabled_toolsets=disabled,
-            quiet_mode=quiet_mode,
+        with frozen_memory_surface(
+            coupled["_memory_provider_mode"],
+            (coupled["_memory_enabled"], coupled["_user_profile_enabled"]),
+        ):
+            new_defs = list(
+                definition_builder(
+                    enabled_toolsets=enabled,
+                    disabled_toolsets=disabled,
+                    quiet_mode=quiet_mode,
+                    _publish_resolved_names=False,
+                )
+                or []
+            )
+        new_names = {tool["function"]["name"] for tool in new_defs}
+        staged_agent.tools = new_defs
+        staged_agent.valid_tool_names = new_names
+        staged_engine_names = _reinject_post_build_tools(
+            staged_agent, new_defs, new_names
         )
-        or []
-    )
-    new_names = {t["function"]["name"] for t in new_defs}
 
-    # Re-append the post-build injected families that get_tool_definitions does
-    # NOT reproduce, so a refresh never strips them (memory-provider + context-
-    # engine tools). Staged entirely on LOCALS — the live ``agent.tools`` /
-    # ``valid_tool_names`` / ``_context_engine_tool_names`` are never touched
-    # until the single atomic publish below, so a concurrent reader
-    # (``build_api_kwargs``) can't see a partial rebuild or a cross-attribute
-    # half-swap. ``staged_engine_names`` are the context-engine routing names
-    # this rebuild actually appended (matching agent_init's dedup-aware add).
-    staged_engine_names = _reinject_post_build_tools(agent, new_defs, new_names)
+        with registry._lock:
+            with _agent_tools_lock:
+                if (
+                    registry._generation != registry_generation
+                    or getattr(agent, "_tool_snapshot_generation", 0) != epoch
+                ):
+                    continue
+                old_defs = list(getattr(agent, "tools", None) or [])
+                old_names = {
+                    tool["function"]["name"] for tool in old_defs
+                }
+                changed = (
+                    old_defs != new_defs
+                    or getattr(agent, "enabled_toolsets", None) != enabled
+                    or getattr(agent, "disabled_toolsets", None) != disabled
+                    or getattr(agent, "_context_engine_tool_names", set())
+                    != staged_engine_names
+                )
+                for attr, value in coupled.items():
+                    setattr(agent, attr, value)
+                agent.enabled_toolsets = enabled
+                agent.disabled_toolsets = disabled
+                agent.tools = new_defs
+                agent.valid_tool_names = new_names
+                agent._context_engine_tool_names = staged_engine_names
+                agent._tool_snapshot_generation = epoch + 1
+                model_tools._last_resolved_tool_names = sorted(new_names)
+                added = new_names - old_names
 
-    # Single atomic read-diff-publish so the returned ``added`` is consistent
-    # with what was actually published, even under concurrent callers, and a
-    # stale (older-generation) rebuild can't overwrite a newer published one.
-    with _agent_tools_lock:
-        # Defensive: the published generation should be an int, but tolerate an
-        # agent that never set it (or set a non-int, e.g. a test mock) rather
-        # than throwing TypeError on the comparison and silently failing the
-        # whole refresh.
-        published_gen_raw = getattr(agent, "_tool_snapshot_generation", -1)
-        published_gen = published_gen_raw if isinstance(published_gen_raw, int) else -1
-        if snapshot_generation < published_gen:
-            # A newer snapshot already won; our set is stale — drop it.
-            return set()
-        current = {
-            t["function"]["name"]
-            for t in (getattr(agent, "tools", None) or [])
-        }
-        if new_names == current:
-            # No change → leave the live snapshot untouched (no churn), but
-            # record the generation so an in-flight older caller can't clobber.
-            agent._tool_snapshot_generation = max(published_gen, snapshot_generation)
-            return set()
-        agent.tools = new_defs
-        agent.valid_tool_names = new_names
-        # Publish context-engine routing names atomically with the snapshot.
-        engine_names = getattr(agent, "_context_engine_tool_names", None)
-        if isinstance(engine_names, set):
-            engine_names.clear()
-            engine_names.update(staged_engine_names)
-        agent._tool_snapshot_generation = max(published_gen, snapshot_generation)
-        return new_names - current
+        if changed:
+            invalidate = getattr(agent, "_invalidate_system_prompt", None)
+            if callable(invalidate):
+                try:
+                    invalidate()
+                except Exception:
+                    # Publication already committed; invalidation is fail-soft.
+                    try:
+                        logger.warning("Tool snapshot prompt invalidation failed")
+                    except Exception:
+                        pass
+        return added
+
+    if raise_on_exhaustion:
+        raise RuntimeError("tool snapshot changed during rebuild")
+    logger.warning("Tool snapshot rebuild exhausted after 3 concurrent changes")
+    return set()
 
 
 def _reinject_post_build_tools(agent, tools_list: list, name_set: set) -> set:
@@ -7883,7 +7585,7 @@ def _reinject_post_build_tools(agent, tools_list: list, name_set: set) -> set:
                     if isinstance(schema, dict):
                         _add(schema)
     except Exception:
-        logger.debug("Memory-provider tool re-injection skipped", exc_info=True)
+        logger.debug("Memory-provider tool re-injection skipped")
 
     # Context-engine tools (lcm_grep/lcm_describe/…) — the `context_engine`
     # toolset is intentionally empty, so these only exist via this append.
@@ -7908,7 +7610,14 @@ def _reinject_post_build_tools(agent, tools_list: list, name_set: set) -> set:
                 if _add(schema) and name:
                     staged_engine_names.add(name)
     except Exception:
-        logger.debug("Context-engine tool re-injection skipped", exc_info=True)
+        logger.debug("Context-engine tool re-injection skipped")
+
+    try:
+        from tools.bot_mode_dm import ensure_message_agent_tool
+
+        ensure_message_agent_tool(agent)
+    except Exception:
+        logger.debug("Bot-mode tool re-injection skipped")
 
     return staged_engine_names
 
@@ -7943,9 +7652,7 @@ def shutdown_mcp_servers():
         )
         for server, result in zip(servers_snapshot, results):
             if isinstance(result, Exception):
-                logger.debug(
-                    "Error closing MCP server '%s': %s", server.name, result,
-                )
+                logger.debug("MCP server shutdown failed")
         with _lock:
             _servers.clear()
             # Drop connect-retry cooldowns too: a full shutdown/restart
@@ -7966,8 +7673,8 @@ def shutdown_mcp_servers():
         if future is not None:
             try:
                 future.result(timeout=15)
-            except BaseException as exc:
-                logger.debug("Error during MCP shutdown: %s", exc)
+            except BaseException:
+                logger.debug("MCP shutdown wait failed")
 
     # Unconditional final sweep: whether the async ``_shutdown`` ran,
     # timed out, or was never scheduled (loop already stopped), a full
@@ -8135,7 +7842,7 @@ async def _drain_mcp_loop_tasks(
     pending = [t for t in asyncio.all_tasks() if t is not current and not t.done()]
     if not pending:
         return
-    logger.debug("Draining %d pending task(s) from the MCP loop", len(pending))
+    logger.debug("Draining pending MCP loop tasks")
     for task in pending:
         task.cancel()
 
@@ -8147,14 +7854,11 @@ async def _drain_mcp_loop_tasks(
             task.exception()
         except asyncio.CancelledError:
             pass
-        except Exception as exc:
-            logger.debug("Pending MCP loop task ended during shutdown: %s", exc)
+        except Exception:
+            logger.debug("Pending MCP loop task failed during shutdown")
 
     if still_pending:
-        logger.warning(
-            "%d MCP loop task(s) still pending after %.1fs drain",
-            len(still_pending), timeout,
-        )
+        logger.warning("MCP loop tasks remain pending after drain")
 
 
 async def _drain_and_stop_mcp_loop() -> None:
@@ -8204,19 +7908,16 @@ def _stop_mcp_loop(*, only_if_idle: bool = False) -> bool:
                 try:
                     future.result(timeout=_MCP_LOOP_DRAIN_TIMEOUT + 1)
                 except TimeoutError:
-                    logger.warning(
-                        "Timed out waiting for MCP loop drain after %.1fs",
-                        _MCP_LOOP_DRAIN_TIMEOUT + 1,
-                    )
-                except BaseException as exc:
-                    logger.warning("Error draining MCP loop tasks: %s", exc)
+                    logger.warning("MCP event loop drain timed out")
+                except BaseException:
+                    logger.warning("MCP event loop drain failed")
         elif not loop.is_closed():
             try:
                 loop.run_until_complete(
                     _drain_mcp_loop_tasks(timeout=_MCP_LOOP_DRAIN_TIMEOUT)
                 )
-            except BaseException as exc:
-                logger.warning("Error draining stopped MCP loop tasks: %s", exc)
+            except BaseException:
+                logger.warning("MCP stopped event loop drain failed")
 
         if not stop_owned_by_loop and loop.is_running():
             loop.call_soon_threadsafe(loop.stop)
@@ -8226,8 +7927,8 @@ def _stop_mcp_loop(*, only_if_idle: bool = False) -> bool:
                 logger.warning("MCP event loop thread did not stop within 5.0s")
         try:
             loop.close()
-        except Exception as exc:
-            logger.warning("Unable to close MCP event loop cleanly: %s", exc)
+        except Exception:
+            logger.warning("MCP event loop close failed")
         # After closing the loop, any stdio subprocesses that survived the
         # graceful shutdown are now orphaned — include active PIDs too
         # since the loop is gone and no session can still be in flight.

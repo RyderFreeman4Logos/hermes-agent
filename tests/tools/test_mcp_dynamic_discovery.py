@@ -1,6 +1,7 @@
 """Tests for MCP dynamic tool discovery (notifications/tools/list_changed)."""
 
 import asyncio
+import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -74,6 +75,54 @@ class TestRefreshTools:
             assert "mcp__live_srv__new_tool" in mock_registry.get_all_tool_names()
             assert "mcp__live_srv__new_tool" in resolve_toolset("live_srv")
             assert server._registered_tool_names == ["mcp__live_srv__new_tool"]
+
+    def test_registry_readers_never_see_partial_refresh(self, mock_registry):
+        server = MCPServerTask("live_srv")
+        server._config = {}
+        mock_registry.register(
+            name="mcp__live_srv__old_tool", toolset="mcp-live_srv", schema={},
+            handler=lambda x: x, check_fn=lambda: True, is_async=False,
+            description="", emoji="",
+        )
+        server._registered_tool_names = ["mcp__live_srv__old_tool"]
+        server.session = SimpleNamespace(
+            list_tools=AsyncMock(
+                return_value=SimpleNamespace(tools=[_make_mcp_tool("new_tool")])
+            )
+        )
+
+        removed = threading.Event()
+        release = threading.Event()
+        observed = threading.Event()
+        snapshots = []
+        original_deregister = mock_registry.deregister
+
+        def blocking_deregister(name):
+            original_deregister(name)
+            removed.set()
+            assert release.wait(2)
+
+        def observe_registry():
+            assert removed.wait(2)
+            snapshots.append(set(mock_registry.get_all_tool_names()))
+            observed.set()
+
+        mock_registry.deregister = blocking_deregister
+        observer = threading.Thread(target=observe_registry)
+        refresher = threading.Thread(target=lambda: asyncio.run(server._refresh_tools()))
+        observer.start()
+        with patch("tools.registry.registry", mock_registry):
+            refresher.start()
+            assert removed.wait(2)
+            partial_read_completed = observed.wait(0.1)
+            release.set()
+            refresher.join(2)
+            observer.join(2)
+
+        assert not refresher.is_alive()
+        assert not observer.is_alive()
+        assert not partial_read_completed
+        assert snapshots == [{"mcp__live_srv__new_tool"}]
 
 
 class TestMessageHandler:

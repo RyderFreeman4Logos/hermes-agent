@@ -12,6 +12,9 @@ attributes are overwritten with the freshly-discovered tool set.
 
 from __future__ import annotations
 
+import asyncio
+import logging
+import threading
 from collections import OrderedDict
 from datetime import datetime
 from types import SimpleNamespace
@@ -174,3 +177,106 @@ async def test_reload_mcp_preserves_per_agent_toolset_overrides():
     assert captured_calls, "get_tool_definitions was never called to refresh the cache"
     assert captured_calls[0]["enabled_toolsets"] == ["safe"]
     assert captured_calls[0]["disabled_toolsets"] == ["terminal"]
+
+
+@pytest.mark.parametrize("warning_handler_raises", [False, True])
+@pytest.mark.asyncio
+async def test_reload_mcp_continues_after_later_cached_agent_refresh_fails(
+    warning_handler_raises,
+):
+    runner = _make_runner_with_cached_agents(num_agents=2)
+    first = runner._agent_cache["session-0"][0]
+    second = runner._agent_cache["session-1"][0]
+    first._tool_snapshot_generation = 0
+    second._tool_snapshot_generation = 0
+    fresh_tools = [
+        {"type": "function", "function": {"name": "fresh_tool", "description": "new"}}
+    ]
+    refresh_calls = 0
+    warning_seen = threading.Event()
+
+    class RefreshWarningHandler(logging.Handler):
+        def emit(self, record):
+            if record.getMessage() != "Cached agent MCP tool refresh failed":
+                return
+            warning_seen.set()
+            if warning_handler_raises:
+                raise RuntimeError("diagnostic handler failure")
+
+    def _build_tools(**_kwargs):
+        nonlocal refresh_calls
+        refresh_calls += 1
+        if refresh_calls == 2:
+            raise RuntimeError("pre-publication refresh failure marker")
+        return fresh_tools
+
+    gateway_logger = logging.getLogger("gateway.run")
+    handler = RefreshWarningHandler()
+    gateway_logger.addHandler(handler)
+    try:
+        with (
+            patch("tools.mcp_tool.shutdown_mcp_servers"),
+            patch("tools.mcp_tool.discover_mcp_tools", return_value=["fresh_tool"]),
+            patch.dict("tools.mcp_tool._servers", {"fresh-server": object()}, clear=True),
+            patch("model_tools.get_tool_definitions", side_effect=_build_tools),
+            patch("gateway.run.t", side_effect=lambda key, **_kwargs: key),
+        ):
+            result = await runner._execute_mcp_reload(_make_event())
+    finally:
+        gateway_logger.removeHandler(handler)
+
+    assert result != "gateway.reload_mcp.failed"
+    assert first.valid_tool_names == {"fresh_tool"}
+    assert first._tool_snapshot_generation == 1
+    assert second.valid_tool_names == {"stale_tool_1"}
+    assert second._tool_snapshot_generation == 0
+    assert warning_seen.is_set()
+
+
+@pytest.mark.asyncio
+async def test_reload_lock_repeated_cancellation_releases_eventual_acquisition():
+    class TrackingLock:
+        def __init__(self):
+            self._lock = threading.Lock()
+            self.waiter_entered = threading.Event()
+            self.waiter_acquired = threading.Event()
+            self.release_called = threading.Event()
+
+        def acquire(self):
+            self.waiter_entered.set()
+            acquired = self._lock.acquire()
+            self.waiter_acquired.set()
+            return acquired
+
+        def release(self):
+            self.release_called.set()
+            self._lock.release()
+
+        def locked(self):
+            return self._lock.locked()
+
+    runner = _make_runner_with_cached_agents(num_agents=0)
+    lock = TrackingLock()
+    lock._lock.acquire()
+    loop = asyncio.get_running_loop()
+
+    with patch("tools.mcp_tool._mcp_reload_lock", lock):
+        task = asyncio.create_task(runner._execute_mcp_reload(_make_event()))
+        assert await loop.run_in_executor(None, lock.waiter_entered.wait, 2)
+        task.cancel()
+        cancellation_processed = loop.create_future()
+        loop.call_soon(cancellation_processed.set_result, None)
+        await cancellation_processed
+        released_other_owner = lock.release_called.is_set()
+        task.cancel()
+        lock._lock.release()
+        assert await loop.run_in_executor(None, lock.waiter_acquired.wait, 2)
+        assert await loop.run_in_executor(None, lock.release_called.wait, 2)
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert not released_other_owner
+    assert lock.release_called.is_set()
+    assert not lock.locked()
+    assert lock._lock.acquire(blocking=False)
+    lock._lock.release()

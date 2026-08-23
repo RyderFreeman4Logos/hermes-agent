@@ -11,6 +11,8 @@ freezing any particular tool list.
 import threading
 import types
 
+import pytest
+
 from tools import mcp_tool
 
 
@@ -24,6 +26,7 @@ def _agent(tool_names, *, enabled=None, disabled=None):
     a.valid_tool_names = set(tool_names)
     a.enabled_toolsets = enabled
     a.disabled_toolsets = disabled
+    a._tool_snapshot_generation = 0
     return a
 
 
@@ -42,6 +45,43 @@ def test_refresh_adds_late_landing_tools(monkeypatch):
     assert added == {"mcp_granola_get_account_info"}
     assert "mcp_granola_get_account_info" in agent.valid_tool_names
     assert len(agent.tools) == 3
+
+
+def test_public_refresh_reinjection_failure_logs_are_static(monkeypatch):
+    from unittest.mock import MagicMock, patch
+
+    import model_tools
+    from tools import bot_mode_dm
+
+    marker = "reinject-credential-exception-marker"
+    agent = _agent(["old_tool"])
+    agent._memory_manager = types.SimpleNamespace(
+        get_all_tool_schemas=lambda: (_ for _ in ()).throw(RuntimeError(marker))
+    )
+    agent.context_compressor = types.SimpleNamespace(
+        get_tool_schemas=lambda: (_ for _ in ()).throw(RuntimeError(marker))
+    )
+    monkeypatch.setattr(model_tools, "get_tool_definitions", lambda **_kwargs: [_tool("new_tool")])
+    monkeypatch.setattr(
+        bot_mode_dm,
+        "ensure_message_agent_tool",
+        lambda _agent: (_ for _ in ()).throw(RuntimeError(marker)),
+    )
+    logger = MagicMock()
+
+    with patch.object(mcp_tool, "logger", logger):
+        assert mcp_tool.refresh_agent_mcp_tools(agent) == {"new_tool"}
+
+    assert agent.valid_tool_names == {"new_tool"}
+    assert agent._tool_snapshot_generation == 1
+    calls = [
+        call
+        for method in (logger.debug, logger.info, logger.warning, logger.error)
+        for call in method.call_args_list
+    ]
+    assert len(calls) == 3
+    assert all(len(call.args) == 1 and call.kwargs == {} for call in calls)
+    assert marker not in repr(calls)
 
 
 def test_refresh_preserves_memory_provider_and_context_engine_tools(monkeypatch):
@@ -201,6 +241,175 @@ def test_refresh_is_thread_safe_under_concurrent_calls(monkeypatch):
 
     assert not errors
     assert agent.valid_tool_names in ({"a", "b"}, {"a", "c"})
+
+
+def test_registry_change_during_slow_build_retries_without_stale_publish(monkeypatch):
+    from tools.registry import registry
+    import model_tools
+
+    agent = _agent(["old"])
+    entered = threading.Event()
+    release = threading.Event()
+    calls = 0
+    start_generation = registry._generation
+
+    def _build(**_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            entered.set()
+            assert release.wait(timeout=5)
+            return [_tool("stale")]
+        return [_tool("fresh")]
+
+    monkeypatch.setattr(model_tools, "get_tool_definitions", _build)
+    worker = threading.Thread(target=mcp_tool.refresh_agent_mcp_tools, args=(agent,))
+    worker.start()
+    assert entered.wait(timeout=2)
+    with registry._lock:
+        registry._generation += 1
+    release.set()
+    worker.join(timeout=5)
+    with registry._lock:
+        registry._generation = start_generation
+
+    assert not worker.is_alive()
+    assert agent.valid_tool_names == {"fresh"}
+    assert agent._tool_snapshot_generation == 1
+
+
+def test_agent_epoch_fences_aba_builder(monkeypatch):
+    import model_tools
+
+    agent = _agent(["old"])
+    entered = threading.Event()
+    release = threading.Event()
+    calls = 0
+
+    def _build(**_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            entered.set()
+            assert release.wait(timeout=5)
+            return [_tool("stale")]
+        return [_tool("winner")]
+
+    monkeypatch.setattr(model_tools, "get_tool_definitions", _build)
+    worker = threading.Thread(target=mcp_tool.refresh_agent_mcp_tools, args=(agent,))
+    worker.start()
+    assert entered.wait(timeout=2)
+    with mcp_tool._agent_tools_lock:
+        agent.tools = [_tool("winner")]
+        agent.valid_tool_names = {"winner"}
+        agent._tool_snapshot_generation += 2
+    release.set()
+    worker.join(timeout=5)
+
+    assert agent.valid_tool_names == {"winner"}
+    assert agent._tool_snapshot_generation == 3
+
+
+def test_same_name_schema_change_commits_and_invalidates(monkeypatch):
+    import model_tools
+
+    agent = _agent(["same"])
+    agent.tools[0]["function"]["description"] = "old"
+    invalidations = []
+    agent._invalidate_system_prompt = lambda: invalidations.append(True)
+    changed = _tool("same")
+    changed["function"]["description"] = "new"
+    monkeypatch.setattr(model_tools, "get_tool_definitions", lambda **_kw: [changed])
+
+    added = mcp_tool.refresh_agent_mcp_tools(agent)
+
+    assert added == set()
+    assert agent.tools[0]["function"]["description"] == "new"
+    assert invalidations == [True]
+    assert agent._tool_snapshot_generation == 1
+
+
+def test_invalidator_failure_does_not_fail_after_snapshot_publication(monkeypatch):
+    import model_tools
+
+    agent = _agent(["old"])
+    agent._invalidate_system_prompt = lambda: (_ for _ in ()).throw(
+        RuntimeError("secret invalidation failure")
+    )
+    monkeypatch.setattr(
+        model_tools, "get_tool_definitions", lambda **_kw: [_tool("new")]
+    )
+
+    assert mcp_tool.refresh_agent_mcp_tools(agent, raise_on_exhaustion=True) == {"new"}
+    assert agent.valid_tool_names == {"new"}
+    assert agent._tool_snapshot_generation == 1
+
+
+@pytest.mark.parametrize("failing_tail", ["history", "success_output"])
+def test_cli_post_refresh_tails_cannot_report_failure(monkeypatch, failing_tail):
+    import model_tools
+    from cli import HermesCLI
+
+    agent = _agent(["old"], enabled=[])
+    cli = object.__new__(HermesCLI)
+    cli.agent = agent
+    cli.enabled_toolsets = []
+    cli._command_running = True
+    printed = []
+
+    class _History(list):
+        def append(self, item):
+            if failing_tail == "history":
+                raise RuntimeError("conversation tail unavailable")
+            super().append(item)
+
+    def _print(message, *_args, **_kwargs):
+        if failing_tail == "success_output" and "Agent updated" in str(message):
+            raise BrokenPipeError("stdout unavailable")
+        printed.append(str(message))
+
+    cli.conversation_history = _History()
+    monkeypatch.setattr("builtins.print", _print)
+    monkeypatch.setattr(mcp_tool, "shutdown_mcp_servers", lambda: None)
+    monkeypatch.setattr(mcp_tool, "discover_mcp_tools", lambda: [])
+    monkeypatch.setattr(mcp_tool, "_servers", {})
+    monkeypatch.setattr(mcp_tool, "_lock", threading.Lock())
+    monkeypatch.setattr(model_tools, "_last_resolved_tool_names", ["old"])
+    monkeypatch.setattr(
+        model_tools, "get_tool_definitions", lambda **_kwargs: [_tool("new")]
+    )
+
+    cli._reload_mcp()
+
+    assert agent.valid_tool_names == {"new"}
+    assert agent._tool_snapshot_generation == 1
+    assert model_tools._last_resolved_tool_names == ["new"]
+    assert not any("MCP reload failed" in line for line in printed)
+
+
+def test_retry_exhaustion_publishes_nothing_and_keeps_compatibility_global(monkeypatch):
+    from tools.registry import registry
+    import model_tools
+
+    agent = _agent(["winner"])
+    model_tools._last_resolved_tool_names = ["winner"]
+    start_generation = registry._generation
+
+    def _always_stale(**_kwargs):
+        with registry._lock:
+            registry._generation += 1
+        return [_tool("loser")]
+
+    monkeypatch.setattr(model_tools, "get_tool_definitions", _always_stale)
+    try:
+        assert mcp_tool.refresh_agent_mcp_tools(agent) == set()
+    finally:
+        with registry._lock:
+            registry._generation = start_generation
+
+    assert agent.valid_tool_names == {"winner"}
+    assert agent._tool_snapshot_generation == 0
+    assert model_tools._last_resolved_tool_names == ["winner"]
 
 
 # ── discovery-wait bound (mcp_discovery_timeout config) ──────────────────────

@@ -537,7 +537,10 @@ def build_turn_context(
                 if has_registered_mcp_tools():
                     refresh_agent_mcp_tools(agent, quiet_mode=True)
     except Exception:
-        logger.debug("between-turns MCP tool refresh skipped", exc_info=True)
+        try:
+            logger.debug("between-turns MCP tool refresh skipped")
+        except Exception:
+            pass
 
     # Sanitize surrogate characters from user input.
     if isinstance(user_message, str):

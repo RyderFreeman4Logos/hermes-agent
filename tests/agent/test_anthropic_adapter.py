@@ -738,6 +738,40 @@ class TestConvertMessages:
         assert isinstance(system, list)
         assert system[0]["cache_control"] == {"type": "ephemeral"}
 
+    def test_system_entries_accumulate_after_cached_breakpoint(self):
+        kwargs = build_anthropic_kwargs(
+            model="claude-sonnet-4-20250514",
+            messages=[
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Stable system",
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                },
+                {"role": "user", "content": "Ping"},
+                {
+                    "role": "system",
+                    "content": "[Agent loop timing] Current loop start: now",
+                },
+            ],
+            tools=None,
+            max_tokens=4096,
+            reasoning_config=None,
+        )
+
+        assert kwargs["system"] == [
+            {
+                "type": "text",
+                "text": "Stable system",
+                "cache_control": {"type": "ephemeral"},
+            },
+            {"type": "text", "text": "[Agent loop timing] Current loop start: now"},
+        ]
+        assert "cache_control" not in kwargs["system"][1]
 
     def test_assistant_cache_control_blocks_are_preserved(self):
         messages = apply_anthropic_cache_control([

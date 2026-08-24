@@ -3644,6 +3644,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     # refused rather than allowed to land a stale turn in a session whose
     # compression is genuinely long-running or wedged.
     _COMPRESSION_BUSY_WAIT_S = 5.0
+    _COMPRESSION_LOCK_ACQUIRE_PATIENCE_S = 2.0
     _WRITE_RETRY_MIN_S = 0.020   # 20ms
     _WRITE_RETRY_MAX_S = 0.150   # 150ms
     _WRITE_RETRY_SLOW_AFTER_S = 2.0
@@ -4462,6 +4463,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self,
         fn: Callable[[sqlite3.Connection], T],
         patience_s: Optional[float] = None,
+        *,
+        recover_fts_errors: bool = True,
     ) -> T:
         """Execute a write transaction with BEGIN IMMEDIATE and jitter retry.
 
@@ -4485,6 +4488,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         millisecond contention and backs off to 250ms-1s once the lock has
         been held longer than ``_WRITE_RETRY_SLOW_AFTER_S``.
 
+        The remaining budget caps SQLite's busy handler on each attempt, so a
+        single ``BEGIN IMMEDIATE`` cannot overrun the wall-time deadline.
+        ``recover_fts_errors=False`` disables the generic derived-index repair
+        path for latency-sensitive writes such as compression-lock acquire.
+
         Returns whatever *fn* returns.
         """
         if patience_s is None:
@@ -4507,16 +4515,37 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         while True:
             try:
                 with self._lock:
-                    self._conn.execute("BEGIN IMMEDIATE")
+                    assert self._conn is not None
+                    previous_busy_timeout_ms = int(
+                        self._conn.execute("PRAGMA busy_timeout").fetchone()[0]
+                    )
+                    remaining_ms = max(
+                        0, int((deadline - time.monotonic()) * 1000)
+                    )
+                    self._conn.execute(
+                        f"PRAGMA busy_timeout={min(previous_busy_timeout_ms, remaining_ms)}"
+                    )
                     try:
-                        result = fn(self._conn)
-                        self._conn.commit()
-                    except BaseException:
+                        self._conn.execute("BEGIN IMMEDIATE")
                         try:
-                            self._conn.rollback()
-                        except Exception:
-                            pass
-                        raise
+                            result = fn(self._conn)
+                            self._conn.commit()
+                        except BaseException:
+                            try:
+                                self._conn.rollback()
+                            except Exception:
+                                pass
+                            raise
+                    finally:
+                        try:
+                            self._conn.execute(
+                                f"PRAGMA busy_timeout={previous_busy_timeout_ms}"
+                            )
+                        except sqlite3.Error:
+                            logger.debug(
+                                "failed to restore SQLite busy timeout",
+                                exc_info=True,
+                            )
                 # Success — periodic best-effort checkpoint + FTS merge.
                 self._write_count += 1
                 if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
@@ -4559,12 +4588,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         "a large WAL checkpoint, or an older pre-update "
                         "process; the database itself is healthy)"
                     ) from exc
-                if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
+                if recover_fts_errors and _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
                     continue
                 # Non-lock error or patience exhausted — propagate.
                 raise
             except sqlite3.DatabaseError as exc:
-                if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
+                if recover_fts_errors and _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
                     continue
                 # Corrupt FTS shadow tables make every write raise the
                 # malformed/corrupt error class through the FTS sync triggers
@@ -4573,9 +4602,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # same guarantee. First try the cheap in-place repair. If that
                 # one-shot path is unavailable or corruption recurs, detach the
                 # derived indexes and retry against the canonical tables.
-                if self._try_runtime_fts_rebuild(exc):
+                if recover_fts_errors and self._try_runtime_fts_rebuild(exc):
                     continue
-                if self._enter_fts_fail_open(exc):
+                if recover_fts_errors and self._enter_fts_fail_open(exc):
                     continue
                 raise
             except sqlite3.Error as exc:
@@ -4584,7 +4613,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 # subclass) or another sqlite3.Error class outside the two
                 # handlers above. Message-scoped: anything else propagates
                 # untouched.
-                if _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
+                if recover_fts_errors and _is_no_more_rows(exc) and self._sleep_before_write_retry(deadline, patience_s):
                     continue
                 raise
 
@@ -6938,10 +6967,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         """Try to atomically acquire the compression lock for ``session_id``.
 
         Returns ``True`` on success (caller now owns the lock and must
-        release via :meth:`release_compression_lock`).  Returns ``False``
-        if another holder already owns a non-expired lock — the caller
-        MUST NOT proceed with compression in that case (its rotation would
-        race against the holder's, splitting the session lineage).
+        release via :meth:`release_compression_lock`). Returns ``False``
+        if another holder owns a live lock or SQLite remains ``locked``/``busy``
+        through the lock-specific wall-time budget. Other SQLite failures
+        propagate so callers do not mistake corruption or schema errors for
+        transient contention.
 
         Expired locks (``expires_at < now``) are reclaimed transparently.
         Structured holders whose local ``pid=`` no longer exists are reclaimed
@@ -6999,7 +7029,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return acquired, reclaimed_holder
 
         try:
-            acquired, reclaimed_holder = self._execute_write(_do)
+            acquired, reclaimed_holder = self._execute_write(
+                _do,
+                patience_s=self._COMPRESSION_LOCK_ACQUIRE_PATIENCE_S,
+                recover_fts_errors=False,
+            )
             if reclaimed_holder:
                 logger.warning(
                     "Reclaimed stale compression lock for session=%s "
@@ -7008,13 +7042,15 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     reclaimed_holder,
                 )
             return bool(acquired)
-        except sqlite3.Error as exc:
-            logger.warning(
-                "try_acquire_compression_lock(%s) failed: %s",
-                session_id, exc,
+        except sqlite3.OperationalError as exc:
+            err_msg = str(exc).lower()
+            if "locked" not in err_msg and "busy" not in err_msg:
+                raise
+            logger.debug(
+                "try_acquire_compression_lock(%s) hit transient SQLite contention: %s",
+                session_id,
+                exc,
             )
-            # Fail open: returning False makes the caller skip compression,
-            # which is the safe behaviour when the lock subsystem is broken.
             return False
 
     def release_compression_lock(self, session_id: str, holder: str) -> None:

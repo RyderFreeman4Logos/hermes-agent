@@ -1594,6 +1594,8 @@ def _build_child_agent(
     # ACP transport overrides from trusted delegation config.
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
+    # Resolved delegation model-pool profile, used by child-runtime policy.
+    model_profile: Optional[str] = None,
     # Per-call role controlling whether the child can further delegate.
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
@@ -1996,6 +1998,9 @@ def _build_child_agent(
     child_session_ref["session_id"] = getattr(child, "session_id", "") or ""
     # Set delegation depth so children can't spawn grandchildren
     child._delegate_depth = child_depth
+    # Preserve the resolved model-pool tier for child-runtime retry policy.
+    child._delegate_model_profile = model_profile
+    child._delegate_has_successful_llm_request = False
     # Stash the post-degrade role for introspection (leaf if the
     # kill switch or depth bounded the caller's requested role).
     child._delegate_role = effective_role
@@ -3837,6 +3842,7 @@ def delegate_task(
             from tools.delegation_output_schema import append_output_contract
 
             _child_context = append_output_contract(_child_context, _task_schema)
+        task_profile = str(t.get("model_profile") or "").strip() or None
         try:
             child = _build_child_preserving_parent_tools(
                 task_index=i,
@@ -3857,6 +3863,7 @@ def delegate_task(
                 override_max_tokens=creds.get("max_output_tokens"),
                 override_acp_command=creds.get("command"),
                 override_acp_args=creds.get("args"),
+                model_profile=task_profile,
                 role=effective_role,
             )
         except ValueError as exc:

@@ -8553,6 +8553,7 @@ class AIAgent:
         durable_turn_lease_interrupt_message = None
         token = None
         acct_token = None
+        heartbeat_token = None
         task_started = False
         task_finished = False
         relay_outcome = "failed"
@@ -8852,11 +8853,13 @@ class AIAgent:
                 getattr(self, "session_id", None),
             )
             from agent.auxiliary_client import scoped_runtime_main
+            from tools.runtime_heartbeat import bind_agent_provider
 
             # The outer token restores the caller's Context even though turn setup
             # replaces the value with the live runtime after fallback restoration.
             # Keep the scope local instead of storing ContextVar tokens on the agent,
             # which may be observed from another thread.
+            heartbeat_token = bind_agent_provider(self)
             with bind_subagent_parent(self), scoped_runtime_main({}):
                 try:
                     if durable_turn_lease_thread is not None:
@@ -8917,6 +8920,10 @@ class AIAgent:
             raise
         finally:
             try:
+                if heartbeat_token is not None:
+                    from tools.runtime_heartbeat import reset_current_provider
+
+                    reset_current_provider(heartbeat_token)
                 if relay_turn is not None:
                     relay_runtime.SESSION_COORDINATOR.end_turn(
                         relay_turn,

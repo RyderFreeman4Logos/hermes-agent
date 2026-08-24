@@ -1949,5 +1949,28 @@ class TestFallbackModelInheritance(unittest.TestCase):
         self.assertIn("missing-acp-binary", str(ctx.exception))
 
 
+class TestStandardProfileAttached(unittest.TestCase):
+    """Standard-tier runtime policy flags must ride on delegate children."""
+
+    def test_standard_profile_is_attached_to_child_runtime(self):
+        parent = _make_mock_parent(depth=0)
+        with patch("run_agent.AIAgent") as MockAgent:
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="test standard profile attach",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+                model_profile="standard",
+            )
+        child = MockAgent.return_value
+        self.assertEqual(child._delegate_model_profile, "standard")
+        self.assertIs(child._delegate_has_successful_llm_request, False)
+
+
 if __name__ == "__main__":
     unittest.main()

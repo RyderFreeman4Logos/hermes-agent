@@ -3162,6 +3162,8 @@ def format_process_notification(evt: dict) -> "str | None":
     and watch disabled events from the unified completion_queue.
     """
     evt_type = evt.get("type", "completion")
+    if evt_type == "heartbeat":
+        return None
     _sid = evt.get("session_id", "unknown")
     _cmd = evt.get("command", "unknown")
     _attribution = _delegation_attribution_line(evt)

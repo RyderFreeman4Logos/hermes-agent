@@ -3298,6 +3298,21 @@ def terminal_tool(
             # For non-local backends: runs inside the sandbox via env.execute().
             from tools.process_registry import process_registry
 
+            heartbeat_interval = None
+            if notify_on_complete:
+                from tools.runtime_heartbeat import (
+                    HeartbeatConfigError,
+                    preflight_current_heartbeat,
+                )
+
+                try:
+                    heartbeat_interval = preflight_current_heartbeat()
+                except HeartbeatConfigError as exc:
+                    return json.dumps(
+                        {"output": "", "exit_code": -1, "error": str(exc)},
+                        ensure_ascii=False,
+                    )
+
             effective_cwd = _resolve_command_cwd(
                 workdir=workdir,
                 default_cwd=cwd,
@@ -3321,6 +3336,17 @@ def terminal_tool(
                         cwd=effective_cwd,
                         task_id=effective_task_id,
                         session_key=session_key,
+                    )
+
+                if heartbeat_interval is not None:
+                    from tools.runtime_heartbeat import inspect_process, runtime_heartbeat
+
+                    runtime_heartbeat.arm(
+                        proc_session.id,
+                        caller_id=session_key,
+                        kind="process",
+                        interval=heartbeat_interval,
+                        inspect=lambda _id=proc_session.id: inspect_process(_id),
                     )
 
                 result_data = {

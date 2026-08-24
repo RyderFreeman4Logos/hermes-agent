@@ -6450,9 +6450,10 @@ def test_run_prompt_submit_delivers_completion_observed_by_poll(monkeypatch, tmp
         process_registry._poll_observed.discard(event["session_id"])
 
 
-def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_threading(
+def test_run_prompt_submit_batches_post_turn_completions_with_real_threading(
     monkeypatch, tmp_path
 ):
+    """Post-turn drain coalesces multiple completions into one nested turn."""
     import queue as _queue_mod
 
     from tools.process_registry import process_registry
@@ -6507,28 +6508,17 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
         server._run_prompt_submit("rid-a", "sid_a", session, "session-a-turn")
 
         assert nested_started.wait(timeout=5)
-        threads[0].join(timeout=5)
-        assert not threads[0].is_alive()
-        # Membership, not order: the completion_queue is process-global, and
-        # notification pollers leaked by earlier session.init tests in this
-        # file legitimately steal-and-requeue foreign-session events (see
-        # _notification_poller_loop's belongs-elsewhere branch), rotating the
-        # queue. The requeue contract is that batch_2 and batch_3 both remain
-        # queued (never consumed) while batch_1's turn is in flight — so drain
-        # with a deadline (an event may be transiently held by a poller
-        # mid-cycle) and assert exactly {batch_2, batch_3} come back.
-        queued: dict = {}
-        deadline = time.time() + 5.0
-        while time.time() < deadline and set(queued) != {
-            "proc_batch_2",
-            "proc_batch_3",
-        }:
-            try:
-                evt = isolated_queue.get(timeout=0.1)
-            except _queue_mod.Empty:
-                continue
-            queued[evt["session_id"]] = evt
-        assert set(queued) == {"proc_batch_2", "proc_batch_3"}
+        # Nested batch turn is still in flight; queue should be empty (all claimed).
+        assert isolated_queue.empty()
+        assert any(
+            "proc_batch_1" in t and "proc_batch_2" in t and "proc_batch_3" in t
+            for t in turns[1:]
+        )
+        release_nested.set()
+        for thread in threads:
+            thread.join(timeout=5)
+        assert turns[0] == "session-a-turn"
+        assert len(turns) == 2
     finally:
         release_nested.set()
         for thread in threads:

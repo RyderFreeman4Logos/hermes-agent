@@ -11672,32 +11672,56 @@ def _run_prompt_submit(
                 owns_event=lambda e: _session_owns_notification_event(sid, session, e),
                 skip_poll_observed=False,
             )
-            for index, (_evt, synth) in enumerate(drained):
+            if drained:
                 with session["history_lock"]:
                     if session.get("running"):
-                        for pending_evt, _pending_synth in drained[index:]:
+                        for pending_evt, _pending_synth in drained:
                             process_registry.completion_queue.put(pending_evt)
-                        break
-                    session["running"] = True
-                from tools.async_delegation import (
-                    claim_event_delivery, complete_event_delivery, release_event_delivery,
-                )
-                _claim = claim_event_delivery(_evt, "tui-post-turn")
-                if _claim is None:
-                    continue
-                try:
-                    _emit("message.start", sid)
-                    _run_prompt_submit(rid, sid, session, synth)
-                    complete_event_delivery(_evt, _claim)
-                except Exception as _n_exc:
-                    release_event_delivery(_evt, _claim)
-                    print(
-                        f"[tui_gateway] completion notification dispatch failed: "
-                        f"{type(_n_exc).__name__}: {_n_exc}",
-                        file=sys.stderr,
+                        drained = []
+                    else:
+                        session["running"] = True
+                if drained:
+                    from tools.async_delegation import (
+                        claim_event_delivery,
+                        complete_event_delivery,
+                        release_event_delivery,
                     )
-                    with session["history_lock"]:
-                        session["running"] = False
+
+                    claimed: list[tuple[dict, str, str]] = []
+                    for pending_evt, pending_synth in drained:
+                        claim = claim_event_delivery(pending_evt, "tui-post-turn")
+                        if claim is None:
+                            process_registry.completion_queue.put(pending_evt)
+                            continue
+                        claimed.append((pending_evt, claim, pending_synth))
+                    if not claimed:
+                        with session["history_lock"]:
+                            session["running"] = False
+                    else:
+                        try:
+                            _emit("message.start", sid)
+                            _run_prompt_submit(
+                                rid,
+                                sid,
+                                session,
+                                "\n\n".join(
+                                    pending_synth
+                                    for _pending_evt, _claim, pending_synth in claimed
+                                ),
+                            )
+                            for pending_evt, claim, _pending_synth in claimed:
+                                complete_event_delivery(pending_evt, claim)
+                        except Exception as _n_exc:
+                            for pending_evt, claim, _pending_synth in claimed:
+                                release_event_delivery(pending_evt, claim)
+                                process_registry.completion_queue.put(pending_evt)
+                            print(
+                                f"[tui_gateway] completion notification dispatch failed: "
+                                f"{type(_n_exc).__name__}: {_n_exc}",
+                                file=sys.stderr,
+                            )
+                            with session["history_lock"]:
+                                session["running"] = False
         except Exception as _drain_exc:
             print(
                 f"[tui_gateway] completion queue drain failed: "

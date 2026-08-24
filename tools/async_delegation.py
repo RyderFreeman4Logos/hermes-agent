@@ -492,6 +492,10 @@ def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
 
 def claim_event_delivery(evt: Dict[str, Any], consumer: str) -> Optional[str]:
     """Claim a durable delegation event; non-durable events need no token."""
+    if evt.get("type") == "heartbeat":
+        from tools.runtime_heartbeat import runtime_heartbeat
+
+        return "" if runtime_heartbeat.is_event_current(evt) else None
     if evt.get("type") != "async_delegation":
         return ""
     delegation_id = str(evt.get("delegation_id") or "")
@@ -1131,6 +1135,13 @@ def dispatch_async_delegation_batch(
     runner admission remains off the foreground thread. If no runner takes
     ownership, ``on_not_started`` receives the terminal status exactly once.
     """
+    from tools.runtime_heartbeat import (
+        inspect_delegation,
+        preflight_current_heartbeat,
+        runtime_heartbeat,
+    )
+
+    heartbeat_interval = preflight_current_heartbeat()
     delegation_id = delegation_id or _new_delegation_id()
     dispatched_at = time.time()
     n = len(goals)
@@ -1213,6 +1224,13 @@ def dispatch_async_delegation_batch(
             "status": "rejected",
             "error": f"Failed to schedule async delegation batch: {exc}",
         }
+    runtime_heartbeat.arm(
+        delegation_id,
+        caller_id=session_key,
+        kind="delegation",
+        interval=heartbeat_interval,
+        inspect=lambda _id=delegation_id: inspect_delegation(_id),
+    )
     logger.info(
         "Dispatched async delegation batch %s (%d task(s), session_key=%s)",
         delegation_id, n, session_key or "<cli>",
@@ -1230,6 +1248,9 @@ def _finalize_batch(
     event_record, _interrupt_fn, on_not_started = claimed
 
     _invoke_not_started(on_not_started, status)
+    from tools.runtime_heartbeat import runtime_heartbeat
+
+    runtime_heartbeat.cancel(delegation_id)
     _push_batch_completion_event(event_record, combined, status)
     _finish_finalization(delegation_id, status)
 

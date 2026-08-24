@@ -14567,6 +14567,58 @@ def test_prompt_submit_surfaces_backend_error_as_visible_text(monkeypatch):
     assert "kimi-k2.6" in payload.get("text", "")
 
 
+def test_prompt_submit_sanitizes_codex_continuation_exhaustion(monkeypatch):
+    """Codex exhaustion is recoverable error text, not assistant prose."""
+    sentinel = "Codex response remained incomplete after 3 continuation attempts"
+
+    class _Agent:
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None, **_kwargs):
+            return {
+                "final_response": sentinel,
+                "messages": [],
+                "api_calls": 4,
+                "completed": False,
+                "partial": True,
+                "error": sentinel,
+            }
+
+    server._sessions["sid"] = _session(agent=_Agent())
+    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+
+    emitted: list[tuple[str, str, dict]] = []
+    monkeypatch.setattr(
+        server,
+        "_emit",
+        lambda event, sid, payload=None: emitted.append((event, sid, payload or {})),
+    )
+    monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
+    monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+
+    try:
+        server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {"session_id": "sid", "text": "hello"},
+            }
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+    complete_events = [e for e in emitted if e[0] == "message.complete"]
+    assert complete_events, "expected message.complete to be emitted"
+    payload = complete_events[-1][2]
+    assert payload["status"] == "error"
+    assert payload["recoverable"] is True
+    assert payload["error"] == sentinel
+    assert sentinel not in payload["text"]
+    assert payload["text"] == (
+        "The model produced no visible answer after 3 continuation attempts. "
+        "Try again, rephrase, or start a new turn with another model."
+    )
+
+
 def test_prompt_submit_preserves_empty_response_without_error(monkeypatch):
     """An empty final_response with NO backend error must stay empty — do not
     synthesize an error string. Preserves the existing None/empty-sentinel

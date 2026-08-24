@@ -6,6 +6,7 @@ import copy
 import hashlib
 import inspect
 import json
+import re
 import logging
 import os
 import queue
@@ -11292,6 +11293,22 @@ def _run_prompt_submit(
                     if result.get("interrupted")
                     else "error" if result.get("error") else "complete"
                 )
+                if result.get("partial") and result.get("error") and not (
+                    result.get("failed") or result.get("interrupted")
+                ):
+                    from gateway.run import _is_gateway_hidden_reasoning_incomplete_turn
+
+                    if _is_gateway_hidden_reasoning_incomplete_turn(result):
+                        continuation_match = re.fullmatch(
+                            r"Codex response remained incomplete after (\d+) continuation attempts",
+                            str(result.get("error")),
+                        )
+                        if continuation_match:
+                            raw = (
+                                "The model produced no visible answer after "
+                                f"{continuation_match.group(1)} continuation attempts. "
+                                "Try again, rephrase, or start a new turn with another model."
+                            )
                 # When the backend produced no visible response AND reported a
                 # real error (e.g. invalid model slug → provider 4xx), surface
                 # that error as the visible text instead of shipping an empty

@@ -33,6 +33,7 @@ from typing import Any, Callable, Optional
 
 from agent.codex_responses_adapter import _format_responses_error
 from agent.redact import redact_sensitive_text
+from agent.stream_payload_bound import StreamPayloadBoundExceeded
 from agent.transports.codex_app_server import (
     CodexAppServerClient,
     CodexAppServerError,
@@ -641,6 +642,8 @@ class CodexAppServerSession:
                     if self._on_event is not None:
                         try:
                             self._on_event(pending)
+                        except StreamPayloadBoundExceeded:
+                            raise
                         except Exception:  # pragma: no cover - display callback
                             logger.debug(
                                 "on_event callback raised", exc_info=True
@@ -689,6 +692,8 @@ class CodexAppServerSession:
             if self._on_event is not None:
                 try:
                     self._on_event(note)
+                except StreamPayloadBoundExceeded:
+                    raise
                 except Exception:  # pragma: no cover - display callback
                     logger.debug("on_event callback raised", exc_info=True)
 
@@ -921,6 +926,8 @@ class CodexAppServerSession:
             if self._on_event is not None:
                 try:
                     self._on_event(note)
+                except StreamPayloadBoundExceeded:
+                    raise
                 except Exception:  # pragma: no cover - display callback
                     logger.debug("on_event callback raised", exc_info=True)
 

@@ -34,6 +34,7 @@ from agent.error_classifier import (
     PROVIDER_STREAM_NON_JSON_ERROR_CODE,
 )
 from agent.errors import EmptyStreamError
+from agent.stream_payload_bound import StreamPayloadBoundExceeded
 from agent.turn_context import substitute_api_content
 from agent.gemini_native_adapter import is_native_gemini_base_url
 from agent.model_metadata import is_local_endpoint
@@ -4031,11 +4032,13 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     agent._fire_stream_delta(text)
                     deltas_were_sent["yes"] = True
                 return
-            if agent.stream_delta_callback:
-                for text in pending_parts:
+            for text in pending_parts:
+                agent._record_streamed_assistant_text(text)
+                if agent.stream_delta_callback:
                     try:
                         agent.stream_delta_callback(text)
-                        agent._record_streamed_assistant_text(text)
+                    except StreamPayloadBoundExceeded:
+                        raise
                     except Exception:
                         pass
 
@@ -4169,12 +4172,15 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 # reasoning display.  Non-reasoning text is harmlessly
                 # suppressed by the CLI's _stream_delta when the stream
                 # box is already closed (tool boundary flush).
-                elif agent.stream_delta_callback:
-                    try:
-                        agent.stream_delta_callback(delta_content)
-                        agent._record_streamed_assistant_text(delta_content)
-                    except Exception:
-                        pass
+                elif tool_calls_acc:
+                    agent._record_streamed_assistant_text(delta_content)
+                    if agent.stream_delta_callback:
+                        try:
+                            agent.stream_delta_callback(delta_content)
+                        except StreamPayloadBoundExceeded:
+                            raise
+                        except Exception:
+                            pass
 
             # Accumulate tool call deltas — notify display on first name
             delta_tool_calls = getattr(delta, "tool_calls", None)
@@ -4725,6 +4731,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         error=None,
                     )
                     return  # success
+                except StreamPayloadBoundExceeded as e:
+                    _emit_stream_end(final_text="", finished=False, error=str(e))
+                    _close_managed_stream()
+                    result["error"] = e
+                    return
                 except Exception as e:
                     _emit_stream_end(final_text="", finished=False, error=str(e))
                     _close_managed_stream()
@@ -4824,6 +4835,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                                 "\n\n⚠ Connection dropped mid tool-call; "
                                 "reconnecting…\n\n"
                             )
+                        except StreamPayloadBoundExceeded:
+                            raise
                         except Exception:
                             pass
                         # Reset the streamed-text buffer so the retry's
@@ -5231,6 +5244,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     if agent._interrupt_requested:
         raise InterruptedError("Agent interrupted during streaming API call (post-worker)")
     if result["error"] is not None:
+        if isinstance(result["error"], StreamPayloadBoundExceeded):
+            raise result["error"]
         if deltas_were_sent["yes"]:
             # Streaming failed AFTER some tokens were already delivered to
             # the platform.  Re-raising would let the outer retry loop make
@@ -5257,6 +5272,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 # Fire as streaming delta so the user sees it immediately.
                 try:
                     agent._fire_stream_delta(_warn)
+                except StreamPayloadBoundExceeded:
+                    raise
                 except Exception:
                     pass
                 logger.warning(

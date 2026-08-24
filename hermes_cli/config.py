@@ -2163,6 +2163,20 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
                     "Add: model: anthropic/claude-sonnet-4 (or another model)",
                 ))
 
+    # ── delegation.model_pool: non-empty pool requires explicit standard ──
+    delegation_cfg = config.get("delegation")
+    if isinstance(delegation_cfg, dict):
+        pool = delegation_cfg.get("model_pool")
+        if isinstance(pool, dict) and pool:
+            names = [str(name) for name in pool if str(name).strip()]
+            if "standard" not in names:
+                issues.append(ConfigIssue(
+                    "error",
+                    "delegation.model_pool is non-empty but has no 'standard' profile",
+                    "Add an explicit standard profile, or remove model_pool. "
+                    "YAML key order is not a routing default.",
+                ))
+
     # ── Check for fallback_model accidentally nested inside custom_providers ──
     if isinstance(cp, dict) and "fallback_model" not in config and "fallback_model" in (cp or {}):
         issues.append(ConfigIssue(

@@ -6195,6 +6195,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         require_compression_lease: bool = True,
         watermark: Optional[int] = None,
         watermark_ceiling: Optional[int] = None,
+        source_ids: Optional[List[int]] = None,
+        source_signature: Optional[str] = None,
     ) -> None:
         """Atomically close a parent and publish its durable compression child.
 
@@ -6217,6 +6219,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         The caller captures ``MAX(id)`` immediately BEFORE that flush; only
         rows in ``(watermark, watermark_ceiling]`` are foreign concurrent
         tail. ``None`` = unbounded (no internal flush happened).
+
+        When *source_signature* is supplied, it must match the complete active
+        pre-watermark durable source; a rewritten source aborts instead of
+        letting a stale summary publish over it. ``source_ids`` remains a
+        narrower compatibility check for direct callers.
         """
         def _do(conn):
             lock_row = conn.execute(
@@ -6232,6 +6239,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 raise CompressionSessionBusyError(
                     f"Compression lease lost before publication: {parent_session_id}"
                 )
+            self._assert_pre_watermark_source_unchanged(
+                conn,
+                parent_session_id,
+                watermark,
+                source_ids,
+                source_signature,
+            )
             parent = conn.execute(
                 """SELECT ended_at, cwd, git_branch, git_repo_root,
                           user_id, session_key, chat_id, chat_type,
@@ -10471,6 +10485,29 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             return cursor.fetchone() is not None
 
+    def get_active_message_source_snapshot(self, session_id: str) -> Tuple[int, str]:
+        """Atomically capture a compression watermark and durable source digest.
+
+        The single statement binds the ``MAX(id)`` watermark to every active
+        pre-watermark row it hashes, so a source rewrite cannot be admitted as
+        part of a later baseline. Rows appended after the watermark are excluded
+        when the digest is checked at publication.
+        """
+        if not session_id:
+            return 0, self._message_source_signature(())
+        with self._read_ctx() as conn:
+            rows = conn.execute(
+                "SELECT messages.*, MAX(id) OVER () AS _compression_watermark "
+                "FROM messages WHERE session_id = ? AND active = 1 ORDER BY id",
+                (session_id,),
+            ).fetchall()
+        if not rows:
+            return 0, self._message_source_signature(())
+        return (
+            int(rows[-1]["_compression_watermark"]),
+            self._message_source_signature(rows, skip_column="_compression_watermark"),
+        )
+
     def get_active_message_watermark(self, session_id: str) -> int:
         """MAX(id) of the session's active rows — the compression watermark.
 
@@ -10496,6 +10533,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         model_config_patch: Optional[Dict[str, Any]] = None,
         watermark: Optional[int] = None,
         lock_holder: Optional[str] = None,
+        source_ids: Optional[List[int]] = None,
+        source_signature: Optional[str] = None,
     ) -> int:
         """Non-destructive in-place compaction for a single durable session id.
 
@@ -10529,6 +10568,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         ``watermark=None`` preserves the historical archive-everything
         behavior.
 
+        When *source_signature* is supplied, it must match the complete active
+        pre-watermark durable source; a rewritten source aborts instead of
+        letting a stale summary publish over it. ``source_ids`` remains a
+        narrower compatibility check for direct callers.
+
         Commit-fence safety: when *lock_holder* is provided, the commit
         verifies INSIDE the transaction that the compression lock is still
         held by that holder and unexpired — a compression whose lease was
@@ -10557,6 +10601,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         f"Compression lease for {session_id!r} lost before "
                         "commit; refusing to publish a stale compaction"
                     )
+
+            self._assert_pre_watermark_source_unchanged(
+                conn,
+                session_id,
+                watermark,
+                source_ids,
+                source_signature,
+            )
 
             patched_model_config = None
             if model_config_patch is not None:
@@ -10640,6 +10692,69 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return inserted
 
         return self._execute_write(_do)
+
+    def _assert_pre_watermark_source_unchanged(
+        self,
+        conn,
+        session_id: str,
+        watermark: Optional[int],
+        source_ids: Optional[List[int]],
+        source_signature: Optional[str],
+    ) -> None:
+        if watermark is None:
+            return
+        if source_ids is not None:
+            current_ids = [
+                int(row[0])
+                for row in conn.execute(
+                    "SELECT id FROM messages WHERE session_id = ? AND active = 1 "
+                    "AND id <= ? ORDER BY id",
+                    (session_id, int(watermark)),
+                ).fetchall()
+            ]
+            if current_ids != source_ids:
+                raise SessionCompressionInProgressError(
+                    f"Compression source changed before publication: {session_id}"
+                )
+        if source_signature is not None and (
+            self._pre_watermark_source_signature(conn, session_id, watermark)
+            != source_signature
+        ):
+            raise SessionCompressionInProgressError(
+                f"Compression source changed before publication: {session_id}"
+            )
+
+    @staticmethod
+    def _message_source_signature(rows, skip_column: Optional[str] = None) -> str:
+        """Hash every durable message field with an unambiguous type boundary."""
+        digest = hashlib.sha256()
+        for row in rows:
+            for column in row.keys():
+                if column == skip_column:
+                    continue
+                value = row[column]
+                if isinstance(value, bytes):
+                    encoded = value
+                elif value is None:
+                    encoded = b""
+                else:
+                    encoded = str(value).encode("utf-8", "surrogatepass")
+                digest.update(column.encode("utf-8"))
+                digest.update(b"\0")
+                digest.update(type(value).__name__.encode("ascii"))
+                digest.update(len(encoded).to_bytes(8, "big"))
+                digest.update(encoded)
+        return digest.hexdigest()
+
+    def _pre_watermark_source_signature(
+        self, conn, session_id: str, watermark: int
+    ) -> str:
+        rows = conn.execute(
+            "SELECT * FROM messages WHERE session_id = ? AND active = 1 "
+            "AND id <= ? ORDER BY id",
+            (session_id, int(watermark)),
+        ).fetchall()
+        return self._message_source_signature(rows)
 
     def _message_column_names(self, conn) -> List[str]:
         """Column names of the messages table, cached per-connection era."""

@@ -385,6 +385,7 @@ class ProcessSession:
     detached: bool = False                      # True if recovered from crash (no pipe)
     pid_scope: str = "host"                     # "host" for local/PTY PIDs, "sandbox" for env-local PIDs
     systemd_unit: str = ""                      # transient scope unit name when spawned under systemd-run (#70716)
+    delegated_child: bool = False                # Spawned while delegate_task child context was active
     # Watcher/notification metadata (persisted for crash recovery)
     watcher_platform: str = ""
     watcher_chat_id: str = ""
@@ -996,6 +997,7 @@ class ProcessRegistry:
         # The rewriter wraps it to ``A && { B & }`` so no subshell fork.
         # Lazy import avoids circular dependency (terminal_tool imports this).
         from tools.terminal_tool import _rewrite_compound_background as _rewrite_bg
+        from agent.delegation_context import is_delegated_child_process_context
 
         safe_command = _rewrite_bg(command)
 
@@ -1006,6 +1008,7 @@ class ProcessRegistry:
             session_key=session_key,
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
             started_at=time.time(),
+            delegated_child=is_delegated_child_process_context(),
         )
 
         pty_scope_attempted = False
@@ -1229,6 +1232,8 @@ class ProcessRegistry:
         This is less capable than local spawn (no live stdout pipe, no stdin),
         but it ensures the command runs in the correct sandbox context.
         """
+        from agent.delegation_context import is_delegated_child_process_context
+
         session = ProcessSession(
             id=f"proc_{uuid.uuid4().hex[:12]}",
             command=command,
@@ -1238,6 +1243,7 @@ class ProcessRegistry:
             started_at=time.time(),
             env_ref=env,
             pid_scope="sandbox",
+            delegated_child=is_delegated_child_process_context(),
         )
 
         # Run the command in the sandbox with output capture
@@ -1584,6 +1590,7 @@ class ProcessRegistry:
                 "completion_reason": session.completion_reason,
                 "termination_source": session.termination_source,
                 "output": output_tail,
+                "delegated_child": session.delegated_child,
                 # Stable producer identity across checkpoint recovery; unlike
                 # a consumer-observed completion timestamp, this does not vary
                 # based on which watcher notices exit first.
@@ -1781,6 +1788,17 @@ class ProcessRegistry:
         """
         return session_id in self._completion_consumed or (
             skip_poll_observed and session_id in self._poll_observed
+        )
+
+    @staticmethod
+    def _is_routine_delegated_child_completion(evt: dict) -> bool:
+        """Whether a completed native-child command needs no parent turn."""
+        return (
+            evt.get("type") == "completion"
+            and evt.get("delegated_child") is True
+            and evt.get("exit_code") == 0
+            and evt.get("completion_reason", "exited") == "exited"
+            and not evt.get("termination_source")
         )
 
     def drain_notifications(
@@ -2709,6 +2727,7 @@ class ProcessRegistry:
                             "watcher_interval": s.watcher_interval,
                             "parent_session_id": s.parent_session_id,
                             "notify_on_complete": s.notify_on_complete,
+                            "delegated_child": s.delegated_child,
                             "watch_patterns": s.watch_patterns,
                         })
                 if extra_entries:
@@ -2806,6 +2825,7 @@ class ProcessRegistry:
                 watcher_interval=entry.get("watcher_interval", 0),
                 parent_session_id=entry.get("parent_session_id", ""),
                 notify_on_complete=entry.get("notify_on_complete", False),
+                delegated_child=entry.get("delegated_child", False),
                 watch_patterns=entry.get("watch_patterns", []),
             )
             with self._lock:
@@ -3091,6 +3111,9 @@ def format_process_notification(evt: dict) -> "str | None":
 
     if evt_type == "async_delegation":
         return _format_async_delegation(evt)
+
+    if ProcessRegistry._is_routine_delegated_child_completion(evt):
+        return None
 
     _exit = evt.get("exit_code", "?")
     _out = evt.get("output", "")

@@ -653,6 +653,141 @@ def test_non_stream_defers_logical_success_and_reuses_scope_for_retry(relay_turn
     assert turn.logical_llm_calls == {}
 
 
+def test_cache_scope_envelope_is_digested_then_removed_before_relay_and_provider(
+    relay_turn, monkeypatch, tmp_path
+):
+    relay, _turn = relay_turn
+    from agent import physical_attempt_diagnostics as diagnostics
+    from hermes_cli import config
+
+    sentinel = "ISSUE108-PRIVATE-CACHE-SCOPE"
+    monkeypatch.setattr(config, "read_raw_config_readonly", lambda: {
+        "observability": {"physical_attempt_digests": {"enabled": True}}
+    })
+    diagnostics._LAST_ATTEMPT.clear()
+    prepared = []
+    scope_digests = iter(("scope-one", "scope-two"))
+
+    def prepare_cache_scope(scope):
+        prepared.append(scope)
+        return {"digest": next(scope_digests)}
+
+    monkeypatch.setattr(diagnostics, "prepare_cache_scope", prepare_cache_scope)
+    relay_requests = []
+    provider_requests = []
+
+    def inspect_relay_request(name, request, annotated):
+        del name
+        relay_requests.append(request.content)
+        return relay.LLMRequestInterceptOutcome(request, annotated)
+
+    relay.intercepts.register_llm_request(
+        "hermes-test-cache-scope-envelope", 1, False, inspect_relay_request
+    )
+    try:
+        for loop, cache_key in ((1, f"{sentinel}-one"), (2, f"{sentinel}-two")):
+            relay_llm.execute(
+                {
+                    "model": "test-model",
+                    "messages": [{"role": "system", "content": "fixed"}],
+                    "prompt_cache_key": cache_key,
+                },
+                lambda request: provider_requests.append(request) or {"ok": True},
+                session_id="session-1",
+                name="test-provider",
+                model_name="test-model",
+                metadata={
+                    "api_mode": "chat_completions",
+                    "api_request_id": f"cache-scope:api:{loop}",
+                },
+            )
+    finally:
+        relay.intercepts.deregister_llm_request("hermes-test-cache-scope-envelope")
+
+    records = [
+        json.loads(line)
+        for line in (
+            tmp_path / "profile" / "observability" / "physical_attempt_digests.jsonl"
+        ).read_text().splitlines()
+    ]
+    attempts = [record for record in records if record["phase"] == "attempt"]
+    assert prepared == [f"{sentinel}-one", f"{sentinel}-two"]
+    assert attempts[0]["digests"]["cache_scope"] != attempts[1]["digests"]["cache_scope"]
+    assert all("_hermes_physical_attempt_cache_scope" not in request for request in relay_requests)
+    assert all("_hermes_physical_attempt_cache_scope" not in request for request in provider_requests)
+    assert sentinel not in json.dumps(records, sort_keys=True)
+
+
+def test_real_config_records_codex_input_history_through_relay(relay_turn, tmp_path):
+    from agent import physical_attempt_diagnostics as diagnostics
+
+    sentinel = "ISSUE170-PRIVATE-CODEX-HISTORY"
+    profile = tmp_path / "profile"
+    profile.mkdir(exist_ok=True)
+    (profile / "config.yaml").write_text(
+        "observability:\n  physical_attempt_digests:\n    enabled: true\n",
+        encoding="utf-8",
+    )
+    diagnostics._LAST_ATTEMPT.clear()
+    provider_requests = []
+
+    for loop, text in ((1, f"{sentinel}-old"), (2, f"{sentinel}-new")):
+        relay_llm.execute(
+            {
+                "model": "test-model",
+                "instructions": "fixed",
+                "input": [{"role": "user", "content": text}],
+                "tools": [],
+                "prompt_cache_key": "fixed",
+            },
+            lambda request: provider_requests.append(request) or {
+                "id": f"response-{loop}",
+                "object": "response",
+                "created_at": 0,
+                "status": "completed",
+                "model": "test-model",
+                "output": [],
+            },
+            session_id="session-1",
+            name="openai-codex",
+            model_name="test-model",
+            metadata={
+                "api_mode": "codex_responses",
+                "api_request_id": f"real-config:api:{loop}",
+            },
+        )
+
+    records = [
+        json.loads(line)
+        for line in (
+            profile / "observability" / "physical_attempt_digests.jsonl"
+        ).read_text(encoding="utf-8").splitlines()
+    ]
+    pair = next(record for record in records if record["phase"] == "pair")
+    assert len(provider_requests) == 2
+    assert pair["first_differing_segment"] == "later_history"
+    assert pair["equal"] == {
+        "cache_scope": True,
+        "later_history": False,
+        "prefix": True,
+        "tools": True,
+    }
+    assert sentinel not in json.dumps(records, sort_keys=True)
+
+
+def test_unrelated_extra_body_keeps_session_cache_scope_fallback(monkeypatch):
+    prepared = []
+    monkeypatch.setattr(
+        relay_llm.physical_attempt_diagnostics,
+        "prepare_cache_scope",
+        lambda scope: prepared.append(scope) or None,
+    )
+
+    request = {"extra_body": {"temperature": 0}}
+    assert relay_llm._request_with_cache_scope(request, "session-1") is request
+    assert prepared == ["session-1"]
+
+
 def test_non_stream_result_survives_logical_scope_close_failure(
     relay_turn, monkeypatch
 ):

@@ -3690,6 +3690,8 @@ DEFAULT_CONFIG = {
     "_config_version": 38,
 }
 
+DEFAULT_CONFIG.setdefault("observability", {})["physical_attempt_digests"] = {"enabled": False}
+
 # Optional environment variables that enhance functionality
 OPTIONAL_ENV_VARS = {
     # ── Provider (handled in provider selection, not shown in checklists) ──

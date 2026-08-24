@@ -5591,6 +5591,111 @@ def _get_usage(agent) -> dict:
     return usage
 
 
+def _cache_counter_snapshot(agent) -> dict[str, int | None]:
+    def count(name: str, *, optional: bool = False) -> int | None:
+        value = getattr(agent, name, None)
+        if value is None:
+            return None if optional else 0
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return None if optional else 0
+
+    return {
+        "calls": count("session_api_calls"),
+        "prompt_tokens": count("session_prompt_tokens"),
+        "read_tokens": count("session_cache_read_tokens", optional=True),
+        "write_tokens": count("session_cache_write_tokens", optional=True),
+    }
+
+
+def _cache_info_for_turn(agent, baseline: dict[str, int | None] | None) -> dict[str, int | str]:
+    current = _cache_counter_snapshot(agent)
+    if current["read_tokens"] is None or current["write_tokens"] is None:
+        return {"state": "unavailable", "pct": 0}
+    before = baseline or {key: 0 for key in current}
+    delta = {
+        key: max(0, int(current[key] or 0) - int(before.get(key, 0) or 0))
+        for key in current
+    }
+    prompt_tokens = delta["prompt_tokens"]
+    read_tokens = delta["read_tokens"]
+    write_tokens = delta["write_tokens"]
+    if delta["calls"] == 0 or prompt_tokens == 0:
+        return {"state": "unavailable", "pct": 0}
+    pct = round(100 * read_tokens / prompt_tokens)
+    state = "hit" if read_tokens else "cold_write" if write_tokens else "miss"
+    return {
+        "state": state,
+        "pct": pct,
+        "read_tokens": read_tokens,
+        "prompt_tokens": prompt_tokens,
+    }
+
+
+def _cache_status_text(info: dict[str, int | str]) -> str:
+    state = str(info.get("state") or "unavailable")
+    if state == "unavailable":
+        return "cache unavailable"
+    pct = int(info.get("pct") or 0)
+    label = "<1%" if pct == 0 and int(info.get("read_tokens") or 0) > 0 else f"{pct}%"
+    counts = ""
+    if "read_tokens" in info and "prompt_tokens" in info:
+        counts = f" {int(info['read_tokens'])}/{int(info['prompt_tokens'])}"
+    if state == "cold_write":
+        return f"cache COLD_WRITE{counts}"
+    return f"cache {label}{counts}"
+
+
+def _cache_info_from_first_call(record: Any) -> dict[str, int | str]:
+    if not isinstance(record, dict):
+        return {"state": "unavailable", "pct": 0}
+    info: dict[str, int | str] = {
+        "state": str(record.get("state") or "unavailable"),
+        "pct": int(record.get("pct") or 0),
+    }
+    for key in ("read_tokens", "prompt_tokens"):
+        if key in record:
+            try:
+                info[key] = max(0, int(record[key]))
+            except (TypeError, ValueError):
+                pass
+    if info["state"] == "no_field":
+        info["state"] = "unavailable"
+    return info
+
+
+def _stamp_loop_cache_info(sid: str, payload: dict) -> None:
+    if "cache_info" in payload:
+        return
+    session = _sessions.get(sid) or {}
+    agent = session.get("agent")
+    info = _cache_info_from_first_call(session.get("first_provider_response"))
+    if info["state"] == "unavailable" and agent is not None:
+        info = _cache_info_for_turn(agent, session.get("_cache_counter_baseline"))
+    session["first_provider_response"] = {
+        **info,
+        "owner": "tui_gateway",
+        "request_index": 1,
+        "timestamp": time.time(),
+        "session": hashlib.sha256(
+            f"{sid}:{getattr(agent, 'session_id', '')}".encode()
+        ).hexdigest(),
+    }
+    payload["cache_info"] = info
+    if not session.get("_cache_status_emitted"):
+        session["_cache_status_emitted"] = True
+        _emit(
+            "status.update",
+            sid,
+            {
+                "kind": "cache_hit",
+                "text": _cache_status_text(info),
+                "cache_record": session["first_provider_response"],
+            },
+        )
+
+
 def _probe_credentials(agent) -> str:
     """Light credential check at session creation — returns warning or ''.
 
@@ -8574,6 +8679,7 @@ def _emit_terminal_turn_error(
         rendered = ""
     if rendered:
         payload["rendered"] = rendered
+    _stamp_loop_cache_info(sid, payload)
     _retire_turn_marker(session)
     _emit("message.complete", sid, payload)
 
@@ -10761,6 +10867,9 @@ def _run_prompt_submit(
         if not isinstance(inflight, dict) or inflight.get("status") == "error":
             _start_inflight_turn(session, text)
         agent = session["agent"]
+        session["_cache_counter_baseline"] = _cache_counter_snapshot(agent)
+        session.pop("first_provider_response", None)
+        session["_cache_status_emitted"] = False
         if hasattr(agent, "clear_interrupt"):
             try:
                 agent.clear_interrupt()
@@ -11327,6 +11436,7 @@ def _run_prompt_submit(
                 payload["recoverable"] = True
                 if _error_surface:
                     payload["error_surface"] = _error_surface
+            _stamp_loop_cache_info(sid, payload)
             _retire_turn_marker(session, marker_key)
             _emit("message.complete", sid, payload)
 

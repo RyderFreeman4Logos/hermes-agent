@@ -8396,6 +8396,7 @@ class AIAgent:
             action=function_args.get("action"),
             subagent_id=function_args.get("subagent_id"),
             message=function_args.get("message"),
+            model_profile=function_args.get("model_profile"),
             parent_agent=self,
         )
 

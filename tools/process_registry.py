@@ -2085,8 +2085,9 @@ class ProcessRegistry:
             timeout: Max seconds to block. Falls back to TERMINAL_TIMEOUT config.
 
         Returns:
-            dict with status ("exited", "timeout", "interrupted", "not_found")
-            and output snapshot.
+            dict with status ("exited", "running", "timeout", "interrupted", "not_found")
+            and output snapshot. A running notified session returns immediately;
+            its completion is delivered through the existing notification queue.
         """
         from tools.ansi_strip import strip_ansi
         from tools.interrupt import is_interrupted as _is_interrupted
@@ -2122,6 +2123,21 @@ class ProcessRegistry:
         session = self.get(session_id)
         if session is None:
             return {"status": "not_found", "error": f"No process with ID {session_id}"}
+
+        if session.notify_on_complete and not session.exited:
+            return {
+                "status": "running",
+                "session_id": session.id,
+                "command": session.command,
+                "process_running": True,
+                "wait_deferred": True,
+                "notify_on_complete": True,
+                "note": (
+                    "process.wait was auto-backgrounded because notify_on_complete "
+                    "is set; continue other work and you will be notified exactly "
+                    "once when the process exits."
+                ),
+            }
 
         deadline = time.monotonic() + effective_timeout
 

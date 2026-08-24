@@ -22,6 +22,7 @@ import contextvars
 import json
 import logging
 import re
+import shutil
 
 logger = logging.getLogger(__name__)
 import os
@@ -907,9 +908,8 @@ def _get_max_async_children() -> int:
     DEPRECATED KNOB: ``delegation.max_async_children`` has been unified into
     ``delegation.max_concurrent_children`` — one cap governs both a single
     synchronous batch's parallelism and how many background delegation units
-    may run at once. When at capacity, a new async dispatch is REJECTED (not
-    queued) so a runaway model can't pile up unbounded background work; the
-    caller falls back to running the work synchronously.
+    may run at once. Additional top-level dispatches stay registered on the
+    background executor queue until worker capacity becomes available.
 
     A leftover ``max_async_children`` in config.yaml is ignored (the config
     migration removes it, folding a raised value into
@@ -3488,6 +3488,52 @@ def _finalize_child_results(
                 logger.debug("Subagent cost rollup failed", exc_info=True)
 
 
+def _finalize_unstarted_children(
+    children: List[tuple[int, Dict[str, Any], Any]],
+    parent_agent,
+    status: str,
+) -> None:
+    """Close prebuilt children and balance lifecycle when no runner starts."""
+    with _parent_finalization_lock(parent_agent):
+        try:
+            from hermes_cli.plugins import invoke_hook
+        except Exception:
+            invoke_hook = None
+
+        for _task_index, _task, child in children:
+            child_role = getattr(child, "_delegate_role", None)
+            try:
+                if hasattr(child, "close"):
+                    child.close()
+            except Exception:
+                logger.debug(
+                    "Failed to close unstarted delegation child", exc_info=True
+                )
+
+            if hasattr(parent_agent, "_active_children"):
+                try:
+                    parent_agent._active_children.remove(child)
+                except ValueError:
+                    pass
+
+            if invoke_hook is None:
+                continue
+            try:
+                invoke_hook(
+                    "subagent_stop",
+                    parent_session_id=getattr(parent_agent, "session_id", None),
+                    parent_turn_id=getattr(parent_agent, "_current_turn_id", "") or "",
+                    child_session_id=getattr(child, "session_id", None),
+                    child_role=child_role,
+                    child_summary=None,
+                    child_status=status,
+                    tool_call_history=[],
+                    duration_ms=0,
+                )
+            except Exception:
+                logger.debug("subagent_stop hook invocation failed", exc_info=True)
+
+
 def _run_child_lifecycle(
     task_index: int,
     goal: str,
@@ -3601,6 +3647,7 @@ def delegate_task(
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
     background: Optional[bool] = None,
+    force_background: Optional[bool] = None,
     output_schema: Optional[Dict[str, Any]] = None,
     action: Optional[str] = None,
     subagent_id: Optional[str] = None,
@@ -3664,6 +3711,9 @@ def delegate_task(
     # as one message once ALL children finish — the chat is not blocked while
     # they run.
     background = is_truthy_value(background, default=False) if background is not None else False
+    force_background = _resolve_force_background(force_background)
+    if force_background:
+        background = True
 
     # Depth limit — configurable via delegation.max_spawn_depth,
     # default 2 for parity with the original MAX_DEPTH constant.
@@ -3790,6 +3840,7 @@ def delegate_task(
     # live_paths is empty and delegation proceeds exactly as before.
     from tools.delegation_live_log import (
         create_live_transcripts,
+        live_transcript_root,
         update_manifest_statuses,
         wrap_progress_callback,
     )
@@ -4098,7 +4149,9 @@ def delegate_task(
             from gateway.session_context import async_delivery_supported
             _async_ok = async_delivery_supported()
         except Exception:
-            _async_ok = True
+            # force_background is a no-inline guarantee; an unknown delivery
+            # capability cannot safely fall back to the synchronous path.
+            _async_ok = not force_background
 
         _wake_sid = ""
         if not _async_ok:
@@ -4122,6 +4175,22 @@ def delegate_task(
                     _wake_sid,
                 )
                 _async_ok = True
+
+        if not _async_ok and force_background:
+            _finalize_unstarted_children(children, parent_agent, "error")
+            if live_deleg_id:
+                shutil.rmtree(live_transcript_root() / live_deleg_id, ignore_errors=True)
+            return json.dumps(
+                {
+                    "status": "rejected",
+                    "mode": "background",
+                    "error": (
+                        "delegation.force_background=true requires a durable async "
+                        "completion route; the child was not started."
+                    ),
+                },
+                ensure_ascii=False,
+            )
 
         if not _async_ok:
             logger.info(
@@ -4194,6 +4263,17 @@ def delegate_task(
                 except ValueError:
                     pass
 
+        _not_started_lock = threading.Lock()
+        _not_started_finalized = False
+
+        def _finalize_not_started(status: str) -> None:
+            nonlocal _not_started_finalized
+            with _not_started_lock:
+                if _not_started_finalized:
+                    return
+                _not_started_finalized = True
+            _finalize_unstarted_children(children, parent_agent, status)
+
         def _batch_runner():
             # This batch is detached from the foreground turn. Its lifecycle is
             # owned by the async registry and cancelled only via _batch_interrupt.
@@ -4255,6 +4335,7 @@ def delegate_task(
             parent_session_id=_parent_session_id,
             runner=_batch_runner,
             interrupt_fn=_batch_interrupt,
+            on_not_started=_finalize_not_started,
             max_async_children=_get_max_async_children(),
             # Reuse the live-transcript directory's id (when created) so the
             # returned delegation_id matches cache/delegation/live/<id>/.
@@ -4306,24 +4387,13 @@ def delegate_task(
                 )
             return json.dumps(payload, ensure_ascii=False)
 
-        # Pool at capacity / schedule failure — children are still attached
-        # (we detach above only on the parent list, but the async unit was
-        # never accepted, so re-attaching isn't needed: we just run inline).
-        logger.info(
-            "delegate_task: async pool at capacity (%s); running the whole "
-            "batch synchronously instead.",
-            dispatch.get("error", "rejected"),
-        )
-        _cap_result = _execute_and_aggregate()
-        if isinstance(_cap_result, dict):
-            _cap_result["note"] = (
-                "The background delegation pool was at capacity "
-                "(delegation.max_concurrent_children), so the subagent(s) ran "
-                "SYNCHRONOUSLY and the result is included above. Raise "
-                "delegation.max_concurrent_children in config.yaml to allow "
-                "more concurrent background delegations."
-            )
-        return json.dumps(_cap_result, ensure_ascii=False)
+        _finalize_not_started("error")
+        if live_deleg_id:
+            shutil.rmtree(live_transcript_root() / live_deleg_id, ignore_errors=True)
+
+        # A full backlog or submit failure is a scheduling error, not
+        # permission to occupy the foreground turn.
+        return tool_error(dispatch.get("error", "Failed to schedule delegation."))
 
     # ----- Synchronous path -----
     return json.dumps(_execute_and_aggregate(), ensure_ascii=False)
@@ -4878,7 +4948,22 @@ def _model_background_value(args: dict, parent_agent=None) -> bool:
     keep the historical synchronous default.
     """
     is_subagent = getattr(parent_agent, "_delegate_depth", 0) > 0
-    return not is_subagent
+    return _force_background_enabled() or not is_subagent
+
+
+def _resolve_force_background(explicit=None) -> bool:
+    """Use config by default; an explicit false opts out."""
+    if explicit is not None:
+        return is_truthy_value(explicit, default=False)
+    try:
+        return bool(_load_config().get("force_background", False))
+    except Exception:
+        return False
+
+
+def _force_background_enabled() -> bool:
+    """Return the configured no-inline guarantee for every delegation depth."""
+    return _resolve_force_background()
 
 
 _MODEL_HIDDEN_TASK_FIELDS = {"acp_command", "acp_args"}

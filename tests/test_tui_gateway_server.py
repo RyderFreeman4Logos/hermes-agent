@@ -19907,3 +19907,92 @@ def test_workspace_move_rehomes_running_session(monkeypatch, tmp_path):
     assert captured["row_update"] == (target, str(new_cwd))
     assert live["cwd"] == str(new_cwd)
     assert live.get("explicit_cwd") is True
+
+
+def test_cache_info_classifies_first_call_usage():
+    agent = types.SimpleNamespace(
+        session_api_calls=4,
+        session_prompt_tokens=4_000,
+        session_cache_read_tokens=3_480,
+        session_cache_write_tokens=0,
+    )
+    assert server._cache_info_for_turn(
+        agent,
+        {"calls": 3, "prompt_tokens": 0, "read_tokens": 0, "write_tokens": 0},
+    ) == {
+        "read_tokens": 3_480,
+        "prompt_tokens": 4_000,
+        "pct": 87,
+        "state": "hit",
+    }
+
+
+def test_cache_info_classifies_explicit_zero_cache_telemetry_as_miss():
+    agent = types.SimpleNamespace(
+        session_api_calls=1,
+        session_prompt_tokens=1_000,
+        session_cache_read_tokens=0,
+        session_cache_write_tokens=0,
+    )
+    assert server._cache_info_for_turn(agent, None) == {
+        "read_tokens": 0,
+        "prompt_tokens": 1_000,
+        "pct": 0,
+        "state": "miss",
+    }
+
+
+def test_cache_info_treats_absent_cache_telemetry_as_unavailable():
+    agent = types.SimpleNamespace(
+        session_api_calls=1,
+        session_prompt_tokens=1_000,
+    )
+    assert server._cache_info_for_turn(agent, None) == {"state": "unavailable", "pct": 0}
+
+
+def test_cache_status_preserves_positive_subpercent_and_cold_write():
+    assert server._cache_status_text(
+        {"state": "hit", "pct": 0, "read_tokens": 3, "prompt_tokens": 4_000}
+    ) == "cache <1% 3/4000"
+    assert server._cache_status_text(
+        {"state": "cold_write", "pct": 0, "read_tokens": 0, "prompt_tokens": 4_000}
+    ) == "cache COLD_WRITE 0/4000"
+
+
+def test_prompt_submit_message_complete_preserves_cache_provenance(monkeypatch):
+    agent = types.SimpleNamespace(
+        session_id="agent-session",
+        session_api_calls=2,
+        session_prompt_tokens=4_000,
+        session_cache_read_tokens=3_480,
+        session_cache_write_tokens=0,
+    )
+    session = {
+        "agent": agent,
+        "_cache_counter_baseline": {
+            "calls": 1,
+            "prompt_tokens": 0,
+            "read_tokens": 0,
+            "write_tokens": 0,
+        },
+        "_cache_status_emitted": False,
+    }
+    emitted = []
+    monkeypatch.setitem(server._sessions, "cache-telemetry", session)
+    monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+    payload = {}
+    server._stamp_loop_cache_info("cache-telemetry", payload)
+
+    assert payload["cache_info"] == {
+        "read_tokens": 3_480,
+        "prompt_tokens": 4_000,
+        "pct": 87,
+        "state": "hit",
+    }
+    assert emitted[0][0:2] == ("status.update", "cache-telemetry")
+    assert emitted[0][2]["text"] == "cache 87% 3480/4000"
+    record = emitted[0][2]["cache_record"]
+    assert record["owner"] == "tui_gateway"
+    assert record["request_index"] == 1
+    assert isinstance(record["session"], str) and len(record["session"]) == 64
+    assert isinstance(record["timestamp"], float)

@@ -1793,11 +1793,14 @@ class ProcessRegistry:
     @staticmethod
     def _is_routine_delegated_child_completion(evt: dict) -> bool:
         """Whether a completed native-child command needs no parent turn."""
+        exit_code = evt.get("exit_code")
         return (
             evt.get("type") == "completion"
             and evt.get("delegated_child") is True
             and evt.get("completion_reason", "exited") == "exited"
             and not evt.get("termination_source")
+            and type(exit_code) is int
+            and exit_code in (0, 1)
         )
 
     def drain_notifications(

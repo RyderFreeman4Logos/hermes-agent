@@ -84,6 +84,14 @@ class TestQuietModeCacheIsolation:
         model_tools.get_tool_definitions(quiet_mode=False)
         assert len(model_tools._tool_defs_cache) == 0
 
+    def test_staged_snapshot_build_does_not_publish_cache(self):
+        model_tools.get_tool_definitions(
+            enabled_toolsets=[],
+            quiet_mode=True,
+            _publish_resolved_names=False,
+        )
+        assert model_tools._tool_defs_cache == {}
+
     def test_concurrent_capacity_misses_evict_atomically(self, monkeypatch):
         """Two profile/toolset misses at capacity cannot race on eviction."""
         barrier = Barrier(2)

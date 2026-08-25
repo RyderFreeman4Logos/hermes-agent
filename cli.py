@@ -14075,39 +14075,39 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     enabled_override=enabled_override,
                     quiet_mode=True,
                 )
+            try:
                 # Keep the CLI's own list in sync with what the agent now uses.
                 if enabled_override is not None:
                     self.enabled_toolsets = enabled_override
 
-            # Inject a message at the END of conversation history so the
-            # model knows tools changed.  Appended after all existing
-            # messages to preserve prompt-cache for the prefix.
-            change_parts = []
-            if added:
-                change_parts.append(f"Added servers: {', '.join(sorted(added))}")
-            if removed:
-                change_parts.append(f"Removed servers: {', '.join(sorted(removed))}")
-            if reconnected:
-                change_parts.append(f"Reconnected servers: {', '.join(sorted(reconnected))}")
-            tool_summary = f"{len(new_tools)} MCP tool(s) now available" if new_tools else "No MCP tools available"
-            change_detail = ". ".join(change_parts) + ". " if change_parts else ""
-            self.conversation_history.append({
-                "role": "user",
-                "content": f"[IMPORTANT: MCP servers have been reloaded. {change_detail}{tool_summary}. The tool list for this conversation has been updated accordingly.]",
-            })
+                # Inject a message at the END of conversation history so the
+                # model knows tools changed.  Appended after all existing
+                # messages to preserve prompt-cache for the prefix.
+                change_parts = []
+                if added:
+                    change_parts.append(f"Added servers: {', '.join(sorted(added))}")
+                if removed:
+                    change_parts.append(f"Removed servers: {', '.join(sorted(removed))}")
+                if reconnected:
+                    change_parts.append(f"Reconnected servers: {', '.join(sorted(reconnected))}")
+                tool_summary = f"{len(new_tools)} MCP tool(s) now available" if new_tools else "No MCP tools available"
+                change_detail = ". ".join(change_parts) + ". " if change_parts else ""
+                self.conversation_history.append({
+                    "role": "user",
+                    "content": f"[IMPORTANT: MCP servers have been reloaded. {change_detail}{tool_summary}. The tool list for this conversation has been updated accordingly.]",
+                })
 
-            # Persist session immediately so the session log reflects the
-            # updated tools list (self.agent.tools was refreshed above).
-            if self.agent is not None:
-                try:
+                # Persist session immediately so the session log reflects the
+                # updated tools list (self.agent.tools was refreshed above).
+                if self.agent is not None:
                     self.agent._persist_session(
                         self.conversation_history,
                         self.conversation_history,
                     )
-                except Exception:
-                    pass  # Best-effort
 
-            print(f"  ✅ Agent updated — {len(self.agent.tools if self.agent else [])} tool(s) available")
+                print(f"  ✅ Agent updated — {len(self.agent.tools if self.agent else [])} tool(s) available")
+            except Exception:
+                pass  # Snapshot publication committed; notification/history tails are best-effort.
 
         except Exception as e:
             print(f"  ❌ MCP reload failed: {e}")

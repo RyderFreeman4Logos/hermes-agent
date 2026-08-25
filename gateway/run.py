@@ -62,6 +62,7 @@ from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.compaction_display import project_compaction_message_for_display
 from agent.i18n import t
 from agent.interrupt_compat import request_hard_interrupt
+from agent.memory_provider import persisted_memory_provider_mode
 from agent.turn_context import (
     compression_made_progress,
 )
@@ -5596,12 +5597,16 @@ class TurnRunner:
         # when the agent was cached; on mismatch, invalidate the cache
         # so a fresh agent re-reads from disk. (#45966)
         _current_msg_count = None
+        memory_provider_mode_override = None
         if self._runner._session_db is not None and ctx.session_id:
             try:
                 # run_sync is off-loop (executor); sync DB is fine.
                 _sess_row = self._runner._session_db._db.get_session(ctx.session_id)
                 if _sess_row:
                     _current_msg_count = _sess_row.get("message_count", 0)
+                    memory_provider_mode_override = persisted_memory_provider_mode(
+                        _sess_row
+                    )
             except Exception:
                 pass
 
@@ -5772,6 +5777,7 @@ class TurnRunner:
                 provider_sort=pr.get("sort"),
                 provider_require_parameters=pr.get("require_parameters", False),
                 provider_data_collection=pr.get("data_collection"),
+                memory_provider_mode_override=memory_provider_mode_override,
                 session_id=ctx.session_id,
                 platform=platform_key,
                 user_id=ctx.source.user_id,
@@ -23545,8 +23551,50 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         button, text reply, or has the confirm gate disabled.
         """
         loop = asyncio.get_running_loop()
+        _reload_lock = None
+        _reload_lock_acquired = False
         try:
-            from tools.mcp_tool import shutdown_mcp_servers, discover_mcp_tools, _servers, _lock
+            from tools.mcp_tool import (
+                _lock,
+                _mcp_reload_lock,
+                _servers,
+                discover_mcp_tools,
+                shutdown_mcp_servers,
+            )
+
+            _reload_lock = _mcp_reload_lock
+            _acquire_abandoned = False
+            _acquire_released = False
+
+            def _release_abandoned_acquire(acquire_future):
+                nonlocal _acquire_released
+                if (
+                    not _acquire_abandoned
+                    or _acquire_released
+                    or acquire_future.cancelled()
+                ):
+                    return
+                try:
+                    acquired = acquire_future.result()
+                except BaseException:
+                    return
+                if acquired:
+                    _acquire_released = True
+                    _reload_lock.release()
+
+            _acquire = loop.run_in_executor(None, _reload_lock.acquire)
+            _acquire.add_done_callback(_release_abandoned_acquire)
+            try:
+                await asyncio.shield(_acquire)
+                _reload_lock_acquired = True
+            except asyncio.CancelledError:
+                _acquire_abandoned = True
+                try:
+                    await asyncio.shield(_acquire)
+                except asyncio.CancelledError:
+                    pass
+                _release_abandoned_acquire(_acquire)
+                raise
 
             # Capture old server names before shutdown
             with _lock:
@@ -23591,13 +23639,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _cache_lock = getattr(self, "_agent_cache_lock", None)
                 if _cache_lock is not None and _cache:
                     with _cache_lock:
-                        for _sess_key, _entry in list(_cache.items()):
-                            try:
-                                _agent = _entry[0] if isinstance(_entry, tuple) else _entry
-                            except Exception:
-                                continue
-                            if _agent is None:
-                                continue
+                        _entries = list(_cache.values())
+                    for _entry in _entries:
+                        try:
+                            _agent = _entry[0] if isinstance(_entry, tuple) else _entry
+                        except Exception:
+                            continue
+                        if _agent is None:
+                            continue
                             # Preserve each cached agent's build-time toolset
                             # selection EXACTLY: a gateway session built with a
                             # restricted enabled_toolsets (e.g. ["safe"]) must
@@ -23607,12 +23656,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             # edit; gateway agents are per-session and may be
                             # deliberately locked down. (Contract is asserted by
                             # test_reload_mcp_preserves_per_agent_toolset_overrides.)
-                            refresh_agent_mcp_tools(_agent, quiet_mode=True)
-            except Exception as _exc:
-                logger.debug(
-                    "Failed to update cached agent tools after MCP reload: %s",
-                    _exc,
-                )
+                        try:
+                            refresh_agent_mcp_tools(
+                                _agent,
+                                quiet_mode=True,
+                                raise_on_exhaustion=True,
+                            )
+                        except Exception:
+                            try:
+                                logger.warning("Cached agent MCP tool refresh failed")
+                            except Exception:
+                                pass
+            except Exception:
+                pass
 
             # Inject a message at the END of the session history so the
             # model knows tools changed on its next turn.  Appended after
@@ -23640,9 +23696,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             return "\n".join(lines)
 
-        except Exception as e:
-            logger.warning("MCP reload failed: %s", e)
-            return t("gateway.reload_mcp.failed", error=e)
+        except Exception:
+            logger.warning("MCP reload failed")
+            return t("gateway.reload_mcp.failed", error="operation failed")
+        finally:
+            if _reload_lock is not None and _reload_lock_acquired:
+                _reload_lock.release()
 
 
 
@@ -30932,8 +30991,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         from tools.mcp_tool import discover_mcp_tools
         _loop = asyncio.get_running_loop()
         await _loop.run_in_executor(None, discover_mcp_tools)
-    except Exception as e:
-        logger.debug("MCP tool discovery failed: %s", e)
+    except Exception:
+        logger.debug("MCP tool discovery failed")
 
     # Start the gateway
     try:

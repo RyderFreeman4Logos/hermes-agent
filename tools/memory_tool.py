@@ -33,6 +33,7 @@ from pathlib import Path
 from hermes_constants import get_hermes_home
 from typing import Dict, Any, List, Optional, Tuple
 
+from agent.memory_provider import normalize_memory_provider_mode, normalize_memory_target
 from utils import atomic_write_text, is_truthy_value
 from tools.registry import no_cache_check_fn
 
@@ -56,6 +57,30 @@ logger = logging.getLogger(__name__)
 _memory_surface_flags: ContextVar[Optional[Tuple[bool, bool]]] = ContextVar(
     "memory_surface_flags", default=None
 )
+_memory_surface_mode: ContextVar[Optional[str]] = ContextVar(
+    "memory_surface_mode", default=None
+)
+
+
+@contextmanager
+def frozen_memory_surface(mode: str, flags: Tuple[bool, bool]):
+    """Freeze one agent's mode/store decision for a tool-definition pass."""
+    mode_token = _memory_surface_mode.set(
+        normalize_memory_provider_mode(mode) or "hybrid"
+    )
+    flags_token = _memory_surface_flags.set(flags)
+    try:
+        yield
+    finally:
+        _memory_surface_flags.reset(flags_token)
+        _memory_surface_mode.reset(mode_token)
+
+
+def memory_surface_cache_key() -> Optional[Tuple[str, Tuple[bool, bool]]]:
+    """Return the active session-owned tool-surface decision, if any."""
+    mode = _memory_surface_mode.get()
+    flags = _memory_surface_flags.get()
+    return (mode, flags) if mode is not None and flags is not None else None
 
 # Where memory files live — resolved dynamically so profile overrides
 # (HERMES_HOME env var changes) are always respected.  The old module-level
@@ -1125,6 +1150,7 @@ def memory_tool(
     target_error = _memory_target_error(store, target)
     if target_error is not None:
         return json.dumps(target_error)
+    target = normalize_memory_target(target)
 
     # --- Batch path -------------------------------------------------------
     if operations:
@@ -1204,25 +1230,55 @@ def get_builtin_memory_store_flags(config: Optional[Dict[str, Any]] = None) -> T
     )
 
 
+def get_memory_provider_mode(memory_config: Optional[Dict[str, Any]] = None) -> str:
+    """Resolve the frozen routing mode for a memory configuration."""
+    memory_config = memory_config if isinstance(memory_config, dict) else {}
+    if "provider_mode" in memory_config:
+        return normalize_memory_provider_mode(memory_config.get("provider_mode")) or "hybrid"
+    memory_enabled = is_truthy_value(memory_config.get("memory_enabled"), default=True)
+    user_profile_enabled = is_truthy_value(
+        memory_config.get("user_profile_enabled"), default=True
+    )
+    if (
+        str(memory_config.get("provider") or "").strip().lower() == "mempal"
+        and not memory_enabled
+        and not user_profile_enabled
+    ):
+        return "authoritative"
+    return "hybrid"
+
+
 @no_cache_check_fn
 def check_memory_requirements() -> bool:
-    """Snapshot store flags and report whether the built-in tool is available."""
+    """Expose the core memory tool for built-in or authoritative storage."""
+    frozen_mode = _memory_surface_mode.get()
+    frozen_flags = _memory_surface_flags.get()
+    if frozen_mode is not None and frozen_flags is not None:
+        return frozen_mode == "authoritative" or any(frozen_flags)
     _memory_surface_flags.set(None)
+    try:
+        from hermes_cli.config import load_config
+
+        memory_config = load_config().get("memory", {})
+    except Exception:
+        return False
     flags = get_builtin_memory_store_flags()
     _memory_surface_flags.set(flags)
-    return flags[0] or flags[1]
+    return get_memory_provider_mode(memory_config) == "authoritative" or any(flags)
 
 
 def _memory_target_error(store: "MemoryStore", target: str) -> Optional[Dict[str, Any]]:
     """Return a shared validation error for an invalid or disabled target."""
-    if target not in {"memory", "user"}:
+    target = normalize_memory_target(target)
+    if target is None:
         from tools.registry import _bound_error_text
 
         return {
             "success": False,
             "error": _bound_error_text(
-                f"Invalid memory target '{target}'. Use 'memory' or 'user'."
+                "Invalid memory target. Use 'memory' or 'user'."
             ),
+            "error_class": "invalid_target",
         }
     if store.target_enabled(target):
         return None
@@ -1245,6 +1301,7 @@ def apply_memory_pending(payload: Dict[str, Any], store: "MemoryStore") -> Dict[
     target_error = _memory_target_error(store, target)
     if target_error is not None:
         return target_error
+    target = normalize_memory_target(target)
     content = payload.get("content") or ""
     old_text = payload.get("old_text") or ""
     if action == "batch":
@@ -1347,7 +1404,11 @@ def _build_memory_schema_overrides() -> Dict[str, Any]:
 
     parameters = copy.deepcopy(MEMORY_SCHEMA["parameters"])
     target_schema = parameters["properties"]["target"]
-    target_schema["enum"] = targets
+    provider_mode = _memory_surface_mode.get()
+    if provider_mode is None:
+        provider_mode = get_memory_provider_mode(get_builtin_memory_config())
+    if targets or provider_mode != "authoritative":
+        target_schema["enum"] = targets
 
     description = MEMORY_SCHEMA["description"]
     if targets == ["memory"]:

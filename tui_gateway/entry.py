@@ -299,9 +299,7 @@ def wait_for_mcp_discovery(timeout: "float | None" = None) -> None:
             logger=logger, thread_name="tui-mcp-discovery"
         )
     except Exception:
-        logger.debug(
-            "TUI MCP discovery retry-spawn failed", exc_info=True
-        )
+        logger.debug("TUI MCP discovery retry-spawn failed")
     try:
         from hermes_cli.mcp_startup import (
             wait_for_mcp_discovery as _startup_wait,
@@ -413,9 +411,7 @@ def ensure_mcp_discovery_started() -> None:
             logger=logger, thread_name="tui-mcp-discovery"
         )
     except Exception:
-        logger.warning(
-            "Background MCP tool discovery failed to start", exc_info=True
-        )
+        logger.warning("Background MCP tool discovery failed to start")
 
 
 def main():

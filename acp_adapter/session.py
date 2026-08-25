@@ -9,6 +9,10 @@ history.
 from __future__ import annotations
 
 from hermes_constants import get_hermes_home
+from agent.memory_provider import (
+    normalize_memory_provider_mode,
+    persisted_memory_provider_mode,
+)
 
 import copy
 import json
@@ -24,6 +28,24 @@ from threading import Lock
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+
+def _session_memory_provider_mode(agent: Any) -> str | None:
+    init_config = getattr(agent, "_session_init_model_config", None)
+    if isinstance(init_config, dict) and "memory_provider_mode" in init_config:
+        return normalize_memory_provider_mode(init_config["memory_provider_mode"])
+    mode = getattr(agent, "_memory_provider_mode", None)
+    if hasattr(agent, "_memory_provider_mode"):
+        return normalize_memory_provider_mode(mode)
+    return None
+
+
+def _merge_session_memory_provider_mode(model_config: dict, agent: Any) -> dict:
+    merged = copy.deepcopy(model_config)
+    mode = _session_memory_provider_mode(agent)
+    if mode is not None:
+        merged["memory_provider_mode"] = mode
+    return merged
 
 
 def _translate_acp_cwd(cwd: str) -> str:
@@ -264,6 +286,7 @@ class SessionManager:
             session_id=new_id,
             cwd=cwd,
             model=original.model or None,
+            memory_provider_mode_override=_session_memory_provider_mode(original.agent),
         )
         state = SessionState(
             session_id=new_id,
@@ -442,22 +465,38 @@ class SessionManager:
             session_meta["base_url"] = base_url.strip()
         if isinstance(api_mode, str) and api_mode.strip():
             session_meta["api_mode"] = api_mode.strip()
-        cwd_json = json.dumps(session_meta)
 
         try:
             # Ensure the session record exists.
             existing = db.get_session(state.session_id)
+            existing_config = {}
+            if existing is not None:
+                raw_config = existing.get("model_config")
+                if isinstance(raw_config, dict):
+                    existing_config = raw_config
+                elif isinstance(raw_config, str):
+                    try:
+                        parsed = json.loads(raw_config)
+                        if isinstance(parsed, dict):
+                            existing_config = parsed
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+            model_config = _merge_session_memory_provider_mode(
+                {**existing_config, **session_meta}, state.agent
+            )
             if existing is None:
                 db.create_session(
                     session_id=state.session_id,
                     source="acp",
                     model=model_str,
-                    model_config={"cwd": state.cwd},
+                    model_config=model_config,
                 )
             else:
-                # Update model_config (contains cwd) if changed.
+                # Update model_config while preserving unrelated session metadata.
                 try:
-                    db.update_session_meta(state.session_id, cwd_json, model_str)
+                    db.update_session_meta(
+                        state.session_id, json.dumps(model_config), model_str
+                    )
                 except Exception:
                     logger.debug("Failed to update ACP session metadata", exc_info=True)
 
@@ -532,6 +571,7 @@ class SessionManager:
         requested_provider = row.get("billing_provider")
         restored_base_url = row.get("billing_base_url")
         restored_api_mode = None
+        memory_provider_mode = persisted_memory_provider_mode(row)
         mc = row.get("model_config")
         if mc:
             try:
@@ -541,6 +581,7 @@ class SessionManager:
                     requested_provider = meta.get("provider") or requested_provider
                     restored_base_url = meta.get("base_url") or restored_base_url
                     restored_api_mode = meta.get("api_mode") or restored_api_mode
+
             except (json.JSONDecodeError, TypeError):
                 pass
 
@@ -567,6 +608,7 @@ class SessionManager:
                 requested_provider=requested_provider,
                 base_url=restored_base_url,
                 api_mode=restored_api_mode,
+                memory_provider_mode_override=memory_provider_mode,
             )
         except Exception:
             logger.warning("Failed to recreate agent for ACP session %s", session_id, exc_info=True)
@@ -608,6 +650,7 @@ class SessionManager:
         requested_provider: str | None = None,
         base_url: str | None = None,
         api_mode: str | None = None,
+        memory_provider_mode_override: str | None = None,
     ):
         if self._agent_factory is not None:
             return self._agent_factory()
@@ -642,6 +685,7 @@ class SessionManager:
             "session_id": session_id,
             "session_db": self._get_db(),
             "model": model or default_model,
+            "memory_provider_mode_override": memory_provider_mode_override,
         }
 
         try:
@@ -682,7 +726,7 @@ class SessionManager:
                 thread_name="acp-mcp-discovery",
             )
         except Exception:
-            logger.debug("ACP: bounded MCP discovery wait failed", exc_info=True)
+            logger.debug("ACP bounded MCP discovery wait failed")
 
         agent = AIAgent(**kwargs)
         # Codex app-server sessions are spawned lazily on the first turn. Stamp

@@ -33,13 +33,65 @@ Optional hooks (override to opt in):
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+MEMORY_TARGETS = frozenset({"memory", "user"})
+MEMORY_PROVIDER_MODES = frozenset({"authoritative", "hybrid"})
+
+
+def normalize_memory_target(value: Any, *, default: str | None = "memory") -> str | None:
+    """Return a canonical memory target, rejecting coercible falsey values."""
+    if value is None:
+        return default
+    if isinstance(value, Enum):
+        value = value.value
+    return value if isinstance(value, str) and value in MEMORY_TARGETS else None
+
+
+def validate_memory_provider_mode(value: Any) -> str:
+    """Validate a user-admitted provider mode without coercing its type."""
+    if isinstance(value, str) and value in MEMORY_PROVIDER_MODES:
+        return value
+    raise ValueError("invalid memory provider mode")
+
+
+def normalize_memory_provider_mode(value: Any, *, default: str | None = "hybrid") -> str | None:
+    """Normalize persisted provider mode values to a safe fallback."""
+    try:
+        return validate_memory_provider_mode(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def persisted_memory_provider_mode(session_row: Any) -> str | None:
+    """Read one frozen mode from a durable session row."""
+    if not isinstance(session_row, dict):
+        return None
+    raw_config = session_row.get("model_config")
+    if raw_config in (None, ""):
+        return None
+    if isinstance(raw_config, dict):
+        config = raw_config
+    elif isinstance(raw_config, str):
+        try:
+            config = json.loads(raw_config)
+        except (TypeError, ValueError):
+            return "hybrid"
+        if not isinstance(config, dict):
+            return "hybrid"
+    else:
+        return "hybrid"
+    if "memory_provider_mode" not in config:
+        return None
+    return normalize_memory_provider_mode(config["memory_provider_mode"]) or "hybrid"
 
 # Default glyph for the deterministic memory indicators. Providers override
 # per-status with their own brand mark (e.g. Hindsight uses "👁️").
@@ -233,6 +285,16 @@ class MemoryProvider(ABC):
         Only called for tool names returned by get_tool_schemas().
         """
         raise NotImplementedError(f"Provider {self.name} does not handle tool {tool_name}")
+
+    def authoritative_memory_write(self, request: Dict[str, Any], **kwargs) -> str:
+        """Apply the core memory write atomically in the provider backend.
+
+        Providers must opt into authoritative CRUD explicitly; generic provider
+        tools are never treated as an equivalent write capability.
+        """
+        raise NotImplementedError(
+            f"Provider {self.name} does not implement authoritative memory writes"
+        )
 
     def shutdown(self) -> None:
         """Clean shutdown — flush queues, close connections."""

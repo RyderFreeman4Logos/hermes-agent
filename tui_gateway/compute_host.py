@@ -572,6 +572,7 @@ class ComputeHost:
                 model_override=frame.get("model_override"),
                 reasoning_config_override=frame.get("reasoning_config_override"),
                 service_tier_override=frame.get("service_tier_override"),
+                memory_provider_mode_override=frame.get("memory_provider_mode_override"),
                 platform_override=frame.get("source"),
                 session_db=session_db,
             )
@@ -637,6 +638,7 @@ class ComputeHost:
         session = server._sessions[sid]
         session["transport"] = self._transport
         session["profile_home"] = profile_home or session.get("profile_home")
+        server._persist_live_session_runtime(session)
         if isinstance(frame.get("attached_images"), list):
             session["attached_images"] = list(frame.get("attached_images") or [])
         if frame.get("model_override") is not None:
@@ -650,9 +652,22 @@ class ComputeHost:
             from tui_gateway import server
 
             resp = server.handle_request({"id": request_id, "method": "reload.mcp", "params": {"session_id": sid, "confirm": True}})
+        except Exception:
+            try:
+                self.emit(
+                    {
+                        "type": "control.error",
+                        "request_id": request_id,
+                        "message": "MCP reload failed",
+                    }
+                )
+            except Exception:
+                pass
+            return
+        try:
             self.emit({"type": "reload_mcp.ack", "sid": sid, "request_id": request_id, "response": resp})
-        except Exception as exc:
-            self.emit({"type": "control.error", "sid": sid, "request_id": request_id, "message": str(exc)})
+        except Exception:
+            pass
 
     def _handle_control(self, frame: dict[str, Any]) -> None:
         sid = str(frame.get("sid") or "")

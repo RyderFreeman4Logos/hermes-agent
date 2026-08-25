@@ -8,6 +8,7 @@ not inherit an empty/parent chain that retries the same exhausted model.
 from __future__ import annotations
 
 import json
+import logging
 import threading
 from unittest.mock import MagicMock, patch
 
@@ -251,6 +252,7 @@ class TestOmittedProfileUsesPoolDefault:
         assert "inherit" not in advertised
         assert "standard" in advertised
         assert "fail closed" in advertised.replace("-", " ")
+        assert "first" not in advertised
 
         payload, kwargs = _child_kwargs()
         assert "error" not in payload
@@ -269,7 +271,7 @@ class TestOmittedProfileUsesPoolDefault:
             "fb-four",
         ]
 
-    def test_omitted_profile_uses_first_pool_key_when_no_standard(self):
+    def test_omitted_profile_fails_when_standard_missing(self):
         cfg = {
             "max_iterations": 10,
             "model": "gpt-5.6-terra",
@@ -298,9 +300,60 @@ class TestOmittedProfileUsesPoolDefault:
         ):
             raw = delegate_task(goal="do work", parent_agent=parent)
         payload = json.loads(raw)
+        assert "error" in payload
+        err = payload["error"].lower()
+        assert "standard" in err
+        assert captured == {}
+
+    def test_missing_standard_is_order_independent(self):
+        def _run(pool):
+            cfg = {
+                "max_iterations": 10,
+                "model": "gpt-5.6-terra",
+                "provider": "openai-codex",
+                "model_pool": pool,
+            }
+            parent = _parent()
+            captured = {}
+
+            def _capture(**kwargs):
+                captured.update(kwargs)
+                child = MagicMock()
+                child.run_conversation.return_value = {
+                    "final_response": "ok",
+                    "completed": True,
+                    "api_calls": 1,
+                }
+                child.close = MagicMock()
+                return child
+
+            with patch("tools.delegate_tool._load_config", return_value=cfg), patch(
+                "run_agent.AIAgent", side_effect=_capture
+            ):
+                payload = json.loads(delegate_task(goal="do work", parent_agent=parent))
+            return payload, captured
+
+        a, captured_a = _run(
+            {"test": STANDARD_POOL["test"], "fast": STANDARD_POOL["standard"]}
+        )
+        b, captured_b = _run(
+            {"fast": STANDARD_POOL["standard"], "test": STANDARD_POOL["test"]}
+        )
+        assert "error" in a and "error" in b
+        assert captured_a == {} and captured_b == {}
+        assert "standard" in a["error"].lower()
+        assert "standard" in b["error"].lower()
+
+    def test_resolved_route_is_logged(self, caplog):
+        with caplog.at_level(logging.INFO, logger="tools.delegate_tool"):
+            payload, kwargs = _child_kwargs()
         assert "error" not in payload
-        assert captured["model"] == "tiny-test"
-        assert captured["provider"] == "custom"
+        text = caplog.text.lower()
+        assert "standard" in text
+        assert kwargs["model"].lower() in text
+        assert kwargs["provider"].lower() in text
+        assert "fb-one" in text
+        assert "reasoning" in text
 
 
 class TestSchemaIsTierNamesOnly:

@@ -3858,6 +3858,18 @@ def delegate_task(
             creds = _creds_for(task_profile)
         except ValueError as exc:
             return tool_error(str(exc))
+        resolved_profile = task_profile or (
+            "standard" if _model_pool(cfg) else None
+        )
+        logger.info(
+            "delegate_task: resolved profile=%s model=%s provider=%s "
+            "reasoning=%s fallback=%s",
+            resolved_profile,
+            creds.get("model"),
+            creds.get("provider"),
+            cfg.get("reasoning_effort") or "",
+            creds.get("fallback_chain"),
+        )
         try:
             child = _build_child_preserving_parent_tools(
                 task_index=i,
@@ -4449,9 +4461,7 @@ def _available_model_profile_names(cfg: Optional[dict] = None) -> List[str]:
 
 def _default_model_profile_name(cfg: dict) -> Optional[str]:
     names = _available_model_profile_names(cfg)
-    if not names:
-        return None
-    return "standard" if "standard" in names else names[0]
+    return "standard" if "standard" in names else None
 
 
 def _normalize_profile_fallback_chain(raw: Any) -> List[Dict[str, Any]]:
@@ -4481,7 +4491,11 @@ def _credentials_for_model_profile(
     if name is None:
         if pool:
             name = _default_model_profile_name(cfg)
-        if name is None:
+            if name is None:
+                raise ValueError(
+                    "Non-empty model_pool requires an explicit 'standard' profile."
+                )
+        else:
             creds = _resolve_delegation_credentials(cfg, parent_agent)
             creds.setdefault("fallback_chain", None)
             return creds
@@ -4751,8 +4765,8 @@ def _build_top_level_description() -> str:
         "- Leaf children (the default) cannot call delegate_task, clarify, "
         "memory, send_message, or cronjob; orchestrators regain only "
         "delegate_task.\n"
-        "- Omitted model_profile uses standard if present, else the first "
-        "tier. Unknown names fail closed; pool tiers supersede "
+        "- Omitted model_profile uses standard. Unknown names and a pool "
+        "without standard fail closed; pool tiers supersede "
         "delegation.provider/model. Results are an array, one per task."
     )
 
@@ -4827,8 +4841,8 @@ def _build_dynamic_schema_overrides() -> dict:
     profile_names = _available_model_profile_names()
     profile_prop = dict(overrides_params["properties"].get("model_profile") or {})
     profile_prop["description"] = (
-        "Named pool tier. Omitted uses standard if present, else the first "
-        "tier. Unknown names fail closed. Per-task value overrides this."
+        "Named pool tier. Omitted uses standard. Unknown names and a pool "
+        "without standard fail closed. Per-task value overrides this."
     )
     if profile_names:
         profile_prop["enum"] = profile_names
@@ -4945,8 +4959,8 @@ DELEGATE_TASK_SCHEMA = {
             "model_profile": {
                 "type": "string",
                 "description": (
-                    "Named pool tier. Omitted uses standard if present, "
-                    "else the first tier. Unknown names fail closed. "
+                    "Named pool tier. Omitted uses standard. Unknown "
+                    "names and a pool without standard fail closed. "
                     "Per-task value overrides this."
                 ),
             },

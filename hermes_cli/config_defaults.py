@@ -370,6 +370,13 @@ DEFAULT_CONFIG = {
         # ``false`` keeps the historical strict-provider behavior (Mistral,
         # Groq, Cerebras reject the field with HTTP 400).
         "reasoning_echo": False,
+        # UTF-8 byte caps for live streamed reasoning vs final assistant text.
+        # Overflow keeps the retained partial, stamps status stream_payload_limit,
+        # and leaves a continue path — it does not rewrite this host's yaml.
+        "stream_payload_limit": {
+            "assistant_bytes": 128 * 1024,
+            "reasoning_bytes": 128 * 1024,
+        },
     },
 
     "terminal": {

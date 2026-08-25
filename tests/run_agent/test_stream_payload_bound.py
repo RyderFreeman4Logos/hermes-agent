@@ -118,7 +118,8 @@ def test_oversize_stream_aborts_and_interrupt_does_not_leave_orphan():
     assert orphan not in first
     assert messages[-1]["role"] == "assistant"
     assert messages[-1]["content"] == first
-    assert len(first.encode("utf-8")) < DEFAULT_STREAM_PAYLOAD_BOUND_BYTES
+    assert messages[-1].get("status") == "stream_payload_limit"
+    assert len(first.encode("utf-8")) < 148_197
 
     # Rapid second interrupt (<10s) with a tiny/empty payload must not leave
     # the 148k orphan as the last transcript message.
@@ -127,7 +128,7 @@ def test_oversize_stream_aborts_and_interrupt_does_not_leave_orphan():
     last = messages[-1]
     assert last.get("role") == "assistant"
     assert orphan not in (last.get("content") or "")
-    assert len((last.get("content") or "").encode("utf-8")) < 1024
+    assert last.get("status") == "stream_payload_limit"
 
 
 def test_reasoning_then_visible_stream_bytes_are_monotonic():
@@ -282,3 +283,75 @@ def test_codex_app_server_compact_thread_propagates_stream_bound():
 
     with pytest.raises(StreamPayloadBoundExceeded, match="exceeded"):
         session.compact_thread(turn_timeout=1.0, notification_poll_timeout=0.01)
+
+
+def test_overflow_retains_partial_with_typed_stream_payload_limit():
+    """#195: overflow keeps the partial, stamps stream_payload_limit, continues."""
+    from agent.stream_payload_bound import (
+        StreamPayloadBoundExceeded,
+        persist_interrupted_stream_partial,
+        resolve_stream_payload_bounds,
+    )
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+    from run_agent import AIAgent
+
+    limits = (DEFAULT_CONFIG.get("agent") or {}).get("stream_payload_limit") or {}
+    assert limits.get("assistant_bytes") == 128 * 1024
+    assert limits.get("reasoning_bytes") == 128 * 1024
+    assistant_bound, reasoning_bound = resolve_stream_payload_bounds()
+    assert assistant_bound == limits["assistant_bytes"]
+    assert reasoning_bound == limits["reasoning_bytes"]
+
+    err = StreamPayloadBoundExceeded(200, 64)
+    assert err.status == "stream_payload_limit"
+
+    agent = AIAgent(
+        api_key="test-key",
+        base_url="https://example.com/v1",
+        model="test/model",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    agent._claim_stream_writer()
+    partial = "kept-partial"
+    agent._current_streamed_assistant_text = partial
+    messages = [{"role": "user", "content": "go"}]
+    first = persist_interrupted_stream_partial(
+        agent, messages, elapsed=1.0, exceeded=True, size=200, bound=64
+    )
+    assert partial in first
+    last = messages[-1]
+    assert last.get("role") == "assistant"
+    assert last.get("content") == first
+    assert last.get("status") == "stream_payload_limit"
+    assert "continue" in first.lower()
+
+
+def test_reasoning_bound_is_independent_of_assistant_bound(monkeypatch):
+    """#195: reasoning vs final overflow use separate configurable byte caps."""
+    from agent.stream_payload_bound import StreamPayloadBoundExceeded
+    from run_agent import AIAgent
+
+    monkeypatch.setattr(
+        "agent.stream_payload_bound.resolve_stream_payload_bounds",
+        lambda: (20, 80),
+    )
+    agent = AIAgent(
+        api_key="test-key",
+        base_url="https://example.com/v1",
+        model="test/model",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    agent._claim_stream_writer()
+    agent._fire_reasoning_delta("r" * 50)
+    assert agent._current_streamed_payload_bytes == 50
+    with pytest.raises(StreamPayloadBoundExceeded) as ei:
+        agent._record_streamed_assistant_text("v" * 21)
+    assert ei.value.status == "stream_payload_limit"
+    assert agent._current_streamed_assistant_text == ""
+    with pytest.raises(StreamPayloadBoundExceeded) as ei2:
+        agent._fire_reasoning_delta("r" * 31)
+    assert ei2.value.status == "stream_payload_limit"

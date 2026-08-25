@@ -6627,6 +6627,7 @@ class AIAgent:
                 self._record_streamed_assistant_text(tail)
         self._current_streamed_assistant_text = ""
         self._current_streamed_payload_bytes = 0
+        self._current_streamed_reasoning_bytes = 0
 
     def _record_streamed_assistant_text(self, text: str) -> None:
         """Accumulate visible assistant text emitted through stream callbacks."""
@@ -6638,19 +6639,29 @@ class AIAgent:
             return
         if isinstance(text, str) and text:
             from agent.stream_payload_bound import (
-                DEFAULT_STREAM_PAYLOAD_BOUND_BYTES,
                 accumulate_stream_text,
+                resolve_stream_payload_bounds,
                 streamed_payload_bytes,
                 StreamPayloadBoundExceeded,
             )
 
+            assistant_bound, reasoning_bound = resolve_stream_payload_bounds()
+            aggregate_bound = max(assistant_bound, reasoning_bound)
+            delta = streamed_payload_bytes(text)
             current_bytes = int(getattr(self, "_current_streamed_payload_bytes", 0) or 0)
-            next_bytes = current_bytes + streamed_payload_bytes(text)
-            if next_bytes > DEFAULT_STREAM_PAYLOAD_BOUND_BYTES:
-                raise StreamPayloadBoundExceeded(next_bytes)
+            next_assistant = streamed_payload_bytes(
+                getattr(self, "_current_streamed_assistant_text", "") or ""
+            ) + delta
+            next_bytes = current_bytes + delta
+            if next_assistant > assistant_bound or next_bytes > aggregate_bound:
+                raise StreamPayloadBoundExceeded(
+                    next_assistant if next_assistant > assistant_bound else next_bytes,
+                    assistant_bound if next_assistant > assistant_bound else aggregate_bound,
+                )
             self._current_streamed_assistant_text = accumulate_stream_text(
                 getattr(self, "_current_streamed_assistant_text", "") or "",
                 text,
+                bound=assistant_bound,
             )
             self._current_streamed_payload_bytes = next_bytes
 
@@ -7039,14 +7050,21 @@ class AIAgent:
             return
         if isinstance(text, str) and text:
             from agent.stream_payload_bound import (
-                DEFAULT_STREAM_PAYLOAD_BOUND_BYTES,
+                resolve_stream_payload_bounds,
                 streamed_payload_bytes,
             )
 
-            nxt = int(getattr(self, "_current_streamed_payload_bytes", 0) or 0)
-            nxt += streamed_payload_bytes(text)
-            if nxt > DEFAULT_STREAM_PAYLOAD_BOUND_BYTES:
-                raise StreamPayloadBoundExceeded(nxt)
+            assistant_bound, reasoning_bound = resolve_stream_payload_bounds()
+            aggregate_bound = max(assistant_bound, reasoning_bound)
+            delta = streamed_payload_bytes(text)
+            nxt_reason = int(getattr(self, "_current_streamed_reasoning_bytes", 0) or 0) + delta
+            nxt = int(getattr(self, "_current_streamed_payload_bytes", 0) or 0) + delta
+            if nxt_reason > reasoning_bound or nxt > aggregate_bound:
+                raise StreamPayloadBoundExceeded(
+                    nxt_reason if nxt_reason > reasoning_bound else nxt,
+                    reasoning_bound if nxt_reason > reasoning_bound else aggregate_bound,
+                )
+            self._current_streamed_reasoning_bytes = nxt_reason
             self._current_streamed_payload_bytes = nxt
         cb = self.reasoning_callback
         if cb is not None:

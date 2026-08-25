@@ -1088,6 +1088,7 @@ def init_agent(
     # assistant message.
     agent._current_streamed_assistant_text = ""
     agent._current_streamed_payload_bytes = 0
+    agent._current_streamed_reasoning_bytes = 0
     # Completed interim messages delivered during the current user turn.
     # Unlike token-stream tracking, this spans Codex continuation/tool calls so
     # repeated commentary is not re-sent before normalization can deduplicate it.

@@ -39,6 +39,10 @@ from agent.context_engine import automatic_compaction_status_message
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.message_metadata import append_message
+from agent.stream_payload_bound import (
+    StreamPayloadBoundExceeded,
+    persist_interrupted_stream_partial,
+)
 from agent.turn_context import (
     _compression_warrants_another_preflight_pass,
     build_turn_context,
@@ -1942,6 +1946,7 @@ def run_conversation(
     api_call_count = 0
     final_response = None
     interrupted = False
+    stream_payload_limited = False
     failed = False
     codex_ack_continuations = 0
     length_continue_retries = 0
@@ -4510,14 +4515,31 @@ def run_conversation(
                 # record of the half-finished reply on screen, so the next turn
                 # the model "forgets" what it just said — exactly what users hit
                 # when they stop to redirect mid-response.
-                _partial = agent._strip_think_blocks(
-                    getattr(agent, "_current_streamed_assistant_text", "") or ""
-                ).strip()
-                if _partial:
-                    append_message(messages, {"role": "assistant", "content": _partial})
-                    final_response = _partial
-                else:
-                    final_response = f"{INTERRUPT_WAITING_FOR_MODEL_PREFIX}{api_elapsed:.1f}s elapsed)."
+                # Oversize thinking/stream payloads must not stay as the last
+                # assistant row when the user mashes interrupt (#119).
+                final_response = persist_interrupted_stream_partial(
+                    agent, messages, elapsed=api_elapsed
+                )
+                agent._persist_session(messages, conversation_history)
+                break
+
+            except StreamPayloadBoundExceeded as api_error:
+                if thinking_spinner:
+                    thinking_spinner.stop("")
+                    thinking_spinner = None
+                if agent.thinking_callback:
+                    agent.thinking_callback("")
+                stream_payload_limited = True
+                _turn_exit_reason = "stream_payload_limit"
+                final_response = persist_interrupted_stream_partial(
+                    agent,
+                    messages,
+                    elapsed=time.time() - api_start_time,
+                    exceeded=True,
+                    size=getattr(api_error, "size", 0),
+                    bound=getattr(api_error, "bound", None),
+                )
+                agent._vprint(f"{agent.log_prefix}⚠ {final_response}", force=True)
                 agent._persist_session(messages, conversation_history)
                 break
 
@@ -6789,8 +6811,11 @@ def run_conversation(
             continue
 
         # If the API call was interrupted, skip response processing
+        if stream_payload_limited:
+            break
         if interrupted:
-            _turn_exit_reason = "interrupted_during_api_call"
+            if _turn_exit_reason != "stream_payload_bound_exceeded":
+                _turn_exit_reason = "interrupted_during_api_call"
             break
 
         if _retry.restart_with_compressed_messages:

@@ -22,6 +22,11 @@ import time
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
 
+from agent.stream_payload_bound import (
+    STREAM_PAYLOAD_LIMIT_STATUS,
+    StreamPayloadBoundExceeded,
+    persist_interrupted_stream_partial,
+)
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 
 logger = logging.getLogger(__name__)
@@ -543,7 +548,7 @@ def _codex_item_completion_payload(item: dict) -> tuple[str, bool]:
     return "", False
 
 
-def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
+def make_codex_app_server_event_bridge(agent) -> Callable[[dict], Any]:
     """Build an ``on_event`` callback that wires codex app-server JSON-RPC
     notifications into Hermes' gateway UI callbacks.
 
@@ -658,34 +663,43 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
                     "tool_complete_callback raised for %s", name, exc_info=True,
                 )
 
-    def _fire_text_delta(params: dict) -> None:
+    def _fire_text_delta(params: dict):
         text = params.get("delta") or params.get("text") or ""
         if not isinstance(text, str) or not text:
-            return
+            return None
         fn = getattr(agent, "_fire_stream_delta", None)
         if fn is None:
-            return
+            return None
         try:
-            fn(text)
+            return fn(text)
+        except StreamPayloadBoundExceeded:
+            raise
         except Exception:
             logger.debug("_fire_stream_delta raised", exc_info=True)
+            return None
 
-    def _fire_reasoning_delta(params: dict) -> None:
+    def _fire_reasoning_delta(params: dict):
         text = params.get("delta") or params.get("text") or ""
         if not isinstance(text, str) or not text:
-            return
+            return None
         fn = getattr(agent, "_fire_reasoning_delta", None)
         if fn is None:
-            return
+            return None
         try:
-            fn(text)
+            return fn(text)
+        except StreamPayloadBoundExceeded:
+            raise
         except Exception:
             logger.debug("_fire_reasoning_delta raised", exc_info=True)
+            return None
 
-    def _fire_agent_message_completed(item: dict) -> None:
+    def _fire_agent_message_completed(item: dict):
+        limit_error = getattr(agent, "_stream_payload_limit_error", None)
+        if isinstance(limit_error, StreamPayloadBoundExceeded):
+            return limit_error
         text = item.get("text") or ""
         if not isinstance(text, str) or not text.strip():
-            return
+            return None
         # display.show_commentary=false — mid-turn narration stays off the
         # visible interim path on this runtime too (same contract as the
         # codex_responses commentary channel).
@@ -701,7 +715,7 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
                 "_emit_interim_assistant_message raised", exc_info=True,
             )
 
-    def on_event(note: dict) -> None:
+    def on_event(note: dict):
         if not isinstance(note, dict):
             return
         method = note.get("method") or ""
@@ -709,11 +723,9 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         if not isinstance(params, dict):
             params = {}
         if method == "item/agentMessage/delta":
-            _fire_text_delta(params)
-            return
+            return _fire_text_delta(params)
         if method in {"item/reasoning/delta", "item/reasoning/summaryDelta"}:
-            _fire_reasoning_delta(params)
-            return
+            return _fire_reasoning_delta(params)
         item = params.get("item")
         if not isinstance(item, dict):
             return
@@ -725,7 +737,7 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
             if item_type in _CODEX_TOOL_ITEM_TYPES:
                 _fire_tool_completed(item)
             elif item_type == "agentMessage":
-                _fire_agent_message_completed(item)
+                return _fire_agent_message_completed(item)
 
     return on_event
 
@@ -809,6 +821,7 @@ def run_codex_app_server_turn(
     # standard run_conversation() flow (line ~11823) before the early
     # return reaches us. Do NOT append again — that would duplicate.
 
+    getattr(agent, "_reset_stream_delivery_tracking", lambda: None)()
     try:
         turn = agent._codex_session.run_turn(user_input=user_message)
     except Exception as exc:
@@ -846,6 +859,42 @@ def run_codex_app_server_turn(
                 else {}
             ),
             "error": str(exc),
+        }
+
+    if getattr(turn, "status", None) == STREAM_PAYLOAD_LIMIT_STATUS:
+        final_response = persist_interrupted_stream_partial(
+            agent,
+            messages,
+            exceeded=True,
+            size=getattr(turn, "stream_payload_size", 0),
+            bound=getattr(turn, "stream_payload_bound", None),
+        )
+        if getattr(agent, "_session_db", None) is not None:
+            try:
+                agent._flush_messages_to_session_db(messages)
+            except Exception:
+                logger.warning(
+                    "codex app-server stream-limit partial flush failed",
+                    exc_info=True,
+                )
+        if getattr(turn, "should_retire", False):
+            try:
+                agent._codex_session.close()
+            except Exception:
+                pass
+            agent._codex_session = None
+        return {
+            "final_response": final_response,
+            "messages": messages,
+            "api_calls": 1,
+            "completed": False,
+            "partial": True,
+            "interrupted": False,
+            "error": None,
+            "status": STREAM_PAYLOAD_LIMIT_STATUS,
+            "agent_persisted": True,
+            "codex_thread_id": turn.thread_id,
+            "codex_turn_id": turn.turn_id,
         }
 
     # This runtime bypasses the normal conversation-loop finalizer. Mirror its

@@ -38,12 +38,13 @@ from agent.context_engine import ContextEngine, sanitize_memory_context
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
+    _reasoning_alias_for_estimation,
     get_model_context_length,
     estimate_messages_tokens_rough,
     estimate_tokens_rough,
 )
 from agent.redact import redact_sensitive_text
-from agent.turn_context import drop_stale_api_content
+from agent.turn_context import api_content_for_wire, drop_stale_api_content
 from tools.todo_tool import TODO_INJECTION_HEADER
 
 logger = logging.getLogger(__name__)
@@ -1462,7 +1463,9 @@ def _estimate_msg_budget_tokens(msg: dict, charge_stale_thinking: bool = True) -
     Default ``True`` preserves the conservative full charge for callers
     without turn-position context.
     """
-    content = msg.get("content") or ""
+    content = api_content_for_wire(msg)
+    if content is None:
+        content = msg.get("content") or ""
     if isinstance(content, str):
         tokens = estimate_tokens_rough(content) + 10  # +10 for role/key overhead
     else:
@@ -1475,8 +1478,12 @@ def _estimate_msg_budget_tokens(msg: dict, charge_stale_thinking: bool = True) -
         tokens += _serialized_length_for_budget(msg.get(key)) // _CHARS_PER_TOKEN
     if not charge_stale_thinking:
         return tokens
-    for key in _NEWEST_TURN_ONLY_BUDGET_KEYS:
-        tokens += _serialized_length_for_budget(msg.get(key)) // _CHARS_PER_TOKEN
+    has_reasoning_aliases, reasoning_replay = _reasoning_alias_for_estimation(msg)
+    if has_reasoning_aliases:
+        tokens += _serialized_length_for_budget(reasoning_replay) // _CHARS_PER_TOKEN
+    else:
+        for key in _NEWEST_TURN_ONLY_BUDGET_KEYS:
+            tokens += _serialized_length_for_budget(msg.get(key)) // _CHARS_PER_TOKEN
     # reasoning_details: charge only the thinking TEXT, never the signed /
     # base64 envelope (#73298 second site; mirrors the preflight estimator's
     # exclusion in model_metadata).  When the same thinking text already rides
@@ -2342,6 +2349,22 @@ class ContextCompressor(ContextEngine):
     def tail_token_budget(self, value: int) -> None:
         self._tail_token_budget = value
 
+    def recalibrate_tail_budget(self) -> None:
+        """Re-derive the tail budget through the mode-aware policy.
+
+        Runtime recalibration paths (update_model, the aux compression-model
+        threshold sync) must call this instead of writing
+        ``threshold_tokens * summary_target_ratio`` themselves: that legacy
+        formula is only one branch of the ``tail_token_budget`` property.
+        Caching it unconditionally overwrote the lean clamp
+        ([LEAN_TAIL_FLOOR_TOKENS, LEAN_TAIL_CAP_TOKENS]) after model
+        switches, fallback activations, and context-window refreshes while
+        ``tail_mode`` still claimed "lean". Invalidating the cache keeps the
+        property as the single source of truth for both modes — the same
+        pattern the ``context_length`` setter uses.
+        """
+        self._tail_token_budget = None
+
     @property
     def max_summary_tokens(self) -> int:
         if self._max_summary_tokens is None:
@@ -2888,8 +2911,11 @@ class ContextCompressor(ContextEngine):
         self._apply_threshold_tokens_cap()
         # Recalculate token budgets for the new context length so the
         # compressor stays calibrated after a model switch (e.g. 200K → 32K).
-        target_tokens = int(self.threshold_tokens * self.summary_target_ratio)
-        self.tail_token_budget = target_tokens
+        # Invalidate the cached tail budget so the mode-aware property
+        # re-derives it: lean re-clamps to [10K, 25K] of the new window,
+        # legacy recomputes threshold_tokens * summary_target_ratio. Writing
+        # the legacy formula here directly overwrote the lean clamp.
+        self.recalibrate_tail_budget()
         self.max_summary_tokens = min(
             int(context_length * 0.05), _SUMMARY_TOKENS_CEILING,
         )
@@ -3646,6 +3672,85 @@ class ContextCompressor(ContextEngine):
     # ------------------------------------------------------------------
     # Tool output pruning (cheap pre-pass, no LLM call)
     # ------------------------------------------------------------------
+
+    def _demote_post_summary_protected_tail(
+        self,
+        messages: List[Dict[str, Any]],
+        tail_start: int,
+    ) -> int:
+        """Demote bulky retained-tail tools before the compression commit."""
+        if tail_start >= len(messages):
+            return 0
+
+        def tail_tokens() -> int:
+            return sum(
+                _estimate_msg_budget_tokens(messages[idx])
+                for idx in range(tail_start, len(messages))
+            )
+
+        if tail_tokens() <= self.tail_token_budget:
+            return 0
+
+        call_id_to_tool: dict[str, tuple[str, str]] = {}
+        for message in messages:
+            if message.get("role") != "assistant":
+                continue
+            for tool_call in message.get("tool_calls") or []:
+                call_id = _extract_tool_call_id(tool_call)
+                if call_id:
+                    call_id_to_tool[call_id] = _extract_tool_call_name_and_args(tool_call)
+
+        protected_skills = _collect_protected_skill_names(messages, tail_start)
+        demote_end = max(tail_start, len(messages) - _PRESSURE_KEEP_RECENT_MESSAGES)
+        demoted = 0
+        for idx in range(tail_start, demote_end):
+            message = messages[idx]
+            if self._is_context_summary_message(message):
+                continue
+            if message.get("role") != "tool":
+                continue
+            content = message.get("content", "")
+            if isinstance(content, (list, dict)):
+                replacement = _strip_images_from_tool_msg(message)
+                if replacement is None:
+                    continue
+                messages[idx] = replacement
+            elif isinstance(content, str):
+                if (
+                    not content
+                    or content == _PRUNED_TOOL_PLACEHOLDER
+                    or content.startswith("[Duplicate tool output")
+                    or (content.startswith("[") and " chars)" in content and len(content) < 400)
+                    or content.startswith("[screenshot removed")
+                    or len(content) <= _PRUNE_MIN_CHARS
+                ):
+                    continue
+                tool_name, tool_args = call_id_to_tool.get(
+                    str(message.get("tool_call_id") or ""), ("unknown", "")
+                )
+                if tool_name == "skill_view" and protected_skills:
+                    try:
+                        args = json.loads(tool_args) if tool_args else {}
+                    except (json.JSONDecodeError, TypeError):
+                        args = {}
+                    skill = args.get("name", "") if isinstance(args, dict) else ""
+                    if isinstance(skill, str) and skill.lower() in protected_skills:
+                        continue
+                messages[idx] = {
+                    **message,
+                    "content": _summarize_tool_result(tool_name, tool_args, content),
+                }
+            else:
+                continue
+            demoted += 1
+            if tail_tokens() <= self.tail_token_budget:
+                break
+        if demoted and not self.quiet_mode:
+            logger.info(
+                "Post-summary protected-tail demotion reclaimed %d tool result(s)",
+                demoted,
+            )
+        return demoted
 
     def _prune_old_tool_results(
         self, messages: List[Dict[str, Any]], protect_tail_count: int,
@@ -6351,6 +6456,8 @@ This compaction should PRIORITISE preserving all information related to the focu
     def _find_tail_cut_by_tokens(
         self, messages: List[Dict[str, Any]], head_end: int,
         token_budget: int | None = None,
+        *,
+        allow_split_turn: bool = True,
     ) -> int:
         """Walk backward from the end of messages, accumulating tokens until
         the budget is reached. Returns the index where the tail starts.
@@ -6359,6 +6466,10 @@ This compaction should PRIORITISE preserving all information related to the focu
         derived from ``summary_target_ratio * context_length``, so it
         scales automatically with the model's context window.
 
+        ``allow_split_turn`` is disabled by rolling micro-compaction, whose
+        cursor consumes complete exchanges independently. Batch/manual
+        compaction enables it so an oversized active turn can make progress.
+
         Token budget is the primary criterion.  A bounded message-count floor
         keeps a short run of recent turns verbatim even when the budget is
         exhausted, but the budget is allowed to exceed by up to 1.5x to avoid
@@ -6366,8 +6477,12 @@ This compaction should PRIORITISE preserving all information related to the focu
         even that floor exceeds 1.5x the budget, the cut is placed right after
         the head so compression still runs.
 
-        Never cuts inside a tool_call/result group.  Always ensures the most
-        recent user message is in the tail (see ``_ensure_last_user_message_in_tail``).
+        Never cuts inside a tool_call/result group.  Normally ensures the most
+        recent user message is in the tail (see
+        ``_ensure_last_user_message_in_tail``).  When one in-progress turn alone
+        exceeds the soft ceiling, the clean mid-turn boundary wins instead: the
+        turn-opening user message enters the grounded compaction handoff and the
+        recent tool groups remain live after it (#80449).
         """
         if token_budget is None:
             token_budget = self.tail_token_budget
@@ -6446,19 +6561,69 @@ This compaction should PRIORITISE preserving all information related to the focu
         if cut_idx <= head_end:
             cut_idx = max(fallback_cut, head_end + 1)
 
-        # Align to avoid splitting tool groups
+        # Align to avoid splitting tool groups. Keep this pre-anchor boundary:
+        # it is the safe fallback when anchoring the opening user message would
+        # retain an entire oversized in-progress turn (#80449).
         cut_idx = self._align_boundary_backward(messages, cut_idx)
 
-        # Ensure the most recent user message is always in the tail so the
-        # active task is never lost to compression (fixes #10896).
-        cut_idx = self._ensure_last_user_message_in_tail(messages, cut_idx, head_end)
+        # Ensure the most recent user message is normally in the tail so the
+        # active task is never lost to compression (fixes #10896). One bounded
+        # exception is required: a single turn can contain many individually
+        # small tool groups whose aggregate size exceeds the soft ceiling. In
+        # that shape the anchor drags the cut back to the turn-opening user and
+        # defeats the token budget entirely. The summarised window already has
+        # deterministic task grounding, while SUMMARY_PREFIX explicitly treats
+        # following tool calls/results as an in-flight exchange, so retaining
+        # the clean tool-group boundary preserves both intent and progress.
+        last_user_idx = self._find_last_user_message_idx(messages, head_end)
+        user_anchored_cut = self._ensure_last_user_message_in_tail(
+            messages, cut_idx, head_end
+        )
+        split_oversized_turn = False
+        if (
+            allow_split_turn
+            and last_user_idx >= head_end
+            and last_user_idx < cut_idx
+            and user_anchored_cut < cut_idx
+            # A single oversized user message is indivisible and must remain
+            # verbatim in the tail. This exception is only for aggregate turn
+            # growth after a normally-sized opening request.
+            and _estimate_msg_budget_tokens(messages[last_user_idx]) <= soft_ceiling
+            and len(
+                _content_text_for_contains(
+                    messages[last_user_idx].get("content")
+                ).strip()
+            ) <= _ACTIVE_TASK_MAX_CHARS
+            and sum(
+                _estimate_msg_budget_tokens(message)
+                for message in messages[user_anchored_cut:]
+            ) > soft_ceiling
+        ):
+            split_oversized_turn = True
+            if not self.quiet_mode:
+                logger.info(
+                    "Active turn exceeds protected-tail soft ceiling; keeping "
+                    "tool-group-aligned mid-turn cut at index %d instead of "
+                    "anchoring user message %d (#80449)",
+                    cut_idx,
+                    last_user_idx,
+                )
+        else:
+            cut_idx = user_anchored_cut
 
         # Ensure the most recent assistant message is always in the tail
         # so the previously-visible reply isn't silently rolled into the
         # ``[CONTEXT COMPACTION — REFERENCE ONLY]`` block (fixes #29824).
-        # Each anchor only walks ``cut_idx`` backward, so chaining them is
-        # monotonic — the tail can only grow, never shrink.
-        cut_idx = self._ensure_last_assistant_message_in_tail(messages, cut_idx, head_end)
+        # Outside the bounded oversized-turn exception, each anchor only walks
+        # ``cut_idx`` backward, so chaining them is monotonic — the tail can
+        # only grow, never shrink.
+        assistant_anchored_cut = self._ensure_last_assistant_message_in_tail(messages, cut_idx, head_end)
+        # An older visible assistant reply can precede the active user turn. If
+        # the active turn was deliberately split above, pulling back to that
+        # reply would undo the bounded exception and recreate the oversized
+        # tail. A latest assistant already inside the chosen tail is unchanged.
+        if not split_oversized_turn or assistant_anchored_cut == cut_idx:
+            cut_idx = assistant_anchored_cut
 
         # Extend to the last N actionable user messages when configured
         # (compression.min_tail_user_messages > 1).  This prevents the
@@ -6475,7 +6640,12 @@ This compaction should PRIORITISE preserving all information related to the focu
         # (and plugin engines) skip __init__, so the attribute may be absent
         # (see the compression-path test-double pitfall).
         _min_tail_users = getattr(self, "min_tail_user_messages", 1)
-        if isinstance(_min_tail_users, int) and not isinstance(_min_tail_users, bool) and _min_tail_users > 1:
+        if (
+            not split_oversized_turn
+            and isinstance(_min_tail_users, int)
+            and not isinstance(_min_tail_users, bool)
+            and _min_tail_users > 1
+        ):
             cut_idx = self._ensure_last_n_user_messages_in_tail(
                 messages, cut_idx, head_end, _min_tail_users,
             )
@@ -6865,7 +7035,11 @@ This compaction should PRIORITISE preserving all information related to the focu
 
         head_size = self._protect_head_size(messages)
         compress_start = self._align_boundary_forward(messages, head_size)
-        compress_end = self._find_tail_cut_by_tokens(messages, compress_start)
+        compress_end = self._find_tail_cut_by_tokens(
+            messages,
+            compress_start,
+            allow_split_turn=False,
+        )
 
         if compress_start >= compress_end:
             return messages
@@ -8032,6 +8206,11 @@ This compaction should PRIORITISE preserving all information related to the focu
                 drop_stale_api_content(msg)
                 _merge_summary_into_tail = False
             compressed.append(msg)
+
+        self._demote_post_summary_protected_tail(
+            compressed,
+            len(compressed) - len(tail_messages),
+        )
 
         self.compression_count += 1
 

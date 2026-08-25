@@ -488,6 +488,17 @@ class CLIAgentSetupMixin:
                 "credential_pool": getattr(self, "_credential_pool", None),
             }
             effective_model = model_override or self.model
+            memory_provider_mode_override = None
+            if self._resumed and self._session_db:
+                from agent.memory_provider import persisted_memory_provider_mode
+
+                try:
+                    resume_row = self._session_db.get_session(self.session_id)
+                except Exception:
+                    resume_row = None
+                memory_provider_mode_override = persisted_memory_provider_mode(
+                    resume_row
+                )
             self.agent = AIAgent(
                 model=effective_model,
                 api_key=runtime.get("api_key"),
@@ -531,6 +542,7 @@ class CLIAgentSetupMixin:
                 checkpoint_max_total_size_mb=self.checkpoint_max_total_size_mb,
                 checkpoint_max_file_size_mb=self.checkpoint_max_file_size_mb,
                 pass_session_id=self.pass_session_id,
+                memory_provider_mode_override=memory_provider_mode_override,
                 skip_context_files=self.ignore_rules,
                 skip_memory=self.ignore_rules,
                 tool_progress_callback=self._on_tool_progress,

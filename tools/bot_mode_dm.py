@@ -126,43 +126,45 @@ def message_agent_tool_schema() -> dict:
 
 
 def ensure_message_agent_tool(agent: Any) -> bool:
-    """Inject the ``message_agent`` schema into a Bot Chat agent's tool list.
-
-    Called once per turn from the conversation loop. Idempotent and
-    deterministic for the life of a session: the gate (canonical Bot Chat
-    title on a Bot-Mode-managed install) is stable from the session's first
-    turn, so the tool list is byte-identical across turns — prompt-cache
-    safe. Every non-Bot-Chat session fails the gate on every turn and never
-    sees the schema. Never raises.
-    """
+    """CAS-inject ``message_agent`` into an eligible Bot Chat snapshot."""
     try:
-        if not getattr(agent, "_bot_mode_protocol", True):
-            return False
-        tools = getattr(agent, "tools", None)
-        if tools:
-            for tool in tools:
-                if (
-                    isinstance(tool, dict)
-                    and tool.get("function", {}).get("name") == MESSAGE_AGENT_TOOL_NAME
-                ):
-                    return True
-        from tools.bot_mode_probe import BOT_CHAT_TITLE, is_bot_mode_managed
+        from tools.mcp_tool import _agent_tools_lock
+        from tools.registry import registry
 
-        if _session_title(agent) != BOT_CHAT_TITLE:
-            return False
-        # Managed-install check, NOT section non-emptiness: a profile whose
-        # SOUL.md carries the legacy plugin-appended protocol text gets an
-        # empty section (dedupe) but must still receive the tool — otherwise
-        # upgraded installs silently lose A2A messaging (Aug 2026).
-        if not is_bot_mode_managed(_agent_home(agent)):
-            return False
-        if agent.tools is None:
-            agent.tools = []
-        agent.tools.append(message_agent_tool_schema())
-        valid = getattr(agent, "valid_tool_names", None)
-        if isinstance(valid, set):
-            valid.add(MESSAGE_AGENT_TOOL_NAME)
-        return True
+        for _attempt in range(3):
+            with _agent_tools_lock:
+                epoch = getattr(agent, "_tool_snapshot_generation", 0)
+                epoch = epoch if isinstance(epoch, int) else 0
+                if MESSAGE_AGENT_TOOL_NAME in getattr(agent, "valid_tool_names", set()):
+                    return True
+            with registry._lock:
+                registry_generation = registry._generation
+            from tools.bot_mode_probe import BOT_CHAT_TITLE, is_bot_mode_managed
+
+            eligible = (
+                getattr(agent, "_bot_mode_protocol", True)
+                and _session_title(agent) == BOT_CHAT_TITLE
+                and is_bot_mode_managed(_agent_home(agent))
+            )
+            if not eligible:
+                return False
+            with registry._lock:
+                with _agent_tools_lock:
+                    if (
+                        registry._generation != registry_generation
+                        or getattr(agent, "_tool_snapshot_generation", 0) != epoch
+                    ):
+                        continue
+                    tools = list(getattr(agent, "tools", None) or [])
+                    valid = set(getattr(agent, "valid_tool_names", set()) or set())
+                    if MESSAGE_AGENT_TOOL_NAME not in valid:
+                        tools.append(message_agent_tool_schema())
+                        valid.add(MESSAGE_AGENT_TOOL_NAME)
+                        agent.tools = tools
+                        agent.valid_tool_names = valid
+                        agent._tool_snapshot_generation = epoch + 1
+                    return True
+        return False
     except Exception:  # pragma: no cover — must never break a turn
         logger.debug("ensure_message_agent_tool failed", exc_info=True)
         return False

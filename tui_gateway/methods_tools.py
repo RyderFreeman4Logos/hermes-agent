@@ -137,8 +137,8 @@ def _(rid, params: dict) -> dict:
                     str(params.get("session_id") or ""),
                     request_id=f"reload-mcp-{rid}",
                 )
-            except Exception as exc:
-                return _err(rid, 5019, f"compute-host reload_mcp failed: {exc}")
+            except Exception:
+                return _err(rid, 5019, "Compute-host MCP reload failed")
             return _ok(rid, {"status": "reloaded", "turn_isolation": True, "host_ack": ack})
 
         from tools.mcp_tool import shutdown_mcp_servers, discover_mcp_tools
@@ -153,22 +153,24 @@ def _(rid, params: dict) -> dict:
             if not session:
                 return
             agent = session["agent"]
-            try:
-                from tools.mcp_tool import refresh_agent_mcp_tools
+            from tools.mcp_tool import refresh_agent_mcp_tools
 
-                # Explicit reload: re-resolve enabled toolsets so a server the
-                # user just enabled in config this session is picked up.
-                refresh_agent_mcp_tools(
-                    agent,
-                    enabled_override=_load_enabled_toolsets(),
-                    quiet_mode=True,
+            # Explicit reload: re-resolve enabled toolsets so a server the
+            # user just enabled in config this session is picked up.
+            refresh_agent_mcp_tools(
+                agent,
+                enabled_override=_load_enabled_toolsets(),
+                quiet_mode=True,
+                raise_on_exhaustion=True,
+            )
+            try:
+                _emit(
+                    "session.info",
+                    params.get("session_id", ""),
+                    _session_info(agent, session),
                 )
-            except Exception as _exc:
-                logger.warning(
-                    "Failed to refresh cached agent tools after /reload-mcp: %s",
-                    _exc,
-                )
-            _emit("session.info", params.get("session_id", ""), _session_info(agent, session))
+            except Exception:
+                pass  # Snapshot publication already committed; UI notification is best-effort.
 
         global _mcp_reload_gen, _mcp_reload_loaded_rev
 
@@ -235,8 +237,8 @@ def _(rid, params: dict) -> dict:
                 coalesced = False
 
         return _finish_reload(rid, params, coalesced=coalesced)
-    except Exception as e:
-        return _err(rid, 5015, str(e))
+    except Exception:
+        return _err(rid, 5015, "MCP reload failed")
 
 
 @method("reload.env")

@@ -266,7 +266,7 @@ def main(argv: list[str] | None = None) -> None:
                 thread_name="acp-mcp-discovery",
             )
         except Exception:
-            logger.debug("MCP tool discovery failed at ACP startup", exc_info=True)
+            logger.debug("MCP tool discovery failed at ACP startup")
 
     agent = HermesACPAgent()
     try:

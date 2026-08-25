@@ -81,8 +81,9 @@ def test_initial_connect_failure_is_registry_owned_and_reaped(monkeypatch, tmp_p
         server = created[0]
         with mcp_tool._lock:
             assert mcp_tool._servers["initial-failure"] is server
-            assert "deterministic initial failure" in (
+            assert (
                 mcp_tool._server_connect_errors["initial-failure"]
+                == "MCP server connection failed"
             )
         assert server._task is not None
         assert not server._task.done(), "recoverable initial failure was not parked"
@@ -169,8 +170,9 @@ def test_initial_connect_failure_revives_same_registered_server(monkeypatch, tmp
         server = created[0]
         with mcp_tool._lock:
             assert mcp_tool._servers["recovering"] is server
-            assert "backend still booting" in (
+            assert (
                 mcp_tool._server_connect_errors["recovering"]
+                == "MCP server connection failed"
             )
         assert not server._task.done()
 
@@ -236,8 +238,9 @@ def test_initial_auth_failure_is_retained_and_reaped(monkeypatch, tmp_path):
         )
         with mcp_tool._lock:
             assert mcp_tool._servers["auth-failure"] is server
-            assert "terminal authentication failure" in (
+            assert (
                 mcp_tool._server_connect_errors["auth-failure"]
+                == "MCP server connection failed"
             )
 
         mcp_tool.shutdown_mcp_servers()

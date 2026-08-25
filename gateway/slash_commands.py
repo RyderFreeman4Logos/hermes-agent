@@ -5546,12 +5546,9 @@ class GatewaySlashCommandsMixin:
                 try:
                     from cli import save_config_value
                     save_config_value("approvals.mcp_reload_confirm", False)
-                    logger.info(
-                        "User opted out of /reload-mcp confirmation (session=%s)",
-                        session_key,
-                    )
-                except Exception as exc:
-                    logger.warning("Failed to persist mcp_reload_confirm=false: %s", exc)
+                    logger.info("MCP reload confirmation preference persisted")
+                except Exception:
+                    logger.warning("MCP reload confirmation preference persistence failed")
             # once / always → run the reload
             result = await self._execute_mcp_reload(event)
             if choice == "always":

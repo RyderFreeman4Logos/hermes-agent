@@ -1,4 +1,6 @@
+import ast
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -3950,9 +3952,660 @@ def test_persist_live_session_runtime_preserves_resume_metadata(monkeypatch):
             "api_mode": "chat_completions",
             "reasoning_config": {"enabled": True, "effort": "high"},
             "service_tier": "priority",
+            "memory_provider_mode": "hybrid",
         },
         "gpt-5.4",
     )
+
+
+def _assert_content_free_records(records, *banned):
+    for record in records:
+        assert record.args == ()
+        assert record.exc_info is None
+        rendered = record.getMessage()
+        for marker in banned:
+            assert marker not in record.msg
+            assert marker not in rendered
+
+
+def test_reload_mcp_refresh_exhaustion_fails_closed_and_private(monkeypatch, caplog):
+    from tools import mcp_tool
+
+    session_id = "private-session-sentinel"
+    exception_marker = "private-exception-sentinel https://secret.invalid Cookie=credential"
+    agent = types.SimpleNamespace(tools=[], valid_tool_names=set())
+    server._sessions[session_id] = {"agent": agent, "session_key": session_id}
+    saved = (server._mcp_reload_gen, server._mcp_reload_loaded_rev)
+    emitted = []
+    try:
+        server._mcp_reload_gen = 0
+        server._mcp_reload_loaded_rev = ""
+        monkeypatch.setattr(mcp_tool, "shutdown_mcp_servers", lambda: None)
+        monkeypatch.setattr(mcp_tool, "discover_mcp_tools", lambda: [])
+        monkeypatch.setattr(
+            mcp_tool,
+            "refresh_agent_mcp_tools",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError(exception_marker)),
+        )
+        monkeypatch.setattr(server, "_compute_mcp_rev", lambda: "rev-private")
+        monkeypatch.setattr(server, "_load_enabled_toolsets", lambda: [])
+        monkeypatch.setattr(server, "_emit", lambda *args: emitted.append(args))
+
+        with caplog.at_level("DEBUG"):
+            envelope = server._methods["reload.mcp"](
+                "request-private", {"session_id": session_id, "confirm": True}
+            )
+
+        assert envelope == {
+            "jsonrpc": "2.0",
+            "id": "request-private",
+            "error": {"code": 5015, "message": "MCP reload failed"},
+        }
+        assert server._mcp_reload_gen == 0
+        assert server._mcp_reload_loaded_rev == ""
+        assert emitted == []
+        _assert_content_free_records(caplog.records, exception_marker, session_id)
+    finally:
+        server._mcp_reload_gen, server._mcp_reload_loaded_rev = saved
+        server._sessions.pop(session_id, None)
+
+
+def test_reload_mcp_emit_failure_after_refresh_is_fail_soft(monkeypatch):
+    import model_tools
+    from tools import mcp_tool
+
+    session_id = "emit-failure-session"
+    old_tool = {"type": "function", "function": {"name": "old"}}
+    new_tool = {"type": "function", "function": {"name": "new"}}
+    agent = types.SimpleNamespace(
+        tools=[old_tool],
+        valid_tool_names={"old"},
+        _tool_snapshot_generation=0,
+    )
+    server._sessions[session_id] = {"agent": agent, "session_key": session_id}
+    saved = (server._mcp_reload_gen, server._mcp_reload_loaded_rev)
+    try:
+        server._mcp_reload_gen = 0
+        server._mcp_reload_loaded_rev = ""
+        monkeypatch.setattr(mcp_tool, "shutdown_mcp_servers", lambda: None)
+        monkeypatch.setattr(mcp_tool, "discover_mcp_tools", lambda: [])
+        monkeypatch.setattr(model_tools, "get_tool_definitions", lambda **_kwargs: [new_tool])
+        monkeypatch.setattr(server, "_compute_mcp_rev", lambda: "rev-new")
+        monkeypatch.setattr(server, "_load_enabled_toolsets", lambda: [])
+        monkeypatch.setattr(
+            server,
+            "_emit",
+            lambda *_args: (_ for _ in ()).throw(RuntimeError("emit unavailable")),
+        )
+
+        envelope = server._methods["reload.mcp"](
+            "emit-failure-request", {"session_id": session_id, "confirm": True}
+        )
+
+        assert envelope["result"]["status"] == "reloaded"
+        assert agent.valid_tool_names == {"new"}
+        assert agent._tool_snapshot_generation == 1
+        assert server._mcp_reload_loaded_rev == "rev-new"
+        assert server._mcp_reload_gen == 1
+    finally:
+        server._mcp_reload_gen, server._mcp_reload_loaded_rev = saved
+        server._sessions.pop(session_id, None)
+
+
+def test_reload_mcp_invalidation_warning_failure_is_fail_soft(monkeypatch):
+    import model_tools
+    from tools import mcp_tool
+
+    session_id = "invalidation-warning-session"
+    warning = "Tool snapshot prompt invalidation failed"
+    warning_seen = threading.Event()
+    old_tool = {"type": "function", "function": {"name": "old"}}
+    new_tool = {"type": "function", "function": {"name": "new"}}
+
+    def _raise() -> None:
+        raise RuntimeError("prompt invalidation failed")
+
+    agent = types.SimpleNamespace(
+        tools=[old_tool],
+        valid_tool_names={"old"},
+        _tool_snapshot_generation=0,
+        _invalidate_system_prompt=_raise,
+    )
+
+    class RaisingWarningHandler(logging.Handler):
+        def emit(self, record):
+            if record.getMessage() == warning:
+                warning_seen.set()
+                raise RuntimeError("warning handler failed")
+
+    handler = RaisingWarningHandler()
+    server._sessions[session_id] = {"agent": agent, "session_key": session_id}
+    saved = (server._mcp_reload_gen, server._mcp_reload_loaded_rev)
+    mcp_tool.logger.addHandler(handler)
+    try:
+        server._mcp_reload_gen = 0
+        server._mcp_reload_loaded_rev = ""
+        monkeypatch.setattr(mcp_tool, "shutdown_mcp_servers", lambda: None)
+        monkeypatch.setattr(mcp_tool, "discover_mcp_tools", lambda: [])
+        monkeypatch.setattr(model_tools, "_last_resolved_tool_names", ["old"])
+        monkeypatch.setattr(model_tools, "get_tool_definitions", lambda **_kwargs: [new_tool])
+        monkeypatch.setattr(server, "_compute_mcp_rev", lambda: "rev-new")
+        monkeypatch.setattr(server, "_load_enabled_toolsets", lambda: [])
+        monkeypatch.setattr(server, "_emit", lambda *_args: None)
+
+        envelope = server._methods["reload.mcp"](
+            "invalidation-warning-request",
+            {"session_id": session_id, "confirm": True},
+        )
+
+        assert warning_seen.is_set()
+        assert envelope["result"]["status"] == "reloaded"
+        assert agent.valid_tool_names == {"new"}
+        assert agent._tool_snapshot_generation == 1
+        assert model_tools._last_resolved_tool_names == ["new"]
+        assert server._mcp_reload_loaded_rev == "rev-new"
+        assert server._mcp_reload_gen == 1
+    finally:
+        mcp_tool.logger.removeHandler(handler)
+        server._mcp_reload_gen, server._mcp_reload_loaded_rev = saved
+        server._sessions.pop(session_id, None)
+
+
+def test_reload_mcp_compute_host_failure_is_content_free(monkeypatch):
+    session_id = "private-compute-session"
+    exception_marker = "private-compute-exception Authorization=credential"
+    server._sessions[session_id] = {"agent": None, "session_key": session_id}
+    supervisor = types.SimpleNamespace(
+        reload_mcp=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError(exception_marker)
+        )
+    )
+    try:
+        monkeypatch.setattr(server, "_session_uses_compute_host", lambda _session: True)
+        monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda: supervisor)
+        envelope = server._methods["reload.mcp"](
+            "request-private", {"session_id": session_id, "confirm": True}
+        )
+
+        assert envelope == {
+            "jsonrpc": "2.0",
+            "id": "request-private",
+            "error": {"code": 5019, "message": "Compute-host MCP reload failed"},
+        }
+        assert exception_marker not in repr(envelope)
+        assert session_id not in repr(envelope)
+    finally:
+        server._sessions.pop(session_id, None)
+
+
+@pytest.mark.asyncio
+async def test_gateway_reload_failure_is_translated_and_logged_content_free(monkeypatch, caplog):
+    import gateway.run as gateway_run
+    from gateway.run import GatewayRunner
+    from tools import mcp_tool
+
+    exception_marker = "private-gateway-exception https://secret.invalid Bearer credential"
+    session_id = "private-gateway-session"
+    runner = object.__new__(GatewayRunner)
+    monkeypatch.setattr(
+        mcp_tool,
+        "shutdown_mcp_servers",
+        lambda: (_ for _ in ()).throw(RuntimeError(exception_marker)),
+    )
+    monkeypatch.setattr(
+        gateway_run,
+        "t",
+        lambda key, **kwargs: f"{key}:{kwargs.get('error', '')}",
+    )
+
+    with caplog.at_level("DEBUG", logger="gateway.run"):
+        result = await runner._execute_mcp_reload(
+            types.SimpleNamespace(source=types.SimpleNamespace(session_id=session_id))  # type: ignore[arg-type]
+        )
+
+    assert result == "gateway.reload_mcp.failed:operation failed"
+    assert exception_marker not in result
+    assert session_id not in result
+    _assert_content_free_records(caplog.records, exception_marker, session_id)
+
+
+def test_late_mcp_refresh_emit_failure_is_contained_and_private(monkeypatch):
+    import model_tools
+    from tui_gateway import entry
+
+    session_id = "private-late-refresh-session"
+    old_tool = {"type": "function", "function": {"name": "old"}}
+    new_tool = {"type": "function", "function": {"name": "new"}}
+    agent = types.SimpleNamespace(
+        tools=[old_tool],
+        valid_tool_names={"old"},
+        _tool_snapshot_generation=0,
+        _user_turn_count=0,
+        _api_call_count=0,
+    )
+    server._sessions[session_id] = {"agent": agent, "session_key": session_id}
+    started = []
+    uncaught = []
+    real_thread = threading.Thread
+    prior_excepthook = threading.excepthook
+
+    def _thread(*args, **kwargs):
+        worker = real_thread(*args, **kwargs)
+        started.append(worker)
+        return worker
+
+    try:
+        monkeypatch.setattr(entry, "mcp_discovery_in_flight", lambda: True)
+        monkeypatch.setattr(entry, "join_mcp_discovery", lambda **_kwargs: True)
+        monkeypatch.setattr(model_tools, "_last_resolved_tool_names", ["old"])
+        monkeypatch.setattr(
+            model_tools, "get_tool_definitions", lambda **_kwargs: [new_tool]
+        )
+        monkeypatch.setattr(server, "_session_info", lambda *_args: {"tools": 1})
+        monkeypatch.setattr(
+            server,
+            "_emit",
+            lambda *_args: (_ for _ in ()).throw(
+                RuntimeError("private emit payload Authorization=credential")
+            ),
+        )
+        monkeypatch.setattr(server.threading, "Thread", _thread)
+        threading.excepthook = uncaught.append
+
+        server._schedule_mcp_late_refresh(session_id, agent)
+        assert len(started) == 1
+        started[0].join(timeout=2)
+
+        assert not started[0].is_alive()
+        assert uncaught == []
+        assert started[0].name == "tui-mcp-late-refresh"
+        assert session_id not in started[0].name
+        assert agent.valid_tool_names == {"new"}
+        assert agent._tool_snapshot_generation == 1
+    finally:
+        threading.excepthook = prior_excepthook
+        server._sessions.pop(session_id, None)
+
+
+def test_mcp_lifecycle_diagnostics_are_static_across_tui_gateway_and_acp():
+    root = Path(__file__).parents[1]
+    paths = (
+        "acp_adapter/entry.py",
+        "acp_adapter/server.py",
+        "acp_adapter/session.py",
+        "agent/turn_context.py",
+        "gateway/run.py",
+        "gateway/slash_commands.py",
+        "hermes_cli/mcp_startup.py",
+        "model_tools.py",
+        "tools/mcp_tool.py",
+        "tools/registry.py",
+        "tui_gateway/compute_host.py",
+        "tui_gateway/entry.py",
+        "tui_gateway/host_supervisor.py",
+        "tui_gateway/mcp_oauth_sessions.py",
+        "tui_gateway/methods_tools.py",
+        "tui_gateway/server.py",
+        "tui_gateway/slash_worker.py",
+    )
+
+    trees = {
+        path: ast.parse((root / path).read_text(encoding="utf-8"))
+        for path in paths
+    }
+    parents_by_path = {
+        path: {
+            child: parent
+            for parent in ast.walk(tree)
+            for child in ast.iter_child_nodes(parent)
+        }
+        for path, tree in trees.items()
+    }
+    modules = {path.removesuffix(".py").replace("/", "."): path for path in paths}
+    functions = {}
+    class_functions = {}
+    routes = {}
+    node_paths = {}
+    for path, tree in trees.items():
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            functions.setdefault((path, node.name), []).append(node)
+            node_paths[node] = path
+            for decorator in node.decorator_list:
+                if (
+                    isinstance(decorator, ast.Call)
+                    and decorator.args
+                    and isinstance(decorator.args[0], ast.Constant)
+                    and isinstance(decorator.args[0].value, str)
+                ):
+                    routes[(path, decorator.args[0].value)] = node
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ClassDef):
+                continue
+            for child in node.body:
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    class_functions[(path, node.name, child.name)] = child
+
+    def _owner(path, node):
+        parents = parents_by_path[path]
+        while node in parents:
+            node = parents[node]
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                return node
+        return None
+
+    def _direct_nodes(path, function):
+        return (
+            node
+            for node in ast.walk(function)
+            if node is function or _owner(path, node) is function
+        )
+
+    def _aliases(path, function):
+        aliases = {}
+        for node in ast.walk(trees[path]):
+            if not isinstance(node, (ast.Import, ast.ImportFrom)):
+                continue
+            owner = _owner(path, node)
+            if owner is not None and owner is not function:
+                continue
+            if isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                for alias in node.names:
+                    aliases[alias.asname or alias.name] = (node.module, alias.name)
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    aliases[alias.asname or alias.name.split(".")[0]] = (
+                        alias.name,
+                        None,
+                    )
+        return aliases
+
+    def _resolve_name(path, function, name, aliases):
+        targets = list(functions.get((path, name), ()))
+        imported = aliases.get(name)
+        if imported and imported[1] is not None:
+            imported_path = modules.get(imported[0])
+            if imported_path:
+                targets.extend(functions.get((imported_path, imported[1]), ()))
+        return targets
+
+    def _call_targets(function):
+        path = node_paths[function]
+        aliases = _aliases(path, function)
+        targets = []
+        for node in _direct_nodes(path, function):
+            if not isinstance(node, ast.Call):
+                continue
+            if isinstance(node.func, ast.Name):
+                targets.extend(_resolve_name(path, function, node.func.id, aliases))
+            elif isinstance(node.func, ast.Attribute) and isinstance(
+                node.func.value, ast.Name
+            ):
+                base = node.func.value.id
+                if (
+                    path == "tools/mcp_tool.py"
+                    and base == "server"
+                    and node.func.attr in {"start", "shutdown"}
+                ):
+                    targets.append(
+                        class_functions[(path, "MCPServerTask", node.func.attr)]
+                    )
+                elif base in {"self", "cls"}:
+                    targets.extend(functions.get((path, node.func.attr), ()))
+                else:
+                    imported = aliases.get(base)
+                    if imported and imported[1] is None:
+                        imported_path = modules.get(imported[0])
+                        if imported_path:
+                            targets.extend(
+                                functions.get((imported_path, node.func.attr), ())
+                            )
+            callable_args = []
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id == "_run_on_mcp_loop"
+                and node.args
+            ):
+                callable_args.append(node.args[0])
+            elif isinstance(node.func, ast.Attribute):
+                if node.func.attr == "to_thread" and node.args:
+                    callable_args.append(node.args[0])
+                elif node.func.attr == "run_in_executor" and len(node.args) > 1:
+                    callable_args.append(node.args[1])
+                elif node.func.attr == "Thread":
+                    callable_args.extend(
+                        keyword.value
+                        for keyword in node.keywords
+                        if keyword.arg == "target"
+                    )
+            for candidate in callable_args:
+                if isinstance(candidate, ast.Name):
+                    targets.extend(
+                        _resolve_name(path, function, candidate.id, aliases)
+                    )
+        return targets
+
+    roots = {
+        routes[("tui_gateway/methods_tools.py", "reload.mcp")],
+        functions[("gateway/run.py", "_execute_mcp_reload")][0],
+        functions[("tui_gateway/compute_host.py", "_handle_reload_mcp")][0],
+        functions[("acp_adapter/server.py", "_register_session_mcp_servers")][0],
+        functions[("hermes_cli/mcp_startup.py", "start_background_mcp_discovery")][0],
+    }
+    reachable = set(roots)
+    excluded = {
+        functions[("tools/mcp_tool.py", "_kill_orphaned_mcp_children")][0]
+    }
+    pending = list(roots)
+    while pending:
+        for target in _call_targets(pending.pop()):
+            if target not in reachable and target not in excluded:
+                reachable.add(target)
+                pending.append(target)
+
+    required_helpers = {
+        ("tools/mcp_tool.py", "register_mcp_servers"),
+        ("tools/mcp_tool.py", "discover_mcp_tools"),
+        ("tools/mcp_tool.py", "refresh_agent_mcp_tools"),
+        ("tools/mcp_tool.py", "_format_connect_error"),
+        ("tools/mcp_tool.py", "_filter_suspicious_mcp_servers"),
+        ("tools/mcp_tool.py", "_load_mcp_config"),
+        ("tools/mcp_tool.py", "_reinject_post_build_tools"),
+        ("tools/mcp_tool.py", "shutdown_mcp_servers"),
+        ("tools/mcp_tool.py", "_shutdown"),
+        ("tools/mcp_tool.py", "start"),
+        ("tools/mcp_tool.py", "run"),
+        ("tools/mcp_tool.py", "shutdown"),
+    }
+    reached_helpers = {
+        (node_paths[node], node.name)
+        for node in reachable
+    }
+    assert required_helpers <= reached_helpers
+
+    diagnostic_violations = []
+    for path in paths:
+        tree = trees[path]
+        parents = parents_by_path[path]
+
+        def _mcp_scope(node):
+            owner = _owner(path, node)
+            return owner in reachable
+
+        def _caught(node):
+            child = node
+            while node in parents:
+                node = parents[node]
+                if isinstance(node, ast.Try):
+                    if child in node.body and any(
+                        handler.type is None
+                        or (
+                            isinstance(handler.type, ast.Name)
+                            and handler.type.id in {"Exception", "BaseException"}
+                        )
+                        for handler in node.handlers
+                    ):
+                        return True
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    return False
+                child = node
+            return False
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Raise) or not _mcp_scope(node):
+                continue
+            if _caught(node) or node.exc is None:
+                continue
+            owner = _owner(path, node)
+            if owner and owner.name in {
+                "_validate_remote_mcp_url",
+                "_resolve_client_cert",
+                "_expand",
+            }:
+                continue
+            private_names = {
+                child.id
+                for child in ast.walk(node.exc)
+                if isinstance(child, ast.Name)
+            } & {
+                "exc",
+                "exception",
+                "result",
+                "server",
+                "server_name",
+                "session",
+                "session_id",
+                "session_key",
+                "sid",
+            }
+            if private_names:
+                diagnostic_violations.append(
+                    (path, node.lineno, "raw MCP raise payload", private_names)
+                )
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            is_logger = (
+                isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "logger"
+            )
+            message = node.args[0] if node.args else None
+            if not _mcp_scope(node):
+                continue
+
+            if any(keyword.arg == "exc_info" for keyword in node.keywords):
+                diagnostic_violations.append((path, node.lineno, "exc_info"))
+
+            call_name = ""
+            if isinstance(node.func, ast.Name):
+                call_name = node.func.id
+            elif isinstance(node.func, ast.Attribute):
+                call_name = node.func.attr
+            if call_name in {
+                "start_background_mcp_discovery",
+                "ensure_mcp_discovery_before_agent_build",
+            } and path != "hermes_cli/mcp_startup.py":
+                thread_name = next(
+                    (
+                        keyword.value
+                        for keyword in node.keywords
+                        if keyword.arg == "thread_name"
+                    ),
+                    None,
+                )
+                assert isinstance(thread_name, ast.Constant) and isinstance(
+                    thread_name.value, str
+                ), (path, node.lineno)
+
+            if (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "Thread"
+            ):
+                name = next(
+                    (keyword.value for keyword in node.keywords if keyword.arg == "name"),
+                    None,
+                )
+                assert name is not None, (path, node.lineno)
+                private_names = {
+                    child.id
+                    for child in ast.walk(name)
+                    if isinstance(child, ast.Name)
+                } & {"sid", "session_id", "session_key", "params", "frame"}
+                assert private_names == set(), (path, node.lineno, private_names)
+                assert isinstance(name, ast.Constant) or (
+                    path == "hermes_cli/mcp_startup.py"
+                    and isinstance(name, ast.Name)
+                    and name.id == "thread_name"
+                ), (path, node.lineno)
+
+            if is_logger:
+                owner = _owner(path, node)
+                if (
+                    owner
+                    and owner.name == "_connect_server"
+                    and isinstance(message, ast.Constant)
+                    and "orphan-reap" in str(message.value)
+                ):
+                    continue
+                if not (
+                    node.func.attr != "exception"
+                    and len(node.args) == 1
+                    and isinstance(message, ast.Constant)
+                    and isinstance(message.value, str)
+                    and node.keywords == []
+                ):
+                    diagnostic_violations.append((path, node.lineno, "logger"))
+                continue
+
+            if isinstance(node.func, ast.Name) and node.func.id == "_err":
+                assert len(node.args) >= 3, (path, node.lineno)
+                assert isinstance(node.args[2], ast.Constant) and isinstance(
+                    node.args[2].value, str
+                ), (path, node.lineno)
+
+            if isinstance(node.func, ast.Name) and node.func.id == "t":
+                for keyword in node.keywords:
+                    if keyword.arg == "error":
+                        assert isinstance(keyword.value, ast.Constant) and isinstance(
+                            keyword.value.value, str
+                        ), (path, node.lineno)
+
+            is_emit = (
+                isinstance(node.func, ast.Name) and node.func.id == "_emit"
+            ) or (
+                isinstance(node.func, ast.Attribute) and node.func.attr == "emit"
+            )
+            if not is_emit:
+                continue
+            assert _caught(node), (path, node.lineno, "uncaught MCP emit")
+            for arg in node.args:
+                if not isinstance(arg, ast.Dict):
+                    continue
+                fields = {
+                    key.value: value
+                    for key, value in zip(arg.keys, arg.values)
+                    if isinstance(key, ast.Constant) and isinstance(key.value, str)
+                }
+                frame_type = fields.get("type")
+                if not (
+                    isinstance(frame_type, ast.Constant)
+                    and isinstance(frame_type.value, str)
+                    and "error" in frame_type.value
+                ):
+                    continue
+                assert set(fields) <= {"type", "request_id", "message"}, (
+                    path,
+                    node.lineno,
+                )
+                error_message = fields.get("message")
+                assert isinstance(error_message, ast.Constant) and isinstance(
+                    error_message.value, str
+                ), (path, node.lineno)
+
+    assert not diagnostic_violations, "\n".join(map(str, diagnostic_violations))
 
 
 def test_persist_live_session_runtime_preserves_explicit_normal_tier():
@@ -6695,7 +7348,7 @@ def test_ensure_session_db_row_persists_explicit_cwd(monkeypatch, tmp_path):
     server._ensure_session_db_row({"session_key": "k1", "cwd": str(tmp_path), "explicit_cwd": True})
 
     assert created == [
-        {"key": "k1", "source": "tui", "model": "test-model", "model_config": None, "cwd": str(tmp_path)}
+        {"key": "k1", "source": "tui", "model": "test-model", "model_config": {"memory_provider_mode": "hybrid"}, "cwd": str(tmp_path)}
     ]
 
 
@@ -6714,7 +7367,7 @@ def test_ensure_session_db_row_persists_session_source(monkeypatch):
     server._ensure_session_db_row({"session_key": "k1", "source": "tool"})
 
     assert created == [
-        {"key": "k1", "source": "tool", "model": "test-model", "model_config": None, "cwd": None}
+        {"key": "k1", "source": "tool", "model": "test-model", "model_config": {"memory_provider_mode": "hybrid"}, "cwd": None}
     ]
 
 
@@ -6741,7 +7394,7 @@ def test_ensure_session_db_row_records_a_terminal_workspace(monkeypatch, tmp_pat
     server._ensure_session_db_row({"session_key": "k1", "cwd": str(tmp_path)})
 
     assert created == [
-        {"key": "k1", "source": "tui", "model": "test-model", "model_config": None, "cwd": str(tmp_path)}
+        {"key": "k1", "source": "tui", "model": "test-model", "model_config": {"memory_provider_mode": "hybrid"}, "cwd": str(tmp_path)}
     ]
 
 
@@ -6762,7 +7415,7 @@ def test_ensure_session_db_row_defaults_desktop_to_no_workspace(monkeypatch, tmp
     server._ensure_session_db_row({"session_key": "k1", "source": "desktop", "cwd": str(tmp_path)})
 
     assert created == [
-        {"key": "k1", "source": "desktop", "model": "test-model", "model_config": None, "cwd": None}
+        {"key": "k1", "source": "desktop", "model": "test-model", "model_config": {"memory_provider_mode": "hybrid"}, "cwd": None}
     ]
 
 
@@ -6805,8 +7458,8 @@ def test_ensure_session_db_row_persists_session_model_override(monkeypatch):
 
 
 def test_ensure_session_db_row_no_override_uses_global(monkeypatch):
-    """A chat that made no explicit pick falls back to the global model and
-    writes no model_config (so it tracks the profile default)."""
+    """A chat with no explicit model pick uses the global model and persists
+    only the resolved provider mode so resume keeps the same memory routing."""
     created = []
 
     class _FakeDB:
@@ -6818,7 +7471,7 @@ def test_ensure_session_db_row_no_override_uses_global(monkeypatch):
 
     server._ensure_session_db_row({"session_key": "k1", "model_override": None})
 
-    assert created == [{"model": "global/default", "model_config": None}]
+    assert created == [{"model": "global/default", "model_config": {"memory_provider_mode": "hybrid"}}]
 
 
 def test_ensure_session_db_row_stamps_profile_name(monkeypatch, tmp_path):

@@ -1897,6 +1897,7 @@ def run_conversation(
     api_call_count = 0
     final_response = None
     interrupted = False
+    stream_payload_limited = False
     failed = False
     codex_ack_continuations = 0
     length_continue_retries = 0
@@ -4369,8 +4370,8 @@ def run_conversation(
                     thinking_spinner = None
                 if agent.thinking_callback:
                     agent.thinking_callback("")
-                interrupted = True
-                _turn_exit_reason = "stream_payload_bound_exceeded"
+                stream_payload_limited = True
+                _turn_exit_reason = "stream_payload_limit"
                 final_response = persist_interrupted_stream_partial(
                     agent,
                     messages,
@@ -6576,6 +6577,8 @@ def run_conversation(
             continue
 
         # If the API call was interrupted, skip response processing
+        if stream_payload_limited:
+            break
         if interrupted:
             if _turn_exit_reason != "stream_payload_bound_exceeded":
                 _turn_exit_reason = "interrupted_during_api_call"

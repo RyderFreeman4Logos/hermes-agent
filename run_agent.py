@@ -3889,12 +3889,12 @@ class AIAgent:
                 + "the request was interrupted mid-call before a reply was "
                 "received. Send `continue` to retry."
             )
-        if reason == "stream_payload_bound_exceeded":
+        if reason in {"stream_payload_bound_exceeded", "stream_payload_limit"}:
             return (
                 prefix
                 + "the streamed assistant payload exceeded the declared size "
-                "bound. The turn was aborted. Send `continue` or start a new "
-                "turn rather than waiting on a silent think."
+                "bound. The retained partial is safe to resume; send `continue` "
+                "to pick up where it stopped."
             )
         if reason == "budget_exhausted":
             return (
@@ -6628,8 +6628,9 @@ class AIAgent:
         self._current_streamed_assistant_text = ""
         self._current_streamed_payload_bytes = 0
         self._current_streamed_reasoning_bytes = 0
+        self._stream_payload_limit_error = None
 
-    def _record_streamed_assistant_text(self, text: str) -> None:
+    def _record_streamed_assistant_text(self, text: str):
         """Accumulate visible assistant text emitted through stream callbacks."""
         # Single-writer guard (#65991): a superseded stream must not pollute the
         # turn's accumulated text (which also feeds the interim-visible-text
@@ -6643,27 +6644,39 @@ class AIAgent:
                 resolve_stream_payload_bounds,
                 streamed_payload_bytes,
                 StreamPayloadBoundExceeded,
+                utf8_truncate,
             )
 
+            prior_error = getattr(self, "_stream_payload_limit_error", None)
+            if isinstance(prior_error, StreamPayloadBoundExceeded):
+                return prior_error
             assistant_bound, reasoning_bound = resolve_stream_payload_bounds()
             aggregate_bound = max(assistant_bound, reasoning_bound)
             delta = streamed_payload_bytes(text)
             current_bytes = int(getattr(self, "_current_streamed_payload_bytes", 0) or 0)
-            next_assistant = streamed_payload_bytes(
-                getattr(self, "_current_streamed_assistant_text", "") or ""
-            ) + delta
+            existing = getattr(self, "_current_streamed_assistant_text", "") or ""
+            existing_bytes = streamed_payload_bytes(existing)
+            next_assistant = existing_bytes + delta
             next_bytes = current_bytes + delta
-            if next_assistant > assistant_bound or next_bytes > aggregate_bound:
-                raise StreamPayloadBoundExceeded(
+            accepted_bound = min(
+                assistant_bound,
+                existing_bytes + max(0, aggregate_bound - current_bytes),
+            )
+            self._current_streamed_assistant_text = accumulate_stream_text(
+                existing,
+                utf8_truncate(text, max(0, accepted_bound - existing_bytes)),
+                bound=accepted_bound,
+            )
+            accepted_bytes = streamed_payload_bytes(self._current_streamed_assistant_text) - existing_bytes
+            self._current_streamed_payload_bytes = current_bytes + accepted_bytes
+            if accepted_bytes < delta:
+                error = StreamPayloadBoundExceeded(
                     next_assistant if next_assistant > assistant_bound else next_bytes,
                     assistant_bound if next_assistant > assistant_bound else aggregate_bound,
                 )
-            self._current_streamed_assistant_text = accumulate_stream_text(
-                getattr(self, "_current_streamed_assistant_text", "") or "",
-                text,
-                bound=assistant_bound,
-            )
-            self._current_streamed_payload_bytes = next_bytes
+                self._stream_payload_limit_error = error
+                return error
+        return None
 
     @staticmethod
     def _normalize_interim_visible_text(text: str) -> str:
@@ -6970,7 +6983,7 @@ class AIAgent:
         except Exception:
             logger.debug("on_stream_end plugin hook enqueue failed", exc_info=True)
 
-    def _fire_stream_delta(self, text: str) -> None:
+    def _fire_stream_delta(self, text: str):
         """Fire all registered stream delta callbacks (display + TTS)."""
         # Single-writer guard (#65991): a superseded stream must not interleave
         # its tokens into the turn alongside the retry that replaced it.
@@ -7017,7 +7030,12 @@ class AIAgent:
                 text = text.lstrip("\n")
         if not text:
             return
-        self._record_streamed_assistant_text(text)
+        before = getattr(self, "_current_streamed_assistant_text", "") or ""
+        limit_error = self._record_streamed_assistant_text(text)
+        after = getattr(self, "_current_streamed_assistant_text", "") or ""
+        text = after[len(before):] if after.startswith(before) else ""
+        if not text:
+            return limit_error
         callbacks = [cb for cb in (self.stream_delta_callback, self._stream_callback) if cb is not None]
         from agent.stream_payload_bound import StreamPayloadBoundExceeded
         for cb in callbacks:
@@ -7038,8 +7056,9 @@ class AIAgent:
             )
         except Exception:
             logger.debug("on_stream_delta plugin hook enqueue failed", exc_info=True)
+        return limit_error
 
-    def _fire_reasoning_delta(self, text: str) -> None:
+    def _fire_reasoning_delta(self, text: str):
         """Fire reasoning callback if registered."""
         from agent.stream_payload_bound import StreamPayloadBoundExceeded
 
@@ -7048,28 +7067,45 @@ class AIAgent:
         if self._stream_writer_superseded():
             self._note_dropped_stream_writer("_fire_reasoning_delta")
             return
+        limit_error = None
+        accepted_text = text
         if isinstance(text, str) and text:
             from agent.stream_payload_bound import (
                 resolve_stream_payload_bounds,
                 streamed_payload_bytes,
+                utf8_truncate,
             )
 
+            prior_error = getattr(self, "_stream_payload_limit_error", None)
+            if isinstance(prior_error, StreamPayloadBoundExceeded):
+                return prior_error
             assistant_bound, reasoning_bound = resolve_stream_payload_bounds()
             aggregate_bound = max(assistant_bound, reasoning_bound)
             delta = streamed_payload_bytes(text)
-            nxt_reason = int(getattr(self, "_current_streamed_reasoning_bytes", 0) or 0) + delta
-            nxt = int(getattr(self, "_current_streamed_payload_bytes", 0) or 0) + delta
-            if nxt_reason > reasoning_bound or nxt > aggregate_bound:
-                raise StreamPayloadBoundExceeded(
+            current_reason = int(getattr(self, "_current_streamed_reasoning_bytes", 0) or 0)
+            current_total = int(getattr(self, "_current_streamed_payload_bytes", 0) or 0)
+            nxt_reason = current_reason + delta
+            nxt = current_total + delta
+            accepted_text = utf8_truncate(
+                text,
+                min(
+                    max(0, reasoning_bound - current_reason),
+                    max(0, aggregate_bound - current_total),
+                ),
+            )
+            accepted_bytes = streamed_payload_bytes(accepted_text)
+            self._current_streamed_reasoning_bytes = current_reason + accepted_bytes
+            self._current_streamed_payload_bytes = current_total + accepted_bytes
+            if accepted_bytes < delta:
+                limit_error = StreamPayloadBoundExceeded(
                     nxt_reason if nxt_reason > reasoning_bound else nxt,
                     reasoning_bound if nxt_reason > reasoning_bound else aggregate_bound,
                 )
-            self._current_streamed_reasoning_bytes = nxt_reason
-            self._current_streamed_payload_bytes = nxt
+                self._stream_payload_limit_error = limit_error
         cb = self.reasoning_callback
-        if cb is not None:
+        if cb is not None and accepted_text:
             try:
-                cb(text)
+                cb(accepted_text)
             except StreamPayloadBoundExceeded:
                 raise
             except Exception:
@@ -7077,15 +7113,16 @@ class AIAgent:
         try:
             from agent.plugin_stream_hooks import enqueue_plugin_stream_hook, stream_reasoning_deltas_enabled
 
-            if stream_reasoning_deltas_enabled():
+            if accepted_text and stream_reasoning_deltas_enabled():
                 enqueue_plugin_stream_hook(
                     "on_stream_delta",
                     **self._stream_hook_base_payload(),
-                    delta=text,
+                    delta=accepted_text,
                     kind="reasoning",
                 )
         except Exception:
             logger.debug("reasoning on_stream_delta plugin hook enqueue failed", exc_info=True)
+        return limit_error
 
     def _fire_tool_gen_started(self, tool_name: str) -> None:
         """Notify display layer that the model is generating tool call arguments.

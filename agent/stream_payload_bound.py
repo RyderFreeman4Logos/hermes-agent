@@ -74,14 +74,10 @@ def accumulate_stream_text(
     *,
     bound: int = DEFAULT_STREAM_PAYLOAD_BOUND_BYTES,
 ) -> str:
-    """Append ``extra`` and raise if the UTF-8 payload would exceed ``bound``."""
+    """Append ``extra`` while retaining at most ``bound`` UTF-8 bytes."""
     if not extra:
         return existing or ""
-    combined = (existing or "") + extra
-    size = streamed_payload_bytes(combined)
-    if size > bound:
-        raise StreamPayloadBoundExceeded(size, bound)
-    return combined
+    return utf8_truncate((existing or "") + extra, bound)
 
 
 def stream_payload_error_text(
@@ -99,11 +95,16 @@ def persist_interrupted_stream_partial(
     messages: list,
     *,
     elapsed: float = 0.0,
-    bound: int = DEFAULT_STREAM_PAYLOAD_BOUND_BYTES,
+    bound: int | None = DEFAULT_STREAM_PAYLOAD_BOUND_BYTES,
     exceeded: bool = False,
     size: int = 0,
 ) -> str:
     """Persist interrupt text without leaving an oversize orphan last message."""
+    limit_error = getattr(agent, "_stream_payload_limit_error", None)
+    if isinstance(limit_error, StreamPayloadBoundExceeded):
+        exceeded = True
+        size = limit_error.size
+        bound = limit_error.bound
     if bound is None:
         bound, _ = resolve_stream_payload_bounds()
     strip = getattr(agent, "_strip_think_blocks", None)

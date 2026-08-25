@@ -1,6 +1,6 @@
-"""#119: abort an oversize streamed turn; do not persist a 148k interrupt orphan."""
+"""#119/#195: truncate oversize streams and retain a resumable partial."""
 
-import pytest
+from unittest.mock import patch
 
 
 class _QueuedCodexClient:
@@ -83,10 +83,9 @@ def _bound_notifications():
     ]
 
 
-def test_oversize_stream_aborts_and_interrupt_does_not_leave_orphan():
+def test_live_writer_overflow_truncates_persists_status_and_continuation():
     from agent.stream_payload_bound import (
         DEFAULT_STREAM_PAYLOAD_BOUND_BYTES,
-        StreamPayloadBoundExceeded,
         persist_interrupted_stream_partial,
     )
     from run_agent import AIAgent
@@ -105,21 +104,21 @@ def test_oversize_stream_aborts_and_interrupt_does_not_leave_orphan():
     agent.stream_delta_callback = lambda _t: None
     agent._stream_callback = None
 
-    with pytest.raises(StreamPayloadBoundExceeded, match="exceeded"):
-        agent._record_streamed_assistant_text(
-            "x" * (DEFAULT_STREAM_PAYLOAD_BOUND_BYTES + 1)
-        )
+    agent._record_streamed_assistant_text(
+        "x" * (DEFAULT_STREAM_PAYLOAD_BOUND_BYTES + 1)
+    )
+    assert len(agent._current_streamed_assistant_text.encode("utf-8")) == (
+        DEFAULT_STREAM_PAYLOAD_BOUND_BYTES
+    )
+
+    messages = [{"role": "user", "content": "go"}]
+    first = persist_interrupted_stream_partial(agent, messages, elapsed=596.8)
+    assert messages[-1]["content"] == first
+    assert messages[-1].get("status") == "stream_payload_limit"
+    assert "continue" in first.lower()
 
     orphan = "y" * 148_197
     agent._current_streamed_assistant_text = orphan
-    messages = [{"role": "user", "content": "go"}]
-    first = persist_interrupted_stream_partial(agent, messages, elapsed=596.8)
-    assert "exceeded" in first.lower()
-    assert orphan not in first
-    assert messages[-1]["role"] == "assistant"
-    assert messages[-1]["content"] == first
-    assert messages[-1].get("status") == "stream_payload_limit"
-    assert len(first.encode("utf-8")) < 148_197
 
     # Rapid second interrupt (<10s) with a tiny/empty payload must not leave
     # the 148k orphan as the last transcript message.
@@ -132,7 +131,6 @@ def test_oversize_stream_aborts_and_interrupt_does_not_leave_orphan():
 
 
 def test_reasoning_then_visible_stream_bytes_are_monotonic():
-    from agent.stream_payload_bound import StreamPayloadBoundExceeded
     from run_agent import AIAgent
 
     agent = AIAgent(
@@ -146,16 +144,15 @@ def test_reasoning_then_visible_stream_bytes_are_monotonic():
     agent._claim_stream_writer()
     agent._fire_reasoning_delta("r" * 90_000)
 
-    with pytest.raises(StreamPayloadBoundExceeded, match="exceeded"):
-        agent._record_streamed_assistant_text("v" * 50_000)
+    agent._record_streamed_assistant_text("v" * 50_000)
 
-    assert agent._current_streamed_payload_bytes == 90_000
-    assert agent._current_streamed_assistant_text == ""
+    assert agent._current_streamed_payload_bytes == 128 * 1024
+    assert len(agent._current_streamed_assistant_text.encode("utf-8")) == 41_072
+    assert agent._stream_payload_limit_error.status == "stream_payload_limit"
 
 
-def test_codex_app_server_bridge_propagates_aggregate_stream_bound():
+def test_codex_app_server_bridge_truncates_aggregate_stream_bound():
     from agent.codex_runtime import make_codex_app_server_event_bridge
-    from agent.stream_payload_bound import StreamPayloadBoundExceeded
     from run_agent import AIAgent
 
     agent = AIAgent(
@@ -170,14 +167,14 @@ def test_codex_app_server_bridge_propagates_aggregate_stream_bound():
     bridge = make_codex_app_server_event_bridge(agent)
     bridge({"method": "item/reasoning/delta", "params": {"delta": "r" * 90_000}})
 
-    with pytest.raises(StreamPayloadBoundExceeded, match="exceeded"):
-        bridge({"method": "item/agentMessage/delta", "params": {"delta": "v" * 50_000}})
+    limit = bridge({"method": "item/agentMessage/delta", "params": {"delta": "v" * 50_000}})
 
-    assert agent._current_streamed_payload_bytes == 90_000
-    assert agent._current_streamed_assistant_text == ""
+    assert limit.status == "stream_payload_limit"
+    assert agent._current_streamed_payload_bytes == 128 * 1024
+    assert len(agent._current_streamed_assistant_text.encode("utf-8")) == 41_072
 
 
-def test_codex_app_server_bound_aborts_before_projection_or_persistence():
+def test_codex_app_server_bound_persists_typed_partial_without_abort():
     from agent.codex_runtime import (
         make_codex_app_server_event_bridge,
         run_codex_app_server_turn,
@@ -219,14 +216,18 @@ def test_codex_app_server_bound_aborts_before_projection_or_persistence():
     )
 
     assert result["completed"] is False
-    assert "exceeded" in result["error"]
-    assert messages == [{"role": "user", "content": "go"}]
-    assert flushes == []
+    assert result["partial"] is True
+    assert result["interrupted"] is False
+    assert result["error"] is None
+    assert result["status"] == "stream_payload_limit"
+    assert messages[-1]["status"] == "stream_payload_limit"
+    assert "continue" in messages[-1]["content"].lower()
+    assert len(agent._current_streamed_assistant_text.encode("utf-8")) == 41_072
+    assert flushes == [messages]
 
 
-def test_codex_app_server_approval_drain_propagates_stream_bound():
+def test_codex_app_server_approval_drain_returns_stream_limit():
     from agent.codex_runtime import make_codex_app_server_event_bridge
-    from agent.stream_payload_bound import StreamPayloadBoundExceeded
     from agent.transports.codex_app_server_session import CodexAppServerSession
     from run_agent import AIAgent
 
@@ -255,13 +256,13 @@ def test_codex_app_server_approval_drain_propagates_stream_bound():
         on_event=make_codex_app_server_event_bridge(agent),
     )
 
-    with pytest.raises(StreamPayloadBoundExceeded, match="exceeded"):
-        session.run_turn("go", turn_timeout=1.0, notification_poll_timeout=0.01)
+    turn = session.run_turn("go", turn_timeout=1.0, notification_poll_timeout=0.01)
+    assert turn.status == "stream_payload_limit"
+    assert turn.interrupted is False
 
 
-def test_codex_app_server_compact_thread_propagates_stream_bound():
+def test_codex_app_server_compact_thread_returns_stream_limit():
     from agent.codex_runtime import make_codex_app_server_event_bridge
-    from agent.stream_payload_bound import StreamPayloadBoundExceeded
     from agent.transports.codex_app_server_session import CodexAppServerSession
     from run_agent import AIAgent
 
@@ -281,8 +282,9 @@ def test_codex_app_server_compact_thread_propagates_stream_bound():
         on_event=make_codex_app_server_event_bridge(agent),
     )
 
-    with pytest.raises(StreamPayloadBoundExceeded, match="exceeded"):
-        session.compact_thread(turn_timeout=1.0, notification_poll_timeout=0.01)
+    turn = session.compact_thread(turn_timeout=1.0, notification_poll_timeout=0.01)
+    assert turn.status == "stream_payload_limit"
+    assert turn.interrupted is False
 
 
 def test_overflow_retains_partial_with_typed_stream_payload_limit():
@@ -330,7 +332,6 @@ def test_overflow_retains_partial_with_typed_stream_payload_limit():
 
 def test_reasoning_bound_is_independent_of_assistant_bound(monkeypatch):
     """#195: reasoning vs final overflow use separate configurable byte caps."""
-    from agent.stream_payload_bound import StreamPayloadBoundExceeded
     from run_agent import AIAgent
 
     monkeypatch.setattr(
@@ -348,10 +349,55 @@ def test_reasoning_bound_is_independent_of_assistant_bound(monkeypatch):
     agent._claim_stream_writer()
     agent._fire_reasoning_delta("r" * 50)
     assert agent._current_streamed_payload_bytes == 50
-    with pytest.raises(StreamPayloadBoundExceeded) as ei:
-        agent._record_streamed_assistant_text("v" * 21)
-    assert ei.value.status == "stream_payload_limit"
-    assert agent._current_streamed_assistant_text == ""
-    with pytest.raises(StreamPayloadBoundExceeded) as ei2:
-        agent._fire_reasoning_delta("r" * 31)
-    assert ei2.value.status == "stream_payload_limit"
+    assistant_limit = agent._record_streamed_assistant_text("v" * 21)
+    assert assistant_limit.status == "stream_payload_limit"
+    assert agent._current_streamed_assistant_text == "v" * 20
+
+    agent._reset_stream_delivery_tracking()
+    agent._fire_reasoning_delta("r" * 50)
+    reasoning_limit = agent._fire_reasoning_delta("r" * 31)
+    assert reasoning_limit.status == "stream_payload_limit"
+    assert agent._current_streamed_reasoning_bytes == 80
+
+
+def test_stream_payload_limit_explainer_is_not_an_aborted_turn():
+    from run_agent import AIAgent
+
+    text = AIAgent._format_turn_completion_explanation("stream_payload_limit")
+    assert "continue" in text.lower()
+    assert "aborted" not in text.lower()
+
+
+def test_conversation_loop_stream_limit_is_partial_not_interrupted():
+    from agent.stream_payload_bound import DEFAULT_STREAM_PAYLOAD_BOUND_BYTES
+    from run_agent import AIAgent
+
+    agent = AIAgent(
+        api_key="test-key",
+        base_url="https://example.com/v1",
+        model="test/model",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    setattr(agent, "_disable_streaming", True)
+
+    def overflow(_api_kwargs):
+        error = agent._record_streamed_assistant_text(
+            "x" * (DEFAULT_STREAM_PAYLOAD_BOUND_BYTES + 1)
+        )
+        assert error is not None
+        raise error
+
+    with (
+        patch.object(agent, "_interruptible_api_call", side_effect=overflow),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("go")
+
+    assert result["turn_exit_reason"] == "stream_payload_limit"
+    assert result["interrupted"] is False
+    assert result["messages"][-1]["status"] == "stream_payload_limit"
+    assert "continue" in result["final_response"].lower()

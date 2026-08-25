@@ -84,6 +84,19 @@ class TurnResult:
     # of riding a CPU-spinning or auth-broken process. Mirrors openclaw
     # beta.8's "retire timed-out app-server clients" fix.
     should_retire: bool = False
+    status: Optional[str] = None
+    stream_payload_size: int = 0
+    stream_payload_bound: int = 0
+
+
+def _capture_stream_payload_limit(result: TurnResult, outcome: Any) -> bool:
+    if not isinstance(outcome, StreamPayloadBoundExceeded):
+        return False
+    result.status = outcome.status
+    result.stream_payload_size = outcome.size
+    result.stream_payload_bound = outcome.bound
+    result.should_retire = True
+    return True
 
 
 # Markers we accept as terminal even when codex never emits turn/completed.
@@ -280,7 +293,7 @@ class CodexAppServerSession:
         codex_home: Optional[str] = None,
         permission_profile: Optional[str] = None,
         approval_callback: Optional[Callable[..., str]] = None,
-        on_event: Optional[Callable[[dict], None]] = None,
+        on_event: Optional[Callable[[dict], Any]] = None,
         request_routing: Optional[_ServerRequestRouting] = None,
         client_factory: Optional[Callable[..., CodexAppServerClient]] = None,
     ) -> None:
@@ -641,13 +654,16 @@ class CodexAppServerSession:
                     # bubbles around approvals.
                     if self._on_event is not None:
                         try:
-                            self._on_event(pending)
+                            outcome = self._on_event(pending)
                         except StreamPayloadBoundExceeded:
                             raise
                         except Exception:  # pragma: no cover - display callback
                             logger.debug(
                                 "on_event callback raised", exc_info=True
                             )
+                            outcome = None
+                        if _capture_stream_payload_limit(result, outcome):
+                            break
                     _apply_token_usage_notification(result, pending)
                     _apply_compaction_notification(result, pending)
                     self._track_pending_file_change(pending)
@@ -666,6 +682,10 @@ class CodexAppServerSession:
                                 result.error
                                 or "codex reported turn_aborted"
                             )
+                if result.status:
+                    self._issue_interrupt(result.turn_id)
+                    turn_complete = True
+                    break
                 self._handle_server_request(sreq)
                 # Activity counts as live signal — reset the post-tool
                 # quiet timer so an approval round-trip doesn't trip it.
@@ -691,11 +711,16 @@ class CodexAppServerSession:
 
             if self._on_event is not None:
                 try:
-                    self._on_event(note)
+                    outcome = self._on_event(note)
                 except StreamPayloadBoundExceeded:
                     raise
                 except Exception:  # pragma: no cover - display callback
                     logger.debug("on_event callback raised", exc_info=True)
+                    outcome = None
+                if _capture_stream_payload_limit(result, outcome):
+                    self._issue_interrupt(result.turn_id)
+                    turn_complete = True
+                    break
 
             _apply_token_usage_notification(result, note)
             _apply_compaction_notification(result, note)
@@ -925,11 +950,16 @@ class CodexAppServerSession:
 
             if self._on_event is not None:
                 try:
-                    self._on_event(note)
+                    outcome = self._on_event(note)
                 except StreamPayloadBoundExceeded:
                     raise
                 except Exception:  # pragma: no cover - display callback
                     logger.debug("on_event callback raised", exc_info=True)
+                    outcome = None
+                if _capture_stream_payload_limit(result, outcome):
+                    self._issue_interrupt(result.turn_id)
+                    turn_complete = True
+                    break
 
             _apply_token_usage_notification(result, note)
             _apply_compaction_notification(result, note)

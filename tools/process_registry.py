@@ -1793,7 +1793,6 @@ class ProcessRegistry:
         return (
             evt.get("type") == "completion"
             and evt.get("delegated_child") is True
-            and evt.get("exit_code") == 0
             and evt.get("completion_reason", "exited") == "exited"
             and not evt.get("termination_source")
         )

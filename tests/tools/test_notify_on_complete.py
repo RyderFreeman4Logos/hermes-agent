@@ -140,13 +140,13 @@ class TestCompletionQueue:
         ("exit_code", "completion_reason", "termination_source", "visible"),
         (
             (0, "exited", "", False),
-            (1, "exited", "", True),
+            (1, "exited", "", False),
             (-1, "lost", "backend_lost", True),
             (-15, "killed", "process.kill", True),
         ),
-        ids=("success", "nonzero", "lost", "killed"),
+        ids=("exit-0", "exit-1", "lost", "killed"),
     )
-    def test_delegated_child_completion_suppresses_only_routine_success(
+    def test_delegated_child_completion_suppresses_normal_exits(
         self, registry, exit_code, completion_reason, termination_source, visible
     ):
         session = _make_session(
@@ -165,8 +165,11 @@ class TestCompletionQueue:
         assert (len(notifications) == 1) is visible
         assert registry._finished[session.id].output_buffer == "child output"
 
-    def test_parent_owned_success_still_notifies(self, registry):
-        session = _make_session(notify_on_complete=True, output="done", exit_code=0)
+    @pytest.mark.parametrize("exit_code", (0, 1), ids=("success", "nonzero"))
+    def test_parent_owned_completion_still_notifies(self, registry, exit_code):
+        session = _make_session(
+            notify_on_complete=True, output="done", exit_code=exit_code
+        )
         registry._running[session.id] = session
         with patch.object(registry, "_write_checkpoint"):
             registry._move_to_finished(session)

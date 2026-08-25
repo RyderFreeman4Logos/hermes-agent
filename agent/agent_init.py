@@ -3063,6 +3063,13 @@ def init_agent(
             "is_anthropic_oauth": agent._is_anthropic_oauth,
         })
 
+    try:
+        from hermes_cli.model_switch import restore_model_switch_after_compression
+
+        restore_model_switch_after_compression(agent)
+    except Exception:
+        logger.debug("deferred model-switch restore skipped", exc_info=True)
+
 
 
 __all__ = ["init_agent"]

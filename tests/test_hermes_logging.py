@@ -136,6 +136,21 @@ class TestSetupLogging:
         assert agent_handlers[0].level == logging.WARNING
 
 
+    def test_readonly_agent_log_does_not_raise(self, hermes_home, monkeypatch):
+        """CSA sandboxes may leave ~/.hermes/logs/agent.log EROFS (#201)."""
+        import errno
+
+        def _erofs_handler(path, *args, **kwargs):
+            raise OSError(errno.EROFS, "Read-only file system", path)
+
+        monkeypatch.setattr(
+            hermes_logging, "_ManagedRotatingFileHandler", _erofs_handler
+        )
+
+        log_dir = hermes_logging.setup_logging(hermes_home=hermes_home)
+        assert log_dir == hermes_home / "logs"
+        assert hermes_logging.rotating_file_handlers() == []
+
 
 class TestGatewayMode:
     """setup_logging(mode='gateway') creates a filtered gateway.log."""

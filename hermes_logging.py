@@ -302,7 +302,11 @@ def setup_logging(
     global _logging_initialized
     home = hermes_home or get_hermes_home()
     log_dir = home / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        # Read-only sandbox (CSA ACP) still needs process startup (#201).
+        pass
 
     # Read config defaults (best-effort — config may not be loaded yet).
     cfg_level, cfg_max_size, cfg_backup = _read_logging_config()
@@ -745,11 +749,16 @@ def _add_rotating_handler(
         ):
             return  # already attached
 
-    path.parent.mkdir(parents=True, exist_ok=True)
-    handler = _ManagedRotatingFileHandler(
-        str(path), maxBytes=max_bytes, backupCount=backup_count,
-        encoding="utf-8",
-    )
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handler = _ManagedRotatingFileHandler(
+            str(path), maxBytes=max_bytes, backupCount=backup_count,
+            encoding="utf-8",
+        )
+    except OSError:
+        # File logging is optional. CSA sandboxes and other read-only
+        # HERMES_HOME trees must not crash ACP/agent startup (#201).
+        return
     handler.setLevel(level)
     handler.setFormatter(formatter)
     if log_filter is not None:

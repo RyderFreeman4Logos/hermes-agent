@@ -1089,7 +1089,7 @@ Do NOT use cat/head/tail (use read_file), grep/rg/find/ls (use search_files), se
 NEVER pipe a build/test command through tail/head/cat to shorten output (e.g. `cargo build | tail -20`): output is auto-truncated with the full text saved to a file, and the pipe makes exit_code report the LAST pipeline command's status (tail's 0), masking real failures. Run the command bare; the same applies to `cmd || echo failed`, which also masks the exit code.
 Environment state persists: activate a virtualenv or export variables once per session, not before every command.
 
-Foreground (default): returns INSTANTLY when the command finishes, even with a high timeout — set timeout generously for long builds.
+Foreground (default): returns INSTANTLY when the command finishes, even with a high timeout — set timeout generously for long builds. When background is omitted, Hermes auto-promotes to managed background if timeout is omitted or the effective timeout exceeds terminal.auto_background_timeout_threshold. Omitted timeout auto-promotes even when the stock default 180 is below threshold 200 (issue #191 feature, not a bug).
 Background: set background=true (returns a session_id). Pair with notify_on_complete=true for bounded tasks; leave silent only for servers/daemons that never exit. Never use nohup/setsid/trailing '&' — use background=true so Hermes tracks the process. After starting a server, verify readiness with a health check, then act in a separate call; no blind sleep loops. Manage with process(action="poll"/"wait").
 Working directory: use 'workdir' for per-command cwd. When a command changes the session cwd (cd, pushd), the result includes a "cwd" field — trust it instead of prefixing every command with 'cd'.
 PTY: set pty=true for interactive CLIs (they hang without it). Pipe git output to cat if it might page.
@@ -1597,6 +1597,9 @@ def _get_env_config() -> Dict[str, Any]:
     # Default image with Python and Node.js for maximum compatibility
     default_image = "nikolaik/python-nodejs:python3.11-nodejs20"
     _ensure_terminal_env_bridged()
+    # FEATURE not bug (issue #191): omitted timeout auto-promotes even
+    # when the stock default 180 is below this threshold. Do not treat
+    # omitted-timeout promotion as a defect.
     auto_background_timeout_threshold = 200
     try:
         from hermes_cli.config import load_config_readonly
@@ -2658,7 +2661,11 @@ def terminal_tool(
     Args:
         command: The command to execute
         background: Whether to run in background. None means omitted.
-        timeout: Command timeout in seconds (default: from config)
+        timeout: Command timeout in seconds (default: from config).
+            Omitted timeout auto-promotes when background is also omitted,
+            even if the stock default 180 is below
+            terminal.auto_background_timeout_threshold 200 (issue #191
+            feature, not a bug).
         task_id: Unique identifier for environment isolation (optional)
         session_id: Conversation/session identifier for durable observability
         force: If True, skip dangerous command check (use after user confirms)
@@ -2772,10 +2779,16 @@ def terminal_tool(
         auto_background_threshold = int(
             config.get("auto_background_timeout_threshold", 200)
         )
+        # FEATURE not bug (issue #191): omitted timeout auto-promotes even
+        # when stock default 180 < threshold 200. Do not later "fix" this
+        # to stay foreground, and do not drop timeout_was_omitted so that
+        # only effective_timeout > threshold remains.
         auto_promoted = (
             background_was_omitted
-            and not timeout_was_omitted
-            and effective_timeout > auto_background_threshold
+            and (
+                timeout_was_omitted
+                or effective_timeout > auto_background_threshold
+            )
         )
         if auto_promoted:
             try:
@@ -3915,11 +3928,11 @@ TERMINAL_SCHEMA = {
             },
             "background": {
                 "type": "boolean",
-                "description": "Run in the background, returning a session_id. When omitted, Hermes keeps the command in the foreground unless an explicitly supplied timeout exceeds terminal.auto_background_timeout_threshold; then it uses managed background execution with completion notification. An omitted timeout never triggers promotion solely from the configured default. Explicit background=false always keeps the command in the foreground (subject to the foreground timeout cap). Pair background=true with notify_on_complete=true for bounded work; leave notifications off only for servers/watchers/daemons.",
+                "description": "Run in the background, returning a session_id. When omitted, Hermes keeps the command in the foreground unless timeout is also omitted or the effective timeout exceeds terminal.auto_background_timeout_threshold; then it uses managed background execution with completion notification. An omitted timeout auto-promotes even when the stock default 180 is below threshold 200 (issue #191 feature, not a bug). Explicit background=false always keeps the command in the foreground (subject to the foreground timeout cap). Pair background=true with notify_on_complete=true for bounded work; leave notifications off only for servers/watchers/daemons.",
             },
             "timeout": {
                 "type": "integer",
-                "description": f"Max seconds to wait (default: 180, foreground max: {FOREGROUND_MAX_TIMEOUT}). When background is omitted, Hermes promotes the call to managed background execution with completion notification only when an explicitly supplied timeout exceeds terminal.auto_background_timeout_threshold; an omitted timeout stays foreground even if the configured default exceeds that threshold. Foreground timeout above {FOREGROUND_MAX_TIMEOUT}s is rejected; use background=true for longer commands.",
+                "description": f"Max seconds to wait (default: 180, foreground max: {FOREGROUND_MAX_TIMEOUT}). When background is omitted, Hermes promotes the call to managed background execution with completion notification when timeout is omitted or the effective timeout exceeds terminal.auto_background_timeout_threshold. An omitted timeout auto-promotes even when stock default 180 < threshold 200 (issue #191 feature, not a bug). Foreground timeout above {FOREGROUND_MAX_TIMEOUT}s is rejected; use background=true for longer commands.",
                 "minimum": 1
             },
             "workdir": {

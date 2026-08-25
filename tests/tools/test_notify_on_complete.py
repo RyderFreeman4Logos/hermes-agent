@@ -408,7 +408,13 @@ def _call_terminal_handler(
 @pytest.mark.parametrize(
     ("call_style", "config_overrides", "args", "expected"),
     [
-        ("handler", {"timeout": 7200}, {}, "foreground"),
+        # FEATURE not bug (issue #191): omitted timeout + omitted background
+        # auto-promotes even when stock default 180 < threshold 200.
+        # Do not later "fix" this row to stay foreground.
+        ("handler", {}, {}, "background"),
+        ("handler", {}, {"timeout": 30}, "foreground"),
+        ("handler", {}, {"timeout": 300}, "background"),
+        ("handler", {}, {"background": False}, "foreground"),
         ("direct", {}, {"timeout": 7200}, "background"),
         ("handler", {}, {"timeout": 7200}, "background"),
         ("handler", {}, {"timeout": 7200, "notify_on_complete": False}, "background"),

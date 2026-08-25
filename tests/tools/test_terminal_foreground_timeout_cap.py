@@ -84,7 +84,11 @@ class TestForegroundTimeoutCap:
             with patch("tools.terminal_tool._active_environments", {"default": mock_env}), \
                  patch("tools.terminal_tool._last_activity", {"default": 0}), \
                  patch("tools.terminal_tool._check_all_guards", return_value={"approved": True}):
-                result = json.loads(terminal_tool(command="pnpm dev --help"))
+                # background=false: omitted timeout would auto-promote (#191 FEATURE).
+                result = json.loads(terminal_tool(
+                    command="pnpm dev --help",
+                    background=False,
+                ))
 
         assert result["error"] is None
         call_kwargs = mock_env.execute.call_args
@@ -99,7 +103,9 @@ class TestForegroundTimeoutCap:
         """
         from tools.terminal_tool import terminal_tool
 
-        # User configured TERMINAL_TIMEOUT=900 in their env
+        # User configured TERMINAL_TIMEOUT=900 in their env.
+        # background=false keeps this on the foreground cap path; omitted
+        # timeout would auto-promote (#191 FEATURE) even if threshold is raised.
         with patch("tools.terminal_tool._get_env_config",
                     return_value=_make_env_config(timeout=900)), \
              patch("tools.terminal_tool._start_cleanup_thread"):
@@ -110,7 +116,10 @@ class TestForegroundTimeoutCap:
             with patch("tools.terminal_tool._active_environments", {"default": mock_env}), \
                  patch("tools.terminal_tool._last_activity", {"default": 0}), \
                  patch("tools.terminal_tool._check_all_guards", return_value={"approved": True}):
-                result = json.loads(terminal_tool(command="make build"))
+                result = json.loads(terminal_tool(
+                    command="make build",
+                    background=False,
+                ))
 
         # Should execute with the config default, NOT be rejected
         call_kwargs = mock_env.execute.call_args

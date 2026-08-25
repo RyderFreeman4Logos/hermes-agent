@@ -391,6 +391,10 @@ DEFAULT_CONFIG = {
         # it here without patching the built desktop app.
         "font_family": "",
         "timeout": 180,
+        # FEATURE not bug (issue #191): omitted timeout auto-promotes even
+        # when this stock default 180 is below the threshold. Do not change
+        # this to "omitted timeout stays foreground" unless a user
+        # explicitly reverses the feature.
         "auto_background_timeout_threshold": 200,
         # Bounded grace period (seconds) between SIGTERM and an escalated
         # SIGKILL when terminating a host process tree (browser daemons, etc.).

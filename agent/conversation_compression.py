@@ -2232,11 +2232,15 @@ def _queue_context_engine_compression_notification(
         raise RuntimeError("a compression notification is already pending")
 
     def _notify() -> bool:
-        return _notify_context_engine_compression_complete(
+        from hermes_cli.model_switch import apply_model_switch_after_compression
+
+        applied = apply_model_switch_after_compression(agent) == "applied"
+        observed = _notify_context_engine_compression_complete(
             agent,
             new_session_id=new_session_id,
             old_session_id=old_session_id,
         )
+        return applied or observed
 
     setattr(agent, _PENDING_CONTEXT_ENGINE_NOTIFICATION, _notify)
 
@@ -3885,6 +3889,9 @@ def compress_context(
                     old_session_id=_boundary_parent,
                 )
             else:
+                from hermes_cli.model_switch import apply_model_switch_after_compression
+
+                apply_model_switch_after_compression(agent)
                 _notify_context_engine_compression_complete(
                     agent,
                     new_session_id=agent.session_id or "",

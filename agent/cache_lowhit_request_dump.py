@@ -1,8 +1,7 @@
-"""Unredacted last-2 send-time dump on economically near-zero cache hits."""
+"""Fingerprint-only last-2 send-time dump on economically near-zero cache hits."""
 
 from __future__ import annotations
 
-import copy
 import threading
 import time
 from collections import deque
@@ -11,7 +10,14 @@ from typing import Any
 from hermes_constants import get_hermes_home
 from utils import atomic_json_write
 
-from agent.physical_attempt_diagnostics import _cache_key, _later_history, _prefix
+from agent.physical_attempt_diagnostics import (
+    _cache_key,
+    _digest,
+    _key,
+    _later_history,
+    _prefix,
+    _serialized,
+)
 from agent.usage_pricing import CanonicalUsage
 
 __all__ = [
@@ -35,18 +41,23 @@ def reset_for_tests() -> None:
 def remember_sent_request(
     request: dict[str, Any], *, api_mode: str = "chat_completions"
 ) -> None:
-    """Keep the last two actually-sent cache-identity snapshots."""
-    snapshot = copy.deepcopy(
-        {
-            "prefix": _prefix(request),
-            "messages": request.get("messages"),
-            "input": request.get("input"),
-            "tools": request.get("tools") or request.get("toolConfig") or [],
-            "prompt_cache_key": _cache_key(request),
-            "model": request.get("model"),
-            "later_history": _later_history(request, api_mode),
-        }
-    )
+    """Keep the last two send-time fingerprints and sizes, never raw bodies."""
+    components = {
+        "prefix": _prefix(request),
+        "messages": request.get("messages"),
+        "input": request.get("input"),
+        "tools": request.get("tools") or request.get("toolConfig") or [],
+        "prompt_cache_key": _cache_key(request),
+        "later_history": _later_history(request, api_mode),
+    }
+    key = _key()
+    snapshot = {
+        "fingerprint": _digest(key, "cache_lowhit", components),
+        "sizes": {
+            f"{name}_bytes": len(_serialized(value)) for name, value in components.items()
+        },
+        "model": request.get("model"),
+    }
     with _LOCK:
         _LAST.append(snapshot)
 
@@ -62,7 +73,7 @@ def _is_near_zero(usage: CanonicalUsage) -> bool:
 
 
 def maybe_dump_on_usage(usage: CanonicalUsage) -> None:
-    """Write the last two unredacted send-time prefixes when the hit is near-zero."""
+    """Write the last two fingerprints when the hit is economically near-zero."""
     if not _is_near_zero(usage):
         return
     with _LOCK:

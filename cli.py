@@ -11541,7 +11541,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         custom_provs = ctx.custom_providers if ctx is not None else None
 
         # No args at all: open prompt_toolkit-native picker modal
-        if not model_input and not explicit_provider:
+        if (
+            not model_input
+            and not explicit_provider
+            and not request.is_after_compression
+        ):
             model_display = self.model or "unknown"
             provider_display = get_label(self.provider) if self.provider else "unknown"
 
@@ -11586,10 +11590,29 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             explicit_provider=explicit_provider,
             user_providers=user_provs,
             custom_providers=custom_provs,
+            is_after_compression=request.is_after_compression,
+            reasoning=request.reasoning,
+            validate_live=not request.is_after_compression,
         )
 
         if not result.success:
             _cprint(f"  ✗ {result.error_message}")
+            return
+        result.is_after_compression = request.is_after_compression
+
+        if request.is_after_compression:
+            agent = getattr(self, "agent", None)
+            if agent is None:
+                _cprint("  ✗ --after-compression requires a live session.")
+                return
+            try:
+                from hermes_cli.model_switch import schedule_model_switch_after_compression
+
+                schedule_model_switch_after_compression(agent, result)
+            except Exception as exc:
+                _cprint(f"  ✗ Could not schedule model switch: {exc}")
+                return
+            _cprint(f"  ✓ Model switch scheduled after compression: {result.new_model}")
             return
 
         if self.agent is not None:

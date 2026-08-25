@@ -2125,19 +2125,24 @@ class ProcessRegistry:
             return {"status": "not_found", "error": f"No process with ID {session_id}"}
 
         if session.notify_on_complete and not session.exited:
-            return {
-                "status": "running",
-                "session_id": session.id,
-                "command": session.command,
-                "process_running": True,
-                "wait_deferred": True,
-                "notify_on_complete": True,
-                "note": (
-                    "process.wait was auto-backgrounded because notify_on_complete "
-                    "is set; continue other work and you will be notified exactly "
-                    "once when the process exits."
-                ),
-            }
+            from agent.delegation_context import is_delegated_child_context
+
+            # A native child has no parent notification drain. Deferring its
+            # wait leaves the child looping on wait_deferred until interrupt.
+            if not is_delegated_child_context():
+                return {
+                    "status": "running",
+                    "session_id": session.id,
+                    "command": session.command,
+                    "process_running": True,
+                    "wait_deferred": True,
+                    "notify_on_complete": True,
+                    "note": (
+                        "process.wait was auto-backgrounded because notify_on_complete "
+                        "is set; continue other work and you will be notified exactly "
+                        "once when the process exits."
+                    ),
+                }
 
         deadline = time.monotonic() + effective_timeout
 

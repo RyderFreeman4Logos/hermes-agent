@@ -19,6 +19,8 @@ from tools.process_registry import (
     ProcessSession,
 )
 
+_MISSING_EXIT_CODE = object()
+
 
 @pytest.fixture()
 def registry():
@@ -141,10 +143,25 @@ class TestCompletionQueue:
         (
             (0, "exited", "", False),
             (1, "exited", "", False),
+            (None, "exited", "", True),
+            (True, "exited", "", True),
+            (False, "exited", "", True),
+            ("0", "exited", "", True),
+            (_MISSING_EXIT_CODE, "exited", "", True),
             (-1, "lost", "backend_lost", True),
             (-15, "killed", "process.kill", True),
         ),
-        ids=("exit-0", "exit-1", "lost", "killed"),
+        ids=(
+            "exit-0",
+            "exit-1",
+            "none",
+            "bool-true",
+            "bool-false",
+            "non-int",
+            "missing",
+            "lost",
+            "killed",
+        ),
     )
     def test_delegated_child_completion_suppresses_normal_exits(
         self, registry, exit_code, completion_reason, termination_source, visible
@@ -153,13 +170,17 @@ class TestCompletionQueue:
             notify_on_complete=True,
             delegated_child=True,
             output="child output",
-            exit_code=exit_code,
+            exit_code=None if exit_code is _MISSING_EXIT_CODE else exit_code,
             completion_reason=completion_reason,
             termination_source=termination_source,
         )
         registry._running[session.id] = session
         with patch.object(registry, "_write_checkpoint"):
             registry._move_to_finished(session)
+        if exit_code is _MISSING_EXIT_CODE:
+            evt = registry.completion_queue.get_nowait()
+            del evt["exit_code"]
+            registry.completion_queue.put(evt)
 
         notifications = registry.drain_notifications()
         assert (len(notifications) == 1) is visible

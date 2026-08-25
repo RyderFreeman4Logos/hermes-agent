@@ -91,6 +91,24 @@ class TestWaitTimeoutClarity:
         assert result["process_running"] is True
         assert not registry.is_completion_consumed(session.id)
 
+    def test_delegated_child_does_not_defer_notified_wait(self, registry):
+        from agent.delegation_context import delegated_child_context
+
+        session = ProcessSession(
+            id="proc_child_wait_no_defer",
+            command="long-running command",
+            notify_on_complete=True,
+        )
+        session._completion_event = threading.Event()
+        registry._running[session.id] = session
+
+        with delegated_child_context():
+            result = registry.wait(session.id, timeout=1)
+
+        assert result.get("wait_deferred") is not True
+        assert result["status"] == "timeout"
+        assert not registry.is_completion_consumed(session.id)
+
     @pytest.mark.parametrize("exit_code", [0, 7])
     def test_deferred_wait_keeps_one_success_or_failure_notification(
         self, registry, exit_code

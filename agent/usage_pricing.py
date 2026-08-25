@@ -1464,7 +1464,7 @@ def normalize_usage(
             cache_read_tokens, cache_write_tokens,
         )
 
-    return CanonicalUsage(
+    usage = CanonicalUsage(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         cache_read_tokens=cache_read_tokens,
@@ -1472,6 +1472,13 @@ def normalize_usage(
         reasoning_tokens=reasoning_tokens,
         cache_telemetry=cache_telemetry,
     )
+    try:
+        from agent.cache_lowhit_request_dump import maybe_dump_on_usage
+
+        maybe_dump_on_usage(usage)
+    except Exception:
+        logger.debug("cache low-hit dump failed", exc_info=True)
+    return usage
 
 
 def estimate_usage_cost(

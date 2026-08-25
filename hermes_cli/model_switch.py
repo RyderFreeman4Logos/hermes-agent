@@ -769,6 +769,7 @@ def _snapshot_runtime(agent: Any) -> dict:
         "_client_kwargs", "request_overrides", "reasoning_config",
         "_primary_runtime", "_cached_system_prompt", "_fallback_chain",
         "_fallback_model", "_fallback_activated", "_fallback_index",
+        "_session_init_model_config", "ui_route",
     )
     snapshot = {
         name: _copy_state(getattr(agent, name, _RUNTIME_MISSING))
@@ -799,6 +800,12 @@ def _restore_runtime(agent: Any, snapshot: dict) -> None:
     if compressor_state is not None and compressor is not None:
         compressor.__dict__.clear()
         compressor.__dict__.update(compressor_state)
+
+
+def _inject_deferred_model_switch_fault(agent: Any, stage: str) -> None:
+    """Raise when a test asks to fail immediately after ``stage``."""
+    if getattr(agent, "_deferred_model_switch_fault_after", None) == stage:
+        raise RuntimeError(f"injected deferred model-switch fault after {stage}")
 
 
 def _emit_deferred_model_switch_status(agent: Any, message: str) -> None:
@@ -931,6 +938,7 @@ def apply_model_switch_after_compression(agent: Any) -> str:
             agent._applying_model_switch_after_compression = True
             agent._deferred_model_switch_context_length = result.context_length
             agent._deferred_model_switch_reasoning_config = result.reasoning_config
+            _inject_deferred_model_switch_fault(agent, "compress_success")
             agent.switch_model(
                 result.new_model,
                 result.target_provider,
@@ -950,6 +958,10 @@ def apply_model_switch_after_compression(agent: Any) -> str:
                 result=result,
                 system_prompt=prompt,
             )
+            _inject_deferred_model_switch_fault(agent, "db")
+            if callable(callback):
+                callback(result, old_model, old_provider)
+            _inject_deferred_model_switch_fault(agent, "frontend")
         except Exception as exc:
             _restore_runtime(agent, runtime)
             try:
@@ -984,11 +996,6 @@ def apply_model_switch_after_compression(agent: Any) -> str:
             "model": result.new_model,
             "provider": result.target_provider,
         }
-        if callable(callback):
-            try:
-                callback(result, old_model, old_provider)
-            except Exception:
-                logger.exception("deferred model-switch frontend sync failed")
         _emit_deferred_model_switch_status(
             agent,
             "Deferred model switch applied after compression: "

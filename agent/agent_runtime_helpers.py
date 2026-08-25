@@ -2614,6 +2614,7 @@ def _switch_model_unlocked(agent, new_model, new_provider, api_key='', base_url=
     change persists across turns (unlike fallback which is
     turn-scoped).
     """
+    from hermes_cli.model_switch import _inject_deferred_model_switch_fault
     from hermes_cli.providers import determine_api_mode
 
     # ── Determine api_mode if not provided ──
@@ -2738,6 +2739,8 @@ def _switch_model_unlocked(agent, new_model, new_provider, api_key='', base_url=
             agent._transport_cache.clear()
         if api_key:
             agent.api_key = api_key
+        if _is_deferred_boundary_switch:
+            _inject_deferred_model_switch_fault(agent, "provider_resolve")
 
         # ── Reload credential pool for the new provider (issue #52727) ──
         # Without this, ``recover_with_credential_pool`` sees a
@@ -2860,6 +2863,8 @@ def _switch_model_unlocked(agent, new_model, new_provider, api_key='', base_url=
             )
 
         sync_credential_pool_entry_id(agent)
+        if _is_deferred_boundary_switch:
+            _inject_deferred_model_switch_fault(agent, "client_construct")
     except Exception:
         # Rollback every mutated field to the pre-swap snapshot so the agent
         # is left consistent (old model + old provider + old client) and the
@@ -2965,6 +2970,8 @@ def _switch_model_unlocked(agent, new_model, new_provider, api_key='', base_url=
             provider=agent.provider,
             api_mode=agent.api_mode,
         )
+        if _is_deferred_boundary_switch:
+            _inject_deferred_model_switch_fault(agent, "compressor_update")
 
     # ── Re-resolve reasoning_config from per-model override ──
     # The new model may have a different reasoning_effort override. Re-read
@@ -2975,6 +2982,7 @@ def _switch_model_unlocked(agent, new_model, new_provider, api_key='', base_url=
         agent.reasoning_config = copy.deepcopy(
             getattr(agent, "_deferred_model_switch_reasoning_config", None)
         )
+        _inject_deferred_model_switch_fault(agent, "overrides")
     else:
         try:
             from hermes_constants import resolve_reasoning_config

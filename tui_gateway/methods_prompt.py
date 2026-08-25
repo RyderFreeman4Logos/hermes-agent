@@ -13,6 +13,20 @@ method = _registry.method
 _profile_scoped = _registry.profile_scoped
 
 
+def _is_agent_loop_timing(text) -> bool:
+    """Recognize the reserved runtime timing block, not ordinary user text."""
+    if not isinstance(text, str):
+        return False
+    lines = text.splitlines()
+    prefixes = ("Previous loop start: ", "Previous loop stop: ", "Current loop start: ")
+    return (
+        len(lines) >= 2
+        and lines[0] == "[Agent loop timing]"
+        and any(line.startswith(prefixes[2]) for line in lines[1:])
+        and all(line.startswith(prefixes) for line in lines[1:])
+    )
+
+
 def _history_user_indices(history: list) -> list:
     """Indices of model-visible user turns (excludes display_kind timeline markers)."""
     return [
@@ -316,6 +330,18 @@ def _(rid, params: dict) -> dict:
     session, err = _sess_nowait(params, rid)
     if err:
         return err
+    if _is_agent_loop_timing(text):
+        # Runtime timing is request-local developer context, never user speech.
+        # Publish it only to an active loop; request assembly consumes it as an
+        # uncached trailing system entry. An idle check-in is intentionally a no-op.
+        with session["history_lock"]:
+            agent = session.get("agent")
+            if session.get("running") and agent is not None:
+                agent._loop_timing_context_text = text
+                status = "appended"
+            else:
+                status = "ignored"
+        return _ok(rid, {"status": status})
     if (limit_message := _ensure_active_session_slot(sid, session)) is not None:
         return _err(rid, 4090, limit_message)
     # Which desktop window this message was typed into. Rewritten on every
@@ -1549,6 +1575,7 @@ def register(server) -> None:
     # sites) resolve the same free names after the split.
     g = vars(server)
     for helper in (
+        _is_agent_loop_timing,
         _history_user_indices,
         _message_row_id,
         _mem_db_pair_agrees,

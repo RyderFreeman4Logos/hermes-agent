@@ -2996,6 +2996,12 @@ def run_conversation(
                 # unless the active provider needs it) so the fallback request
                 # isn't sent with stale, primary-shaped reasoning fields.
                 agent._reapply_reasoning_echo_for_provider(api_messages)
+                # Consume runtime timing only while this request is being built.
+                # Cache planning skips trailing system entries, so it stays
+                # after the last breakpoint and carries no cache_control.
+                if timing_context := getattr(agent, "_loop_timing_context_text", ""):
+                    api_messages.append({"role": "system", "content": timing_context})
+                    agent._loop_timing_context_text = ""
                 # Same story for prompt-cache decoration (#72626): try_activate_
                 # fallback refreshes the policy flags, but the decorated list
                 # still carries the primary's breakpoints (or none). Strip and

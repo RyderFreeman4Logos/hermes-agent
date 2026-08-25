@@ -34,6 +34,7 @@ from agent.error_classifier import (
     PROVIDER_STREAM_NON_JSON_ERROR_CODE,
 )
 from agent.errors import EmptyStreamError
+from agent.stream_payload_bound import StreamPayloadBoundExceeded
 from agent.turn_context import substitute_api_content
 from agent.gemini_native_adapter import is_native_gemini_base_url
 from agent.model_metadata import is_local_endpoint
@@ -64,6 +65,11 @@ _PROVIDER_STREAM_ERROR_TEXT_LIMIT = 4096
 # billing reasons keep their own 60s cooldown (set above); this is the
 # narrower non-rate-limit case.  See issue #24996.
 _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
+
+
+def _raise_stream_payload_limit(outcome: Any) -> None:
+    if isinstance(outcome, StreamPayloadBoundExceeded):
+        raise outcome
 
 
 def _context_thread_target(callback):
@@ -3437,7 +3443,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 def _on_text(text):
                     _bedrock_response_started["yes"] = True
                     _fire_first()
-                    agent._fire_stream_delta(text)
+                    _raise_stream_payload_limit(agent._fire_stream_delta(text))
                     deltas_were_sent["yes"] = True
 
                 def _on_tool(name):
@@ -3448,7 +3454,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 def _on_reasoning(text):
                     _bedrock_response_started["yes"] = True
                     _fire_first()
-                    agent._fire_reasoning_delta(text)
+                    _raise_stream_payload_limit(agent._fire_reasoning_delta(text))
 
                 def _finalize_bedrock_stream():
                     return stream_converse_with_callbacks(
@@ -4028,14 +4034,16 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             if not tool_calls_acc:
                 for text in pending_parts:
                     _fire_first_delta()
-                    agent._fire_stream_delta(text)
+                    _raise_stream_payload_limit(agent._fire_stream_delta(text))
                     deltas_were_sent["yes"] = True
                 return
-            if agent.stream_delta_callback:
-                for text in pending_parts:
+            for text in pending_parts:
+                _raise_stream_payload_limit(agent._record_streamed_assistant_text(text))
+                if agent.stream_delta_callback:
                     try:
                         agent.stream_delta_callback(text)
-                        agent._record_streamed_assistant_text(text)
+                    except StreamPayloadBoundExceeded:
+                        raise
                     except Exception:
                         pass
 
@@ -4141,7 +4149,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 )
                 reasoning_parts.append(reasoning_text)
                 _fire_first_delta()
-                agent._fire_reasoning_delta(reasoning_text)
+                _raise_stream_payload_limit(agent._fire_reasoning_delta(reasoning_text))
 
             # Accumulate text content — fire callback only when no tool calls
             delta_content = getattr(delta, "content", None)
@@ -4156,7 +4164,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         _flush_pending_stream_text()
                         continue
                     _fire_first_delta()
-                    agent._fire_stream_delta(delta_content)
+                    _raise_stream_payload_limit(agent._fire_stream_delta(delta_content))
                     deltas_were_sent["yes"] = True
                 # Tool calls suppress regular content streaming (avoids
                 # displaying chatty "I'll use the tool..." text alongside
@@ -4169,12 +4177,15 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 # reasoning display.  Non-reasoning text is harmlessly
                 # suppressed by the CLI's _stream_delta when the stream
                 # box is already closed (tool boundary flush).
-                elif agent.stream_delta_callback:
-                    try:
-                        agent.stream_delta_callback(delta_content)
-                        agent._record_streamed_assistant_text(delta_content)
-                    except Exception:
-                        pass
+                elif tool_calls_acc:
+                    _raise_stream_payload_limit(agent._record_streamed_assistant_text(delta_content))
+                    if agent.stream_delta_callback:
+                        try:
+                            agent.stream_delta_callback(delta_content)
+                        except StreamPayloadBoundExceeded:
+                            raise
+                        except Exception:
+                            pass
 
             # Accumulate tool call deltas — notify display on first name
             delta_tool_calls = getattr(delta, "tool_calls", None)
@@ -4301,11 +4312,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 )
                 if isinstance(reasoning_text, str) and reasoning_text:
                     _fire_first_delta()
-                    agent._fire_reasoning_delta(reasoning_text)
+                    _raise_stream_payload_limit(agent._fire_reasoning_delta(reasoning_text))
                 content = getattr(message, "content", None)
                 if isinstance(content, str) and content:
                     _fire_first_delta()
-                    agent._fire_stream_delta(content)
+                    _raise_stream_payload_limit(agent._fire_stream_delta(content))
             return final_response
 
         # Build mock response matching non-streaming shape
@@ -4596,13 +4607,13 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                             text = getattr(delta, "text", "")
                             if text and not has_tool_use:
                                 _fire_first_delta()
-                                agent._fire_stream_delta(text)
+                                _raise_stream_payload_limit(agent._fire_stream_delta(text))
                                 deltas_were_sent["yes"] = True
                         elif delta_type == "thinking_delta":
                             thinking_text = getattr(delta, "thinking", "")
                             if thinking_text:
                                 _fire_first_delta()
-                                agent._fire_reasoning_delta(thinking_text)
+                                _raise_stream_payload_limit(agent._fire_reasoning_delta(thinking_text))
             if not agent._interrupt_requested:
                 raw_stream = _stream_context["stream"]
                 if raw_stream is not None:
@@ -4725,6 +4736,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         error=None,
                     )
                     return  # success
+                except StreamPayloadBoundExceeded as e:
+                    _emit_stream_end(final_text="", finished=False, error=str(e))
+                    _close_managed_stream()
+                    result["error"] = e
+                    return
                 except Exception as e:
                     _emit_stream_end(final_text="", finished=False, error=str(e))
                     _close_managed_stream()
@@ -4820,10 +4836,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         # emitted by ``_emit_stream_drop`` below; no
                         # additional INFO line needed.
                         try:
-                            agent._fire_stream_delta(
+                            _raise_stream_payload_limit(agent._fire_stream_delta(
                                 "\n\n⚠ Connection dropped mid tool-call; "
                                 "reconnecting…\n\n"
-                            )
+                            ))
+                        except StreamPayloadBoundExceeded:
+                            raise
                         except Exception:
                             pass
                         # Reset the streamed-text buffer so the retry's
@@ -5231,6 +5249,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     if agent._interrupt_requested:
         raise InterruptedError("Agent interrupted during streaming API call (post-worker)")
     if result["error"] is not None:
+        if isinstance(result["error"], StreamPayloadBoundExceeded):
+            raise result["error"]
         if deltas_were_sent["yes"]:
             # Streaming failed AFTER some tokens were already delivered to
             # the platform.  Re-raising would let the outer retry loop make
@@ -5256,7 +5276,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 _partial_text = (_partial_text or "") + _warn
                 # Fire as streaming delta so the user sees it immediately.
                 try:
-                    agent._fire_stream_delta(_warn)
+                    _raise_stream_payload_limit(agent._fire_stream_delta(_warn))
+                except StreamPayloadBoundExceeded:
+                    raise
                 except Exception:
                     pass
                 logger.warning(

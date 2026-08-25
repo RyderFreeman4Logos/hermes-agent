@@ -9,6 +9,8 @@ from unittest.mock import patch, MagicMock
 from agent.context_compressor import (
     ContextCompressor,
     HISTORICAL_TASK_HEADING,
+    LEAN_TAIL_CAP_TOKENS,
+    LEAN_TAIL_FLOOR_TOKENS,
     SUMMARY_PREFIX,
     COMPRESSED_SUMMARY_METADATA_KEY,
     _PRUNE_MIN_CHARS,
@@ -1939,6 +1941,87 @@ class TestUpdateModelBudgets:
         comp.update_model("model-b", context_length=10_000)
         assert comp.tail_token_budget == int(comp.threshold_tokens * comp.summary_target_ratio)
         assert comp.max_summary_tokens == min(int(10_000 * 0.05), 4000)
+
+
+class TestUpdateModelLeanTailBudget:
+    """Regression: update_model() must not overwrite the lean tail budget.
+
+    The tail policy lives in the mode-aware ``tail_token_budget`` property:
+    lean mode clamps ``context_length * 0.025`` to
+    [LEAN_TAIL_FLOOR_TOKENS, LEAN_TAIL_CAP_TOKENS]. update_model() used to
+    unconditionally cache ``threshold_tokens * summary_target_ratio`` (the
+    legacy formula), so a lean compressor on a 1M window jumped from 25K to
+    195K (ratio .30) after any model switch / fallback / context-window
+    refresh — while ``tail_mode`` still claimed "lean".
+    """
+
+    @staticmethod
+    def _lean_comp(ratio: float, context: int = 1_000_000) -> ContextCompressor:
+        return ContextCompressor(
+            "test-model",
+            threshold_percent=0.65,
+            summary_target_ratio=ratio,
+            config_context_length=context,
+            tail_mode="lean",
+            quiet_mode=True,
+        )
+
+    def test_lean_tail_survives_update_model_same_model(self):
+        """1M/.65/.30/lean: 25K before, 25K after — even when the same
+        model and context are re-reported (no-op refresh)."""
+        comp = self._lean_comp(0.30)
+        assert comp.tail_token_budget == LEAN_TAIL_CAP_TOKENS  # 25K on 1M
+        comp.update_model("test-model", context_length=1_000_000)
+        assert comp.tail_mode == "lean"
+        assert comp.tail_token_budget == LEAN_TAIL_CAP_TOKENS
+
+    def test_lean_tail_survives_update_model_low_ratio(self):
+        """ratio .10 must not shrink or inflate the lean clamp either."""
+        comp = self._lean_comp(0.10)
+        assert comp.tail_token_budget == LEAN_TAIL_CAP_TOKENS
+        comp.update_model("test-model", context_length=1_000_000)
+        assert comp.tail_mode == "lean"
+        assert comp.tail_token_budget == LEAN_TAIL_CAP_TOKENS
+
+    def test_lean_tail_recalculated_on_context_change(self):
+        """A genuine window change re-derives the budget through the
+        canonical clamp: 1M -> 25K cap, 372K -> floor (9,300 < 10K),
+        back to 1M -> 25K again."""
+        comp = self._lean_comp(0.30)
+        assert comp.tail_token_budget == LEAN_TAIL_CAP_TOKENS
+
+        comp.update_model("small-model", context_length=372_000)
+        expected = max(
+            LEAN_TAIL_FLOOR_TOKENS,
+            min(LEAN_TAIL_CAP_TOKENS, int(372_000 * 0.025)),
+        )
+        assert expected == LEAN_TAIL_FLOOR_TOKENS  # 9,300 clamps to 10K
+        assert comp.tail_mode == "lean"
+        assert comp.tail_token_budget == expected
+
+        comp.update_model("big-model", context_length=1_000_000)
+        assert comp.tail_token_budget == LEAN_TAIL_CAP_TOKENS
+
+    def test_legacy_tail_recalculated_on_update_model(self):
+        """Legacy behavior is unchanged: budget stays threshold*ratio
+        across update_model()."""
+        comp = ContextCompressor(
+            "test-model",
+            threshold_percent=0.65,
+            summary_target_ratio=0.30,
+            config_context_length=1_000_000,
+            tail_mode="legacy",
+            quiet_mode=True,
+        )
+        before = comp.tail_token_budget
+        assert before == int(comp.threshold_tokens * comp.summary_target_ratio)
+        comp.update_model("test-model", context_length=1_000_000)
+        assert comp.tail_mode == "legacy"
+        assert comp.tail_token_budget == before
+        comp.update_model("small-model", context_length=372_000)
+        assert comp.tail_token_budget == int(
+            comp.threshold_tokens * comp.summary_target_ratio
+        )
 
 
 class TestUpdateModelResetsCalibration:

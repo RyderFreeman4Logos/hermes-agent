@@ -604,6 +604,50 @@ class TestReasoningStreaming:
         assert response.choices[0].message.reasoning_content == "Let me think about this"
         assert response.choices[0].message.content == "The answer is 42"
 
+    @pytest.mark.parametrize("with_callback", [False, True])
+    @patch("run_agent.AIAgent._create_request_openai_client")
+    @patch("run_agent.AIAgent._close_request_openai_client")
+    def test_tool_suppressed_content_always_enforces_stream_bound(
+        self, mock_close, mock_create, with_callback
+    ):
+        from agent.stream_payload_bound import (
+            DEFAULT_STREAM_PAYLOAD_BOUND_BYTES,
+            StreamPayloadBoundExceeded,
+        )
+        from run_agent import AIAgent
+
+        chunks = [
+            _make_stream_chunk(
+                tool_calls=[
+                    _make_tool_call_delta(
+                        tc_id="call_1", name="terminal", arguments=""
+                    )
+                ]
+            ),
+            _make_stream_chunk(
+                content="x" * (DEFAULT_STREAM_PAYLOAD_BOUND_BYTES + 1)
+            ),
+            _make_stream_chunk(finish_reason="tool_calls"),
+        ]
+        mock_client = MagicMock()
+        mock_client.chat.completions.create.return_value = iter(chunks)
+        mock_create.return_value = mock_client
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            stream_delta_callback=(lambda _text: None) if with_callback else None,
+        )
+        agent.api_mode = "chat_completions"
+        agent._interrupt_requested = False
+
+        with pytest.raises(StreamPayloadBoundExceeded, match="exceeded"):
+            agent._interruptible_streaming_api_call({})
+
 
 # ── Test: _has_stream_consumers ──────────────────────────────────────────
 

@@ -225,6 +225,31 @@ def test_codex_app_server_bound_persists_typed_partial_without_abort():
     assert len(agent._current_streamed_assistant_text.encode("utf-8")) == 41_072
     assert flushes == [messages]
 
+    follow_up_notifications = _bound_notifications()
+    follow_up_notifications.pop(1)
+    follow_up_notifications[1]["params"]["delta"] = "continued"
+    follow_up_notifications[2]["params"]["item"]["text"] = "continued"
+    follow_up_client = _QueuedCodexClient(follow_up_notifications)
+    agent._codex_session = CodexAppServerSession(
+        cwd="/tmp",
+        client_factory=lambda **_kwargs: follow_up_client,
+        on_event=make_codex_app_server_event_bridge(agent),
+    )
+    messages.append({"role": "user", "content": "continue"})
+
+    follow_up = run_codex_app_server_turn(
+        agent,
+        user_message="continue",
+        original_user_message="continue",
+        messages=messages,
+        effective_task_id="task",
+    )
+
+    assert follow_up["completed"] is True
+    assert follow_up.get("status") != "stream_payload_limit"
+    assert follow_up["final_response"] == "continued"
+    assert agent._stream_payload_limit_error is None
+
 
 def test_codex_app_server_approval_drain_returns_stream_limit():
     from agent.codex_runtime import make_codex_app_server_event_bridge

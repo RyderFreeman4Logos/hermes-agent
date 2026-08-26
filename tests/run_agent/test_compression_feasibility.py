@@ -500,5 +500,48 @@ def test_threshold_suggestion_kept_for_large_context_main(mock_get_client, mock_
     assert "threshold: 0.30" in messages[0]
 
 
+def _aux_client_for_feasibility(mock_get_client):
+    mock_client = MagicMock()
+    mock_client.base_url = "https://openrouter.ai/api/v1"
+    mock_client.api_key = "sk-aux"
+    mock_get_client.return_value = (mock_client, "google/gemini-3-flash-preview")
+
+
+@patch("agent.model_metadata.get_model_context_length", return_value=128_000)
+@patch("agent.auxiliary_client.get_text_auxiliary_client")
+def test_lean_does_not_lower_threshold_to_aux_context(mock_get_client, mock_ctx_len):
+    """Lean digest is chunked; aux window must not become the main trigger."""
+    agent = _make_agent(main_context=372_000, threshold_percent=0.80)
+    agent.context_compressor.tail_mode = "lean"
+    agent.context_compressor.threshold_percent = 0.80
+    original_threshold = agent.context_compressor.threshold_tokens
+    original_percent = agent.context_compressor.threshold_percent
+    original_tail = agent.context_compressor.tail_token_budget
+    assert original_threshold == 297_600
+    _aux_client_for_feasibility(mock_get_client)
+    agent._emit_status = lambda msg: None
+
+    agent._check_compression_model_feasibility()
+
+    assert agent.context_compressor.threshold_tokens == original_threshold
+    assert agent.context_compressor.threshold_percent == original_percent
+    assert agent.context_compressor.tail_token_budget == original_tail
+
+
+@patch("agent.model_metadata.get_model_context_length", return_value=128_000)
+@patch("agent.auxiliary_client.get_text_auxiliary_client")
+def test_legacy_still_lowers_threshold_to_aux_context(mock_get_client, mock_ctx_len):
+    """Legacy single-prompt summariser still clamps the live trigger to aux."""
+    agent = _make_agent(main_context=372_000, threshold_percent=0.80)
+    agent.context_compressor.tail_mode = "legacy"
+    assert agent.context_compressor.threshold_tokens == 297_600
+    _aux_client_for_feasibility(mock_get_client)
+    agent._emit_status = lambda msg: None
+
+    agent._check_compression_model_feasibility()
+
+    assert agent.context_compressor.threshold_tokens == 128_000
+
+
 
 

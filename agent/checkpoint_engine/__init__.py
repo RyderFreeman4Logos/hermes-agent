@@ -6,9 +6,10 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import hashlib
 import json
+import time
 from typing import Any, Callable, Dict, List, Optional
 
-from agent.context_engine import ContextEngine
+from agent.context_engine import ContextEngine, sanitize_memory_context
 
 __all__ = [
     "ActiveIntent",
@@ -29,6 +30,7 @@ _MAP_TASK = "compression"
 _DEFAULT_TARGET_WIRE_TOKENS = 48_000
 _DEFAULT_HARD_MAX_WIRE_TOKENS = 60_000
 _DEFAULT_OUTPUT_RESERVE_TOKENS = 4_096
+_AUTO_COMPRESSION_COOLDOWN_SECONDS = 60.0
 _ACTION_STATES = frozenset(
     {"planned", "issued", "running", "succeeded", "failed", "unknown"}
 )
@@ -155,6 +157,35 @@ class CheckpointContextEngine(ContextEngine):
             _DEFAULT_OUTPUT_RESERVE_TOKENS,
             allow_zero=True,
         )
+        self.model = ""
+        self.base_url = ""
+        self.api_key = ""
+        self.provider = ""
+        self.api_mode = ""
+        self.model_thresholds: Dict[str, float] = {}
+        self.threshold_percent = type(self).threshold_percent
+        self.threshold_tokens = 0
+        self._context_length = 0
+        self.compression_count = 0
+        self.last_prompt_tokens = 0
+        self.last_completion_tokens = 0
+        self.last_total_tokens = 0
+        self.last_input_tokens = 0
+        self.last_output_tokens = 0
+        self.last_cache_read_tokens = 0
+        self.last_cache_write_tokens = 0
+        self.last_reasoning_tokens = 0
+        self.last_request_tokens = 0
+        self.last_trigger_reason: Optional[str] = None
+        self.last_focus_topic = ""
+        self.last_memory_context = ""
+        self._automatic_cooldown_until = 0.0
+        self._automatic_cooldown_reason = ""
+        self._last_compress_aborted = False
+        self._last_summary_error: Optional[str] = None
+        self._last_compression_made_progress = False
+        self._verify_compaction_cleared_threshold = False
+        self.awaiting_real_usage_after_compression = False
         self.last_map_shards: tuple[MapShard, ...] = ()
         self.last_reduced_state: Optional[ReducedState] = None
         self.last_checkpoint_text: Optional[str] = None
@@ -200,13 +231,152 @@ class CheckpointContextEngine(ContextEngine):
     def name(self) -> str:
         return "checkpoint"
 
+    @property
+    def context_length(self) -> int:
+        return self._context_length
+
+    @context_length.setter
+    def context_length(self, value: Any) -> None:
+        context_length = value if isinstance(value, int) and not isinstance(value, bool) else 0
+        context_length = max(0, context_length)
+        if context_length == getattr(self, "_context_length", 0):
+            return
+        self._context_length = context_length
+        if hasattr(self, "threshold_percent"):
+            self.threshold_tokens = int(context_length * self.threshold_percent)
+
+    @staticmethod
+    def _usage_tokens(value: Any) -> int:
+        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
     def update_from_response(self, usage: Dict[str, Any]) -> None:
-        self.last_prompt_tokens = usage.get("prompt_tokens", 0)
-        self.last_completion_tokens = usage.get("completion_tokens", 0)
-        self.last_total_tokens = usage.get("total_tokens", 0)
+        usage = usage if isinstance(usage, dict) else {}
+        self.last_input_tokens = self._usage_tokens(usage.get("input_tokens"))
+        self.last_output_tokens = self._usage_tokens(usage.get("output_tokens"))
+        self.last_cache_read_tokens = self._usage_tokens(usage.get("cache_read_tokens"))
+        self.last_cache_write_tokens = self._usage_tokens(usage.get("cache_write_tokens"))
+        self.last_reasoning_tokens = self._usage_tokens(usage.get("reasoning_tokens"))
+        provider_prompt = self._usage_tokens(usage.get("prompt_tokens"))
+        if not provider_prompt:
+            provider_prompt = (
+                self.last_input_tokens
+                + self.last_cache_read_tokens
+                + self.last_cache_write_tokens
+            )
+        self.last_prompt_tokens = provider_prompt
+        self.last_completion_tokens = self._usage_tokens(
+            usage.get("completion_tokens", self.last_output_tokens)
+        )
+        self.last_total_tokens = self._usage_tokens(
+            usage.get("total_tokens", self.last_prompt_tokens + self.last_completion_tokens)
+        )
+        if self._verify_compaction_cleared_threshold:
+            self._verify_compaction_cleared_threshold = False
+            if self.last_prompt_tokens >= self.threshold_tokens > 0:
+                self._set_automatic_cooldown("ineffective")
+            else:
+                self._clear_automatic_cooldown()
+        elif self.last_prompt_tokens < self.threshold_tokens:
+            self._clear_automatic_cooldown()
+        self.awaiting_real_usage_after_compression = False
+
+    def update_model(
+        self,
+        model: str,
+        context_length: int,
+        base_url: str = "",
+        api_key: str = "",
+        provider: str = "",
+        api_mode: str = "",
+    ) -> None:
+        self.model = model
+        self.base_url = base_url
+        self.api_key = api_key
+        self.provider = provider
+        self.api_mode = api_mode
+        super().update_model(
+            model=model,
+            context_length=context_length,
+            base_url=base_url,
+            api_key=api_key,
+            provider=provider,
+            api_mode=api_mode,
+        )
+        self._clear_automatic_cooldown()
+
+    def on_session_reset(self) -> None:
+        super().on_session_reset()
+        self._clear_automatic_cooldown()
+        self.last_request_tokens = 0
+        self.last_trigger_reason = None
 
     def should_compress(self, prompt_tokens: Optional[int] = None) -> bool:
-        return False
+        return self.should_compress_info(prompt_tokens)[0]
+
+    def should_compress_info(
+        self, prompt_tokens: Optional[int] = None
+    ) -> tuple[bool, Optional[str]]:
+        """Return the automatic trigger decision without warning below threshold.
+
+        The host treats a non-empty reason as an overflow warning, so the
+        detailed ``below_threshold`` state remains available on the engine
+        without spuriously warning on healthy turns.
+        """
+        tokens = self._usage_tokens(prompt_tokens)
+        if prompt_tokens is None:
+            tokens = self.last_prompt_tokens or self.last_request_tokens
+        if self.threshold_tokens <= 0:
+            self.last_trigger_reason = "threshold_unavailable"
+            return False, None
+        if tokens < self.threshold_tokens:
+            self.last_trigger_reason = "below_threshold"
+            return False, None
+        if reason := self._automatic_cooldown_reason_now():
+            self.last_trigger_reason = reason
+            return False, reason
+        self.last_trigger_reason = None
+        return True, None
+
+    def record_completed_compaction(
+        self, *, used_fallback: bool = False, feasibility_skip: bool = False
+    ) -> None:
+        del used_fallback, feasibility_skip
+        self._verify_compaction_cleared_threshold = True
+        self._clear_automatic_cooldown()
+
+    def _set_automatic_cooldown(self, reason: str) -> None:
+        self._automatic_cooldown_until = time.monotonic() + _AUTO_COMPRESSION_COOLDOWN_SECONDS
+        self._automatic_cooldown_reason = reason
+        self.last_trigger_reason = f"cooldown:{reason}"
+
+    def _clear_automatic_cooldown(self) -> None:
+        self._automatic_cooldown_until = 0.0
+        self._automatic_cooldown_reason = ""
+
+    def _automatic_cooldown_reason_now(self) -> Optional[str]:
+        if self._automatic_cooldown_until <= time.monotonic():
+            self._clear_automatic_cooldown()
+            return None
+        return f"cooldown:{self._automatic_cooldown_reason or 'retry'}"
+
+    def _reclaimable_groups(
+        self, messages: List[Dict[str, Any]], groups: Optional[tuple[CausalGroup, ...]] = None
+    ) -> tuple[CausalGroup, ...]:
+        groups = groups if groups is not None else self._plan_causal_groups(messages)
+        lanes = self._extract_deterministic_lanes(messages)
+        active_indices = set(lanes.active_intent.event_indices) if lanes.active_intent else set()
+        return tuple(
+            group
+            for group in groups
+            if not active_indices.intersection(group.event_indices)
+            and not any(messages[index].get("role") == "system" for index in group.event_indices)
+        )
+
+    def has_content_to_compress(self, messages: List[Dict[str, Any]]) -> bool:
+        try:
+            return bool(self._reclaimable_groups(messages))
+        except (AttributeError, IndexError, TypeError, ValueError):
+            return False
 
     @staticmethod
     def _tool_calls(message: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -601,8 +771,12 @@ class CheckpointContextEngine(ContextEngine):
         )
 
     @staticmethod
-    def _semantic_reduce_prompt(state: ReducedState) -> List[Dict[str, str]]:
+    def _semantic_reduce_prompt(
+        state: ReducedState, *, focus_topic: str = "", memory_context: str = ""
+    ) -> List[Dict[str, str]]:
         payload = {
+            "focus_topic": focus_topic,
+            "memory_context": memory_context,
             "active_intent": (
                 {
                     "content": state.active_intent.content,
@@ -648,13 +822,21 @@ class CheckpointContextEngine(ContextEngine):
             },
         ]
 
-    def _semantic_checkpoint(self, state: ReducedState) -> Optional[str]:
+    def _semantic_checkpoint(
+        self, state: ReducedState, *, focus_topic: str = "", memory_context: str = ""
+    ) -> Optional[str]:
         try:
             if self._semantic_reducer is not None:
                 candidate = self._semantic_reducer(state)
             else:
                 candidate = self._response_content(
-                    self._call_semantic_reduce(self._semantic_reduce_prompt(state))
+                    self._call_semantic_reduce(
+                        self._semantic_reduce_prompt(
+                            state,
+                            focus_topic=focus_topic,
+                            memory_context=memory_context,
+                        )
+                    )
                 )
         except Exception:
             return None
@@ -824,13 +1006,31 @@ class CheckpointContextEngine(ContextEngine):
         force: bool = False,
         memory_context: str = "",
     ) -> List[Dict[str, Any]]:
+        self._last_compress_aborted = False
+        self._last_summary_error = None
+        self._last_compression_made_progress = False
+        self.last_request_tokens = self._usage_tokens(current_tokens) or self._estimate_wire_tokens(messages)
+        self.last_focus_topic = focus_topic.strip() if isinstance(focus_topic, str) else ""
+        self.last_memory_context = (
+            sanitize_memory_context(memory_context)
+            if isinstance(memory_context, str) and memory_context.strip()
+            else ""
+        )
+        if force:
+            self._clear_automatic_cooldown()
+        elif reason := self._automatic_cooldown_reason_now():
+            self.last_trigger_reason = reason
+            return messages
         try:
             snapshot = self._capture_snapshot(messages)
         except (TypeError, ValueError):
+            self._set_automatic_cooldown("snapshot_unavailable")
             return messages
-        if self._has_inflight_tools(messages) or not self._snapshot_is_current(
-            messages, snapshot
-        ):
+        if self._has_inflight_tools(messages):
+            self.last_trigger_reason = "in_flight_tools"
+            return messages
+        if not self._snapshot_is_current(messages, snapshot):
+            self.last_trigger_reason = "stale_snapshot"
             return messages
         self.last_map_shards = ()
         self.last_reduced_state = None
@@ -839,16 +1039,45 @@ class CheckpointContextEngine(ContextEngine):
         self.last_wire_tokens = None
         self.last_degradation_steps = ()
         groups = self._plan_causal_groups(messages)
+        if (
+            current_tokens is not None
+            and not force
+            and not self._reclaimable_groups(messages, groups)
+        ):
+            self._set_automatic_cooldown("nothing_reclaimable")
+            return messages
         mapped = self._map_shards(messages, groups)
-        if mapped is None or not self._snapshot_is_current(messages, snapshot):
+        if mapped is None:
+            self._set_automatic_cooldown("map_failed")
+            self._last_compress_aborted = True
+            self._last_summary_error = "checkpoint Map failed"
+            return messages
+        if not self._snapshot_is_current(messages, snapshot):
+            self.last_trigger_reason = "stale_snapshot"
             return messages
         self.last_map_shards = mapped
         reduced = self._reduce(self._extract_deterministic_lanes(messages), mapped)
-        checkpoint = self._semantic_checkpoint(reduced)
-        if checkpoint is None or not self._snapshot_is_current(messages, snapshot):
+        checkpoint = self._semantic_checkpoint(
+            reduced,
+            focus_topic=self.last_focus_topic,
+            memory_context=self.last_memory_context,
+        )
+        if checkpoint is None:
+            self._set_automatic_cooldown("semantic_reduce_failed")
+            self._last_compress_aborted = True
+            self._last_summary_error = "checkpoint semantic Reduce failed"
+            return messages
+        if not self._snapshot_is_current(messages, snapshot):
+            self.last_trigger_reason = "stale_snapshot"
             return messages
         rendered = self._render_candidate(messages, groups, reduced, checkpoint)
-        if rendered is None or not self._snapshot_is_current(messages, snapshot):
+        if rendered is None:
+            self._set_automatic_cooldown("candidate_rejected")
+            self._last_compress_aborted = True
+            self._last_summary_error = "checkpoint candidate exceeded its wire budget"
+            return messages
+        if not self._snapshot_is_current(messages, snapshot):
+            self.last_trigger_reason = "stale_snapshot"
             return messages
         candidate, wire_tokens, steps, checkpoint_text = rendered
         self.last_reduced_state = reduced
@@ -857,6 +1086,11 @@ class CheckpointContextEngine(ContextEngine):
         self.last_wire_tokens = wire_tokens
         self.last_degradation_steps = steps
         if self._mode != "live":
+            self._set_automatic_cooldown("shadow")
+            return messages
+        if candidate == messages:
+            self._set_automatic_cooldown("ineffective")
             return messages
         self.compression_count += 1
+        self._last_compression_made_progress = True
         return candidate

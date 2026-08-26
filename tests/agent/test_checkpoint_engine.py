@@ -4,6 +4,7 @@ from copy import deepcopy
 import json
 from types import SimpleNamespace
 
+from agent.context_engine import sanitize_memory_context
 from hermes_cli.config_defaults import DEFAULT_CONFIG
 from plugins.context_engine import discover_context_engines, load_context_engine
 
@@ -67,6 +68,132 @@ def test_checkpoint_engine_name_is_checkpoint():
 def test_discover_includes_checkpoint():
     names = [name for name, _desc, _available in discover_context_engines()]
     assert "checkpoint" in names
+
+
+def test_trigger_tracks_host_thresholds_and_provider_usage():
+    from agent.checkpoint_engine import CheckpointContextEngine
+
+    engine = CheckpointContextEngine()
+    engine.threshold_percent = 0.50
+    engine.model_thresholds = {"narrow": 0.60}
+
+    engine.update_model(model="narrow-model", context_length=1_000)
+    engine.update_from_response(
+        {
+            "prompt_tokens": 600,
+            "completion_tokens": 25,
+            "total_tokens": 625,
+            "input_tokens": 400,
+            "output_tokens": 25,
+            "cache_read_tokens": 200,
+            "cache_write_tokens": 10,
+            "reasoning_tokens": 5,
+        }
+    )
+
+    assert engine.context_length == 1_000
+    assert engine.threshold_percent == 0.60
+    assert engine.threshold_tokens == 600
+    assert engine.last_prompt_tokens == 600
+    assert engine.last_input_tokens == 400
+    assert engine.last_cache_read_tokens == 200
+    assert engine.should_compress() is True
+    assert engine.should_compress(599) is False
+    assert engine.last_trigger_reason == "below_threshold"
+
+
+def test_auto_trigger_cooldown_and_force_retry_after_failed_checkpoint():
+    from agent.checkpoint_engine import CheckpointContextEngine
+
+    auxiliary = _FakeAuxiliaryClient(RuntimeError("temporary failure"), RuntimeError("retry"))
+    engine = CheckpointContextEngine(auxiliary_client=auxiliary)
+    engine.update_model(model="test", context_length=100)
+    messages = [
+        {"role": "user", "content": "old request"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "active request"},
+    ]
+
+    assert engine.should_compress(engine.threshold_tokens) is True
+    assert engine.compress(messages, current_tokens=engine.threshold_tokens) is messages
+    should_compress, reason = engine.should_compress_info(engine.threshold_tokens)
+    assert should_compress is False
+    assert reason is not None and reason.startswith("cooldown:")
+
+    attempts_before_force = len(auxiliary.calls)
+    assert engine.compress(messages, current_tokens=engine.threshold_tokens, force=True) is messages
+    assert len(auxiliary.calls) > attempts_before_force
+
+
+def test_checkpoint_skips_unreclaimable_or_inflight_history_with_block_reason():
+    from agent.checkpoint_engine import CheckpointContextEngine
+
+    engine = CheckpointContextEngine(auxiliary_client=_EchoMapClient())
+    engine.update_model(model="test", context_length=100)
+    unreclaimable = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "active request"},
+    ]
+
+    assert engine.has_content_to_compress(unreclaimable) is False
+    assert engine.compress(unreclaimable, current_tokens=engine.threshold_tokens) is unreclaimable
+    assert engine.should_compress_info(engine.threshold_tokens) == (
+        False,
+        "cooldown:nothing_reclaimable",
+    )
+
+    inflight = [
+        {"role": "user", "content": "active request"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "write_file", "arguments": "{}"},
+                }
+            ],
+        },
+    ]
+    assert engine.compress(inflight, current_tokens=engine.threshold_tokens, force=True) is inflight
+    assert engine.last_trigger_reason == "in_flight_tools"
+
+
+def test_checkpoint_uses_focus_memory_and_complete_request_estimate():
+    from agent.checkpoint_engine import CheckpointContextEngine
+
+    memory_context = "api_key=sk-test-secret\nRemember the release checklist."
+    auxiliary = _FakeAuxiliaryClient(
+        _map_response({"source_event_ids": [0], "facts": []}),
+        _map_response({"source_event_ids": [1], "facts": []}),
+        _map_response({"source_event_ids": [2], "facts": []}),
+        _map_response({"source_event_ids": [3], "facts": []}),
+        SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(
+                content="Continue from the verified state.", tool_calls=[]
+            ))]
+        ),
+    )
+    engine = CheckpointContextEngine(auxiliary_client=auxiliary)
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "old request"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "finish the release"},
+    ]
+
+    assert engine.compress(
+        messages,
+        current_tokens=900,
+        focus_topic="release validation",
+        memory_context=memory_context,
+    ) is messages
+
+    semantic_payload = json.loads(auxiliary.calls[-1]["messages"][-1]["content"])
+    assert engine.last_request_tokens == 900
+    assert semantic_payload["focus_topic"] == "release validation"
+    assert semantic_payload["memory_context"] == sanitize_memory_context(memory_context)
 
 
 def test_shadow_compress_is_noop():

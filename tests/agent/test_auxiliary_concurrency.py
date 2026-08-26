@@ -115,6 +115,62 @@ class TestSemaphoreCache:
             assert _acquire_async_aux_semaphore("compression") is None
 
 
+def test_configured_chain_keeps_entry_settings_without_main_fallback(monkeypatch):
+    import agent.auxiliary_client as auxiliary_client
+
+    calls = []
+    response = MagicMock()
+    config = {
+        "provider": "primary",
+        "model": "primary-model",
+        "timeout": 450,
+        "extra_body": {"request_marker": "primary", "reasoning": {"enabled": True, "effort": "low"}},
+        "fallback_chain": [
+            {
+                "provider": "fallback",
+                "model": "fallback-model",
+                "timeout": 7,
+                "extra_body": {"request_marker": "fallback"},
+                "reasoning_effort": "high",
+            }
+        ],
+    }
+
+    def call_candidate(_client, model, _label, **kwargs):
+        calls.append((model, kwargs))
+        if model == "primary-model":
+            raise RuntimeError("primary unavailable")
+        return response
+
+    monkeypatch.setattr(auxiliary_client, "_get_auxiliary_task_config", lambda _task: config)
+    monkeypatch.setattr(
+        auxiliary_client,
+        "_resolve_fallback_entry",
+        lambda entry: (object(), entry["model"]),
+    )
+    monkeypatch.setattr(auxiliary_client, "_call_fallback_candidate_sync", call_candidate)
+    monkeypatch.setattr(
+        auxiliary_client,
+        "_try_main_agent_model_fallback",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("main fallback")),
+    )
+
+    assert auxiliary_client.call_configured_auxiliary_chain(
+        task="compression",
+        messages=[{"role": "user", "content": "compress"}],
+        temperature=0,
+        max_tokens=1024,
+        tools=[],
+    ) is response
+    assert [model for model, _kwargs in calls] == ["primary-model", "fallback-model"]
+    assert calls[0][1]["effective_timeout"] == 450
+    assert calls[0][1]["effective_extra_body"] == {"request_marker": "primary"}
+    assert calls[0][1]["reasoning_config"]["effort"] == "low"
+    assert calls[1][1]["effective_timeout"] == 7
+    assert calls[1][1]["effective_extra_body"] == {"request_marker": "fallback"}
+    assert calls[1][1]["reasoning_config"]["effort"] == "high"
+
+
 class TestSyncCallEnforcesLimit:
     def test_call_llm_caps_concurrent_inflight(self):
         limit = 2

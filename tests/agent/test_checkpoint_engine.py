@@ -1,7 +1,10 @@
 """Checkpoint ContextEngine: opt-in shadow no-op (DESIGN.md §10 item 1)."""
 
 from copy import deepcopy
+from concurrent.futures import ThreadPoolExecutor
 import json
+import threading
+import time
 from types import SimpleNamespace
 
 from agent.context_engine import sanitize_memory_context
@@ -454,6 +457,82 @@ def test_checkpoint_map_concurrency_is_capped_at_two_by_default():
     from agent.checkpoint_engine import CheckpointContextEngine
 
     assert CheckpointContextEngine().map_concurrency == 2
+
+
+def test_checkpoint_map_and_reduce_use_the_public_auxiliary_chain(monkeypatch):
+    import agent.auxiliary_client as auxiliary_client
+    from agent.checkpoint_engine import CheckpointContextEngine
+
+    calls = []
+
+    def complete_configured_chain(**kwargs):
+        calls.append(kwargs)
+        if kwargs["max_tokens"] == 1024:
+            payload = json.loads(kwargs["messages"][-1]["content"])
+            return _map_response({"source_event_ids": payload["source_event_ids"], "facts": []})
+        return _map_response("Continue from the verified state.")
+
+    monkeypatch.setattr(
+        auxiliary_client, "call_configured_auxiliary_chain", complete_configured_chain,
+    )
+    engine = CheckpointContextEngine(token_counter=lambda _value: 1, output_reserve_tokens=0)
+
+    assert engine.compress([{"role": "user", "content": "finish the migration"}])
+    assert [call["max_tokens"] for call in calls] == [1024, 2048]
+    assert all(call["task"] == "compression" and call["tools"] == [] for call in calls)
+
+
+def test_two_checkpoint_engines_share_the_default_compression_limit(monkeypatch):
+    import agent.auxiliary_client as auxiliary_client
+    from agent.checkpoint_engine import CausalGroup, CheckpointContextEngine
+
+    active = 0
+    max_active = 0
+    lock = threading.Lock()
+
+    def complete_candidate(_client, _model, _label, *, messages, **_kwargs):
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        try:
+            time.sleep(0.05)
+            payload = json.loads(messages[-1]["content"])
+            return _map_response({"source_event_ids": payload["source_event_ids"], "facts": []})
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(
+        auxiliary_client,
+        "_get_auxiliary_task_config",
+        lambda _task: {"provider": "test", "model": "test-model"},
+    )
+    monkeypatch.setattr(
+        auxiliary_client,
+        "_resolve_fallback_entry",
+        lambda entry: (object(), entry["model"]),
+    )
+    monkeypatch.setattr(auxiliary_client, "_call_fallback_candidate_sync", complete_candidate)
+    auxiliary_client._reset_aux_semaphores()
+    messages = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "second"},
+    ]
+    groups = (CausalGroup((0,)), CausalGroup((1,)))
+    engines = (CheckpointContextEngine(), CheckpointContextEngine())
+
+    try:
+        with ThreadPoolExecutor(max_workers=len(engines)) as executor:
+            futures = [
+                executor.submit(engine._map_shards, messages, groups)
+                for engine in engines
+            ]
+            assert all(future.result(timeout=2) is not None for future in futures)
+    finally:
+        auxiliary_client._reset_aux_semaphores()
+
+    assert max_active <= 2
 
 
 def test_map_planner_packs_consecutive_causal_units_without_splitting_tool_receipts(

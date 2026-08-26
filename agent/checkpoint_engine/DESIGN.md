@@ -234,7 +234,9 @@ Do not add a new core toolset. Engine-owned tools, if any, go through
 
 Reuse, do not rewrite:
 
-- configured auxiliary routing / fallback chain
+- `agent.auxiliary_client.call_configured_auxiliary_chain` for configured-only
+  compression routing; it shares the process-wide compression limit (default 2)
+  and never reaches main-model fallback
 - session DB raw messages
 - identifier extraction already used by lean
 - `ContextEngine` lifecycle (`update_from_response`, `should_compress`,

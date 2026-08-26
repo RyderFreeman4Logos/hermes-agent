@@ -8439,7 +8439,7 @@ def _get_task_max_concurrency(task: Optional[str]) -> Optional[int]:
         return None
     raw = _get_auxiliary_task_config(task).get("max_concurrency")
     if raw is None:
-        return None
+        return 2 if task == "compression" else None
     try:
         value = int(raw)
     except (TypeError, ValueError):
@@ -8486,6 +8486,94 @@ def _reset_aux_semaphores() -> None:
     with _aux_sem_lock:
         _aux_sync_semaphores.clear()
         _aux_async_semaphores.clear()
+
+
+def _configured_chain_request_settings(
+    task: str, entry: Dict[str, Any], *, primary: bool,
+) -> Tuple[Dict[str, Any], Optional[dict]]:
+    """Return one configured candidate's non-reasoning body and reasoning."""
+    extra_body = _get_task_extra_body(task) if primary else dict(
+        entry.get("extra_body") or {}
+    )
+    reasoning_config = extra_body.pop("reasoning", None)
+    if reasoning_config is None and not primary:
+        effort = entry.get("reasoning_effort")
+        if effort not in (None, ""):
+            from hermes_constants import parse_reasoning_effort
+
+            reasoning_config = parse_reasoning_effort(effort)
+    return extra_body, reasoning_config
+
+
+def call_configured_auxiliary_chain(
+    *,
+    task: str,
+    messages: list,
+    temperature: Optional[float] = None,
+    max_tokens: Optional[int] = None,
+    tools: Optional[list] = None,
+) -> Optional[Any]:
+    """Call only a task's configured primary and fallback candidates.
+
+    This deliberately excludes auto-discovery and main-model fallback. It is
+    the public surface for callers which must fail closed after their explicit
+    auxiliary chain is exhausted.
+    """
+    if not task:
+        return None
+    config = _get_auxiliary_task_config(task)
+    candidates = [(f"{task}-primary", config, True)]
+    chain = config.get("fallback_chain")
+    if isinstance(chain, list):
+        candidates.extend(
+            (f"fallback_chain[{index}]({entry.get('provider', '')})", entry, False)
+            for index, entry in enumerate(chain)
+            if isinstance(entry, dict)
+        )
+
+    semaphore = _acquire_sync_aux_semaphore(task)
+    if semaphore is not None:
+        semaphore.acquire()
+    try:
+        task_timeout = _effective_aux_timeout(task, None)
+        for label, entry, primary in candidates:
+            provider = str(entry.get("provider") or "").strip()
+            model = str(entry.get("model") or "").strip()
+            if not provider or not model or provider.lower() == "auto":
+                continue
+            try:
+                client, resolved_model = _resolve_fallback_entry(entry)
+                if client is None:
+                    continue
+                extra_body, reasoning_config = _configured_chain_request_settings(
+                    task, entry, primary=primary,
+                )
+                timeout = _fallback_entry_timeout(task, label) or task_timeout
+                response = _call_fallback_candidate_sync(
+                    client,
+                    resolved_model or model,
+                    label,
+                    task=task,
+                    messages=messages,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    tools=tools,
+                    effective_timeout=timeout,
+                    effective_extra_body=extra_body,
+                    reasoning_config=reasoning_config,
+                )
+            except Exception as exc:
+                logger.debug(
+                    "Auxiliary %s: configured candidate %s failed: %s",
+                    task, label, exc,
+                )
+                continue
+            if response is not None:
+                return response
+        return None
+    finally:
+        if semaphore is not None:
+            semaphore.release()
 
 
 # ---------------------------------------------------------------------------

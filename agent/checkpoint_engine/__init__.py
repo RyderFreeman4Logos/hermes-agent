@@ -587,55 +587,20 @@ class CheckpointContextEngine(ContextEngine):
             return None
         return tuple(shards)
 
+    @staticmethod
     def _configured_auxiliary_response(
-        self, messages: List[Dict[str, str]], max_tokens: int
+        messages: List[Dict[str, str]], max_tokens: int,
     ) -> Any:
-        """Call only explicit compression candidates and their configured chain."""
-        try:
-            from agent import auxiliary_client
+        """Call the public configured-only compression chain."""
+        from agent.auxiliary_client import call_configured_auxiliary_chain
 
-            config = auxiliary_client._get_auxiliary_task_config(_MAP_TASK)
-            chain = config.get("fallback_chain", [])
-            candidates = [("checkpoint-primary", config)]
-            if isinstance(chain, list):
-                candidates.extend(
-                    (f"fallback_chain[{index}]({entry.get('provider', '')})", entry)
-                    for index, entry in enumerate(chain)
-                    if isinstance(entry, dict)
-                )
-            timeout = auxiliary_client._effective_aux_timeout(_MAP_TASK, None)
-            extra_body = auxiliary_client._get_task_extra_body(_MAP_TASK)
-            extra_body.pop("reasoning", None)
-        except (AttributeError, ImportError, OSError, TypeError, ValueError):
-            return None
-
-        for label, entry in candidates:
-            provider = str(entry.get("provider", "")).strip()
-            model = str(entry.get("model", "")).strip()
-            if not provider or not model or provider.lower() == "auto":
-                continue
-            try:
-                client, resolved_model = auxiliary_client._resolve_fallback_entry(entry)
-                if client is None:
-                    continue
-                response = auxiliary_client._call_fallback_candidate_sync(
-                    client,
-                    resolved_model or model,
-                    label,
-                    task=_MAP_TASK,
-                    messages=messages,
-                    temperature=0,
-                    max_tokens=max_tokens,
-                    tools=[],
-                    effective_timeout=timeout,
-                    effective_extra_body=extra_body,
-                    reasoning_config={"enabled": False},
-                )
-            except Exception:
-                continue
-            if response is not None:
-                return response
-        return None
+        return call_configured_auxiliary_chain(
+            task=_MAP_TASK,
+            messages=messages,
+            temperature=0,
+            max_tokens=max_tokens,
+            tools=[],
+        )
 
     def _call_map(self, messages: List[Dict[str, str]]) -> Any:
         if self._auxiliary_client is not None:

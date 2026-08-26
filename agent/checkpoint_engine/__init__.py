@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import hashlib
 import json
+import subprocess
 import time
 from typing import Any, Callable, Dict, List, Optional
 
@@ -159,6 +160,7 @@ class CheckpointCommitSnapshot:
     queued_user_pending: bool
     queued_steer_pending: bool
     background_completion_pending: bool
+    workspace_state: Optional[tuple[str, Optional[str], str]] = None
 
 
 class CheckpointContextEngine(ContextEngine):
@@ -739,6 +741,94 @@ class CheckpointContextEngine(ContextEngine):
         except Exception:
             return object()
 
+    def _workspace_state(
+        self, lifecycle: Any, session_id: Optional[str] = None
+    ) -> Optional[tuple[str, Optional[str], str]]:
+        """Return Git identity plus tracked-worktree contents for a workspace."""
+        workspace = None
+        if lifecycle is not None:
+            workspace = next(
+                (
+                    getattr(lifecycle, attribute, None)
+                    for attribute in ("working_directory", "cwd", "workspace")
+                    if getattr(lifecycle, attribute, None)
+                ),
+                None,
+            )
+        if not workspace and self._session_db is not None and session_id:
+            get_session = getattr(self._session_db, "get_session", None)
+            if callable(get_session):
+                session = get_session(session_id)
+                if isinstance(session, dict):
+                    workspace = session.get("git_repo_root") or session.get("cwd")
+        if not workspace:
+            return None
+        try:
+            root_result = subprocess.run(
+                ["git", "-C", str(workspace), "rev-parse", "--show-toplevel"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except subprocess.CalledProcessError:
+            return None
+        except FileNotFoundError:
+            return None
+        except subprocess.SubprocessError as exc:
+            raise RuntimeError("workspace Git probe failed") from exc
+
+        root = root_result.stdout.strip()
+        try:
+            head_result = subprocess.run(
+                ["git", "-C", root, "rev-parse", "--verify", "HEAD"],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            if head_result.returncode not in {0, 128}:
+                raise RuntimeError("workspace HEAD probe failed")
+            head = head_result.stdout.strip() or None
+            diff_command = ["git", "-C", root, "diff", "--no-ext-diff", "--binary"]
+            if head is not None:
+                diff_command.extend(["HEAD", "--"])
+                diff_result = subprocess.run(
+                    diff_command,
+                    check=True,
+                    capture_output=True,
+                    timeout=5,
+                )
+                tracked_digest = hashlib.sha256(diff_result.stdout).hexdigest()
+            else:
+                diff_result = subprocess.run(
+                    [*diff_command, "--"],
+                    check=True,
+                    capture_output=True,
+                    timeout=5,
+                )
+                cached_result = subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        root,
+                        "diff",
+                        "--cached",
+                        "--no-ext-diff",
+                        "--binary",
+                        "--",
+                    ],
+                    check=True,
+                    capture_output=True,
+                    timeout=5,
+                )
+                tracked_digest = hashlib.sha256(
+                    diff_result.stdout + b"\\0" + cached_result.stdout
+                ).hexdigest()
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RuntimeError("workspace Git probe failed") from exc
+        return root, head, tracked_digest
+
     def _capture_commit_snapshot(self, lifecycle: Any) -> CheckpointCommitSnapshot:
         session_id = (
             getattr(lifecycle, "session_id", None) if lifecycle is not None else None
@@ -799,6 +889,7 @@ class CheckpointContextEngine(ContextEngine):
             queued_user_pending=queued_user_pending,
             queued_steer_pending=queued_steer_pending,
             background_completion_pending=background_completion_pending,
+            workspace_state=self._workspace_state(lifecycle, session_id),
         )
 
     @staticmethod

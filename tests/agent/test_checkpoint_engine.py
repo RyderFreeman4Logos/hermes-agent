@@ -4,6 +4,7 @@ from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
+import subprocess
 import threading
 import time
 from types import SimpleNamespace
@@ -317,6 +318,124 @@ def test_durable_revision_and_queued_input_refuse_checkpoint(tmp_path):
     lifecycle._pending_cli_user_message = {"role": "user", "content": "queued"}
     assert engine.compress(messages, force=True, lifecycle=lifecycle) is messages
     assert engine.last_trigger_reason == "queued_user_message"
+
+
+def _git(repo, *args):
+    return subprocess.run(
+        ["git", *args], cwd=repo, check=True, capture_output=True, text=True
+    )
+
+
+def _workspace_lifecycle(repo):
+    return SimpleNamespace(
+        session_id="checkpoint-session",
+        working_directory=str(repo),
+        _pending_cli_user_message=None,
+        _pending_steer=None,
+        _executing_tools=False,
+        model="test-model",
+        provider="test-provider",
+        base_url="https://example.test",
+        api_mode="chat_completions",
+    )
+
+
+def _workspace_engine(client):
+    from agent.checkpoint_engine import CheckpointContextEngine
+
+    return CheckpointContextEngine(
+        auxiliary_client=client,
+        semantic_reducer=lambda _state: "Continue from the verified state.",
+        mode="live",
+        token_counter=lambda _value: 1,
+        output_reserve_tokens=0,
+    )
+
+
+def _make_workspace_repo(tmp_path):
+    repo = tmp_path / "workspace"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    (repo / "tracked.txt").write_text("before\n")
+    _git(repo, "add", "tracked.txt")
+    _git(
+        repo,
+        "-c",
+        "user.name=checkpoint-test",
+        "-c",
+        "user.email=checkpoint@example.test",
+        "commit",
+        "-qm",
+        "initial",
+    )
+    return repo
+
+
+def test_checkpoint_refuses_when_workspace_head_changes_during_compaction(tmp_path):
+    repo = _make_workspace_repo(tmp_path)
+
+    class _HeadChangingMapClient(_EchoMapClient):
+        _changed = False
+        _lock = threading.Lock()
+
+        def complete(self, **kwargs):
+            response = super().complete(**kwargs)
+            with self._lock:
+                if not self._changed:
+                    self._changed = True
+                    (repo / "tracked.txt").write_text("head changed\n")
+                    _git(repo, "add", "tracked.txt")
+                    _git(
+                        repo,
+                        "-c",
+                        "user.name=checkpoint-test",
+                        "-c",
+                        "user.email=checkpoint@example.test",
+                        "commit",
+                        "-qm",
+                        "concurrent head",
+                    )
+            return response
+
+    messages = [
+        {"role": "user", "content": "old request"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "active request"},
+    ]
+    lifecycle = _workspace_lifecycle(repo)
+    engine = _workspace_engine(_HeadChangingMapClient())
+
+    assert engine.compress(messages, force=True, lifecycle=lifecycle) is messages
+    assert engine.last_trigger_reason == "stale_durable_snapshot"
+    assert engine.compression_count == 0
+
+
+def test_checkpoint_refuses_when_workspace_tracked_tree_gets_dirty(tmp_path):
+    repo = _make_workspace_repo(tmp_path)
+
+    class _DirtyWorkspaceMapClient(_EchoMapClient):
+        _changed = False
+        _lock = threading.Lock()
+
+        def complete(self, **kwargs):
+            response = super().complete(**kwargs)
+            with self._lock:
+                if not self._changed:
+                    self._changed = True
+                    (repo / "tracked.txt").write_text("dirty during compaction\n")
+            return response
+
+    messages = [
+        {"role": "user", "content": "old request"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "active request"},
+    ]
+    lifecycle = _workspace_lifecycle(repo)
+    engine = _workspace_engine(_DirtyWorkspaceMapClient())
+
+    assert engine.compress(messages, force=True, lifecycle=lifecycle) is messages
+    assert engine.last_trigger_reason == "stale_durable_snapshot"
+    assert engine.compression_count == 0
 
 
 def test_causal_groups_keep_tool_call_and_results_together():

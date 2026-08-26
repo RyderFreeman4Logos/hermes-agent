@@ -801,3 +801,29 @@ def test_stalling_delegation_is_stuck_while_finalizing_is_alive(monkeypatch):
         "progress": True,
         "evidence": "delegation finalizing",
     }
+
+
+def test_process_terminal_transition_cancels_its_heartbeat(monkeypatch, tmp_path):
+    from tools import process_registry as process_registry_module
+    from tools.process_registry import ProcessRegistry, ProcessSession
+    from tools.runtime_heartbeat import RuntimeHeartbeat
+
+    FakeTimer.created = []
+    registry = ProcessRegistry()
+    manager = RuntimeHeartbeat(event_queue=queue.Queue(), timer_factory=FakeTimer)
+    session = ProcessSession(id="proc-short", command="true", session_key="owner")
+    registry._running[session.id] = session
+    monkeypatch.setattr(process_registry_module, "CHECKPOINT_PATH", tmp_path / "processes.json")
+    monkeypatch.setattr("tools.runtime_heartbeat.runtime_heartbeat", manager)
+
+    assert manager.arm(
+        session.id,
+        caller_id="owner",
+        kind="process",
+        interval=1700,
+        inspect=lambda: {"alive": True, "output_size": 0, "cpu_seconds": 0.0},
+    )
+    registry._move_to_finished(session)
+
+    assert manager.outstanding_for_caller("owner") == []
+    assert FakeTimer.created[0].cancelled is True

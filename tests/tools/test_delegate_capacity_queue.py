@@ -842,3 +842,32 @@ def test_public_force_background_rejection_finalizes_and_detaches_child(monkeypa
     assert len(children) == 1
     children[0].close.assert_called_once_with()
     assert [name for name, _kwargs in lifecycle] == ["subagent_stop"]
+
+
+def test_batch_arms_before_publishing_an_immediate_worker(monkeypatch):
+    """A synchronous executor interleaving cannot leave a late heartbeat armed."""
+    events = []
+
+    class ImmediateExecutor:
+        def submit(self, callback):
+            events.append("submit")
+            callback()
+
+    monkeypatch.setattr(ad, "_get_executor", lambda _capacity: ImmediateExecutor())
+    monkeypatch.setattr(ad, "_admission_cap", 1)
+    monkeypatch.setattr(
+        "tools.runtime_heartbeat.preflight_current_heartbeat", lambda: 1700
+    )
+    monkeypatch.setattr(
+        "tools.runtime_heartbeat.runtime_heartbeat.arm",
+        lambda *_args, **_kwargs: events.append("arm") or True,
+    )
+    monkeypatch.setattr(
+        "tools.runtime_heartbeat.runtime_heartbeat.cancel",
+        lambda *_args, **_kwargs: events.append("cancel") or True,
+    )
+
+    result = _dispatch_batch(lambda: {"results": []}, 1)
+
+    assert result["status"] == "dispatched", result
+    assert events == ["arm", "submit", "cancel"]

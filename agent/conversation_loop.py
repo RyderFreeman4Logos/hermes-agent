@@ -6601,6 +6601,7 @@ def run_conversation(
                                 FailoverReason.upstream_rate_limit,
                             },
                             terminal_quota=_terminal_quota_429,
+                            billing=classified.reason == FailoverReason.billing,
                         )
                         and agent._try_activate_fallback(
                             reason=(

@@ -309,7 +309,8 @@ class TestFallbackChainResetOnTransportRecovery:
         ]
         agent = _make_agent_with_fallback(fb_chain)
         agent._delegate_model_profile = "standard"
-        agent._credential_pool = None
+        agent._api_max_retries = 1
+        agent._credential_pool = object()
         calls = []
 
         def fake_api_call(api_kwargs):
@@ -317,6 +318,7 @@ class TestFallbackChainResetOnTransportRecovery:
             if len(calls) == 1:
                 raise RateLimitError()
             if calls[-1][0] == "xai-oauth":
+                agent._credential_pool = object()
                 raise XaiSpendingLimitError()
             return _mock_response("Recovered after xAI fallback")
 
@@ -325,7 +327,7 @@ class TestFallbackChainResetOnTransportRecovery:
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
-            patch("run_agent._pool_may_recover_from_rate_limit", return_value=False),
+            patch("run_agent._pool_may_recover_from_rate_limit", return_value=True),
             patch("agent.agent_runtime_helpers.time.sleep"),
             patch(
                 "agent.auxiliary_client.resolve_provider_client",

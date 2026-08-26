@@ -76,3 +76,17 @@ def test_agent_forwarder_exposes_timing_context_to_loop_and_clears_it():
     assert timing.call_count == 2
     assert timing.call_args_list[1].kwargs["stop"] is True
     assert agent._loop_timing_context_text == ""
+
+
+def test_take_loop_timing_context_text_claims_once():
+    agent = SimpleNamespace(_loop_timing_context_text="a")
+    assert conversation_loop._take_loop_timing_context_text(agent) == "a"
+    assert "_loop_timing_context_text" not in vars(agent)
+    assert conversation_loop._take_loop_timing_context_text(agent) == ""
+
+
+def test_take_loop_timing_context_text_preserves_late_write():
+    agent = SimpleNamespace(_loop_timing_context_text="a")
+    assert conversation_loop._take_loop_timing_context_text(agent) == "a"
+    agent._loop_timing_context_text = "b"
+    assert conversation_loop._take_loop_timing_context_text(agent) == "b"

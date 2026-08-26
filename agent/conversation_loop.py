@@ -145,9 +145,7 @@ def _loop_timing_context(
 
 def _take_loop_timing_context_text(agent: Any) -> str:
     """Claim current loop-timing text exactly once."""
-    text = getattr(agent, "_loop_timing_context_text", "") or ""
-    agent._loop_timing_context_text = ""
-    return text
+    return agent.__dict__.pop("_loop_timing_context_text", "") or ""
 
 
 # Scaffold marker used by _apply_active_turn_redirect and the ghost-row filter

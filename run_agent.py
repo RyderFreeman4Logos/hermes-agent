@@ -8930,7 +8930,8 @@ class AIAgent:
             # which may be observed from another thread.
             with bind_subagent_parent(self), scoped_runtime_main({}):
                 try:
-                    self._loop_timing_context_text = _loop_timing_context(self) or ""
+                    if not getattr(self, "_loop_timing_context_text", ""):
+                        self._loop_timing_context_text = _loop_timing_context(self) or ""
                     if durable_turn_lease_thread is not None:
                         with durable_turn_lease_activity_lock:
                             durable_turn_lease_turn_active = True

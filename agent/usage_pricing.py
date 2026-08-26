@@ -79,6 +79,7 @@ class CanonicalUsage:
     reasoning_tokens: int = 0
     request_count: int = 1
     raw_usage: Optional[dict[str, Any]] = None
+    cache_telemetry: Literal["reported", "unavailable"] = "unavailable"
 
     @property
     def prompt_tokens(self) -> int:
@@ -105,6 +106,12 @@ class CanonicalUsage:
             reasoning_tokens=self.reasoning_tokens + other.reasoning_tokens,
             request_count=self.request_count + other.request_count,
             raw_usage=None,
+            cache_telemetry=(
+                "reported"
+                if self.cache_telemetry == "reported"
+                or other.cache_telemetry == "reported"
+                else "unavailable"
+            ),
         )
 
 
@@ -1048,6 +1055,12 @@ def _usage_get(obj: Any, name: str, default: Any = 0) -> Any:
     return getattr(obj, name, default)
 
 
+def _usage_has(obj: Any, name: str) -> bool:
+    if isinstance(obj, dict):
+        return obj.get(name) is not None
+    return getattr(obj, name, None) is not None
+
+
 def _usage_count(value: Any) -> int:
     """Coerce a usage counter to a non-negative integer.
 
@@ -1295,6 +1308,7 @@ def normalize_usage(
 
     provider_name = (provider or "").strip().lower()
     mode = (api_mode or "").strip().lower()
+    cache_telemetry: Literal["reported", "unavailable"] = "unavailable"
 
     if mode == "anthropic_messages" or provider_name == "anthropic":
         input_tokens = _usage_count(_usage_get(response_usage, "input_tokens", 0))
@@ -1303,6 +1317,10 @@ def normalize_usage(
         cache_write_tokens = _usage_count(
             _usage_get(response_usage, "cache_creation_input_tokens", 0)
         )
+        if _usage_has(response_usage, "cache_read_input_tokens") or _usage_has(
+            response_usage, "cache_creation_input_tokens"
+        ):
+            cache_telemetry = "reported"
     elif mode == "codex_responses":
         input_total = _usage_count(_usage_get(response_usage, "input_tokens", 0))
         output_tokens = _usage_count(_usage_get(response_usage, "output_tokens", 0))
@@ -1322,6 +1340,11 @@ def normalize_usage(
                 _usage_get(details, "cache_creation_tokens", 0) if details else 0
             )
         input_tokens = max(0, input_total - cache_read_tokens - cache_write_tokens)
+        if any(
+            _usage_has(details, name)
+            for name in ("cached_tokens", "cache_write_tokens", "cache_creation_tokens")
+        ) or _usage_has(response_usage, "cached_input_tokens"):
+            cache_telemetry = "reported"
     else:
         # OpenAI-style names first; fall back to Anthropic-style
         # (input_tokens/output_tokens). Local OpenAI-compatible servers like
@@ -1382,6 +1405,20 @@ def normalize_usage(
                 _usage_get(response_usage, "cache_write_tokens", 0)
             )
         input_tokens = max(0, prompt_total - cache_read_tokens - cache_write_tokens)
+        if any(
+            _usage_has(source, name)
+            for source in (response_usage, details)
+            for name in (
+                "cached_tokens",
+                "cache_write_tokens",
+                "cache_creation_tokens",
+                "cache_read_input_tokens",
+                "cache_creation_input_tokens",
+                "prompt_cache_hit_tokens",
+                "cached_input_tokens",
+            )
+        ):
+            cache_telemetry = "reported"
 
     reasoning_tokens = 0
     # Responses API shape: output_tokens_details.reasoning_tokens.
@@ -1419,13 +1456,21 @@ def normalize_usage(
             cache_read_tokens, cache_write_tokens,
         )
 
-    return CanonicalUsage(
+    usage = CanonicalUsage(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         cache_read_tokens=cache_read_tokens,
         cache_write_tokens=cache_write_tokens,
         reasoning_tokens=reasoning_tokens,
+        cache_telemetry=cache_telemetry,
     )
+    try:
+        from agent.cache_lowhit_request_dump import maybe_dump_on_usage
+
+        maybe_dump_on_usage(usage)
+    except Exception:
+        logger.debug("cache low-hit dump failed", exc_info=True)
+    return usage
 
 
 def estimate_usage_cost(

@@ -12,9 +12,20 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 
-from agent import relay_runtime
+from agent import cache_lowhit_request_dump, relay_runtime
 
 logger = logging.getLogger(__name__)
+
+
+def _remember_sent_request(
+    request: dict[str, Any], metadata: dict[str, Any] | None
+) -> None:
+    try:
+        cache_lowhit_request_dump.remember_sent_request(
+            request, api_mode=str((metadata or {}).get("api_mode") or "unknown")
+        )
+    except Exception:
+        logger.debug("cache low-hit remember failed", exc_info=True)
 
 
 _PROVIDER_MESSAGE_EXTENSION_KEYS = frozenset(
@@ -83,6 +94,7 @@ def execute(
     """Run one non-streaming physical provider attempt through Relay."""
     runtime, session, parent = relay_runtime.resolve_execution_context(session_id)
     if runtime is None or session is None or not runtime.managed_execution_enabled():
+        _remember_sent_request(request, metadata)
         return callback(request)
     logical = _logical_parent(runtime, session, parent, metadata)
     parent = logical[1] if logical is not None else parent
@@ -116,6 +128,7 @@ def execute(
                 codec_baseline_body=codec_baseline_body,
                 metadata=metadata,
             )
+            _remember_sent_request(final_request, metadata)
             raw = callback_context.copy().run(guarded, final_request)
         except BaseException as exc:
             callback_error = exc
@@ -175,6 +188,7 @@ async def execute_async(
     """Run one asynchronous physical provider attempt through Relay."""
     runtime, session, parent = relay_runtime.resolve_execution_context(session_id)
     if runtime is None or session is None or not runtime.managed_execution_enabled():
+        _remember_sent_request(request, metadata)
         return await callback(request)
     logical = _logical_parent(runtime, session, parent, metadata)
     parent = logical[1] if logical is not None else parent
@@ -201,6 +215,7 @@ async def execute_async(
                 codec_baseline_body=codec_baseline_body,
                 metadata=metadata,
             )
+            _remember_sent_request(final_request, metadata)
             async def call_provider() -> Any:
                 # Nested relay calls inside a managed provider callback must
                 # run unmanaged (#77244).
@@ -267,6 +282,7 @@ def execute_current(
     """Run a provider attempt under the inherited Hermes turn when present."""
     turn = relay_runtime.active_turn()
     if turn is None:
+        _remember_sent_request(request, metadata)
         return callback(request)
     return execute(
         request,
@@ -291,6 +307,7 @@ async def execute_current_async(
     """Run an async provider attempt under the inherited turn when present."""
     turn = relay_runtime.active_turn()
     if turn is None:
+        _remember_sent_request(request, metadata)
         return await callback(request)
     return await execute_async(
         request,
@@ -475,6 +492,7 @@ class ManagedLlmStream(Iterator[Any]):
             or session is None
             or not runtime.managed_execution_enabled()
         ):
+            _remember_sent_request(request, metadata)
             raw_stream = stream_factory(request)
             if completed_response_predicate is not None and completed_response_predicate(
                 raw_stream
@@ -503,15 +521,17 @@ class ManagedLlmStream(Iterator[Any]):
         async def provider_stream(next_request: Any):
             raw_stream = None
             try:
+                final_request = _provider_request(
+                    request,
+                    next_request,
+                    relay_request_body=relay_request_body,
+                    codec_baseline_body=codec_baseline_body,
+                    metadata=metadata,
+                )
+                _remember_sent_request(final_request, metadata)
                 raw_stream = run_callback(
                     stream_factory,
-                    _provider_request(
-                        request,
-                        next_request,
-                        relay_request_body=relay_request_body,
-                        codec_baseline_body=codec_baseline_body,
-                        metadata=metadata,
-                    )
+                    final_request,
                 )
                 if (
                     completed_response_predicate is not None

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import hashlib
 import json
@@ -15,7 +16,14 @@ __all__ = [
     "CheckpointContextEngine",
     "DeterministicLanes",
     "Effect",
+    "MapFact",
+    "MapShard",
 ]
+
+
+_MAP_CONCURRENCY_CAP = 2
+_MAP_MAX_TOKENS = 1024
+_MAP_TASK = "compression"
 
 
 @dataclass(frozen=True)
@@ -51,8 +59,56 @@ class DeterministicLanes:
     effects: tuple[Effect, ...]
 
 
+@dataclass(frozen=True)
+class MapFact:
+    """One model-derived fact tied to source events or marked uncertain."""
+
+    kind: str
+    text: str
+    source_event_ids: tuple[int, ...]
+    uncertain: bool = False
+
+
+@dataclass(frozen=True)
+class MapShard:
+    """Validated typed Map output for one causally complete shard."""
+
+    source_event_ids: tuple[int, ...]
+    facts: tuple[MapFact, ...]
+
+
 class CheckpointContextEngine(ContextEngine):
     """Selectable ``checkpoint`` engine that does not mutate messages."""
+
+    def __init__(
+        self,
+        *,
+        auxiliary_client: Any = None,
+        map_concurrency: Optional[int] = None,
+    ) -> None:
+        self._auxiliary_client = auxiliary_client
+        self._map_concurrency = self._bounded_map_concurrency(map_concurrency)
+        self.last_map_shards: tuple[MapShard, ...] = ()
+
+    @property
+    def map_concurrency(self) -> int:
+        """Bounded Map worker count; never exceeds the v1 cap."""
+        return self._map_concurrency
+
+    @staticmethod
+    def _bounded_map_concurrency(value: Optional[int]) -> int:
+        if value is None:
+            try:
+                from hermes_cli.config import load_config_readonly
+
+                config = load_config_readonly()
+                checkpoint = config.get("checkpoint", {})
+                value = checkpoint.get("map_concurrency", _MAP_CONCURRENCY_CAP)
+            except (AttributeError, ImportError, OSError, TypeError, ValueError):
+                value = _MAP_CONCURRENCY_CAP
+        if isinstance(value, bool) or not isinstance(value, int):
+            return _MAP_CONCURRENCY_CAP
+        return min(max(value, 1), _MAP_CONCURRENCY_CAP)
 
     @property
     def name(self) -> str:
@@ -181,6 +237,182 @@ class CheckpointContextEngine(ContextEngine):
     ) -> bool:
         return self._capture_snapshot(messages) == snapshot
 
+    @staticmethod
+    def _map_prompt(
+        messages: List[Dict[str, Any]], group: CausalGroup
+    ) -> List[Dict[str, str]]:
+        event_ids = group.event_indices
+        payload = {
+            "source_event_ids": event_ids,
+            "events": [
+                {"source_event_id": event_id, "message": messages[event_id]}
+                for event_id in event_ids
+            ],
+        }
+        return [
+            {
+                "role": "system",
+                "content": (
+                    "Return only JSON with exactly source_event_ids and facts. "
+                    "source_event_ids must cover this shard exactly. Each fact "
+                    "needs kind, text, and source_event_ids from this shard, or "
+                    "uncertain: true when it has no source. Do not call tools."
+                ),
+            },
+            {
+                "role": "user",
+                "content": json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            },
+        ]
+
+    def _configured_auxiliary_response(self, messages: List[Dict[str, str]]) -> Any:
+        """Call only explicit compression candidates and their configured chain."""
+        try:
+            from agent import auxiliary_client
+
+            config = auxiliary_client._get_auxiliary_task_config(_MAP_TASK)
+            chain = config.get("fallback_chain", [])
+            candidates = [("checkpoint-primary", config)]
+            if isinstance(chain, list):
+                candidates.extend(
+                    (f"fallback_chain[{index}]({entry.get('provider', '')})", entry)
+                    for index, entry in enumerate(chain)
+                    if isinstance(entry, dict)
+                )
+            timeout = auxiliary_client._effective_aux_timeout(_MAP_TASK, None)
+            extra_body = auxiliary_client._get_task_extra_body(_MAP_TASK)
+            extra_body.pop("reasoning", None)
+        except (AttributeError, ImportError, OSError, TypeError, ValueError):
+            return None
+
+        for label, entry in candidates:
+            provider = str(entry.get("provider", "")).strip()
+            model = str(entry.get("model", "")).strip()
+            if not provider or not model or provider.lower() == "auto":
+                continue
+            try:
+                client, resolved_model = auxiliary_client._resolve_fallback_entry(entry)
+                if client is None:
+                    continue
+                response = auxiliary_client._call_fallback_candidate_sync(
+                    client,
+                    resolved_model or model,
+                    label,
+                    task=_MAP_TASK,
+                    messages=messages,
+                    temperature=0,
+                    max_tokens=_MAP_MAX_TOKENS,
+                    tools=[],
+                    effective_timeout=timeout,
+                    effective_extra_body=extra_body,
+                    reasoning_config={"enabled": False},
+                )
+            except Exception:
+                continue
+            if response is not None:
+                return response
+        return None
+
+    def _call_map(self, messages: List[Dict[str, str]]) -> Any:
+        if self._auxiliary_client is not None:
+            return self._auxiliary_client.complete(
+                messages=messages,
+                max_tokens=_MAP_MAX_TOKENS,
+                tools=[],
+            )
+        return self._configured_auxiliary_response(messages)
+
+    @staticmethod
+    def _response_content(response: Any) -> Optional[str]:
+        if isinstance(response, str):
+            return response
+        choices = response.get("choices") if isinstance(response, dict) else getattr(response, "choices", None)
+        if not isinstance(choices, list) or not choices:
+            return None
+        choice = choices[0]
+        message = choice.get("message") if isinstance(choice, dict) else getattr(choice, "message", None)
+        if not isinstance(message, dict) and message is None:
+            return None
+        tool_calls = message.get("tool_calls") if isinstance(message, dict) else getattr(message, "tool_calls", None)
+        if tool_calls:
+            return None
+        content = message.get("content") if isinstance(message, dict) else getattr(message, "content", None)
+        return content if isinstance(content, str) else None
+
+    @staticmethod
+    def _event_ids(value: Any) -> Optional[tuple[int, ...]]:
+        if not isinstance(value, list) or any(
+            isinstance(event_id, bool) or not isinstance(event_id, int)
+            for event_id in value
+        ):
+            return None
+        event_ids = tuple(value)
+        return event_ids if len(set(event_ids)) == len(event_ids) else None
+
+    @classmethod
+    def _parse_map_shard(
+        cls, response: Any, group: CausalGroup
+    ) -> Optional[MapShard]:
+        content = cls._response_content(response)
+        if content is None:
+            return None
+        try:
+            payload = json.loads(content)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(payload, dict) or set(payload) != {"source_event_ids", "facts"}:
+            return None
+        source_event_ids = cls._event_ids(payload["source_event_ids"])
+        if source_event_ids is None or set(source_event_ids) != set(group.event_indices):
+            return None
+        facts = payload["facts"]
+        if not isinstance(facts, list):
+            return None
+
+        parsed_facts = []
+        for fact in facts:
+            if not isinstance(fact, dict) or not {"kind", "text"} <= set(fact):
+                return None
+            if set(fact) - {"kind", "text", "source_event_ids", "uncertain"}:
+                return None
+            kind = fact["kind"]
+            text = fact["text"]
+            uncertain = fact.get("uncertain", False)
+            if not isinstance(kind, str) or not kind or not isinstance(text, str) or not text:
+                return None
+            if not isinstance(uncertain, bool):
+                return None
+            fact_event_ids = cls._event_ids(fact.get("source_event_ids"))
+            if fact_event_ids is None:
+                if "source_event_ids" in fact or not uncertain:
+                    return None
+                fact_event_ids = ()
+            elif not fact_event_ids or not set(fact_event_ids) <= set(source_event_ids):
+                return None
+            parsed_facts.append(MapFact(kind, text, fact_event_ids, uncertain))
+        return MapShard(tuple(group.event_indices), tuple(parsed_facts))
+
+    def _map_group(
+        self, messages: List[Dict[str, Any]], group: CausalGroup
+    ) -> Optional[MapShard]:
+        try:
+            return self._parse_map_shard(
+                self._call_map(self._map_prompt(messages, group)), group
+            )
+        except Exception:
+            return None
+
+    def _map_shards(
+        self, messages: List[Dict[str, Any]], groups: tuple[CausalGroup, ...]
+    ) -> Optional[tuple[MapShard, ...]]:
+        if not groups:
+            return ()
+        with ThreadPoolExecutor(max_workers=self._map_concurrency) as executor:
+            mapped = tuple(executor.map(lambda group: self._map_group(messages, group), groups))
+        if any(shard is None for shard in mapped):
+            return None
+        return tuple(shard for shard in mapped if shard is not None)
+
     def compress(
         self,
         messages: List[Dict[str, Any]],
@@ -197,4 +429,9 @@ class CheckpointContextEngine(ContextEngine):
             messages, snapshot
         ):
             return messages
+        self.last_map_shards = ()
+        mapped = self._map_shards(messages, self._plan_causal_groups(messages))
+        if mapped is None or not self._snapshot_is_current(messages, snapshot):
+            return messages
+        self.last_map_shards = mapped
         return messages

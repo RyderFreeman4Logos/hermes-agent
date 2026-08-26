@@ -1,9 +1,45 @@
 """Checkpoint ContextEngine: opt-in shadow no-op (DESIGN.md §10 item 1)."""
 
 from copy import deepcopy
+import json
+from types import SimpleNamespace
 
 from hermes_cli.config_defaults import DEFAULT_CONFIG
 from plugins.context_engine import discover_context_engines, load_context_engine
+
+
+class _FakeAuxiliaryClient:
+    def __init__(self, *responses):
+        self.calls = []
+        self._responses = list(responses)
+
+    def complete(self, **kwargs):
+        self.calls.append(kwargs)
+        response = self._responses.pop(0)
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+
+class _FakeMainModel:
+    def __init__(self):
+        self.calls = 0
+
+    def complete(self, **_kwargs):
+        self.calls += 1
+        raise AssertionError("checkpoint Map must not call the main model")
+
+
+def _map_response(payload, *, tool_calls=None):
+    return SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content=json.dumps(payload), tool_calls=tool_calls or []
+                )
+            )
+        ]
+    )
 
 
 def test_default_context_engine_remains_compressor():
@@ -168,3 +204,110 @@ def test_assistant_prose_does_not_mark_effect_succeeded():
     assert len(lanes.effects) == 1
     assert lanes.effects[0].operation == "write_file"
     assert lanes.effects[0].status == "unknown"
+
+
+def test_typed_map_keeps_source_event_ids_and_uses_no_tools():
+    from agent.checkpoint_engine import CheckpointContextEngine
+
+    auxiliary = _FakeAuxiliaryClient(
+        _map_response({"source_event_ids": [0], "facts": []}),
+        _map_response(
+            {
+                "source_event_ids": [1],
+                "facts": [
+                    {
+                        "kind": "request",
+                        "text": "The user said hello.",
+                        "source_event_ids": [1],
+                    }
+                ],
+            }
+        )
+    )
+    engine = CheckpointContextEngine(auxiliary_client=auxiliary)
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "hello"},
+    ]
+
+    result = engine.compress(messages)
+
+    assert result is messages
+    assert all(call["tools"] == [] for call in auxiliary.calls)
+    assert [shard.source_event_ids for shard in engine.last_map_shards] == [(0,), (1,)]
+    assert engine.last_map_shards[1].facts[0].source_event_ids == (1,)
+
+
+def test_invalid_or_truncated_map_json_rejects_candidate():
+    from agent.checkpoint_engine import CheckpointContextEngine
+
+    auxiliary = _FakeAuxiliaryClient(
+        SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="{", tool_calls=[]))]
+        )
+    )
+    engine = CheckpointContextEngine(auxiliary_client=auxiliary)
+    messages = [{"role": "user", "content": "hello"}]
+
+    result = engine.compress(messages)
+
+    assert result is messages
+    assert auxiliary.calls
+    assert engine.last_map_shards == ()
+    assert "[digest unavailable]" not in str(result)
+    assert engine.compression_count == 0
+
+
+def test_map_tool_call_rejects_candidate():
+    from agent.checkpoint_engine import CheckpointContextEngine
+
+    auxiliary = _FakeAuxiliaryClient(
+        _map_response(
+            {"source_event_ids": [0], "facts": []},
+            tool_calls=[{"id": "call_1"}],
+        )
+    )
+    engine = CheckpointContextEngine(auxiliary_client=auxiliary)
+    messages = [{"role": "user", "content": "hello"}]
+
+    assert engine.compress(messages) is messages
+    assert engine.last_map_shards == ()
+    assert engine.compression_count == 0
+
+
+def test_missing_map_coverage_rejects_candidate():
+    from agent.checkpoint_engine import CheckpointContextEngine
+
+    auxiliary = _FakeAuxiliaryClient(
+        _map_response({"source_event_ids": [0], "facts": []}),
+        _map_response({"source_event_ids": [0], "facts": []}),
+    )
+    engine = CheckpointContextEngine(auxiliary_client=auxiliary)
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "hello"},
+    ]
+
+    assert engine.compress(messages) is messages
+    assert engine.last_map_shards == ()
+    assert engine.compression_count == 0
+
+
+def test_exhausted_auxiliary_map_never_calls_main_model():
+    from agent.checkpoint_engine import CheckpointContextEngine
+
+    main_model = _FakeMainModel()
+    auxiliary = _FakeAuxiliaryClient(RuntimeError("configured chain exhausted"))
+    engine = CheckpointContextEngine(auxiliary_client=auxiliary)
+    messages = [{"role": "user", "content": "hello"}]
+
+    assert engine.compress(messages) is messages
+    assert auxiliary.calls
+    assert main_model.calls == 0
+    assert engine.compression_count == 0
+
+
+def test_checkpoint_map_concurrency_is_capped_at_two_by_default():
+    from agent.checkpoint_engine import CheckpointContextEngine
+
+    assert CheckpointContextEngine().map_concurrency == 2

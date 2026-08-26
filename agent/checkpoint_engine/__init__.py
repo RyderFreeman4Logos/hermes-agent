@@ -106,6 +106,7 @@ class CheckpointContextEngine(ContextEngine):
         self,
         *,
         auxiliary_client: Any = None,
+        main_model: Any = None,
         map_concurrency: Optional[int] = None,
         semantic_reducer: Optional[Callable[[ReducedState], Any]] = None,
         mode: Optional[str] = None,
@@ -117,6 +118,7 @@ class CheckpointContextEngine(ContextEngine):
     ) -> None:
         checkpoint_config = self._checkpoint_config()
         self._auxiliary_client = auxiliary_client
+        self._main_model = main_model
         self._map_concurrency = self._bounded_map_concurrency(map_concurrency)
         self._semantic_reducer = semantic_reducer
         configured_mode = checkpoint_config.get("mode", "shadow")

@@ -310,13 +310,21 @@ def test_exhausted_auxiliary_map_never_calls_main_model():
 
     main_model = _FakeMainModel()
     auxiliary = _FakeAuxiliaryClient(RuntimeError("configured chain exhausted"))
-    engine = CheckpointContextEngine(auxiliary_client=auxiliary)
+    engine = CheckpointContextEngine(
+        auxiliary_client=auxiliary,
+        main_model=main_model,
+    )
     messages = [{"role": "user", "content": "hello"}]
 
-    assert engine.compress(messages) is messages
+    result = engine.compress(messages)
+
+    assert result is messages
+    assert engine._main_model is main_model
     assert auxiliary.calls
     assert main_model.calls == 0
+    assert engine.last_map_shards == ()
     assert engine.compression_count == 0
+    assert "[digest unavailable]" not in str(result)
 
 
 def test_checkpoint_map_concurrency_is_capped_at_two_by_default():

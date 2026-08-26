@@ -6473,6 +6473,11 @@ This compaction should PRIORITISE preserving all information related to the focu
         user_anchored_cut = self._ensure_last_user_message_in_tail(
             messages, cut_idx, head_end
         )
+        last_user_text = (
+            _content_text_for_contains(messages[last_user_idx].get("content"))
+            if last_user_idx >= 0
+            else ""
+        )
         split_oversized_turn = False
         if (
             allow_split_turn
@@ -6481,13 +6486,16 @@ This compaction should PRIORITISE preserving all information related to the focu
             and user_anchored_cut < cut_idx
             # A single oversized user message is indivisible and must remain
             # verbatim in the tail. This exception is only for aggregate turn
-            # growth after a normally-sized opening request.
+            # growth after a normally-sized opening request. Internal
+            # completion notices ([ASYNC DELEGATION …], etc.) can exceed
+            # _ACTIVE_TASK_MAX_CHARS while still fitting the token budget;
+            # treating them as indivisible pastes hoards the following tool
+            # run and turns /compress into a no-op.
             and _estimate_msg_budget_tokens(messages[last_user_idx]) <= soft_ceiling
-            and len(
-                _content_text_for_contains(
-                    messages[last_user_idx].get("content")
-                ).strip()
-            ) <= _ACTIVE_TASK_MAX_CHARS
+            and (
+                len(last_user_text.strip()) <= _ACTIVE_TASK_MAX_CHARS
+                or _synthetic_user_row(last_user_text)
+            )
             and sum(
                 _estimate_msg_budget_tokens(message)
                 for message in messages[user_anchored_cut:]

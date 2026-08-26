@@ -9,6 +9,7 @@ import pytest
 from agent.context_compressor import (
     COMPRESSED_SUMMARY_METADATA_KEY,
     ContextCompressor,
+    _ACTIVE_TASK_MAX_CHARS,
     _estimate_msg_budget_tokens,
 )
 
@@ -184,5 +185,68 @@ def test_full_compaction_preserves_active_request_and_tool_pairs(
         _ACTIVE_REQUEST in str(message.get("content"))
         for message in compressed
     ) == 1
+    assert len(compressed) < len(messages)
+    _assert_tool_pairs_are_complete(compressed)
+
+
+def test_long_internal_completion_does_not_hoard_the_whole_transcript(
+    compressor: ContextCompressor,
+) -> None:
+    """A 3k-char async-delegation notice is not an indivisible user paste.
+
+    Live /compress after #207: session 20260714_140712_15c248 kept 461
+    messages / ~188k tokens unchanged. The only non-synthetic user row was
+    ``[ASYNC DELEGATION BATCH COMPLETE]`` (3136 chars). The #80449 split
+    bails when that text exceeds ``_ACTIVE_TASK_MAX_CHARS`` (1400), so the
+    user-anchor swallowed the remaining ~170k-token tool run, the middle
+    window collapsed to the previous compaction handoff, and compress()
+    returned the input list (telemetry ``failure_class=no_progress``,
+    ``middle_window_tokens=0``, 114ms, no aux call).
+    """
+    completion = (
+        "[ASYNC DELEGATION BATCH COMPLETE — deleg_9dc8cde8]\n"
+        + ("A background fan-out finished. Details: " + "x" * 80 + "\n") * 40
+    )
+    assert len(completion) > _ACTIVE_TASK_MAX_CHARS
+    # Budget must fit the notice itself (else the user-message token
+    # ceiling independently refuses the split) but not the following
+    # tool run — the live session was 10k tail / 3k-char notice / 170k
+    # tools.
+    notice_budget = 1_200
+    compressor.tail_token_budget = notice_budget
+    messages = [
+        {
+            "role": "user",
+            "content": (
+                "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were "
+                "compacted into the summary below."
+            ),
+        },
+        {"role": "assistant", "content": "acked prior handoff"},
+        {"role": "user", "content": completion},
+    ]
+    for index in range(12):
+        messages.extend(_tool_group(index))
+    messages.append({"role": "assistant", "content": "visible reply after tools"})
+
+    completion_idx = 2
+    assert _estimate_msg_budget_tokens(messages[completion_idx]) <= int(
+        notice_budget * 1.5
+    )
+    head_end = compressor._protect_head_size(messages)
+    cut = compressor._find_tail_cut_by_tokens(
+        messages,
+        head_end,
+        token_budget=notice_budget,
+    )
+    tail_tokens = sum(_estimate_msg_budget_tokens(msg) for msg in messages[cut:])
+    assert cut > completion_idx
+    assert tail_tokens < sum(
+        _estimate_msg_budget_tokens(msg) for msg in messages[completion_idx:]
+    )
+
+    with patch.object(compressor, "_generate_summary", return_value=None):
+        compressed = compressor.compress(messages, current_tokens=90_000)
+
     assert len(compressed) < len(messages)
     _assert_tool_pairs_are_complete(compressed)

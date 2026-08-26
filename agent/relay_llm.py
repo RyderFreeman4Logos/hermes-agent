@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 
-from agent import physical_attempt_diagnostics, relay_runtime
+from agent import cache_lowhit_request_dump, physical_attempt_diagnostics, relay_runtime
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +84,16 @@ def _attempt_loop(metadata: dict[str, Any] | None) -> tuple[int | None, str]:
 def _record_attempt(
     request: dict[str, Any], *, name: str, model_name: str, metadata: dict[str, Any] | None
 ) -> None:
+    try:
+        cache_lowhit_request_dump.remember_sent_request(
+            request,
+            api_mode=str((metadata or {}).get("api_mode") or "unknown"),
+            route=str((metadata or {}).get("api_mode") or "unknown"),
+            provider=name,
+            model=str(request.get("model") or model_name),
+        )
+    except Exception:
+        logger.debug("cache low-hit remember failed", exc_info=True)
     scope = physical_attempt_diagnostics.take_cache_scope(request)
     loop, correlation = _attempt_loop(metadata)
     physical_attempt_diagnostics.start_attempt(

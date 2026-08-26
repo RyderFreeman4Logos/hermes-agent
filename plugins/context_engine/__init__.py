@@ -35,9 +35,10 @@ def discover_context_engines() -> List[Tuple[str, str, bool]]:
 
     Returns list of (name, description, is_available) tuples.
     Does NOT import the engines — just reads plugin.yaml for metadata
-    and does a lightweight availability check.
+    and does a lightweight availability check. Built-in engines such as
+    ``checkpoint`` are prepended so ``context.engine`` can select them.
     """
-    results = []
+    results = [("checkpoint", "Opt-in checkpoint ContextEngine (shadow no-op).", True)]
     if not _CONTEXT_ENGINE_PLUGINS_DIR.is_dir():
         return results
 
@@ -81,6 +82,10 @@ def load_context_engine(name: str) -> Optional["ContextEngine"]:
 
     Returns None if the engine is not found or fails to load.
     """
+    if name == "checkpoint":
+        from agent.checkpoint_engine import CheckpointContextEngine
+        return CheckpointContextEngine()
+
     engine_dir = _CONTEXT_ENGINE_PLUGINS_DIR / name
     if not engine_dir.is_dir():
         logger.debug("Context engine '%s' not found in %s", name, _CONTEXT_ENGINE_PLUGINS_DIR)

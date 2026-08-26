@@ -3497,6 +3497,8 @@ _CJK_DENSE_RE = re.compile(
     "\uf900-\ufaff"  # CJK compatibility ideographs
     "\uff00-\uffef]"  # Fullwidth forms / halfwidth kana
 )
+_BASE64_RUN_RE = re.compile(r"[A-Za-z0-9+/]{64,}={0,2}")
+_TOKEN_DENSE_ASCII_MARKERS = ("```", "{", "}", "[", "]", "<", ">", "\\", "=>", "::")
 
 
 def estimate_tokens_rough(text: str) -> int:
@@ -3509,17 +3511,19 @@ def estimate_tokens_rough(text: str) -> int:
     tokenizers, so count those codepoints as roughly one token each instead
     of applying the English-centric ~4 chars/token rule.
 
-    Perf: this runs on every message in every preflight/compaction walk,
-    including MB-scale tool outputs, so the common all-ASCII case must stay
-    O(1).  ``str.isascii()`` is a flag check on CPython's compact unicode
-    representation (no scan), and the CJK counting itself is a single
-    C-level ``re.findall`` rather than a per-character Python loop.
+    Code, JSON, and base64 are estimated more conservatively than prose. This
+    runs on every message in every preflight/compaction walk, including
+    MB-scale tool outputs; CJK counting remains a single C-level regex pass.
     """
     if not text:
         return 0
     text = str(text)
     if text.isascii():
-        # O(1) fast path — ASCII text cannot contain token-dense CJK chars.
+        if _BASE64_RUN_RE.search(text):
+            return len(text)
+        if any(marker in text for marker in _TOKEN_DENSE_ASCII_MARKERS):
+            return (len(text) + 1) // 2
+        # Plain ASCII prose retains the English-centric fast estimate.
         return (len(text) + 3) // 4
     dense = len(text) - len(_CJK_DENSE_RE.sub("", text))
     if not dense:
@@ -3736,14 +3740,19 @@ def estimate_request_tokens_rough(
     *,
     system_prompt: str = "",
     tools: Optional[List[Dict[str, Any]]] = None,
+    response_format: Any = None,
+    output_reserve_tokens: int = 0,
+    reasoning_reserve_tokens: int = 0,
+    provider_overhead_tokens: int = 0,
 ) -> int:
-    """Rough token estimate for a full chat-completions request.
+    """Conservative estimate for the complete provider-visible request.
 
     Includes the major payload buckets Hermes sends to providers:
-    system prompt, conversation messages, and tool schemas.  With 50+
-    tools enabled, schemas alone can add 20-30K tokens — a significant
-    blind spot when only counting messages. Image content is counted
-    at a flat per-image cost (see estimate_messages_tokens_rough).
+    system/developer prompt, conversation messages, tool schemas, optional
+    structured-output schema, provider envelope overhead, and output/reasoning
+    reserves. With 50+ tools enabled, schemas alone can add 20-30K tokens.
+    Image content is counted at a flat per-image cost (see
+    estimate_messages_tokens_rough).
     """
     total = 0
     if system_prompt:
@@ -3751,7 +3760,29 @@ def estimate_request_tokens_rough(
     if messages:
         total += estimate_messages_tokens_rough(messages)
     if tools:
-        total += _estimate_tools_tokens_rough(tools)
+        if isinstance(tools, list):
+            total += _estimate_tools_tokens_rough(tools)
+        else:
+            try:
+                total += estimate_tokens_rough(
+                    json.dumps(tools, ensure_ascii=False, separators=(",", ":"))
+                )
+            except (TypeError, ValueError):
+                total += estimate_tokens_rough(str(tools))
+    if response_format:
+        try:
+            total += estimate_tokens_rough(
+                json.dumps(response_format, ensure_ascii=False, separators=(",", ":"))
+            )
+        except (TypeError, ValueError):
+            total += estimate_tokens_rough(str(response_format))
+    for reserve in (
+        output_reserve_tokens,
+        reasoning_reserve_tokens,
+        provider_overhead_tokens,
+    ):
+        if isinstance(reserve, int) and not isinstance(reserve, bool) and reserve > 0:
+            total += reserve
     return total
 
 
@@ -3795,10 +3826,9 @@ def _estimate_tools_tokens_rough(tools: List[Dict[str, Any]]) -> int:
         if cached_n == n and cached_first == first and cached_last == last:
             return cached_tokens
 
-    # Fast, stable rough estimate: sum lengths of the major schema fields.
-    # This avoids the pathological `str(tools)` path while still scaling with
-    # schema size (descriptions + parameters dominate).
-    total_chars = 0
+    # Sum provider-visible schema fields in order. JSON and code use a denser
+    # conservative estimate than prose, avoiding char/4 for tool-heavy calls.
+    tokens = 0
     for tool in tools:
         if not isinstance(tool, dict):
             continue
@@ -3813,16 +3843,16 @@ def _estimate_tools_tokens_rough(tools: List[Dict[str, Any]]) -> int:
             params = tool.get("parameters") or {}
 
         if isinstance(name, str):
-            total_chars += len(name)
+            tokens += estimate_tokens_rough(name)
         if isinstance(desc, str):
-            total_chars += len(desc)
+            tokens += estimate_tokens_rough(desc)
         # Parameters can be nested; JSON is closer to over-the-wire size than repr().
         try:
-            total_chars += len(json.dumps(params, ensure_ascii=False, separators=(",", ":")))
+            tokens += estimate_tokens_rough(
+                json.dumps(params, ensure_ascii=False, separators=(",", ":"))
+            )
         except Exception:
-            total_chars += len(str(params))
-
-    tokens = (total_chars + 3) // 4
+            tokens += estimate_tokens_rough(str(params))
     # Bound the cache: drop the oldest entry when the cap is exceeded so a
     # long-running process can't accumulate an unbounded number of stale
     # ``id(tools)`` entries (id values are recycled after GC anyway).

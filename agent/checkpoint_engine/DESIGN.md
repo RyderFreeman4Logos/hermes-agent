@@ -131,9 +131,12 @@ checkpoint content. Exhausted chain ⇒ reject candidate.
 local OOM, or “model unavailable” must not retry the main model unless
 that route is explicitly in the configured auxiliary chain.
 
-**I-12 Hard low-water.** Measure the **full** provider-visible request
-(system, tools/schemas, skills, checkpoint, active turn, tail, output
-reserve). Over `hard_max_wire_tokens` ⇒ reject. A “successful”
+**I-12 Hard low-water.** Measure the **full** provider-visible request with
+the host request-budget service (system/developer prompt, tools/schemas,
+skills, checkpoint, active turn, tail, structured output, multimodal parts,
+provider overhead, output/reasoning reserve). Preserve any host-only overhead
+from the source request when rendering a candidate. Over
+`hard_max_wire_tokens` ⇒ reject. A “successful”
 compaction that leaves 100K+ tokens is a contract violation.
 
 **I-13 Checkpoints do not do work.** Generating or rendering a checkpoint

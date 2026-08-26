@@ -964,13 +964,24 @@ class CheckpointContextEngine(ContextEngine):
                 return count
         return self._rough_token_count(value)
 
-    def _estimate_wire_tokens(self, candidate: List[Dict[str, Any]]) -> int:
-        schema_tokens = self._token_count(self._tool_schemas) if self._tool_schemas else 0
-        return (
-            sum(self._token_count(message) for message in candidate)
-            + schema_tokens
-            + self._output_reserve_tokens
+    def _estimate_request_tokens(
+        self, messages: List[Dict[str, Any]], *, output_reserve_tokens: int = 0
+    ) -> int:
+        """Use the host's full-request budget service for every candidate."""
+        from agent.model_metadata import estimate_request_tokens_rough
+
+        return estimate_request_tokens_rough(
+            messages,
+            tools=self._tool_schemas or None,
+            output_reserve_tokens=output_reserve_tokens,
         )
+
+    def _estimate_wire_tokens(
+        self, candidate: List[Dict[str, Any]], *, fixed_wire_tokens: int = 0
+    ) -> int:
+        return self._estimate_request_tokens(
+            candidate, output_reserve_tokens=self._output_reserve_tokens
+        ) + fixed_wire_tokens
 
     @staticmethod
     def _tail_groups(
@@ -1020,6 +1031,7 @@ class CheckpointContextEngine(ContextEngine):
         groups: tuple[CausalGroup, ...],
         state: ReducedState,
         semantic_checkpoint: str,
+        fixed_wire_tokens: int,
     ) -> Optional[tuple[List[Dict[str, Any]], int, tuple[str, ...], str]]:
         if state.active_intent is None:
             return None
@@ -1033,7 +1045,9 @@ class CheckpointContextEngine(ContextEngine):
             candidate = self._projection(
                 messages, tail_groups, state.active_intent, checkpoint
             )
-            wire_tokens = self._estimate_wire_tokens(candidate)
+            wire_tokens = self._estimate_wire_tokens(
+                candidate, fixed_wire_tokens=fixed_wire_tokens
+            )
             if wire_tokens <= self._target_wire_tokens:
                 break
             if detail_level < 3:
@@ -1060,7 +1074,12 @@ class CheckpointContextEngine(ContextEngine):
         self._last_compress_aborted = False
         self._last_summary_error = None
         self._last_compression_made_progress = False
-        self.last_request_tokens = self._usage_tokens(current_tokens) or self._estimate_wire_tokens(messages)
+        known_request_tokens = self._estimate_request_tokens(messages)
+        current_request_tokens = self._usage_tokens(current_tokens)
+        fixed_wire_tokens = max(
+            0, (current_request_tokens or 0) - known_request_tokens
+        )
+        self.last_request_tokens = current_request_tokens or self._estimate_wire_tokens(messages)
         self.last_focus_topic = focus_topic.strip() if isinstance(focus_topic, str) else ""
         self.last_memory_context = (
             sanitize_memory_context(memory_context)
@@ -1128,7 +1147,9 @@ class CheckpointContextEngine(ContextEngine):
         if not self._snapshot_is_current(messages, snapshot):
             self.last_trigger_reason = "stale_snapshot"
             return messages
-        rendered = self._render_candidate(messages, groups, reduced, checkpoint)
+        rendered = self._render_candidate(
+            messages, groups, reduced, checkpoint, fixed_wire_tokens
+        )
         if rendered is None:
             self._set_automatic_cooldown("candidate_rejected")
             self._last_compress_aborted = True

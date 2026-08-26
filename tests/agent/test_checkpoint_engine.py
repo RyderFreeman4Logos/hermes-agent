@@ -165,10 +165,7 @@ def test_checkpoint_uses_focus_memory_and_complete_request_estimate():
 
     memory_context = "api_key=sk-test-secret\nRemember the release checklist."
     auxiliary = _FakeAuxiliaryClient(
-        _map_response({"source_event_ids": [0], "facts": []}),
-        _map_response({"source_event_ids": [1], "facts": []}),
-        _map_response({"source_event_ids": [2], "facts": []}),
-        _map_response({"source_event_ids": [3], "facts": []}),
+        _map_response({"source_event_ids": [0, 1, 2, 3], "facts": []}),
         SimpleNamespace(
             choices=[SimpleNamespace(message=SimpleNamespace(
                 content="Continue from the verified state.", tool_calls=[]
@@ -349,10 +346,9 @@ def test_typed_map_keeps_source_event_ids_and_uses_no_tools():
     from agent.checkpoint_engine import CheckpointContextEngine
 
     auxiliary = _FakeAuxiliaryClient(
-        _map_response({"source_event_ids": [0], "facts": []}),
         _map_response(
             {
-                "source_event_ids": [1],
+                "source_event_ids": [0, 1],
                 "facts": [
                     {
                         "kind": "request",
@@ -373,8 +369,8 @@ def test_typed_map_keeps_source_event_ids_and_uses_no_tools():
 
     assert result is messages
     assert all(call["tools"] == [] for call in auxiliary.calls)
-    assert [shard.source_event_ids for shard in engine.last_map_shards] == [(0,), (1,)]
-    assert engine.last_map_shards[1].facts[0].source_event_ids == (1,)
+    assert [shard.source_event_ids for shard in engine.last_map_shards] == [(0, 1)]
+    assert engine.last_map_shards[0].facts[0].source_event_ids == (1,)
 
 
 def test_invalid_or_truncated_map_json_rejects_candidate():
@@ -459,6 +455,150 @@ def test_checkpoint_map_concurrency_is_capped_at_two_by_default():
 
     assert CheckpointContextEngine().map_concurrency == 2
 
+
+def test_map_planner_packs_consecutive_causal_units_without_splitting_tool_receipts(
+    monkeypatch,
+):
+    import agent.checkpoint_engine as checkpoint_engine
+    from agent.checkpoint_engine import CheckpointContextEngine
+
+    monkeypatch.setattr(checkpoint_engine, "_MAP_SHARD_TARGET_INPUT_TOKENS", 12)
+    monkeypatch.setattr(checkpoint_engine, "_MAP_SHARD_MAX_INPUT_TOKENS", 16)
+
+    def token_counter(prompt):
+        payload = json.loads(prompt[-1]["content"])
+        return 6 * len(payload["source_event_ids"])
+
+    engine = CheckpointContextEngine(token_counter=token_counter)
+    messages = [
+        {"role": "user", "content": "first request"},
+        {"role": "assistant", "content": "first response"},
+        {"role": "user", "content": "change the file"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "write_file", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "written"},
+        {"role": "assistant", "content": "verified"},
+    ]
+
+    shards = engine._plan_map_shards(messages, engine._plan_causal_groups(messages))
+
+    assert [shard.event_indices for shard in shards] == [(0, 1), (2,), (3, 4), (5,)]
+
+
+def test_map_planner_externalizes_an_oversized_causal_unit_without_tearing_it(
+    monkeypatch,
+):
+    import agent.checkpoint_engine as checkpoint_engine
+    from agent.checkpoint_engine import CheckpointContextEngine
+
+    monkeypatch.setattr(checkpoint_engine, "_MAP_SHARD_TARGET_INPUT_TOKENS", 12)
+    monkeypatch.setattr(checkpoint_engine, "_MAP_SHARD_MAX_INPUT_TOKENS", 16)
+
+    def token_counter(prompt):
+        payload = json.loads(prompt[-1]["content"])
+        return 20 if payload["source_event_ids"] == [0, 1] else 6
+
+    engine = CheckpointContextEngine(token_counter=token_counter)
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "write_file", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "receipt"},
+        {"role": "user", "content": "continue"},
+    ]
+
+    shards = engine._plan_map_shards(messages, engine._plan_causal_groups(messages))
+
+    assert [shard.event_indices for shard in shards] == [(2,)]
+    assert [group.event_indices for group in engine.last_map_externalized_groups] == [(0, 1)]
+
+
+def test_map_planner_fails_closed_when_its_total_input_budget_is_exceeded(monkeypatch):
+    import agent.checkpoint_engine as checkpoint_engine
+    from agent.checkpoint_engine import CheckpointContextEngine
+
+    monkeypatch.setattr(checkpoint_engine, "_MAP_SHARD_TARGET_INPUT_TOKENS", 6)
+    monkeypatch.setattr(checkpoint_engine, "_MAP_TOTAL_INPUT_TOKENS", 11)
+
+    def token_counter(prompt):
+        return 6 * len(json.loads(prompt[-1]["content"])["source_event_ids"])
+
+    engine = CheckpointContextEngine(token_counter=token_counter)
+    messages = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "first response"},
+    ]
+
+    assert engine._plan_map_shards(messages, engine._plan_causal_groups(messages)) is None
+
+
+def test_map_planner_fails_closed_when_its_total_output_budget_is_exceeded(monkeypatch):
+    import agent.checkpoint_engine as checkpoint_engine
+    from agent.checkpoint_engine import CheckpointContextEngine
+
+    monkeypatch.setattr(checkpoint_engine, "_MAP_SHARD_TARGET_INPUT_TOKENS", 6)
+    monkeypatch.setattr(checkpoint_engine, "_MAP_TOTAL_OUTPUT_TOKENS", 1_500)
+
+    def token_counter(prompt):
+        return 6 * len(json.loads(prompt[-1]["content"])["source_event_ids"])
+
+    engine = CheckpointContextEngine(token_counter=token_counter)
+    messages = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "first response"},
+    ]
+
+    assert engine._plan_map_shards(messages, engine._plan_causal_groups(messages)) is None
+
+
+def test_map_planner_has_a_bounded_default_shard_cap():
+    from agent.checkpoint_engine import CheckpointContextEngine
+
+    assert DEFAULT_CONFIG["checkpoint"]["max_map_shards"] == 32
+    assert CheckpointContextEngine().max_map_shards == 32
+    assert CheckpointContextEngine(max_map_shards=33).max_map_shards == 32
+
+
+def test_map_token_estimate_uses_host_request_estimator_and_safe_fallback(monkeypatch):
+    import agent.model_metadata as model_metadata
+    from agent.checkpoint_engine import CheckpointContextEngine
+
+    monkeypatch.setattr(model_metadata, "estimate_request_tokens_rough", lambda *_args, **_kwargs: 91)
+    engine = CheckpointContextEngine()
+    messages = [{"role": "user", "content": "中文" * 40}]
+    group = engine._plan_causal_groups(messages)[0]
+
+    assert engine._map_input_tokens(messages, group) >= 91
+
+
+def test_token_fallback_is_conservative_for_cjk_and_json(monkeypatch):
+    import agent.model_metadata as model_metadata
+    from agent.checkpoint_engine import CheckpointContextEngine
+
+    monkeypatch.setattr(model_metadata, "estimate_tokens_rough", lambda _value: 1)
+    engine = CheckpointContextEngine()
+    cjk = "中文" * 40
+    structured = {"content": '{"code":"def f(): return {\"ok\": true}"}'}
+
+    assert engine._rough_token_count(cjk) >= len(cjk)
+    assert engine._rough_token_count(structured) >= len(json.dumps(structured)) // 2
 
 def test_deterministic_reduce_merges_identity_supersession_and_action_state():
     from agent.checkpoint_engine import (

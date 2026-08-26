@@ -36,6 +36,7 @@ rot, dumb-zone collapse, hallucination. The mitigation is mechanical, not
 a smarter prompt:
 
 - shard on causal boundaries into 8K–16K inputs
+- pack consecutive causal units toward 12K; units over 16K stay external
 - complementary typed views, not N copies of the same prose summary
 - ~1K hard output cap per shard, thinking off/low
 - require source event IDs; reject truncated/invalid JSON
@@ -256,6 +257,7 @@ checkpoint:
   target_wire_tokens: 48000
   hard_max_wire_tokens: 60000
   map_concurrency: 2          # cap; do not auto-raise
+  max_map_shards: 32          # hard cap; Map input/output budgets fail closed
 ```
 
 Auxiliary model/provider/fallback stay under existing `auxiliary` /

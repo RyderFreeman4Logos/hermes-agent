@@ -25,6 +25,12 @@ __all__ = [
 
 _MAP_CONCURRENCY_CAP = 2
 _MAP_MAX_TOKENS = 1024
+_MAP_SHARD_TARGET_INPUT_TOKENS = 12_000
+_MAP_SHARD_MAX_INPUT_TOKENS = 16_000
+_MAP_MAX_SHARDS_CAP = 32
+_DEFAULT_MAX_MAP_SHARDS = 32
+_MAP_TOTAL_INPUT_TOKENS = _MAP_SHARD_TARGET_INPUT_TOKENS * _DEFAULT_MAX_MAP_SHARDS
+_MAP_TOTAL_OUTPUT_TOKENS = _MAP_MAX_TOKENS * _DEFAULT_MAX_MAP_SHARDS
 _SEMANTIC_REDUCE_MAX_TOKENS = 2048
 _MAP_TASK = "compression"
 _DEFAULT_TARGET_WIRE_TOKENS = 48_000
@@ -110,6 +116,7 @@ class CheckpointContextEngine(ContextEngine):
         auxiliary_client: Any = None,
         main_model: Any = None,
         map_concurrency: Optional[int] = None,
+        max_map_shards: Optional[int] = None,
         semantic_reducer: Optional[Callable[[ReducedState], Any]] = None,
         mode: Optional[str] = None,
         target_wire_tokens: Optional[int] = None,
@@ -122,6 +129,7 @@ class CheckpointContextEngine(ContextEngine):
         self._auxiliary_client = auxiliary_client
         self._main_model = main_model
         self._map_concurrency = self._bounded_map_concurrency(map_concurrency)
+        self._max_map_shards = self._bounded_max_map_shards(max_map_shards)
         self._semantic_reducer = semantic_reducer
         configured_mode = checkpoint_config.get("mode", "shadow")
         self._mode = mode if mode in {"shadow", "live"} else configured_mode
@@ -187,6 +195,7 @@ class CheckpointContextEngine(ContextEngine):
         self._verify_compaction_cleared_threshold = False
         self.awaiting_real_usage_after_compression = False
         self.last_map_shards: tuple[MapShard, ...] = ()
+        self.last_map_externalized_groups: tuple[CausalGroup, ...] = ()
         self.last_reduced_state: Optional[ReducedState] = None
         self.last_checkpoint_text: Optional[str] = None
         self.last_candidate: Optional[List[Dict[str, Any]]] = None
@@ -226,6 +235,21 @@ class CheckpointContextEngine(ContextEngine):
         if isinstance(value, bool) or not isinstance(value, int):
             return _MAP_CONCURRENCY_CAP
         return min(max(value, 1), _MAP_CONCURRENCY_CAP)
+
+    @property
+    def max_map_shards(self) -> int:
+        """Hard cap for Map requests in one checkpoint candidate."""
+        return self._max_map_shards
+
+    @staticmethod
+    def _bounded_max_map_shards(value: Optional[int]) -> int:
+        if value is None:
+            value = CheckpointContextEngine._checkpoint_config().get(
+                "max_map_shards", _DEFAULT_MAX_MAP_SHARDS
+            )
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            return _DEFAULT_MAX_MAP_SHARDS
+        return min(value, _MAP_MAX_SHARDS_CAP)
 
     @property
     def name(self) -> str:
@@ -520,6 +544,48 @@ class CheckpointContextEngine(ContextEngine):
                 "content": json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
             },
         ]
+
+    def _map_input_tokens(
+        self, messages: List[Dict[str, Any]], group: CausalGroup
+    ) -> int:
+        """Estimate the complete Map request before admission."""
+        return self._token_count(self._map_prompt(messages, group))
+
+    def _plan_map_shards(
+        self, messages: List[Dict[str, Any]], groups: tuple[CausalGroup, ...]
+    ) -> Optional[tuple[CausalGroup, ...]]:
+        """Pack adjacent causal units; retain units with no proven safe split."""
+        shards = []
+        current_indices: List[int] = []
+        externalized = []
+
+        def finish_current() -> None:
+            nonlocal current_indices
+            if current_indices:
+                shards.append(CausalGroup(tuple(current_indices)))
+                current_indices = []
+
+        for group in groups:
+            unit_tokens = self._map_input_tokens(messages, group)
+            if unit_tokens > _MAP_SHARD_MAX_INPUT_TOKENS:
+                finish_current()
+                externalized.append(group)
+                continue
+            candidate = CausalGroup(tuple((*current_indices, *group.event_indices)))
+            if current_indices and self._map_input_tokens(messages, candidate) > _MAP_SHARD_TARGET_INPUT_TOKENS:
+                finish_current()
+            current_indices.extend(group.event_indices)
+        finish_current()
+
+        self.last_map_externalized_groups = tuple(externalized)
+        total_input = sum(self._map_input_tokens(messages, shard) for shard in shards)
+        if (
+            len(shards) > self._max_map_shards
+            or total_input > _MAP_TOTAL_INPUT_TOKENS
+            or len(shards) * _MAP_MAX_TOKENS > _MAP_TOTAL_OUTPUT_TOKENS
+        ):
+            return None
+        return tuple(shards)
 
     def _configured_auxiliary_response(
         self, messages: List[Dict[str, str]], max_tokens: int
@@ -901,7 +967,27 @@ class CheckpointContextEngine(ContextEngine):
             text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
         except (TypeError, ValueError):
             text = str(value)
-        return max(1, (len(text) + 3) // 4)
+        try:
+            from agent.model_metadata import (
+                estimate_request_tokens_rough,
+                estimate_tokens_rough,
+            )
+
+            host_estimate = (
+                estimate_request_tokens_rough(value)
+                if isinstance(value, list)
+                and all(isinstance(message, dict) and "role" in message for message in value)
+                else estimate_tokens_rough(text)
+            )
+        except (AttributeError, ImportError, OSError, TypeError, ValueError):
+            host_estimate = 0
+        if not text.isascii():
+            fallback = len(text)
+        elif isinstance(value, (dict, list, tuple)):
+            fallback = (len(text) + 1) // 2
+        else:
+            fallback = (len(text) + 3) // 4
+        return max(1, host_estimate, fallback)
 
     def _token_count(self, value: Any) -> int:
         if self._token_counter is not None:
@@ -1033,6 +1119,7 @@ class CheckpointContextEngine(ContextEngine):
             self.last_trigger_reason = "stale_snapshot"
             return messages
         self.last_map_shards = ()
+        self.last_map_externalized_groups = ()
         self.last_reduced_state = None
         self.last_checkpoint_text = None
         self.last_candidate = None
@@ -1046,7 +1133,13 @@ class CheckpointContextEngine(ContextEngine):
         ):
             self._set_automatic_cooldown("nothing_reclaimable")
             return messages
-        mapped = self._map_shards(messages, groups)
+        map_groups = self._plan_map_shards(messages, groups)
+        if map_groups is None:
+            self._set_automatic_cooldown("map_budget_exceeded")
+            self._last_compress_aborted = True
+            self._last_summary_error = "checkpoint Map exceeded its token budget"
+            return messages
+        mapped = self._map_shards(messages, map_groups)
         if mapped is None:
             self._set_automatic_cooldown("map_failed")
             self._last_compress_aborted = True

@@ -1348,6 +1348,163 @@ def test_renderer_shrinks_only_complete_old_causal_groups_before_rejecting(monke
     )
 
 
+def test_adaptive_causal_tail_keeps_complete_groups_inside_default_band():
+    import agent.checkpoint_engine as checkpoint_engine
+    from agent.checkpoint_engine import CheckpointContextEngine
+
+    engine = CheckpointContextEngine(token_counter=lambda _value: 5_000)
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "oldest request"},
+        {"role": "assistant", "content": "oldest reply"},
+        {"role": "user", "content": "middle request"},
+        {"role": "assistant", "content": "middle reply"},
+        {"role": "user", "content": "recent request"},
+        {"role": "assistant", "content": "recent reply"},
+        {"role": "user", "content": "active request"},
+    ]
+    groups = engine._plan_causal_groups(messages)
+    lanes = engine._extract_deterministic_lanes(messages)
+
+    tail = engine._adaptive_tail_groups(messages, groups, lanes)
+
+    assert [group.event_indices for group in tail] == [(4,), (5,), (6,)]
+    assert checkpoint_engine._DEFAULT_TAIL_TARGET_TOKENS == 14_000
+    assert checkpoint_engine._DEFAULT_TAIL_MIN_TOKENS == 12_000
+    assert checkpoint_engine._DEFAULT_TAIL_MAX_TOKENS == 16_000
+    assert checkpoint_engine._HARD_MAX_TAIL_TOKENS == 24_000
+    assert 12_000 <= engine._tail_token_count(messages, tail) <= 16_000
+    assert all(
+        message.get("content") != "active request"
+        for group in tail
+        for message in (messages[index] for index in group.event_indices)
+    )
+
+
+def test_adaptive_causal_tail_may_grow_to_hard_max_but_not_beyond():
+    from agent.checkpoint_engine import CheckpointContextEngine
+
+    def token_counter(value):
+        text = json.dumps(value)
+        if "recent reply" in text:
+            return 10_000
+        if "recent request" in text:
+            return 14_000
+        return 8_000
+
+    engine = CheckpointContextEngine(token_counter=token_counter)
+    messages = [
+        {"role": "user", "content": "oldest request"},
+        {"role": "assistant", "content": "oldest reply"},
+        {"role": "user", "content": "middle request"},
+        {"role": "assistant", "content": "middle reply"},
+        {"role": "user", "content": "recent request"},
+        {"role": "assistant", "content": "recent reply"},
+        {"role": "user", "content": "active request"},
+    ]
+    groups = engine._plan_causal_groups(messages)
+    lanes = engine._extract_deterministic_lanes(messages)
+
+    tail = engine._adaptive_tail_groups(messages, groups, lanes)
+
+    assert [group.event_indices for group in tail] == [(4,), (5,)]
+    assert engine._tail_token_count(messages, tail) == 24_000
+    assert all(
+        messages[index].get("content") != "oldest request"
+        for group in tail
+        for index in group.event_indices
+    )
+
+
+def test_adaptive_causal_tail_does_not_split_a_tool_receipt_group():
+    from agent.checkpoint_engine import CheckpointContextEngine
+
+    def token_counter(value):
+        if isinstance(value, dict) and (
+            value.get("tool_calls") or value.get("role") == "tool"
+        ):
+            return 10_000
+        return 4_000
+
+    engine = CheckpointContextEngine(token_counter=token_counter)
+    messages = [
+        {"role": "user", "content": "old request"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "write_file", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "written"},
+        {"role": "user", "content": "active request"},
+    ]
+    groups = engine._plan_causal_groups(messages)
+    lanes = engine._extract_deterministic_lanes(messages)
+
+    tail = engine._adaptive_tail_groups(messages, groups, lanes)
+
+    assert [group.event_indices for group in tail] == [(1, 2)]
+    assert engine._tail_token_count(messages, tail) == 20_000
+
+
+def test_adaptive_causal_tail_excludes_protected_lanes_from_its_budget():
+    from agent.checkpoint_engine import CheckpointContextEngine
+
+    engine = CheckpointContextEngine(token_counter=lambda _value: 8_000)
+    messages = [
+        {"role": "system", "content": "policy: never delete files"},
+        {"role": "user", "content": "old request"},
+        {"role": "assistant", "content": "old reply"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "write_file", "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": json.dumps(
+                {
+                    "receipt": {
+                        "id": "call_1",
+                        "op": "write_file",
+                        "status": "succeeded",
+                        "source_event_ids": [3, 4],
+                    }
+                }
+            ),
+        },
+        {"role": "assistant", "content": "tests passed on this HEAD"},
+        {"role": "user", "content": "active request"},
+    ]
+    groups = engine._plan_causal_groups(messages)
+    lanes = engine._extract_deterministic_lanes(messages)
+
+    tail = engine._adaptive_tail_groups(messages, groups, lanes)
+
+    tail_indices = {index for group in tail for index in group.event_indices}
+    assert 0 not in tail_indices
+    assert 6 not in tail_indices
+    assert 3 in tail_indices
+    assert 4 in tail_indices
+    assert 5 in tail_indices
+    assert 12_000 <= engine._tail_token_count(messages, tail) <= 24_000
+    assert lanes.active_intent is not None
+    assert lanes.active_intent.event_indices == (6,)
+    assert lanes.effects[0].status == "succeeded"
+
+
 def test_acknowledgments_do_not_replace_actionable_root_task():
     engine = load_context_engine("checkpoint")
     assert engine is not None

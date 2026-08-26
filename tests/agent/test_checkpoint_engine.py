@@ -396,6 +396,141 @@ def test_assistant_prose_does_not_mark_effect_succeeded():
     assert lanes.effects[0].status == "unknown"
 
 
+def test_tool_effect_status_uses_recorded_receipt_evidence():
+    from agent.checkpoint_engine import CheckpointContextEngine, Effect
+
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "write_file", "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": json.dumps(
+                {
+                    "receipt": {
+                        "id": "call_1",
+                        "op": "write_file",
+                        "status": "succeeded",
+                    }
+                }
+            ),
+        },
+    ]
+
+    lanes = CheckpointContextEngine()._extract_deterministic_lanes(messages)
+
+    assert lanes.effects == (
+        Effect("call_1", "write_file", "succeeded", (0, 1)),
+    )
+
+
+def test_tool_effect_status_uses_persisted_effect_disposition():
+    from agent.checkpoint_engine import CheckpointContextEngine
+
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "write_file", "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": "file.txt",
+            "effect_disposition": "succeeded",
+        },
+    ]
+
+    lanes = CheckpointContextEngine()._extract_deterministic_lanes(messages)
+
+    assert lanes.effects[0].status == "succeeded"
+
+
+def test_tool_effect_receipt_must_match_call_identity():
+    from agent.checkpoint_engine import CheckpointContextEngine
+
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "write_file", "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": json.dumps(
+                {
+                    "receipt": {
+                        "id": "other_call",
+                        "op": "write_file",
+                        "status": "succeeded",
+                    }
+                }
+            ),
+        },
+    ]
+
+    lanes = CheckpointContextEngine()._extract_deterministic_lanes(messages)
+
+    assert lanes.effects[0].status == "unknown"
+
+
+def test_tool_effect_receipt_failure_is_terminal_evidence():
+    from agent.checkpoint_engine import CheckpointContextEngine
+
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "write_file", "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": json.dumps(
+                {
+                    "receipt": {
+                        "id": "call_1",
+                        "op": "write_file",
+                        "status": "failed",
+                    }
+                }
+            ),
+        },
+    ]
+
+    lanes = CheckpointContextEngine()._extract_deterministic_lanes(messages)
+
+    assert lanes.effects[0].status == "failed"
+
+
 def test_typed_map_keeps_source_event_ids_and_uses_no_tools():
     from agent.checkpoint_engine import CheckpointContextEngine
 

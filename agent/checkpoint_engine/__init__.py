@@ -610,6 +610,40 @@ class CheckpointContextEngine(ContextEngine):
             return ActiveIntent(cls._project_intent_text(text), (index,))
         return ActiveIntent("\n".join(parts), tuple(indices))
 
+    @staticmethod
+    def _receipt_status(
+        message: Dict[str, Any], tool_call_id: str, operation: Optional[str]
+    ) -> Optional[str]:
+        """Read effect state only from identity-bound persisted evidence."""
+        disposition = message.get("effect_disposition")
+        if disposition in {"running", "succeeded", "failed", "unknown"}:
+            return disposition
+        candidates = [message.get("receipt"), message.get("mutation_receipt")]
+        content = message.get("content")
+        if isinstance(content, str):
+            try:
+                candidates.append(json.loads(content))
+            except (TypeError, ValueError):
+                pass
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            receipt = candidate.get("receipt", candidate)
+            if not isinstance(receipt, dict):
+                continue
+            if receipt.get("id") != tool_call_id or receipt.get("op") != operation:
+                continue
+            status = receipt.get("status")
+            if status in {"running", "succeeded", "failed", "unknown"}:
+                return status
+        return None
+
+    @staticmethod
+    def _effect_status_after_receipt(current: str, observed: str) -> str:
+        if current in _TERMINAL_ACTION_STATES:
+            return current
+        return observed
+
     @classmethod
     def _extract_deterministic_lanes(
         cls, messages: List[Dict[str, Any]]
@@ -637,14 +671,20 @@ class CheckpointContextEngine(ContextEngine):
                     effects.append(Effect(tool_call_id, operation, "issued", (index,)))
             elif message.get("role") == "tool":
                 tool_call_id = message.get("tool_call_id")
-                if tool_call_id not in effect_positions:
+                if not isinstance(tool_call_id, str) or tool_call_id not in effect_positions:
                     continue
                 effect_index = effect_positions[tool_call_id]
                 effect = effects[effect_index]
+                observed = cls._receipt_status(message, tool_call_id, effect.operation)
+                status = (
+                    cls._effect_status_after_receipt(effect.status, observed)
+                    if observed is not None
+                    else "unknown"
+                )
                 effects[effect_index] = Effect(
                     effect.tool_call_id,
                     effect.operation,
-                    "unknown",
+                    status,
                     (*effect.event_indices, index),
                 )
         return DeterministicLanes(active_intent, tuple(effects))

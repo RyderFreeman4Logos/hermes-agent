@@ -26,6 +26,9 @@ __all__ = [
 
 _MAP_CONCURRENCY_CAP = 2
 _MAP_MAX_TOKENS = 1024
+_MAP_PROMPT_VERSION = "map-prompt-v1"
+_MAP_SCHEMA_VERSION = "map-schema-v1"
+_MAP_EXTRACTOR_VERSION = "map-extractor-v1"
 _MAP_SHARD_TARGET_INPUT_TOKENS = 12_000
 _MAP_SHARD_MAX_INPUT_TOKENS = 16_000
 _MAP_MAX_SHARDS_CAP = 32
@@ -251,6 +254,7 @@ class CheckpointContextEngine(ContextEngine):
         self._verify_compaction_cleared_threshold = False
         self.awaiting_real_usage_after_compression = False
         self.last_map_shards: tuple[MapShard, ...] = ()
+        self._map_shard_cache: Dict[tuple[str, ...], MapShard] = {}
         self.last_map_externalized_groups: tuple[CausalGroup, ...] = ()
         self.last_reduced_state: Optional[ReducedState] = None
         self.last_checkpoint_text: Optional[str] = None
@@ -1175,15 +1179,110 @@ class CheckpointContextEngine(ContextEngine):
             )
         return MapShard(tuple(group.event_indices), tuple(parsed_facts))
 
+    @staticmethod
+    def _map_shard_cache_key(
+        messages: List[Dict[str, Any]], group: CausalGroup
+    ) -> tuple[str, ...]:
+        """Fingerprint only source digests and parser/prompt versions."""
+        source_event_range_hash = hashlib.sha256(
+            json.dumps(
+                list(group.event_indices), separators=(",", ":")
+            ).encode("utf-8")
+        ).hexdigest()
+        source_content_hash = hashlib.sha256(
+            json.dumps(
+                [messages[index] for index in group.event_indices],
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        return (
+            source_event_range_hash,
+            source_content_hash,
+            _MAP_PROMPT_VERSION,
+            _MAP_SCHEMA_VERSION,
+            _MAP_EXTRACTOR_VERSION,
+        )
+
+    @classmethod
+    def _is_valid_map_shard(
+        cls, shard: Any, group: CausalGroup
+    ) -> bool:
+        if not isinstance(shard, MapShard):
+            return False
+        source_event_ids = shard.source_event_ids
+        if (
+            not isinstance(source_event_ids, tuple)
+            or source_event_ids != tuple(group.event_indices)
+            or not isinstance(shard.facts, tuple)
+        ):
+            return False
+        source_events = set(source_event_ids)
+        for fact in shard.facts:
+            if not isinstance(fact, MapFact):
+                return False
+            if (
+                not isinstance(fact.kind, str)
+                or not fact.kind
+                or not isinstance(fact.text, str)
+                or not fact.text
+                or not isinstance(fact.uncertain, bool)
+            ):
+                return False
+            if fact.identity is not None and (
+                not isinstance(fact.identity, str) or not fact.identity.strip()
+            ):
+                return False
+            if (
+                not isinstance(fact.supersedes, tuple)
+                or any(
+                    not isinstance(identity, str) or not identity.strip()
+                    for identity in fact.supersedes
+                )
+                or len(set(fact.supersedes)) != len(fact.supersedes)
+            ):
+                return False
+            if fact.action_state is not None and (
+                fact.action_state not in _ACTION_STATES or fact.identity is None
+            ):
+                return False
+            fact_event_ids = fact.source_event_ids
+            if (
+                not isinstance(fact_event_ids, tuple)
+                or any(
+                    isinstance(event_id, bool) or not isinstance(event_id, int)
+                    for event_id in fact_event_ids
+                )
+                or len(set(fact_event_ids)) != len(fact_event_ids)
+            ):
+                return False
+            if fact_event_ids:
+                if not set(fact_event_ids) <= source_events:
+                    return False
+            elif not fact.uncertain:
+                return False
+        return True
+
     def _map_group(
         self, messages: List[Dict[str, Any]], group: CausalGroup
     ) -> Optional[MapShard]:
         try:
-            return self._parse_map_shard(
+            cache_key = self._map_shard_cache_key(messages, group)
+            cached = self._map_shard_cache.get(cache_key)
+            if cached is not None:
+                if self._is_valid_map_shard(cached, group):
+                    return cached
+                self._map_shard_cache.pop(cache_key, None)
+            shard = self._parse_map_shard(
                 self._call_map(self._map_prompt(messages, group)), group
             )
         except Exception:
             return None
+        if shard is None or not self._is_valid_map_shard(shard, group):
+            return None
+        self._map_shard_cache[cache_key] = shard
+        return shard
 
     def _map_shards(
         self, messages: List[Dict[str, Any]], groups: tuple[CausalGroup, ...]

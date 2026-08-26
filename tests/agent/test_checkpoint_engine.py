@@ -738,6 +738,72 @@ def test_invalid_or_truncated_map_json_rejects_candidate():
     assert engine.compression_count == 0
 
 
+def test_map_cache_resumes_only_missing_shards():
+    from agent.checkpoint_engine import CausalGroup, CheckpointContextEngine, MapShard
+
+    attempts = {}
+
+    class _ResumableMapClient:
+        def complete(self, **kwargs):
+            payload = json.loads(kwargs["messages"][-1]["content"])
+            event_ids = tuple(payload["source_event_ids"])
+            attempts[event_ids] = attempts.get(event_ids, 0) + 1
+            if event_ids == (1,) and attempts[event_ids] == 1:
+                raise RuntimeError("temporary shard failure")
+            return _map_response(
+                {"source_event_ids": list(event_ids), "facts": []}
+            )
+
+    engine = CheckpointContextEngine(auxiliary_client=_ResumableMapClient())
+    messages = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "second"},
+    ]
+    groups = (CausalGroup((0,)), CausalGroup((1,)))
+
+    assert engine._map_shards(messages, groups) is None
+    assert engine._map_shards(messages, groups) == (
+        MapShard((0,), ()),
+        MapShard((1,), ()),
+    )
+    assert attempts == {(0,): 1, (1,): 2}
+
+
+def test_map_cache_rejects_invalid_entries_and_keys_include_all_fingerprints(
+    monkeypatch,
+):
+    import agent.checkpoint_engine as checkpoint_engine
+    from agent.checkpoint_engine import CausalGroup, CheckpointContextEngine, MapShard
+
+    auxiliary = _EchoMapClient()
+    engine = CheckpointContextEngine(auxiliary_client=auxiliary)
+    messages = [{"role": "user", "content": "hello"}]
+    group = CausalGroup((0,))
+
+    assert engine._map_shards(messages, (group,)) == (MapShard((0,), ()),)
+    assert len(auxiliary.calls) == 1
+    key = engine._map_shard_cache_key(messages, group)
+    engine._map_shard_cache[key] = MapShard((99,), ())
+    assert engine._map_shards(messages, (group,)) == (MapShard((0,), ()),)
+    assert len(auxiliary.calls) == 2
+
+    messages[0]["content"] = "changed"
+    assert engine._map_shards(messages, (group,)) == (MapShard((0,), ()),)
+    assert len(auxiliary.calls) == 3
+    messages[0]["content"] = "hello"
+    for name in (
+        "_MAP_PROMPT_VERSION",
+        "_MAP_SCHEMA_VERSION",
+        "_MAP_EXTRACTOR_VERSION",
+    ):
+        monkeypatch.setattr(
+            checkpoint_engine, name, getattr(checkpoint_engine, name) + "-changed"
+        )
+        assert engine._map_shards(messages, (group,)) == (MapShard((0,), ()),)
+
+    assert len(auxiliary.calls) == 6
+
+
 def test_map_tool_call_rejects_candidate():
     from agent.checkpoint_engine import CheckpointContextEngine
 

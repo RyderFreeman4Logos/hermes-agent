@@ -4747,7 +4747,7 @@ def _build_top_level_description() -> str:
         "you. Provide 'goal' for a single task or 'tasks' for a parallel batch "
         "(limits and nesting rules are in the parameter descriptions).\n\n"
         "Runs in the background: dispatch returns immediately with live "
-        "transcript paths, and the completed result (one consolidated message "
+        "transcript paths, and the result (one consolidated message "
         "for a batch) re-enters the conversation on its own. Do NOT wait or "
         "poll; continue other work.\n\n"
         "LIVE ORCHESTRATION: while children run, this tool also controls "
@@ -4778,8 +4778,8 @@ def _build_top_level_description() -> str:
         "memory, send_message, or cronjob; orchestrators regain only "
         "delegate_task.\n"
         "- Omitted model_profile uses standard if present, else the first "
-        "tier. Unknown names fail closed. "
-        "Results are returned as an array, one entry per task."
+        "tier. delegation.provider selects the child provider; unknown names fail "
+        "closed. Results are returned as an array, one entry per task."
     )
 
 

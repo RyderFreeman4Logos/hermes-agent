@@ -2908,6 +2908,17 @@ def terminal_tool(
         from tools.approval import get_current_session_key
 
         session_key = get_current_session_key(default="") or (task_id or "")
+        from agent.delegation_context import is_delegated_child_context
+
+        delegated_child = is_delegated_child_context()
+        process_task_id = str(task_id or "") if delegated_child else effective_task_id
+        if delegated_child and background:
+            # A native delegate shares this process registry with its parent.
+            # Keep its subprocesses addressable by the child task only; a child
+            # completion must not become a parent session notification.
+            session_key = ""
+            notify_on_complete = False
+            watch_patterns = None
 
         # Hard-block: gateway lifecycle commands (systemctl/launchctl/hermes
         # restart|stop targeting hermes-gateway) must never run inside the
@@ -3150,7 +3161,7 @@ def terminal_tool(
                     proc_session = process_registry.spawn_local(
                         command=command,
                         cwd=effective_cwd,
-                        task_id=effective_task_id,
+                        task_id=process_task_id,
                         session_key=session_key,
                         env_vars=env.env if hasattr(env, 'env') else None,
                         use_pty=effective_pty,
@@ -3161,7 +3172,7 @@ def terminal_tool(
                         env=env,
                         command=command,
                         cwd=effective_cwd,
-                        task_id=effective_task_id,
+                        task_id=process_task_id,
                         session_key=session_key,
                         notify_on_complete=notify_on_complete,
                     )

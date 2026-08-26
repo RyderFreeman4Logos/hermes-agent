@@ -478,6 +478,30 @@ def test_notify_is_armed_at_spawn(monkeypatch, tmp_path, args):
     assert getattr(tt, "_test_spawn_kwargs")[-1]["notify_on_complete"] is True
 
 
+def test_delegated_child_background_process_is_not_parent_scoped(monkeypatch, tmp_path):
+    """A native child may manage its process, but cannot wake its parent."""
+    from agent.delegation_context import delegated_child_context
+    from tools import approval
+
+    tt = _silent_bg_harness(monkeypatch, tmp_path)
+    monkeypatch.setattr(approval, "get_current_session_key", lambda default="": "parent-session")
+    try:
+        with delegated_child_context("child-session"):
+            result = json.loads(tt.terminal_tool(
+                command="false", background=True, notify_on_complete=True,
+                task_id="child-task",
+            ))
+    finally:
+        tt._active_environments.pop("default", None)
+        tt._last_activity.pop("default", None)
+
+    spawn = tt._test_spawn_kwargs[-1]
+    assert spawn["session_key"] == ""
+    assert spawn["task_id"] == "child-task"
+    assert spawn["notify_on_complete"] is False
+    assert result.get("notify_on_complete") is not True
+
+
 def test_unsupported_immediate_exit_does_not_enqueue_completion(monkeypatch, tmp_path):
     """A refused async promise must not leak an already-completed event."""
     from gateway import session_context

@@ -1743,16 +1743,18 @@ def check_compression_model_feasibility(agent: Any) -> None:
             )
 
         threshold = agent.context_compressor.threshold_tokens
-        if aux_context < threshold:
+        # Legacy summariser sends one user-role prompt the size of the
+        # trigger window, so clamping threshold_tokens to aux_context is
+        # required. Lean chunks the digest; the aux window is not the
+        # main-model trigger or leftover success line — do not clamp.
+        if (
+            aux_context < threshold
+            and getattr(agent.context_compressor, "tail_mode", "legacy") != "lean"
+        ):
             # Auto-correct: lower the live session threshold so
             # compression actually works this session.  The hard floor
             # above guarantees aux_context >= MINIMUM_CONTEXT_LENGTH,
             # so the new threshold is always >= 64K.
-            #
-            # The compression summariser sends a single user-role
-            # prompt (no system prompt, no tools) to the aux model, so
-            # new_threshold == aux_context is safe: the request is
-            # the raw messages plus a small summarisation instruction.
             old_threshold = threshold
             new_threshold = aux_context
             agent.context_compressor.threshold_tokens = new_threshold

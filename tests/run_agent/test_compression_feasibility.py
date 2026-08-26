@@ -146,13 +146,14 @@ def test_auto_corrects_threshold_when_aux_context_below_threshold(mock_get_clien
 @patch("agent.model_metadata.get_model_context_length", return_value=80_000)
 @patch("agent.auxiliary_client.get_text_auxiliary_client")
 def test_aux_sync_keeps_lean_tail_policy(mock_get_client, mock_ctx_len):
-    """Regression: the aux-context threshold sync must not cache a legacy
-    threshold*ratio tail when tail_mode is lean.
+    """Regression: lean must not lower the main session threshold to aux
+    context, and must not cache a legacy threshold*ratio tail.
 
-    Real compressor, 1M main window (lean tail = 25K cap), aux context 80K
-    lowers the live threshold to 80K. The legacy formula would write
-    80K * 0.20 = 16K into the tail budget; lean must stay at its canonical
-    clamp (25K on a 1M window) and keep tail_mode == "lean".
+    Real compressor, 1M main window (lean tail = 25K cap). Aux context 80K
+    used to clamp threshold to 80K; lean now leaves the main trigger
+    (650K) alone. The legacy formula would write 80K * 0.20 = 16K into
+    the tail budget; lean must stay at its canonical clamp (25K on a 1M
+    window) and keep tail_mode == "lean".
     """
     agent = _make_agent(
         main_context=1_000_000,
@@ -162,6 +163,7 @@ def test_aux_sync_keeps_lean_tail_policy(mock_get_client, mock_ctx_len):
     )
     comp = agent.context_compressor
     assert comp.tail_token_budget == LEAN_TAIL_CAP_TOKENS  # 25K on 1M
+    before = comp.threshold_tokens
 
     mock_client = MagicMock()
     mock_client.base_url = "https://openrouter.ai/api/v1"
@@ -171,9 +173,8 @@ def test_aux_sync_keeps_lean_tail_policy(mock_get_client, mock_ctx_len):
 
     agent._check_compression_model_feasibility()
 
-    # The threshold was lowered to the aux context...
-    assert comp.threshold_tokens == 80_000
-    # ...but the lean tail policy survived the sync.
+    assert before == 650_000
+    assert comp.threshold_tokens == before
     assert comp.tail_mode == "lean"
     assert comp.tail_token_budget == LEAN_TAIL_CAP_TOKENS
 

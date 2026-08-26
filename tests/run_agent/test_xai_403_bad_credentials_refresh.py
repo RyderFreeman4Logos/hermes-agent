@@ -266,6 +266,29 @@ def test_xai_403_spending_limit_does_not_refresh(monkeypatch):
     assert result.get("completed") is not True
 
 
+def test_xai_403_spending_limit_is_hedged_after_same_agent_succeeds(monkeypatch):
+    """A later successful Grok call proves this 403 was not confirmation that
+    the xAI OAuth credential was exhausted (#209)."""
+    agent = _build_xai_agent(monkeypatch)
+    calls = {"count": 0}
+
+    def _api_call(api_kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise _XaiSpendingLimit403()
+        return _codex_message_response("OK")
+
+    monkeypatch.setattr(agent, "_interruptible_api_call", _api_call)
+
+    failed = agent.run_conversation("Say OK")
+    recovered = agent.run_conversation("Say OK")
+
+    assert not failed["final_response"].startswith("Billing or credits exhausted")
+    assert failed["billing_unverified"] is True
+    assert recovered["completed"] is True
+    assert recovered["final_response"] == "OK"
+
+
 def test_xai_403_structured_body_variant_refreshes(monkeypatch):
     """An SDK exception carrying the parsed body dict still exposes the
     marker through str(exc), so the structured variant recovers too."""

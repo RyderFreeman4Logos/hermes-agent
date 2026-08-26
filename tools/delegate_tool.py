@@ -3010,6 +3010,15 @@ def _run_single_child(
         duration = round(time.monotonic() - child_start, 2)
 
         summary = result.get("final_response") or ""
+        _result_billing = result.get("billing_block")
+        _child_model = getattr(child, "model", "")
+        if (
+            isinstance(_result_billing, dict)
+            and _result_billing.get("provider") in {"xai", "xai-oauth"}
+            and "grok" not in str(_child_model).lower()
+        ):
+            # Do not attach a parent xAI terminal to a child routed elsewhere (#209).
+            summary = "Subagent failed with a provider error unrelated to its effective model."
         completed = result.get("completed", False)
         interrupted = result.get("interrupted", False)
         api_calls = result.get("api_calls", 0)

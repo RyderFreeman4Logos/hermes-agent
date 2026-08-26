@@ -43,9 +43,41 @@ _ACTION_STATES = frozenset(
 _TERMINAL_ACTION_STATES = frozenset({"succeeded", "failed", "unknown"})
 
 
+_ACK_ONLY = frozenset(
+    {
+        "ok",
+        "okay",
+        "continue",
+        "go on",
+        "go ahead",
+        "yes",
+        "yep",
+        "yeah",
+        "sure",
+        "thanks",
+        "thank you",
+        "lgtm",
+        "please continue",
+        "keep going",
+    }
+)
+_INTENT_OVERFLOW_CHARS = 1200
+_CONSTRAINT_LINE_PREFIXES = (
+    "must ",
+    "must not ",
+    "never ",
+    "do not ",
+    "don't ",
+    "acceptance:",
+    "acceptance ",
+    "constraint:",
+    "hard constraint",
+)
+
+
 @dataclass(frozen=True)
 class ActiveIntent:
-    """The newest non-empty user turn, kept outside checkpoint prose."""
+    """Newest actionable root task plus later corrections, outside checkpoint prose."""
 
     content: str
     event_indices: tuple[int, ...]
@@ -467,19 +499,119 @@ class CheckpointContextEngine(ContextEngine):
             groups.append(CausalGroup(tuple(range(group_start, len(messages)))))
         return tuple(groups)
 
+    @staticmethod
+    def _user_text(message: Dict[str, Any]) -> Optional[str]:
+        content = message.get("content")
+        if isinstance(content, str):
+            stripped = content.strip()
+            return stripped or None
+        return None
+
+    @staticmethod
+    def _normalized_user_text(text: str) -> str:
+        return " ".join(text.lower().split())
+
+    @classmethod
+    def _is_ack_only(cls, text: str) -> bool:
+        return cls._normalized_user_text(text).rstrip(".!") in _ACK_ONLY
+
+    @classmethod
+    def _is_steer(cls, text: str) -> bool:
+        return cls._normalized_user_text(text).startswith("/steer")
+
+    @classmethod
+    def _is_correction(cls, text: str) -> bool:
+        lowered = cls._normalized_user_text(text)
+        return (
+            cls._is_steer(text)
+            or lowered.startswith("also ")
+            or " instead " in lowered
+            or lowered.startswith("instead ")
+        )
+
+    @classmethod
+    def _is_new_task(cls, text: str) -> bool:
+        lowered = cls._normalized_user_text(text)
+        return (
+            "new task:" in lowered
+            or lowered.startswith("ignore the ")
+            or "ignore the previous" in lowered
+            or lowered.startswith("instead, ")
+            or "forget the previous" in lowered
+        )
+
+    @classmethod
+    def _constraint_spans(cls, text: str) -> tuple[str, ...]:
+        spans = []
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            probe = stripped.lower()
+            if any(probe.startswith(prefix) for prefix in _CONSTRAINT_LINE_PREFIXES):
+                spans.append(stripped)
+        return tuple(spans)
+
+    @classmethod
+    def _project_intent_text(cls, text: str) -> str:
+        if len(text) <= _INTENT_OVERFLOW_CHARS:
+            return text
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        beginning = lines[0] if lines else text[:80]
+        constraints = cls._constraint_spans(text)
+        constraint_set = set(constraints)
+        filler = {"x", " "}
+        ending_lines = [
+            line
+            for line in lines[1:]
+            if line not in constraint_set and set(line.lower()) - filler
+        ][-1:]
+        parts = [f"source sha256={digest}", beginning, *ending_lines, *constraints]
+        return "\n".join(dict.fromkeys(parts))
+
+    @classmethod
+    def _active_intent_from_messages(
+        cls, messages: List[Dict[str, Any]]
+    ) -> Optional[ActiveIntent]:
+        turns: list[tuple[int, str]] = []
+        for index, message in enumerate(messages):
+            if message.get("role") != "user":
+                continue
+            text = cls._user_text(message)
+            if text is not None:
+                turns.append((index, text))
+        if not turns:
+            return None
+
+        parts: list[str] = []
+        indices: list[int] = []
+        for index, text in turns:
+            if cls._is_ack_only(text):
+                continue
+            projected = cls._project_intent_text(text)
+            if not parts or cls._is_new_task(text) or not cls._is_correction(text):
+                parts = [projected]
+                indices = [index]
+                continue
+            parts.append(projected)
+            indices.append(index)
+        if not parts:
+            index, text = turns[-1]
+            return ActiveIntent(cls._project_intent_text(text), (index,))
+        return ActiveIntent("\n".join(parts), tuple(indices))
+
     @classmethod
     def _extract_deterministic_lanes(
         cls, messages: List[Dict[str, Any]]
     ) -> DeterministicLanes:
         """Extract active intent and conservative tool-effect state."""
-        active_intent = None
+        active_intent = cls._active_intent_from_messages(messages)
         effects = []
         effect_positions = {}
         for index, message in enumerate(messages):
             if message.get("role") == "user":
-                content = message.get("content")
-                if isinstance(content, str) and content.strip():
-                    active_intent = ActiveIntent(content, (index,))
+                continue
             elif message.get("role") == "assistant":
                 for tool_call in cls._tool_calls(message):
                     tool_call_id = tool_call.get("id")

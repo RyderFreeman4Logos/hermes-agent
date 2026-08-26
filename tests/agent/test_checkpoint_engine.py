@@ -2,6 +2,7 @@
 
 from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
 import json
 import threading
 import time
@@ -984,3 +985,82 @@ def test_renderer_shrinks_only_complete_old_causal_groups_before_rejecting(monke
         "tail",
         "tail",
     )
+
+
+def test_acknowledgments_do_not_replace_actionable_root_task():
+    engine = load_context_engine("checkpoint")
+    assert engine is not None
+    messages = [
+        {"role": "user", "content": "Ship the rename CLI; keep tests green."},
+        {"role": "assistant", "content": "Working on the rename CLI."},
+        {"role": "user", "content": "okay"},
+        {"role": "assistant", "content": "Continuing."},
+        {"role": "user", "content": "continue"},
+    ]
+
+    lanes = engine._extract_deterministic_lanes(messages)
+
+    assert lanes.active_intent is not None
+    assert "Ship the rename CLI; keep tests green." in lanes.active_intent.content
+    assert "okay" not in lanes.active_intent.content.splitlines()[0]
+    assert lanes.active_intent.event_indices[0] == 0
+
+
+def test_corrections_steer_and_supersession_stay_on_intent_lane():
+    engine = load_context_engine("checkpoint")
+    assert engine is not None
+    messages = [
+        {
+            "role": "user",
+            "content": "Add a dry-run flag.\nMUST use argparse.\nAcceptance: `cli --dry-run` prints the plan.",
+        },
+        {"role": "assistant", "content": "Planning the flag."},
+        {"role": "user", "content": "Use click instead of argparse."},
+        {
+            "role": "user",
+            "content": "/steer Stop the argparse path; click only.",
+        },
+        {
+            "role": "user",
+            "content": "Ignore the dry-run work. New task: document the public API only.",
+        },
+    ]
+
+    lanes = engine._extract_deterministic_lanes(messages)
+
+    assert lanes.active_intent is not None
+    assert "document the public API only" in lanes.active_intent.content
+    assert "Add a dry-run flag" not in lanes.active_intent.content
+    assert "Use click instead of argparse" not in lanes.active_intent.content
+    assert lanes.active_intent.event_indices[-1] == 4
+    assert "MUST use argparse" not in lanes.active_intent.content
+
+
+def test_overflow_intent_keeps_hash_edges_and_exact_constraints():
+    engine = load_context_engine("checkpoint")
+    assert engine is not None
+    long_task = (
+        "Implement the checkpoint intent lane.\n"
+        + ("x" * 8000)
+        + "\nEnd of task body.\n"
+        "MUST never rewrite high-priority constraints.\n"
+        "Acceptance: source hashes stay on the projection."
+    )
+    messages = [
+        {"role": "user", "content": long_task},
+        {"role": "assistant", "content": "Working."},
+        {"role": "user", "content": "also keep /steer in the chain"},
+    ]
+
+    lanes = engine._extract_deterministic_lanes(messages)
+
+    assert lanes.active_intent is not None
+    assert long_task not in lanes.active_intent.content
+    digest = hashlib.sha256(long_task.encode("utf-8")).hexdigest()
+    assert digest in lanes.active_intent.content
+    assert "Implement the checkpoint intent lane." in lanes.active_intent.content
+    assert "End of task body." in lanes.active_intent.content
+    assert "MUST never rewrite high-priority constraints." in lanes.active_intent.content
+    assert "Acceptance: source hashes stay on the projection." in lanes.active_intent.content
+    assert "also keep /steer in the chain" in lanes.active_intent.content
+    assert lanes.active_intent.event_indices == (0, 2)

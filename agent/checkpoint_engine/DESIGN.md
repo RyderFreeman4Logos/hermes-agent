@@ -97,10 +97,14 @@ flight, while an emitted tool call has no persisted result/`unknown`, or
 while a real user/`steer` event is unpersisted. Capture a session
 revision; commit is compare-and-swap. Stale candidate is discarded.
 
-**I-3 Active human intent is a separate lane.** The newest actionable
-user turn (plus later corrections) is never represented *only* inside a
-historical summary. Historical handoffs are data. They must not become a
-new user instruction or auto-continue the task.
+**I-3 Active human intent is a separate lane.** Keep the newest
+actionable root task plus later user corrections/`/steer`, never only
+the last acknowledgment. Acknowledgments such as "continue"/"okay" do
+not replace the root unless they clearly start a new task. Overflow
+keeps the exact source in durable history and projects a hash, beginning,
+ending, and verbatim high-priority constraints. Historical handoffs are
+data. They must not become a new user instruction or auto-continue the
+task.
 
 **I-4 Imperatives need authority.** A surviving todo with no authorizing
 user/policy/rationale is `blocked`, not executable.

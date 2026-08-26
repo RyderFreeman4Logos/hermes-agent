@@ -147,6 +147,13 @@ def _loop_timing_context(
     return "\n".join(lines)
 
 
+def _take_loop_timing_context_text(agent: Any) -> str:
+    """Claim current loop-timing text exactly once."""
+    text = getattr(agent, "_loop_timing_context_text", "") or ""
+    agent._loop_timing_context_text = ""
+    return text
+
+
 def _is_standard_profile_child(agent) -> bool:
     return getattr(agent, "_delegate_model_profile", None) == "standard"
 
@@ -2419,7 +2426,6 @@ def run_conversation(
         effective_system = active_system_prompt or ""
         if agent.ephemeral_system_prompt:
             effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
-        _loop_timing_text = getattr(agent, "_loop_timing_context_text", "")
         if effective_system:
             api_messages = [{"role": "system", "content": effective_system}] + api_messages
 
@@ -2592,7 +2598,7 @@ def run_conversation(
 
         # Timing is API-only context. Append it after cache planning so it never
         # receives a breakpoint or changes the stable cached prefix.
-        if _loop_timing_text:
+        if _loop_timing_text := _take_loop_timing_context_text(agent):
             api_messages.append({"role": "system", "content": _loop_timing_text})
 
         # Build a persistent-MoA request before measuring compression pressure.
@@ -2999,9 +3005,10 @@ def run_conversation(
                 # Consume runtime timing only while this request is being built.
                 # Cache planning skips trailing system entries, so it stays
                 # after the last breakpoint and carries no cache_control.
-                if timing_context := getattr(agent, "_loop_timing_context_text", ""):
+                # A second take-and-clear is only for a late TUI write after the
+                # post-cache-plan consume; the same claimed value is never appended twice.
+                if timing_context := _take_loop_timing_context_text(agent):
                     api_messages.append({"role": "system", "content": timing_context})
-                    agent._loop_timing_context_text = ""
                 # Same story for prompt-cache decoration (#72626): try_activate_
                 # fallback refreshes the policy flags, but the decorated list
                 # still carries the primary's breakpoints (or none). Strip and

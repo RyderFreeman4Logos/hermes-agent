@@ -117,6 +117,10 @@ def test_inflight_loop_timing_is_consumed_onto_outgoing_prompt():
         result = agent.run_conversation("hello")
 
     sent = agent.client.chat.completions.create.call_args.kwargs["messages"]
+    timing_messages = [
+        message for message in sent if message.get("content") == TIMING
+    ]
     assert sent[-1] == {"role": "system", "content": TIMING}
+    assert timing_messages == [{"role": "system", "content": TIMING}]
     assert agent._loop_timing_context_text == ""
     assert all(message.get("content") != TIMING for message in result["messages"])

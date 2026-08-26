@@ -3541,6 +3541,16 @@ class SessionCompressionInProgressError(CompressionSessionBusyError):
     """
 
 
+class SessionTurnLeaseLostError(RuntimeError):
+    """A transcript write presented a turn-lease holder that no longer owns it.
+
+    Fail-fast fencing: do not retry inside ``_execute_write``. The caller
+    either still thinks it owns the conversation after expiry/reclaim, or
+    the lease row is gone. A later writer may already be persisting a
+    newer turn; landing this write would interleave a stale reply.
+    """
+
+
 class SessionTranscriptRevisionChangedError(RuntimeError):
     """A compaction candidate no longer matches the active transcript."""
 
@@ -3553,16 +3563,6 @@ class ActiveMessageRevision:
     first_message_id: int
     last_message_id: int
     active_message_count: int
-
-
-class SessionTurnLeaseLostError(RuntimeError):
-    """A transcript write presented a turn-lease holder that no longer owns it.
-
-    Fail-fast fencing: do not retry inside ``_execute_write``. The caller
-    either still thinks it owns the conversation after expiry/reclaim, or
-    the lease row is gone. A later writer may already be persisting a
-    newer turn; landing this write would interleave a stale reply.
-    """
 
 
 def _connect_tracked_db(path, tracking_path=None, **kwargs):
@@ -11270,6 +11270,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         model_config_patch: Optional[Dict[str, Any]] = None,
         watermark: Optional[int] = None,
         lock_holder: Optional[str] = None,
+        source_ids: Optional[List[int]] = None,
+        source_signature: Optional[str] = None,
         expected_revision: Optional[ActiveMessageRevision] = None,
     ) -> int:
         """Non-destructive in-place compaction for a single durable session id.
@@ -11310,6 +11312,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         reclaimed (crash cleanup, TTL expiry, competing writer) fails the
         commit instead of clobbering the winner's transcript.
 
+        Live source CAS (*source_ids* / *source_signature*) is accepted so
+        this signature matches SessionDB pins that digest the pre-watermark
+        rows. This pin enforces identity with *expected_revision*.
+
         Durable revision safety: when *expected_revision* is provided, the
         active transcript must still exactly match it inside this transaction.
         A changed revision refuses the candidate instead of re-sequencing a
@@ -11338,16 +11344,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         "commit; refusing to publish a stale compaction"
                     )
 
-            if expected_revision is not None:
-                if (
-                    expected_revision.session_id != session_id
-                    or self._active_message_revision(conn, session_id)
-                    != expected_revision
-                ):
-                    raise SessionTranscriptRevisionChangedError(
-                        f"Active transcript for {session_id!r} changed before "
-                        "compaction commit; refusing stale candidate"
-                    )
+            self._assert_expected_active_revision(
+                conn,
+                session_id,
+                expected_revision,
+                source_ids=source_ids,
+                source_signature=source_signature,
+            )
 
             patched_model_config = None
             if model_config_patch is not None:
@@ -11431,6 +11434,28 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return inserted
 
         return self._execute_write(_do)
+
+    def _assert_expected_active_revision(
+        self,
+        conn,
+        session_id: str,
+        expected_revision: Optional[ActiveMessageRevision],
+        source_ids: Optional[List[int]] = None,
+        source_signature: Optional[str] = None,
+    ) -> None:
+        # Live SessionDB hashes pre-watermark rows; this pin keys CAS on
+        # expected_revision and keeps the live kwargs as a no-op seam.
+        _ = (source_ids, source_signature)
+        if expected_revision is None:
+            return
+        if (
+            expected_revision.session_id != session_id
+            or self._active_message_revision(conn, session_id) != expected_revision
+        ):
+            raise SessionTranscriptRevisionChangedError(
+                f"Active transcript for {session_id!r} changed before "
+                "compaction commit; refusing stale candidate"
+            )
 
     def _message_column_names(self, conn) -> List[str]:
         """Column names of the messages table, cached per-connection era."""

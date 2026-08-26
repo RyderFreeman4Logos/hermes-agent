@@ -2537,6 +2537,7 @@ def compress_context(
     # Watermark captured at compression start (#75316); None = fall back to
     # archive-everything (no concurrent-tail preservation this cycle).
     _commit_watermark: Optional[int] = None
+    _commit_source_signature: Optional[str] = None
     # Probe whether the lock subsystem is actually available on this
     # SessionDB instance. A process running mismatched module versions can have
     # this call site while its long-lived SessionDB instance predates the lock
@@ -2662,6 +2663,7 @@ def compress_context(
                             _lock_sid, _wm_err,
                         )
                         _commit_watermark = None
+                        _commit_source_signature = None
             except Exception as _lock_err:
                 # The method exists and entered its implementation but failed.
                 # Do not mistake an internal AttributeError or TypeError for
@@ -3689,6 +3691,7 @@ def compress_context(
                         },
                         watermark=_commit_watermark,
                         lock_holder=_lock_holder,
+                        source_signature=_commit_source_signature,
                         expected_revision=_checkpoint_expected_revision,
                     )
                     split_status = "in_place_committed"

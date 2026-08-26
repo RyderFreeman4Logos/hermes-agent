@@ -68,6 +68,20 @@ class TestWatermarkCommit:
         ]
         assert all(row["active"] for row in db.get_messages("sess1", include_inactive=True))
 
+    def test_live_source_kwargs_are_accepted_with_revision_cas(
+        self, db: SessionDB
+    ) -> None:
+        _seed(db)
+        revision = db.get_active_message_revision("sess1")
+        count = db.archive_and_compact(
+            "sess1",
+            SUMMARY,
+            source_ids=[1, 2, 3],
+            source_signature="live-pin-digest",
+            expected_revision=revision,
+        )
+        assert count == 2
+
     def test_concurrent_tail_survives_compaction(self, db: SessionDB) -> None:
         _seed(db)
         watermark = db.get_active_message_watermark("sess1")

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Any, Dict, List, Optional
 
 from agent.context_engine import ContextEngine
@@ -24,6 +26,43 @@ class CheckpointContextEngine(ContextEngine):
     def should_compress(self, prompt_tokens: Optional[int] = None) -> bool:
         return False
 
+    @staticmethod
+    def _has_inflight_tools(messages: List[Dict[str, Any]]) -> bool:
+        pending = set()
+        for message in messages:
+            if message.get("role") == "assistant":
+                tool_calls = message.get("tool_calls")
+                if tool_calls is None:
+                    continue
+                if not isinstance(tool_calls, list):
+                    return True
+                for tool_call in tool_calls:
+                    if not isinstance(tool_call, dict):
+                        return True
+                    tool_call_id = tool_call.get("id")
+                    if not isinstance(tool_call_id, str) or not tool_call_id:
+                        return True
+                    pending.add(tool_call_id)
+            elif message.get("role") == "tool":
+                tool_call_id = message.get("tool_call_id")
+                if isinstance(tool_call_id, str):
+                    pending.discard(tool_call_id)
+        return bool(pending)
+
+    @staticmethod
+    def _capture_snapshot(messages: List[Dict[str, Any]]) -> tuple[int, str]:
+        content_hash = hashlib.sha256(
+            json.dumps(
+                messages, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+            ).encode()
+        ).hexdigest()
+        return id(messages), content_hash
+
+    def _snapshot_is_current(
+        self, messages: List[Dict[str, Any]], snapshot: tuple[int, str]
+    ) -> bool:
+        return self._capture_snapshot(messages) == snapshot
+
     def compress(
         self,
         messages: List[Dict[str, Any]],
@@ -32,4 +71,12 @@ class CheckpointContextEngine(ContextEngine):
         force: bool = False,
         memory_context: str = "",
     ) -> List[Dict[str, Any]]:
+        try:
+            snapshot = self._capture_snapshot(messages)
+        except (TypeError, ValueError):
+            return messages
+        if self._has_inflight_tools(messages) or not self._snapshot_is_current(
+            messages, snapshot
+        ):
+            return messages
         return messages

@@ -3015,10 +3015,20 @@ def _run_single_child(
         if (
             isinstance(_result_billing, dict)
             and _result_billing.get("provider") in {"xai", "xai-oauth"}
-            and "grok" not in str(_child_model).lower()
+            and (
+                "grok" not in str(_child_model).lower()
+                or (
+                    getattr(child, "_delegate_model_profile", None) == "standard"
+                    and result.get("billing_unverified", False)
+                )
+            )
         ):
             # Do not attach a parent xAI terminal to a child routed elsewhere (#209).
-            summary = "Subagent failed with a provider error unrelated to its effective model."
+            summary = (
+                "Subagent failed after an unverified provider billing error."
+                if result.get("billing_unverified", False)
+                else "Subagent failed with a provider error unrelated to its effective model."
+            )
         completed = result.get("completed", False)
         interrupted = result.get("interrupted", False)
         api_calls = result.get("api_calls", 0)

@@ -1112,6 +1112,35 @@ class TestChildCredentialLeasing(unittest.TestCase):
 
         self.assertNotIn("xAI spending-limit body", result["summary"])
 
+    def test_standard_child_hides_unverified_xai_fallback_terminal(self):
+        """A standard child must not relay an xAI fallback's unverified terminal (#209)."""
+        from tools.delegate_tool import _run_single_child
+
+        child = MagicMock()
+        # The selected standard route was DeepSeek; fallback has updated the
+        # effective model to Grok before delegate completion is assembled.
+        child.model = "grok-4.6"
+        child._delegate_model_profile = "standard"
+        child._credential_pool = None
+        child.run_conversation.return_value = {
+            "final_response": "Provider reported usage/credit exhaustion (unverified): xAI spending-limit body",
+            "billing_block": {"provider": "xai-oauth"},
+            "billing_unverified": True,
+            "completed": False,
+            "interrupted": False,
+            "api_calls": 1,
+            "messages": [],
+        }
+
+        result = _run_single_child(
+            task_index=0,
+            goal="Do child work",
+            child=child,
+            parent_agent=_make_mock_parent(),
+        )
+
+        self.assertNotIn("xAI spending-limit body", result["summary"])
+
 
 class TestDelegateHeartbeat(unittest.TestCase):
     """Heartbeat propagates child activity to parent during delegation.

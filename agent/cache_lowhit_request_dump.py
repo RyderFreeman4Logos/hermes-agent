@@ -1,8 +1,11 @@
-"""Unredacted last-2 send-time dump on economically near-zero cache hits."""
+"""Fingerprint-only last-2 send-time dump on economically near-zero cache hits."""
 
 from __future__ import annotations
 
-import copy
+import hashlib
+import hmac
+import json
+import secrets
 import threading
 import time
 from collections import deque
@@ -23,6 +26,7 @@ __all__ = [
 MAX_DUMPS = 8
 _LOCK = threading.Lock()
 _LAST: deque[dict[str, Any]] = deque(maxlen=2)
+_KEY = secrets.token_bytes(32)
 
 
 def reset_for_tests() -> None:
@@ -68,21 +72,36 @@ def _cache_key(request: dict[str, Any]) -> Any:
     return request.get("prompt_cache_key")
 
 
+def _serialized(value: Any) -> bytes:
+    return json.dumps(
+        value, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str
+    ).encode("utf-8")
+
+
+def _digest(key: bytes, label: str, value: Any) -> str:
+    encoded = _serialized(value)
+    return hmac.new(key, label.encode() + b"\0" + encoded, hashlib.sha256).hexdigest()
+
+
 def remember_sent_request(
     request: dict[str, Any], *, api_mode: str = "chat_completions"
 ) -> None:
-    """Keep the last two actually-sent cache-identity snapshots."""
-    snapshot = copy.deepcopy(
-        {
-            "prefix": _prefix(request),
-            "messages": request.get("messages"),
-            "input": request.get("input"),
-            "tools": request.get("tools") or request.get("toolConfig") or [],
-            "prompt_cache_key": _cache_key(request),
-            "model": request.get("model"),
-            "later_history": _later_history(request, api_mode),
-        }
-    )
+    """Keep the last two send-time fingerprints and sizes, never raw bodies."""
+    components = {
+        "prefix": _prefix(request),
+        "messages": request.get("messages"),
+        "input": request.get("input"),
+        "tools": request.get("tools") or request.get("toolConfig") or [],
+        "prompt_cache_key": _cache_key(request),
+        "later_history": _later_history(request, api_mode),
+    }
+    snapshot = {
+        "fingerprint": _digest(_KEY, "cache_lowhit", components),
+        "sizes": {
+            f"{name}_bytes": len(_serialized(value)) for name, value in components.items()
+        },
+        "model": request.get("model"),
+    }
     with _LOCK:
         _LAST.append(snapshot)
 
@@ -98,7 +117,7 @@ def _is_near_zero(usage: CanonicalUsage) -> bool:
 
 
 def maybe_dump_on_usage(usage: CanonicalUsage) -> None:
-    """Write the last two unredacted send-time prefixes when the hit is near-zero."""
+    """Write the last two fingerprints when the hit is economically near-zero."""
     if not _is_near_zero(usage):
         return
     with _LOCK:

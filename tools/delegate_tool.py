@@ -3100,6 +3100,13 @@ def _run_single_child(
         _input_tokens = getattr(child, "session_prompt_tokens", 0)
         _output_tokens = getattr(child, "session_completion_tokens", 0)
         _model = getattr(child, "model", None)
+        if (
+            isinstance(_result_billing, dict)
+            and _result_billing.get("provider") in {"xai", "xai-oauth"}
+            and result.get("billing_unverified", False)
+            and getattr(child, "_delegate_model_profile", None) == "standard"
+        ):
+            _model = None
 
         entry: Dict[str, Any] = {
             "task_index": task_index,

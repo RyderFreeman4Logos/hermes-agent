@@ -2465,6 +2465,7 @@ def try_activate_fallback(
             return False
         if reason not in {
             FailoverReason.rate_limit,
+            FailoverReason.billing,
             FailoverReason.upstream_rate_limit,
         } and not terminal_quota:
             return False

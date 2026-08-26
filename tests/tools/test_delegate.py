@@ -1140,6 +1140,7 @@ class TestChildCredentialLeasing(unittest.TestCase):
         )
 
         self.assertNotIn("xAI spending-limit body", result["summary"])
+        self.assertIsNone(result["model"])
 
 
 class TestDelegateHeartbeat(unittest.TestCase):

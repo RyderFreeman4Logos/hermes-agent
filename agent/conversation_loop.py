@@ -180,13 +180,17 @@ def _standard_child_has_successful_llm_request(agent) -> bool:
 
 
 def _standard_child_can_fallback(
-    agent, *, rate_limited: bool = False, terminal_quota: bool = False
+    agent,
+    *,
+    rate_limited: bool = False,
+    terminal_quota: bool = False,
+    billing: bool = False,
 ) -> bool:
-    """Permit only pre-success 429 fallback for standard-profile children."""
+    """Permit pre-success 429 or billing fallback for standard children."""
     if not _is_standard_profile_child(agent):
         return True
     return (
-        (rate_limited or terminal_quota)
+        (rate_limited or terminal_quota or billing)
         and not _standard_child_has_successful_llm_request(agent)
     )
 
@@ -5638,17 +5642,22 @@ def run_conversation(
                 _should_fallback = (
                     (is_rate_limited and _wrapped_output_cap_budget is None)
                     or (_is_transport_failure and retry_count >= 2)
+                    or classified.reason == FailoverReason.billing
                 )
                 if (
                     _should_fallback
-                    and _standard_child_can_fallback(
-                        agent,
-                        rate_limited=classified.reason
-                        in {
-                            FailoverReason.rate_limit,
-                            FailoverReason.upstream_rate_limit,
-                        },
-                        terminal_quota=_terminal_quota_429,
+                    and (
+                        _standard_child_can_fallback(
+                            agent,
+                            rate_limited=classified.reason
+                            in {
+                                FailoverReason.rate_limit,
+                                FailoverReason.upstream_rate_limit,
+                            },
+                            terminal_quota=_terminal_quota_429,
+                            billing=classified.reason == FailoverReason.billing,
+                        )
+                        or classified.reason == FailoverReason.billing
                     )
                     and agent._fallback_index < len(agent._fallback_chain)
                 ):

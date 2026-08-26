@@ -586,11 +586,11 @@ def inspect_delegation(target_id: str) -> Dict[str, Any]:
         None,
     )
     status = str((record or {}).get("status") or "")
-    if status == "running":
+    if status in {"queued", "running"}:
         return {
             "alive": True,
             "progress": True,
-            "evidence": f"delegation in progress; status={status}",
+            "evidence": f"delegation pending or in progress; status={status}",
         }
     if status == "finalizing":
         return {

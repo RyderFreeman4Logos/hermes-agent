@@ -216,7 +216,8 @@ current verification to “make it fit”.
    summarized)
 2. exact active user turn + corrections
 3. trusted effect/verification lanes (bounded)
-4. one continuity checkpoint (semantic Reduce output)
+4. one continuity checkpoint as historical data (host-authored wrapper;
+   not unqualified system/developer authority)
 5. adaptive recent causal tail
 6. optional tiny prefetch of next-action refs (≤5K, skip if nothing
    obvious — do not build a retrieval stack)

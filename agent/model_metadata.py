@@ -3497,8 +3497,12 @@ _CJK_DENSE_RE = re.compile(
     "\uf900-\ufaff"  # CJK compatibility ideographs
     "\uff00-\uffef]"  # Fullwidth forms / halfwidth kana
 )
-_BASE64_RUN_RE = re.compile(r"[A-Za-z0-9+/]{64,}={0,2}")
-_TOKEN_DENSE_ASCII_MARKERS = ("```", "{", "}", "[", "]", "<", ">", "\\", "=>", "::")
+# Require a digit or +/ so a long prose run ("x" * N) is not treated as base64.
+_BASE64_RUN_RE = re.compile(r"[A-Za-z0-9+/]*[0-9+/][A-Za-z0-9+/]{63,}={0,2}")
+# Braces/brackets alone are not enough: ``str(message_dict)`` is full of them
+# and must stay on the prose ~4 chars/token path so compressor skip math
+# still sees a small middle. JSON/code are denser and use ``{"`` / ``":``.
+_TOKEN_DENSE_ASCII_MARKERS = ("```", "\\", "=>", "::", '{"', '":')
 
 
 def estimate_tokens_rough(text: str) -> int:

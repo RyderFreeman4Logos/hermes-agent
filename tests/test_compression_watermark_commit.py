@@ -18,7 +18,11 @@ from pathlib import Path
 
 import pytest
 
-from hermes_state import SessionCompressionInProgressError, SessionDB
+from hermes_state import (
+    SessionCompressionInProgressError,
+    SessionDB,
+    SessionTranscriptRevisionChangedError,
+)
 
 
 @pytest.fixture
@@ -41,6 +45,29 @@ SUMMARY = [
 
 
 class TestWatermarkCommit:
+    def test_durable_revision_cas_refuses_changed_active_transcript(
+        self, db: SessionDB
+    ) -> None:
+        _seed(db)
+        revision = db.get_active_message_revision("sess1")
+        db.append_message("sess1", role="user", content="concurrent input")
+
+        with pytest.raises(SessionTranscriptRevisionChangedError):
+            db.archive_and_compact(
+                "sess1", SUMMARY, expected_revision=revision
+            )
+
+        assert [row["content"] for row in db.get_messages("sess1")] == [
+            "turn 0",
+            "turn 1",
+            "turn 2",
+            "turn 3",
+            "turn 4",
+            "turn 5",
+            "concurrent input",
+        ]
+        assert all(row["active"] for row in db.get_messages("sess1", include_inactive=True))
+
     def test_concurrent_tail_survives_compaction(self, db: SessionDB) -> None:
         _seed(db)
         watermark = db.get_active_message_watermark("sess1")

@@ -107,6 +107,22 @@ class ReducedState:
     plans: tuple[MapFact, ...]
 
 
+@dataclass(frozen=True)
+class CheckpointCommitSnapshot:
+    """Durable and lifecycle identity required to publish one candidate."""
+
+    session_id: str
+    durable_revision: Any
+    source_event_range: tuple[int, int]
+    queued_user_generation: Any
+    queued_steer_generation: Any
+    tool_result_generation: tuple[Any, ...]
+    model_session_lineage: tuple[Any, ...]
+    queued_user_pending: bool
+    queued_steer_pending: bool
+    background_completion_pending: bool
+
+
 class CheckpointContextEngine(ContextEngine):
     """Selectable ``checkpoint`` engine that does not mutate messages."""
 
@@ -201,6 +217,9 @@ class CheckpointContextEngine(ContextEngine):
         self.last_candidate: Optional[List[Dict[str, Any]]] = None
         self.last_wire_tokens: Optional[int] = None
         self.last_degradation_steps: tuple[str, ...] = ()
+        self._session_db = None
+        self._session_id = ""
+        self._commit_snapshot: Optional[CheckpointCommitSnapshot] = None
 
     @staticmethod
     def _checkpoint_config() -> Dict[str, Any]:
@@ -333,6 +352,15 @@ class CheckpointContextEngine(ContextEngine):
         self._clear_automatic_cooldown()
         self.last_request_tokens = 0
         self.last_trigger_reason = None
+
+    def bind_session_state(self, session_db: Any = None, session_id: str = "") -> None:
+        """Bind the public durable-session seam supplied by the host."""
+        self._session_db = session_db
+        self._session_id = session_id or ""
+        self._commit_snapshot = None
+
+    def on_session_start(self, session_id: str, **kwargs: Any) -> None:
+        self.bind_session_state(kwargs.get("session_db", self._session_db), session_id)
 
     def should_compress(self, prompt_tokens: Optional[int] = None) -> bool:
         return self.should_compress_info(prompt_tokens)[0]
@@ -516,6 +544,138 @@ class CheckpointContextEngine(ContextEngine):
         self, messages: List[Dict[str, Any]], snapshot: tuple[int, str]
     ) -> bool:
         return self._capture_snapshot(messages) == snapshot
+
+    @staticmethod
+    def _pending_steer(lifecycle: Any) -> Any:
+        if lifecycle is None:
+            return None
+        lock = getattr(lifecycle, "_pending_steer_lock", None)
+        if lock is None:
+            return getattr(lifecycle, "_pending_steer", None)
+        try:
+            with lock:
+                return getattr(lifecycle, "_pending_steer", None)
+        except Exception:
+            return object()
+
+    def _capture_commit_snapshot(self, lifecycle: Any) -> CheckpointCommitSnapshot:
+        session_id = (
+            getattr(lifecycle, "session_id", None) if lifecycle is not None else None
+        ) or self._session_id
+        revision = None
+        if self._session_db is not None and session_id:
+            revision_getter = getattr(
+                self._session_db, "get_active_message_revision", None
+            )
+            if not callable(revision_getter):
+                raise RuntimeError("durable session revision API unavailable")
+            revision = revision_getter(session_id)
+        pending_user = (
+            getattr(lifecycle, "_pending_cli_user_message", None)
+            if lifecycle is not None
+            else None
+        )
+        queued_user_pending = isinstance(pending_user, dict) and not pending_user.get(
+            "_db_persisted"
+        )
+        pending_steer = self._pending_steer(lifecycle)
+        queued_steer_pending = bool(pending_steer)
+        background_completion_pending = bool(
+            getattr(lifecycle, "_background_completion_pending", False)
+            or getattr(lifecycle, "_background_tool_result_pending", False)
+        )
+        return CheckpointCommitSnapshot(
+            session_id=session_id or "",
+            durable_revision=revision,
+            source_event_range=(
+                int(getattr(revision, "first_message_id", 0)),
+                int(getattr(revision, "last_message_id", 0)),
+            ),
+            queued_user_generation=(
+                getattr(lifecycle, "_queued_user_generation", None),
+                getattr(lifecycle, "_queued_prompt_generation", None),
+                bool(queued_user_pending),
+            ),
+            queued_steer_generation=(
+                getattr(lifecycle, "_queued_steer_generation", None), pending_steer
+            ),
+            tool_result_generation=(
+                bool(getattr(lifecycle, "_executing_tools", False)),
+                getattr(lifecycle, "_tool_result_generation", None),
+                getattr(lifecycle, "_background_tool_result_generation", None),
+                getattr(lifecycle, "_background_completion_generation", None),
+            ),
+            model_session_lineage=(
+                session_id,
+                getattr(lifecycle, "_session_generation", None),
+                getattr(lifecycle, "_session_lineage_generation", None),
+                getattr(lifecycle, "_session_rotation_generation", None),
+                getattr(lifecycle, "model", None),
+                getattr(lifecycle, "provider", None),
+                getattr(lifecycle, "base_url", None),
+                getattr(lifecycle, "api_mode", None),
+            ),
+            queued_user_pending=queued_user_pending,
+            queued_steer_pending=queued_steer_pending,
+            background_completion_pending=background_completion_pending,
+        )
+
+    @staticmethod
+    def _snapshot_has_unrepresented_work(snapshot: CheckpointCommitSnapshot) -> Optional[str]:
+        if snapshot.queued_user_pending:
+            return "queued_user_message"
+        if snapshot.queued_steer_pending:
+            return "queued_steer"
+        if snapshot.tool_result_generation[0]:
+            return "in_flight_tools"
+        if snapshot.background_completion_pending:
+            return "background_completion_pending"
+        return None
+
+    def _candidate_snapshot_is_current(
+        self,
+        messages: List[Dict[str, Any]],
+        snapshot: tuple[int, str],
+        commit_snapshot: CheckpointCommitSnapshot,
+        lifecycle: Any,
+    ) -> bool:
+        if not self._snapshot_is_current(messages, snapshot):
+            self.last_trigger_reason = "stale_snapshot"
+            return False
+        if not self._commit_snapshot_is_current(commit_snapshot, lifecycle):
+            self.last_trigger_reason = "stale_durable_snapshot"
+            return False
+        return True
+
+    def _commit_snapshot_is_current(
+        self, snapshot: CheckpointCommitSnapshot, lifecycle: Any
+    ) -> bool:
+        if snapshot.durable_revision is not None:
+            revision_current = getattr(
+                self._session_db, "active_message_revision_is_current", None
+            )
+            if not callable(revision_current) or not revision_current(
+                snapshot.durable_revision
+            ):
+                return False
+        try:
+            return self._capture_commit_snapshot(lifecycle) == snapshot
+        except Exception:
+            return False
+
+    def commit_snapshot_is_current(self, lifecycle: Any = None) -> bool:
+        """Host commit guard; re-check the candidate immediately before publish."""
+        snapshot = self._commit_snapshot
+        return bool(
+            snapshot
+            and self._snapshot_has_unrepresented_work(snapshot) is None
+            and self._commit_snapshot_is_current(snapshot, lifecycle)
+        )
+
+    @property
+    def expected_session_revision(self) -> Any:
+        snapshot = self._commit_snapshot
+        return snapshot.durable_revision if snapshot is not None else None
 
     @staticmethod
     def _map_prompt(
@@ -1070,10 +1230,12 @@ class CheckpointContextEngine(ContextEngine):
         focus_topic: Optional[str] = None,
         force: bool = False,
         memory_context: str = "",
+        lifecycle: Any = None,
     ) -> List[Dict[str, Any]]:
         self._last_compress_aborted = False
         self._last_summary_error = None
         self._last_compression_made_progress = False
+        self._commit_snapshot = None
         known_request_tokens = self._estimate_request_tokens(messages)
         current_request_tokens = self._usage_tokens(current_tokens)
         fixed_wire_tokens = max(
@@ -1096,11 +1258,20 @@ class CheckpointContextEngine(ContextEngine):
         except (TypeError, ValueError):
             self._set_automatic_cooldown("snapshot_unavailable")
             return messages
+        try:
+            commit_snapshot = self._capture_commit_snapshot(lifecycle)
+        except Exception:
+            self.last_trigger_reason = "durable_snapshot_unavailable"
+            return messages
+        if reason := self._snapshot_has_unrepresented_work(commit_snapshot):
+            self.last_trigger_reason = reason
+            return messages
         if self._has_inflight_tools(messages):
             self.last_trigger_reason = "in_flight_tools"
             return messages
-        if not self._snapshot_is_current(messages, snapshot):
-            self.last_trigger_reason = "stale_snapshot"
+        if not self._candidate_snapshot_is_current(
+            messages, snapshot, commit_snapshot, lifecycle
+        ):
             return messages
         self.last_map_shards = ()
         self.last_map_externalized_groups = ()
@@ -1129,8 +1300,9 @@ class CheckpointContextEngine(ContextEngine):
             self._last_compress_aborted = True
             self._last_summary_error = "checkpoint Map failed"
             return messages
-        if not self._snapshot_is_current(messages, snapshot):
-            self.last_trigger_reason = "stale_snapshot"
+        if not self._candidate_snapshot_is_current(
+            messages, snapshot, commit_snapshot, lifecycle
+        ):
             return messages
         self.last_map_shards = mapped
         reduced = self._reduce(self._extract_deterministic_lanes(messages), mapped)
@@ -1144,8 +1316,9 @@ class CheckpointContextEngine(ContextEngine):
             self._last_compress_aborted = True
             self._last_summary_error = "checkpoint semantic Reduce failed"
             return messages
-        if not self._snapshot_is_current(messages, snapshot):
-            self.last_trigger_reason = "stale_snapshot"
+        if not self._candidate_snapshot_is_current(
+            messages, snapshot, commit_snapshot, lifecycle
+        ):
             return messages
         rendered = self._render_candidate(
             messages, groups, reduced, checkpoint, fixed_wire_tokens
@@ -1155,8 +1328,9 @@ class CheckpointContextEngine(ContextEngine):
             self._last_compress_aborted = True
             self._last_summary_error = "checkpoint candidate exceeded its wire budget"
             return messages
-        if not self._snapshot_is_current(messages, snapshot):
-            self.last_trigger_reason = "stale_snapshot"
+        if not self._candidate_snapshot_is_current(
+            messages, snapshot, commit_snapshot, lifecycle
+        ):
             return messages
         candidate, wire_tokens, steps, checkpoint_text = rendered
         self.last_reduced_state = reduced
@@ -1170,6 +1344,7 @@ class CheckpointContextEngine(ContextEngine):
         if candidate == messages:
             self._set_automatic_cooldown("ineffective")
             return messages
+        self._commit_snapshot = commit_snapshot
         self.compression_count += 1
         self._last_compression_made_progress = True
         return candidate

@@ -268,6 +268,56 @@ def test_stale_snapshot_refuses_checkpoint(monkeypatch):
     assert engine.compression_count == 0
 
 
+def test_durable_revision_and_queued_input_refuse_checkpoint(tmp_path):
+    from hermes_state import SessionDB
+    from agent.checkpoint_engine import CheckpointContextEngine
+
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("checkpoint-session", source="test")
+    messages = [
+        {"role": "user", "content": "original request"},
+        {"role": "assistant", "content": "original answer"},
+        {"role": "user", "content": "active request"},
+    ]
+    for message in messages:
+        db.append_message("checkpoint-session", **message)
+
+    class _AdvancingMapClient(_EchoMapClient):
+        def complete(self, **kwargs):
+            response = super().complete(**kwargs)
+            db.append_message(
+                "checkpoint-session", role="user", content="concurrent input"
+            )
+            return response
+
+    lifecycle = SimpleNamespace(
+        session_id="checkpoint-session",
+        _pending_cli_user_message=None,
+        _pending_steer=None,
+        _executing_tools=False,
+        model="test-model",
+        provider="test-provider",
+        base_url="https://example.test",
+        api_mode="chat_completions",
+    )
+    engine = CheckpointContextEngine(
+        auxiliary_client=_AdvancingMapClient(),
+        semantic_reducer=lambda _state: "Continue from the verified state.",
+        mode="live",
+        token_counter=lambda _value: 1,
+        output_reserve_tokens=0,
+    )
+    engine.bind_session_state(db, "checkpoint-session")
+
+    assert engine.compress(messages, force=True, lifecycle=lifecycle) is messages
+    assert engine.last_trigger_reason == "stale_durable_snapshot"
+    assert engine.compression_count == 0
+
+    lifecycle._pending_cli_user_message = {"role": "user", "content": "queued"}
+    assert engine.compress(messages, force=True, lifecycle=lifecycle) is messages
+    assert engine.last_trigger_reason == "queued_user_message"
+
+
 def test_causal_groups_keep_tool_call_and_results_together():
     engine = load_context_engine("checkpoint")
     assert engine is not None

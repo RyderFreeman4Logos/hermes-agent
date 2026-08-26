@@ -1419,6 +1419,7 @@ def _supported_compression_kwargs(
     focus_topic: Optional[str],
     force: bool,
     memory_context: str,
+    lifecycle: Any = None,
 ) -> dict:
     """Return only compression kwargs accepted by an engine callable.
 
@@ -1434,6 +1435,8 @@ def _supported_compression_kwargs(
     }
     if memory_context:
         candidates["memory_context"] = memory_context
+    if lifecycle is not None:
+        candidates["lifecycle"] = lifecycle
     try:
         parameters = inspect.signature(compress_fn).parameters
     except (TypeError, ValueError):
@@ -2252,6 +2255,7 @@ def _notify_context_engine_compression_complete(
             new_session_id,
             boundary_reason="compression",
             old_session_id=old_session_id,
+            session_db=getattr(agent, "_session_db", None),
             platform=getattr(agent, "platform", None) or "cli",
             conversation_id=getattr(agent, "_gateway_session_key", None),
         )
@@ -3073,6 +3077,7 @@ def compress_context(
             focus_topic=focus_topic,
             force=force,
             memory_context=memory_context,
+            lifecycle=agent,
         )
         if memory_context.strip() and "memory_context" not in compress_kwargs:
             engine_name = getattr(
@@ -3236,6 +3241,7 @@ def compress_context(
             _activity_heartbeat.stop("context compression completed")
 
     _commit_fence_entered = False
+    _checkpoint_expected_revision = None
     try:
         # Capture boundary quality before session-rotation callbacks run. Built-in
         # and plugin lifecycle hooks may reset per-session compressor fields while
@@ -3362,6 +3368,47 @@ def compress_context(
                     commit_status="aborted",
                     split_status="aborted",
                     failure_class="commit_fence_cancelled",
+                )
+                _release_lock()
+                return messages, _existing_sp
+
+        _checkpoint_validator = getattr(
+            agent.context_compressor, "commit_snapshot_is_current", None
+        )
+        if callable(_checkpoint_validator):
+            try:
+                _checkpoint_current = bool(_checkpoint_validator(agent))
+                _checkpoint_expected_revision = getattr(
+                    agent.context_compressor, "expected_session_revision", None
+                )
+            except Exception:
+                _checkpoint_current = False
+            if in_place and _checkpoint_expected_revision is None:
+                _checkpoint_current = False
+            if not _checkpoint_current:
+                _restore_compressor_attempt_state(
+                    agent.context_compressor,
+                    _compressor_attempt_snapshot,
+                    durable_cooldown_authoritative=_durable_cooldown_authoritative,
+                    durable_cooldown_state=_durable_cooldown_state,
+                )
+                if messages != messages_before_compression:
+                    messages[:] = copy.deepcopy(messages_before_compression)
+                logger.info(
+                    "Compression candidate became stale before durable commit "
+                    "(session=%s); keeping the live transcript unchanged.",
+                    agent.session_id or "none",
+                )
+                agent._last_compaction_in_place = False
+                _existing_sp = getattr(agent, "_cached_system_prompt", None)
+                if not _existing_sp:
+                    _existing_sp = agent._build_system_prompt(system_message)
+                _emit_compression_attempt_telemetry(
+                    agent,
+                    started_at=_attempt_started_at,
+                    commit_status="aborted",
+                    split_status="aborted",
+                    failure_class="stale_durable_revision",
                 )
                 _release_lock()
                 return messages, _existing_sp
@@ -3642,6 +3689,7 @@ def compress_context(
                         },
                         watermark=_commit_watermark,
                         lock_holder=_lock_holder,
+                        expected_revision=_checkpoint_expected_revision,
                     )
                     split_status = "in_place_committed"
                     # Reset the flush identity set so the next turn's appends are
@@ -3888,6 +3936,19 @@ def compress_context(
                     }
                 _session_commit_succeeded = True
             except Exception as e:
+                if in_place:
+                    # archive_and_compact() can reject a stale durable revision
+                    # after candidate construction. Its transaction leaves the
+                    # durable rows intact; keep the in-memory projection aligned.
+                    messages[:] = copy.deepcopy(messages_before_compression)
+                    compressed = messages
+                    _compression_made_progress = False
+                    agent._cached_system_prompt = cached_system_prompt
+                    new_system_prompt = (
+                        cached_system_prompt
+                        if cached_system_prompt is not None
+                        else agent._build_system_prompt(system_message)
+                    )
                 if (
                     not in_place
                     and locals().get("old_session_id")

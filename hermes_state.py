@@ -32,6 +32,7 @@ import time
 import weakref
 from collections import deque
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 from agent.memory_manager import sanitize_context
@@ -3538,6 +3539,20 @@ class SessionCompressionInProgressError(CompressionSessionBusyError):
     Subclassing keeps every existing ``except CompressionSessionBusyError``
     handler working unchanged.
     """
+
+
+class SessionTranscriptRevisionChangedError(RuntimeError):
+    """A compaction candidate no longer matches the active transcript."""
+
+
+@dataclass(frozen=True)
+class ActiveMessageRevision:
+    """Public durable identity of one session's active transcript."""
+
+    session_id: str
+    first_message_id: int
+    last_message_id: int
+    active_message_count: int
 
 
 class SessionTurnLeaseLostError(RuntimeError):
@@ -11218,6 +11233,36 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             ).fetchone()
         return int(row[0]) if row else 0
 
+    @staticmethod
+    def _active_message_revision(conn, session_id: str) -> ActiveMessageRevision:
+        row = conn.execute(
+            "SELECT COALESCE(MIN(id), 0), COALESCE(MAX(id), 0), COUNT(*) "
+            "FROM messages WHERE session_id = ? AND active = 1",
+            (session_id,),
+        ).fetchone()
+        return ActiveMessageRevision(
+            session_id=session_id,
+            first_message_id=int(row[0]) if row else 0,
+            last_message_id=int(row[1]) if row else 0,
+            active_message_count=int(row[2]) if row else 0,
+        )
+
+    def get_active_message_revision(self, session_id: str) -> ActiveMessageRevision:
+        """Return the exact durable identity of the current active transcript."""
+        if not session_id:
+            return ActiveMessageRevision("", 0, 0, 0)
+        with self._read_ctx() as conn:
+            return self._active_message_revision(conn, session_id)
+
+    def active_message_revision_is_current(
+        self, revision: ActiveMessageRevision
+    ) -> bool:
+        """Return whether *revision* still identifies the active transcript."""
+        if not isinstance(revision, ActiveMessageRevision) or not revision.session_id:
+            return False
+        with self._read_ctx() as conn:
+            return self._active_message_revision(conn, revision.session_id) == revision
+
     def archive_and_compact(
         self,
         session_id: str,
@@ -11225,6 +11270,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         model_config_patch: Optional[Dict[str, Any]] = None,
         watermark: Optional[int] = None,
         lock_holder: Optional[str] = None,
+        expected_revision: Optional[ActiveMessageRevision] = None,
     ) -> int:
         """Non-destructive in-place compaction for a single durable session id.
 
@@ -11264,6 +11310,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         reclaimed (crash cleanup, TTL expiry, competing writer) fails the
         commit instead of clobbering the winner's transcript.
 
+        Durable revision safety: when *expected_revision* is provided, the
+        active transcript must still exactly match it inside this transaction.
+        A changed revision refuses the candidate instead of re-sequencing a
+        concurrent tail into a snapshot that did not include it.
+
         ``message_count`` is set to the ACTIVE count after commit, matching
         what the live load returns. ``model_config_patch`` is merged into the
         session's JSON config in the same transaction; a ``None`` value
@@ -11285,6 +11336,17 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     raise SessionCompressionInProgressError(
                         f"Compression lease for {session_id!r} lost before "
                         "commit; refusing to publish a stale compaction"
+                    )
+
+            if expected_revision is not None:
+                if (
+                    expected_revision.session_id != session_id
+                    or self._active_message_revision(conn, session_id)
+                    != expected_revision
+                ):
+                    raise SessionTranscriptRevisionChangedError(
+                        f"Active transcript for {session_id!r} changed before "
+                        "compaction commit; refusing stale candidate"
                     )
 
             patched_model_config = None

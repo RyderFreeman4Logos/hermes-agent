@@ -35,6 +35,12 @@ class TestGetTaskMaxConcurrency:
         ):
             assert _get_task_max_concurrency("title_generation") is None
 
+    def test_defaults_compression_when_unset(self):
+        with patch(
+            "agent.auxiliary_client._get_auxiliary_task_config", return_value={}
+        ):
+            assert _get_task_max_concurrency("compression") == 2
+
     def test_does_not_reuse_vision_cpu_limit_for_llm_calls(self):
         with patch(
             "agent.auxiliary_client._get_auxiliary_task_config",
@@ -54,19 +60,22 @@ class TestGetTaskMaxConcurrency:
             "agent.auxiliary_client._get_auxiliary_task_config",
             return_value={"max_concurrency": "not-a-number"},
         ):
-            assert _get_task_max_concurrency("compression") is None
+            assert _get_task_max_concurrency("title_generation") is None
+            assert _get_task_max_concurrency("compression") == 2
 
     def test_returns_none_for_zero_or_negative(self):
         with patch(
             "agent.auxiliary_client._get_auxiliary_task_config",
             return_value={"max_concurrency": 0},
         ):
-            assert _get_task_max_concurrency("compression") is None
+            assert _get_task_max_concurrency("title_generation") is None
+            assert _get_task_max_concurrency("compression") == 2
         with patch(
             "agent.auxiliary_client._get_auxiliary_task_config",
             return_value={"max_concurrency": -2},
         ):
-            assert _get_task_max_concurrency("compression") is None
+            assert _get_task_max_concurrency("title_generation") is None
+            assert _get_task_max_concurrency("compression") == 2
 
 
 class TestSemaphoreCache:

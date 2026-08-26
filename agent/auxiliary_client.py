@@ -8437,14 +8437,15 @@ def _get_task_max_concurrency(task: Optional[str]) -> Optional[int]:
         # Vision already uses this key for its encode/resize CPU worker pool;
         # its LLM calls deliberately remain concurrent.
         return None
+    default = 2 if task == "compression" else None
     raw = _get_auxiliary_task_config(task).get("max_concurrency")
     if raw is None:
-        return 2 if task == "compression" else None
+        return default
     try:
         value = int(raw)
     except (TypeError, ValueError):
-        return None
-    return value if value > 0 else None
+        return default
+    return value if value > 0 else default
 
 
 def _acquire_sync_aux_semaphore(task: Optional[str]) -> Optional[threading.BoundedSemaphore]:

@@ -30,6 +30,18 @@ class _FakeMainModel:
         raise AssertionError("checkpoint Map must not call the main model")
 
 
+class _EchoMapClient:
+    """Return a valid Map record for whichever causal group is requested."""
+
+    def __init__(self):
+        self.calls = []
+
+    def complete(self, **kwargs):
+        self.calls.append(kwargs)
+        payload = json.loads(kwargs["messages"][-1]["content"])
+        return _map_response({"source_event_ids": payload["source_event_ids"], "facts": []})
+
+
 def _map_response(payload, *, tool_calls=None):
     return SimpleNamespace(
         choices=[
@@ -311,3 +323,209 @@ def test_checkpoint_map_concurrency_is_capped_at_two_by_default():
     from agent.checkpoint_engine import CheckpointContextEngine
 
     assert CheckpointContextEngine().map_concurrency == 2
+
+
+def test_deterministic_reduce_merges_identity_supersession_and_action_state():
+    from agent.checkpoint_engine import (
+        ActiveIntent,
+        CheckpointContextEngine,
+        DeterministicLanes,
+        Effect,
+        MapFact,
+        MapShard,
+    )
+
+    lanes = DeterministicLanes(
+        ActiveIntent("finish the migration", (5,)),
+        (Effect("call_1", "write_file", "unknown", (3, 4)),),
+    )
+    shards = (
+        MapShard(
+            (0, 1, 2),
+            (
+                MapFact("identity", "old project name", (0,), identity="project:old"),
+                MapFact(
+                    "identity",
+                    "current project name",
+                    (1,),
+                    identity="project:current",
+                    supersedes=("project:old",),
+                ),
+                MapFact(
+                    "action",
+                    "review migration",
+                    (2,),
+                    identity="review:migration",
+                    action_state="planned",
+                ),
+            ),
+        ),
+        MapShard(
+            (3, 4),
+            (
+                MapFact(
+                    "action",
+                    "write migration",
+                    (3,),
+                    identity="write:migration",
+                    action_state="issued",
+                ),
+                MapFact(
+                    "action",
+                    "migration written",
+                    (4,),
+                    identity="write:migration",
+                    action_state="succeeded",
+                ),
+            ),
+        ),
+    )
+
+    reduced = CheckpointContextEngine()._reduce(lanes, shards)
+
+    facts = {fact.identity: fact for fact in reduced.facts}
+    assert set(facts) == {
+        "project:current",
+        "review:migration",
+        "write:migration",
+    }
+    assert facts["write:migration"].action_state == "succeeded"
+    assert [fact.identity for fact in reduced.plans] == ["review:migration"]
+    assert reduced.effects == lanes.effects
+
+
+def test_semantic_reduce_builds_a_shadow_candidate_without_a_new_user_turn():
+    from agent.checkpoint_engine import CheckpointContextEngine
+
+    reduced_states = []
+    engine = CheckpointContextEngine(
+        auxiliary_client=_FakeAuxiliaryClient(_map_response({"source_event_ids": [0], "facts": []})),
+        semantic_reducer=lambda state: reduced_states.append(state) or "Continue from the verified state.",
+        mode="shadow",
+        token_counter=lambda _value: 1,
+        output_reserve_tokens=0,
+    )
+    messages = [{"role": "user", "content": "finish the migration"}]
+
+    result = engine.compress(messages)
+
+    assert result is messages
+    assert reduced_states
+    assert engine.last_candidate is not None
+    assert all(
+        message["role"] != "user" or message["content"] != "Continue from the verified state."
+        for message in engine.last_candidate
+    )
+    assert engine.compression_count == 0
+
+
+def test_invalid_semantic_reduce_output_rejects_candidate():
+    from agent.checkpoint_engine import CheckpointContextEngine
+
+    engine = CheckpointContextEngine(
+        auxiliary_client=_EchoMapClient(),
+        semantic_reducer=lambda _state: {"not": "checkpoint text"},
+    )
+    messages = [{"role": "user", "content": "finish the migration"}]
+
+    assert engine.compress(messages) is messages
+    assert engine.last_candidate is None
+    assert engine.compression_count == 0
+
+
+def test_full_wire_hard_cap_rejects_before_live_commit():
+    from agent.checkpoint_engine import CheckpointContextEngine
+
+    counted = []
+    tool_schema_stub = {"name": "write_file", "parameters": {}}
+
+    def token_counter(value):
+        counted.append(value)
+        return 1
+
+    engine = CheckpointContextEngine(
+        auxiliary_client=_FakeAuxiliaryClient(_map_response({"source_event_ids": [0], "facts": []})),
+        semantic_reducer=lambda _state: "Continue from the verified state.",
+        mode="live",
+        token_counter=token_counter,
+        tool_schemas=tool_schema_stub,
+        output_reserve_tokens=1,
+        target_wire_tokens=3,
+        hard_max_wire_tokens=3,
+    )
+    messages = [{"role": "user", "content": "finish the migration"}]
+
+    assert engine.compress(messages) is messages
+    assert tool_schema_stub in counted
+    assert engine.compression_count == 0
+
+
+def test_live_mode_commits_only_a_valid_under_cap_projection():
+    from agent.checkpoint_engine import CheckpointContextEngine
+
+    engine = CheckpointContextEngine(
+        auxiliary_client=_EchoMapClient(),
+        semantic_reducer=lambda _state: "Continue from the verified state.",
+        mode="live",
+        token_counter=lambda _value: 1,
+        tool_schemas={"name": "write_file", "parameters": {}},
+        output_reserve_tokens=1,
+        target_wire_tokens=6,
+        hard_max_wire_tokens=6,
+    )
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "finish the migration"},
+    ]
+
+    result = engine.compress(messages)
+
+    assert result is not messages
+    assert result[-1] == messages[-1]
+    assert any(message["content"] == "Continue from the verified state." for message in result)
+    assert engine.compression_count == 1
+
+
+def test_renderer_shrinks_only_complete_old_causal_groups_before_rejecting():
+    from agent.checkpoint_engine import CheckpointContextEngine
+
+    engine = CheckpointContextEngine(
+        auxiliary_client=_EchoMapClient(),
+        semantic_reducer=lambda _state: "Continue from the verified state.",
+        mode="live",
+        token_counter=lambda _value: 1,
+        output_reserve_tokens=0,
+        target_wire_tokens=4,
+        hard_max_wire_tokens=4,
+    )
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "old request"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "write_file", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "written"},
+        {"role": "user", "content": "active request"},
+    ]
+
+    result = engine.compress(messages)
+
+    assert result is not messages
+    assert result[-1] == messages[-1]
+    assert all(message.get("content") not in {"old request", "written"} for message in result)
+    assert not any(message.get("tool_calls") for message in result)
+    assert engine.last_degradation_steps == (
+        "completed",
+        "tool_bodies",
+        "decisions",
+        "tail",
+        "tail",
+    )

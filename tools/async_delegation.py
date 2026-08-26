@@ -1219,10 +1219,18 @@ def dispatch_async_delegation_batch(
         finally:
             _finalize_batch(delegation_id, combined, status)
 
+    runtime_heartbeat.arm(
+        delegation_id,
+        caller_id=session_key,
+        kind="delegation",
+        interval=heartbeat_interval,
+        inspect=lambda _id=delegation_id: inspect_delegation(_id),
+    )
     try:
         # Propagate the dispatching profile to the detached batch children.
         executor.submit(propagate_context_to_thread(_worker))
     except Exception as exc:  # pragma: no cover
+        runtime_heartbeat.cancel(delegation_id)
         with _records_lock:
             _records.pop(delegation_id, None)
             _pending_admission_ids.discard(delegation_id)
@@ -1232,13 +1240,6 @@ def dispatch_async_delegation_batch(
             "status": "rejected",
             "error": f"Failed to schedule async delegation batch: {exc}",
         }
-    runtime_heartbeat.arm(
-        delegation_id,
-        caller_id=session_key,
-        kind="delegation",
-        interval=heartbeat_interval,
-        inspect=lambda _id=delegation_id: inspect_delegation(_id),
-    )
     logger.info(
         "Dispatched async delegation batch %s (%d task(s), session_key=%s)",
         delegation_id, n, session_key or "<cli>",
@@ -1450,6 +1451,9 @@ def _finalize_stalled(delegation_id: str) -> None:
         return
     event_record, _interrupt_fn, on_not_started = claimed
     _invoke_not_started(on_not_started, "stalled")
+    from tools.runtime_heartbeat import runtime_heartbeat
+
+    runtime_heartbeat.cancel(delegation_id)
 
     completed_at = event_record.get("completed_at") or time.time()
     duration = round(

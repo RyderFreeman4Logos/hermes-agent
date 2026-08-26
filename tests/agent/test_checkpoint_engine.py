@@ -91,3 +91,80 @@ def test_stale_snapshot_refuses_checkpoint(monkeypatch):
     assert revision_checked
     assert result is messages
     assert engine.compression_count == 0
+
+
+def test_causal_groups_keep_tool_call_and_results_together():
+    engine = load_context_engine("checkpoint")
+    assert engine is not None
+    messages = [
+        {"role": "user", "content": "change the file"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "write_file", "arguments": "{}"},
+                },
+                {
+                    "id": "call_2",
+                    "type": "function",
+                    "function": {"name": "run_terminal", "arguments": "{}"},
+                },
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "written"},
+        {"role": "tool", "tool_call_id": "call_2", "content": "passed"},
+        {"role": "assistant", "content": "The change is ready."},
+    ]
+
+    groups = engine._plan_causal_groups(messages)
+
+    assert [group.event_indices for group in groups] == [(0,), (1, 2, 3), (4,)]
+
+
+def test_deterministic_lanes_keep_latest_user_turn_as_active_intent():
+    engine = load_context_engine("checkpoint")
+    assert engine is not None
+    messages = [
+        {"role": "user", "content": "old request"},
+        {"role": "assistant", "content": "Summary: old request was handled."},
+        {"role": "user", "content": "rename the generated file"},
+        {
+            "role": "assistant",
+            "content": "Summary: the user asked to rename the generated file.",
+        },
+    ]
+
+    lanes = engine._extract_deterministic_lanes(messages)
+
+    assert lanes.active_intent is not None
+    assert lanes.active_intent.content == "rename the generated file"
+    assert lanes.active_intent.event_indices == (2,)
+
+
+def test_assistant_prose_does_not_mark_effect_succeeded():
+    engine = load_context_engine("checkpoint")
+    assert engine is not None
+    messages = [
+        {
+            "role": "assistant",
+            "content": "I will write the file.",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "write_file", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "file.txt"},
+        {"role": "assistant", "content": "I wrote the file."},
+    ]
+
+    lanes = engine._extract_deterministic_lanes(messages)
+
+    assert len(lanes.effects) == 1
+    assert lanes.effects[0].operation == "write_file"
+    assert lanes.effects[0].status == "unknown"

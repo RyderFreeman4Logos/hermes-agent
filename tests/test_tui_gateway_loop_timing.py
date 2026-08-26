@@ -123,4 +123,6 @@ def test_inflight_loop_timing_is_consumed_onto_outgoing_prompt():
     assert sent[-1] == {"role": "system", "content": TIMING}
     assert timing_messages == [{"role": "system", "content": TIMING}]
     assert agent._loop_timing_context_text == ""
-    assert all(message.get("content") != TIMING for message in result["messages"])
+    persisted = [message for message in result["messages"] if message.get("content") == TIMING]
+    assert persisted == [{"role": "system", "content": TIMING, "display_kind": "hidden"}]
+    assert all(message.get("role") != "user" for message in persisted)

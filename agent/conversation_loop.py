@@ -152,6 +152,25 @@ def _take_loop_timing_context_text(agent: Any) -> str:
     return agent.__dict__.pop("_loop_timing_context_text", "") or ""
 
 
+def _drop_redundant_previous_loop_start(text: str, history) -> str:
+    """Drop Previous loop start when history already has that Current stamp."""
+    if not text or not history:
+        return text
+    lines = text.splitlines()
+    prev = next((line for line in lines if line.startswith("Previous loop start: ")), None)
+    if prev is None:
+        return text
+    needle = f"Current loop start: {prev[len('Previous loop start: '):]}"
+    if any(
+        isinstance(msg, dict)
+        and "[Agent loop timing]" in str(msg.get("content", ""))
+        and needle in str(msg.get("content", ""))
+        for msg in history
+    ):
+        return "\n".join(line for line in lines if line != prev)
+    return text
+
+
 def _is_standard_profile_child(agent) -> bool:
     return getattr(agent, "_delegate_model_profile", None) == "standard"
 
@@ -2594,10 +2613,19 @@ def run_conversation(
             api_messages = _initial_cache_plan.messages
             tools_for_api = _initial_cache_plan.tools
 
-        # Timing is API-only context. Append it after cache planning so it never
-        # receives a breakpoint or changes the stable cached prefix.
+        # Timing is system/metadata, never user speech. Append after cache
+        # planning so the new block never receives a breakpoint. Persist it
+        # so the next cycle keeps this stamp in the historical prefix.
         if _loop_timing_text := _take_loop_timing_context_text(agent):
+            _loop_timing_text = _drop_redundant_previous_loop_start(
+                _loop_timing_text, messages
+            )
             api_messages.append({"role": "system", "content": _loop_timing_text})
+            messages.append({
+                "role": "system",
+                "content": _loop_timing_text,
+                "display_kind": "hidden",
+            })
 
         # Build a persistent-MoA request before measuring compression pressure.
         # MoA reference output is injected into the aggregator prompt, but it
@@ -3006,7 +3034,15 @@ def run_conversation(
                 # A second take-and-clear is only for a late TUI write after the
                 # post-cache-plan consume; the same claimed value is never appended twice.
                 if timing_context := _take_loop_timing_context_text(agent):
+                    timing_context = _drop_redundant_previous_loop_start(
+                        timing_context, messages
+                    )
                     api_messages.append({"role": "system", "content": timing_context})
+                    messages.append({
+                        "role": "system",
+                        "content": timing_context,
+                        "display_kind": "hidden",
+                    })
                 # Same story for prompt-cache decoration (#72626): try_activate_
                 # fallback refreshes the policy flags, but the decorated list
                 # still carries the primary's breakpoints (or none). Strip and

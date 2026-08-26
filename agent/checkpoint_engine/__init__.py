@@ -635,6 +635,18 @@ class CheckpointContextEngine(ContextEngine):
                 continue
             if receipt.get("id") != tool_call_id or receipt.get("op") != operation:
                 continue
+            source_event_ids = receipt.get("source_event_ids")
+            if (
+                not isinstance(source_event_ids, (list, tuple))
+                or not source_event_ids
+                or any(
+                    isinstance(event_id, bool)
+                    or not isinstance(event_id, int)
+                    or event_id < 0
+                    for event_id in source_event_ids
+                )
+            ):
+                continue
             status = receipt.get("status")
             if status in {"running", "succeeded", "failed", "unknown"}:
                 return status

@@ -539,6 +539,7 @@ def test_tool_effect_status_uses_recorded_receipt_evidence():
                         "id": "call_1",
                         "op": "write_file",
                         "status": "succeeded",
+                        "source_event_ids": [0, 1],
                     }
                 }
             ),
@@ -550,6 +551,41 @@ def test_tool_effect_status_uses_recorded_receipt_evidence():
     assert lanes.effects == (
         Effect("call_1", "write_file", "succeeded", (0, 1)),
     )
+
+
+def test_tool_effect_receipt_requires_source_event_ids():
+    from agent.checkpoint_engine import CheckpointContextEngine
+
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "write_file", "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": json.dumps(
+                {
+                    "receipt": {
+                        "id": "call_1",
+                        "op": "write_file",
+                        "status": "succeeded",
+                    }
+                }
+            ),
+        },
+    ]
+
+    lanes = CheckpointContextEngine()._extract_deterministic_lanes(messages)
+
+    assert lanes.effects[0].status == "unknown"
 
 
 def test_tool_effect_status_uses_persisted_effect_disposition():
@@ -639,6 +675,7 @@ def test_tool_effect_receipt_failure_is_terminal_evidence():
                         "id": "call_1",
                         "op": "write_file",
                         "status": "failed",
+                        "source_event_ids": [0, 1],
                     }
                 }
             ),

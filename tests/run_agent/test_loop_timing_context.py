@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from agent import conversation_loop
 from agent.conversation_loop import _loop_timing_context
 from run_agent import AIAgent
 
@@ -171,3 +172,17 @@ def test_timing_context_is_injected_as_api_only_system_context():
     assert timing_messages[0]["role"] == "system"
     assert "Current loop start:" in timing_messages[0]["content"]
     assert "cache_control" not in timing_messages[0]
+
+
+def test_take_loop_timing_context_text_claims_once():
+    agent = SimpleNamespace(_loop_timing_context_text="a")
+    assert conversation_loop._take_loop_timing_context_text(agent) == "a"
+    assert "_loop_timing_context_text" not in vars(agent)
+    assert conversation_loop._take_loop_timing_context_text(agent) == ""
+
+
+def test_take_loop_timing_context_text_preserves_late_write():
+    agent = SimpleNamespace(_loop_timing_context_text="a")
+    assert conversation_loop._take_loop_timing_context_text(agent) == "a"
+    agent._loop_timing_context_text = "b"
+    assert conversation_loop._take_loop_timing_context_text(agent) == "b"

@@ -84,13 +84,17 @@ def _attempt_loop(metadata: dict[str, Any] | None) -> tuple[int | None, str]:
 def _record_attempt(
     request: dict[str, Any], *, name: str, model_name: str, metadata: dict[str, Any] | None
 ) -> None:
+    request_id = str((metadata or {}).get("api_request_id") or "").strip()
+    retry = int((metadata or {}).get("retry_count") or 0)
     try:
         cache_lowhit_request_dump.remember_sent_request(
             request,
             api_mode=str((metadata or {}).get("api_mode") or "unknown"),
-            route=str((metadata or {}).get("api_mode") or "unknown"),
+            route=str((metadata or {}).get("route") or "unknown"),
             provider=name,
             model=str(request.get("model") or model_name),
+            correlation=request_id or None,
+            attempt_id=f"{request_id}:attempt:{retry}" if request_id else None,
         )
     except Exception:
         logger.debug("cache low-hit remember failed", exc_info=True)
@@ -99,10 +103,10 @@ def _record_attempt(
     physical_attempt_diagnostics.start_attempt(
         request,
         api_mode=str((metadata or {}).get("api_mode") or "unknown"),
-        route=str((metadata or {}).get("api_mode") or "unknown"),
+        route=str((metadata or {}).get("route") or "unknown"),
         provider=name,
         model=str(request.get("model") or model_name),
-        retry=int((metadata or {}).get("retry_count") or 0),
+        retry=retry,
         loop=loop,
         correlation=correlation,
         scope=scope,

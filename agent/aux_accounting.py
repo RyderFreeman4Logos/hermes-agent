@@ -74,6 +74,11 @@ def record_aux_usage(
     *,
     provider: Optional[str] = None,
     base_url: Optional[str] = None,
+    route: Optional[str] = None,
+    api_mode: Optional[str] = None,
+    model: Optional[str] = None,
+    correlation: Optional[str] = None,
+    attempt_id: Optional[str] = None,
 ) -> None:
     """Record an auxiliary response's token usage against the ambient session.
 
@@ -102,7 +107,17 @@ def record_aux_usage(
 
         from agent.usage_pricing import estimate_usage_cost, normalize_usage
 
-        usage = normalize_usage(raw_usage, provider=provider)
+        response_model = str(getattr(response, "model", "") or "") or None
+        model = model or response_model
+        usage = normalize_usage(
+            raw_usage,
+            provider=provider,
+            model=model,
+            route=route,
+            api_mode=api_mode,
+            correlation=correlation,
+            attempt_id=attempt_id,
+        )
         if not (
             usage.input_tokens or usage.output_tokens
             or usage.cache_read_tokens or usage.cache_write_tokens
@@ -110,7 +125,7 @@ def record_aux_usage(
         ):
             return
 
-        model = str(getattr(response, "model", "") or "") or "unknown"
+        model = model or "unknown"
         estimated_cost = None
         try:
             cost = estimate_usage_cost(

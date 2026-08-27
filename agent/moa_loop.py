@@ -598,6 +598,7 @@ def _run_reference(
                     raw_usage,
                     provider=runtime.get("provider"),
                     api_mode=runtime.get("api_mode"),
+                    model=slot.get("model"),
                 )
             except Exception:  # pragma: no cover - defensive
                 usage = CanonicalUsage()

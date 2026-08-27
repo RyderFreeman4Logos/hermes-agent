@@ -868,7 +868,12 @@ def _usage_and_cost(response: Any, *, provider: str, api_mode: str, model: str, 
     try:
         from agent.usage_pricing import normalize_usage
 
-        canonical = normalize_usage(raw_usage, provider=provider, api_mode=api_mode)
+        canonical = normalize_usage(
+            raw_usage,
+            provider=provider,
+            api_mode=api_mode,
+            model=model,
+        )
         return _canonical_usage_and_cost(
             canonical,
             provider=provider,

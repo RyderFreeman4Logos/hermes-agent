@@ -2,6 +2,7 @@
 
 import json
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -607,6 +608,32 @@ class TestStdinHelpers:
         finally:
             registry.kill_process(session.id)
 
+    def test_close_stdin_pty_flushes_pending_input_then_eof(self, registry, tmp_path):
+        """A PTY close must satisfy the record read and the next EOF read."""
+        child = (
+            "import os;"
+            "print('data='+os.read(0, 1024).decode(), flush=True);"
+            "print('eof='+str(os.read(0, 1024) == b''), flush=True)"
+        )
+        session = registry.spawn_local(
+            f"{shlex.quote(sys.executable)} -c {shlex.quote(child)}",
+            cwd=str(tmp_path),
+            use_pty=True,
+        )
+        try:
+            assert registry.write_stdin(session.id, "hello")["status"] == "ok"
+            assert registry.close_stdin(session.id)["status"] == "ok"
+            assert _wait_until(
+                lambda: registry.poll(session.id)["status"] == "exited",
+                timeout=5.0,
+                interval=0.02,
+            )
+            poll = registry.poll(session.id)
+            assert poll["exit_code"] == 0
+            assert "eof=True" in poll["output_preview"]
+        finally:
+            registry.kill_process(session.id)
+
 
 # =========================================================================
 # List sessions
@@ -748,6 +775,102 @@ class TestSpawnEnvSanitization:
         assert "FIRECRAWL_API_KEY" not in env
         assert f"{_HERMES_PROVIDER_ENV_FORCE_PREFIX}TELEGRAM_BOT_TOKEN" not in env
         assert env["PYTHONUNBUFFERED"] == "1"
+
+    def test_reader_setup_failure_removes_registered_session(self, registry, monkeypatch):
+        """A post-spawn reader failure must not leave an untracked child session."""
+        import tools.process_registry as process_registry_module
+
+        proc = MagicMock(pid=9999)
+        proc.poll.return_value = None
+        monkeypatch.setattr(process_registry_module.subprocess, "Popen", lambda *_args, **_kwargs: proc)
+        monkeypatch.setattr(process_registry_module, "_find_shell", lambda: "/bin/bash")
+        monkeypatch.setattr(registry, "_safe_host_start_time", lambda _pid: None)
+        monkeypatch.setattr(
+            process_registry_module.threading,
+            "Thread",
+            lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("reader setup failed")),
+        )
+        monkeypatch.setattr(
+            process_registry_module.os,
+            "getpgid",
+            lambda _pid: (_ for _ in ()).throw(ProcessLookupError),
+        )
+        checkpoint = MagicMock()
+        monkeypatch.setattr(registry, "_write_checkpoint", checkpoint)
+
+        with pytest.raises(RuntimeError, match="reader setup failed"):
+            registry.spawn_local("true", cwd="/tmp", notify_on_complete=True)
+
+        assert registry._running == {}
+        assert registry.completion_queue.empty()
+        assert proc.kill.called
+        checkpoint.assert_called_once()
+
+    def test_pty_reader_setup_failure_does_not_fallback_to_second_spawn(self, registry, monkeypatch):
+        """A spawned PTY must be reaped instead of running the command twice."""
+        import tools.process_registry as process_registry_module
+        from types import SimpleNamespace
+
+        terminated = []
+        waited = []
+
+        class FakePty:
+            pid = 5432
+
+            @classmethod
+            def spawn(cls, *_args, **_kwargs):
+                return cls()
+
+            def terminate(self, force=False):
+                terminated.append(force)
+
+            def wait(self):
+                waited.append(True)
+
+        monkeypatch.setitem(
+            sys.modules, "ptyprocess", SimpleNamespace(PtyProcess=FakePty)
+        )
+        monkeypatch.setattr(
+            process_registry_module.threading,
+            "Thread",
+            lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("PTY reader failed")),
+        )
+        popen = MagicMock()
+        monkeypatch.setattr(process_registry_module.subprocess, "Popen", popen)
+        monkeypatch.setattr(registry, "_safe_host_start_time", lambda _pid: None)
+        monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+
+        with pytest.raises(RuntimeError, match="PTY reader failed"):
+            registry.spawn_local("true", cwd="/tmp", use_pty=True)
+
+        popen.assert_not_called()
+        assert terminated == [True]
+        assert waited == [True]
+        assert registry._running == {}
+
+    def test_env_poller_setup_failure_kills_remote_process(self, registry, monkeypatch):
+        """A failed environment poller must not leave its remote child running."""
+        import tools.process_registry as process_registry_module
+
+        commands = []
+
+        class FakeEnv:
+            def execute(self, command, **kwargs):
+                commands.append(command)
+                return {"output": "4321\n", "returncode": 0}
+
+        monkeypatch.setattr(
+            process_registry_module.threading,
+            "Thread",
+            lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("poller setup failed")),
+        )
+        monkeypatch.setattr(registry, "_write_checkpoint", lambda: None)
+
+        with pytest.raises(RuntimeError, match="poller setup failed"):
+            registry.spawn_via_env(FakeEnv(), "true", notify_on_complete=True)
+
+        assert any(command.startswith("kill 4321") for command in commands)
+        assert registry._running == {}
 
     def test_spawn_via_env_checks_returncode_when_wrapper_fails(self, registry):
         class FakeEnv:

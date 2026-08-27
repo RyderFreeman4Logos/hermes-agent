@@ -1710,12 +1710,24 @@ class CheckpointContextEngine(ContextEngine):
                         "blocked",
                     )
                 identity = cls._fact_identity(fact)
+                authoritative = fact.kind.casefold() in _AUTHORITATIVE_MAP_KINDS
                 for superseded in fact.supersedes:
-                    records.pop(superseded, None)
+                    existing = records.get(superseded)
+                    if (
+                        existing is None
+                        or authoritative
+                        or existing.kind.casefold() not in _AUTHORITATIVE_MAP_KINDS
+                    ):
+                        records.pop(superseded, None)
                 previous = records.get(identity)
-                records[identity] = (
-                    fact if previous is None else cls._newer_fact(previous, fact)
-                )
+                if (
+                    previous is None
+                    or authoritative
+                    or previous.kind.casefold() not in _AUTHORITATIVE_MAP_KINDS
+                ):
+                    records[identity] = (
+                        fact if previous is None else cls._newer_fact(previous, fact)
+                    )
         facts = tuple(
             sorted(records.values(), key=lambda fact: (cls._fact_position(fact), cls._fact_identity(fact)))
         )

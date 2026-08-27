@@ -2138,6 +2138,77 @@ def test_deterministic_reduce_merges_identity_supersession_and_action_state():
     assert reduced.effects == lanes.effects
 
 
+def test_reduce_preserves_authority_across_identity_and_supersedes_collisions():
+    from agent.checkpoint_engine import CausalGroup, CheckpointContextEngine, DeterministicLanes
+
+    source_event_ids = (101, 102, 103, 104, 105, 106)
+    messages = [
+        {"role": "user", "content": "Never delete config files."},
+        {"role": "assistant", "content": "Policy removed."},
+        {"role": "user", "content": "Never rotate credentials."},
+        {"role": "assistant", "content": "Credential policy removed."},
+        {"role": "user", "content": "Keep cache files."},
+        {"role": "user", "content": "Delete stale cache files."},
+    ]
+    facts = [
+        {
+            "kind": "PoLiCy",
+            "text": messages[0]["content"],
+            "source_event_ids": [101],
+            "identity": "policy:delete",
+        },
+        {
+            "kind": "ObSeRvAtIoN",
+            "text": messages[1]["content"],
+            "source_event_ids": [102],
+            "identity": "policy:delete",
+        },
+        {
+            "kind": "POLICY",
+            "text": messages[2]["content"],
+            "source_event_ids": [103],
+            "identity": "policy:rotate",
+        },
+        {
+            "kind": "observation",
+            "text": messages[3]["content"],
+            "source_event_ids": [104],
+            "supersedes": ["policy:rotate"],
+        },
+        {
+            "kind": "policy",
+            "text": messages[4]["content"],
+            "source_event_ids": [105],
+            "identity": "policy:cache",
+        },
+        {
+            "kind": "POLICY",
+            "text": messages[5]["content"],
+            "source_event_ids": [106],
+            "identity": "policy:cache",
+        },
+    ]
+    group = CausalGroup(tuple(range(len(messages))))
+    engine = CheckpointContextEngine()
+    shard = engine._parse_map_shard(
+        _map_response({"source_event_ids": list(source_event_ids), "facts": facts}),
+        group,
+        source_event_ids,
+    )
+
+    assert shard is not None
+    shard = engine._validate_map_shard_sources(shard, messages, group, source_event_ids)
+    reduced = engine._reduce(DeterministicLanes(None, ()), (shard,))
+    rendered = engine._render_checkpoint("summary", reduced, 0)
+
+    assert "Never delete config files." in rendered
+    assert "Policy removed." not in rendered
+    assert "Never rotate credentials." in rendered
+    assert "Credential policy removed." in rendered
+    assert "Keep cache files." not in rendered
+    assert "Delete stale cache files." in rendered
+
+
 def test_reduce_drops_unsourced_policy_and_blocks_unsourced_actions():
     from agent.checkpoint_engine import (
         CheckpointContextEngine,

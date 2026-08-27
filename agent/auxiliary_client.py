@@ -5198,6 +5198,56 @@ class _FallbackDestination:
     def __deepcopy__(self, memo: Any) -> NoReturn:
         raise TypeError("fallback plan is not serializable")
 
+    @property
+    def credential_discriminator(self) -> str:
+        """Expose a non-secret identity marker for selected-route checks."""
+        return repr((self.identity or ())[-2:])
+
+
+class _FallbackRoute(str):
+    """JSON-safe selected fallback label carrying one process-local plan."""
+
+    __slots__ = ("destination", "identity")
+
+    def __new__(
+        cls, label: str, destination: _FallbackDestination,
+    ) -> "_FallbackRoute":
+        value = super().__new__(cls, label)
+        value.destination = destination
+        value.identity = destination.identity
+        return value
+
+    def __reduce__(self):
+        return str, (str(self),)
+
+
+def _fallback_route(
+    task: Optional[str], label: str, destination: _FallbackDestination,
+) -> _FallbackRoute:
+    """Freeze the selected configured route before its first request."""
+    return _FallbackRoute(label, destination)
+
+
+class _SelectedRouteInfo(dict):
+    """Internal route handoff with the public route metadata kept as a dict."""
+
+    __slots__ = ("fallback_route",)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fallback_route: Optional[_FallbackRoute] = None
+
+
+def _selected_fallback_route(route_info: Any) -> Optional[_FallbackRoute]:
+    return getattr(route_info, "fallback_route", None)
+
+
+def _set_selected_fallback_route(
+    route_info: Any, route: Optional[_FallbackRoute],
+) -> None:
+    if isinstance(route_info, _SelectedRouteInfo):
+        route_info.fallback_route = route
+
 
 _fallback_resolution_destination: contextvars.ContextVar[Optional[_FallbackDestination]] = (
     contextvars.ContextVar("fallback_resolution_destination", default=None)
@@ -5253,6 +5303,32 @@ def _provider_chain_candidate_is_codex(label: str) -> bool:
             return False
         return _is_codex_destination("custom", api_mode)
     return False
+
+
+def _validate_fallback_base_url(value: Any) -> str:
+    """Reject malformed fallback URLs without exposing credentials."""
+    if value is None:
+        return ""
+    base_url = str(value)
+    if not base_url or any(
+        char == "\\" or char.isspace() or ord(char) <= 0x1F
+        or 0x80 <= ord(char) <= 0x9F or ord(char) == 0x7F
+        for char in base_url
+    ):
+        raise ValueError("fallback base_url is malformed")
+    try:
+        parsed = urlparse(base_url)
+        if not parsed.scheme or not parsed.hostname:
+            raise ValueError
+        parsed.port
+        if re.search(r"%(?![0-9A-Fa-f]{2})", base_url):
+            raise ValueError
+        from httpx import URL
+        strict_url = URL(base_url)
+        _ = strict_url.host
+    except Exception:
+        raise ValueError("fallback base_url is malformed") from None
+    return base_url
 
 
 def _normalize_fallback_base_url(value: Any) -> tuple:
@@ -5478,12 +5554,25 @@ def _fallback_destination_from_entry(
     explicit_api_key = _fallback_entry_api_key(entry)
     from hermes_cli.runtime_provider import resolve_runtime_provider
 
-    runtime = resolve_runtime_provider(
-        requested=provider,
-        explicit_base_url=base_url or None,
-        explicit_api_key=explicit_api_key,
-        target_model=model or "",
-    )
+    try:
+        runtime = resolve_runtime_provider(
+            requested=provider,
+            explicit_base_url=base_url or None,
+            explicit_api_key=explicit_api_key,
+            target_model=model or "",
+        )
+    except Exception:
+        # An explicit endpoint is self-describing; test/local/custom provider
+        # labels need not be registered in the runtime provider catalog.
+        if not base_url:
+            raise
+        runtime = {
+            "provider": provider,
+            "base_url": base_url,
+            "api_mode": api_mode,
+            "api_key": explicit_api_key,
+            "model": model,
+        }
     effective_provider = str(runtime.get("provider") or provider).strip()
     effective_base_url = str(runtime.get("base_url") or base_url).strip()
     effective_api_mode = api_mode or str(runtime.get("api_mode") or "").strip() or None
@@ -5621,6 +5710,26 @@ def _call_fallback_candidate_sync(
     fb_client: Any,
     fb_model: Optional[str],
     fb_label: str,
+    **kwargs: Any,
+) -> Optional[Any]:
+    """Apply the selected fallback's concurrency limit to its request."""
+    semaphore = _acquire_sync_aux_semaphore(kwargs.get("task"), fb_label)
+    owns_semaphore = _aux_semaphore_is_held(kwargs.get("task"), semaphore)
+    if semaphore is not None and not owns_semaphore:
+        semaphore.acquire()
+    try:
+        return _call_fallback_candidate_sync_impl(
+            fb_client, fb_model, fb_label, **kwargs,
+        )
+    finally:
+        if semaphore is not None and not owns_semaphore:
+            semaphore.release()
+
+
+def _call_fallback_candidate_sync_impl(
+    fb_client: Any,
+    fb_model: Optional[str],
+    fb_label: str,
     *,
     task: Optional[str],
     messages: list,
@@ -5747,6 +5856,26 @@ def _call_fallback_candidate_sync(
 
 
 async def _call_fallback_candidate_async(
+    fb_client: Any,
+    fb_model: Optional[str],
+    fb_label: str,
+    **kwargs: Any,
+) -> Optional[Any]:
+    """Apply the selected fallback's concurrency limit to its request."""
+    semaphore = _acquire_async_aux_semaphore(kwargs.get("task"), fb_label)
+    owns_semaphore = _aux_semaphore_is_held(kwargs.get("task"), semaphore)
+    if semaphore is not None and not owns_semaphore:
+        await semaphore.acquire()
+    try:
+        return await _call_fallback_candidate_async_impl(
+            fb_client, fb_model, fb_label, **kwargs,
+        )
+    finally:
+        if semaphore is not None and not owns_semaphore:
+            semaphore.release()
+
+
+async def _call_fallback_candidate_async_impl(
     fb_client: Any,
     fb_model: Optional[str],
     fb_label: str,
@@ -6366,6 +6495,8 @@ def _resolve_fallback_entry(
         selected._base_url or None if selected is not None
         else str(entry.get("base_url") or "").strip() or None
     )
+    if base_url is not None:
+        base_url = _validate_fallback_base_url(base_url)
     api_key = selected._api_key if selected is not None else _fallback_entry_api_key(entry)
     api_mode = (
         selected.api_mode if selected is not None
@@ -9087,44 +9218,69 @@ def _get_task_extra_body(task: str) -> Dict[str, Any]:
 # chain, multiplying request volume on already-degraded endpoints. A per-task
 # semaphore caps in-flight calls so retry amplification stays bounded.
 
-_aux_sync_semaphores: Dict[str, Tuple[int, threading.BoundedSemaphore]] = {}
-_aux_async_semaphores: Dict[Tuple[str, int], Tuple[int, Any]] = {}
+_aux_sync_semaphores: Dict[Tuple[Optional[str], int], threading.BoundedSemaphore] = {}
+_aux_async_semaphores: Dict[Tuple[Optional[str], int, int], Any] = {}
 _aux_sem_lock = threading.Lock()
+_AUX_HELD_SEMAPHORE: contextvars.ContextVar[Optional[Tuple[Optional[str], Any]]] = (
+    contextvars.ContextVar("auxiliary_held_semaphore", default=None)
+)
 
 
-def _get_task_max_concurrency(task: Optional[str]) -> Optional[int]:
-    """Return ``auxiliary.<task>.max_concurrency`` as a positive int, or None."""
+def _aux_semaphore_is_held(task: Optional[str], semaphore: Any) -> bool:
+    owner = _AUX_HELD_SEMAPHORE.get()
+    return owner is not None and owner[0] == task and owner[1] is semaphore
+
+
+def _get_task_max_concurrency(
+    task: Optional[str], fallback_label: Optional[str] = None,
+) -> Optional[int]:
+    """Return the selected auxiliary route's positive concurrency limit."""
     if not task or task == "vision":
         # Vision already uses this key for its encode/resize CPU worker pool;
         # its LLM calls deliberately remain concurrent.
         return None
-    raw = _get_auxiliary_task_config(task).get("max_concurrency")
+    config = _get_auxiliary_task_config(task)
+    raw = None
+    if fallback_label:
+        entry = _fallback_chain_entry(task, fallback_label)
+        if entry is not None:
+            raw = entry.get("max_concurrency")
+            if type(raw) is int or (type(raw) is str and raw.isdecimal()):
+                value = int(raw)
+                if value > 0:
+                    return value
+            # An invalid route-specific value must not shadow the task value.
+            raw = None
     if raw is None:
-        return None
-    try:
+        raw = config.get("max_concurrency")
+    if type(raw) is int or (type(raw) is str and raw.isdecimal()):
         value = int(raw)
-    except (TypeError, ValueError):
-        return None
-    return value if value > 0 else None
+        if value > 0:
+            return value
+    return 2 if task == "compression" else None
 
 
-def _acquire_sync_aux_semaphore(task: Optional[str]) -> Optional[threading.BoundedSemaphore]:
-    """Get a per-task sync semaphore, rebuilding it after a config change."""
-    limit = _get_task_max_concurrency(task)
+def _acquire_sync_aux_semaphore(
+    task: Optional[str], fallback_label: Optional[str] = None,
+) -> Optional[threading.BoundedSemaphore]:
+    """Get the stable per-task-and-limit sync semaphore."""
+    limit = _get_task_max_concurrency(task, fallback_label)
     if limit is None:
         return None
+    key = (task, limit)
     with _aux_sem_lock:
-        entry = _aux_sync_semaphores.get(task)
-        if entry is None or entry[0] != limit:
+        semaphore = _aux_sync_semaphores.get(key)
+        if semaphore is None:
             semaphore = threading.BoundedSemaphore(limit)
-            _aux_sync_semaphores[task] = (limit, semaphore)
-            return semaphore
-        return entry[1]
+            _aux_sync_semaphores[key] = semaphore
+        return semaphore
 
 
-def _acquire_async_aux_semaphore(task: Optional[str]):
-    """Get a per-task, per-event-loop async semaphore after config lookup."""
-    limit = _get_task_max_concurrency(task)
+def _acquire_async_aux_semaphore(
+    task: Optional[str], fallback_label: Optional[str] = None,
+):
+    """Get the stable per-task, per-loop, and per-limit async semaphore."""
+    limit = _get_task_max_concurrency(task, fallback_label)
     if limit is None:
         return None
     import asyncio
@@ -9132,14 +9288,13 @@ def _acquire_async_aux_semaphore(task: Optional[str]):
         loop = asyncio.get_running_loop()
     except RuntimeError:
         return None
-    key = (task, id(loop))
+    key = (task, id(loop), limit)
     with _aux_sem_lock:
-        entry = _aux_async_semaphores.get(key)
-        if entry is None or entry[0] != limit:
+        semaphore = _aux_async_semaphores.get(key)
+        if semaphore is None:
             semaphore = asyncio.Semaphore(limit)
-            _aux_async_semaphores[key] = (limit, semaphore)
-            return semaphore
-        return entry[1]
+            _aux_async_semaphores[key] = semaphore
+        return semaphore
 
 
 def _reset_aux_semaphores() -> None:
@@ -10024,9 +10179,15 @@ def call_llm(
     route_info: Optional[Dict[str, Any]] = None,
 ) -> Any:
     """Run an auxiliary LLM request, applying the configured task limit."""
-    semaphore = _acquire_sync_aux_semaphore(task)
+    fallback_label = (
+        str(route_info.get("fallback_label") or "")
+        if isinstance(route_info, dict) else ""
+    )
+    semaphore = _acquire_sync_aux_semaphore(task, fallback_label)
+    semaphore_token = None
     if semaphore is not None:
         semaphore.acquire()
+        semaphore_token = _AUX_HELD_SEMAPHORE.set((task, semaphore))
     try:
         response = _call_llm_impl(
             task=task,
@@ -10054,6 +10215,8 @@ def call_llm(
             return _release_sync_semaphore_after_stream(response, stream_semaphore)
         return response
     finally:
+        if semaphore_token is not None:
+            _AUX_HELD_SEMAPHORE.reset(semaphore_token)
         if semaphore is not None:
             semaphore.release()
 
@@ -10280,6 +10443,80 @@ def _call_llm_impl(
         route_info, _fallback_provider_from_label(request_provider), final_model,
         fallback_label=fallback_label,
     )
+
+    selected_route = _selected_fallback_route(route_info)
+    if isinstance(selected_route, _FallbackRoute):
+        entry = _fallback_chain_entry(task, str(selected_route))
+        if entry is not None:
+            current_destination = _fallback_destination_from_entry(entry)
+            if current_destination.identity == selected_route.identity:
+                destination = selected_route.destination
+                token = _fallback_resolution_destination.set(destination)
+                try:
+                    route_client, route_model = _resolve_fallback_entry(entry)
+                finally:
+                    _fallback_resolution_destination.reset(token)
+                if route_client is not None:
+                    _record_route_info(
+                        route_info, destination.provider, route_model,
+                        fallback_label=str(selected_route),
+                    )
+                    try:
+                        selected_response = _call_fallback_candidate_sync(
+                            route_client, route_model, str(selected_route), task=task,
+                            messages=messages, temperature=temperature,
+                            max_tokens=max_tokens, tools=tools,
+                            effective_timeout=_effective_aux_timeout(task, timeout),
+                            effective_extra_body=effective_extra_body,
+                            reasoning_config=reasoning_config, destination=destination,
+                        )
+                        if selected_response is not None:
+                            return selected_response
+                    except Exception as route_err:
+                        if route_info is not None:
+                            _set_selected_fallback_route(route_info, None)
+                        next_client, next_model, next_label = _try_configured_fallback_chain(
+                            task, destination.provider, failed_model=route_model,
+                            start_index=_next_configured_fallback_index(str(selected_route)) or 0,
+                        )
+                        if next_client is not None:
+                            if route_info is not None and next_label.startswith("fallback_chain["):
+                                _set_selected_fallback_route(route_info, _fallback_route(
+                                    task, next_label,
+                                    _fallback_destination(task, next_client, next_model, next_label),
+                                ))
+                            return _call_fallback_candidate_sync(
+                                next_client, next_model, next_label, task=task,
+                                messages=messages, temperature=temperature,
+                                max_tokens=max_tokens, tools=tools,
+                                effective_timeout=_effective_aux_timeout(task, timeout),
+                                effective_extra_body=effective_extra_body,
+                                reasoning_config=reasoning_config,
+                            )
+                        raise route_err
+        next_client, next_model, next_label = _try_configured_fallback_chain(
+            task, selected_route.destination.provider,
+            failed_model=selected_route.destination.model,
+            start_index=_next_configured_fallback_index(str(selected_route)) or 0,
+        )
+        if next_client is not None:
+            if route_info is not None and next_label.startswith("fallback_chain["):
+                _set_selected_fallback_route(route_info, _fallback_route(
+                    task, next_label,
+                    _fallback_destination(task, next_client, next_model, next_label),
+                ))
+            _record_route_info(
+                route_info, _fallback_provider_from_label(next_label), next_model,
+                fallback_label=next_label,
+            )
+            return _call_fallback_candidate_sync(
+                next_client, next_model, next_label, task=task,
+                messages=messages, temperature=temperature, max_tokens=max_tokens,
+                tools=tools, effective_timeout=_effective_aux_timeout(task, timeout),
+                effective_extra_body=effective_extra_body,
+                reasoning_config=reasoning_config,
+            )
+        raise RuntimeError("selected fallback route is unavailable")
 
     # Log what we're about to do — makes auxiliary operations visible
     _base_info = (
@@ -10848,6 +11085,10 @@ def _call_llm_impl(
                     route_info, _fallback_provider_from_label(fb_label), fb_model,
                     fallback_label=fb_label,
                 )
+                if isinstance(route_info, dict) and fb_label.startswith("fallback_chain["):
+                    _set_selected_fallback_route(route_info, _fallback_route(
+                        task, fb_label, fallback_destinations[fb_label],
+                    ))
                 try:
                     fb_resp = _call_fallback_candidate_sync(
                         fb_client, fb_model, fb_label,
@@ -10905,6 +11146,10 @@ def _call_llm_impl(
                     route_info, _fallback_provider_from_label(fb_label), fb_model,
                     fallback_label=fb_label,
                 )
+                if isinstance(route_info, dict) and fb_label.startswith("fallback_chain["):
+                    _set_selected_fallback_route(route_info, _fallback_route(
+                        task, fb_label, fallback_destinations[fb_label],
+                    ))
                 fb_resp = _call_fallback_candidate_sync(
                     fb_client, fb_model, fb_label,
                     task=task, messages=messages,
@@ -11035,9 +11280,15 @@ async def async_call_llm(
     route_info: Optional[Dict[str, Any]] = None,
 ) -> Any:
     """Run an asynchronous auxiliary LLM request under the configured limit."""
-    semaphore = _acquire_async_aux_semaphore(task)
+    fallback_label = (
+        str(route_info.get("fallback_label") or "")
+        if isinstance(route_info, dict) else ""
+    )
+    semaphore = _acquire_async_aux_semaphore(task, fallback_label)
+    semaphore_token = None
     if semaphore is not None:
         await semaphore.acquire()
+        semaphore_token = _AUX_HELD_SEMAPHORE.set((task, semaphore))
     try:
         return await _async_call_llm_impl(
             task=task,
@@ -11056,6 +11307,8 @@ async def async_call_llm(
             route_info=route_info,
         )
     finally:
+        if semaphore_token is not None:
+            _AUX_HELD_SEMAPHORE.reset(semaphore_token)
         if semaphore is not None:
             semaphore.release()
 
@@ -11222,6 +11475,86 @@ async def _async_call_llm_impl(
         route_info, _fallback_provider_from_label(request_provider), final_model,
         fallback_label=fallback_label,
     )
+
+    selected_route = _selected_fallback_route(route_info)
+    if isinstance(selected_route, _FallbackRoute):
+        entry = _fallback_chain_entry(task, str(selected_route))
+        if entry is not None:
+            current_destination = _fallback_destination_from_entry(entry)
+            if current_destination.identity == selected_route.identity:
+                destination = selected_route.destination
+                token = _fallback_resolution_destination.set(destination)
+                try:
+                    route_client, route_model = _resolve_fallback_entry(entry, async_mode=True)
+                finally:
+                    _fallback_resolution_destination.reset(token)
+                if route_client is not None:
+                    _record_route_info(
+                        route_info, destination.provider, route_model,
+                        fallback_label=str(selected_route),
+                    )
+                    try:
+                        selected_response = await _call_fallback_candidate_async(
+                            route_client, route_model, str(selected_route), task=task,
+                            messages=messages, temperature=temperature,
+                            max_tokens=max_tokens, tools=tools,
+                            effective_timeout=_effective_aux_timeout(task, timeout),
+                            effective_extra_body=effective_extra_body,
+                            reasoning_config=reasoning_config, destination=destination,
+                        )
+                        if selected_response is not None:
+                            return selected_response
+                    except Exception as route_err:
+                        if route_info is not None:
+                            _set_selected_fallback_route(route_info, None)
+                        next_client, next_model, next_label = _try_configured_fallback_chain(
+                            task, destination.provider, failed_model=route_model,
+                            start_index=_next_configured_fallback_index(str(selected_route)) or 0,
+                        )
+                        if next_client is not None:
+                            next_client, next_model = _to_async_client(
+                                next_client, next_model or "", is_vision=(task == "vision"),
+                            )
+                            if route_info is not None and next_label.startswith("fallback_chain["):
+                                _set_selected_fallback_route(route_info, _fallback_route(
+                                    task, next_label,
+                                    _fallback_destination(task, next_client, next_model, next_label),
+                                ))
+                            return await _call_fallback_candidate_async(
+                                next_client, next_model, next_label, task=task,
+                                messages=messages, temperature=temperature,
+                                max_tokens=max_tokens, tools=tools,
+                                effective_timeout=_effective_aux_timeout(task, timeout),
+                                effective_extra_body=effective_extra_body,
+                                reasoning_config=reasoning_config,
+                            )
+                        raise route_err
+        next_client, next_model, next_label = _try_configured_fallback_chain(
+            task, selected_route.destination.provider,
+            failed_model=selected_route.destination.model,
+            start_index=_next_configured_fallback_index(str(selected_route)) or 0,
+        )
+        if next_client is not None:
+            next_client, next_model = _to_async_client(
+                next_client, next_model or "", is_vision=(task == "vision"),
+            )
+            if route_info is not None and next_label.startswith("fallback_chain["):
+                _set_selected_fallback_route(route_info, _fallback_route(
+                    task, next_label,
+                    _fallback_destination(task, next_client, next_model, next_label),
+                ))
+            _record_route_info(
+                route_info, _fallback_provider_from_label(next_label), next_model,
+                fallback_label=next_label,
+            )
+            return await _call_fallback_candidate_async(
+                next_client, next_model, next_label, task=task,
+                messages=messages, temperature=temperature, max_tokens=max_tokens,
+                tools=tools, effective_timeout=_effective_aux_timeout(task, timeout),
+                effective_extra_body=effective_extra_body,
+                reasoning_config=reasoning_config,
+            )
+        raise RuntimeError("selected fallback route is unavailable")
 
     # Pass the selected destination instead of re-inferring from a mutable client.
     _client_base = (
@@ -11668,6 +12001,10 @@ async def _async_call_llm_impl(
                     async_fb_model or fb_model,
                     fallback_label=fb_label,
                 )
+                if isinstance(route_info, dict) and fb_label.startswith("fallback_chain["):
+                    _set_selected_fallback_route(route_info, _fallback_route(
+                        task, fb_label, fallback_destinations[fb_label],
+                    ))
                 try:
                     fb_resp = await _call_fallback_candidate_async(
                         async_fb, async_fb_model or fb_model, fb_label,
@@ -11730,6 +12067,10 @@ async def _async_call_llm_impl(
                     async_fb_model or fb_model,
                     fallback_label=fb_label,
                 )
+                if isinstance(route_info, dict) and fb_label.startswith("fallback_chain["):
+                    _set_selected_fallback_route(route_info, _fallback_route(
+                        task, fb_label, fallback_destinations[fb_label],
+                    ))
                 fb_resp = await _call_fallback_candidate_async(
                     async_fb, async_fb_model or fb_model, fb_label,
                     task=task, messages=messages,

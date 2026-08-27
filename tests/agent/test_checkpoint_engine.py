@@ -2311,7 +2311,15 @@ def test_semantic_reduce_renders_only_selected_optional_map_facts():
     )
 
 
-def test_historical_map_kinds_parse_and_degrade_under_wire_pressure():
+@pytest.mark.parametrize(
+    "historical_kinds",
+    (
+        ("decision", "tool_body", "tool_result"),
+        ("DeCiSiOn", "ToOl_BoDy", "ToOl_ReSuLt"),
+    ),
+    ids=("lowercase", "mixed_case"),
+)
+def test_historical_map_kinds_parse_and_degrade_under_wire_pressure(historical_kinds):
     from agent.checkpoint_engine import (
         ActiveIntent,
         CausalGroup,
@@ -2333,17 +2341,17 @@ def test_historical_map_kinds_parse_and_degrade_under_wire_pressure():
             "source_event_ids": list(source_event_ids),
             "facts": [
                 {
-                    "kind": "decision",
+                    "kind": historical_kinds[0],
                     "text": old_decision,
                     "source_event_ids": [50],
                 },
                 {
-                    "kind": "tool_body",
+                    "kind": historical_kinds[1],
                     "text": messages[1]["content"],
                     "source_event_ids": [60],
                 },
                 {
-                    "kind": "tool_result",
+                    "kind": historical_kinds[2],
                     "text": messages[2]["content"],
                     "source_event_ids": [70],
                 },
@@ -2359,7 +2367,7 @@ def test_historical_map_kinds_parse_and_degrade_under_wire_pressure():
     shard = engine._parse_map_shard(response, group, source_event_ids)
     assert shard is not None
     shard = engine._validate_map_shard_sources(shard, messages, group, source_event_ids)
-    assert {fact.kind for fact in shard.facts} == {"decision", "tool_body", "tool_result"}
+
     assert engine._parse_map_shard(
         _map_response(
             {
@@ -2399,6 +2407,7 @@ def test_historical_map_kinds_parse_and_degrade_under_wire_pressure():
     assert f"{'x' * 157}..." in checkpoint
     assert "- tool_body ref: 60" in checkpoint
     assert "- tool_result ref: 70" in checkpoint
+    assert {fact.kind for fact in shard.facts} == {"decision", "tool_body", "tool_result"}
 
 
 def test_semantic_reduce_builds_a_shadow_candidate_without_a_new_user_turn():

@@ -1399,11 +1399,13 @@ class CheckpointContextEngine(ContextEngine):
             kind = fact["kind"]
             text = fact["text"]
             uncertain = fact.get("uncertain", False)
+            if not isinstance(kind, str):
+                return None
+            kind = kind.casefold()
             if (
-                not isinstance(kind, str)
-                or kind.casefold() not in _MAP_KINDS
+                kind not in _MAP_KINDS
                 or (
-                    kind.casefold() == "observation"
+                    kind == "observation"
                     and fact.get("action_state") not in (None, "blocked")
                 )
                 or not isinstance(text, str)

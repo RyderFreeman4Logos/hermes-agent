@@ -1597,6 +1597,21 @@ def _get_env_config() -> Dict[str, Any]:
     # Default image with Python and Node.js for maximum compatibility
     default_image = "nikolaik/python-nodejs:python3.11-nodejs20"
     _ensure_terminal_env_bridged()
+    auto_background_timeout_threshold = 200
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        terminal_config = load_config_readonly().get("terminal") or {}
+        auto_background_timeout_threshold = max(
+            1,
+            int(terminal_config.get("auto_background_timeout_threshold", 200)),
+        )
+    except (AttributeError, TypeError, ValueError):
+        logger.warning(
+            "Invalid terminal.auto_background_timeout_threshold; using 200s"
+        )
+    except Exception:
+        logger.debug("Could not load terminal auto-background threshold", exc_info=True)
     env_type = os.getenv("TERMINAL_ENV", "local")
     
     mount_docker_cwd = os.getenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "false").lower() in {"true", "1", "yes"}
@@ -1680,6 +1695,7 @@ def _get_env_config() -> Dict[str, Any]:
         "host_cwd": host_cwd,
         "docker_mount_cwd_to_workspace": mount_docker_cwd,
         "timeout": _parse_env_var("TERMINAL_TIMEOUT", "180"),
+        "auto_background_timeout_threshold": auto_background_timeout_threshold,
         "lifetime_seconds": _parse_env_var("TERMINAL_LIFETIME_SECONDS", "300"),
         # SSH-specific config
         "ssh_host": os.getenv("TERMINAL_SSH_HOST", ""),
@@ -2626,7 +2642,7 @@ def _resolve_command_cwd(
 
 def terminal_tool(
     command: str,
-    background: bool = False,
+    background: Optional[bool] = None,
     timeout: Optional[int] = None,
     task_id: Optional[str] = None,
     session_id: Optional[str] = None,
@@ -2748,7 +2764,34 @@ def terminal_tool(
             return tool_error(
                 f"timeout must be a positive number of seconds (got {timeout})."
             )
+        timeout_was_omitted = timeout is None
         effective_timeout = timeout or default_timeout
+
+        background_was_omitted = background is None
+        background = False if background_was_omitted else bool(background)
+        auto_background_threshold = int(
+            config.get("auto_background_timeout_threshold", 200)
+        )
+        auto_promoted = background_was_omitted and (
+            timeout_was_omitted or effective_timeout > auto_background_threshold
+        )
+        if auto_promoted:
+            try:
+                from gateway.session_context import async_delivery_supported
+
+                if not async_delivery_supported():
+                    return tool_error(
+                        "Long terminal command was not started: this session cannot "
+                        "deliver a managed background completion. Use a short bounded "
+                        f"timeout at or below {auto_background_threshold}s."
+                    )
+            except Exception:
+                return tool_error(
+                    "Long terminal command was not started because async completion "
+                    "delivery could not be verified."
+                )
+            background = True
+            notify_on_complete = True
 
         # Reject foreground commands where the model explicitly requests
         # a timeout above FOREGROUND_MAX_TIMEOUT — nudge it toward background.
@@ -3111,6 +3154,37 @@ def terminal_tool(
                 session_key=session_key,
                 env_type=env_type,
             )
+            watcher_metadata = {}
+            if notify_on_complete or watch_patterns:
+                from gateway.session_context import (
+                    async_delivery_supported as _async_ok,
+                    get_session_env as _gse,
+                )
+
+                if not _async_ok():
+                    return json.dumps(
+                        {
+                            "output": "",
+                            "exit_code": -1,
+                            "status": "error",
+                            "notify_unsupported": True,
+                            "error": (
+                                "Background process was not started: notify_on_complete / "
+                                "watch_patterns are not available in this session — retrieve "
+                                "its result with process(action='poll') or process(action='wait')."
+                            ),
+                        },
+                        ensure_ascii=False,
+                    )
+                watcher_metadata = {
+                    "watcher_platform": _gse("HERMES_SESSION_PLATFORM", ""),
+                    "watcher_chat_id": _gse("HERMES_SESSION_CHAT_ID", ""),
+                    "watcher_thread_id": _gse("HERMES_SESSION_THREAD_ID", ""),
+                    "watcher_user_id": _gse("HERMES_SESSION_USER_ID", ""),
+                    "watcher_user_name": _gse("HERMES_SESSION_USER_NAME", ""),
+                    "watcher_message_id": _gse("HERMES_SESSION_MESSAGE_ID", ""),
+                    "parent_session_id": _gse("HERMES_SESSION_ID", ""),
+                }
             try:
                 if env_type == "local":
                     proc_session = process_registry.spawn_local(
@@ -3120,6 +3194,8 @@ def terminal_tool(
                         session_key=session_key,
                         env_vars=env.env if hasattr(env, 'env') else None,
                         use_pty=effective_pty,
+                        notify_on_complete=notify_on_complete,
+                        watcher_metadata=watcher_metadata,
                     )
                 else:
                     proc_session = process_registry.spawn_via_env(
@@ -3128,6 +3204,8 @@ def terminal_tool(
                         cwd=effective_cwd,
                         task_id=effective_task_id,
                         session_key=session_key,
+                        notify_on_complete=notify_on_complete,
+                        watcher_metadata=watcher_metadata,
                     )
 
                 if heartbeat_interval is not None:
@@ -3260,61 +3338,6 @@ def terminal_tool(
                             existing + "\n\n" + canonical_hint if existing
                             else canonical_hint
                         )
-
-                # Populate routing metadata on the session so that
-                # watch-pattern and completion notifications can be
-                # routed back to the correct chat/thread.
-                if background and (notify_on_complete or watch_patterns):
-                    from gateway.session_context import (
-                        async_delivery_supported as _async_ok,
-                        get_session_env as _gse,
-                    )
-
-                    # Finite sessions (stateless HTTP requests and one-shot
-                    # Kanban workers) cannot route a completion back to the
-                    # agent after the turn/process ends. Refuse the promise:
-                    # drop the flags and tell the agent to poll.
-                    if not _async_ok():
-                        notify_on_complete = False
-                        watch_patterns = None
-                        result_data["notify_on_complete"] = False
-                        result_data["notify_unsupported"] = (
-                            "notify_on_complete / watch_patterns are not available in "
-                            "this session — it cannot receive an async completion after "
-                            "the turn ends (a one-shot runner such as `hermes -z`, a "
-                            "cron job, a Kanban worker, or a stateless HTTP endpoint). "
-                            "The process is "
-                            "running in the background; retrieve its result with "
-                            "process(action='poll') or process(action='wait')."
-                        )
-                        logger.info(
-                            "background proc %s: async delivery unsupported on this "
-                            "session; notify_on_complete/watch_patterns disabled",
-                            proc_session.id,
-                        )
-                    else:
-                        _gw_platform = _gse("HERMES_SESSION_PLATFORM", "")
-                        if _gw_platform:
-                            _gw_chat_id = _gse("HERMES_SESSION_CHAT_ID", "")
-                            _gw_thread_id = _gse("HERMES_SESSION_THREAD_ID", "")
-                            _gw_user_id = _gse("HERMES_SESSION_USER_ID", "")
-                            _gw_user_name = _gse("HERMES_SESSION_USER_NAME", "")
-                            _gw_message_id = _gse("HERMES_SESSION_MESSAGE_ID", "")
-                            proc_session.watcher_platform = _gw_platform
-                            proc_session.watcher_chat_id = _gw_chat_id
-                            proc_session.watcher_user_id = _gw_user_id
-                            proc_session.watcher_user_name = _gw_user_name
-                            proc_session.watcher_thread_id = _gw_thread_id
-                            proc_session.watcher_message_id = _gw_message_id
-                            # Stamp the spawning conversation's session-db id
-                            # so the gateway's completion pre-flight
-                            # (_classify_completion_target) can drop the
-                            # notification when the user closes this session
-                            # (/new) before the process finishes, instead of
-                            # injecting it into the chat's NEW session.
-                            proc_session.parent_session_id = _gse(
-                                "HERMES_SESSION_ID", ""
-                            )
 
                 # Mutual exclusion: if both notify_on_complete and watch_patterns
                 # are set, drop watch_patterns. The combination produces duplicate

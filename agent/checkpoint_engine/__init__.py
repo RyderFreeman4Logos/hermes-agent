@@ -36,6 +36,11 @@ _MAP_SHARD_MAX_INPUT_TOKENS = 16_000
 _MAP_MAX_SHARDS_CAP = 32
 _DEFAULT_MAX_MAP_SHARDS = 32
 _MAP_SHARD_CACHE_MAX = 128
+# ponytail: fixed shard ceilings bound this LRU; add a byte-LRU only if normal shards hit them.
+_MAP_RESPONSE_MAX_BYTES = 16_384
+_MAP_MAX_FACTS = 64
+_MAP_FACT_TEXT_MAX_BYTES = 2_048
+_MAP_FACT_TEXT_TOTAL_MAX_BYTES = 8_192
 _MAP_TOTAL_INPUT_TOKENS = _MAP_SHARD_TARGET_INPUT_TOKENS * _DEFAULT_MAX_MAP_SHARDS
 _MAP_TOTAL_OUTPUT_TOKENS = _MAP_MAX_TOKENS * _DEFAULT_MAX_MAP_SHARDS
 _SEMANTIC_REDUCE_MAX_TOKENS = 2048
@@ -1225,6 +1230,11 @@ class CheckpointContextEngine(ContextEngine):
         content = cls._response_content(response)
         if content is None:
             return None
+        if (
+            len(content) > _MAP_RESPONSE_MAX_BYTES
+            or len(content.encode("utf-8")) > _MAP_RESPONSE_MAX_BYTES
+        ):
+            return None
         try:
             payload = json.loads(content)
         except (TypeError, ValueError):
@@ -1238,10 +1248,11 @@ class CheckpointContextEngine(ContextEngine):
         if parsed_source_ids is None or parsed_source_ids != expected_source_ids:
             return None
         facts = payload["facts"]
-        if not isinstance(facts, list):
+        if not isinstance(facts, list) or len(facts) > _MAP_MAX_FACTS:
             return None
 
         parsed_facts = []
+        total_fact_text_bytes = 0
         for fact in facts:
             if not isinstance(fact, dict) or not {"kind", "text"} <= set(fact):
                 return None
@@ -1259,6 +1270,15 @@ class CheckpointContextEngine(ContextEngine):
             text = fact["text"]
             uncertain = fact.get("uncertain", False)
             if not isinstance(kind, str) or not kind or not isinstance(text, str) or not text:
+                return None
+            if len(text) > _MAP_FACT_TEXT_MAX_BYTES:
+                return None
+            text_bytes = len(text.encode("utf-8"))
+            total_fact_text_bytes += text_bytes
+            if (
+                text_bytes > _MAP_FACT_TEXT_MAX_BYTES
+                or total_fact_text_bytes > _MAP_FACT_TEXT_TOTAL_MAX_BYTES
+            ):
                 return None
             if not isinstance(uncertain, bool):
                 return None
@@ -1377,9 +1397,11 @@ class CheckpointContextEngine(ContextEngine):
             or shard_source_ids
             != tuple(source_event_ids[index] for index in group.event_indices)
             or not isinstance(shard.facts, tuple)
+            or len(shard.facts) > _MAP_MAX_FACTS
         ):
             return False
         source_events = set(shard_source_ids)
+        total_fact_text_bytes = 0
         for fact in shard.facts:
             if not isinstance(fact, MapFact):
                 return False
@@ -1389,6 +1411,15 @@ class CheckpointContextEngine(ContextEngine):
                 or not isinstance(fact.text, str)
                 or not fact.text
                 or not isinstance(fact.uncertain, bool)
+            ):
+                return False
+            if len(fact.text) > _MAP_FACT_TEXT_MAX_BYTES:
+                return False
+            text_bytes = len(fact.text.encode("utf-8"))
+            total_fact_text_bytes += text_bytes
+            if (
+                text_bytes > _MAP_FACT_TEXT_MAX_BYTES
+                or total_fact_text_bytes > _MAP_FACT_TEXT_TOTAL_MAX_BYTES
             ):
                 return False
             if fact.identity is not None and (

@@ -1227,6 +1227,115 @@ def test_invalid_or_truncated_map_json_rejects_candidate():
     assert engine.compression_count == 0
 
 
+def test_map_rejects_one_million_character_response_before_parsing(monkeypatch):
+    import agent.checkpoint_engine as checkpoint_engine
+    from agent.checkpoint_engine import CausalGroup, CheckpointContextEngine
+
+    response = _map_response(
+        {
+            "source_event_ids": [1],
+            "facts": [
+                {
+                    "kind": "observation",
+                    "text": "x" * 1_000_000,
+                    "source_event_ids": [1],
+                }
+            ],
+        }
+    )
+    parsed = False
+    real_loads = checkpoint_engine.json.loads
+
+    def record_loads(value):
+        nonlocal parsed
+        parsed = True
+        return real_loads(value)
+
+    monkeypatch.setattr(checkpoint_engine.json, "loads", record_loads)
+    engine = CheckpointContextEngine(auxiliary_client=_FakeAuxiliaryClient(response))
+
+    assert engine._map_group(
+        [{"role": "user", "content": "x"}], CausalGroup((0,)), (1,)
+    ) is None
+    assert parsed is False
+    assert not engine._map_shard_cache
+
+
+def test_map_accepts_a_boundary_normal_valid_shard():
+    from agent.checkpoint_engine import CausalGroup, CheckpointContextEngine
+
+    text = "Keep the checkpoint deterministic."
+    engine = CheckpointContextEngine(
+        auxiliary_client=_FakeAuxiliaryClient(
+            _map_response(
+                {
+                    "source_event_ids": [1],
+                    "facts": [
+                        {
+                            "kind": "request",
+                            "text": text,
+                            "source_event_ids": [1],
+                        }
+                    ],
+                }
+            )
+        )
+    )
+
+    shard = engine._map_group(
+        [{"role": "user", "content": text}], CausalGroup((0,)), (1,)
+    )
+
+    assert shard is not None
+    assert shard.facts[0].text == text
+    assert len(engine._map_shard_cache) == 1
+
+
+@pytest.mark.parametrize(
+    ("limit_name", "limit", "facts"),
+    (
+        (
+            "_MAP_MAX_FACTS",
+            1,
+            [
+                {"kind": "observation", "text": "a", "source_event_ids": [1]},
+                {"kind": "observation", "text": "b", "source_event_ids": [1]},
+            ],
+        ),
+        (
+            "_MAP_FACT_TEXT_MAX_BYTES",
+            3,
+            [{"kind": "observation", "text": "abcd", "source_event_ids": [1]}],
+        ),
+        (
+            "_MAP_FACT_TEXT_TOTAL_MAX_BYTES",
+            4,
+            [
+                {"kind": "observation", "text": "abc", "source_event_ids": [1]},
+                {"kind": "observation", "text": "de", "source_event_ids": [1]},
+            ],
+        ),
+    ),
+)
+def test_map_fact_content_limits_fail_closed_without_cache(
+    monkeypatch, limit_name, limit, facts
+):
+    import agent.checkpoint_engine as checkpoint_engine
+    from agent.checkpoint_engine import CausalGroup, CheckpointContextEngine
+
+    monkeypatch.setattr(checkpoint_engine, limit_name, limit, raising=False)
+    engine = CheckpointContextEngine(
+        auxiliary_client=_FakeAuxiliaryClient(
+            _map_response({"source_event_ids": [1], "facts": facts})
+        )
+    )
+
+    assert engine._map_group(
+        [{"role": "user", "content": "abcde"}], CausalGroup((0,)), (1,)
+    ) is None
+    assert not engine._map_shard_cache
+
+
 def test_map_cache_resumes_only_missing_shards():
     from agent.checkpoint_engine import CausalGroup, CheckpointContextEngine, MapShard
 

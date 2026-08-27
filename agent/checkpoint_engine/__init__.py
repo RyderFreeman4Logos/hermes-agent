@@ -64,7 +64,12 @@ _ACTION_STATES = frozenset(
 )
 _TERMINAL_ACTION_STATES = frozenset({"succeeded", "failed", "unknown"})
 _AUTHORITATIVE_MAP_KINDS = frozenset({"action", "constraint", "plan", "policy", "request", "todo"})
-_MAP_KINDS = _AUTHORITATIVE_MAP_KINDS | {"observation"}
+_MAP_KINDS = _AUTHORITATIVE_MAP_KINDS | {
+    "decision",
+    "observation",
+    "tool_body",
+    "tool_result",
+}
 _AUTHORITATIVE_ROLES = frozenset({"system", "developer", "user"})
 
 

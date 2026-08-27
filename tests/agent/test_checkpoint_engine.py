@@ -2311,26 +2311,94 @@ def test_semantic_reduce_renders_only_selected_optional_map_facts():
     )
 
 
-def test_old_decision_degradation_compares_durable_source_ids():
+def test_historical_map_kinds_parse_and_degrade_under_wire_pressure():
     from agent.checkpoint_engine import (
         ActiveIntent,
+        CausalGroup,
         CheckpointContextEngine,
-        MapFact,
-        ReducedState,
+        DeterministicLanes,
     )
 
     old_decision = "x" * 400
-    state = ReducedState(
-        ActiveIntent("active request", (10,), (100,)),
-        (),
-        (MapFact("decision", old_decision, (50,)),),
-        (),
+    messages = [
+        {"role": "assistant", "content": old_decision},
+        {"role": "assistant", "content": "reproducible command body"},
+        {"role": "tool", "content": "reproducible command result"},
+        {"role": "user", "content": "active request"},
+    ]
+    source_event_ids = (50, 60, 70, 100)
+    group = CausalGroup(tuple(range(len(messages))))
+    response = _map_response(
+        {
+            "source_event_ids": list(source_event_ids),
+            "facts": [
+                {
+                    "kind": "decision",
+                    "text": old_decision,
+                    "source_event_ids": [50],
+                },
+                {
+                    "kind": "tool_body",
+                    "text": messages[1]["content"],
+                    "source_event_ids": [60],
+                },
+                {
+                    "kind": "tool_result",
+                    "text": messages[2]["content"],
+                    "source_event_ids": [70],
+                },
+            ],
+        }
+    )
+    engine = CheckpointContextEngine(
+        target_wire_tokens=1,
+        hard_max_wire_tokens=60_000,
+        output_reserve_tokens=0,
     )
 
-    rendered = CheckpointContextEngine()._render_checkpoint("summary", state, 3)
+    shard = engine._parse_map_shard(response, group, source_event_ids)
+    assert shard is not None
+    shard = engine._validate_map_shard_sources(shard, messages, group, source_event_ids)
+    assert {fact.kind for fact in shard.facts} == {"decision", "tool_body", "tool_result"}
+    assert engine._parse_map_shard(
+        _map_response(
+            {
+                "source_event_ids": list(source_event_ids),
+                "facts": [
+                    {
+                        "kind": "task",
+                        "text": "unknown work item",
+                        "source_event_ids": [100],
+                    }
+                ],
+            }
+        ),
+        group,
+        source_event_ids,
+    ) is None
 
-    assert old_decision not in rendered
-    assert f"{'x' * 157}..." in rendered
+    state = engine._reduce(
+        DeterministicLanes(ActiveIntent("active request", (3,), (100,)), ()),
+        (shard,),
+    )
+    rendered = engine._render_candidate(
+        messages,
+        (CausalGroup((0,)), CausalGroup((1, 2)), CausalGroup((3,))),
+        state,
+        "summary",
+        0,
+        frozenset({50, 60, 70}),
+        source_event_ids,
+        frozenset({100}),
+    )
+
+    assert rendered is not None
+    _, _, steps, checkpoint = rendered
+    assert steps[:3] == ("completed", "tool_bodies", "decisions")
+    assert old_decision not in checkpoint
+    assert f"{'x' * 157}..." in checkpoint
+    assert "- tool_body ref: 60" in checkpoint
+    assert "- tool_result ref: 70" in checkpoint
 
 
 def test_semantic_reduce_builds_a_shadow_candidate_without_a_new_user_turn():

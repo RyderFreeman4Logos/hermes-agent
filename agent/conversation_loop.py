@@ -152,23 +152,44 @@ def _take_loop_timing_context_text(agent: Any) -> str:
     return agent.__dict__.pop("_loop_timing_context_text", "") or ""
 
 
-def _drop_redundant_previous_loop_start(text: str, history) -> str:
-    """Drop Previous loop start when history already has that Current stamp."""
-    if not text or not history:
-        return text
-    lines = text.splitlines()
-    prev = next((line for line in lines if line.startswith("Previous loop start: ")), None)
-    if prev is None:
-        return text
-    needle = f"Current loop start: {prev[len('Previous loop start: '):]}"
-    if any(
-        isinstance(msg, dict)
-        and "[Agent loop timing]" in str(msg.get("content", ""))
-        and needle in str(msg.get("content", ""))
-        for msg in history
-    ):
-        return "\n".join(line for line in lines if line != prev)
-    return text
+def _append_loop_timing_context(agent: Any, api_messages: list, *, timing: str | None = None) -> list:
+    """Project API-only timing onto a fresh request copy."""
+    if timing is None:
+        timing = _take_loop_timing_context_text(agent)
+    if not timing:
+        return api_messages
+    api_messages = [_clone_message_for_send(message) for message in api_messages]
+    if agent.api_mode != "chat_completions":
+        api_messages.append({"role": "system", "content": timing})
+        return api_messages
+
+    # Strict Chat Completions providers reject a system row after the prompt.
+    # Reuse the request-only user carrier without changing durable history.
+    if not api_messages or api_messages[-1].get("role") != "user":
+        api_messages.append({"role": "user", "content": timing})
+        return api_messages
+
+    tail = api_messages[-1]
+    content = tail.get("content", "")
+    marker = tail.pop("cache_control", None)
+    if isinstance(content, str):
+        if marker is None:
+            tail["content"] = f"{content}\n\n{timing}" if content else timing
+        else:
+            tail["content"] = [
+                {"type": "text", "text": content, "cache_control": marker},
+                {"type": "text", "text": timing},
+            ]
+    elif isinstance(content, list):
+        tail["content"] = [*content, {"type": "text", "text": timing}]
+        if marker is not None:
+            for part in reversed(tail["content"][:-1]):
+                if isinstance(part, dict) and part.get("type") == "text":
+                    part["cache_control"] = marker
+                    break
+    else:
+        api_messages.append({"role": "user", "content": timing})
+    return api_messages
 
 
 def _is_standard_profile_child(agent) -> bool:
@@ -2039,6 +2060,7 @@ def run_conversation(
     # objects without the attribute (older pickles / minimal stubs).
     max_compression_attempts = getattr(agent, "max_compression_attempts", 3)
     _last_preflight_pressure: Optional[int] = None
+    loop_timing_context: Optional[str] = None
     _preflight_compression_blocked = _ctx.preflight_compression_blocked
     _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
     # Last composed answer intentionally held back by a verification gate. If
@@ -2617,19 +2639,8 @@ def run_conversation(
             api_messages = _initial_cache_plan.messages
             tools_for_api = _initial_cache_plan.tools
 
-        # Timing is system/metadata, never user speech. Append after cache
-        # planning so the new block never receives a breakpoint. Persist it
-        # so the next cycle keeps this stamp in the historical prefix.
-        if _loop_timing_text := _take_loop_timing_context_text(agent):
-            _loop_timing_text = _drop_redundant_previous_loop_start(
-                _loop_timing_text, messages
-            )
-            api_messages.append({"role": "system", "content": _loop_timing_text})
-            messages.append({
-                "role": "system",
-                "content": _loop_timing_text,
-                "display_kind": "hidden",
-            })
+        # Timing is injected below, after cache redecoration, so strict Chat
+        # Completions providers never receive a non-leading system row.
 
         # Build a persistent-MoA request before measuring compression pressure.
         # MoA reference output is injected into the aggregator prompt, but it
@@ -2947,6 +2958,8 @@ def run_conversation(
             logging.debug(f"Total message size: ~{approx_tokens:,} tokens")
         
         api_start_time = time.time()
+        if loop_timing_context is None:
+            loop_timing_context = _take_loop_timing_context_text(agent)
         retry_count = 0
         max_retries = agent._api_max_retries
         _retry = TurnRetryState()
@@ -3032,21 +3045,6 @@ def run_conversation(
                 # unless the active provider needs it) so the fallback request
                 # isn't sent with stale, primary-shaped reasoning fields.
                 agent._reapply_reasoning_echo_for_provider(api_messages)
-                # Consume runtime timing only while this request is being built.
-                # Cache planning skips trailing system entries, so it stays
-                # after the last breakpoint and carries no cache_control.
-                # A second take-and-clear is only for a late TUI write after the
-                # post-cache-plan consume; the same claimed value is never appended twice.
-                if timing_context := _take_loop_timing_context_text(agent):
-                    timing_context = _drop_redundant_previous_loop_start(
-                        timing_context, messages
-                    )
-                    api_messages.append({"role": "system", "content": timing_context})
-                    messages.append({
-                        "role": "system",
-                        "content": timing_context,
-                        "display_kind": "hidden",
-                    })
                 # Same story for prompt-cache decoration (#72626): try_activate_
                 # fallback refreshes the policy flags, but the decorated list
                 # still carries the primary's breakpoints (or none). Strip and
@@ -3060,11 +3058,16 @@ def run_conversation(
                         tools_for_api=tools_for_api,
                     )
                 )
+                # Re-render the timing-free canonical request for the current
+                # provider, then project the once-claimed timing per attempt.
+                attempt_messages = _append_loop_timing_context(
+                    agent, api_messages, timing=loop_timing_context
+                )
                 if tools_for_api == agent.tools:
-                    api_kwargs = agent._build_api_kwargs(api_messages)
+                    api_kwargs = agent._build_api_kwargs(attempt_messages)
                 else:
                     api_kwargs = agent._build_api_kwargs(
-                        api_messages,
+                        attempt_messages,
                         tools_for_api=tools_for_api,
                     )
                 # Outbound-request surrogate chokepoint (#50959): the messages
@@ -7694,6 +7697,7 @@ def run_conversation(
                         pass
 
                 agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
+                loop_timing_context = None
 
                 if getattr(agent, "_incremental_persistence_failed", False):
                     # A tool result could not be made canonical. Do not send

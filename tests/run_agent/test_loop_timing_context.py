@@ -124,7 +124,7 @@ def test_agent_forwarder_exposes_timing_context_to_loop_and_records_stop():
     assert timing.call_args_list[1].kwargs["stop"] is True
 
 
-def test_timing_context_is_injected_as_api_only_system_context():
+def test_timing_context_is_api_only_chat_user_context():
     with (
         patch("run_agent.get_tool_definitions", return_value=[]),
         patch("run_agent.check_toolset_requirements", return_value={}),
@@ -159,7 +159,7 @@ def test_timing_context_is_injected_as_api_only_system_context():
         patch.object(agent, "_save_trajectory"),
         patch.object(agent, "_cleanup_task_resources"),
     ):
-        agent.run_conversation("hello")
+        result = agent.run_conversation("hello")
 
     sent_messages = agent.client.chat.completions.create.call_args.kwargs["messages"]
     assert sent_messages[0] == {"role": "system", "content": "You are helpful."}
@@ -169,12 +169,17 @@ def test_timing_context_is_injected_as_api_only_system_context():
         if "[Agent loop timing]" in str(message.get("content", ""))
     ]
     assert len(timing_messages) == 1
-    assert timing_messages[0]["role"] == "system"
+    assert timing_messages[0]["role"] == "user"
     assert "Current loop start:" in timing_messages[0]["content"]
     assert "cache_control" not in timing_messages[0]
+    assert all(
+        not (index and message.get("role") == "system")
+        for index, message in enumerate(sent_messages)
+    )
+    assert all("[Agent loop timing]" not in str(message.get("content", "")) for message in result["messages"])
 
 
-def test_next_cycle_keeps_prior_timing_in_historical_prefix():
+def test_next_cycle_keeps_timing_out_of_durable_history():
     t1 = datetime(2026, 8, 26, 0, 0, 0, tzinfo=UTC_MINUS_7)
     t1_stop = datetime(2026, 8, 26, 0, 0, 3, tzinfo=UTC_MINUS_7)
     t2 = datetime(2026, 8, 26, 0, 1, 0, tzinfo=UTC_MINUS_7)
@@ -237,31 +242,18 @@ def test_next_cycle_keeps_prior_timing_in_historical_prefix():
 
     first_timing = _timing_messages(first_sent)
     assert len(first_timing) == 1
-    assert first_timing[0]["role"] == "system"
+    assert first_timing[0]["role"] == "user"
     assert "Current loop start: 2026-08-26T00:00:00-07:00" in first_timing[0]["content"]
     assert "cache_control" not in first_timing[0]
-
-    persisted = _timing_messages(first["messages"])
-    assert len(persisted) == 1
-    assert persisted[0]["role"] == "system"
-    assert persisted[0]["role"] != "user"
-
-    def _wire(message):
-        return (message.get("role"), message.get("content"))
-
-    assert [_wire(message) for message in second_sent[: len(first_sent)]] == [
-        _wire(message) for message in first_sent
-    ]
+    assert _timing_messages(first["messages"]) == []
 
     second_timing = _timing_messages(second_sent)
-    assert any(
-        message.get("content") == first_timing[0]["content"]
-        and message.get("role") == "system"
-        for message in second_timing
-    )
-    assert "Current loop start: 2026-08-26T00:01:00-07:00" in second_timing[-1]["content"]
-    assert "Previous loop start: 2026-08-26T00:00:00-07:00" not in second_timing[-1]["content"]
+    assert len(second_timing) == 1
+    assert second_timing[0]["role"] == "user"
+    assert "Current loop start: 2026-08-26T00:01:00-07:00" in second_timing[0]["content"]
+    assert "Previous loop start: 2026-08-26T00:00:00-07:00" in second_timing[0]["content"]
     assert all("cache_control" not in message for message in second_timing)
+    assert _timing_messages(second["messages"]) == []
 
 
 def test_take_loop_timing_context_text_claims_once():

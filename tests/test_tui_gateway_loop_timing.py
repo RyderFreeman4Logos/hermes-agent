@@ -1,3 +1,5 @@
+import copy
+import logging
 import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -14,6 +16,21 @@ TIMING = (
     "Previous loop stop: 2026-08-25T09:00:03-07:00\n"
     "Current loop start: 2026-08-25T09:33:25-07:00"
 )
+
+
+def _strict_provider_accepts_message_shape(messages):
+    shape = [
+        {
+            "index": index,
+            "role": message.get("role"),
+            "has_cache_control": "cache_control" in message,
+        }
+        for index, message in enumerate(messages)
+    ]
+    logging.getLogger(__name__).info("strict-provider message shape=%s", shape)
+    if any(item["role"] == "system" and item["index"] for item in shape):
+        raise ValueError("System message must be at the beginning.")
+    return shape
 
 
 @pytest.mark.parametrize(
@@ -117,12 +134,207 @@ def test_inflight_loop_timing_is_consumed_onto_outgoing_prompt():
         result = agent.run_conversation("hello")
 
     sent = agent.client.chat.completions.create.call_args.kwargs["messages"]
-    timing_messages = [
-        message for message in sent if message.get("content") == TIMING
-    ]
-    assert sent[-1] == {"role": "system", "content": TIMING}
-    assert timing_messages == [{"role": "system", "content": TIMING}]
+    shape = _strict_provider_accepts_message_shape(sent)
+    assert shape[-1]["role"] == "user"
+    assert len(shape) == 2
     assert agent._loop_timing_context_text == ""
-    persisted = [message for message in result["messages"] if message.get("content") == TIMING]
-    assert persisted == [{"role": "system", "content": TIMING, "display_kind": "hidden"}]
-    assert all(message.get("role") != "user" for message in persisted)
+    assert all(message.get("content") != TIMING for message in result["messages"])
+
+
+def test_loop_timing_stays_unmarked_across_retry_and_fallback():
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+    agent.client = MagicMock()
+    agent._cached_system_prompt = "You are helpful."
+    agent._cached_system_prompt_static = "You are helpful."
+    agent._use_prompt_caching = True
+    agent._disable_streaming = True
+    agent._loop_timing_context_text = TIMING
+    agent._fallback_chain = [{"provider": "openrouter", "model": "fallback/model"}]
+    agent._fallback_index = 0
+    sent = []
+    empty = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=None, tool_calls=None))],
+        model="test/model",
+        usage=None,
+    )
+    complete = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content="done", reasoning_content=None, reasoning=None, tool_calls=None
+                ),
+                finish_reason="stop",
+            )
+        ],
+        model="fallback/model",
+        usage=None,
+    )
+    outcomes = [UnicodeEncodeError("utf-8", "x", 0, 1, "retry"), empty, complete]
+
+    def _send(**kwargs):
+        sent.append(copy.deepcopy(kwargs["messages"]))
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    def _activate_fallback():
+        agent._fallback_index = 1
+        agent.provider = "openrouter"
+        agent._use_prompt_caching = True
+        agent._use_native_cache_layout = False
+        return True
+
+    agent.client.chat.completions.create.side_effect = _send
+    with (
+        patch.object(agent, "_try_activate_fallback", side_effect=_activate_fallback),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("hello")
+
+    assert result["completed"] is True
+    assert len(sent) == 3
+    prior = sent[0][-1]["content"][0]
+    for attempt in sent:
+        timing_blocks = [
+            part
+            for message in attempt
+            for part in (message.get("content") if isinstance(message.get("content"), list) else [])
+            if isinstance(part, dict) and part.get("text") == TIMING
+        ]
+        assert len(timing_blocks) == 1
+        assert "cache_control" not in timing_blocks[0]
+        assert all(not (index and message.get("role") == "system") for index, message in enumerate(attempt))
+        assert attempt[-1]["content"][0] == prior
+
+
+def test_loop_timing_clears_after_retried_tool_response():
+    tool = SimpleNamespace(
+        id="call_1",
+        type="function",
+        function=SimpleNamespace(name="web_search", arguments="{}"),
+    )
+    with (
+        patch(
+            "run_agent.get_tool_definitions",
+            return_value=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "web_search",
+                        "description": "search",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ],
+        ),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+    agent.client = MagicMock()
+    agent._cached_system_prompt = "You are helpful."
+    agent._cached_system_prompt_static = "You are helpful."
+    agent._use_prompt_caching = True
+    agent._disable_streaming = True
+    agent._loop_timing_context_text = TIMING
+    sent = []
+    tool_response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content=None, reasoning_content=None, reasoning=None, tool_calls=[tool]
+                ),
+                finish_reason="tool_calls",
+            )
+        ],
+        model="test/model",
+        usage=None,
+    )
+    final_response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content="done", reasoning_content=None, reasoning=None, tool_calls=None
+                ),
+                finish_reason="stop",
+            )
+        ],
+        model="test/model",
+        usage=None,
+    )
+    outcomes = [UnicodeEncodeError("utf-8", "x", 0, 1, "retry"), tool_response, final_response]
+
+    def _send(**kwargs):
+        sent.append(copy.deepcopy(kwargs["messages"]))
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    agent.client.chat.completions.create.side_effect = _send
+
+    def _timing_parts(messages):
+        return [
+            part
+            for message in messages
+            for part in (
+                [message.get("content")]
+                if isinstance(message.get("content"), str)
+                else message.get("content", [])
+            )
+            if (part.get("text") if isinstance(part, dict) else part) == TIMING
+        ]
+
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch("run_agent.handle_function_call", return_value='{"ok": true}'),
+    ):
+        result = agent.run_conversation("hello")
+
+    assert result["completed"] is True
+    assert len(sent) == 3
+    for attempt in sent[:2]:
+        timing_parts = _timing_parts(attempt)
+        assert len(timing_parts) == 1
+        assert isinstance(timing_parts[0], dict)
+        assert "cache_control" not in timing_parts[0]
+    assert not _timing_parts(sent[2])
+
+
+def test_non_chat_loop_timing_follows_cached_breakpoint_without_marker():
+    agent = type("Agent", (), {"api_mode": "anthropic_messages"})()
+    agent._loop_timing_context_text = TIMING
+    messages = [
+        {"role": "user", "content": [{"type": "text", "text": "prior", "cache_control": {"type": "ephemeral"}}]}
+    ]
+
+    from agent.conversation_loop import _append_loop_timing_context
+
+    sent = _append_loop_timing_context(agent, messages)
+
+    assert sent[-1] == {"role": "system", "content": TIMING}
+    assert "cache_control" not in sent[-1]

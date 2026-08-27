@@ -7067,6 +7067,21 @@ class AIAgent:
     def _try_activate_fallback(self, reason: "FailoverReason | None" = None) -> bool:
         """Forwarder — see ``agent.chat_completion_helpers.try_activate_fallback``."""
         from agent.chat_completion_helpers import try_activate_fallback
+
+        if getattr(self, "_delegate_model_profile", None) == "standard":
+            if getattr(self, "_delegate_has_successful_llm_request", False):
+                return False
+            if reason not in {
+                FailoverReason.rate_limit,
+                FailoverReason.upstream_rate_limit,
+            }:
+                return False
+            cooldown = getattr(self, "_rate_limited_until", 0)
+            backoff_count = getattr(self, "_rate_limit_backoff_count", 0)
+            activated = try_activate_fallback(self, reason)
+            self._rate_limited_until = cooldown
+            self._rate_limit_backoff_count = backoff_count
+            return activated
         return try_activate_fallback(self, reason)
 
     def _has_pending_fallback(self) -> bool:

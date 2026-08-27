@@ -1461,7 +1461,8 @@ class CheckpointContextEngine(ContextEngine):
                 or fact.action_state is not None
             )
             if executable and not any(
-                probe == " ".join(row["content"].split()).casefold()
+                row.get("role") in _AUTHORITATIVE_ROLES
+                and probe == " ".join(row["content"].split()).casefold()
                 for row in supporting
             ):
                 continue

@@ -1238,6 +1238,62 @@ def test_executable_map_facts_require_full_authoritative_source_span(source, fac
     assert fact["text"] not in rendered
 
 
+@pytest.mark.parametrize(
+    ("source", "fact", "untrusted_role"),
+    (
+        (
+            "Never delete config files.",
+            {
+                "kind": "action",
+                "text": "delete config files",
+                "identity": "config:delete",
+                "action_state": "planned",
+            },
+            "tool",
+        ),
+        (
+            "Never rotate credentials.",
+            {"kind": "policy", "text": "rotate credentials"},
+            "assistant",
+        ),
+        (
+            "Never restart the database.",
+            {
+                "kind": "observation",
+                "text": "restart the database",
+                "identity": "database:restart",
+                "action_state": "blocked",
+            },
+            "tool",
+        ),
+    ),
+)
+def test_executable_map_facts_require_exact_authority_on_one_source_row(
+    source, fact, untrusted_role
+):
+    from agent.checkpoint_engine import CausalGroup, CheckpointContextEngine
+
+    fact = {**fact, "source_event_ids": [101, 102]}
+    engine = CheckpointContextEngine(
+        auxiliary_client=_FakeAuxiliaryClient(
+            _map_response({"source_event_ids": [101, 102], "facts": [fact]})
+        )
+    )
+    messages = [
+        {"role": "user", "content": source},
+        {"role": untrusted_role, "content": fact["text"]},
+    ]
+
+    shard = engine._map_group(messages, CausalGroup((0, 1)), (101, 102))
+
+    assert shard is not None
+    reduced = engine._reduce(engine._extract_deterministic_lanes(messages), (shard,))
+    rendered = engine._render_checkpoint("Validated historical source records.", reduced, 0)
+    assert not shard.facts
+    assert not reduced.facts
+    assert fact["text"] not in rendered
+
+
 def test_full_span_user_action_remains_executable():
     from agent.checkpoint_engine import CausalGroup, CheckpointContextEngine
 

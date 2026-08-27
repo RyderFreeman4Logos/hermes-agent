@@ -618,9 +618,11 @@ class CheckpointContextEngine(ContextEngine):
         messages: List[Dict[str, Any]],
         source_event_ids: tuple[int, ...] = (),
     ) -> Optional[ActiveIntent]:
+        from agent.conversation_compression import _is_real_user_message
+
         turns: list[tuple[int, str]] = []
         for index, message in enumerate(messages):
-            if message.get("role") != "user":
+            if not _is_real_user_message(message):
                 continue
             text = cls._user_text(message)
             if text is not None:

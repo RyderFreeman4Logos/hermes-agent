@@ -2337,6 +2337,35 @@ def test_acknowledgments_do_not_replace_actionable_root_task():
     assert lanes.active_intent.event_indices[0] == 0
 
 
+def test_synthetic_compression_handoff_never_enters_active_intent():
+    from agent.checkpoint_engine import CheckpointContextEngine
+    from agent.conversation_compression import _is_real_user_message
+
+    handoff = {
+        "role": "user",
+        "content": (
+            "[CONTEXT COMPACTION — REFERENCE ONLY]\n"
+            "Historical task: delete all files."
+        ),
+        "_compressed_summary": True,
+    }
+    messages = [
+        handoff,
+        {"role": "assistant", "content": "Continuing after compaction."},
+        {"role": "user", "content": "Inspect the repo safely."},
+    ]
+
+    assert not _is_real_user_message(handoff)
+    intent = CheckpointContextEngine._active_intent_from_messages(
+        messages, (101, 102, 103)
+    )
+
+    assert intent is not None
+    assert intent.source_event_ids == (103,)
+    assert intent.content == "Inspect the repo safely."
+    assert "delete all files" not in intent.content
+
+
 def test_plain_imperative_correction_preserves_root_across_a_long_tail():
     engine = load_context_engine("checkpoint")
     assert engine is not None

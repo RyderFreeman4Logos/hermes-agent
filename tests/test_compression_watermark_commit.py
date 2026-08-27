@@ -68,6 +68,24 @@ class TestWatermarkCommit:
         ]
         assert all(row["active"] for row in db.get_messages("sess1", include_inactive=True))
 
+    def test_durable_revision_cas_binds_provider_visible_content(
+        self, db: SessionDB
+    ) -> None:
+        _seed(db, 3)
+        revision = db.get_active_message_revision("sess1")
+
+        assert db.set_latest_user_api_content(
+            "sess1", "turn 2", "changed wire content"
+        ) == 1
+        assert not db.active_message_revision_is_current(revision)
+
+        with pytest.raises(SessionTranscriptRevisionChangedError):
+            db.archive_and_compact("sess1", SUMMARY, expected_revision=revision)
+
+        live = db.get_messages("sess1")
+        assert [row["content"] for row in live] == ["turn 0", "turn 1", "turn 2"]
+        assert live[-1]["api_content"] == "changed wire content"
+
     def test_live_source_kwargs_are_accepted_with_revision_cas(
         self, db: SessionDB
     ) -> None:
@@ -76,8 +94,8 @@ class TestWatermarkCommit:
         count = db.archive_and_compact(
             "sess1",
             SUMMARY,
-            source_ids=[1, 2, 3],
-            source_signature="live-pin-digest",
+            source_ids=list(revision.source_ids),
+            source_signature=revision.source_signature,
             expected_revision=revision,
         )
         assert count == 2

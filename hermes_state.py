@@ -3563,6 +3563,8 @@ class ActiveMessageRevision:
     first_message_id: int
     last_message_id: int
     active_message_count: int
+    source_ids: tuple[int, ...]
+    source_signature: str
 
 
 def _connect_tracked_db(path, tracking_path=None, **kwargs):
@@ -11235,22 +11237,31 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
     @staticmethod
     def _active_message_revision(conn, session_id: str) -> ActiveMessageRevision:
-        row = conn.execute(
-            "SELECT COALESCE(MIN(id), 0), COALESCE(MAX(id), 0), COUNT(*) "
-            "FROM messages WHERE session_id = ? AND active = 1",
+        rows = conn.execute(
+            "SELECT id, role, content, tool_call_id, tool_calls, tool_name, "
+            "effect_disposition, finish_reason, reasoning, reasoning_content, "
+            "reasoning_details, codex_reasoning_items, codex_message_items, "
+            "observed, _compressed_summary, api_content "
+            "FROM messages WHERE session_id = ? AND active = 1 ORDER BY id",
             (session_id,),
-        ).fetchone()
+        ).fetchall()
+        source_ids = tuple(int(row[0]) for row in rows)
+        source_signature = hashlib.sha256(
+            repr(tuple(tuple(row) for row in rows)).encode("utf-8", "surrogatepass")
+        ).hexdigest()
         return ActiveMessageRevision(
             session_id=session_id,
-            first_message_id=int(row[0]) if row else 0,
-            last_message_id=int(row[1]) if row else 0,
-            active_message_count=int(row[2]) if row else 0,
+            first_message_id=source_ids[0] if source_ids else 0,
+            last_message_id=source_ids[-1] if source_ids else 0,
+            active_message_count=len(source_ids),
+            source_ids=source_ids,
+            source_signature=source_signature,
         )
 
     def get_active_message_revision(self, session_id: str) -> ActiveMessageRevision:
         """Return the exact durable identity of the current active transcript."""
         if not session_id:
-            return ActiveMessageRevision("", 0, 0, 0)
+            return ActiveMessageRevision("", 0, 0, 0, (), "")
         with self._read_ctx() as conn:
             return self._active_message_revision(conn, session_id)
 
@@ -11443,14 +11454,19 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         source_ids: Optional[List[int]] = None,
         source_signature: Optional[str] = None,
     ) -> None:
-        # Live SessionDB hashes pre-watermark rows; this pin keys CAS on
-        # expected_revision and keeps the live kwargs as a no-op seam.
-        _ = (source_ids, source_signature)
-        if expected_revision is None:
-            return
+        current_revision = self._active_message_revision(conn, session_id)
         if (
-            expected_revision.session_id != session_id
-            or self._active_message_revision(conn, session_id) != expected_revision
+            expected_revision is not None
+            and (
+                expected_revision.session_id != session_id
+                or current_revision != expected_revision
+            )
+        ) or (
+            source_ids is not None
+            and tuple(source_ids) != current_revision.source_ids
+        ) or (
+            source_signature is not None
+            and source_signature != current_revision.source_signature
         ):
             raise SessionTranscriptRevisionChangedError(
                 f"Active transcript for {session_id!r} changed before "

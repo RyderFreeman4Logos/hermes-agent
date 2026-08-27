@@ -1943,7 +1943,6 @@ def run_conversation(
     agent._last_turn_usage = None
     agent._first_turn_usage = None
     agent._tui_provider_response_index = 0
-    agent._cache_turn_origin = turn_origin
 
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
     # turn to the codex app-server subprocess (terminal/file ops/patching

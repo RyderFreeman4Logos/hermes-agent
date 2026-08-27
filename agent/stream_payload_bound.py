@@ -12,8 +12,8 @@ from typing import Any
 
 from agent.message_metadata import append_message
 
-# Below the 148197-char orphan observed in session 20260624_143447_f60046.
-DEFAULT_STREAM_PAYLOAD_BOUND_BYTES = 128 * 1024
+# Retain a useful long-form answer before the bounded overflow path engages.
+DEFAULT_STREAM_PAYLOAD_BOUND_BYTES = 256 * 1024
 
 
 class StreamPayloadBoundExceeded(RuntimeError):

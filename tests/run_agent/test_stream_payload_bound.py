@@ -11,7 +11,7 @@ def test_oversize_stream_aborts_and_interrupt_does_not_leave_orphan():
     )
     from run_agent import AIAgent
 
-    assert DEFAULT_STREAM_PAYLOAD_BOUND_BYTES < 148_197
+    assert DEFAULT_STREAM_PAYLOAD_BOUND_BYTES == 256 * 1024
 
     agent = AIAgent(
         api_key="test-key",
@@ -30,7 +30,7 @@ def test_oversize_stream_aborts_and_interrupt_does_not_leave_orphan():
             "x" * (DEFAULT_STREAM_PAYLOAD_BOUND_BYTES + 1)
         )
 
-    orphan = "y" * 148_197
+    orphan = "y" * (DEFAULT_STREAM_PAYLOAD_BOUND_BYTES + 1)
     agent._current_streamed_assistant_text = orphan
     messages = [{"role": "user", "content": "go"}]
     first = persist_interrupted_stream_partial(agent, messages, elapsed=596.8)
@@ -48,3 +48,21 @@ def test_oversize_stream_aborts_and_interrupt_does_not_leave_orphan():
     assert last.get("role") == "assistant"
     assert orphan not in (last.get("content") or "")
     assert len((last.get("content") or "").encode("utf-8")) < 1024
+
+
+def test_default_stream_payload_limit_retains_131090_byte_assistant_delta():
+    from run_agent import AIAgent
+
+    payload = "x" * 131_090
+    agent = AIAgent(
+        api_key="test-key",
+        base_url="https://example.com/v1",
+        model="test/model",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    agent._claim_stream_writer()
+
+    assert agent._record_streamed_assistant_text(payload) is None
+    assert agent._current_streamed_assistant_text == payload

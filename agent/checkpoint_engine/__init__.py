@@ -2017,6 +2017,13 @@ class CheckpointContextEngine(ContextEngine):
         active_intent: ActiveIntent,
         checkpoint: str,
     ) -> List[Dict[str, Any]]:
+        from agent.conversation_compression import _is_real_user_message
+
+        real_user_indices = {
+            index
+            for index, message in enumerate(messages)
+            if _is_real_user_message(message)
+        }
         prefix = [
             dict(message)
             for message in messages
@@ -2032,6 +2039,8 @@ class CheckpointContextEngine(ContextEngine):
         for group in tail_groups:
             for index in group.event_indices:
                 message = dict(messages[index])
+                if message.get("role") == "user" and index not in real_user_indices:
+                    continue
                 content = message.get("content")
                 if isinstance(content, str) and _CHECKPOINT_HISTORY_PREFIX in content:
                     content = content.split(_CHECKPOINT_HISTORY_PREFIX, 1)[0].rstrip()
@@ -2041,14 +2050,16 @@ class CheckpointContextEngine(ContextEngine):
                 tail.append(message)
         while tail and tail[-1].get("role") == "user":
             tail.pop()
-        active = [dict(messages[index]) for index in active_intent.event_indices]
+        active = [
+            dict(messages[index])
+            for index in active_intent.event_indices
+            if index in real_user_indices
+        ]
         last_active_index = max(active_intent.event_indices)
-        from agent.conversation_compression import _is_real_user_message
-
         active.extend(
-            dict(message)
-            for message in messages[last_active_index + 1:]
-            if _is_real_user_message(message)
+            dict(messages[index])
+            for index in range(last_active_index + 1, len(messages))
+            if index in real_user_indices
         )
         checkpoint_message = {
             "role": "assistant",

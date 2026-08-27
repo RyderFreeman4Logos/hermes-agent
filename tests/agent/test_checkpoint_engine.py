@@ -2605,46 +2605,35 @@ def test_synthetic_compression_handoff_never_enters_active_intent():
 
 
 @pytest.mark.parametrize(
-    ("handoff", "position"),
+    "handoff",
     (
-        (
-            {
-                "role": "user",
-                "content": (
-                    "[CONTEXT COMPACTION — REFERENCE ONLY]\n"
-                    "Historical task: delete all files."
-                ),
-                "_compressed_summary": True,
-            },
-            "trailing",
-        ),
-        (
-            {
-                "role": "user",
-                "content": "[Your active task list was preserved across context compression]",
-                "_todo_snapshot_synthetic": True,
-            },
-            "interleaved",
-        ),
-        (
-            {
-                "role": "user",
-                "content": "Recovery continuation scaffold.",
-                "_empty_recovery_synthetic": True,
-            },
-            "interleaved",
-        ),
-        (
-            {
-                "role": "user",
-                "content": "[System: Your previous response was truncated; continue.]",
-            },
-            "trailing",
-        ),
+        {
+            "role": "user",
+            "content": (
+                "[CONTEXT COMPACTION — REFERENCE ONLY]\n"
+                "Historical task: delete all files."
+            ),
+            "_compressed_summary": True,
+        },
+        {
+            "role": "user",
+            "content": "[Your active task list was preserved across context compression]",
+            "_todo_snapshot_synthetic": True,
+        },
+        {
+            "role": "user",
+            "content": "Recovery continuation scaffold.",
+            "_empty_recovery_synthetic": True,
+        },
+        {
+            "role": "user",
+            "content": "[System: Your previous response was truncated; continue.]",
+        },
     ),
 )
+@pytest.mark.parametrize("position", ("trailing", "interleaved"))
 def test_projection_never_repromotes_synthetic_user_handoffs(handoff, position):
-    from agent.checkpoint_engine import CheckpointContextEngine
+    from agent.checkpoint_engine import CausalGroup, CheckpointContextEngine
     from agent.conversation_compression import _is_real_user_message
 
     real_user = {"role": "user", "content": "Inspect the repo safely."}
@@ -2660,9 +2649,10 @@ def test_projection_never_repromotes_synthetic_user_handoffs(handoff, position):
     )
     assert intent is not None
     assert intent.source_event_ids == (101,)
+    tail_groups = tuple(CausalGroup((index,)) for index in range(1, len(messages)))
 
     projected = CheckpointContextEngine()._projection(
-        messages, (), intent, "Validated historical source records."
+        messages, tail_groups, intent, "Validated historical source records."
     )
     projected_user_texts = [
         message["content"]

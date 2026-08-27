@@ -310,6 +310,21 @@ def test_symlink_output_directory_fails_closed(monkeypatch, tmp_path):
     assert list(outside.iterdir()) == []
 
 
+def test_ancestor_symlink_fails_closed(monkeypatch, tmp_path):
+    from agent import cache_lowhit_request_dump as dump
+
+    monkeypatch.setattr(dump, "get_hermes_home", lambda: tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (tmp_path / "observability").symlink_to(outside, target_is_directory=True)
+    dump.reset_for_tests()
+    _remember_pair(dump, "PREFIX-A", "PREFIX-B")
+
+    _finish(dump, _usage(cache_read=0, prompt=10_000))
+
+    assert list(outside.iterdir()) == []
+
+
 def test_existing_artifact_is_never_overwritten(monkeypatch, tmp_path):
     from agent import cache_lowhit_request_dump as dump
 
@@ -502,3 +517,105 @@ def test_auxiliary_interleaving_does_not_finalize_other_api_mode(monkeypatch, tm
     assert _dump_files(tmp_path) == []
     assert not dump._BUFFERS[("same-route", "same-provider", "same-model", "chat_completions")][-1]["_terminal"]
     assert not dump._BUFFERS[("same-route", "same-provider", "same-model", "anthropic_messages")][-1]["_terminal"]
+
+
+def test_out_of_order_same_identity_finalizes_exact_correlation(monkeypatch, tmp_path):
+    from agent import cache_lowhit_request_dump as dump
+
+    monkeypatch.setattr(dump, "get_hermes_home", lambda: tmp_path)
+    dump.reset_for_tests()
+    kwargs = {"route": "same-route", "provider": "provider", "model": "model", "api_mode": "chat_completions"}
+    dump.remember_sent_request({"messages": [{"role": "system", "content": "a"}]}, correlation="logical-a", attempt_id="attempt-a", **kwargs)
+    dump.remember_sent_request({"messages": [{"role": "system", "content": "b"}]}, correlation="logical-b", attempt_id="attempt-b", **kwargs)
+    usage = _usage(cache_read=0, prompt=1_000)
+
+    dump.maybe_dump_on_usage(usage, correlation="logical-a", attempt_id="attempt-a", **kwargs)
+
+    history = dump._BUFFERS[("same-route", "provider", "model", "chat_completions")]
+    by_owner = {packet["_correlation"]: packet for packet in history}
+    assert by_owner["logical-a"]["_terminal"] is True
+    assert by_owner["logical-b"]["_terminal"] is False
+
+
+def test_failed_pending_owner_cannot_become_predecessor(monkeypatch, tmp_path):
+    from agent import cache_lowhit_request_dump as dump
+
+    monkeypatch.setattr(dump, "get_hermes_home", lambda: tmp_path)
+    dump.reset_for_tests()
+    kwargs = {"route": "same-route", "provider": "provider", "model": "model", "api_mode": "chat_completions", "correlation": "logical",}
+    dump.remember_sent_request({"messages": [{"role": "system", "content": "failed"}]}, **kwargs)
+    dump.remember_sent_request({"messages": [{"role": "system", "content": "current"}]}, **kwargs)
+    dump.maybe_dump_on_usage(_usage(cache_read=0, prompt=1_000), **kwargs)
+
+    assert _dump_files(tmp_path) == []
+
+
+def test_partial_pair_publication_removes_staging(monkeypatch, tmp_path):
+    from agent import cache_lowhit_request_dump as dump
+
+    monkeypatch.setattr(dump, "get_hermes_home", lambda: tmp_path)
+    payload = {"route": {}, "requests": [], "comparison": {}, "log_lines": []}
+    calls = 0
+    original = dump._exclusive_write
+
+    def fail_second(path, value):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise OSError("synthetic publication failure")
+        return original(path, value)
+
+    monkeypatch.setattr(dump, "_exclusive_write", fail_second)
+    try:
+        dump._persist_pair((payload, payload))
+    except OSError:
+        pass
+    root = tmp_path / "observability" / "cache_lowhit"
+    assert not any(path.is_dir() for path in root.iterdir()) if root.exists() else True
+
+
+def test_retention_ignores_unsealed_matching_directory(monkeypatch, tmp_path):
+    from agent import cache_lowhit_request_dump as dump
+
+    monkeypatch.setattr(dump, "get_hermes_home", lambda: tmp_path)
+    root = tmp_path / "observability" / "cache_lowhit"
+    root.mkdir(parents=True)
+    unowned = root / "pair-unsealed"
+    unowned.mkdir()
+    (unowned / "pair.json").write_text("{}", encoding="utf-8")
+    (unowned / "log_lines.jsonl").write_text("", encoding="utf-8")
+    for index in range(dump.MAX_DUMPS):
+        owned = root / f"pair-owned-{index}"
+        owned.mkdir()
+        (owned / dump._PAIR_MARKER).write_text(dump._PAIR_SCHEMA, encoding="utf-8")
+        (owned / "pair.json").write_text(json.dumps({"schema": dump._PAIR_SCHEMA}), encoding="utf-8")
+        (owned / "log_lines.jsonl").write_text("", encoding="utf-8")
+    dump._retain(root)
+    assert unowned.exists()
+
+
+def test_physical_append_uses_process_lock(monkeypatch, tmp_path):
+    from agent import physical_attempt_diagnostics as diagnostics
+    from hermes_cli import config
+
+    monkeypatch.setattr(diagnostics, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(config, "read_raw_config_readonly", lambda: _config(True))
+    calls = []
+    real_flock = diagnostics.fcntl.flock
+    monkeypatch.setattr(diagnostics.fcntl, "flock", lambda fd, op: (calls.append(op), real_flock(fd, op))[1])
+    diagnostics._append({"schema": "test"})
+    assert diagnostics.fcntl.LOCK_EX in calls and diagnostics.fcntl.LOCK_UN in calls
+
+
+def test_raw_values_are_sanitized_before_physical_boundaries(monkeypatch, tmp_path):
+    from agent import physical_attempt_diagnostics as diagnostics
+    from hermes_cli import config
+
+    sentinel = "REPAIR-SENTINEL"
+    monkeypatch.setattr(diagnostics, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(config, "read_raw_config_readonly", lambda: _config(True))
+    seen = []
+    monkeypatch.setattr(diagnostics, "_serialized", lambda value: (seen.append(value), b"{}")[1])
+    diagnostics._LAST_ATTEMPT.clear()
+    diagnostics.start_attempt({"messages": [{"role": "system", "content": sentinel}], "prompt_cache_key": sentinel}, api_mode="chat_completions", route="chat_completions", provider="provider", model="model", retry=0, loop=1, correlation="repair")
+    assert sentinel not in repr(seen)

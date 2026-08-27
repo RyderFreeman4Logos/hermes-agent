@@ -3283,7 +3283,8 @@ def _relay_auxiliary_call(callback):
             "provider": "",
             "model": "",
             "response_model": None,
-            "api_mode": "chat_completions",
+            "route": "",
+            "api_mode": "",
         })
         try:
             return callback(*args, **kwargs)
@@ -3309,7 +3310,8 @@ def _relay_auxiliary_call_async(callback):
             "provider": "",
             "model": "",
             "response_model": None,
-            "api_mode": "chat_completions",
+            "route": "",
+            "api_mode": "",
         })
         try:
             return await callback(*args, **kwargs)
@@ -3326,14 +3328,16 @@ def _set_relay_auxiliary_route(
     provider: str | None,
     model: str | None,
     api_mode: str | None,
+    route: str | None = None,
 ) -> None:
     context = _RELAY_AUX_CALL_CONTEXT.get()
     if context is None:
         return
-    context["provider"] = str(provider or "auxiliary")
-    context["model"] = str(model or "unknown")
+    context["provider"] = str(provider or "")
+    context["model"] = str(model or "")
     context["response_model"] = None
-    context["api_mode"] = str(api_mode or "chat_completions")
+    context["route"] = str(route or "")
+    context["api_mode"] = str(api_mode or "")
 
 
 def _record_route_info(
@@ -3354,16 +3358,27 @@ def _relay_auxiliary_metadata(
     *,
     provider: str | None = None,
     api_mode: str | None = None,
+    model: str | None = None,
+    route: str | None = None,
 ) -> tuple[str, str, dict[str, Any]] | None:
     context = _RELAY_AUX_CALL_CONTEXT.get()
     if context is None:
         return None
     attempt_count = int(context.get("attempt_count") or 0)
     context["attempt_count"] = attempt_count + 1
-    provider_name = str(provider or context.get("provider") or "auxiliary")
-    model_name = str(context.get("model") or "unknown")
+    provider_name = str(provider or context.get("provider") or "")
+    model_name = str(model or context.get("model") or "")
+    route_name = str(route or context.get("route") or "")
+    api_mode_name = str(api_mode or context.get("api_mode") or "")
+    context.update(
+        provider=provider_name,
+        model=model_name,
+        route=route_name,
+        api_mode=api_mode_name,
+    )
     return provider_name, model_name, {
-        "api_mode": str(api_mode or context.get("api_mode") or "chat_completions"),
+        "route": route_name,
+        "api_mode": api_mode_name,
         "api_request_id": str(context["request_id"]),
         "call_role": f"auxiliary:{context['task']}",
         "retry_count": attempt_count,
@@ -3380,7 +3395,12 @@ def _relay_sync_completion(
     create: Callable[[dict[str, Any]], Any] | None = None,
 ) -> Any:
     callback = create or (lambda request: client.chat.completions.create(**request))
-    route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
+    route = _relay_auxiliary_metadata(
+        provider=provider,
+        api_mode=api_mode,
+        model=kwargs.get("model"),
+        route=str(getattr(client, "base_url", "") or ""),
+    )
     # Protected compression calls isolate only the provider callback and stream
     # aggregation.  The owning thread remains free to unwind its lease/DB
     # transaction on hard cancel without touching the process-shared client.
@@ -3408,7 +3428,12 @@ async def _relay_async_completion(
     create: Callable[[dict[str, Any]], Any] | None = None,
 ) -> Any:
     callback = create or (lambda request: client.chat.completions.create(**request))
-    route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
+    route = _relay_auxiliary_metadata(
+        provider=provider,
+        api_mode=api_mode,
+        model=kwargs.get("model"),
+        route=str(getattr(client, "base_url", "") or ""),
+    )
     if route is None:
         return await callback(kwargs)
     provider_name, fallback_model, metadata = route
@@ -3431,7 +3456,12 @@ def _relay_sync_stream(
     provider: str | None = None,
     api_mode: str | None = None,
 ) -> Any:
-    route = _relay_auxiliary_metadata(provider=provider, api_mode=api_mode)
+    route = _relay_auxiliary_metadata(
+        provider=provider,
+        api_mode=api_mode,
+        model=kwargs.get("model"),
+        route=str(getattr(client, "base_url", "") or ""),
+    )
     if route is None:
         return client.chat.completions.create(**kwargs)
     provider_name, fallback_model, metadata = route
@@ -9537,7 +9567,28 @@ def _validate_llm_response(
             f"Auxiliary {task or 'call'}: LLM returned None response"
         )
     from agent.aux_accounting import record_aux_usage
-    record_aux_usage(response, task, provider=provider, base_url=base_url)
+    relay_context = _RELAY_AUX_CALL_CONTEXT.get()
+    if relay_context is not None:
+        provider = str(relay_context.get("provider") or provider or "") or None
+        model = str(relay_context.get("model") or "") or None
+        route = str(relay_context.get("route") or "") or None
+        api_mode = str(relay_context.get("api_mode") or "") or None
+        correlation = str(relay_context.get("request_id") or "") or None
+        retry = int(relay_context.get("attempt_count") or 0) - 1
+        attempt_id = f"{correlation}:attempt:{max(0, retry)}" if correlation else None
+    else:
+        model = route = api_mode = correlation = attempt_id = None
+    record_aux_usage(
+        response,
+        task,
+        provider=provider,
+        base_url=base_url,
+        route=route,
+        api_mode=api_mode,
+        model=model,
+        correlation=correlation,
+        attempt_id=attempt_id,
+    )
     # Allow SimpleNamespace responses from adapters (CodexAuxiliaryClient,
     # AnthropicAuxiliaryClient) — they have .choices[0].message.
     try:

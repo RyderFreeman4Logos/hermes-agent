@@ -3529,6 +3529,25 @@ def run_conversation(
                 if _is_standard_profile_child(agent):
                     agent._delegate_has_successful_llm_request = True
 
+                if api_call_count == 1 and getattr(response, "usage", None):
+                    first_usage = normalize_usage(
+                        response.usage,
+                        provider=agent.provider,
+                        api_mode=agent.api_mode,
+                        model=api_kwargs.get("model") or agent.model,
+                    )
+                    agent._first_turn_usage = {
+                        "prompt_tokens": first_usage.prompt_tokens,
+                        "completion_tokens": first_usage.output_tokens,
+                        "total_tokens": first_usage.total_tokens,
+                        "input_tokens": first_usage.input_tokens,
+                        "output_tokens": first_usage.output_tokens,
+                        "cache_read_tokens": first_usage.cache_read_tokens,
+                        "cache_write_tokens": first_usage.cache_write_tokens,
+                        "cache_telemetry": first_usage.cache_telemetry,
+                        "reasoning_tokens": first_usage.reasoning_tokens,
+                    }
+
                 # Check finish_reason before proceeding
                 if agent.api_mode == "codex_responses":
                     status = getattr(response, "status", None)
@@ -4105,6 +4124,7 @@ def run_conversation(
                         response.usage,
                         provider=agent.provider,
                         api_mode=agent.api_mode,
+                        model=api_kwargs.get("model") or agent.model,
                     )
                     # Aggregator-only usage is retained for cost pricing: MoA
                     # advisor tokens must be priced at each advisor's OWN model

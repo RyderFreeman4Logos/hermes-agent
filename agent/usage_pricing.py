@@ -79,6 +79,7 @@ class CanonicalUsage:
     reasoning_tokens: int = 0
     request_count: int = 1
     raw_usage: Optional[dict[str, Any]] = None
+    cache_telemetry: Literal["reported", "unavailable"] = "unavailable"
 
     @property
     def prompt_tokens(self) -> int:
@@ -1278,6 +1279,10 @@ def normalize_usage(
     *,
     provider: Optional[str] = None,
     api_mode: Optional[str] = None,
+    model: Optional[str] = None,
+    route: Optional[str] = None,
+    correlation: Optional[str] = None,
+    attempt_id: Optional[str] = None,
 ) -> CanonicalUsage:
     """Normalize raw API response usage into canonical token buckets.
 
@@ -1295,6 +1300,10 @@ def normalize_usage(
 
     provider_name = (provider or "").strip().lower()
     mode = (api_mode or "").strip().lower()
+    cache_telemetry: Literal["reported", "unavailable"] = "unavailable"
+
+    def _has(value: Any, name: str) -> bool:
+        return _usage_get(value, name, None) is not None
 
     if mode == "anthropic_messages" or provider_name == "anthropic":
         input_tokens = _usage_count(_usage_get(response_usage, "input_tokens", 0))
@@ -1303,10 +1312,25 @@ def normalize_usage(
         cache_write_tokens = _usage_count(
             _usage_get(response_usage, "cache_creation_input_tokens", 0)
         )
+        if _has(response_usage, "cache_read_input_tokens") or _has(
+            response_usage, "cache_creation_input_tokens"
+        ):
+            cache_telemetry = "reported"
+    elif mode == "codex_app_server":
+        input_tokens = _usage_count(_usage_get(response_usage, "input_tokens", 0))
+        output_tokens = _usage_count(_usage_get(response_usage, "output_tokens", 0))
+        cache_telemetry = "reported" if _has(response_usage, "cached_input_tokens") else "unavailable"
+        cache_read_tokens = _usage_count(_usage_get(response_usage, "cached_input_tokens", 0))
+        cache_write_tokens = 0
     elif mode == "codex_responses":
         input_total = _usage_count(_usage_get(response_usage, "input_tokens", 0))
         output_tokens = _usage_count(_usage_get(response_usage, "output_tokens", 0))
         details = _usage_get(response_usage, "input_tokens_details", None)
+        if details and any(
+            _has(details, name)
+            for name in ("cached_tokens", "cache_write_tokens", "cache_creation_tokens")
+        ):
+            cache_telemetry = "reported"
         cache_read_tokens = _usage_count(
             _usage_get(details, "cached_tokens", 0) if details else 0
         )
@@ -1334,6 +1358,20 @@ def normalize_usage(
             _usage_get(response_usage, "completion_tokens", 0)
         ) or _usage_count(_usage_get(response_usage, "output_tokens", 0))
         details = _usage_get(response_usage, "prompt_tokens_details", None)
+        cache_field_names = (
+            "cached_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+            "cache_write_tokens",
+            "prompt_cache_hit_tokens",
+            "prompt_cache_miss_tokens",
+        )
+        if any(
+            _has(source, name)
+            for source in (response_usage, details)
+            for name in cache_field_names
+        ):
+            cache_telemetry = "reported"
         # Primary: OpenAI-style prompt_tokens_details. Fallback: Anthropic-style
         # top-level fields that some OpenAI-compatible proxies (OpenRouter, Vercel
         # AI Gateway, Cline) expose when routing Claude models — without this
@@ -1419,17 +1457,26 @@ def normalize_usage(
             cache_read_tokens, cache_write_tokens,
         )
 
-    return CanonicalUsage(
+    usage = CanonicalUsage(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         cache_read_tokens=cache_read_tokens,
         cache_write_tokens=cache_write_tokens,
         reasoning_tokens=reasoning_tokens,
+        cache_telemetry=cache_telemetry,
     )
     try:
         from agent.cache_lowhit_request_dump import maybe_dump_on_usage
 
-        maybe_dump_on_usage(usage, provider=provider, api_mode=api_mode)
+        maybe_dump_on_usage(
+            usage,
+            route=route,
+            provider=provider,
+            model=model,
+            api_mode=api_mode,
+            correlation=correlation,
+            attempt_id=attempt_id,
+        )
     except Exception:
         logger.debug("cache low-hit dump failed", exc_info=True)
     return usage

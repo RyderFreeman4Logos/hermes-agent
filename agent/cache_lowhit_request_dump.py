@@ -23,6 +23,9 @@ from agent.physical_attempt_diagnostics import (
     _prefix,
     _serialized,
     _label,
+    _sanitize_value,
+    _open_private_dir_chain,
+    _posix_euid,
 )
 from agent.usage_pricing import CanonicalUsage
 
@@ -35,6 +38,7 @@ __all__ = [
 
 MAX_DUMPS = 8
 _PAIR_SCHEMA = "hermes.cache_lowhit_pair.v1"
+_PAIR_MARKER = ".hermes_cache_lowhit_pair.v1"
 _COMPONENTS = ("prefix", "tools", "cache_key_or_scope", "later_history")
 _SEGMENTS = {
     "prefix": "system_or_static_prefix",
@@ -57,6 +61,7 @@ _SENSITIVE_KEY_PARTS = (
 )
 _LOCK = threading.Lock()
 _BUFFERS: OrderedDict[tuple[str, str, str, str], deque[dict[str, Any]]] = OrderedDict()
+_MAX_BUFFERED_PACKETS = 256
 _SANITIZE_KEY = secrets.token_bytes(32)
 
 
@@ -73,8 +78,10 @@ def remember_sent_request(
     route: str | None = None,
     provider: str | None = None,
     model: str | None = None,
+    correlation: str | None = None,
+    attempt_id: str | None = None,
 ) -> None:
-    """Keep one sanitized packet per route; never retain request bodies."""
+    """Keep one sanitized packet per route and logical owner."""
     try:
         api_mode = _identity(api_mode)
         route_key = (
@@ -90,10 +97,25 @@ def remember_sent_request(
             provider=route_key[1],
             model=route_key[2],
         )
-        snapshot = {"_terminal": False, "_route_key": route_key, **packet}
+        owner = correlation.strip() if isinstance(correlation, str) and correlation.strip() else None
+        physical = attempt_id.strip() if isinstance(attempt_id, str) and attempt_id.strip() else None
+        snapshot = {
+            "_terminal": False,
+            "_abandoned": False,
+            "_route_key": route_key,
+            "_correlation": owner,
+            "_attempt_id": physical,
+            **packet,
+        }
         with _LOCK:
-            history = _BUFFERS.setdefault(route_key, deque(maxlen=2))
+            history = _BUFFERS.setdefault(route_key, deque())
+            if owner is not None:
+                for prior in history:
+                    if prior.get("_correlation") == owner and not prior["_terminal"]:
+                        prior["_abandoned"] = True
             history.append(snapshot)
+            while len(history) > _MAX_BUFFERED_PACKETS:
+                history.popleft()
             _BUFFERS.move_to_end(route_key)
     except Exception:
         # Request capture is diagnostic-only and must not affect the provider call.
@@ -104,10 +126,10 @@ def _sanitize_packet(
     request: dict[str, Any], *, api_mode: str, route: str, provider: str, model: str
 ) -> dict[str, Any]:
     components = {
-        "prefix": _prefix(request),
-        "tools": request.get("tools") or request.get("toolConfig") or [],
-        "cache_key_or_scope": _cache_key(request),
-        "later_history": _later_history(request, api_mode),
+        "prefix": _sanitize_value(_prefix(request), _SANITIZE_KEY),
+        "tools": _sanitize_value(request.get("tools") or request.get("toolConfig") or [], _SANITIZE_KEY),
+        "cache_key_or_scope": _sanitize_value(_cache_key(request), _SANITIZE_KEY),
+        "later_history": _sanitize_value(_later_history(request, api_mode), _SANITIZE_KEY),
     }
     return {
         "route": {
@@ -315,8 +337,10 @@ def maybe_dump_on_usage(
     provider: str | None = None,
     model: str | None = None,
     api_mode: str | None = None,
+    correlation: str | None = None,
+    attempt_id: str | None = None,
 ) -> None:
-    """Attach terminal scalar usage and persist a sanitized same-route pair."""
+    """Attach terminal scalar usage and persist a sanitized same-owner pair."""
     try:
         if not _complete_identity(route, provider, model, api_mode):
             return
@@ -325,24 +349,54 @@ def maybe_dump_on_usage(
             if key is None:
                 return
             history = _BUFFERS[key]
-            current = history[-1]
-            if current["_terminal"]:
+            current = _select_packet(history, correlation=correlation, attempt_id=attempt_id)
+            if current is None or current["_terminal"] or current.get("_abandoned"):
                 return
             current["usage"] = _usage_payload(usage)
             current["log_lines"] = [_log_line(current)]
             current["_terminal"] = True
-            previous = history[-2] if len(history) == 2 else None
+            previous = next(
+                (
+                    packet
+                    for packet in reversed(history)
+                    if packet is not current
+                    and packet.get("_correlation") == current.get("_correlation")
+                    and packet.get("_route_key") == key
+                    and packet["_terminal"]
+                    and not packet.get("_abandoned")
+                ),
+                None,
+            )
             pair = (
                 _public_packet(previous),
                 _public_packet(current),
-            ) if previous is not None and previous["_terminal"] else None
+            ) if previous is not None else None
+            history_copy = [
+                packet for packet in history if not packet["_terminal"] or packet is current
+            ]
             history.clear()
-            history.append(current)
+            history.extend(history_copy)
         if pair is not None and _is_near_zero(usage):
             _persist_pair(pair)
     except Exception:
         # Persistence and diagnostic bookkeeping are best-effort by contract.
         return
+
+
+def _select_packet(
+    history: deque[dict[str, Any]], *, correlation: str | None, attempt_id: str | None
+) -> dict[str, Any] | None:
+    owner = correlation.strip() if isinstance(correlation, str) and correlation.strip() else None
+    physical = attempt_id.strip() if isinstance(attempt_id, str) and attempt_id.strip() else None
+    for packet in reversed(history):
+        if packet["_terminal"] or packet.get("_abandoned"):
+            continue
+        if owner is not None and packet.get("_correlation") != owner:
+            continue
+        if physical is not None and packet.get("_attempt_id") != physical:
+            continue
+        return packet
+    return None
 
 
 def _complete_identity(*values: Any) -> bool:
@@ -384,13 +438,14 @@ def _public_packet(packet: dict[str, Any]) -> dict[str, Any]:
 def _persist_pair(pair: tuple[dict[str, Any], dict[str, Any]]) -> None:
     previous, current = pair
     equal = {
-        name: previous["components"][name]["digest"] == current["components"][name]["digest"]
+        name: previous.get("components", {}).get(name, {}).get("digest")
+        == current.get("components", {}).get(name, {}).get("digest")
         for name in _COMPONENTS
     }
     payload = {
         "schema": _PAIR_SCHEMA,
         "timestamp_ns": time.time_ns(),
-        "route": current["route"],
+        "route": current.get("route", {}),
         "requests": [previous, current],
         "comparison": {
             "equal": equal,
@@ -398,38 +453,58 @@ def _persist_pair(pair: tuple[dict[str, Any], dict[str, Any]]) -> None:
                 (_SEGMENTS[name] for name in _COMPONENTS if not equal[name]), "none"
             ),
         },
-        "log_lines": [*previous["log_lines"], *current["log_lines"]],
+        "log_lines": [*previous.get("log_lines", []), *current.get("log_lines", [])],
     }
     root = get_hermes_home() / "observability" / "cache_lowhit"
     _ensure_private_dir(root.parent)
     _ensure_private_dir(root)
-    pair_dir = _new_pair_dir(root)
-    _exclusive_write(pair_dir / "pair.json", payload)
-    _exclusive_write(
-        pair_dir / "log_lines.jsonl",
-        "".join(json.dumps({"line": line}, separators=(",", ":")) + "\n" for line in payload["log_lines"]),
-    )
-    _retain(root)
+    staging = _new_pair_dir(root, prefix=".staging-")
+    try:
+        _exclusive_write(staging / "pair.json", payload)
+        _exclusive_write(
+            staging / "log_lines.jsonl",
+            "".join(
+                json.dumps({"line": line}, separators=(",", ":")) + "\n"
+                for line in payload["log_lines"]
+            ),
+        )
+        _exclusive_write(staging / _PAIR_MARKER, _PAIR_SCHEMA + "\n")
+        final = root / f"pair-{time.time_ns()}-{secrets.token_hex(4)}"
+        os.rename(staging, final)
+        _fsync_dir(root)
+        staging = None
+        _retain(root)
+    finally:
+        if staging is not None:
+            _remove_dir(staging)
+
+
+def _fsync_dir(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _remove_dir(path: Path) -> None:
+    try:
+        for child in path.iterdir():
+            if child.is_file() or child.is_symlink():
+                child.unlink(missing_ok=True)
+        path.rmdir()
+    except OSError:
+        return
 
 
 def _ensure_private_dir(path: Path) -> None:
-    try:
-        path.mkdir(mode=0o700, parents=False, exist_ok=True)
-    except FileExistsError:
-        pass
-    info = path.stat(follow_symlinks=False)
-    euid = getattr(os, "geteuid", lambda: None)()
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
-        raise PermissionError(f"unsafe cache low-hit directory: {path}")
-    if euid is not None and info.st_uid != euid:
-        raise PermissionError(f"foreign cache low-hit directory: {path}")
-    if stat.S_IMODE(info.st_mode) != 0o700:
-        path.chmod(0o700)
+    fd = _open_private_dir_chain(path)
+    os.close(fd)
 
 
-def _new_pair_dir(root: Path) -> Path:
+def _new_pair_dir(root: Path, *, prefix: str = "pair-") -> Path:
     for _ in range(8):
-        path = root / f"{time.time_ns()}-{secrets.token_hex(4)}"
+        path = root / f"{prefix}{time.time_ns()}-{secrets.token_hex(4)}"
         try:
             path.mkdir(mode=0o700)
             return path
@@ -454,23 +529,43 @@ def _exclusive_write(path: Path, value: Any) -> None:
         os.close(fd)
 
 
+def _owned_sealed_pair(path: Path) -> bool:
+    try:
+        info = path.stat(follow_symlinks=False)
+        euid = _posix_euid()
+        if not stat.S_ISDIR(info.st_mode) or (euid is not None and info.st_uid != euid):
+            return False
+        if stat.S_IMODE(info.st_mode) != 0o700:
+            return False
+        names = {child.name for child in path.iterdir()}
+        if not names.issubset({_PAIR_MARKER, "pair.json", "log_lines.jsonl"}):
+            return False
+        marker = path / _PAIR_MARKER
+        pair = path / "pair.json"
+        lines = path / "log_lines.jsonl"
+        for child in (marker, pair, lines):
+            child_info = child.stat(follow_symlinks=False)
+            if not stat.S_ISREG(child_info.st_mode) or (euid is not None and child_info.st_uid != euid):
+                return False
+        if marker.read_text(encoding="utf-8").strip() != _PAIR_SCHEMA:
+            return False
+        return json.loads(pair.read_text(encoding="utf-8")).get("schema") == _PAIR_SCHEMA
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return False
+
+
 def _retain(root: Path) -> None:
-    pairs = []
-    for path in root.iterdir():
-        try:
-            info = path.stat(follow_symlinks=False)
-            if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
-                children = list(path.iterdir())
-                if children and all(
-                    child.name in {"pair.json", "log_lines.jsonl"}
-                    and stat.S_ISREG(child.stat(follow_symlinks=False).st_mode)
-                    for child in children
-                ):
-                    pairs.append((info.st_mtime_ns, path))
-        except OSError:
-            continue
-    for _, stale in sorted(pairs)[:-MAX_DUMPS]:
-        for child in stale.iterdir():
-            if child.is_file() and not child.is_symlink():
-                child.unlink(missing_ok=True)
-        stale.rmdir()
+    try:
+        pairs = sorted(
+            (
+                path
+                for path in root.iterdir()
+                if path.name.startswith("pair-") and _owned_sealed_pair(path)
+            ),
+            key=lambda path: path.stat(follow_symlinks=False).st_mtime_ns,
+            reverse=True,
+        )
+        for stale in pairs[MAX_DUMPS:]:
+            _remove_dir(stale)
+    except OSError:
+        return

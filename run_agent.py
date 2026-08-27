@@ -2850,7 +2850,12 @@ class AIAgent:
             return None
         from dataclasses import asdict
 
-        cu = normalize_usage(raw_usage, provider=self.provider, api_mode=self.api_mode)
+        cu = normalize_usage(
+            raw_usage,
+            provider=self.provider,
+            api_mode=self.api_mode,
+            model=self.model,
+        )
         summary = asdict(cu)
         summary.pop("raw_usage", None)
         summary["prompt_tokens"] = cu.prompt_tokens

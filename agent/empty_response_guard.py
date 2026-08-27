@@ -156,6 +156,7 @@ def _estimate_attempt_cost(agent: Any, response: Any) -> Optional[Decimal]:
             raw_usage,
             provider=getattr(agent, "provider", None),
             api_mode=getattr(agent, "api_mode", None),
+            model=getattr(agent, "model", None),
         )
         result = estimate_usage_cost(
             getattr(agent, "model", "") or "",
@@ -182,6 +183,7 @@ def _zero_output(agent: Any, response: Any) -> tuple:
             raw_usage,
             provider=getattr(agent, "provider", None),
             api_mode=getattr(agent, "api_mode", None),
+            model=getattr(agent, "model", None),
         )
     except Exception:  # noqa: BLE001
         logger.debug("empty-guard: usage normalization failed", exc_info=True)

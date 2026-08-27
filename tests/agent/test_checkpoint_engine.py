@@ -29,15 +29,6 @@ class _FakeAuxiliaryClient:
         return response
 
 
-class _FakeMainModel:
-    def __init__(self):
-        self.calls = 0
-
-    def complete(self, **_kwargs):
-        self.calls += 1
-        raise AssertionError("checkpoint Map must not call the main model")
-
-
 class _EchoMapClient:
     """Return a valid Map record for whichever causal group is requested."""
 
@@ -1496,26 +1487,27 @@ def test_missing_map_coverage_rejects_candidate():
     assert engine.compression_count == 0
 
 
-def test_exhausted_auxiliary_map_never_calls_main_model():
+def test_exhausted_auxiliary_map_fails_closed():
     from agent.checkpoint_engine import CheckpointContextEngine
 
-    main_model = _FakeMainModel()
     auxiliary = _FakeAuxiliaryClient(RuntimeError("configured chain exhausted"))
-    engine = CheckpointContextEngine(
-        auxiliary_client=auxiliary,
-        main_model=main_model,
-    )
+    engine = CheckpointContextEngine(auxiliary_client=auxiliary)
     messages = [{"role": "user", "content": "hello"}]
 
     result = _compress(engine, messages)
 
     assert result is messages
-    assert engine._main_model is main_model
     assert auxiliary.calls
-    assert main_model.calls == 0
     assert engine.last_map_shards == ()
     assert engine.compression_count == 0
     assert "[digest unavailable]" not in str(result)
+
+
+def test_checkpoint_constructor_rejects_dead_main_model_seam():
+    from agent.checkpoint_engine import CheckpointContextEngine
+
+    with pytest.raises(TypeError):
+        CheckpointContextEngine(main_model=object())
 
 
 def test_checkpoint_map_concurrency_is_capped_at_two_by_default():
@@ -1963,18 +1955,14 @@ def test_invalid_semantic_reduce_output_rejects_candidate():
     assert engine.compression_count == 0
 
 
-def test_exhausted_semantic_reduce_fails_closed_without_main_model_fallback():
+def test_exhausted_semantic_reduce_fails_closed():
     from agent.checkpoint_engine import CheckpointContextEngine
 
-    main_model = _FakeMainModel()
     auxiliary = _FakeAuxiliaryClient(
         _map_response({"source_event_ids": [1], "facts": []}),
         StopIteration("semantic reducer exhausted"),
     )
-    engine = CheckpointContextEngine(
-        auxiliary_client=auxiliary,
-        main_model=main_model,
-    )
+    engine = CheckpointContextEngine(auxiliary_client=auxiliary)
     messages = [{"role": "user", "content": "finish the migration"}]
 
     result = _compress(engine, messages)
@@ -1986,7 +1974,6 @@ def test_exhausted_semantic_reduce_fails_closed_without_main_model_fallback():
     assert engine.last_checkpoint_text is None
     assert engine.last_reduced_state is None
     assert engine.compression_count == 0
-    assert main_model.calls == 0
 
 
 def test_full_wire_hard_cap_rejects_before_live_commit():

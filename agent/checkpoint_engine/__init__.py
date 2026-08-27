@@ -194,7 +194,6 @@ class CheckpointContextEngine(ContextEngine):
         self,
         *,
         auxiliary_client: Any = None,
-        main_model: Any = None,
         map_concurrency: Optional[int] = None,
         max_map_shards: Optional[int] = None,
         semantic_reducer: Optional[Callable[[ReducedState], Any]] = None,
@@ -207,7 +206,6 @@ class CheckpointContextEngine(ContextEngine):
     ) -> None:
         checkpoint_config = self._checkpoint_config()
         self._auxiliary_client = auxiliary_client
-        self._main_model = main_model
         self._map_concurrency = self._bounded_map_concurrency(map_concurrency)
         self._max_map_shards = self._bounded_max_map_shards(max_map_shards)
         self._semantic_reducer = semantic_reducer

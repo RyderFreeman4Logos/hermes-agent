@@ -1829,3 +1829,45 @@ class TestBedrockReasoningStaleFloor:
         from agent.chat_completion_helpers import _bedrock_reasoning_stale_floor
 
         assert _bedrock_reasoning_stale_floor(model_id) == expected
+
+
+def test_conversation_loop_stream_limit_is_partial_not_interrupted():
+    """A streamed turn reaches the provider and returns its partial text."""
+    from run_agent import AIAgent
+
+    with (
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="[REDACTED]",
+            base_url="https://example.com/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+    agent._cached_system_prompt = "You are helpful."
+    agent._use_prompt_caching = False
+    agent.compression_enabled = False
+    agent.save_trajectories = False
+    agent.client = MagicMock()
+    agent.client.chat.completions.create.return_value = iter([
+        _make_stream_chunk(content="partial", finish_reason="stop", model="test/model"),
+    ])
+    stream_callback = MagicMock()
+
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("go", stream_callback=stream_callback)
+
+    assert agent.client.chat.completions.create.called
+    assert result["completed"] is True
+    assert result["interrupted"] is False
+    assert result["final_response"] == "partial"
+    stream_callback.assert_called_once_with("partial")

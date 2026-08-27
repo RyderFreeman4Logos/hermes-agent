@@ -617,7 +617,24 @@ export type GatewayEvent =
   | { payload?: { text?: string }; session_id?: string; type: 'thinking.delta' }
   | { payload?: { kind?: string }; session_id?: string; type: 'reaction' }
   | { payload?: undefined; session_id?: string; type: 'message.start' }
-  | { payload?: { kind?: string; text?: string }; session_id?: string; type: 'status.update' }
+  | {
+      payload?: {
+        cache_record?: {
+          owner: 'tui_gateway'
+          pct?: number
+          prompt_tokens?: number
+          read_tokens?: number
+          request_index: number
+          session: string
+          state: 'hit' | 'miss' | 'unavailable' | 'cold_write'
+          timestamp: number
+        }
+        kind?: string
+        text?: string
+      }
+      session_id?: string
+      type: 'status.update'
+    }
   | {
       payload?: {
         id?: string
@@ -744,6 +761,12 @@ export type GatewayEvent =
   | {
       payload?: {
         billing?: BillingBlock
+        cache_info?: {
+          pct?: number
+          prompt_tokens?: number
+          read_tokens?: number
+          state: 'cold_write' | 'hit' | 'miss' | 'unavailable'
+        }
         failure_reason?: string
         reasoning?: string
         rendered?: string

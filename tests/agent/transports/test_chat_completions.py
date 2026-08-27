@@ -146,6 +146,23 @@ class TestChatCompletionsBasic:
         msgs = [{"role": "user", "content": "hi"}]
         assert transport.convert_messages(msgs) is msgs
 
+    def test_build_kwargs_rejects_late_system_message_on_strict_wire(self, transport):
+        """Reproduce the strict Chat Completions 400 at the wire boundary."""
+        payload = transport.build_kwargs(
+            model="test/model",
+            messages=[
+                {"role": "system", "content": "stable instructions"},
+                {"role": "user", "content": "hello"},
+                {"role": "system", "content": "[Agent loop timing]"},
+            ],
+        )
+        if any(message.get("role") == "system" for message in payload["messages"][1:]):
+            raise ValueError("HTTP 400: System message must be at the beginning.")
+        assert payload["messages"][-1] == {
+            "role": "user",
+            "content": "[Agent loop timing]",
+        }
+
     def test_convert_messages_strips_internal_scaffolding_markers(self, transport):
         """Hermes-internal ``_``-prefixed markers must never reach the wire.
 

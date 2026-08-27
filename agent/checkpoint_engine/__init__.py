@@ -562,12 +562,17 @@ class CheckpointContextEngine(ContextEngine):
     @classmethod
     def _is_new_task(cls, text: str) -> bool:
         lowered = cls._normalized_user_text(text)
-        return (
-            "new task:" in lowered
-            or lowered.startswith("ignore the ")
-            or "ignore the previous" in lowered
-            or lowered.startswith("instead, ")
-            or "forget the previous" in lowered
+        return "new task:" in lowered or lowered.startswith(
+            (
+                "cancel the current task",
+                "cancel the previous task",
+                "forget the current task",
+                "forget the previous task",
+                "ignore the current task",
+                "ignore the previous task",
+                "replace the current task",
+                "replace the previous task",
+            )
         )
 
     @classmethod

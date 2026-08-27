@@ -2223,6 +2223,59 @@ def test_plain_imperative_correction_preserves_root_across_a_long_tail():
     ]
 
 
+@pytest.mark.parametrize(
+    "correction",
+    (
+        "Instead, use click.",
+        "Ignore the previous color choice; use blue.",
+    ),
+)
+def test_scoped_correction_preserves_root_across_a_long_tail(correction):
+    engine = load_context_engine("checkpoint")
+    assert engine is not None
+    messages = [{"role": "user", "content": "Implement feature"}]
+    messages.extend(
+        {"role": "assistant", "content": f"status update {index}"}
+        for index in range(40)
+    )
+    messages.append({"role": "user", "content": correction})
+
+    lanes = engine._extract_deterministic_lanes(
+        messages, _test_source_event_ids(messages)
+    )
+
+    assert lanes.active_intent is not None
+    assert lanes.active_intent.event_indices == (0, 41)
+    assert lanes.active_intent.content.splitlines() == ["Implement feature", correction]
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    (
+        "New task: document the public API.",
+        "Cancel the previous task; document the public API.",
+        "Replace the previous task with documenting the public API.",
+    ),
+)
+def test_explicit_whole_task_reset_drops_root_across_a_long_tail(replacement):
+    engine = load_context_engine("checkpoint")
+    assert engine is not None
+    messages = [{"role": "user", "content": "Implement feature"}]
+    messages.extend(
+        {"role": "assistant", "content": f"status update {index}"}
+        for index in range(40)
+    )
+    messages.append({"role": "user", "content": replacement})
+
+    lanes = engine._extract_deterministic_lanes(
+        messages, _test_source_event_ids(messages)
+    )
+
+    assert lanes.active_intent is not None
+    assert lanes.active_intent.event_indices == (41,)
+    assert lanes.active_intent.content == replacement
+
+
 def test_corrections_steer_and_supersession_stay_on_intent_lane():
     engine = load_context_engine("checkpoint")
     assert engine is not None

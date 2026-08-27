@@ -66,7 +66,7 @@ immutable raw session events
         ├── causal shard plan            (no LLM)
         ├── cheap-model typed Map
         ├── deterministic Reduce         (no LLM)
-        ├── small semantic Reduce        (cheap model)
+        ├── sourced semantic selection   (cheap model; ids only)
         └── full-wire budget check       (no LLM)
                 │
                 ▼
@@ -181,14 +181,17 @@ preflight
   → causal shard plan (8K–16K, never split I-8 groups)
   → bounded parallel typed Map (concurrency 2, configured aux only)
   → deterministic Reduce (authority, supersession, action state, dedup)
-  → cheap semantic Reduce (typed state → 4K–8K continuity checkpoint)
+  → cheap semantic selection (validated ids → deterministic checkpoint)
   → full-wire measurement + degradation order
   → CAS commit or abort (live session untouched on abort)
 ```
 
-Deterministic stages have no LLM. Map/semantic Reduce use the configured
-auxiliary chain. There is **no** separate LLM auditor and **no** repair
-pass in v1: deterministic validation + I-12 is the gate; failure aborts.
+Deterministic stages have no LLM. Map/semantic selection use the configured
+auxiliary chain. Semantic output may select validated source ids but may not
+add prose; the checkpoint renderer formats the typed records deterministically.
+Unsourced actions render as `blocked` and never enter the plan lane. There is
+**no** separate LLM auditor and **no** repair pass in v1: deterministic
+validation + I-12 is the gate; failure aborts.
 
 Degradation order before reject:
 

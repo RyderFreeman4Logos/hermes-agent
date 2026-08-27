@@ -52,7 +52,7 @@ _CHECKPOINT_HISTORY_PREFIX = (
 _CHECKPOINT_HISTORY_SUFFIX = "\nCHECKPOINT>>>"
 _AUTO_COMPRESSION_COOLDOWN_SECONDS = 60.0
 _ACTION_STATES = frozenset(
-    {"planned", "issued", "running", "succeeded", "failed", "unknown"}
+    {"planned", "issued", "running", "succeeded", "failed", "unknown", "blocked"}
 )
 _TERMINAL_ACTION_STATES = frozenset({"succeeded", "failed", "unknown"})
 
@@ -1331,6 +1331,18 @@ class CheckpointContextEngine(ContextEngine):
         records: Dict[str, MapFact] = {}
         for shard in shards:
             for fact in sorted(shard.facts, key=cls._fact_position):
+                if not fact.source_event_ids:
+                    if fact.action_state is None:
+                        continue
+                    fact = MapFact(
+                        fact.kind,
+                        fact.text,
+                        (),
+                        True,
+                        fact.identity,
+                        fact.supersedes,
+                        "blocked",
+                    )
                 identity = cls._fact_identity(fact)
                 for superseded in fact.supersedes:
                     records.pop(superseded, None)
@@ -1389,9 +1401,9 @@ class CheckpointContextEngine(ContextEngine):
             {
                 "role": "system",
                 "content": (
-                    "Write one concise continuity checkpoint from this typed state. "
-                    "Keep active intent, trusted effects, verification, and source ids. "
-                    "Plans are not effects. Return text only. Do not call tools."
+                    "Select the validated typed records needed for continuity. "
+                    "Return only JSON with exactly source_event_ids, using only ids "
+                    "present in the typed state. Do not generate prose or call tools."
                 ),
             },
             {
@@ -1420,8 +1432,25 @@ class CheckpointContextEngine(ContextEngine):
             return None
         if not isinstance(candidate, str):
             return None
-        checkpoint = candidate.strip()
-        return checkpoint or None
+        try:
+            payload = json.loads(candidate)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(payload, dict) or set(payload) != {"source_event_ids"}:
+            return None
+        selected = self._event_ids(payload["source_event_ids"])
+        available = {
+            event_id
+            for fact in state.facts
+            for event_id in fact.source_event_ids
+        }
+        if state.active_intent is not None:
+            available.update(state.active_intent.event_indices)
+        for effect in state.effects:
+            available.update(effect.event_indices)
+        if not selected or not set(selected) <= available:
+            return None
+        return f"Validated historical source events: {','.join(map(str, selected))}."
 
     @staticmethod
     def _source_reference(fact: MapFact) -> str:

@@ -326,8 +326,8 @@ def test_live_replay_is_idempotent_but_later_events_compact():
 
     wrappers = [
         message for message in replay
-        if message.get("role") == "system"
-        and "<<<CHECKPOINT\n" in message.get("content", "")
+        if message.get("role") == "assistant"
+        and "<<<CHECKPOINT\n" in str(message.get("content", ""))
     ]
     replay_effects = _effect_lines(replay)
     assert replay == first
@@ -368,9 +368,9 @@ def test_live_replay_is_idempotent_but_later_events_compact():
     assert compacted != later
     assert compacted[-1] == later[-1]
     assert sum(
-        "<<<CHECKPOINT\n" in message.get("content", "")
+        "<<<CHECKPOINT\n" in str(message.get("content", ""))
         for message in compacted
-        if message.get("role") == "system"
+        if message.get("role") == "assistant"
     ) == 1
     later_effects = _effect_lines(compacted)
     assert len(later_effects) == 2
@@ -1347,13 +1347,17 @@ def test_semantic_reduce_builds_a_shadow_candidate_without_a_new_user_turn():
 
     reduced_states = []
     engine = CheckpointContextEngine(
-        auxiliary_client=_FakeAuxiliaryClient(_map_response({"source_event_ids": [0], "facts": []})),
+        auxiliary_client=_EchoMapClient(),
         semantic_reducer=lambda state: reduced_states.append(state) or "Continue from the verified state.",
         mode="shadow",
         token_counter=lambda _value: 1,
         output_reserve_tokens=0,
     )
-    messages = [{"role": "user", "content": "finish the migration"}]
+    messages = [
+        {"role": "user", "content": "completed request"},
+        {"role": "assistant", "content": "completed response"},
+        {"role": "user", "content": "finish the migration"},
+    ]
 
     result = engine.compress(messages)
 
@@ -1365,7 +1369,7 @@ def test_semantic_reduce_builds_a_shadow_candidate_without_a_new_user_turn():
     assert engine.last_wire_tokens is not None
     assert engine.last_wire_tokens > 0
     assert engine.last_map_shards
-    assert [shard.source_event_ids for shard in engine.last_map_shards] == [(0,)]
+    assert [shard.source_event_ids for shard in engine.last_map_shards] == [(0, 1, 2)]
     assert engine.last_map_externalized_groups == ()
     assert engine.last_reduced_state is reduced_states[0]
     assert engine.last_degradation_steps == ()
@@ -1483,6 +1487,8 @@ def test_live_mode_commits_only_a_valid_under_cap_projection():
     )
     messages = [
         {"role": "system", "content": "sys"},
+        {"role": "user", "content": "completed request"},
+        {"role": "assistant", "content": "completed response"},
         {"role": "user", "content": "finish the migration"},
     ]
 
@@ -1805,6 +1811,8 @@ def test_canonical_prefix_stays_first_and_unmodified():
     messages = [
         {"role": "system", "content": "canonical system"},
         {"role": "developer", "content": "canonical developer"},
+        {"role": "user", "content": "completed request"},
+        {"role": "assistant", "content": "completed response"},
         {"role": "user", "content": "finish the migration"},
     ]
 
@@ -1816,27 +1824,46 @@ def test_canonical_prefix_stays_first_and_unmodified():
     assert result[-1] == messages[-1]
 
 
-def test_checkpoint_is_historical_data_not_unqualified_system():
+def test_checkpoint_projection_is_non_authoritative_provider_valid_and_causal():
     messages = [
         {"role": "system", "content": "canonical system"},
-        {"role": "user", "content": "finish the migration"},
+        {"role": "developer", "content": "canonical developer"},
+        {"role": "user", "content": "Previous task"},
+        {"role": "assistant", "content": "Done."},
+        {"role": "user", "content": "Implement feature"},
+        {"role": "assistant", "content": "Working."},
+        {"role": "assistant", "content": "Still working."},
+        {"role": "user", "content": "Also do not modify config files."},
+        {"role": "user", "content": "/steer Keep the patch minimal."},
     ]
 
     result = _live_projection(messages, semantic="Continue from the verified state.")
 
-    assert result[0] == {"role": "system", "content": "canonical system"}
+    assert result[:2] == messages[:2]
+    body = result[2:]
     checkpoint_msgs = [
         message
-        for message in result[1:]
+        for message in body
         if "Continue from the verified state." in str(message.get("content", ""))
     ]
     assert checkpoint_msgs
-    for message in checkpoint_msgs:
-        assert message.get("role") != "system" or "historical" in str(message.get("content", "")).lower()
-        assert message.get("content") != "Continue from the verified state."
-        assert "historical" in str(message.get("content", "")).lower()
-    assert result[-1]["role"] == "user"
-    assert result[-1]["content"] == "finish the migration"
+    assert all(message["role"] == "assistant" for message in checkpoint_msgs)
+    assert all(
+        previous["role"] != current["role"]
+        for previous, current in zip(body, body[1:])
+    )
+    assert body[0]["role"] == "user"
+    assert body[-1]["role"] == "user"
+    assert [line for line in body[-1]["content"].splitlines() if line] == [
+        "Implement feature",
+        "Also do not modify config files.",
+        "/steer Keep the patch minimal.",
+    ]
+    assert all(
+        any(previous["role"] == "user" for previous in body[:index])
+        for index, message in enumerate(body)
+        if message["role"] in {"assistant", "tool"}
+    )
 
 
 def test_adversarial_ignore_instructions_stay_historical_after_compaction():
@@ -1873,7 +1900,7 @@ def test_adversarial_ignore_instructions_stay_historical_after_compaction():
     wrapped = [
         message
         for message in poison_hits
-        if message.get("role") == "system"
+        if message.get("role") == "assistant"
     ]
     assert wrapped
     for message in wrapped:

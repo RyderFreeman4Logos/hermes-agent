@@ -1603,31 +1603,47 @@ class CheckpointContextEngine(ContextEngine):
                 and message["content"].endswith(_CHECKPOINT_HISTORY_SUFFIX)
             )
         ]
-        tail = [
-            dict(messages[index])
-            for group in tail_groups
-            for index in group.event_indices
-        ]
+        tail = []
+        for group in tail_groups:
+            for index in group.event_indices:
+                message = dict(messages[index])
+                content = message.get("content")
+                if isinstance(content, str) and _CHECKPOINT_HISTORY_PREFIX in content:
+                    content = content.split(_CHECKPOINT_HISTORY_PREFIX, 1)[0].rstrip()
+                    if not content:
+                        continue
+                    message["content"] = content
+                tail.append(message)
         while tail and tail[-1].get("role") == "user":
-            tail_groups = tail_groups[:-1]
-            tail = [
-                dict(messages[index])
-                for group in tail_groups
-                for index in group.event_indices
-            ]
-        active = [dict(messages[index]) for index in active_intent.event_indices]
-        return [
-            *prefix,
-            {
-                "role": "system",
-                "content": (
-                    f"{_CHECKPOINT_HISTORY_PREFIX}{checkpoint}"
-                    f"{_CHECKPOINT_HISTORY_SUFFIX}"
-                ),
-            },
-            *tail,
-            *active,
+            tail.pop()
+        active_start = min(active_intent.event_indices)
+        active = [
+            dict(message)
+            for message in messages[active_start:]
+            if message.get("role") == "user"
         ]
+        checkpoint_message = {
+            "role": "assistant",
+            "content": (
+                f"{_CHECKPOINT_HISTORY_PREFIX}{checkpoint}"
+                f"{_CHECKPOINT_HISTORY_SUFFIX}"
+            ),
+        }
+        if tail:
+            body = (
+                [*tail, checkpoint_message, *active]
+                if tail[0].get("role") == "user"
+                else [active[0], *tail, checkpoint_message, *active[1:]]
+            )
+        elif len(active) > 1:
+            body = [active[0], checkpoint_message, *active[1:]]
+        else:
+            body = active
+        if len(body) > 1:
+            from agent.agent_runtime_helpers import repair_message_sequence
+
+            repair_message_sequence(None, body)
+        return [*prefix, *body]
 
     def _render_candidate(
         self,

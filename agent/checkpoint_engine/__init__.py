@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 import hashlib
 import json
 import subprocess
+from threading import RLock
 import time
 from typing import Any, Callable, Dict, List, Optional
 
@@ -33,6 +35,7 @@ _MAP_SHARD_TARGET_INPUT_TOKENS = 12_000
 _MAP_SHARD_MAX_INPUT_TOKENS = 16_000
 _MAP_MAX_SHARDS_CAP = 32
 _DEFAULT_MAX_MAP_SHARDS = 32
+_MAP_SHARD_CACHE_MAX = 128
 _MAP_TOTAL_INPUT_TOKENS = _MAP_SHARD_TARGET_INPUT_TOKENS * _DEFAULT_MAX_MAP_SHARDS
 _MAP_TOTAL_OUTPUT_TOKENS = _MAP_MAX_TOKENS * _DEFAULT_MAX_MAP_SHARDS
 _SEMANTIC_REDUCE_MAX_TOKENS = 2048
@@ -265,7 +268,9 @@ class CheckpointContextEngine(ContextEngine):
         self._verify_compaction_cleared_threshold = False
         self.awaiting_real_usage_after_compression = False
         self.last_map_shards: tuple[MapShard, ...] = ()
-        self._map_shard_cache: Dict[tuple[str, ...], MapShard] = {}
+        self._map_shard_cache: OrderedDict[tuple[str, ...], MapShard] = OrderedDict()
+        # ponytail: one lock keeps bounded cache bookkeeping simple; shard locks if throughput matters
+        self._map_shard_cache_lock = RLock()
         self.last_map_externalized_groups: tuple[CausalGroup, ...] = ()
         self.last_reduced_state: Optional[ReducedState] = None
         self.last_checkpoint_text: Optional[str] = None
@@ -275,6 +280,10 @@ class CheckpointContextEngine(ContextEngine):
         self._session_db = None
         self._session_id = ""
         self._commit_snapshot: Optional[CheckpointCommitSnapshot] = None
+
+    def _clear_map_shard_cache(self) -> None:
+        with self._map_shard_cache_lock:
+            self._map_shard_cache.clear()
 
     @staticmethod
     def _checkpoint_config() -> Dict[str, Any]:
@@ -387,6 +396,7 @@ class CheckpointContextEngine(ContextEngine):
         provider: str = "",
         api_mode: str = "",
     ) -> None:
+        self._clear_map_shard_cache()
         self.model = model
         self.base_url = base_url
         self.api_key = api_key
@@ -404,18 +414,24 @@ class CheckpointContextEngine(ContextEngine):
 
     def on_session_reset(self) -> None:
         super().on_session_reset()
+        self._clear_map_shard_cache()
         self._clear_automatic_cooldown()
         self.last_request_tokens = 0
         self.last_trigger_reason = None
 
     def bind_session_state(self, session_db: Any = None, session_id: str = "") -> None:
         """Bind the public durable-session seam supplied by the host."""
+        self._clear_map_shard_cache()
         self._session_db = session_db
         self._session_id = session_id or ""
         self._commit_snapshot = None
 
     def on_session_start(self, session_id: str, **kwargs: Any) -> None:
         self.bind_session_state(kwargs.get("session_db", self._session_db), session_id)
+
+    def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
+        super().on_session_end(session_id, messages)
+        self._clear_map_shard_cache()
 
     def should_compress(self, prompt_tokens: Optional[int] = None) -> bool:
         return self.should_compress_info(prompt_tokens)[0]
@@ -1374,11 +1390,16 @@ class CheckpointContextEngine(ContextEngine):
             cache_key = self._map_shard_cache_key(
                 messages, group, source_event_ids
             )
-            cached = self._map_shard_cache.get(cache_key)
+            with self._map_shard_cache_lock:
+                cached = self._map_shard_cache.get(cache_key)
+                if cached is not None:
+                    self._map_shard_cache.move_to_end(cache_key)
             if cached is not None:
                 if self._is_valid_map_shard(cached, group, source_event_ids):
                     return cached
-                self._map_shard_cache.pop(cache_key, None)
+                with self._map_shard_cache_lock:
+                    if self._map_shard_cache.get(cache_key) is cached:
+                        self._map_shard_cache.pop(cache_key, None)
             shard = self._parse_map_shard(
                 self._call_map(
                     self._map_prompt(messages, group, source_event_ids)
@@ -1392,7 +1413,11 @@ class CheckpointContextEngine(ContextEngine):
             shard, group, source_event_ids
         ):
             return None
-        self._map_shard_cache[cache_key] = shard
+        with self._map_shard_cache_lock:
+            self._map_shard_cache[cache_key] = shard
+            self._map_shard_cache.move_to_end(cache_key)
+            while len(self._map_shard_cache) > _MAP_SHARD_CACHE_MAX:
+                self._map_shard_cache.popitem(last=False)
         return shard
 
     def _map_shards(

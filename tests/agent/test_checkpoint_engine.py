@@ -1211,6 +1211,55 @@ def test_map_cache_rejects_invalid_entries_and_keys_include_all_fingerprints(
     assert len(auxiliary.calls) == 6
 
 
+def test_map_cache_evicts_oldest_entries(monkeypatch):
+    import agent.checkpoint_engine as checkpoint_engine
+    from agent.checkpoint_engine import CausalGroup, CheckpointContextEngine
+
+    monkeypatch.setattr(checkpoint_engine, "_MAP_SHARD_CACHE_MAX", 2, raising=False)
+    engine = CheckpointContextEngine(auxiliary_client=_EchoMapClient())
+    messages = [
+        {"role": "user", "content": "first"},
+        {"role": "user", "content": "second"},
+        {"role": "user", "content": "third"},
+    ]
+    source_event_ids = _test_source_event_ids(messages)
+    groups = [CausalGroup((index,)) for index in range(len(messages))]
+
+    for group in groups:
+        assert engine._map_group(messages, group, source_event_ids) is not None
+
+    keys = [engine._map_shard_cache_key(messages, group, source_event_ids) for group in groups]
+    assert len(engine._map_shard_cache) == 2
+    assert keys[0] not in engine._map_shard_cache
+    assert keys[1] in engine._map_shard_cache
+    assert keys[2] in engine._map_shard_cache
+
+
+def test_map_cache_is_cleared_at_session_boundaries():
+    from agent.checkpoint_engine import CausalGroup, CheckpointContextEngine
+
+    engine = CheckpointContextEngine(auxiliary_client=_EchoMapClient())
+    messages = [{"role": "user", "content": "hello"}]
+    group = CausalGroup((0,))
+    source_event_ids = _test_source_event_ids(messages)
+    session_db = object()
+
+    engine.bind_session_state(session_db, "session-one")
+    assert engine._map_group(messages, group, source_event_ids) is not None
+    assert engine._map_shard_cache
+
+    engine.on_session_reset()
+    assert not engine._map_shard_cache
+
+    assert engine._map_group(messages, group, source_event_ids) is not None
+    engine.bind_session_state(session_db, "session-two")
+    assert not engine._map_shard_cache
+
+    assert engine._map_group(messages, group, source_event_ids) is not None
+    engine.on_session_end("session-two", messages)
+    assert not engine._map_shard_cache
+
+
 def test_map_tool_call_rejects_candidate():
     from agent.checkpoint_engine import CheckpointContextEngine
 
@@ -1786,7 +1835,7 @@ def test_full_wire_hard_cap_preserves_host_only_request_overhead(monkeypatch):
 
     assert _compress(engine, messages, current_tokens=100) is messages
     assert any(
-        kwargs.get("tools") == tools and kwargs.get("output_reserve_tokens") == 3
+        kwargs.get("tools") == tools and "output_reserve_tokens" not in kwargs
         for _request_messages, kwargs in calls
     )
     assert engine.compression_count == 0

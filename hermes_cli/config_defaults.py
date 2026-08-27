@@ -377,8 +377,8 @@ DEFAULT_CONFIG = {
         # Overflow keeps the retained partial, stamps status stream_payload_limit,
         # and leaves a continue path — it does not rewrite this host's yaml.
         "stream_payload_limit": {
-            "assistant_bytes": 128 * 1024,
-            "reasoning_bytes": 128 * 1024,
+            "assistant_bytes": 256 * 1024,
+            "reasoning_bytes": 256 * 1024,
         },
     },
 

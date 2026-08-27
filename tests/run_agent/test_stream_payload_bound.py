@@ -45,6 +45,8 @@ class _QueuedCodexClient:
 
 
 def _bound_notifications():
+    from agent.stream_payload_bound import DEFAULT_STREAM_PAYLOAD_BOUND_BYTES
+
     return [
         {
             "method": "turn/started",
@@ -55,7 +57,7 @@ def _bound_notifications():
         },
         {
             "method": "item/reasoning/delta",
-            "params": {"delta": "r" * 90_000},
+            "params": {"delta": "r" * (DEFAULT_STREAM_PAYLOAD_BOUND_BYTES - 41_072)},
         },
         {
             "method": "item/agentMessage/delta",
@@ -90,7 +92,7 @@ def test_live_writer_overflow_truncates_persists_status_and_continuation():
     )
     from run_agent import AIAgent
 
-    assert DEFAULT_STREAM_PAYLOAD_BOUND_BYTES < 148_197
+    assert DEFAULT_STREAM_PAYLOAD_BOUND_BYTES == 256 * 1024
 
     agent = AIAgent(
         api_key="test-key",
@@ -130,7 +132,27 @@ def test_live_writer_overflow_truncates_persists_status_and_continuation():
     assert last.get("status") == "stream_payload_limit"
 
 
+def test_default_stream_payload_limit_allows_131090_byte_assistant_delta():
+    from run_agent import AIAgent
+
+    payload = "x" * 131_090
+    agent = AIAgent(
+        api_key="test-key",
+        base_url="https://example.com/v1",
+        model="test/model",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    agent._claim_stream_writer()
+
+    assert agent._record_streamed_assistant_text(payload) is None
+    assert agent._current_streamed_assistant_text == payload
+    assert agent._stream_payload_limit_error is None
+
+
 def test_reasoning_then_visible_stream_bytes_are_monotonic():
+    from agent.stream_payload_bound import DEFAULT_STREAM_PAYLOAD_BOUND_BYTES
     from run_agent import AIAgent
 
     agent = AIAgent(
@@ -142,17 +164,18 @@ def test_reasoning_then_visible_stream_bytes_are_monotonic():
         skip_memory=True,
     )
     agent._claim_stream_writer()
-    agent._fire_reasoning_delta("r" * 90_000)
+    agent._fire_reasoning_delta("r" * (DEFAULT_STREAM_PAYLOAD_BOUND_BYTES - 41_072))
 
     agent._record_streamed_assistant_text("v" * 50_000)
 
-    assert agent._current_streamed_payload_bytes == 128 * 1024
+    assert agent._current_streamed_payload_bytes == DEFAULT_STREAM_PAYLOAD_BOUND_BYTES
     assert len(agent._current_streamed_assistant_text.encode("utf-8")) == 41_072
     assert agent._stream_payload_limit_error.status == "stream_payload_limit"
 
 
 def test_codex_app_server_bridge_truncates_aggregate_stream_bound():
     from agent.codex_runtime import make_codex_app_server_event_bridge
+    from agent.stream_payload_bound import DEFAULT_STREAM_PAYLOAD_BOUND_BYTES
     from run_agent import AIAgent
 
     agent = AIAgent(
@@ -165,12 +188,17 @@ def test_codex_app_server_bridge_truncates_aggregate_stream_bound():
     )
     agent._claim_stream_writer()
     bridge = make_codex_app_server_event_bridge(agent)
-    bridge({"method": "item/reasoning/delta", "params": {"delta": "r" * 90_000}})
+    bridge(
+        {
+            "method": "item/reasoning/delta",
+            "params": {"delta": "r" * (DEFAULT_STREAM_PAYLOAD_BOUND_BYTES - 41_072)},
+        }
+    )
 
     limit = bridge({"method": "item/agentMessage/delta", "params": {"delta": "v" * 50_000}})
 
     assert limit.status == "stream_payload_limit"
-    assert agent._current_streamed_payload_bytes == 128 * 1024
+    assert agent._current_streamed_payload_bytes == 256 * 1024
     assert len(agent._current_streamed_assistant_text.encode("utf-8")) == 41_072
 
 
@@ -323,8 +351,8 @@ def test_overflow_retains_partial_with_typed_stream_payload_limit():
     from run_agent import AIAgent
 
     limits = (DEFAULT_CONFIG.get("agent") or {}).get("stream_payload_limit") or {}
-    assert limits.get("assistant_bytes") == 128 * 1024
-    assert limits.get("reasoning_bytes") == 128 * 1024
+    assert limits.get("assistant_bytes") == 256 * 1024
+    assert limits.get("reasoning_bytes") == 256 * 1024
     assistant_bound, reasoning_bound = resolve_stream_payload_bounds()
     assert assistant_bound == limits["assistant_bytes"]
     assert reasoning_bound == limits["reasoning_bytes"]

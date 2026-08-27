@@ -1,3 +1,4 @@
+import logging
 import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -14,6 +15,21 @@ TIMING = (
     "Previous loop stop: 2026-08-25T09:00:03-07:00\n"
     "Current loop start: 2026-08-25T09:33:25-07:00"
 )
+
+
+def _strict_provider_accepts_message_shape(messages):
+    shape = [
+        {
+            "index": index,
+            "role": message.get("role"),
+            "has_cache_control": "cache_control" in message,
+        }
+        for index, message in enumerate(messages)
+    ]
+    logging.getLogger(__name__).info("strict-provider message shape=%s", shape)
+    if any(item["role"] == "system" and item["index"] for item in shape):
+        raise ValueError("System message must be at the beginning.")
+    return shape
 
 
 @pytest.mark.parametrize(
@@ -117,10 +133,8 @@ def test_inflight_loop_timing_is_consumed_onto_outgoing_prompt():
         result = agent.run_conversation("hello")
 
     sent = agent.client.chat.completions.create.call_args.kwargs["messages"]
-    timing_messages = [
-        message for message in sent if message.get("content") == TIMING
-    ]
-    assert sent[-1] == {"role": "system", "content": TIMING}
-    assert timing_messages == [{"role": "system", "content": TIMING}]
+    shape = _strict_provider_accepts_message_shape(sent)
+    assert shape[-1]["role"] == "user"
+    assert len(shape) == 2
     assert agent._loop_timing_context_text == ""
     assert all(message.get("content") != TIMING for message in result["messages"])

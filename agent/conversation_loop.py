@@ -148,6 +148,44 @@ def _take_loop_timing_context_text(agent: Any) -> str:
     return agent.__dict__.pop("_loop_timing_context_text", "") or ""
 
 
+def _append_loop_timing_context(agent: Any, api_messages: list) -> list:
+    """Append API-only timing without adding a non-leading system message."""
+    if not (timing := _take_loop_timing_context_text(agent)):
+        return api_messages
+    if agent.api_mode != "chat_completions":
+        api_messages.append({"role": "system", "content": timing})
+        return api_messages
+
+    # Strict Chat Completions providers reject a system row after the prompt.
+    # Reuse the existing machine-context carrier role and, when the request
+    # already ends in user content, extend that row to preserve alternation.
+    if not api_messages or api_messages[-1].get("role") != "user":
+        api_messages.append({"role": "user", "content": timing})
+        return api_messages
+
+    tail = api_messages[-1]
+    content = tail.get("content", "")
+    marker = tail.pop("cache_control", None)
+    if isinstance(content, str):
+        if marker is None:
+            tail["content"] = f"{content}\n\n{timing}" if content else timing
+        else:
+            tail["content"] = [
+                {"type": "text", "text": content, "cache_control": marker},
+                {"type": "text", "text": timing},
+            ]
+    elif isinstance(content, list):
+        tail["content"] = [*content, {"type": "text", "text": timing}]
+        if marker is not None:
+            for part in reversed(tail["content"][:-1]):
+                if isinstance(part, dict) and part.get("type") == "text":
+                    part["cache_control"] = marker
+                    break
+    else:
+        api_messages.append({"role": "user", "content": timing})
+    return api_messages
+
+
 # Scaffold marker used by _apply_active_turn_redirect and the ghost-row filter
 # in the api_messages loop. Module-level so both sites can never drift.
 _INTERRUPT_SCAFFOLD_MARKER = "[This response was interrupted by a user correction.]"
@@ -2531,10 +2569,8 @@ def run_conversation(
             api_messages = _initial_cache_plan.messages
             tools_for_api = _initial_cache_plan.tools
 
-        # Timing is API-only context. Append it after cache planning so it never
-        # receives a breakpoint or changes the stable cached prefix.
-        if _loop_timing_text := _take_loop_timing_context_text(agent):
-            api_messages.append({"role": "system", "content": _loop_timing_text})
+        # Timing is injected below, after cache redecoration, so strict Chat
+        # Completions providers never receive a non-leading system row.
 
         # Build a persistent-MoA request before measuring compression pressure.
         # MoA reference output is injected into the aggregator prompt, but it
@@ -2924,13 +2960,6 @@ def run_conversation(
                 # unless the active provider needs it) so the fallback request
                 # isn't sent with stale, primary-shaped reasoning fields.
                 agent._reapply_reasoning_echo_for_provider(api_messages)
-                # Consume runtime timing only while this request is being built.
-                # Cache planning skips trailing system entries, so it stays
-                # after the last breakpoint and carries no cache_control.
-                # A second take-and-clear is only for a late TUI write after the
-                # post-cache-plan consume; the same claimed value is never appended twice.
-                if timing_context := _take_loop_timing_context_text(agent):
-                    api_messages.append({"role": "system", "content": timing_context})
                 # Same story for prompt-cache decoration (#72626): try_activate_
                 # fallback refreshes the policy flags, but the decorated list
                 # still carries the primary's breakpoints (or none). Strip and
@@ -2944,6 +2973,9 @@ def run_conversation(
                         tools_for_api=tools_for_api,
                     )
                 )
+                # Keep timing outside cache redecoration; Chat Completions uses
+                # the existing request-only user carrier to preserve ordering.
+                api_messages = _append_loop_timing_context(agent, api_messages)
                 if tools_for_api == agent.tools:
                     api_kwargs = agent._build_api_kwargs(api_messages)
                 else:

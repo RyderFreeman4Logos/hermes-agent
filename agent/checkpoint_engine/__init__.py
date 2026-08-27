@@ -58,6 +58,8 @@ _ACTION_STATES = frozenset(
     {"planned", "issued", "running", "succeeded", "failed", "unknown", "blocked"}
 )
 _TERMINAL_ACTION_STATES = frozenset({"succeeded", "failed", "unknown"})
+_AUTHORITATIVE_MAP_KINDS = frozenset({"action", "constraint", "plan", "policy", "request", "todo"})
+_AUTHORITATIVE_ROLES = frozenset({"system", "developer", "user"})
 
 
 _ACK_ONLY = frozenset(
@@ -1288,6 +1290,44 @@ class CheckpointContextEngine(ContextEngine):
             )
         return MapShard(expected_source_ids, tuple(parsed_facts))
 
+    @classmethod
+    def _validate_map_shard_sources(
+        cls,
+        shard: MapShard,
+        messages: List[Dict[str, Any]],
+        group: CausalGroup,
+        source_event_ids: tuple[int, ...],
+    ) -> MapShard:
+        """Keep only facts exactly supported by cited row content and authority."""
+        rows = {
+            source_event_ids[index]: messages[index]
+            for index in group.event_indices
+        }
+        validated = []
+        for fact in shard.facts:
+            if not fact.source_event_ids:
+                validated.append(fact)
+                continue
+            probe = " ".join(fact.text.split()).casefold()
+            supporting = [
+                row
+                for event_id in fact.source_event_ids
+                if (row := rows.get(event_id)) is not None
+                and isinstance(row.get("content"), str)
+                and probe in " ".join(row["content"].split()).casefold()
+            ]
+            if not supporting:
+                continue
+            if fact.kind.casefold() == "verification" or fact.action_state in _TERMINAL_ACTION_STATES:
+                continue
+            if (
+                fact.kind.casefold() in _AUTHORITATIVE_MAP_KINDS
+                or fact.action_state is not None
+            ) and not any(row.get("role") in _AUTHORITATIVE_ROLES for row in supporting):
+                continue
+            validated.append(fact)
+        return MapShard(shard.source_event_ids, tuple(validated))
+
     @staticmethod
     def _map_shard_cache_key(
         messages: List[Dict[str, Any]],
@@ -1407,6 +1447,10 @@ class CheckpointContextEngine(ContextEngine):
                 group,
                 source_event_ids,
             )
+            if shard is not None:
+                shard = self._validate_map_shard_sources(
+                    shard, messages, group, source_event_ids
+                )
         except Exception:
             return None
         if shard is None or not self._is_valid_map_shard(

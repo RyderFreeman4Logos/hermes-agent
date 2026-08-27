@@ -16,17 +16,20 @@ Improvements over v2:
   - Richer tool call/result detail in summarizer input
 """
 
+import contextvars
 import hashlib
 import json
 import logging
 import sqlite3
 import re
+import threading
 import time
 import uuid
 from typing import Any, Dict, List, Optional
 
 from agent.auxiliary_client import (
     AuxiliaryExplicitCancellation,
+    _SelectedRouteInfo,
     _is_connection_error,
     aux_interrupt_protection,
     call_llm,
@@ -4436,9 +4439,10 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
 
         Splits the region into ``_LEAN_DIGEST_CHUNK_CHARS`` chunks (capped at
         ``_LEAN_DIGEST_MAX_CHUNKS`` — beyond that, earliest chunks are merged
-        coarser) and digests each with the compression LLM. Any chunk failure
-        degrades to a placeholder naming the message range; the whole call
-        never raises. Reuse the first selected fallback route for siblings.
+        coarser) and digests each with the compression LLM. Ordinary chunk
+        failures degrade to placeholders; explicit cancellation and process
+        control exceptions propagate. Chunks run concurrently on the same
+        transport as the main summary; concatenated output stays in order.
         """
         text = _serialize_turns_for_digest(
             turns, getattr(self, "_lean_pristine_tools", None),
@@ -4450,13 +4454,16 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         if n_chunks > _LEAN_DIGEST_MAX_CHUNKS:
             chunk_size = (len(text) + _LEAN_DIGEST_MAX_CHUNKS - 1) // _LEAN_DIGEST_MAX_CHUNKS
             n_chunks = _LEAN_DIGEST_MAX_CHUNKS
-        jobs = [
-            (ci, text[ci * chunk_size:(ci + 1) * chunk_size])
-            for ci in range(n_chunks)
-            if text[ci * chunk_size:(ci + 1) * chunk_size].strip()
-        ]
+
+        jobs: list[tuple[int, str]] = []
+        for ci in range(n_chunks):
+            segment = text[ci * chunk_size:(ci + 1) * chunk_size]
+            if segment.strip():
+                jobs.append((ci, segment))
         if not jobs:
             return ""
+
+        hard_cancelled = threading.Event()
 
         def _unavailable(ci: int, exc: BaseException | None = None) -> str:
             if exc is not None:
@@ -4474,59 +4481,132 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             route: dict[str, Any] | None = None,
             route_info: dict[str, Any] | None = None,
         ) -> str:
-            try:
-                from agent.auxiliary_client import call_llm
+            from agent.auxiliary_client import call_llm
 
-                call_kwargs = {
-                    "messages": [{
-                        "role": "user",
-                        "content": _LEAN_DIGEST_PROMPT.format(segment=segment),
-                    }],
-                    "task": "compression",
-                    "max_tokens": _LEAN_DIGEST_MAX_TOKENS,
-                }
-                if route:
-                    call_kwargs.update(route)
-                elif route_info is not None:
-                    call_kwargs["route_info"] = route_info
-                resp = call_llm(**call_kwargs)
-                body = (
-                    resp.choices[0].message.content
-                    if hasattr(resp, "choices") else str(resp)
-                ) or ""
-                from agent.agent_runtime_helpers import strip_think_blocks
+            call_kwargs = {
+                "messages": [{
+                    "role": "user",
+                    "content": _LEAN_DIGEST_PROMPT.format(segment=segment),
+                }],
+                "task": "compression",
+                "max_tokens": _LEAN_DIGEST_MAX_TOKENS,
+            }
+            if route:
+                call_kwargs.update(route)
+            elif route_info is not None:
+                call_kwargs["route_info"] = route_info
+            for attempt in range(2):
+                try:
+                    if hard_cancelled.is_set():
+                        raise AuxiliaryExplicitCancellation()
+                    resp = call_llm(**call_kwargs)
+                    body = (
+                        resp.choices[0].message.content
+                        if hasattr(resp, "choices") else str(resp)
+                    ) or ""
+                    from agent.agent_runtime_helpers import strip_think_blocks
 
-                body = strip_think_blocks(None, body).strip()
-            except BaseException as exc:
-                if isinstance(exc, (KeyboardInterrupt, SystemExit)):
-                    raise
-                return _unavailable(ci, exc)
-            return f"### Segment {ci + 1}/{n_chunks}\n{body}"
+                    body = strip_think_blocks(None, body).strip()
+                    if not body:
+                        raise RuntimeError("Auxiliary compression returned an empty response")
+                    if route_info is not None:
+                        route_info["_route_selected"] = True
+                    return f"### Segment {ci + 1}/{n_chunks}\n{body}"
+                except BaseException as exc:
+                    if isinstance(
+                        exc,
+                        (AuxiliaryExplicitCancellation, KeyboardInterrupt, SystemExit),
+                    ):
+                        if isinstance(exc, AuxiliaryExplicitCancellation):
+                            hard_cancelled.set()
+                        raise
+                    if (
+                        attempt == 0
+                        and isinstance(exc, Exception)
+                        and not _is_summary_access_or_quota_error(exc)
+                    ):
+                        logger.warning(
+                            "lean chunk digest %d/%d failed; retrying candidate: %s",
+                            ci + 1, n_chunks, exc,
+                        )
+                        continue
+                    return _unavailable(ci, exc)
+            return _unavailable(ci)
 
+        from concurrent.futures import ThreadPoolExecutor
+        from agent.auxiliary_client import _get_task_max_concurrency
+
+        # Probe one chunk through the normal resolver so sibling chunks reuse
+        # the selected fallback route instead of re-hitting a failed primary.
         first_ci, first_segment = jobs[0]
-        route_info: dict[str, Any] = {}
+        route_info = _SelectedRouteInfo()
         first_digest = _digest_one(
             first_ci, first_segment, route_info=route_info,
         )
-        provider = str(route_info.get("provider") or "").strip()
-        model = str(route_info.get("model") or "").strip()
         selected_route: dict[str, Any] | None = None
-        if provider and model and model not in {"default", "unknown"}:
+        provider = str(route_info.get("provider", "")).strip()
+        model = str(route_info.get("model", "")).strip()
+        if route_info.get("_route_selected") and provider and model and model not in {"default", "unknown"}:
             selected_route = {"provider": provider, "model": model}
-            fallback_label = route_info.get("fallback_label")
+            fallback_label = str(route_info.get("fallback_label") or "")
             if fallback_label:
-                selected_route["route_info"] = {
-                    "fallback_label": str(fallback_label),
-                }
+                selected_route["route_info"] = {"fallback_label": fallback_label}
+            if route_info.fallback_route is not None:
+                selected_route = {"route_info": route_info}
+        elif route_info.get("_failed_fallback_labels"):
+            # Keep the failed-candidate exclusions for the one retry and
+            # siblings, but do not carry an unaccepted route as selected.
+            selected_route = {"route_info": dict(route_info)}
 
-        digests = [first_digest]
-        for ci, segment in jobs[1:]:
-            try:
-                digests.append(_digest_one(ci, segment, route=selected_route))
-            except BaseException as exc:
-                if isinstance(exc, (KeyboardInterrupt, SystemExit)):
-                    raise
-                digests.append(_unavailable(ci, exc))
+        configured = _get_task_max_concurrency("compression")
+        remaining = jobs[1:]
+        if not remaining:
+            digests = [first_digest]
+        else:
+            workers = len(remaining) if configured is None else min(configured, len(remaining))
+            # ponytail: pool size capped at _LEAN_DIGEST_MAX_CHUNKS; raise only if
+            # the chunk ceiling itself is lifted.
+            workers = max(1, min(workers, _LEAN_DIGEST_MAX_CHUNKS))
+            if workers == 1 or len(remaining) == 1:
+                sibling_digests = [
+                    _digest_one(ci, segment, route=selected_route)
+                    for ci, segment in remaining
+                ]
+            else:
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    futures = [
+                        pool.submit(
+                            contextvars.copy_context().run,
+                            _digest_one,
+                            ci,
+                            segment,
+                            route=selected_route,
+                        )
+                        for ci, segment in remaining
+                    ]
+
+                    def _cancel_pending_on_hard_cancel(done):
+                        if done.cancelled():
+                            return
+                        if isinstance(done.exception(), AuxiliaryExplicitCancellation):
+                            hard_cancelled.set()
+                            for pending in futures:
+                                pending.cancel()
+
+                    for future in futures:
+                        future.add_done_callback(_cancel_pending_on_hard_cancel)
+                    sibling_digests = []
+                    for fut, (ci, _segment) in zip(futures, remaining):
+                        try:
+                            sibling_digests.append(fut.result())
+                        except BaseException as exc:
+                            if isinstance(
+                                exc,
+                                (AuxiliaryExplicitCancellation, KeyboardInterrupt, SystemExit),
+                            ):
+                                raise
+                            sibling_digests.append(_unavailable(ci, exc))
+            digests = [first_digest, *sibling_digests]
         return (
             "\n\n" + _LEAN_DIGESTS_HEADING + "\n"
             + "\n\n".join(digests)
@@ -4548,9 +4628,17 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
                 _build_anchor_index(turns_to_summarize)
             )
         if _LEAN_DIGESTS_HEADING not in summary:
-            summary += _redact_compaction_text(
-                self._build_chunk_digests(turns_to_summarize)
-            )
+            try:
+                digest_text = self._build_chunk_digests(turns_to_summarize)
+            except BaseException as exc:
+                if isinstance(
+                    exc,
+                    (AuxiliaryExplicitCancellation, KeyboardInterrupt, SystemExit),
+                ):
+                    raise
+                logger.warning("lean chunk digest map failed: %s", exc)
+                digest_text = ""
+            summary += _redact_compaction_text(digest_text)
         if _LEAN_USER_MESSAGES_HEADING not in summary:
             summary += _redact_compaction_text(
                 _build_verbatim_user_section(turns_to_summarize)

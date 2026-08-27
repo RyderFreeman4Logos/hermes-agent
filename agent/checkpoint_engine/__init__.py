@@ -87,6 +87,10 @@ _CONSTRAINT_LINE_PREFIXES = (
     "constraint:",
     "hard constraint",
 )
+_CHECKPOINT_BASE64_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/="
+)
+_CHECKPOINT_DENSE_MARKERS = ("```", "{\"", "{\\\"", "\":", "[{")
 
 
 @dataclass(frozen=True)
@@ -1616,7 +1620,43 @@ class CheckpointContextEngine(ContextEngine):
         return semantic_checkpoint if not details else f"{semantic_checkpoint}\n\n" + "\n".join(details)
 
     @staticmethod
-    def _rough_token_count(value: Any) -> int:
+    def _checkpoint_text_token_count(text: str) -> int:
+        if not text:
+            return 0
+        if not text.isascii():
+            return len(text)
+        linear = (len(text) + 3) // 4
+        dense = (
+            (len(text) + 1) // 2
+            if any(marker in text for marker in _CHECKPOINT_DENSE_MARKERS)
+            else linear
+        )
+        longest_encoded_run = 0
+        run_length = 0
+        run_has_marker = False
+        for character in text:
+            if character in _CHECKPOINT_BASE64_CHARS:
+                run_length += 1
+                run_has_marker |= character in "0123456789+/="
+                continue
+            if run_has_marker and run_length >= 64:
+                longest_encoded_run = max(longest_encoded_run, run_length)
+            run_length = 0
+            run_has_marker = False
+        if run_has_marker and run_length >= 64:
+            longest_encoded_run = max(longest_encoded_run, run_length)
+        return max(linear, dense, longest_encoded_run)
+
+    @classmethod
+    def _checkpoint_content_delta(cls, value: Any) -> int:
+        try:
+            text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError):
+            text = str(value)
+        return max(0, cls._checkpoint_text_token_count(text) - (len(text) + 3) // 4)
+
+    @classmethod
+    def _rough_token_count(cls, value: Any) -> int:
         try:
             text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
         except (TypeError, ValueError):
@@ -1635,12 +1675,9 @@ class CheckpointContextEngine(ContextEngine):
             )
         except (AttributeError, ImportError, OSError, TypeError, ValueError):
             host_estimate = 0
-        if not text.isascii():
-            fallback = len(text)
-        elif isinstance(value, (dict, list, tuple)):
-            fallback = (len(text) + 1) // 2
-        else:
-            fallback = (len(text) + 3) // 4
+        fallback = cls._checkpoint_text_token_count(text)
+        if isinstance(value, (dict, list, tuple)):
+            fallback = max(fallback, (len(text) + 1) // 2)
         return max(1, host_estimate, fallback)
 
     def _token_count(self, value: Any) -> int:
@@ -1656,14 +1693,23 @@ class CheckpointContextEngine(ContextEngine):
     def _estimate_request_tokens(
         self, messages: List[Dict[str, Any]], *, output_reserve_tokens: int = 0
     ) -> int:
-        """Use the host's full-request budget service for every candidate."""
-        from agent.model_metadata import estimate_request_tokens_rough
+        """Estimate checkpoint wire usage without changing the host estimator."""
+        try:
+            from agent.model_metadata import estimate_request_tokens_rough
 
-        return estimate_request_tokens_rough(
-            messages,
-            tools=self._tool_schemas or None,
-            output_reserve_tokens=output_reserve_tokens,
-        )
+            host_estimate = estimate_request_tokens_rough(
+                messages,
+                tools=self._tool_schemas or None,
+            )
+        except (AttributeError, ImportError, OSError, TypeError, ValueError):
+            host_estimate = 0
+        conservative = max(0, host_estimate)
+        for message in messages:
+            if isinstance(message, dict):
+                conservative += self._checkpoint_content_delta(message.get("content"))
+        if self._tool_schemas:
+            conservative += self._checkpoint_content_delta(self._tool_schemas)
+        return conservative + max(0, output_reserve_tokens)
 
     def _estimate_wire_tokens(
         self, candidate: List[Dict[str, Any]], *, fixed_wire_tokens: int = 0

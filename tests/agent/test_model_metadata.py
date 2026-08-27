@@ -46,6 +46,10 @@ class TestEstimateTokensRough:
     def test_known_length(self):
         assert estimate_tokens_rough("a" * 400) == 100
 
+    def test_base64_like_ascii_keeps_linear_default_estimate(self):
+        text = "A" * 64 + "0" + "A" * 64
+        assert estimate_tokens_rough(text) == (len(text) + 3) // 4
+
 
 
 
@@ -210,6 +214,25 @@ class TestEstimateRequestTokensRough:
             mm._estimate_tools_tokens_rough(tools)
             assert len(mm._TOOLS_TOKENS_CACHE) <= cap
         assert len(mm._TOOLS_TOKENS_CACHE) == cap
+
+    def test_tools_keep_legacy_char_four_estimate(self):
+        import json
+
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "run",
+                "description": "Return structured output",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}},
+                },
+            },
+        }
+        fn = tool["function"]
+        chars = len(fn["name"]) + len(fn["description"])
+        chars += len(json.dumps(fn["parameters"], ensure_ascii=False, separators=(",", ":")))
+        assert estimate_request_tokens_rough([], tools=[tool]) == (chars + 3) // 4
 
 
 # =========================================================================

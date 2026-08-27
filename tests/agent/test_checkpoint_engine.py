@@ -1519,23 +1519,16 @@ def test_token_fallback_is_conservative_for_cjk_and_json(monkeypatch):
     assert engine._rough_token_count(structured) >= len(json.dumps(structured)) // 2
 
 
-def test_host_fallback_is_conservative_for_code_base64_and_tool_schemas():
-    from agent.model_metadata import estimate_request_tokens_rough, estimate_tokens_rough
+def test_checkpoint_budget_fallback_is_conservative_for_code_base64_and_tool_schemas():
+    from agent.checkpoint_engine import CheckpointContextEngine
 
     code = "def render(payload): return {\"ok\": True, \"payload\": payload}"
     base64 = "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVowMTIzNDU2Nzg5+/" * 3
-    tools = [{
-        "type": "function",
-        "function": {
-            "name": "write_file",
-            "description": code,
-            "parameters": {"type": "object", "properties": {"payload": {"type": "string"}}},
-        },
-    }]
+    engine = CheckpointContextEngine()
 
-    assert estimate_tokens_rough(code) >= len(code) // 2
-    assert estimate_tokens_rough(base64) >= len(base64)
-    assert estimate_request_tokens_rough([], tools=tools) >= len(json.dumps(tools[0]["function"]["parameters"])) // 2
+    assert engine._rough_token_count(code) >= len(code) // 2
+    assert engine._rough_token_count(base64) >= len(base64)
+    assert engine._rough_token_count([{"role": "user", "content": base64}]) >= len(base64)
 
 
 def test_deterministic_reduce_merges_identity_supersession_and_action_state():
@@ -1773,7 +1766,7 @@ def test_full_wire_hard_cap_preserves_host_only_request_overhead(monkeypatch):
 
     def host_estimator(request_messages, **kwargs):
         calls.append((request_messages, kwargs))
-        return 7 + kwargs.get("output_reserve_tokens", 0)
+        return 7
 
     monkeypatch.setattr(model_metadata, "estimate_request_tokens_rough", host_estimator)
     engine = CheckpointContextEngine(

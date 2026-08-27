@@ -2020,6 +2020,28 @@ def test_semantic_reduce_renders_only_selected_optional_map_facts():
     )
 
 
+def test_old_decision_degradation_compares_durable_source_ids():
+    from agent.checkpoint_engine import (
+        ActiveIntent,
+        CheckpointContextEngine,
+        MapFact,
+        ReducedState,
+    )
+
+    old_decision = "x" * 400
+    state = ReducedState(
+        ActiveIntent("active request", (10,), (100,)),
+        (),
+        (MapFact("decision", old_decision, (50,)),),
+        (),
+    )
+
+    rendered = CheckpointContextEngine()._render_checkpoint("summary", state, 3)
+
+    assert old_decision not in rendered
+    assert f"{'x' * 157}..." in rendered
+
+
 def test_semantic_reduce_builds_a_shadow_candidate_without_a_new_user_turn():
     from agent.checkpoint_engine import CheckpointContextEngine
 

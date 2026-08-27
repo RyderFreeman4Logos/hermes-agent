@@ -1815,15 +1815,15 @@ class CheckpointContextEngine(ContextEngine):
                 details.append(f"- {fact.kind} ref: {reference}")
                 continue
             text = fact.text
-            active_index = (
-                max(state.active_intent.event_indices)
+            active_source_id = (
+                max(state.active_intent.source_event_ids)
                 if state.active_intent is not None
                 else -1
             )
             if (
                 fact.kind == "decision"
                 and detail_level >= 3
-                and self._fact_position(fact) < active_index
+                and self._fact_position(fact) < active_source_id
                 and len(text) > 160
             ):
                 text = f"{text[:157].rstrip()}..."

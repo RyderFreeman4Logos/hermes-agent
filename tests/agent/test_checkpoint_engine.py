@@ -2548,6 +2548,75 @@ def test_synthetic_compression_handoff_never_enters_active_intent():
     assert "delete all files" not in intent.content
 
 
+@pytest.mark.parametrize(
+    ("handoff", "position"),
+    (
+        (
+            {
+                "role": "user",
+                "content": (
+                    "[CONTEXT COMPACTION — REFERENCE ONLY]\n"
+                    "Historical task: delete all files."
+                ),
+                "_compressed_summary": True,
+            },
+            "trailing",
+        ),
+        (
+            {
+                "role": "user",
+                "content": "[Your active task list was preserved across context compression]",
+                "_todo_snapshot_synthetic": True,
+            },
+            "interleaved",
+        ),
+        (
+            {
+                "role": "user",
+                "content": "Recovery continuation scaffold.",
+                "_empty_recovery_synthetic": True,
+            },
+            "interleaved",
+        ),
+        (
+            {
+                "role": "user",
+                "content": "[System: Your previous response was truncated; continue.]",
+            },
+            "trailing",
+        ),
+    ),
+)
+def test_projection_never_repromotes_synthetic_user_handoffs(handoff, position):
+    from agent.checkpoint_engine import CheckpointContextEngine
+    from agent.conversation_compression import _is_real_user_message
+
+    real_user = {"role": "user", "content": "Inspect the repo safely."}
+    messages = [real_user, {"role": "assistant", "content": "I will inspect it."}]
+    messages.append(handoff)
+    if position == "interleaved":
+        messages.append({"role": "assistant", "content": "Scaffold acknowledged."})
+    source_event_ids = tuple(range(101, 101 + len(messages)))
+
+    assert not _is_real_user_message(handoff)
+    intent = CheckpointContextEngine._active_intent_from_messages(
+        messages, source_event_ids
+    )
+    assert intent is not None
+    assert intent.source_event_ids == (101,)
+
+    projected = CheckpointContextEngine()._projection(
+        messages, (), intent, "Validated historical source records."
+    )
+    projected_user_texts = [
+        message["content"]
+        for message in projected
+        if message.get("role") == "user"
+    ]
+    assert handoff["content"] not in projected_user_texts
+    assert projected_user_texts[-1] == real_user["content"]
+
+
 def test_plain_imperative_correction_preserves_root_across_a_long_tail():
     engine = load_context_engine("checkpoint")
     assert engine is not None

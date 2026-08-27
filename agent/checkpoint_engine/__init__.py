@@ -2042,10 +2042,12 @@ class CheckpointContextEngine(ContextEngine):
             tail.pop()
         active = [dict(messages[index]) for index in active_intent.event_indices]
         last_active_index = max(active_intent.event_indices)
+        from agent.conversation_compression import _is_real_user_message
+
         active.extend(
             dict(message)
             for message in messages[last_active_index + 1:]
-            if message.get("role") == "user"
+            if _is_real_user_message(message)
         )
         checkpoint_message = {
             "role": "assistant",

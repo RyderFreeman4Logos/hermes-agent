@@ -55,6 +55,7 @@ def test_on_pre_compress_result_reaches_compressor_with_existing_options():
         focus_topic=None,
         force=False,
         memory_context="",
+        lifecycle=None,
     ):
         received.update(
             current_tokens=current_tokens,

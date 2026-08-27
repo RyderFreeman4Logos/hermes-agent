@@ -64,6 +64,7 @@ _ACTION_STATES = frozenset(
 )
 _TERMINAL_ACTION_STATES = frozenset({"succeeded", "failed", "unknown"})
 _AUTHORITATIVE_MAP_KINDS = frozenset({"action", "constraint", "plan", "policy", "request", "todo"})
+_MAP_KINDS = _AUTHORITATIVE_MAP_KINDS | {"observation"}
 _AUTHORITATIVE_ROLES = frozenset({"system", "developer", "user"})
 
 
@@ -1200,7 +1201,8 @@ class CheckpointContextEngine(ContextEngine):
                 "content": (
                     "Return only JSON with exactly source_event_ids and facts. "
                     "source_event_ids must cover this shard exactly. Each fact "
-                    "needs kind, text, and source_event_ids from this shard, or "
+                    f"needs kind ({', '.join(sorted(_MAP_KINDS))}), text, and "
+                    "source_event_ids from this shard, or "
                     "uncertain: true when it has no source. Do not call tools."
                 ),
             },
@@ -1382,7 +1384,16 @@ class CheckpointContextEngine(ContextEngine):
             kind = fact["kind"]
             text = fact["text"]
             uncertain = fact.get("uncertain", False)
-            if not isinstance(kind, str) or not kind or not isinstance(text, str) or not text:
+            if (
+                not isinstance(kind, str)
+                or kind.casefold() not in _MAP_KINDS
+                or (
+                    kind.casefold() == "observation"
+                    and fact.get("action_state") not in (None, "blocked")
+                )
+                or not isinstance(text, str)
+                or not text
+            ):
                 return None
             if len(text) > _MAP_FACT_TEXT_MAX_BYTES:
                 return None

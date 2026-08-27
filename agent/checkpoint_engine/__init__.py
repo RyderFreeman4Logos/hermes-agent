@@ -535,20 +535,6 @@ class CheckpointContextEngine(ContextEngine):
         return cls._normalized_user_text(text).rstrip(".!") in _ACK_ONLY
 
     @classmethod
-    def _is_steer(cls, text: str) -> bool:
-        return cls._normalized_user_text(text).startswith("/steer")
-
-    @classmethod
-    def _is_correction(cls, text: str) -> bool:
-        lowered = cls._normalized_user_text(text)
-        return (
-            cls._is_steer(text)
-            or lowered.startswith("also ")
-            or " instead " in lowered
-            or lowered.startswith("instead ")
-        )
-
-    @classmethod
     def _is_new_task(cls, text: str) -> bool:
         lowered = cls._normalized_user_text(text)
         return (
@@ -609,7 +595,7 @@ class CheckpointContextEngine(ContextEngine):
             if cls._is_ack_only(text):
                 continue
             projected = cls._project_intent_text(text)
-            if not parts or cls._is_new_task(text) or not cls._is_correction(text):
+            if not parts or cls._is_new_task(text):
                 parts = [projected]
                 indices = [index]
                 continue
@@ -1450,7 +1436,7 @@ class CheckpointContextEngine(ContextEngine):
             available.update(effect.event_indices)
         if not selected or not set(selected) <= available:
             return None
-        return f"Validated historical source events: {','.join(map(str, selected))}."
+        return "Validated historical source records."
 
     @staticmethod
     def _source_reference(fact: MapFact) -> str:
@@ -1645,12 +1631,13 @@ class CheckpointContextEngine(ContextEngine):
                 tail.append(message)
         while tail and tail[-1].get("role") == "user":
             tail.pop()
-        active_start = min(active_intent.event_indices)
-        active = [
+        active = [dict(messages[index]) for index in active_intent.event_indices]
+        last_active_index = max(active_intent.event_indices)
+        active.extend(
             dict(message)
-            for message in messages[active_start:]
+            for message in messages[last_active_index + 1:]
             if message.get("role") == "user"
-        ]
+        )
         checkpoint_message = {
             "role": "assistant",
             "content": (

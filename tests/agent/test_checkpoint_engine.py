@@ -647,7 +647,7 @@ def test_causal_groups_keep_tool_call_and_results_together():
     assert [group.event_indices for group in groups] == [(0,), (1, 2, 3), (4,)]
 
 
-def test_deterministic_lanes_keep_latest_user_turn_as_active_intent():
+def test_deterministic_lanes_preserve_ambiguous_root_and_followup():
     engine = load_context_engine("checkpoint")
     assert engine is not None
     messages = [
@@ -663,8 +663,11 @@ def test_deterministic_lanes_keep_latest_user_turn_as_active_intent():
     lanes = engine._extract_deterministic_lanes(messages)
 
     assert lanes.active_intent is not None
-    assert lanes.active_intent.content == "rename the generated file"
-    assert lanes.active_intent.event_indices == (2,)
+    assert lanes.active_intent.content.splitlines() == [
+        "old request",
+        "rename the generated file",
+    ]
+    assert lanes.active_intent.event_indices == (0, 2)
 
 
 def test_assistant_prose_does_not_mark_effect_succeeded():
@@ -1438,7 +1441,7 @@ def test_semantic_reduce_builds_a_shadow_candidate_without_a_new_user_turn():
     assert engine.last_candidate is not None
     assert engine.last_candidate != messages
     assert engine.last_checkpoint_text is not None
-    assert engine.last_checkpoint_text.startswith("Validated historical source events: ")
+    assert engine.last_checkpoint_text == "Validated historical source records."
     assert engine.last_wire_tokens is not None
     assert engine.last_wire_tokens > 0
     assert engine.last_map_shards
@@ -1448,7 +1451,7 @@ def test_semantic_reduce_builds_a_shadow_candidate_without_a_new_user_turn():
     assert engine.last_degradation_steps == ()
     assert all(
         message["role"] != "user"
-        or "Validated historical source events:" not in str(message["content"])
+        or "Validated historical source records." not in str(message["content"])
         for message in engine.last_candidate
     )
     assert engine.compression_count == 0
@@ -1571,7 +1574,7 @@ def test_live_mode_commits_only_a_valid_under_cap_projection():
     assert result is not messages
     assert result[-1] == messages[-1]
     assert any(
-        "Validated historical source events:" in str(message.get("content", ""))
+        "Validated historical source records." in str(message.get("content", ""))
         and "historical" in str(message.get("content", "")).lower()
         for message in result
     )
@@ -1618,13 +1621,13 @@ def test_renderer_shrinks_only_complete_old_causal_groups_before_rejecting(monke
 
     assert result is not messages
     assert result[-1] == messages[-1]
-    assert all(message.get("content") not in {"old request", "written"} for message in result)
+    assert any(message.get("content") == "old request" for message in result)
+    assert all(message.get("content") != "written" for message in result)
     assert not any(message.get("tool_calls") for message in result)
     assert engine.last_degradation_steps == (
         "completed",
         "tool_bodies",
         "decisions",
-        "tail",
         "tail",
     )
 
@@ -1649,7 +1652,7 @@ def test_adaptive_causal_tail_keeps_complete_groups_inside_default_band():
 
     tail = engine._adaptive_tail_groups(messages, groups, lanes)
 
-    assert [group.event_indices for group in tail] == [(4,), (5,), (6,)]
+    assert [group.event_indices for group in tail] == [(2,), (4,), (6,)]
     assert checkpoint_engine._DEFAULT_TAIL_TARGET_TOKENS == 14_000
     assert checkpoint_engine._DEFAULT_TAIL_MIN_TOKENS == 12_000
     assert checkpoint_engine._DEFAULT_TAIL_MAX_TOKENS == 16_000
@@ -1669,7 +1672,7 @@ def test_adaptive_causal_tail_may_grow_to_hard_max_but_not_beyond():
         text = json.dumps(value)
         if "recent reply" in text:
             return 10_000
-        if "recent request" in text:
+        if "middle reply" in text:
             return 14_000
         return 8_000
 
@@ -1688,7 +1691,7 @@ def test_adaptive_causal_tail_may_grow_to_hard_max_but_not_beyond():
 
     tail = engine._adaptive_tail_groups(messages, groups, lanes)
 
-    assert [group.event_indices for group in tail] == [(4,), (5,)]
+    assert [group.event_indices for group in tail] == [(3,), (5,)]
     assert engine._tail_token_count(messages, tail) == 24_000
     assert all(
         messages[index].get("content") != "oldest request"
@@ -1782,7 +1785,7 @@ def test_adaptive_causal_tail_excludes_protected_lanes_from_its_budget():
     assert 5 in tail_indices
     assert 12_000 <= engine._tail_token_count(messages, tail) <= 24_000
     assert lanes.active_intent is not None
-    assert lanes.active_intent.event_indices == (6,)
+    assert lanes.active_intent.event_indices == (1, 6)
     assert lanes.effects[0].status == "succeeded"
 
 
@@ -1803,6 +1806,26 @@ def test_acknowledgments_do_not_replace_actionable_root_task():
     assert "Ship the rename CLI; keep tests green." in lanes.active_intent.content
     assert "okay" not in lanes.active_intent.content.splitlines()[0]
     assert lanes.active_intent.event_indices[0] == 0
+
+
+def test_plain_imperative_correction_preserves_root_across_a_long_tail():
+    engine = load_context_engine("checkpoint")
+    assert engine is not None
+    messages = [{"role": "user", "content": "Implement feature"}]
+    messages.extend(
+        {"role": "assistant", "content": f"status update {index}"}
+        for index in range(40)
+    )
+    messages.append({"role": "user", "content": "Do not modify config files."})
+
+    lanes = engine._extract_deterministic_lanes(messages)
+
+    assert lanes.active_intent is not None
+    assert lanes.active_intent.event_indices == (0, 41)
+    assert lanes.active_intent.content.splitlines() == [
+        "Implement feature",
+        "Do not modify config files.",
+    ]
 
 
 def test_corrections_steer_and_supersession_stay_on_intent_lane():
@@ -1918,7 +1941,7 @@ def test_checkpoint_projection_is_non_authoritative_provider_valid_and_causal():
     checkpoint_msgs = [
         message
         for message in body
-        if "Validated historical source events:" in str(message.get("content", ""))
+        if "Validated historical source records." in str(message.get("content", ""))
     ]
     assert checkpoint_msgs
     assert all(message["role"] == "assistant" for message in checkpoint_msgs)

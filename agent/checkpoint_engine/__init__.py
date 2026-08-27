@@ -1436,7 +1436,7 @@ class CheckpointContextEngine(ContextEngine):
         group: CausalGroup,
         source_event_ids: tuple[int, ...],
     ) -> MapShard:
-        """Keep only facts exactly supported by cited row content and authority."""
+        """Keep only source-backed facts with executable authority."""
         rows = {
             source_event_ids[index]: messages[index]
             for index in group.event_indices
@@ -1455,6 +1455,15 @@ class CheckpointContextEngine(ContextEngine):
                 and probe in " ".join(row["content"].split()).casefold()
             ]
             if not supporting:
+                continue
+            executable = (
+                fact.kind.casefold() in {"action", "policy"}
+                or fact.action_state is not None
+            )
+            if executable and not any(
+                probe == " ".join(row["content"].split()).casefold()
+                for row in supporting
+            ):
                 continue
             if fact.kind.casefold() == "verification" or fact.action_state in _TERMINAL_ACTION_STATES:
                 continue

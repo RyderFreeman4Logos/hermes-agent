@@ -1190,6 +1190,87 @@ def test_map_source_membership_cannot_forge_authority_or_effects():
     assert "I wrote the file and tests passed" in rendered
 
 
+@pytest.mark.parametrize(
+    ("source", "fact"),
+    (
+        (
+            "Never delete config files.",
+            {
+                "kind": "action",
+                "text": "delete config files",
+                "identity": "config:delete",
+                "action_state": "planned",
+            },
+        ),
+        (
+            "Do not rotate credentials.",
+            {"kind": "policy", "text": "rotate credentials"},
+        ),
+        (
+            "In production, do not restart the database.",
+            {
+                "kind": "observation",
+                "text": "restart the database",
+                "identity": "database:restart",
+                "action_state": "blocked",
+            },
+        ),
+    ),
+)
+def test_executable_map_facts_require_full_authoritative_source_span(source, fact):
+    from agent.checkpoint_engine import CausalGroup, CheckpointContextEngine
+
+    fact = {**fact, "source_event_ids": [101]}
+    engine = CheckpointContextEngine(
+        auxiliary_client=_FakeAuxiliaryClient(
+            _map_response({"source_event_ids": [101], "facts": [fact]})
+        )
+    )
+    messages = [{"role": "user", "content": source}]
+
+    shard = engine._map_group(messages, CausalGroup((0,)), (101,))
+
+    assert shard is not None
+    reduced = engine._reduce(engine._extract_deterministic_lanes(messages), (shard,))
+    rendered = engine._render_checkpoint("Validated historical source records.", reduced, 0)
+    assert not shard.facts
+    assert not reduced.facts
+    assert fact["text"] not in rendered
+
+
+def test_full_span_user_action_remains_executable():
+    from agent.checkpoint_engine import CausalGroup, CheckpointContextEngine
+
+    action = "Delete stale cache files."
+    engine = CheckpointContextEngine(
+        auxiliary_client=_FakeAuxiliaryClient(
+            _map_response(
+                {
+                    "source_event_ids": [101],
+                    "facts": [
+                        {
+                            "kind": "action",
+                            "text": action,
+                            "source_event_ids": [101],
+                            "identity": "cache:delete-stale",
+                            "action_state": "planned",
+                        }
+                    ],
+                }
+            )
+        )
+    )
+    messages = [{"role": "user", "content": action}]
+
+    shard = engine._map_group(messages, CausalGroup((0,)), (101,))
+
+    assert shard is not None
+    reduced = engine._reduce(engine._extract_deterministic_lanes(messages), (shard,))
+    rendered = engine._render_checkpoint("Validated historical source records.", reduced, 0)
+    assert shard.facts == reduced.facts == reduced.plans
+    assert "- action [planned]: Delete stale cache files. (events: 101)" in rendered
+
+
 def test_map_source_bytes_must_match_the_cited_durable_row(tmp_path):
     from agent.checkpoint_engine import CheckpointContextEngine
     from hermes_state import SessionDB

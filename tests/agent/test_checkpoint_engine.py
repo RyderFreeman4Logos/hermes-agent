@@ -214,6 +214,114 @@ def test_shadow_compress_is_noop():
     assert engine.compression_count == 0
 
 
+def test_live_replay_is_idempotent_but_later_events_compact():
+    from agent.checkpoint_engine import CheckpointContextEngine
+
+    engine = CheckpointContextEngine(
+        auxiliary_client=_EchoMapClient(),
+        semantic_reducer=lambda _state: "continuity",
+        mode="live",
+        output_reserve_tokens=0,
+    )
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "old request"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "write_file", "arguments": "{}"},
+            }],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": json.dumps({
+                "receipt": {
+                    "id": "call_1",
+                    "op": "write_file",
+                    "status": "succeeded",
+                    "source_event_ids": [2, 3],
+                }
+            }),
+        },
+        {"role": "assistant", "content": "done"},
+        {"role": "user", "content": "continue"},
+    ]
+
+    first = engine.compress(messages)
+    replay = engine.compress(first)
+
+    def _effect_lines(history):
+        return [
+            line
+            for message in history
+            for line in (
+                message.get("content", "")
+                if isinstance(message.get("content", ""), str)
+                else ""
+            ).splitlines()
+            if "[succeeded]" in line
+        ]
+
+    wrappers = [
+        message for message in replay
+        if message.get("role") == "system"
+        and "<<<CHECKPOINT\n" in message.get("content", "")
+    ]
+    replay_effects = _effect_lines(replay)
+    assert replay == first
+    assert len(wrappers) == 1
+    assert len(replay_effects) == 1
+    assert len(set(replay_effects)) == 1
+    assert engine.last_candidate == first
+    assert engine.compression_count == 1
+
+    later = [
+        *first,
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{
+                "id": "call_2",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": "{}"},
+            }],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_2",
+            "content": json.dumps({
+                "receipt": {
+                    "id": "call_2",
+                    "op": "read_file",
+                    "status": "succeeded",
+                    "source_event_ids": [6, 7],
+                }
+            }),
+        },
+        {"role": "assistant", "content": "new result"},
+        {"role": "user", "content": "new active request"},
+    ]
+    compacted = engine.compress(later)
+
+    assert compacted != later
+    assert compacted[-1] == later[-1]
+    assert sum(
+        "<<<CHECKPOINT\n" in message.get("content", "")
+        for message in compacted
+        if message.get("role") == "system"
+    ) == 1
+    later_effects = _effect_lines(compacted)
+    assert len(later_effects) == 2
+    assert len(set(later_effects)) == 2
+    assert sum("write_file [succeeded]" in line for line in later_effects) == 1
+    assert sum("read_file [succeeded]" in line for line in later_effects) == 1
+    assert engine.compression_count == 2
+
+
 def test_inflight_tool_call_refuses_checkpoint():
     engine = load_context_engine("checkpoint")
     assert engine is not None

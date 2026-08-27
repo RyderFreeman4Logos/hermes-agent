@@ -1596,6 +1596,12 @@ class CheckpointContextEngine(ContextEngine):
             dict(message)
             for message in messages
             if message.get("role") in {"system", "developer"}
+            and not (
+                message.get("role") == "system"
+                and isinstance(message.get("content"), str)
+                and message["content"].startswith(_CHECKPOINT_HISTORY_PREFIX)
+                and message["content"].endswith(_CHECKPOINT_HISTORY_SUFFIX)
+            )
         ]
         tail = [
             dict(messages[index])
@@ -1784,7 +1790,7 @@ class CheckpointContextEngine(ContextEngine):
             self._set_automatic_cooldown("shadow")
             return messages
         if candidate == messages:
-            self._set_automatic_cooldown("ineffective")
+            self.last_trigger_reason = "replay_unchanged"
             return messages
         self._commit_snapshot = commit_snapshot
         self.compression_count += 1

@@ -222,6 +222,109 @@ def test_loop_timing_stays_unmarked_across_retry_and_fallback():
         assert attempt[-1]["content"][0] == prior
 
 
+def test_loop_timing_clears_after_retried_tool_response():
+    tool = SimpleNamespace(
+        id="call_1",
+        type="function",
+        function=SimpleNamespace(name="web_search", arguments="{}"),
+    )
+    with (
+        patch(
+            "run_agent.get_tool_definitions",
+            return_value=[
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "web_search",
+                        "description": "search",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ],
+        ),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        agent = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+
+    agent.client = MagicMock()
+    agent._cached_system_prompt = "You are helpful."
+    agent._cached_system_prompt_static = "You are helpful."
+    agent._use_prompt_caching = True
+    agent._disable_streaming = True
+    agent._loop_timing_context_text = TIMING
+    sent = []
+    tool_response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content=None, reasoning_content=None, reasoning=None, tool_calls=[tool]
+                ),
+                finish_reason="tool_calls",
+            )
+        ],
+        model="test/model",
+        usage=None,
+    )
+    final_response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                message=SimpleNamespace(
+                    content="done", reasoning_content=None, reasoning=None, tool_calls=None
+                ),
+                finish_reason="stop",
+            )
+        ],
+        model="test/model",
+        usage=None,
+    )
+    outcomes = [UnicodeEncodeError("utf-8", "x", 0, 1, "retry"), tool_response, final_response]
+
+    def _send(**kwargs):
+        sent.append(copy.deepcopy(kwargs["messages"]))
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    agent.client.chat.completions.create.side_effect = _send
+
+    def _timing_parts(messages):
+        return [
+            part
+            for message in messages
+            for part in (
+                [message.get("content")]
+                if isinstance(message.get("content"), str)
+                else message.get("content", [])
+            )
+            if (part.get("text") if isinstance(part, dict) else part) == TIMING
+        ]
+
+    with (
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+        patch("run_agent.handle_function_call", return_value='{"ok": true}'),
+    ):
+        result = agent.run_conversation("hello")
+
+    assert result["completed"] is True
+    assert len(sent) == 3
+    for attempt in sent[:2]:
+        timing_parts = _timing_parts(attempt)
+        assert len(timing_parts) == 1
+        assert isinstance(timing_parts[0], dict)
+        assert "cache_control" not in timing_parts[0]
+    assert not _timing_parts(sent[2])
+
+
 def test_non_chat_loop_timing_follows_cached_breakpoint_without_marker():
     agent = type("Agent", (), {"api_mode": "anthropic_messages"})()
     agent._loop_timing_context_text = TIMING

@@ -729,6 +729,42 @@ def test_checkpoint_refuses_when_workspace_tracked_tree_gets_dirty(tmp_path):
     assert engine.compression_count == 0
 
 
+@pytest.mark.parametrize("mutation", ["create", "modify", "delete"])
+def test_checkpoint_refuses_when_untracked_workspace_file_changes(tmp_path, mutation):
+    repo = _make_workspace_repo(tmp_path)
+    untracked = repo / "new-untracked.txt"
+    if mutation != "create":
+        untracked.write_text("before\n")
+
+    class _UntrackedChangingMapClient(_EchoMapClient):
+        _changed = False
+        _lock = threading.Lock()
+
+        def complete(self, **kwargs):
+            response = super().complete(**kwargs)
+            with self._lock:
+                if not self._changed:
+                    self._changed = True
+                    if mutation == "delete":
+                        untracked.unlink()
+                    else:
+                        untracked.write_text("after\n")
+            return response
+
+    messages = [
+        {"role": "user", "content": "old request"},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "user", "content": "active request"},
+    ]
+    engine = _workspace_engine(_UntrackedChangingMapClient())
+
+    assert _compress(
+        engine, messages, force=True, lifecycle=_workspace_lifecycle(repo)
+    ) is messages
+    assert engine.last_trigger_reason == "stale_durable_snapshot"
+    assert engine.compression_count == 0
+
+
 def test_causal_groups_keep_tool_call_and_results_together():
     engine = load_context_engine("checkpoint")
     assert engine is not None

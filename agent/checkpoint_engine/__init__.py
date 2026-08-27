@@ -828,7 +828,7 @@ class CheckpointContextEngine(ContextEngine):
     def _workspace_state(
         self, lifecycle: Any, session_id: Optional[str] = None
     ) -> Optional[tuple[str, Optional[str], str]]:
-        """Return Git identity plus tracked-worktree contents for a workspace."""
+        """Return Git identity plus tracked and nonignored untracked contents."""
         workspace = None
         if lifecycle is not None:
             workspace = next(
@@ -909,9 +909,54 @@ class CheckpointContextEngine(ContextEngine):
                 tracked_digest = hashlib.sha256(
                     diff_result.stdout + b"\\0" + cached_result.stdout
                 ).hexdigest()
+            untracked_result = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    root,
+                    "ls-files",
+                    "--others",
+                    "--exclude-standard",
+                    "-z",
+                ],
+                check=True,
+                capture_output=True,
+                timeout=5,
+            )
+            untracked_paths = sorted(
+                path for path in untracked_result.stdout.split(b"\0") if path
+            )
+            untracked_hashes = (
+                subprocess.run(
+                    [
+                        "git",
+                        "-C",
+                        root,
+                        "hash-object",
+                        "--no-filters",
+                        "--",
+                        *(path.decode(errors="surrogateescape") for path in untracked_paths),
+                    ],
+                    check=True,
+                    capture_output=True,
+                    timeout=5,
+                ).stdout.splitlines()
+                if untracked_paths
+                else []
+            )
+            if len(untracked_hashes) != len(untracked_paths):
+                raise RuntimeError("workspace untracked-file probe failed")
+            workspace_digest = hashlib.sha256(
+                tracked_digest.encode()
+                + b"\0"
+                + b"\0".join(
+                    path + b"\0" + object_hash
+                    for path, object_hash in zip(untracked_paths, untracked_hashes)
+                )
+            ).hexdigest()
         except (OSError, subprocess.SubprocessError) as exc:
             raise RuntimeError("workspace Git probe failed") from exc
-        return root, head, tracked_digest
+        return root, head, workspace_digest
 
     def _capture_commit_snapshot(self, lifecycle: Any) -> CheckpointCommitSnapshot:
         session_id = (

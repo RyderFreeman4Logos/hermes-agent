@@ -1457,7 +1457,7 @@ class CheckpointContextEngine(ContextEngine):
             if not supporting:
                 continue
             executable = (
-                fact.kind.casefold() in {"action", "policy"}
+                fact.kind.casefold() in _AUTHORITATIVE_MAP_KINDS
                 or fact.action_state is not None
             )
             if executable and not any(

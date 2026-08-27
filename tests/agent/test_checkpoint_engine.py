@@ -1207,6 +1207,22 @@ def test_map_source_membership_cannot_forge_authority_or_effects():
             {"kind": "policy", "text": "rotate credentials"},
         ),
         (
+            "Never delete config files.",
+            {"kind": "constraint", "text": "delete config files"},
+        ),
+        (
+            "Never delete config files.",
+            {"kind": "plan", "text": "delete config files"},
+        ),
+        (
+            "Never delete config files.",
+            {"kind": "request", "text": "delete config files"},
+        ),
+        (
+            "Never delete config files.",
+            {"kind": "todo", "text": "delete config files"},
+        ),
+        (
             "In production, do not restart the database.",
             {
                 "kind": "observation",
@@ -1294,24 +1310,27 @@ def test_executable_map_facts_require_exact_authority_on_one_source_row(
     assert fact["text"] not in rendered
 
 
-def test_full_span_user_action_remains_executable():
+@pytest.mark.parametrize(
+    ("kind", "action_state"),
+    (("action", "planned"), ("todo", None)),
+)
+def test_full_span_user_action_remains_executable(kind, action_state):
     from agent.checkpoint_engine import CausalGroup, CheckpointContextEngine
 
     action = "Delete stale cache files."
+    fact = {
+        "kind": kind,
+        "text": action,
+        "source_event_ids": [101],
+    }
+    if action_state is not None:
+        fact.update(identity="cache:delete-stale", action_state=action_state)
     engine = CheckpointContextEngine(
         auxiliary_client=_FakeAuxiliaryClient(
             _map_response(
                 {
                     "source_event_ids": [101],
-                    "facts": [
-                        {
-                            "kind": "action",
-                            "text": action,
-                            "source_event_ids": [101],
-                            "identity": "cache:delete-stale",
-                            "action_state": "planned",
-                        }
-                    ],
+                    "facts": [fact],
                 }
             )
         )
@@ -1323,8 +1342,10 @@ def test_full_span_user_action_remains_executable():
     assert shard is not None
     reduced = engine._reduce(engine._extract_deterministic_lanes(messages), (shard,))
     rendered = engine._render_checkpoint("Validated historical source records.", reduced, 0)
-    assert shard.facts == reduced.facts == reduced.plans
-    assert "- action [planned]: Delete stale cache files. (events: 101)" in rendered
+    assert shard.facts == reduced.facts
+    assert reduced.plans == (shard.facts if action_state else ())
+    action_label = f" [{action_state}]" if action_state else ""
+    assert f"- {kind}{action_label}: {action} (events: 101)" in rendered
 
 
 def test_map_source_bytes_must_match_the_cited_durable_row(tmp_path):

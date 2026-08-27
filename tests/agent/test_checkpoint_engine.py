@@ -1977,6 +1977,49 @@ def test_semantic_reduce_rejects_source_free_success_policy_and_plan_prose():
     assert engine._semantic_checkpoint(state) is None
 
 
+def test_semantic_reduce_renders_only_selected_optional_map_facts():
+    from agent.checkpoint_engine import (
+        CheckpointContextEngine,
+        Effect,
+        MapFact,
+        ReducedState,
+    )
+
+    state = ReducedState(
+        None,
+        (Effect("call-2", "write_file", "succeeded", (1,), (2,)),),
+        (
+            MapFact("observation", "selected record", (1,)),
+            MapFact("observation", "unselected record", (2,)),
+        ),
+        (),
+    )
+    engine = CheckpointContextEngine(
+        semantic_reducer=lambda _state: json.dumps({"source_event_ids": [1]})
+    )
+
+    semantic = engine._semantic_checkpoint(state)
+
+    assert semantic == ("Validated historical source records.", frozenset({1}))
+    summary, selected = semantic
+    rendered = engine._render_checkpoint(
+        summary, state, 0, selected_source_event_ids=selected
+    )
+    assert "selected record" in rendered
+    assert "unselected record" not in rendered
+    assert "write_file [succeeded]" in rendered
+
+    multi_id_state = ReducedState(
+        None,
+        (),
+        (MapFact("observation", "multi-id record", (1, 2)),),
+        (),
+    )
+    assert "multi-id record" in engine._render_checkpoint(
+        summary, multi_id_state, 0, selected_source_event_ids=selected
+    )
+
+
 def test_semantic_reduce_builds_a_shadow_candidate_without_a_new_user_turn():
     from agent.checkpoint_engine import CheckpointContextEngine
 

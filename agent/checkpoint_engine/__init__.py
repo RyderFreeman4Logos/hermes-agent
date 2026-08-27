@@ -1749,7 +1749,7 @@ class CheckpointContextEngine(ContextEngine):
 
     def _semantic_checkpoint(
         self, state: ReducedState, *, focus_topic: str = "", memory_context: str = ""
-    ) -> Optional[str]:
+    ) -> Optional[tuple[str, frozenset[int]]]:
         try:
             if self._semantic_reducer is not None:
                 candidate = self._semantic_reducer(state)
@@ -1785,19 +1785,28 @@ class CheckpointContextEngine(ContextEngine):
             available.update(effect.source_event_ids)
         if not selected or not set(selected) <= available:
             return None
-        return "Validated historical source records."
+        return "Validated historical source records.", frozenset(selected)
 
     @staticmethod
     def _source_reference(fact: MapFact) -> str:
         return ",".join(str(event_id) for event_id in fact.source_event_ids)
 
     def _render_checkpoint(
-        self, semantic_checkpoint: str, state: ReducedState, detail_level: int
+        self,
+        semantic_checkpoint: str,
+        state: ReducedState,
+        detail_level: int,
+        *,
+        selected_source_event_ids: Optional[frozenset[int]] = None,
     ) -> str:
         """Add deterministic lanes while degrading only safe historical detail."""
         details = []
         completed_refs = []
         for fact in state.facts:
+            if selected_source_event_ids is not None and selected_source_event_ids.isdisjoint(
+                fact.source_event_ids
+            ):
+                continue
             reference = self._source_reference(fact)
             if fact.action_state in _TERMINAL_ACTION_STATES and detail_level >= 1:
                 completed_refs.append(f"{self._fact_identity(fact)}@{reference}")
@@ -2059,6 +2068,7 @@ class CheckpointContextEngine(ContextEngine):
         state: ReducedState,
         semantic_checkpoint: str,
         fixed_wire_tokens: int,
+        selected_source_event_ids: frozenset[int],
     ) -> Optional[tuple[List[Dict[str, Any]], int, tuple[str, ...], str]]:
         if state.active_intent is None:
             return None
@@ -2071,7 +2081,10 @@ class CheckpointContextEngine(ContextEngine):
         steps = []
         while True:
             checkpoint = self._render_checkpoint(
-                semantic_checkpoint, state, detail_level
+                semantic_checkpoint,
+                state,
+                detail_level,
+                selected_source_event_ids=selected_source_event_ids,
             )
             candidate = self._projection(
                 messages, tail_groups, state.active_intent, checkpoint
@@ -2195,22 +2208,28 @@ class CheckpointContextEngine(ContextEngine):
         reduced = self._reduce(
             self._extract_deterministic_lanes(durable_messages, source_event_ids), mapped
         )
-        checkpoint = self._semantic_checkpoint(
+        semantic_checkpoint = self._semantic_checkpoint(
             reduced,
             focus_topic=self.last_focus_topic,
             memory_context=self.last_memory_context,
         )
-        if checkpoint is None:
+        if semantic_checkpoint is None:
             self._set_automatic_cooldown("semantic_reduce_failed")
             self._last_compress_aborted = True
             self._last_summary_error = "checkpoint semantic Reduce failed"
             return messages
+        checkpoint, selected_source_event_ids = semantic_checkpoint
         if not self._candidate_snapshot_is_current(
             messages, snapshot, commit_snapshot, lifecycle
         ):
             return messages
         rendered = self._render_candidate(
-            source_messages, groups, reduced, checkpoint, fixed_wire_tokens
+            source_messages,
+            groups,
+            reduced,
+            checkpoint,
+            fixed_wire_tokens,
+            selected_source_event_ids,
         )
         if rendered is None:
             self._set_automatic_cooldown("candidate_rejected")

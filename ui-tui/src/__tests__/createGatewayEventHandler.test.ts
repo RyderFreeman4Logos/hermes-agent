@@ -183,6 +183,22 @@ describe('createGatewayEventHandler', () => {
     expect(getTurnState().todos).toEqual(todos)
   })
 
+  it('allows the next turn to replace a cached status', () => {
+    const onEvent = createGatewayEventHandler(buildCtx([]))
+
+    onEvent({ payload: {}, type: 'message.start' } as any)
+    onEvent({
+      payload: { kind: 'cache_hit', text: 'cache 87% 3480/4000' },
+      type: 'status.update'
+    } as any)
+    onEvent({ payload: { text: 'first' }, type: 'message.complete' } as any)
+    expect(getUiState().status).toBe('cache 87% 3480/4000')
+
+    onEvent({ payload: {}, type: 'message.start' } as any)
+    onEvent({ payload: { text: 'second' }, type: 'message.complete' } as any)
+    expect(getUiState().status).toBe('ready')
+  })
+
   it('prints compaction progress status into the transcript', () => {
     const appended: Msg[] = []
     const ctx = buildCtx(appended)

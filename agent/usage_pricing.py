@@ -106,6 +106,12 @@ class CanonicalUsage:
             reasoning_tokens=self.reasoning_tokens + other.reasoning_tokens,
             request_count=self.request_count + other.request_count,
             raw_usage=None,
+            cache_telemetry=(
+                "reported"
+                if self.cache_telemetry == "reported"
+                or other.cache_telemetry == "reported"
+                else "unavailable"
+            ),
         )
 
 
@@ -1049,6 +1055,12 @@ def _usage_get(obj: Any, name: str, default: Any = 0) -> Any:
     return getattr(obj, name, default)
 
 
+def _usage_has(obj: Any, name: str) -> bool:
+    if isinstance(obj, dict):
+        return obj.get(name) is not None
+    return getattr(obj, name, None) is not None
+
+
 def _usage_count(value: Any) -> int:
     """Coerce a usage counter to a non-negative integer.
 
@@ -1286,14 +1298,15 @@ def normalize_usage(
 ) -> CanonicalUsage:
     """Normalize raw API response usage into canonical token buckets.
 
-    Handles three API shapes:
+    Handles four API shapes:
     - Anthropic: input_tokens/output_tokens/cache_read_input_tokens/cache_creation_input_tokens
+    - Codex app-server: input_tokens is uncached; cached_input_tokens is the cache-read bucket
     - Codex Responses: input_tokens includes cache tokens; input_tokens_details.cached_tokens separates them
     - OpenAI Chat Completions: prompt_tokens includes cache tokens; prompt_tokens_details.cached_tokens separates them
 
-    In both Codex and OpenAI modes, input_tokens is derived by subtracting cache
-    tokens from the total — the API contract is that input/prompt totals include
-    cached tokens and the details object breaks them out.
+    For Codex Responses and OpenAI modes, input_tokens is derived by subtracting
+    cache tokens from the total — those API contracts report input/prompt totals
+    that include cached tokens and details break them out.
     """
     if not response_usage:
         return CanonicalUsage()
@@ -1302,9 +1315,6 @@ def normalize_usage(
     mode = (api_mode or "").strip().lower()
     cache_telemetry: Literal["reported", "unavailable"] = "unavailable"
 
-    def _has(value: Any, name: str) -> bool:
-        return _usage_get(value, name, None) is not None
-
     if mode == "anthropic_messages" or provider_name == "anthropic":
         input_tokens = _usage_count(_usage_get(response_usage, "input_tokens", 0))
         output_tokens = _usage_count(_usage_get(response_usage, "output_tokens", 0))
@@ -1312,22 +1322,28 @@ def normalize_usage(
         cache_write_tokens = _usage_count(
             _usage_get(response_usage, "cache_creation_input_tokens", 0)
         )
-        if _has(response_usage, "cache_read_input_tokens") or _has(
+        if _usage_has(response_usage, "cache_read_input_tokens") or _usage_has(
             response_usage, "cache_creation_input_tokens"
         ):
             cache_telemetry = "reported"
     elif mode == "codex_app_server":
         input_tokens = _usage_count(_usage_get(response_usage, "input_tokens", 0))
         output_tokens = _usage_count(_usage_get(response_usage, "output_tokens", 0))
-        cache_telemetry = "reported" if _has(response_usage, "cached_input_tokens") else "unavailable"
-        cache_read_tokens = _usage_count(_usage_get(response_usage, "cached_input_tokens", 0))
+        cache_telemetry = (
+            "reported"
+            if _usage_has(response_usage, "cached_input_tokens")
+            else "unavailable"
+        )
+        cache_read_tokens = _usage_count(
+            _usage_get(response_usage, "cached_input_tokens", 0)
+        )
         cache_write_tokens = 0
     elif mode == "codex_responses":
         input_total = _usage_count(_usage_get(response_usage, "input_tokens", 0))
         output_tokens = _usage_count(_usage_get(response_usage, "output_tokens", 0))
         details = _usage_get(response_usage, "input_tokens_details", None)
         if details and any(
-            _has(details, name)
+            _usage_has(details, name)
             for name in ("cached_tokens", "cache_write_tokens", "cache_creation_tokens")
         ):
             cache_telemetry = "reported"
@@ -1367,7 +1383,7 @@ def normalize_usage(
             "prompt_cache_miss_tokens",
         )
         if any(
-            _has(source, name)
+            _usage_has(source, name)
             for source in (response_usage, details)
             for name in cache_field_names
         ):

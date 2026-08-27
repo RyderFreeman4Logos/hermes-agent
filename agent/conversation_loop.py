@@ -1990,6 +1990,8 @@ def run_conversation(
     # (early failure / interrupt) so the hook receives None rather than a
     # stale prior turn's usage.
     agent._last_turn_usage = None
+    agent._first_turn_usage = None
+    agent._tui_provider_response_index = 0
 
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
     # turn to the codex app-server subprocess (terminal/file ops/patching
@@ -3557,6 +3559,28 @@ def run_conversation(
                         "reasoning_tokens": first_usage.reasoning_tokens,
                     }
 
+                # Preserve first-call cache provenance before any truncation,
+                # refusal, or partial-response path can return early.
+                if api_call_count == 1:
+                    _first_response_usage = getattr(response, "usage", None)
+                    if _first_response_usage:
+                        _first_canonical_usage = normalize_usage(
+                            _first_response_usage,
+                            provider=agent.provider,
+                            api_mode=agent.api_mode,
+                        )
+                        agent._first_turn_usage = {
+                            "prompt_tokens": _first_canonical_usage.prompt_tokens,
+                            "completion_tokens": _first_canonical_usage.output_tokens,
+                            "total_tokens": _first_canonical_usage.total_tokens,
+                            "input_tokens": _first_canonical_usage.input_tokens,
+                            "output_tokens": _first_canonical_usage.output_tokens,
+                            "cache_read_tokens": _first_canonical_usage.cache_read_tokens,
+                            "cache_write_tokens": _first_canonical_usage.cache_write_tokens,
+                            "cache_telemetry": _first_canonical_usage.cache_telemetry,
+                            "reasoning_tokens": _first_canonical_usage.reasoning_tokens,
+                        }
+
                 # Check finish_reason before proceeding
                 if agent.api_mode == "codex_responses":
                     status = getattr(response, "status", None)
@@ -4188,8 +4212,40 @@ def run_conversation(
                         "output_tokens": canonical_usage.output_tokens,
                         "cache_read_tokens": canonical_usage.cache_read_tokens,
                         "cache_write_tokens": canonical_usage.cache_write_tokens,
+                        "cache_telemetry": canonical_usage.cache_telemetry,
                         "reasoning_tokens": canonical_usage.reasoning_tokens,
                     }
+                    cache_callback = getattr(agent, "_tui_cache_callback", None)
+                    if callable(cache_callback):
+                        cache_read = canonical_usage.cache_read_tokens
+                        cache_write = canonical_usage.cache_write_tokens
+                        if cache_read:
+                            cache_state = "hit"
+                            cache_pct = round(100 * cache_read / prompt_tokens) if prompt_tokens else 0
+                        elif cache_write:
+                            cache_state, cache_pct = "cold_write", 0
+                        elif canonical_usage.cache_telemetry == "unavailable":
+                            cache_state, cache_pct = "no_field", 0
+                        else:
+                            cache_state, cache_pct = "miss", 0
+                        response_index = int(getattr(agent, "_tui_provider_response_index", 0)) + 1
+                        agent._tui_provider_response_index = response_index
+                        try:
+                            cache_callback(
+                                cache_state,
+                                cache_pct,
+                                cache_read,
+                                prompt_tokens,
+                                {
+                                    "request_index": response_index,
+                                    "state": cache_state,
+                                    "pct": cache_pct if cache_state == "hit" else None,
+                                    "timestamp": time.monotonic(),
+                                    "turn_origin": getattr(agent, "_cache_turn_origin", "user"),
+                                },
+                            )
+                        except Exception:
+                            logger.debug("TUI cache callback failed", exc_info=True)
                     # Capture the boundary latch before update_from_response()
                     # consumes it. Only a real provider prompt count for the
                     # request immediately following a completed compaction can

@@ -124,6 +124,50 @@ class TestInPlaceCompaction:
             # Live transcript actually shrank.
             assert len(compressed) == 2
 
+    def test_prompt_update_failure_after_commit_keeps_compacted_memory(
+        self, monkeypatch
+    ):
+        from agent.conversation_compression import (
+            compress_context,
+            conversation_history_after_compression,
+        )
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = SessionDB(db_path=Path(tmp) / "t.db")
+            sid = "20260619_120000_prompt"
+            _seed(db, sid, "prompt-failure")
+            agent = _make_agent(db, sid, in_place=True)
+            original = [
+                {
+                    "role": "user" if index % 2 == 0 else "assistant",
+                    "content": f"msg {index}",
+                }
+                for index in range(8)
+            ]
+
+            def fail_prompt_update(*_args, **_kwargs):
+                raise RuntimeError("prompt update failed")
+
+            monkeypatch.setattr(db, "update_system_prompt", fail_prompt_update)
+            compacted, _ = compress_context(
+                agent, original, approx_tokens=100_000, system_message="sys"
+            )
+
+            assert [message["content"] for message in compacted] == [
+                "[CONTEXT COMPACTION] summary of prior turns",
+                "recent reply",
+            ]
+            assert len(db.get_messages(sid)) == 2
+            baseline = conversation_history_after_compression(agent, compacted)
+            agent._flush_messages_to_session_db(
+                compacted, conversation_history=baseline
+            )
+            active = db.get_messages(sid)
+            assert len(active) == 2
+            assert not any(row["content"].startswith("msg ") for row in active)
+            assert getattr(agent, "_last_compaction_in_place", False) is True
+
     def test_in_place_alternation_preserved(self):
         """The compacted list must not introduce consecutive same-role messages."""
         from hermes_state import SessionDB

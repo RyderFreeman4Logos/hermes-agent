@@ -3937,9 +3937,16 @@ def compress_context(
                 # In-place mode still updates/replaces the current row here.
                 # Rotation already published prompt + compacted handoff atomically.
                 if in_place:
-                    agent._session_db.update_system_prompt(
-                        agent.session_id, new_system_prompt
-                    )
+                    try:
+                        agent._session_db.update_system_prompt(
+                            agent.session_id, new_system_prompt
+                        )
+                    except Exception as prompt_error:
+                        logger.warning(
+                            "In-place compaction committed but system prompt "
+                            "update failed: %s",
+                            prompt_error,
+                        )
                     agent._last_flushed_db_idx = 0
                 else:
                     agent._last_flushed_db_idx = len(compressed)

@@ -198,6 +198,64 @@ def test_checkpoint_uses_focus_memory_and_complete_request_estimate():
     assert semantic_payload["memory_context"] == sanitize_memory_context(memory_context)
 
 
+def test_long_session_replay_sanitizes_and_bounds_memory_context():
+    from agent.checkpoint_engine import CheckpointContextEngine
+
+    class _ReplayAuxiliaryClient:
+        def __init__(self):
+            self.calls = []
+
+        def complete(self, **kwargs):
+            self.calls.append(kwargs)
+            if kwargs["max_tokens"] == 1024:
+                payload = json.loads(kwargs["messages"][-1]["content"])
+                return _map_response({
+                    "source_event_ids": payload["source_event_ids"],
+                    "facts": [],
+                })
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(
+                    content="continuity", tool_calls=[]
+                ))]
+            )
+
+    sentinel = "P3_SYNTHETIC_SECRET_SENTINEL"
+    memory_context = "head:" + ("x" * 4_200) + sentinel + ("y" * 1_800)
+    messages = [{"role": "system", "content": "sys"}]
+    for index in range(16):
+        messages.extend([
+            {"role": "user", "content": f"historical request {index}"},
+            {"role": "assistant", "content": f"historical reply {index}"},
+        ])
+    messages.append({"role": "user", "content": "active request"})
+    auxiliary = _ReplayAuxiliaryClient()
+    engine = CheckpointContextEngine(
+        auxiliary_client=auxiliary,
+        mode="live",
+        output_reserve_tokens=0,
+        target_wire_tokens=60_000,
+        hard_max_wire_tokens=60_000,
+    )
+
+    first = engine.compress(messages, memory_context=memory_context)
+    replay = engine.compress(first, memory_context=memory_context)
+
+    assert first is not messages
+    assert replay == first
+    assert engine.compression_count == 1
+    semantic_payloads = [
+        json.loads(call["messages"][-1]["content"])
+        for call in auxiliary.calls
+        if call["max_tokens"] == 2048
+    ]
+    assert len(semantic_payloads) == 2
+    assert all(
+        len(payload["memory_context"]) <= 6_000
+        and sentinel not in payload["memory_context"]
+        for payload in semantic_payloads
+    )
+
+
 def test_shadow_compress_is_noop():
     engine = load_context_engine("checkpoint")
     assert engine is not None
@@ -1302,6 +1360,15 @@ def test_semantic_reduce_builds_a_shadow_candidate_without_a_new_user_turn():
     assert result is messages
     assert reduced_states
     assert engine.last_candidate is not None
+    assert engine.last_candidate != messages
+    assert engine.last_checkpoint_text == "Continue from the verified state."
+    assert engine.last_wire_tokens is not None
+    assert engine.last_wire_tokens > 0
+    assert engine.last_map_shards
+    assert [shard.source_event_ids for shard in engine.last_map_shards] == [(0,)]
+    assert engine.last_map_externalized_groups == ()
+    assert engine.last_reduced_state is reduced_states[0]
+    assert engine.last_degradation_steps == ()
     assert all(
         message["role"] != "user" or message["content"] != "Continue from the verified state."
         for message in engine.last_candidate
@@ -1321,6 +1388,32 @@ def test_invalid_semantic_reduce_output_rejects_candidate():
     assert engine.compress(messages) is messages
     assert engine.last_candidate is None
     assert engine.compression_count == 0
+
+
+def test_exhausted_semantic_reduce_fails_closed_without_main_model_fallback():
+    from agent.checkpoint_engine import CheckpointContextEngine
+
+    main_model = _FakeMainModel()
+    auxiliary = _FakeAuxiliaryClient(
+        _map_response({"source_event_ids": [0], "facts": []}),
+        StopIteration("semantic reducer exhausted"),
+    )
+    engine = CheckpointContextEngine(
+        auxiliary_client=auxiliary,
+        main_model=main_model,
+    )
+    messages = [{"role": "user", "content": "finish the migration"}]
+
+    result = engine.compress(messages)
+
+    assert result is messages
+    assert auxiliary.calls
+    assert engine.last_map_shards
+    assert engine.last_candidate is None
+    assert engine.last_checkpoint_text is None
+    assert engine.last_reduced_state is None
+    assert engine.compression_count == 0
+    assert main_model.calls == 0
 
 
 def test_full_wire_hard_cap_rejects_before_live_commit():

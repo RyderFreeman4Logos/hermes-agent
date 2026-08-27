@@ -285,6 +285,8 @@ class CheckpointContextEngine(ContextEngine):
         self._session_db = None
         self._session_id = ""
         self._commit_snapshot: Optional[CheckpointCommitSnapshot] = None
+        self._source_messages: Optional[List[Dict[str, Any]]] = None
+        self._source_snapshot: Optional[tuple[int, str]] = None
 
     def _clear_map_shard_cache(self) -> None:
         with self._map_shard_cache_lock:
@@ -430,6 +432,8 @@ class CheckpointContextEngine(ContextEngine):
         self._session_db = session_db
         self._session_id = session_id or ""
         self._commit_snapshot = None
+        self._source_messages = None
+        self._source_snapshot = None
 
     def on_session_start(self, session_id: str, **kwargs: Any) -> None:
         self.bind_session_state(kwargs.get("session_db", self._session_db), session_id)
@@ -996,6 +1000,62 @@ class CheckpointContextEngine(ContextEngine):
         return durable_ids
 
     @staticmethod
+    def _provider_visible_sources(
+        messages: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Return the ordered message bytes that can reach a provider."""
+        from agent.turn_context import substitute_api_content
+
+        hidden = {
+            "display_kind",
+            "display_metadata",
+            "effect_disposition",
+            "finish_reason",
+            "message_id",
+            "observed",
+            "timestamp",
+            "tool_name",
+        }
+        sources = []
+        for message in messages:
+            source = {
+                key: value
+                for key, value in message.items()
+                if key not in hidden
+                and not (isinstance(key, str) and key.startswith("_"))
+            }
+            substitute_api_content(source)
+            sources.append(source)
+        return sources
+
+    def _durable_source_messages(
+        self,
+        messages: List[Dict[str, Any]],
+        snapshot: CheckpointCommitSnapshot,
+    ) -> Optional[tuple[List[Dict[str, Any]], List[Dict[str, Any]]]]:
+        """Bind caller messages to one revision's durable provider projection."""
+        if snapshot.durable_revision is None:
+            return messages, messages
+        loader = getattr(self._session_db, "get_messages_as_conversation", None)
+        revision_current = getattr(
+            self._session_db, "active_message_revision_is_current", None
+        )
+        if not callable(loader) or not callable(revision_current):
+            return None
+        durable = loader(snapshot.session_id, include_row_ids=True)
+        if (
+            not isinstance(durable, list)
+            or tuple(message.get("_row_id") for message in durable)
+            != snapshot.source_event_ids
+            or not revision_current(snapshot.durable_revision)
+        ):
+            return None
+        durable_sources = self._provider_visible_sources(durable)
+        if self._provider_visible_sources(messages) != durable_sources:
+            return None
+        return durable, durable_sources
+
+    @staticmethod
     def _snapshot_has_unrepresented_work(snapshot: CheckpointCommitSnapshot) -> Optional[str]:
         if snapshot.queued_user_pending:
             return "queued_user_message"
@@ -1025,6 +1085,14 @@ class CheckpointContextEngine(ContextEngine):
     def _commit_snapshot_is_current(
         self, snapshot: CheckpointCommitSnapshot, lifecycle: Any
     ) -> bool:
+        if (
+            self._source_messages is None
+            or self._source_snapshot is None
+            or not self._snapshot_is_current(
+                self._source_messages, self._source_snapshot
+            )
+        ):
+            return False
         if snapshot.durable_revision is not None:
             revision_current = getattr(
                 self._session_db, "active_message_revision_is_current", None
@@ -2014,6 +2082,8 @@ class CheckpointContextEngine(ContextEngine):
         except (TypeError, ValueError):
             self._set_automatic_cooldown("snapshot_unavailable")
             return messages
+        self._source_messages = messages
+        self._source_snapshot = snapshot
         try:
             commit_snapshot = self._capture_commit_snapshot(lifecycle)
         except Exception:
@@ -2033,6 +2103,11 @@ class CheckpointContextEngine(ContextEngine):
         if source_event_ids is None:
             self.last_trigger_reason = "durable_source_mapping_unavailable"
             return messages
+        durable_sources = self._durable_source_messages(messages, commit_snapshot)
+        if durable_sources is None:
+            self.last_trigger_reason = "durable_source_content_mismatch"
+            return messages
+        durable_messages, source_messages = durable_sources
         publication_snapshot = (
             commit_snapshot
             if source_event_ids == commit_snapshot.source_event_ids
@@ -2045,21 +2120,21 @@ class CheckpointContextEngine(ContextEngine):
         self.last_candidate = None
         self.last_wire_tokens = None
         self.last_degradation_steps = ()
-        groups = self._plan_causal_groups(messages)
+        groups = self._plan_causal_groups(source_messages)
         if (
             current_tokens is not None
             and not force
-            and not self._reclaimable_groups(messages, groups)
+            and not self._reclaimable_groups(source_messages, groups)
         ):
             self._set_automatic_cooldown("nothing_reclaimable")
             return messages
-        map_groups = self._plan_map_shards(messages, groups, source_event_ids)
+        map_groups = self._plan_map_shards(source_messages, groups, source_event_ids)
         if map_groups is None:
             self._set_automatic_cooldown("map_budget_exceeded")
             self._last_compress_aborted = True
             self._last_summary_error = "checkpoint Map exceeded its token budget"
             return messages
-        mapped = self._map_shards(messages, map_groups, source_event_ids)
+        mapped = self._map_shards(source_messages, map_groups, source_event_ids)
         if mapped is None:
             self._set_automatic_cooldown("map_failed")
             self._last_compress_aborted = True
@@ -2071,7 +2146,7 @@ class CheckpointContextEngine(ContextEngine):
             return messages
         self.last_map_shards = mapped
         reduced = self._reduce(
-            self._extract_deterministic_lanes(messages, source_event_ids), mapped
+            self._extract_deterministic_lanes(durable_messages, source_event_ids), mapped
         )
         checkpoint = self._semantic_checkpoint(
             reduced,
@@ -2088,7 +2163,7 @@ class CheckpointContextEngine(ContextEngine):
         ):
             return messages
         rendered = self._render_candidate(
-            messages, groups, reduced, checkpoint, fixed_wire_tokens
+            source_messages, groups, reduced, checkpoint, fixed_wire_tokens
         )
         if rendered is None:
             self._set_automatic_cooldown("candidate_rejected")

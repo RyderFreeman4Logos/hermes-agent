@@ -26210,6 +26210,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "type": "completion",
                         "session_id": session_id,
                         "session_key": session_key,
+                        "task_id": getattr(session, "task_id", ""),
                         "platform": platform_name,
                         "chat_type": watcher.get("chat_type", ""),
                         "chat_id": chat_id,

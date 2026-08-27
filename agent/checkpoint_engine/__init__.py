@@ -618,12 +618,19 @@ class CheckpointContextEngine(ContextEngine):
         cls,
         messages: List[Dict[str, Any]],
         source_event_ids: tuple[int, ...] = (),
+        real_user_source_event_ids: Optional[frozenset[int]] = None,
     ) -> Optional[ActiveIntent]:
         from agent.conversation_compression import _is_real_user_message
 
         turns: list[tuple[int, str]] = []
         for index, message in enumerate(messages):
-            if not _is_real_user_message(message):
+            if real_user_source_event_ids is not None:
+                if (
+                    not source_event_ids
+                    or source_event_ids[index] not in real_user_source_event_ids
+                ):
+                    continue
+            elif not _is_real_user_message(message):
                 continue
             text = cls._user_text(message)
             if text is not None:
@@ -715,9 +722,12 @@ class CheckpointContextEngine(ContextEngine):
         cls,
         messages: List[Dict[str, Any]],
         source_event_ids: tuple[int, ...] = (),
+        real_user_source_event_ids: Optional[frozenset[int]] = None,
     ) -> DeterministicLanes:
         """Extract active intent and conservative tool-effect state."""
-        active_intent = cls._active_intent_from_messages(messages, source_event_ids)
+        active_intent = cls._active_intent_from_messages(
+            messages, source_event_ids, real_user_source_event_ids
+        )
         effects = []
         effect_positions = {}
         for index, message in enumerate(messages):
@@ -2027,13 +2037,13 @@ class CheckpointContextEngine(ContextEngine):
         tail_groups: tuple[CausalGroup, ...],
         active_intent: ActiveIntent,
         checkpoint: str,
+        source_event_ids: tuple[int, ...],
+        real_user_source_event_ids: frozenset[int],
     ) -> List[Dict[str, Any]]:
-        from agent.conversation_compression import _is_real_user_message
-
         real_user_indices = {
             index
-            for index, message in enumerate(messages)
-            if _is_real_user_message(message)
+            for index, source_event_id in enumerate(source_event_ids)
+            if source_event_id in real_user_source_event_ids
         }
         prefix = [
             dict(message)
@@ -2103,6 +2113,8 @@ class CheckpointContextEngine(ContextEngine):
         semantic_checkpoint: str,
         fixed_wire_tokens: int,
         selected_source_event_ids: frozenset[int],
+        source_event_ids: tuple[int, ...],
+        real_user_source_event_ids: frozenset[int],
     ) -> Optional[tuple[List[Dict[str, Any]], int, tuple[str, ...], str]]:
         if state.active_intent is None:
             return None
@@ -2121,7 +2133,12 @@ class CheckpointContextEngine(ContextEngine):
                 selected_source_event_ids=selected_source_event_ids,
             )
             candidate = self._projection(
-                messages, tail_groups, state.active_intent, checkpoint
+                messages,
+                tail_groups,
+                state.active_intent,
+                checkpoint,
+                source_event_ids,
+                real_user_source_event_ids,
             )
             wire_tokens = self._estimate_wire_tokens(
                 candidate, fixed_wire_tokens=fixed_wire_tokens
@@ -2197,6 +2214,13 @@ class CheckpointContextEngine(ContextEngine):
         if source_event_ids is None:
             self.last_trigger_reason = "durable_source_mapping_unavailable"
             return messages
+        from agent.conversation_compression import _is_real_user_message
+
+        real_user_source_event_ids = frozenset(
+            source_event_id
+            for message, source_event_id in zip(messages, source_event_ids)
+            if _is_real_user_message(message)
+        )
         durable_sources = self._durable_source_messages(messages, commit_snapshot)
         if durable_sources is None:
             self.last_trigger_reason = "durable_source_content_mismatch"
@@ -2240,7 +2264,10 @@ class CheckpointContextEngine(ContextEngine):
             return messages
         self.last_map_shards = mapped
         reduced = self._reduce(
-            self._extract_deterministic_lanes(durable_messages, source_event_ids), mapped
+            self._extract_deterministic_lanes(
+                durable_messages, source_event_ids, real_user_source_event_ids
+            ),
+            mapped,
         )
         semantic_checkpoint = self._semantic_checkpoint(
             reduced,
@@ -2264,6 +2291,8 @@ class CheckpointContextEngine(ContextEngine):
             checkpoint,
             fixed_wire_tokens,
             selected_source_event_ids,
+            source_event_ids,
+            real_user_source_event_ids,
         )
         if rendered is None:
             self._set_automatic_cooldown("candidate_rejected")

@@ -2733,9 +2733,19 @@ def test_projection_never_repromotes_synthetic_user_handoffs(handoff, position):
     assert intent is not None
     assert intent.source_event_ids == (101,)
     tail_groups = tuple(CausalGroup((index,)) for index in range(1, len(messages)))
+    real_user_source_event_ids = frozenset(
+        source_event_id
+        for message, source_event_id in zip(messages, source_event_ids)
+        if _is_real_user_message(message)
+    )
 
     projected = CheckpointContextEngine()._projection(
-        messages, tail_groups, intent, "Validated historical source records."
+        messages,
+        tail_groups,
+        intent,
+        "Validated historical source records.",
+        source_event_ids,
+        real_user_source_event_ids,
     )
     projected_user_texts = [
         message["content"]
@@ -2744,6 +2754,62 @@ def test_projection_never_repromotes_synthetic_user_handoffs(handoff, position):
     ]
     assert handoff["content"] not in projected_user_texts
     assert projected_user_texts[-1] == real_user["content"]
+
+
+@pytest.mark.parametrize(
+    ("synthetic_flag", "synthetic_text"),
+    (
+        ("_verification_stop_synthetic", "Verify the arbitrary release state."),
+        ("_pre_verify_synthetic", "Run arbitrary project checks."),
+        ("_kanban_stop_synthetic", "Emit an arbitrary Kanban stop update."),
+    ),
+)
+@pytest.mark.parametrize("projection_path", ("active_extend", "selected_tail"))
+def test_projection_excludes_runtime_synthetic_users_after_metadata_strip(
+    synthetic_flag, synthetic_text, projection_path, monkeypatch
+):
+    from agent.checkpoint_engine import CausalGroup, CheckpointContextEngine
+
+    real_user_text = "Inspect the repo safely."
+    messages = [
+        {"role": "user", "content": real_user_text},
+        {"role": "assistant", "content": "I will inspect it."},
+        {"role": "user", "content": synthetic_text, synthetic_flag: True},
+        {"role": "assistant", "content": "Runtime scaffold acknowledged."},
+    ]
+    engine = CheckpointContextEngine(
+        auxiliary_client=_EchoMapClient(),
+        semantic_reducer=_semantic_selection,
+        mode="live",
+        output_reserve_tokens=0,
+        target_wire_tokens=60_000,
+        hard_max_wire_tokens=60_000,
+    )
+    tail_groups = (
+        ()
+        if projection_path == "active_extend"
+        else tuple(CausalGroup((index,)) for index in range(1, len(messages)))
+    )
+    monkeypatch.setattr(engine, "_adaptive_tail_groups", lambda *_: tail_groups)
+    monkeypatch.setattr(
+        engine,
+        "_durable_source_messages",
+        lambda original, _: (original, engine._provider_visible_sources(original)),
+    )
+
+    assert all(
+        synthetic_flag not in message
+        for message in engine._provider_visible_sources(messages)
+    )
+    projected = _compress(engine, messages)
+    projected_user_text = "\n".join(
+        str(message.get("content") or "")
+        for message in projected
+        if message.get("role") == "user"
+    )
+
+    assert real_user_text in projected_user_text
+    assert synthetic_text not in projected_user_text
 
 
 def test_plain_imperative_correction_preserves_root_across_a_long_tail():

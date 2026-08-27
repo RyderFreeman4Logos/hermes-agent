@@ -1816,7 +1816,7 @@ class CheckpointContextEngine(ContextEngine):
                 continue
             text = fact.text
             active_source_id = (
-                max(state.active_intent.source_event_ids)
+                max(state.active_intent.source_event_ids, default=-1)
                 if state.active_intent is not None
                 else -1
             )

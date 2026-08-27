@@ -3244,6 +3244,7 @@ def compress_context(
 
     _commit_fence_entered = False
     _checkpoint_expected_revision = None
+    _checkpoint_source_ids = None
     try:
         # Capture boundary quality before session-rotation callbacks run. Built-in
         # and plugin lifecycle hooks may reset per-session compressor fields while
@@ -3383,9 +3384,19 @@ def compress_context(
                 _checkpoint_expected_revision = getattr(
                     agent.context_compressor, "expected_session_revision", None
                 )
+                _checkpoint_source_ids = getattr(
+                    agent.context_compressor, "expected_source_event_ids", None
+                )
+                _commit_source_signature = getattr(
+                    agent.context_compressor, "expected_source_signature", None
+                )
             except Exception:
                 _checkpoint_current = False
-            if in_place and _checkpoint_expected_revision is None:
+            if in_place and (
+                _checkpoint_expected_revision is None
+                or not _checkpoint_source_ids
+                or not _commit_source_signature
+            ):
                 _checkpoint_current = False
             if not _checkpoint_current:
                 _restore_compressor_attempt_state(
@@ -3691,6 +3702,7 @@ def compress_context(
                         },
                         watermark=_commit_watermark,
                         lock_holder=_lock_holder,
+                        source_ids=_checkpoint_source_ids,
                         source_signature=_commit_source_signature,
                         expected_revision=_checkpoint_expected_revision,
                     )

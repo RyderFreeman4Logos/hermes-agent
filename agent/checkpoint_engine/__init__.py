@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import subprocess
@@ -95,6 +95,7 @@ class ActiveIntent:
 
     content: str
     event_indices: tuple[int, ...]
+    source_event_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -105,6 +106,7 @@ class Effect:
     operation: Optional[str]
     status: str
     event_indices: tuple[int, ...]
+    source_event_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -160,6 +162,7 @@ class CheckpointCommitSnapshot:
     session_id: str
     durable_revision: Any
     source_event_range: tuple[int, int]
+    source_event_ids: tuple[int, ...]
     queued_user_generation: Any
     queued_steer_generation: Any
     tool_result_generation: tuple[Any, ...]
@@ -577,7 +580,9 @@ class CheckpointContextEngine(ContextEngine):
 
     @classmethod
     def _active_intent_from_messages(
-        cls, messages: List[Dict[str, Any]]
+        cls,
+        messages: List[Dict[str, Any]],
+        source_event_ids: tuple[int, ...] = (),
     ) -> Optional[ActiveIntent]:
         turns: list[tuple[int, str]] = []
         for index, message in enumerate(messages):
@@ -603,16 +608,32 @@ class CheckpointContextEngine(ContextEngine):
             indices.append(index)
         if not parts:
             index, text = turns[-1]
-            return ActiveIntent(cls._project_intent_text(text), (index,))
-        return ActiveIntent("\n".join(parts), tuple(indices))
+            return ActiveIntent(
+                cls._project_intent_text(text),
+                (index,),
+                (source_event_ids[index],) if source_event_ids else (),
+            )
+        return ActiveIntent(
+            "\n".join(parts),
+            tuple(indices),
+            tuple(source_event_ids[index] for index in indices)
+            if source_event_ids
+            else (),
+        )
 
     @staticmethod
     def _receipt_status(
-        message: Dict[str, Any], tool_call_id: str, operation: Optional[str]
+        message: Dict[str, Any],
+        tool_call_id: str,
+        operation: Optional[str],
+        expected_source_event_ids: tuple[int, ...],
     ) -> Optional[str]:
         """Read effect state only from identity-bound persisted evidence."""
         disposition = message.get("effect_disposition")
-        if disposition in {"running", "succeeded", "failed", "unknown"}:
+        if (
+            expected_source_event_ids
+            and disposition in {"running", "succeeded", "failed", "unknown"}
+        ):
             return disposition
         candidates = [message.get("receipt"), message.get("mutation_receipt")]
         content = message.get("content")
@@ -632,7 +653,7 @@ class CheckpointContextEngine(ContextEngine):
             source_event_ids = receipt.get("source_event_ids")
             if (
                 not isinstance(source_event_ids, (list, tuple))
-                or not source_event_ids
+                or tuple(source_event_ids) != expected_source_event_ids
                 or any(
                     isinstance(event_id, bool)
                     or not isinstance(event_id, int)
@@ -654,10 +675,12 @@ class CheckpointContextEngine(ContextEngine):
 
     @classmethod
     def _extract_deterministic_lanes(
-        cls, messages: List[Dict[str, Any]]
+        cls,
+        messages: List[Dict[str, Any]],
+        source_event_ids: tuple[int, ...] = (),
     ) -> DeterministicLanes:
         """Extract active intent and conservative tool-effect state."""
-        active_intent = cls._active_intent_from_messages(messages)
+        active_intent = cls._active_intent_from_messages(messages, source_event_ids)
         effects = []
         effect_positions = {}
         for index, message in enumerate(messages):
@@ -676,14 +699,32 @@ class CheckpointContextEngine(ContextEngine):
                         else None
                     )
                     effect_positions[tool_call_id] = len(effects)
-                    effects.append(Effect(tool_call_id, operation, "issued", (index,)))
+                    effects.append(
+                        Effect(
+                            tool_call_id,
+                            operation,
+                            "issued",
+                            (index,),
+                            (source_event_ids[index],) if source_event_ids else (),
+                        )
+                    )
             elif message.get("role") == "tool":
                 tool_call_id = message.get("tool_call_id")
                 if not isinstance(tool_call_id, str) or tool_call_id not in effect_positions:
                     continue
                 effect_index = effect_positions[tool_call_id]
                 effect = effects[effect_index]
-                observed = cls._receipt_status(message, tool_call_id, effect.operation)
+                exact_source_ids = (
+                    (*effect.source_event_ids, source_event_ids[index])
+                    if source_event_ids
+                    else ()
+                )
+                observed = cls._receipt_status(
+                    message,
+                    tool_call_id,
+                    effect.operation,
+                    exact_source_ids,
+                )
                 status = (
                     cls._effect_status_after_receipt(effect.status, observed)
                     if observed is not None
@@ -694,6 +735,7 @@ class CheckpointContextEngine(ContextEngine):
                     effect.operation,
                     status,
                     (*effect.event_indices, index),
+                    exact_source_ids,
                 )
         return DeterministicLanes(active_intent, tuple(effects))
 
@@ -868,6 +910,7 @@ class CheckpointContextEngine(ContextEngine):
                 int(getattr(revision, "first_message_id", 0)),
                 int(getattr(revision, "last_message_id", 0)),
             ),
+            source_event_ids=tuple(getattr(revision, "source_ids", ())),
             queued_user_generation=(
                 getattr(lifecycle, "_queued_user_generation", None),
                 getattr(lifecycle, "_queued_prompt_generation", None),
@@ -897,6 +940,30 @@ class CheckpointContextEngine(ContextEngine):
             background_completion_pending=background_completion_pending,
             workspace_state=self._workspace_state(lifecycle, session_id),
         )
+
+    @staticmethod
+    def _durable_source_event_ids(
+        messages: List[Dict[str, Any]], snapshot: CheckpointCommitSnapshot
+    ) -> Optional[tuple[int, ...]]:
+        durable_ids = snapshot.source_event_ids
+        row_ids = tuple(message.get("_row_id") for message in messages)
+        if not durable_ids:
+            durable_ids = row_ids
+        if (
+            len(durable_ids) != len(messages)
+            or not durable_ids
+            or any(
+                isinstance(event_id, bool)
+                or not isinstance(event_id, int)
+                or event_id <= 0
+                for event_id in durable_ids
+            )
+            or len(set(durable_ids)) != len(durable_ids)
+        ):
+            return None
+        if any(row_id is not None for row_id in row_ids) and row_ids != durable_ids:
+            return None
+        return durable_ids
 
     @staticmethod
     def _snapshot_has_unrepresented_work(snapshot: CheckpointCommitSnapshot) -> Optional[str]:
@@ -955,16 +1022,31 @@ class CheckpointContextEngine(ContextEngine):
         snapshot = self._commit_snapshot
         return snapshot.durable_revision if snapshot is not None else None
 
+    @property
+    def expected_source_event_ids(self) -> Optional[tuple[int, ...]]:
+        snapshot = self._commit_snapshot
+        return snapshot.source_event_ids if snapshot is not None else None
+
+    @property
+    def expected_source_signature(self) -> Optional[str]:
+        revision = self.expected_session_revision
+        return getattr(revision, "source_signature", None)
+
     @staticmethod
     def _map_prompt(
-        messages: List[Dict[str, Any]], group: CausalGroup
+        messages: List[Dict[str, Any]],
+        group: CausalGroup,
+        source_event_ids: tuple[int, ...],
     ) -> List[Dict[str, str]]:
-        event_ids = group.event_indices
+        event_ids = tuple(source_event_ids[index] for index in group.event_indices)
         payload = {
             "source_event_ids": event_ids,
             "events": [
-                {"source_event_id": event_id, "message": messages[event_id]}
-                for event_id in event_ids
+                {
+                    "source_event_id": source_event_ids[index],
+                    "message": messages[index],
+                }
+                for index in group.event_indices
             ],
         }
         return [
@@ -984,13 +1066,19 @@ class CheckpointContextEngine(ContextEngine):
         ]
 
     def _map_input_tokens(
-        self, messages: List[Dict[str, Any]], group: CausalGroup
+        self,
+        messages: List[Dict[str, Any]],
+        group: CausalGroup,
+        source_event_ids: tuple[int, ...],
     ) -> int:
         """Estimate the complete Map request before admission."""
-        return self._token_count(self._map_prompt(messages, group))
+        return self._token_count(self._map_prompt(messages, group, source_event_ids))
 
     def _plan_map_shards(
-        self, messages: List[Dict[str, Any]], groups: tuple[CausalGroup, ...]
+        self,
+        messages: List[Dict[str, Any]],
+        groups: tuple[CausalGroup, ...],
+        source_event_ids: tuple[int, ...],
     ) -> Optional[tuple[CausalGroup, ...]]:
         """Pack adjacent causal units; retain units with no proven safe split."""
         shards = []
@@ -1004,19 +1092,24 @@ class CheckpointContextEngine(ContextEngine):
                 current_indices = []
 
         for group in groups:
-            unit_tokens = self._map_input_tokens(messages, group)
+            unit_tokens = self._map_input_tokens(messages, group, source_event_ids)
             if unit_tokens > _MAP_SHARD_MAX_INPUT_TOKENS:
                 finish_current()
                 externalized.append(group)
                 continue
             candidate = CausalGroup(tuple((*current_indices, *group.event_indices)))
-            if current_indices and self._map_input_tokens(messages, candidate) > _MAP_SHARD_TARGET_INPUT_TOKENS:
+            if current_indices and self._map_input_tokens(
+                messages, candidate, source_event_ids
+            ) > _MAP_SHARD_TARGET_INPUT_TOKENS:
                 finish_current()
             current_indices.extend(group.event_indices)
         finish_current()
 
         self.last_map_externalized_groups = tuple(externalized)
-        total_input = sum(self._map_input_tokens(messages, shard) for shard in shards)
+        total_input = sum(
+            self._map_input_tokens(messages, shard, source_event_ids)
+            for shard in shards
+        )
         if (
             len(shards) > self._max_map_shards
             or total_input > _MAP_TOTAL_INPUT_TOKENS
@@ -1097,7 +1190,10 @@ class CheckpointContextEngine(ContextEngine):
 
     @classmethod
     def _parse_map_shard(
-        cls, response: Any, group: CausalGroup
+        cls,
+        response: Any,
+        group: CausalGroup,
+        source_event_ids: tuple[int, ...],
     ) -> Optional[MapShard]:
         content = cls._response_content(response)
         if content is None:
@@ -1108,8 +1204,11 @@ class CheckpointContextEngine(ContextEngine):
             return None
         if not isinstance(payload, dict) or set(payload) != {"source_event_ids", "facts"}:
             return None
-        source_event_ids = cls._event_ids(payload["source_event_ids"])
-        if source_event_ids is None or set(source_event_ids) != set(group.event_indices):
+        expected_source_ids = tuple(
+            source_event_ids[index] for index in group.event_indices
+        )
+        parsed_source_ids = cls._event_ids(payload["source_event_ids"])
+        if parsed_source_ids is None or parsed_source_ids != expected_source_ids:
             return None
         facts = payload["facts"]
         if not isinstance(facts, list):
@@ -1154,7 +1253,7 @@ class CheckpointContextEngine(ContextEngine):
                 if "source_event_ids" in fact or not uncertain:
                     return None
                 fact_event_ids = ()
-            elif not fact_event_ids or not set(fact_event_ids) <= set(source_event_ids):
+            elif not fact_event_ids or not set(fact_event_ids) <= set(parsed_source_ids):
                 return None
             parsed_facts.append(
                 MapFact(
@@ -1167,16 +1266,19 @@ class CheckpointContextEngine(ContextEngine):
                     action_state,
                 )
             )
-        return MapShard(tuple(group.event_indices), tuple(parsed_facts))
+        return MapShard(expected_source_ids, tuple(parsed_facts))
 
     @staticmethod
     def _map_shard_cache_key(
-        messages: List[Dict[str, Any]], group: CausalGroup
+        messages: List[Dict[str, Any]],
+        group: CausalGroup,
+        source_event_ids: tuple[int, ...],
     ) -> tuple[str, ...]:
         """Fingerprint only source digests and parser/prompt versions."""
         source_event_range_hash = hashlib.sha256(
             json.dumps(
-                list(group.event_indices), separators=(",", ":")
+                [source_event_ids[index] for index in group.event_indices],
+                separators=(",", ":"),
             ).encode("utf-8")
         ).hexdigest()
         source_content_hash = hashlib.sha256(
@@ -1197,18 +1299,22 @@ class CheckpointContextEngine(ContextEngine):
 
     @classmethod
     def _is_valid_map_shard(
-        cls, shard: Any, group: CausalGroup
+        cls,
+        shard: Any,
+        group: CausalGroup,
+        source_event_ids: tuple[int, ...],
     ) -> bool:
         if not isinstance(shard, MapShard):
             return False
-        source_event_ids = shard.source_event_ids
+        shard_source_ids = shard.source_event_ids
         if (
-            not isinstance(source_event_ids, tuple)
-            or source_event_ids != tuple(group.event_indices)
+            not isinstance(shard_source_ids, tuple)
+            or shard_source_ids
+            != tuple(source_event_ids[index] for index in group.event_indices)
             or not isinstance(shard.facts, tuple)
         ):
             return False
-        source_events = set(source_event_ids)
+        source_events = set(shard_source_ids)
         for fact in shard.facts:
             if not isinstance(fact, MapFact):
                 return False
@@ -1255,32 +1361,53 @@ class CheckpointContextEngine(ContextEngine):
         return True
 
     def _map_group(
-        self, messages: List[Dict[str, Any]], group: CausalGroup
+        self,
+        messages: List[Dict[str, Any]],
+        group: CausalGroup,
+        source_event_ids: tuple[int, ...],
     ) -> Optional[MapShard]:
         try:
-            cache_key = self._map_shard_cache_key(messages, group)
+            cache_key = self._map_shard_cache_key(
+                messages, group, source_event_ids
+            )
             cached = self._map_shard_cache.get(cache_key)
             if cached is not None:
-                if self._is_valid_map_shard(cached, group):
+                if self._is_valid_map_shard(cached, group, source_event_ids):
                     return cached
                 self._map_shard_cache.pop(cache_key, None)
             shard = self._parse_map_shard(
-                self._call_map(self._map_prompt(messages, group)), group
+                self._call_map(
+                    self._map_prompt(messages, group, source_event_ids)
+                ),
+                group,
+                source_event_ids,
             )
         except Exception:
             return None
-        if shard is None or not self._is_valid_map_shard(shard, group):
+        if shard is None or not self._is_valid_map_shard(
+            shard, group, source_event_ids
+        ):
             return None
         self._map_shard_cache[cache_key] = shard
         return shard
 
     def _map_shards(
-        self, messages: List[Dict[str, Any]], groups: tuple[CausalGroup, ...]
+        self,
+        messages: List[Dict[str, Any]],
+        groups: tuple[CausalGroup, ...],
+        source_event_ids: tuple[int, ...],
     ) -> Optional[tuple[MapShard, ...]]:
         if not groups:
             return ()
         with ThreadPoolExecutor(max_workers=self._map_concurrency) as executor:
-            mapped = tuple(executor.map(lambda group: self._map_group(messages, group), groups))
+            mapped = tuple(
+                executor.map(
+                    lambda group: self._map_group(
+                        messages, group, source_event_ids
+                    ),
+                    groups,
+                )
+            )
         if any(shard is None for shard in mapped):
             return None
         return tuple(shard for shard in mapped if shard is not None)
@@ -1356,7 +1483,7 @@ class CheckpointContextEngine(ContextEngine):
             "active_intent": (
                 {
                     "content": state.active_intent.content,
-                    "source_event_ids": state.active_intent.event_indices,
+                    "source_event_ids": state.active_intent.source_event_ids,
                 }
                 if state.active_intent is not None
                 else None
@@ -1366,7 +1493,7 @@ class CheckpointContextEngine(ContextEngine):
                     "tool_call_id": effect.tool_call_id,
                     "operation": effect.operation,
                     "status": effect.status,
-                    "source_event_ids": effect.event_indices,
+                    "source_event_ids": effect.source_event_ids,
                 }
                 for effect in state.effects
             ],
@@ -1431,9 +1558,9 @@ class CheckpointContextEngine(ContextEngine):
             for event_id in fact.source_event_ids
         }
         if state.active_intent is not None:
-            available.update(state.active_intent.event_indices)
+            available.update(state.active_intent.source_event_ids)
         for effect in state.effects:
-            available.update(effect.event_indices)
+            available.update(effect.source_event_ids)
         if not selected or not set(selected) <= available:
             return None
         return "Validated historical source records."
@@ -1482,7 +1609,7 @@ class CheckpointContextEngine(ContextEngine):
                 "Trusted effects:\n"
                 + "\n".join(
                     f"- {effect.operation or 'tool'} [{effect.status}] "
-                    f"(events: {','.join(str(index) for index in effect.event_indices)})"
+                    f"(events: {','.join(str(event_id) for event_id in effect.source_event_ids)})"
                     for effect in state.effects
                 )
             )
@@ -1753,6 +1880,15 @@ class CheckpointContextEngine(ContextEngine):
             messages, snapshot, commit_snapshot, lifecycle
         ):
             return messages
+        source_event_ids = self._durable_source_event_ids(messages, commit_snapshot)
+        if source_event_ids is None:
+            self.last_trigger_reason = "durable_source_mapping_unavailable"
+            return messages
+        publication_snapshot = (
+            commit_snapshot
+            if source_event_ids == commit_snapshot.source_event_ids
+            else replace(commit_snapshot, source_event_ids=source_event_ids)
+        )
         self.last_map_shards = ()
         self.last_map_externalized_groups = ()
         self.last_reduced_state = None
@@ -1768,13 +1904,13 @@ class CheckpointContextEngine(ContextEngine):
         ):
             self._set_automatic_cooldown("nothing_reclaimable")
             return messages
-        map_groups = self._plan_map_shards(messages, groups)
+        map_groups = self._plan_map_shards(messages, groups, source_event_ids)
         if map_groups is None:
             self._set_automatic_cooldown("map_budget_exceeded")
             self._last_compress_aborted = True
             self._last_summary_error = "checkpoint Map exceeded its token budget"
             return messages
-        mapped = self._map_shards(messages, map_groups)
+        mapped = self._map_shards(messages, map_groups, source_event_ids)
         if mapped is None:
             self._set_automatic_cooldown("map_failed")
             self._last_compress_aborted = True
@@ -1785,7 +1921,9 @@ class CheckpointContextEngine(ContextEngine):
         ):
             return messages
         self.last_map_shards = mapped
-        reduced = self._reduce(self._extract_deterministic_lanes(messages), mapped)
+        reduced = self._reduce(
+            self._extract_deterministic_lanes(messages, source_event_ids), mapped
+        )
         checkpoint = self._semantic_checkpoint(
             reduced,
             focus_topic=self.last_focus_topic,
@@ -1824,7 +1962,7 @@ class CheckpointContextEngine(ContextEngine):
         if candidate == messages:
             self.last_trigger_reason = "replay_unchanged"
             return messages
-        self._commit_snapshot = commit_snapshot
+        self._commit_snapshot = publication_snapshot
         self.compression_count += 1
         self._last_compression_made_progress = True
         return candidate

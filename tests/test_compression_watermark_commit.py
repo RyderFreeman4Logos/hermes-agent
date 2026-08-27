@@ -91,6 +91,16 @@ class TestWatermarkCommit:
     ) -> None:
         _seed(db)
         revision = db.get_active_message_revision("sess1")
+
+        with pytest.raises(SessionTranscriptRevisionChangedError):
+            db.archive_and_compact(
+                "sess1",
+                SUMMARY,
+                source_ids=list(revision.source_ids),
+                source_signature="not-the-active-signature",
+                expected_revision=revision,
+            )
+
         count = db.archive_and_compact(
             "sess1",
             SUMMARY,

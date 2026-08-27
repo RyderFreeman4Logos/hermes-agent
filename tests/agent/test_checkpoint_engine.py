@@ -9,6 +9,8 @@ import threading
 import time
 from types import SimpleNamespace
 
+import pytest
+
 from agent.context_engine import sanitize_memory_context
 from hermes_cli.config_defaults import DEFAULT_CONFIG
 from plugins.context_engine import discover_context_engines, load_context_engine
@@ -63,9 +65,9 @@ def _map_response(payload, *, tool_calls=None):
 def _semantic_selection(state):
     source_event_ids = set()
     if state.active_intent is not None:
-        source_event_ids.update(state.active_intent.event_indices)
+        source_event_ids.update(state.active_intent.source_event_ids)
     for effect in state.effects:
-        source_event_ids.update(effect.event_indices)
+        source_event_ids.update(effect.source_event_ids)
     for fact in state.facts:
         source_event_ids.update(fact.source_event_ids)
     return json.dumps({"source_event_ids": sorted(source_event_ids)})
@@ -77,6 +79,43 @@ def _semantic_response(payload):
     for record in (*payload.get("effects", ()), *payload.get("facts", ())):
         source_event_ids.update(record.get("source_event_ids", ()))
     return _map_response({"source_event_ids": sorted(source_event_ids)})
+
+
+def _test_source_event_ids(messages):
+    return tuple(range(1, len(messages) + 1))
+
+
+def _compress(engine, messages, *args, **kwargs):
+    """Supply durable row ids to isolated engine tests without a SessionDB."""
+    used = {
+        message.get("_row_id")
+        for message in messages
+        if isinstance(message.get("_row_id"), int)
+    }
+    next_id = max(used, default=0) + 1
+    injected = set()
+    for message in messages:
+        if "_row_id" not in message:
+            while next_id in used:
+                next_id += 1
+            message["_row_id"] = next_id
+            injected.add(next_id)
+            used.add(next_id)
+            next_id += 1
+    result = engine.compress(messages, *args, **kwargs)
+    for message in messages:
+        if message.get("_row_id") in injected:
+            message.pop("_row_id")
+    if result is not messages:
+        for message in result:
+            if message.get("_row_id") in injected:
+                message.pop("_row_id")
+    candidate = getattr(engine, "last_candidate", None)
+    if isinstance(candidate, list):
+        for message in candidate:
+            if message.get("_row_id") in injected:
+                message.pop("_row_id")
+    return result
 
 
 def test_default_context_engine_remains_compressor():
@@ -139,13 +178,13 @@ def test_auto_trigger_cooldown_and_force_retry_after_failed_checkpoint():
     ]
 
     assert engine.should_compress(engine.threshold_tokens) is True
-    assert engine.compress(messages, current_tokens=engine.threshold_tokens) is messages
+    assert _compress(engine, messages, current_tokens=engine.threshold_tokens) is messages
     should_compress, reason = engine.should_compress_info(engine.threshold_tokens)
     assert should_compress is False
     assert reason is not None and reason.startswith("cooldown:")
 
     attempts_before_force = len(auxiliary.calls)
-    assert engine.compress(messages, current_tokens=engine.threshold_tokens, force=True) is messages
+    assert _compress(engine, messages, current_tokens=engine.threshold_tokens, force=True) is messages
     assert len(auxiliary.calls) > attempts_before_force
 
 
@@ -160,7 +199,7 @@ def test_checkpoint_skips_unreclaimable_or_inflight_history_with_block_reason():
     ]
 
     assert engine.has_content_to_compress(unreclaimable) is False
-    assert engine.compress(unreclaimable, current_tokens=engine.threshold_tokens) is unreclaimable
+    assert _compress(engine, unreclaimable, current_tokens=engine.threshold_tokens) is unreclaimable
     assert engine.should_compress_info(engine.threshold_tokens) == (
         False,
         "cooldown:nothing_reclaimable",
@@ -180,7 +219,7 @@ def test_checkpoint_skips_unreclaimable_or_inflight_history_with_block_reason():
             ],
         },
     ]
-    assert engine.compress(inflight, current_tokens=engine.threshold_tokens, force=True) is inflight
+    assert _compress(engine, inflight, current_tokens=engine.threshold_tokens, force=True) is inflight
     assert engine.last_trigger_reason == "in_flight_tools"
 
 
@@ -189,8 +228,8 @@ def test_checkpoint_uses_focus_memory_and_complete_request_estimate():
 
     memory_context = "api_key=sk-test-secret\nRemember the release checklist."
     auxiliary = _FakeAuxiliaryClient(
-        _map_response({"source_event_ids": [0, 1, 2, 3], "facts": []}),
-        _map_response({"source_event_ids": [3]}),
+        _map_response({"source_event_ids": [1, 2, 3, 4], "facts": []}),
+        _map_response({"source_event_ids": [4]}),
     )
     engine = CheckpointContextEngine(auxiliary_client=auxiliary)
     messages = [
@@ -200,7 +239,7 @@ def test_checkpoint_uses_focus_memory_and_complete_request_estimate():
         {"role": "user", "content": "finish the release"},
     ]
 
-    assert engine.compress(
+    assert _compress(engine,
         messages,
         current_tokens=900,
         focus_topic="release validation",
@@ -249,8 +288,8 @@ def test_long_session_replay_sanitizes_and_bounds_memory_context():
         hard_max_wire_tokens=60_000,
     )
 
-    first = engine.compress(messages, memory_context=memory_context)
-    replay = engine.compress(first, memory_context=memory_context)
+    first = _compress(engine, messages, memory_context=memory_context)
+    replay = _compress(engine, first, memory_context=memory_context)
 
     assert first is not messages
     assert replay == first
@@ -277,7 +316,7 @@ def test_shadow_compress_is_noop():
     ]
     original = deepcopy(messages)
 
-    result = engine.compress(messages)
+    result = _compress(engine, messages)
 
     assert result == original
     assert result is messages
@@ -313,7 +352,7 @@ def test_live_replay_is_idempotent_but_later_events_compact():
                     "id": "call_1",
                     "op": "write_file",
                     "status": "succeeded",
-                    "source_event_ids": [2, 3],
+                    "source_event_ids": [3, 4],
                 }
             }),
         },
@@ -321,8 +360,8 @@ def test_live_replay_is_idempotent_but_later_events_compact():
         {"role": "user", "content": "continue"},
     ]
 
-    first = engine.compress(messages)
-    replay = engine.compress(first)
+    first = _compress(engine, messages)
+    replay = _compress(engine, first)
 
     def _effect_lines(history):
         return [
@@ -368,14 +407,14 @@ def test_live_replay_is_idempotent_but_later_events_compact():
                     "id": "call_2",
                     "op": "read_file",
                     "status": "succeeded",
-                    "source_event_ids": [6, 7],
+                    "source_event_ids": [len(first) + 1, len(first) + 2],
                 }
             }),
         },
         {"role": "assistant", "content": "new result"},
         {"role": "user", "content": "new active request"},
     ]
-    compacted = engine.compress(later)
+    compacted = _compress(engine, later)
 
     assert compacted != later
     assert compacted[-1] == later[-1]
@@ -412,7 +451,7 @@ def test_inflight_tool_call_refuses_checkpoint():
     original = deepcopy(messages)
 
     assert engine._has_inflight_tools(messages)
-    result = engine.compress(messages)
+    result = _compress(engine, messages)
 
     assert result == original
     assert result is messages
@@ -441,7 +480,7 @@ def test_stale_snapshot_refuses_checkpoint(monkeypatch):
 
     monkeypatch.setattr(engine, "_snapshot_is_current", stale_revision)
 
-    result = engine.compress(messages)
+    result = _compress(engine, messages)
 
     assert revision_checked
     assert result is messages
@@ -489,13 +528,96 @@ def test_durable_revision_and_queued_input_refuse_checkpoint(tmp_path):
     )
     engine.bind_session_state(db, "checkpoint-session")
 
-    assert engine.compress(messages, force=True, lifecycle=lifecycle) is messages
+    assert _compress(engine, messages, force=True, lifecycle=lifecycle) is messages
     assert engine.last_trigger_reason == "stale_durable_snapshot"
     assert engine.compression_count == 0
 
     lifecycle._pending_cli_user_message = {"role": "user", "content": "queued"}
-    assert engine.compress(messages, force=True, lifecycle=lifecycle) is messages
+    assert _compress(engine, messages, force=True, lifecycle=lifecycle) is messages
     assert engine.last_trigger_reason == "queued_user_message"
+
+
+def test_checkpoint_map_uses_durable_active_row_ids(tmp_path):
+    from hermes_state import SessionDB
+    from agent.checkpoint_engine import CheckpointContextEngine
+
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("checkpoint-session", source="test")
+    for role, content in (
+        ("user", "original request"),
+        ("assistant", "original answer"),
+        ("user", "active request"),
+    ):
+        db.append_message("checkpoint-session", role=role, content=content)
+    messages = db.get_messages_as_conversation(
+        "checkpoint-session", include_row_ids=True
+    )
+    durable_ids = tuple(message["_row_id"] for message in messages)
+    observed_ids = []
+
+    class _RecordingMapClient:
+        def complete(self, **kwargs):
+            payload = json.loads(kwargs["messages"][-1]["content"])
+            observed_ids.append(tuple(payload["source_event_ids"]))
+            return _map_response(
+                {"source_event_ids": payload["source_event_ids"], "facts": []}
+            )
+
+    lifecycle = SimpleNamespace(
+        session_id="checkpoint-session",
+        _pending_cli_user_message=None,
+        _pending_steer=None,
+        _executing_tools=False,
+        model="test-model",
+        provider="test-provider",
+        base_url="https://example.test",
+        api_mode="chat_completions",
+    )
+    engine = CheckpointContextEngine(
+        auxiliary_client=_RecordingMapClient(),
+        semantic_reducer=_semantic_selection,
+        mode="live",
+        token_counter=lambda _value: 1,
+        output_reserve_tokens=0,
+    )
+    engine.bind_session_state(db, "checkpoint-session")
+
+    result = _compress(engine, messages, force=True, lifecycle=lifecycle)
+
+    assert observed_ids == [durable_ids]
+    assert engine.last_map_shards[0].source_event_ids == durable_ids
+    assert engine.expected_source_event_ids == durable_ids
+    assert engine.expected_source_signature == db.get_active_message_revision(
+        "checkpoint-session"
+    ).source_signature
+    assert result is not messages, engine.last_trigger_reason
+
+
+def test_checkpoint_rejects_missing_or_mismatched_durable_id_mapping(tmp_path):
+    from hermes_state import SessionDB
+    from agent.checkpoint_engine import CheckpointContextEngine
+
+    client = _EchoMapClient()
+    engine = CheckpointContextEngine(
+        auxiliary_client=client,
+        semantic_reducer=_semantic_selection,
+        mode="live",
+    )
+    messages = [{"role": "user", "content": "not durable"}]
+
+    assert engine.compress(messages, force=True) is messages
+    assert engine.last_trigger_reason == "durable_source_mapping_unavailable"
+    assert client.calls == []
+
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("checkpoint-session", source="test")
+    db.append_message("checkpoint-session", role="user", content="first")
+    db.append_message("checkpoint-session", role="assistant", content="second")
+    engine.bind_session_state(db, "checkpoint-session")
+
+    assert engine.compress(messages, force=True) is messages
+    assert engine.last_trigger_reason == "durable_source_mapping_unavailable"
+    assert client.calls == []
 
 
 def _git(repo, *args):
@@ -583,7 +705,7 @@ def test_checkpoint_refuses_when_workspace_head_changes_during_compaction(tmp_pa
     lifecycle = _workspace_lifecycle(repo)
     engine = _workspace_engine(_HeadChangingMapClient())
 
-    assert engine.compress(messages, force=True, lifecycle=lifecycle) is messages
+    assert _compress(engine, messages, force=True, lifecycle=lifecycle) is messages
     assert engine.last_trigger_reason == "stale_durable_snapshot"
     assert engine.compression_count == 0
 
@@ -611,7 +733,7 @@ def test_checkpoint_refuses_when_workspace_tracked_tree_gets_dirty(tmp_path):
     lifecycle = _workspace_lifecycle(repo)
     engine = _workspace_engine(_DirtyWorkspaceMapClient())
 
-    assert engine.compress(messages, force=True, lifecycle=lifecycle) is messages
+    assert _compress(engine, messages, force=True, lifecycle=lifecycle) is messages
     assert engine.last_trigger_reason == "stale_durable_snapshot"
     assert engine.compression_count == 0
 
@@ -660,7 +782,9 @@ def test_deterministic_lanes_preserve_ambiguous_root_and_followup():
         },
     ]
 
-    lanes = engine._extract_deterministic_lanes(messages)
+    lanes = engine._extract_deterministic_lanes(
+        messages, _test_source_event_ids(messages)
+    )
 
     assert lanes.active_intent is not None
     assert lanes.active_intent.content.splitlines() == [
@@ -689,7 +813,9 @@ def test_assistant_prose_does_not_mark_effect_succeeded():
         {"role": "assistant", "content": "I wrote the file."},
     ]
 
-    lanes = engine._extract_deterministic_lanes(messages)
+    lanes = engine._extract_deterministic_lanes(
+        messages, _test_source_event_ids(messages)
+    )
 
     assert len(lanes.effects) == 1
     assert lanes.effects[0].operation == "write_file"
@@ -720,17 +846,19 @@ def test_tool_effect_status_uses_recorded_receipt_evidence():
                         "id": "call_1",
                         "op": "write_file",
                         "status": "succeeded",
-                        "source_event_ids": [0, 1],
+                        "source_event_ids": [1, 2],
                     }
                 }
             ),
         },
     ]
 
-    lanes = CheckpointContextEngine()._extract_deterministic_lanes(messages)
+    lanes = CheckpointContextEngine()._extract_deterministic_lanes(
+        messages, _test_source_event_ids(messages)
+    )
 
     assert lanes.effects == (
-        Effect("call_1", "write_file", "succeeded", (0, 1)),
+        Effect("call_1", "write_file", "succeeded", (0, 1), (1, 2)),
     )
 
 
@@ -764,9 +892,91 @@ def test_tool_effect_receipt_requires_source_event_ids():
         },
     ]
 
-    lanes = CheckpointContextEngine()._extract_deterministic_lanes(messages)
+    lanes = CheckpointContextEngine()._extract_deterministic_lanes(
+        messages, _test_source_event_ids(messages)
+    )
 
     assert lanes.effects[0].status == "unknown"
+
+
+@pytest.mark.parametrize("receipt_ids", ([999], [0, 1]))
+def test_tool_effect_receipt_rejects_unrelated_or_offset_source_ids(receipt_ids):
+    from agent.checkpoint_engine import CheckpointContextEngine
+
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "write_file", "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": json.dumps(
+                {
+                    "receipt": {
+                        "id": "call_1",
+                        "op": "write_file",
+                        "status": "succeeded",
+                        "source_event_ids": receipt_ids,
+                    }
+                }
+            ),
+        },
+        {"role": "user", "content": "unrelated durable row"},
+    ]
+
+    lanes = CheckpointContextEngine()._extract_deterministic_lanes(
+        messages, (101, 102, 999)
+    )
+
+    assert lanes.effects[0].status == "unknown"
+
+
+def test_tool_effect_receipt_accepts_exact_durable_call_and_result_ids():
+    from agent.checkpoint_engine import CheckpointContextEngine, Effect
+
+    messages = [
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "write_file", "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": json.dumps(
+                {
+                    "receipt": {
+                        "id": "call_1",
+                        "op": "write_file",
+                        "status": "succeeded",
+                        "source_event_ids": [101, 102],
+                    }
+                }
+            ),
+        },
+    ]
+
+    lanes = CheckpointContextEngine()._extract_deterministic_lanes(
+        messages, (101, 102)
+    )
+
+    assert lanes.effects == (
+        Effect("call_1", "write_file", "succeeded", (0, 1), (101, 102)),
+    )
 
 
 def test_tool_effect_status_uses_persisted_effect_disposition():
@@ -792,7 +1002,9 @@ def test_tool_effect_status_uses_persisted_effect_disposition():
         },
     ]
 
-    lanes = CheckpointContextEngine()._extract_deterministic_lanes(messages)
+    lanes = CheckpointContextEngine()._extract_deterministic_lanes(
+        messages, _test_source_event_ids(messages)
+    )
 
     assert lanes.effects[0].status == "succeeded"
 
@@ -827,7 +1039,9 @@ def test_tool_effect_receipt_must_match_call_identity():
         },
     ]
 
-    lanes = CheckpointContextEngine()._extract_deterministic_lanes(messages)
+    lanes = CheckpointContextEngine()._extract_deterministic_lanes(
+        messages, _test_source_event_ids(messages)
+    )
 
     assert lanes.effects[0].status == "unknown"
 
@@ -856,14 +1070,16 @@ def test_tool_effect_receipt_failure_is_terminal_evidence():
                         "id": "call_1",
                         "op": "write_file",
                         "status": "failed",
-                        "source_event_ids": [0, 1],
+                        "source_event_ids": [1, 2],
                     }
                 }
             ),
         },
     ]
 
-    lanes = CheckpointContextEngine()._extract_deterministic_lanes(messages)
+    lanes = CheckpointContextEngine()._extract_deterministic_lanes(
+        messages, _test_source_event_ids(messages)
+    )
 
     assert lanes.effects[0].status == "failed"
 
@@ -874,7 +1090,7 @@ def test_typed_map_keeps_source_event_ids_and_uses_no_tools():
     auxiliary = _FakeAuxiliaryClient(
         _map_response(
             {
-                "source_event_ids": [0, 1],
+                "source_event_ids": [1, 2],
                 "facts": [
                     {
                         "kind": "request",
@@ -891,11 +1107,11 @@ def test_typed_map_keeps_source_event_ids_and_uses_no_tools():
         {"role": "user", "content": "hello"},
     ]
 
-    result = engine.compress(messages)
+    result = _compress(engine, messages)
 
     assert result is messages
     assert all(call["tools"] == [] for call in auxiliary.calls)
-    assert [shard.source_event_ids for shard in engine.last_map_shards] == [(0, 1)]
+    assert [shard.source_event_ids for shard in engine.last_map_shards] == [(1, 2)]
     assert engine.last_map_shards[0].facts[0].source_event_ids == (1,)
 
 
@@ -910,7 +1126,7 @@ def test_invalid_or_truncated_map_json_rejects_candidate():
     engine = CheckpointContextEngine(auxiliary_client=auxiliary)
     messages = [{"role": "user", "content": "hello"}]
 
-    result = engine.compress(messages)
+    result = _compress(engine, messages)
 
     assert result is messages
     assert auxiliary.calls
@@ -941,13 +1157,14 @@ def test_map_cache_resumes_only_missing_shards():
         {"role": "assistant", "content": "second"},
     ]
     groups = (CausalGroup((0,)), CausalGroup((1,)))
+    source_event_ids = _test_source_event_ids(messages)
 
-    assert engine._map_shards(messages, groups) is None
-    assert engine._map_shards(messages, groups) == (
-        MapShard((0,), ()),
+    assert engine._map_shards(messages, groups, source_event_ids) is None
+    assert engine._map_shards(messages, groups, source_event_ids) == (
         MapShard((1,), ()),
+        MapShard((2,), ()),
     )
-    assert attempts == {(0,): 1, (1,): 2}
+    assert attempts == {(1,): 2, (2,): 1}
 
 
 def test_map_cache_rejects_invalid_entries_and_keys_include_all_fingerprints(
@@ -960,16 +1177,23 @@ def test_map_cache_rejects_invalid_entries_and_keys_include_all_fingerprints(
     engine = CheckpointContextEngine(auxiliary_client=auxiliary)
     messages = [{"role": "user", "content": "hello"}]
     group = CausalGroup((0,))
+    source_event_ids = _test_source_event_ids(messages)
 
-    assert engine._map_shards(messages, (group,)) == (MapShard((0,), ()),)
+    assert engine._map_shards(messages, (group,), source_event_ids) == (
+        MapShard((1,), ()),
+    )
     assert len(auxiliary.calls) == 1
-    key = engine._map_shard_cache_key(messages, group)
+    key = engine._map_shard_cache_key(messages, group, source_event_ids)
     engine._map_shard_cache[key] = MapShard((99,), ())
-    assert engine._map_shards(messages, (group,)) == (MapShard((0,), ()),)
+    assert engine._map_shards(messages, (group,), source_event_ids) == (
+        MapShard((1,), ()),
+    )
     assert len(auxiliary.calls) == 2
 
     messages[0]["content"] = "changed"
-    assert engine._map_shards(messages, (group,)) == (MapShard((0,), ()),)
+    assert engine._map_shards(messages, (group,), source_event_ids) == (
+        MapShard((1,), ()),
+    )
     assert len(auxiliary.calls) == 3
     messages[0]["content"] = "hello"
     for name in (
@@ -980,7 +1204,9 @@ def test_map_cache_rejects_invalid_entries_and_keys_include_all_fingerprints(
         monkeypatch.setattr(
             checkpoint_engine, name, getattr(checkpoint_engine, name) + "-changed"
         )
-        assert engine._map_shards(messages, (group,)) == (MapShard((0,), ()),)
+        assert engine._map_shards(messages, (group,), source_event_ids) == (
+            MapShard((1,), ()),
+        )
 
     assert len(auxiliary.calls) == 6
 
@@ -997,7 +1223,7 @@ def test_map_tool_call_rejects_candidate():
     engine = CheckpointContextEngine(auxiliary_client=auxiliary)
     messages = [{"role": "user", "content": "hello"}]
 
-    assert engine.compress(messages) is messages
+    assert _compress(engine, messages) is messages
     assert engine.last_map_shards == ()
     assert engine.compression_count == 0
 
@@ -1015,7 +1241,7 @@ def test_missing_map_coverage_rejects_candidate():
         {"role": "user", "content": "hello"},
     ]
 
-    assert engine.compress(messages) is messages
+    assert _compress(engine, messages) is messages
     assert engine.last_map_shards == ()
     assert engine.compression_count == 0
 
@@ -1031,7 +1257,7 @@ def test_exhausted_auxiliary_map_never_calls_main_model():
     )
     messages = [{"role": "user", "content": "hello"}]
 
-    result = engine.compress(messages)
+    result = _compress(engine, messages)
 
     assert result is messages
     assert engine._main_model is main_model
@@ -1067,7 +1293,7 @@ def test_checkpoint_map_and_reduce_use_the_public_auxiliary_chain(monkeypatch):
     )
     engine = CheckpointContextEngine(token_counter=lambda _value: 1, output_reserve_tokens=0)
 
-    assert engine.compress([{"role": "user", "content": "finish the migration"}])
+    assert _compress(engine, [{"role": "user", "content": "finish the migration"}])
     assert [call["max_tokens"] for call in calls] == [1024, 2048]
     assert all(call["task"] == "compression" and call["tools"] == [] for call in calls)
 
@@ -1115,7 +1341,12 @@ def test_two_checkpoint_engines_share_the_default_compression_limit(monkeypatch)
     try:
         with ThreadPoolExecutor(max_workers=len(engines)) as executor:
             futures = [
-                executor.submit(engine._map_shards, messages, groups)
+                executor.submit(
+                    engine._map_shards,
+                    messages,
+                    groups,
+                    _test_source_event_ids(messages),
+                )
                 for engine in engines
             ]
             assert all(future.result(timeout=2) is not None for future in futures)
@@ -1158,7 +1389,11 @@ def test_map_planner_packs_consecutive_causal_units_without_splitting_tool_recei
         {"role": "assistant", "content": "verified"},
     ]
 
-    shards = engine._plan_map_shards(messages, engine._plan_causal_groups(messages))
+    shards = engine._plan_map_shards(
+        messages,
+        engine._plan_causal_groups(messages),
+        _test_source_event_ids(messages),
+    )
 
     assert [shard.event_indices for shard in shards] == [(0, 1), (2,), (3, 4), (5,)]
 
@@ -1174,7 +1409,7 @@ def test_map_planner_externalizes_an_oversized_causal_unit_without_tearing_it(
 
     def token_counter(prompt):
         payload = json.loads(prompt[-1]["content"])
-        return 20 if payload["source_event_ids"] == [0, 1] else 6
+        return 20 if payload["source_event_ids"] == [1, 2] else 6
 
     engine = CheckpointContextEngine(token_counter=token_counter)
     messages = [
@@ -1193,7 +1428,11 @@ def test_map_planner_externalizes_an_oversized_causal_unit_without_tearing_it(
         {"role": "user", "content": "continue"},
     ]
 
-    shards = engine._plan_map_shards(messages, engine._plan_causal_groups(messages))
+    shards = engine._plan_map_shards(
+        messages,
+        engine._plan_causal_groups(messages),
+        _test_source_event_ids(messages),
+    )
 
     assert [shard.event_indices for shard in shards] == [(2,)]
     assert [group.event_indices for group in engine.last_map_externalized_groups] == [(0, 1)]
@@ -1215,7 +1454,11 @@ def test_map_planner_fails_closed_when_its_total_input_budget_is_exceeded(monkey
         {"role": "assistant", "content": "first response"},
     ]
 
-    assert engine._plan_map_shards(messages, engine._plan_causal_groups(messages)) is None
+    assert engine._plan_map_shards(
+        messages,
+        engine._plan_causal_groups(messages),
+        _test_source_event_ids(messages),
+    ) is None
 
 
 def test_map_planner_fails_closed_when_its_total_output_budget_is_exceeded(monkeypatch):
@@ -1234,7 +1477,11 @@ def test_map_planner_fails_closed_when_its_total_output_budget_is_exceeded(monke
         {"role": "assistant", "content": "first response"},
     ]
 
-    assert engine._plan_map_shards(messages, engine._plan_causal_groups(messages)) is None
+    assert engine._plan_map_shards(
+        messages,
+        engine._plan_causal_groups(messages),
+        _test_source_event_ids(messages),
+    ) is None
 
 
 def test_map_planner_has_a_bounded_default_shard_cap():
@@ -1254,7 +1501,9 @@ def test_map_token_estimate_uses_host_request_estimator_and_safe_fallback(monkey
     messages = [{"role": "user", "content": "中文" * 40}]
     group = engine._plan_causal_groups(messages)[0]
 
-    assert engine._map_input_tokens(messages, group) >= 91
+    assert engine._map_input_tokens(
+        messages, group, _test_source_event_ids(messages)
+    ) >= 91
 
 
 def test_token_fallback_is_conservative_for_cjk_and_json(monkeypatch):
@@ -1434,7 +1683,7 @@ def test_semantic_reduce_builds_a_shadow_candidate_without_a_new_user_turn():
         {"role": "user", "content": "finish the migration"},
     ]
 
-    result = engine.compress(messages)
+    result = _compress(engine, messages)
 
     assert result is messages
     assert reduced_states
@@ -1445,7 +1694,7 @@ def test_semantic_reduce_builds_a_shadow_candidate_without_a_new_user_turn():
     assert engine.last_wire_tokens is not None
     assert engine.last_wire_tokens > 0
     assert engine.last_map_shards
-    assert [shard.source_event_ids for shard in engine.last_map_shards] == [(0, 1, 2)]
+    assert [shard.source_event_ids for shard in engine.last_map_shards] == [(1, 2, 3)]
     assert engine.last_map_externalized_groups == ()
     assert engine.last_reduced_state is reduced_states[0]
     assert engine.last_degradation_steps == ()
@@ -1466,7 +1715,7 @@ def test_invalid_semantic_reduce_output_rejects_candidate():
     )
     messages = [{"role": "user", "content": "finish the migration"}]
 
-    assert engine.compress(messages) is messages
+    assert _compress(engine, messages) is messages
     assert engine.last_candidate is None
     assert engine.compression_count == 0
 
@@ -1476,7 +1725,7 @@ def test_exhausted_semantic_reduce_fails_closed_without_main_model_fallback():
 
     main_model = _FakeMainModel()
     auxiliary = _FakeAuxiliaryClient(
-        _map_response({"source_event_ids": [0], "facts": []}),
+        _map_response({"source_event_ids": [1], "facts": []}),
         StopIteration("semantic reducer exhausted"),
     )
     engine = CheckpointContextEngine(
@@ -1485,7 +1734,7 @@ def test_exhausted_semantic_reduce_fails_closed_without_main_model_fallback():
     )
     messages = [{"role": "user", "content": "finish the migration"}]
 
-    result = engine.compress(messages)
+    result = _compress(engine, messages)
 
     assert result is messages
     assert auxiliary.calls
@@ -1501,7 +1750,7 @@ def test_full_wire_hard_cap_rejects_before_live_commit():
     from agent.checkpoint_engine import CheckpointContextEngine
 
     engine = CheckpointContextEngine(
-        auxiliary_client=_FakeAuxiliaryClient(_map_response({"source_event_ids": [0], "facts": []})),
+        auxiliary_client=_FakeAuxiliaryClient(_map_response({"source_event_ids": [1], "facts": []})),
         semantic_reducer=_semantic_selection,
         mode="live",
         tool_schemas=[{"type": "function", "function": {"name": "write_file", "parameters": {}}}],
@@ -1511,7 +1760,7 @@ def test_full_wire_hard_cap_rejects_before_live_commit():
     )
     messages = [{"role": "user", "content": "finish the migration"}]
 
-    assert engine.compress(messages) is messages
+    assert _compress(engine, messages) is messages
     assert engine.compression_count == 0
 
 
@@ -1542,7 +1791,7 @@ def test_full_wire_hard_cap_preserves_host_only_request_overhead(monkeypatch):
         {"role": "user", "content": "finish the migration"},
     ]
 
-    assert engine.compress(messages, current_tokens=100) is messages
+    assert _compress(engine, messages, current_tokens=100) is messages
     assert any(
         kwargs.get("tools") == tools and kwargs.get("output_reserve_tokens") == 3
         for _request_messages, kwargs in calls
@@ -1569,7 +1818,7 @@ def test_live_mode_commits_only_a_valid_under_cap_projection():
         {"role": "user", "content": "finish the migration"},
     ]
 
-    result = engine.compress(messages)
+    result = _compress(engine, messages)
 
     assert result is not messages
     assert result[-1] == messages[-1]
@@ -1617,7 +1866,7 @@ def test_renderer_shrinks_only_complete_old_causal_groups_before_rejecting(monke
         {"role": "user", "content": "active request"},
     ]
 
-    result = engine.compress(messages)
+    result = _compress(engine, messages)
 
     assert result is not messages
     assert result[-1] == messages[-1]
@@ -1648,7 +1897,9 @@ def test_adaptive_causal_tail_keeps_complete_groups_inside_default_band():
         {"role": "user", "content": "active request"},
     ]
     groups = engine._plan_causal_groups(messages)
-    lanes = engine._extract_deterministic_lanes(messages)
+    lanes = engine._extract_deterministic_lanes(
+        messages, _test_source_event_ids(messages)
+    )
 
     tail = engine._adaptive_tail_groups(messages, groups, lanes)
 
@@ -1687,7 +1938,9 @@ def test_adaptive_causal_tail_may_grow_to_hard_max_but_not_beyond():
         {"role": "user", "content": "active request"},
     ]
     groups = engine._plan_causal_groups(messages)
-    lanes = engine._extract_deterministic_lanes(messages)
+    lanes = engine._extract_deterministic_lanes(
+        messages, _test_source_event_ids(messages)
+    )
 
     tail = engine._adaptive_tail_groups(messages, groups, lanes)
 
@@ -1728,7 +1981,9 @@ def test_adaptive_causal_tail_does_not_split_a_tool_receipt_group():
         {"role": "user", "content": "active request"},
     ]
     groups = engine._plan_causal_groups(messages)
-    lanes = engine._extract_deterministic_lanes(messages)
+    lanes = engine._extract_deterministic_lanes(
+        messages, _test_source_event_ids(messages)
+    )
 
     tail = engine._adaptive_tail_groups(messages, groups, lanes)
 
@@ -1764,7 +2019,7 @@ def test_adaptive_causal_tail_excludes_protected_lanes_from_its_budget():
                         "id": "call_1",
                         "op": "write_file",
                         "status": "succeeded",
-                        "source_event_ids": [3, 4],
+                        "source_event_ids": [4, 5],
                     }
                 }
             ),
@@ -1773,7 +2028,9 @@ def test_adaptive_causal_tail_excludes_protected_lanes_from_its_budget():
         {"role": "user", "content": "active request"},
     ]
     groups = engine._plan_causal_groups(messages)
-    lanes = engine._extract_deterministic_lanes(messages)
+    lanes = engine._extract_deterministic_lanes(
+        messages, _test_source_event_ids(messages)
+    )
 
     tail = engine._adaptive_tail_groups(messages, groups, lanes)
 
@@ -1800,7 +2057,9 @@ def test_acknowledgments_do_not_replace_actionable_root_task():
         {"role": "user", "content": "continue"},
     ]
 
-    lanes = engine._extract_deterministic_lanes(messages)
+    lanes = engine._extract_deterministic_lanes(
+        messages, _test_source_event_ids(messages)
+    )
 
     assert lanes.active_intent is not None
     assert "Ship the rename CLI; keep tests green." in lanes.active_intent.content
@@ -1818,7 +2077,9 @@ def test_plain_imperative_correction_preserves_root_across_a_long_tail():
     )
     messages.append({"role": "user", "content": "Do not modify config files."})
 
-    lanes = engine._extract_deterministic_lanes(messages)
+    lanes = engine._extract_deterministic_lanes(
+        messages, _test_source_event_ids(messages)
+    )
 
     assert lanes.active_intent is not None
     assert lanes.active_intent.event_indices == (0, 41)
@@ -1848,7 +2109,9 @@ def test_corrections_steer_and_supersession_stay_on_intent_lane():
         },
     ]
 
-    lanes = engine._extract_deterministic_lanes(messages)
+    lanes = engine._extract_deterministic_lanes(
+        messages, _test_source_event_ids(messages)
+    )
 
     assert lanes.active_intent is not None
     assert "document the public API only" in lanes.active_intent.content
@@ -1874,7 +2137,9 @@ def test_overflow_intent_keeps_hash_edges_and_exact_constraints():
         {"role": "user", "content": "also keep /steer in the chain"},
     ]
 
-    lanes = engine._extract_deterministic_lanes(messages)
+    lanes = engine._extract_deterministic_lanes(
+        messages, _test_source_event_ids(messages)
+    )
 
     assert lanes.active_intent is not None
     assert long_task not in lanes.active_intent.content
@@ -1899,7 +2164,7 @@ def _live_projection(messages):
         target_wire_tokens=60_000,
         hard_max_wire_tokens=60_000,
     )
-    result = engine.compress(messages)
+    result = _compress(engine, messages)
     assert result is not messages
     return result
 

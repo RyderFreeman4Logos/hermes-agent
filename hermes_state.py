@@ -11238,14 +11238,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     @staticmethod
     def _active_message_revision(conn, session_id: str) -> ActiveMessageRevision:
         rows = conn.execute(
-            "SELECT id, role, content, tool_call_id, tool_calls, tool_name, "
-            "effect_disposition, finish_reason, reasoning, reasoning_content, "
-            "reasoning_details, codex_reasoning_items, codex_message_items, "
-            "observed, _compressed_summary, api_content "
-            "FROM messages WHERE session_id = ? AND active = 1 ORDER BY id",
+            "SELECT * FROM messages "
+            "WHERE session_id = ? AND active = 1 ORDER BY id",
             (session_id,),
         ).fetchall()
-        source_ids = tuple(int(row[0]) for row in rows)
+        source_ids = tuple(int(row["id"]) for row in rows)
         source_signature = hashlib.sha256(
             repr(tuple(tuple(row) for row in rows)).encode("utf-8", "surrogatepass")
         ).hexdigest()
@@ -11323,9 +11320,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         reclaimed (crash cleanup, TTL expiry, competing writer) fails the
         commit instead of clobbering the winner's transcript.
 
-        Live source CAS (*source_ids* / *source_signature*) is accepted so
-        this signature matches SessionDB pins that digest the pre-watermark
-        rows. This pin enforces identity with *expected_revision*.
+        Live source CAS (*source_ids* / *source_signature*), when supplied,
+        must match the transaction-local ordered active-row identity and content
+        signature. They are never accepted as unchecked compatibility kwargs.
 
         Durable revision safety: when *expected_revision* is provided, the
         active transcript must still exactly match it inside this transaction.

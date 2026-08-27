@@ -148,10 +148,17 @@ def _take_loop_timing_context_text(agent: Any) -> str:
     return agent.__dict__.pop("_loop_timing_context_text", "") or ""
 
 
-def _append_loop_timing_context(agent: Any, api_messages: list) -> list:
-    """Append API-only timing without adding a non-leading system message."""
-    if not (timing := _take_loop_timing_context_text(agent)):
+def _append_loop_timing_context(agent: Any, api_messages: list, *, timing: str | None = None) -> list:
+    """Project API-only timing onto a fresh request copy.
+
+    ``timing`` is claimed once per call block; keeping it outside the canonical
+    request lets every retry redecorate only stable prompt bytes.
+    """
+    if timing is None:
+        timing = _take_loop_timing_context_text(agent)
+    if not timing:
         return api_messages
+    api_messages = [_clone_message_for_send(message) for message in api_messages]
     if agent.api_mode != "chat_completions":
         api_messages.append({"role": "system", "content": timing})
         return api_messages
@@ -1994,6 +2001,7 @@ def run_conversation(
     # objects without the attribute (older pickles / minimal stubs).
     max_compression_attempts = getattr(agent, "max_compression_attempts", 3)
     _last_preflight_pressure: Optional[int] = None
+    loop_timing_context: Optional[str] = None
     _preflight_compression_blocked = _ctx.preflight_compression_blocked
     _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
     # Last composed answer intentionally held back by a verification gate. If
@@ -2888,6 +2896,8 @@ def run_conversation(
             logging.debug(f"Total message size: ~{approx_tokens:,} tokens")
         
         api_start_time = time.time()
+        if loop_timing_context is None:
+            loop_timing_context = _take_loop_timing_context_text(agent)
         retry_count = 0
         max_retries = agent._api_max_retries
         _retry = TurnRetryState()
@@ -2973,14 +2983,17 @@ def run_conversation(
                         tools_for_api=tools_for_api,
                     )
                 )
-                # Keep timing outside cache redecoration; Chat Completions uses
-                # the existing request-only user carrier to preserve ordering.
-                api_messages = _append_loop_timing_context(agent, api_messages)
+                # Re-render the timing-free canonical request for the current
+                # provider, then project the once-claimed timing onto this
+                # outbound attempt only.
+                attempt_messages = _append_loop_timing_context(
+                    agent, api_messages, timing=loop_timing_context
+                )
                 if tools_for_api == agent.tools:
-                    api_kwargs = agent._build_api_kwargs(api_messages)
+                    api_kwargs = agent._build_api_kwargs(attempt_messages)
                 else:
                     api_kwargs = agent._build_api_kwargs(
-                        api_messages,
+                        attempt_messages,
                         tools_for_api=tools_for_api,
                     )
                 # Outbound-request surrogate chokepoint (#50959): the messages
